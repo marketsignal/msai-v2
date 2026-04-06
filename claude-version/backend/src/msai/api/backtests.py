@@ -19,6 +19,7 @@ from msai.core.auth import get_current_user
 from msai.core.config import settings
 from msai.core.database import get_db
 from msai.core.logging import get_logger
+from msai.core.queue import enqueue_backtest, get_redis_pool
 from msai.models.backtest import Backtest
 from msai.models.strategy import Strategy
 from msai.models.trade import Trade
@@ -47,7 +48,6 @@ async def run_backtest(
     arq worker pool via Redis. The caller should poll ``GET /{job_id}/status``
     to track progress.
 
-    TODO: Wire up actual Redis enqueue once infra is running.
     """
     # Verify the strategy exists
     result = await db.execute(select(Strategy).where(Strategy.id == body.strategy_id))
@@ -59,27 +59,35 @@ async def run_backtest(
             detail=f"Strategy {body.strategy_id} not found",
         )
 
+    # Compute strategy code hash
+    strategy_hash = "unknown"
+    if strategy.file_path:
+        strategy_file = Path(strategy.file_path)
+        if strategy_file.exists():
+            import hashlib
+
+            strategy_hash = hashlib.sha256(strategy_file.read_bytes()).hexdigest()
+
     # Create the backtest record
     backtest = Backtest(
         strategy_id=body.strategy_id,
-        strategy_code_hash="pending",  # TODO: compute from strategy file
+        strategy_code_hash=strategy_hash,
         config=body.config,
         instruments=body.instruments,
         start_date=body.start_date,
         end_date=body.end_date,
         status="pending",
         progress=0,
-        created_by=strategy.created_by,  # TODO: use authenticated user ID
     )
     db.add(backtest)
     await db.commit()
     await db.refresh(backtest)
 
-    # TODO: Enqueue to arq worker
-    # pool = await get_redis_pool()
-    # await enqueue_backtest(pool, str(backtest.id), strategy.file_path, body.config)
+    # Enqueue to arq worker
+    pool = await get_redis_pool()
+    await enqueue_backtest(pool, str(backtest.id), strategy.file_path, body.config)
 
-    log.info("backtest_created", backtest_id=str(backtest.id), strategy_id=str(body.strategy_id))
+    log.info("backtest_enqueued", backtest_id=str(backtest.id), strategy_id=str(body.strategy_id))
 
     return BacktestStatusResponse(
         id=backtest.id,

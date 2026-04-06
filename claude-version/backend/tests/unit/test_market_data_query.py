@@ -36,8 +36,15 @@ def _sample_bars(symbol: str = "AAPL", n: int = 5) -> pd.DataFrame:
 
 
 def _write_test_data(tmp_path: str, asset_class: str, symbol: str, n: int = 5) -> None:
-    """Write sample bar data to the Parquet store for testing."""
-    store = ParquetStore(tmp_path)
+    """Write sample bar data to the Parquet store for testing.
+
+    Data is written under a ``parquet/`` subdirectory so that service classes
+    (which append ``/parquet`` to the provided root) find the files.
+    """
+    from pathlib import Path
+
+    parquet_root = str(Path(tmp_path) / "parquet")
+    store = ParquetStore(parquet_root)
     store.write_bars(asset_class, symbol, _sample_bars(symbol, n))
 
 
@@ -88,7 +95,7 @@ class TestGetBars:
         calendar days so that the date boundary excludes the second day.
         """
         # Arrange -- write bars on 2024-03-15 AND 2024-03-16
-        store = ParquetStore(str(tmp_path))
+        store = ParquetStore(str(tmp_path / "parquet"))
         ts_day1 = pd.date_range("2024-03-15 09:30", periods=5, freq="1min")
         ts_day2 = pd.date_range("2024-03-16 09:30", periods=5, freq="1min")
         df = pd.DataFrame(

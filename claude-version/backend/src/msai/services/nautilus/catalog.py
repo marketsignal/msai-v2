@@ -38,8 +38,8 @@ class NautilusCatalog:
     """
 
     def __init__(self, data_root: str) -> None:
-        self.data_root = Path(data_root)
-        self._store = ParquetStore(data_root)
+        self.data_root = Path(data_root) / "parquet"
+        self._store = ParquetStore(str(self.data_root))
         self._catalog: Any | None = None
 
         if _HAS_NAUTILUS:

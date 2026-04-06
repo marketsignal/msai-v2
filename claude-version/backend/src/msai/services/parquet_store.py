@@ -122,11 +122,11 @@ class ParquetStore:
         df = pd.concat(frames, ignore_index=True)
 
         if "timestamp" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
             if start is not None:
-                df = df[df["timestamp"] >= pd.Timestamp(start)]
+                df = df[df["timestamp"] >= pd.Timestamp(start, tz="UTC")]
             if end is not None:
-                df = df[df["timestamp"] <= pd.Timestamp(end)]
+                df = df[df["timestamp"] <= pd.Timestamp(end, tz="UTC")]
             df = df.sort_values("timestamp").reset_index(drop=True)
 
         return df

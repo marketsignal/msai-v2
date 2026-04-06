@@ -24,7 +24,7 @@ class MarketDataQuery:
     """Query Parquet bar data using DuckDB for fast analytical access."""
 
     def __init__(self, data_root: str) -> None:
-        self.data_root = Path(data_root)
+        self.data_root = Path(data_root) / "parquet"
 
     def get_bars(
         self,

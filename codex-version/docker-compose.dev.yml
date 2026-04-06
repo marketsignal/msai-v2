@@ -46,6 +46,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://msai:msai_dev_password@postgres:5432/msai
       REDIS_URL: redis://redis:6379
       DATA_ROOT: /app/data
+      STRATEGIES_ROOT: /app/strategies
       ENVIRONMENT: development
       JWT_TENANT_ID: dev-tenant-id
       JWT_CLIENT_ID: dev-client-id
@@ -70,6 +71,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://msai:msai_dev_password@postgres:5432/msai
       REDIS_URL: redis://redis:6379
       DATA_ROOT: /app/data
+      STRATEGIES_ROOT: /app/strategies
       ENVIRONMENT: development
       JWT_TENANT_ID: dev-tenant-id
       JWT_CLIENT_ID: dev-client-id

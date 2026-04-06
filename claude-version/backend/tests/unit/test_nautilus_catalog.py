@@ -46,7 +46,7 @@ class TestGetAvailableInstruments:
     def test_get_available_instruments_finds_written_data(self, tmp_path: Path) -> None:
         """Write Parquet data for two symbols and verify instruments are listed."""
         # Arrange
-        store = ParquetStore(str(tmp_path))
+        store = ParquetStore(str(tmp_path / "parquet"))
         store.write_bars("stocks", "AAPL", _sample_bars("AAPL"))
         store.write_bars("stocks", "GOOG", _sample_bars("GOOG"))
         store.write_bars("futures", "ES", _sample_bars("ES"))
@@ -90,7 +90,7 @@ class TestLoadBars:
     def test_load_bars_returns_dataframe(self, tmp_path: Path) -> None:
         """Write Parquet bars then load them back via the catalog."""
         # Arrange
-        store = ParquetStore(str(tmp_path))
+        store = ParquetStore(str(tmp_path / "parquet"))
         df = _sample_bars("AAPL", n=20)
         store.write_bars("stocks", "AAPL", df)
         catalog = NautilusCatalog(str(tmp_path))
@@ -107,7 +107,7 @@ class TestLoadBars:
     def test_load_bars_with_date_range(self, tmp_path: Path) -> None:
         """Load bars filtered by start and end date."""
         # Arrange
-        store = ParquetStore(str(tmp_path))
+        store = ParquetStore(str(tmp_path / "parquet"))
         df = _sample_bars("AAPL", n=20)
         store.write_bars("stocks", "AAPL", df)
         catalog = NautilusCatalog(str(tmp_path))
