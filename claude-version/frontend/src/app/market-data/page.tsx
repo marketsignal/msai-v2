@@ -8,25 +8,10 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { CandlestickChart } from "@/components/charts/candlestick-chart";
-import { symbols, generateOHLCV } from "@/lib/mock-data/market-data";
+import { SymbolSelector } from "@/components/charts/symbol-selector";
+import { generateOHLCV } from "@/lib/mock-data/market-data";
 import { formatCurrency, formatPercent, formatNumber } from "@/lib/format";
-
-const timeframes = [
-  { label: "1D", days: 1 },
-  { label: "1W", days: 7 },
-  { label: "1M", days: 30 },
-  { label: "3M", days: 90 },
-  { label: "1Y", days: 365 },
-] as const;
 
 export default function MarketDataPage(): React.ReactElement {
   const [selectedSymbol, setSelectedSymbol] = useState("AAPL");
@@ -59,33 +44,12 @@ export default function MarketDataPage(): React.ReactElement {
       </div>
 
       {/* Controls */}
-      <div className="flex flex-wrap items-center gap-4">
-        <Select value={selectedSymbol} onValueChange={setSelectedSymbol}>
-          <SelectTrigger className="w-56">
-            <SelectValue placeholder="Select symbol..." />
-          </SelectTrigger>
-          <SelectContent>
-            {symbols.map((s) => (
-              <SelectItem key={s.value} value={s.value}>
-                {s.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-
-        <div className="flex gap-1">
-          {timeframes.map((tf) => (
-            <Button
-              key={tf.label}
-              variant={selectedTimeframe === tf.days ? "default" : "outline"}
-              size="sm"
-              onClick={() => setSelectedTimeframe(tf.days)}
-            >
-              {tf.label}
-            </Button>
-          ))}
-        </div>
-      </div>
+      <SymbolSelector
+        selectedSymbol={selectedSymbol}
+        onSymbolChange={setSelectedSymbol}
+        selectedTimeframe={selectedTimeframe}
+        onTimeframeChange={setSelectedTimeframe}
+      />
 
       {/* Price info cards */}
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
