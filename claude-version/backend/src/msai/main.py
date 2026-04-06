@@ -11,9 +11,13 @@ Creates and configures the FastAPI application with:
 
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import select
 
 from msai.api.account import router as account_router
 from msai.api.auth import router as auth_router
@@ -22,7 +26,7 @@ from msai.api.live import router as live_router
 from msai.api.market_data import router as market_data_router
 from msai.api.strategies import router as strategies_router
 from msai.api.websocket import live_stream
-from msai.core.auth import init_validator
+from msai.core.auth import _API_KEY_CLAIMS, init_validator
 from msai.core.config import settings
 from msai.core.logging import logging_middleware, setup_logging
 
@@ -32,9 +36,37 @@ setup_logging(settings.environment)
 if settings.azure_tenant_id and settings.azure_client_id:
     init_validator(settings.azure_tenant_id, settings.azure_client_id)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Startup/shutdown lifecycle — ensure API key user exists in DB."""
+    if settings.msai_api_key:
+        try:
+            from msai.core.database import async_session_factory
+            from msai.models.user import User
+
+            async with async_session_factory() as session:
+                api_user_id = _API_KEY_CLAIMS["sub"]
+                result = await session.execute(
+                    select(User).where(User.entra_id == api_user_id)
+                )
+                if result.scalar_one_or_none() is None:
+                    session.add(User(
+                        entra_id=api_user_id,
+                        email=_API_KEY_CLAIMS["preferred_username"],
+                        display_name=_API_KEY_CLAIMS.get("name", "API Key User"),
+                        role="admin",
+                    ))
+                    await session.commit()
+        except Exception:
+            pass  # DB may not be ready yet (migrations pending)
+    yield
+
+
 app: FastAPI = FastAPI(
     title="MSAI v2",
     description="Personal Hedge Fund Platform",
+    lifespan=lifespan,
     version="0.1.0",
 )
 

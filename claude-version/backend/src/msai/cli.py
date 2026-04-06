@@ -38,7 +38,7 @@ def ingest(
         typer.echo("Error: no symbols provided", err=True)
         raise typer.Exit(code=1)
 
-    store = ParquetStore(settings.data_root)
+    store = ParquetStore(str(settings.data_root / "parquet"))
     polygon = PolygonClient(settings.polygon_api_key) if settings.polygon_api_key else None
 
     databento = None
@@ -67,7 +67,7 @@ def ingest_daily(
     ),
 ) -> None:
     """Download yesterday's data for incremental daily update."""
-    store = ParquetStore(settings.data_root)
+    store = ParquetStore(str(settings.data_root / "parquet"))
 
     if symbols.lower() == "all":
         symbol_list = store.list_symbols(asset)
@@ -100,7 +100,7 @@ def ingest_daily(
 @app.command()
 def data_status() -> None:
     """Show storage stats and data summary."""
-    store = ParquetStore(settings.data_root)
+    store = ParquetStore(str(settings.data_root / "parquet"))
     stats = store.get_storage_stats()
 
     typer.echo("Storage Statistics:")

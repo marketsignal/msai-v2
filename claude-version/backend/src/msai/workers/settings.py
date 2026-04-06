@@ -57,7 +57,7 @@ async def run_ingest(
     from msai.services.data_sources.polygon_client import PolygonClient
     from msai.services.parquet_store import ParquetStore
 
-    store = ParquetStore(settings.data_root)
+    store = ParquetStore(str(settings.data_root / "parquet"))
 
     polygon = PolygonClient(settings.polygon_api_key) if settings.polygon_api_key else None
     databento = DatabentoClient(settings.databento_api_key) if settings.databento_api_key else None

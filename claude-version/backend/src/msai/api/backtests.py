@@ -68,11 +68,20 @@ async def run_backtest(
 
             strategy_hash = hashlib.sha256(strategy_file.read_bytes()).hexdigest()
 
+    # Enrich config with fields the worker needs
+    worker_config = {
+        **body.config,
+        "instrument": body.instruments[0] if body.instruments else "AAPL",
+        "asset_class": body.config.get("asset_class", "stocks"),
+        "start_date": str(body.start_date),
+        "end_date": str(body.end_date),
+    }
+
     # Create the backtest record
     backtest = Backtest(
         strategy_id=body.strategy_id,
         strategy_code_hash=strategy_hash,
-        config=body.config,
+        config=worker_config,
         instruments=body.instruments,
         start_date=body.start_date,
         end_date=body.end_date,
@@ -80,12 +89,21 @@ async def run_backtest(
         progress=0,
     )
     db.add(backtest)
+
+    # Enqueue to arq BEFORE commit — if enqueue fails, rollback the row
+    try:
+        pool = await get_redis_pool()
+        await enqueue_backtest(pool, str(backtest.id), strategy.file_path, worker_config)
+    except Exception as exc:
+        await db.rollback()
+        log.error("backtest_enqueue_failed", error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to enqueue backtest job — Redis may be unavailable",
+        ) from exc
+
     await db.commit()
     await db.refresh(backtest)
-
-    # Enqueue to arq worker
-    pool = await get_redis_pool()
-    await enqueue_backtest(pool, str(backtest.id), strategy.file_path, body.config)
 
     log.info("backtest_enqueued", backtest_id=str(backtest.id), strategy_id=str(body.strategy_id))
 
