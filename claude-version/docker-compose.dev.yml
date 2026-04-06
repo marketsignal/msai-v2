@@ -74,6 +74,20 @@ services:
       redis:
         condition: service_healthy
 
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: msai-claude-ib-gateway
+    environment:
+      TWS_USERID: ${TWS_USERID:-dev-user}
+      TWS_PASSWORD: ${TWS_PASSWORD:-dev-password}
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      READ_ONLY_API: "yes"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 4002"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
   frontend:
     build:
       context: ./frontend
