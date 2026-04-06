@@ -1,6 +1,6 @@
 "use client";
 
-import { use, useState } from "react";
+import { use, useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
@@ -13,14 +13,6 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import {
   Dialog,
   DialogContent,
@@ -37,27 +29,10 @@ import {
   BarChart3,
   TrendingUp,
   Trophy,
-  Percent,
+  Hash,
 } from "lucide-react";
-import { getStrategyById } from "@/lib/mock-data/strategies";
-import { formatPercent, formatDate } from "@/lib/format";
-
-function statusColor(status: string): string {
-  switch (status) {
-    case "running":
-      return "bg-emerald-500/15 text-emerald-500 hover:bg-emerald-500/25";
-    case "stopped":
-      return "bg-muted text-muted-foreground hover:bg-muted";
-    case "error":
-      return "bg-red-500/15 text-red-500 hover:bg-red-500/25";
-    case "completed":
-      return "bg-emerald-500/15 text-emerald-500 hover:bg-emerald-500/25";
-    case "failed":
-      return "bg-red-500/15 text-red-500 hover:bg-red-500/25";
-    default:
-      return "bg-muted text-muted-foreground hover:bg-muted";
-  }
-}
+import { apiGet, ApiError, type StrategyResponse } from "@/lib/api";
+import { formatDate } from "@/lib/format";
 
 export default function StrategyDetailPage({
   params,
@@ -66,23 +41,48 @@ export default function StrategyDetailPage({
 }): React.ReactElement {
   const { id } = use(params);
   const router = useRouter();
-  const strategy = getStrategyById(id);
-  const [configText, setConfigText] = useState(
-    strategy ? JSON.stringify(strategy.config, null, 2) : "{}",
-  );
-  const [validateOpen, setValidateOpen] = useState(false);
+  const [strategy, setStrategy] = useState<StrategyResponse | null>(null);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [notFound, setNotFound] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
+  const [configText, setConfigText] = useState<string>("{}");
+  const [validateOpen, setValidateOpen] = useState<boolean>(false);
   const [isValid, setIsValid] = useState<boolean | null>(null);
 
-  if (!strategy) {
-    return (
-      <div className="flex h-96 flex-col items-center justify-center gap-4">
-        <p className="text-muted-foreground">Strategy not found</p>
-        <Button asChild variant="outline">
-          <Link href="/strategies">Back to Strategies</Link>
-        </Button>
-      </div>
-    );
-  }
+  useEffect(() => {
+    let cancelled = false;
+    const load = async (): Promise<void> => {
+      try {
+        const data = await apiGet<StrategyResponse>(
+          `/api/v1/strategies/${encodeURIComponent(id)}`,
+        );
+        if (cancelled) return;
+        setStrategy(data);
+        setConfigText(
+          data.default_config
+            ? JSON.stringify(data.default_config, null, 2)
+            : "{}",
+        );
+      } catch (err) {
+        if (cancelled) return;
+        if (err instanceof ApiError && err.status === 404) {
+          setNotFound(true);
+        } else {
+          const msg =
+            err instanceof ApiError
+              ? `Failed to load strategy (${err.status})`
+              : "Failed to load strategy";
+          setError(msg);
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, [id]);
 
   function handleValidate(): void {
     try {
@@ -92,6 +92,25 @@ export default function StrategyDetailPage({
       setIsValid(false);
     }
     setValidateOpen(true);
+  }
+
+  if (loading) {
+    return (
+      <div className="flex h-96 items-center justify-center text-sm text-muted-foreground">
+        Loading strategy...
+      </div>
+    );
+  }
+
+  if (notFound || !strategy) {
+    return (
+      <div className="flex h-96 flex-col items-center justify-center gap-4">
+        <p className="text-muted-foreground">{error ?? "Strategy not found"}</p>
+        <Button asChild variant="outline">
+          <Link href="/strategies">Back to Strategies</Link>
+        </Button>
+      </div>
+    );
   }
 
   return (
@@ -110,8 +129,11 @@ export default function StrategyDetailPage({
             <h1 className="text-2xl font-semibold tracking-tight">
               {strategy.name}
             </h1>
-            <Badge variant="secondary" className={statusColor(strategy.status)}>
-              {strategy.status}
+            <Badge
+              variant="secondary"
+              className="bg-muted text-muted-foreground hover:bg-muted"
+            >
+              registered
             </Badge>
           </div>
           <p className="mt-1 text-sm text-muted-foreground">
@@ -120,81 +142,79 @@ export default function StrategyDetailPage({
         </div>
       </div>
 
-      {/* Key metrics */}
+      {error && (
+        <div className="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-400">
+          {error}
+        </div>
+      )}
+
+      {/* Key info */}
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <Card className="border-border/50">
           <CardHeader className="flex flex-row items-center justify-between pb-2">
             <CardTitle className="text-sm font-medium text-muted-foreground">
-              Sharpe Ratio
+              Strategy Class
             </CardTitle>
             <BarChart3 className="size-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-semibold">
-              {strategy.sharpeRatio.toFixed(2)}
+            <div className="truncate font-mono text-base">
+              {strategy.strategy_class}
             </div>
           </CardContent>
         </Card>
         <Card className="border-border/50">
           <CardHeader className="flex flex-row items-center justify-between pb-2">
             <CardTitle className="text-sm font-medium text-muted-foreground">
-              Total Return
+              Code Hash
+            </CardTitle>
+            <Hash className="size-4 text-muted-foreground" />
+          </CardHeader>
+          <CardContent>
+            <div
+              className="truncate font-mono text-sm"
+              title={strategy.code_hash}
+            >
+              {strategy.code_hash.slice(0, 12)}...
+            </div>
+          </CardContent>
+        </Card>
+        <Card className="border-border/50">
+          <CardHeader className="flex flex-row items-center justify-between pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground">
+              Registered
+            </CardTitle>
+            <Trophy className="size-4 text-muted-foreground" />
+          </CardHeader>
+          <CardContent>
+            <div className="text-base">{formatDate(strategy.created_at)}</div>
+          </CardContent>
+        </Card>
+        <Card className="border-border/50">
+          <CardHeader className="flex flex-row items-center justify-between pb-2">
+            <CardTitle className="text-sm font-medium text-muted-foreground">
+              File
             </CardTitle>
             <TrendingUp className="size-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
             <div
-              className={`text-2xl font-semibold ${
-                strategy.totalReturn >= 0 ? "text-emerald-500" : "text-red-500"
-              }`}
+              className="truncate font-mono text-xs"
+              title={strategy.file_path}
             >
-              {formatPercent(strategy.totalReturn)}
-            </div>
-          </CardContent>
-        </Card>
-        <Card className="border-border/50">
-          <CardHeader className="flex flex-row items-center justify-between pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">
-              Win Rate
-            </CardTitle>
-            <Trophy className="size-4 text-muted-foreground" />
-          </CardHeader>
-          <CardContent>
-            <div className="text-2xl font-semibold">
-              {strategy.winRate.toFixed(1)}%
-            </div>
-          </CardContent>
-        </Card>
-        <Card className="border-border/50">
-          <CardHeader className="flex flex-row items-center justify-between pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">
-              Instruments
-            </CardTitle>
-            <Percent className="size-4 text-muted-foreground" />
-          </CardHeader>
-          <CardContent>
-            <div className="flex flex-wrap gap-1.5">
-              {strategy.instruments.map((inst) => (
-                <Badge
-                  key={inst}
-                  variant="outline"
-                  className="text-xs font-normal"
-                >
-                  {inst}
-                </Badge>
-              ))}
+              {strategy.file_path}
             </div>
           </CardContent>
         </Card>
       </div>
 
-      {/* Config editor + Backtest history */}
+      {/* Config editor */}
       <div className="grid gap-6 lg:grid-cols-2">
         <Card className="border-border/50">
           <CardHeader>
             <CardTitle className="text-base">Configuration</CardTitle>
             <CardDescription>
-              Edit the JSON configuration for this strategy
+              Default JSON configuration for this strategy
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
@@ -248,57 +268,17 @@ export default function StrategyDetailPage({
 
         <Card className="border-border/50">
           <CardHeader>
-            <CardTitle className="text-base">Backtest History</CardTitle>
+            <CardTitle className="text-base">Schema</CardTitle>
             <CardDescription>
-              Previous backtest runs for this strategy
+              Config schema declared by the strategy
             </CardDescription>
           </CardHeader>
           <CardContent>
-            <Table>
-              <TableHeader>
-                <TableRow className="border-border/50 hover:bg-transparent">
-                  <TableHead>Date Range</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead className="text-right">Sharpe</TableHead>
-                  <TableHead className="text-right">Return</TableHead>
-                  <TableHead className="text-right">Run Date</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {strategy.backtestHistory.map((bt) => (
-                  <TableRow key={bt.id} className="border-border/50">
-                    <TableCell className="text-sm">{bt.dateRange}</TableCell>
-                    <TableCell>
-                      <Badge
-                        variant="secondary"
-                        className={statusColor(bt.status)}
-                      >
-                        {bt.status}
-                      </Badge>
-                    </TableCell>
-                    <TableCell className="text-right">
-                      {bt.status === "completed"
-                        ? bt.sharpeRatio.toFixed(2)
-                        : "--"}
-                    </TableCell>
-                    <TableCell
-                      className={`text-right ${
-                        bt.totalReturn >= 0
-                          ? "text-emerald-500"
-                          : "text-red-500"
-                      }`}
-                    >
-                      {bt.status === "completed"
-                        ? formatPercent(bt.totalReturn)
-                        : "--"}
-                    </TableCell>
-                    <TableCell className="text-right text-muted-foreground">
-                      {formatDate(bt.runDate)}
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+            <pre className="max-h-72 overflow-auto rounded-md bg-muted/40 p-3 font-mono text-xs">
+              {strategy.config_schema
+                ? JSON.stringify(strategy.config_schema, null, 2)
+                : "No schema declared."}
+            </pre>
           </CardContent>
         </Card>
       </div>

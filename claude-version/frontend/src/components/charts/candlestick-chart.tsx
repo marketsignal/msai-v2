@@ -9,7 +9,15 @@ import {
   type ISeriesApi,
   ColorType,
 } from "lightweight-charts";
-import type { OHLCVBar } from "@/lib/mock-data/market-data";
+
+export interface OHLCVBar {
+  time: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
 
 interface CandlestickChartProps {
   data: OHLCVBar[];

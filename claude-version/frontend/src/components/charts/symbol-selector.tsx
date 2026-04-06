@@ -8,7 +8,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { symbols } from "@/lib/mock-data/market-data";
 
 const timeframes = [
   { label: "1D", days: 1 },
@@ -18,24 +17,41 @@ const timeframes = [
   { label: "1Y", days: 365 },
 ] as const;
 
+export interface SymbolOption {
+  value: string;
+  label: string;
+}
+
 export interface SymbolSelectorProps {
+  symbols: SymbolOption[];
   selectedSymbol: string;
   onSymbolChange: (symbol: string) => void;
   selectedTimeframe: number;
   onTimeframeChange: (days: number) => void;
+  disabled?: boolean;
 }
 
 export function SymbolSelector({
+  symbols,
   selectedSymbol,
   onSymbolChange,
   selectedTimeframe,
   onTimeframeChange,
+  disabled = false,
 }: SymbolSelectorProps): React.ReactElement {
   return (
     <div className="flex flex-wrap items-center gap-4">
-      <Select value={selectedSymbol} onValueChange={onSymbolChange}>
+      <Select
+        value={selectedSymbol}
+        onValueChange={onSymbolChange}
+        disabled={disabled || symbols.length === 0}
+      >
         <SelectTrigger className="w-56">
-          <SelectValue placeholder="Select symbol..." />
+          <SelectValue
+            placeholder={
+              symbols.length === 0 ? "No symbols available" : "Select symbol..."
+            }
+          />
         </SelectTrigger>
         <SelectContent>
           {symbols.map((s) => (
@@ -53,6 +69,7 @@ export function SymbolSelector({
             variant={selectedTimeframe === tf.days ? "default" : "outline"}
             size="sm"
             onClick={() => onTimeframeChange(tf.days)}
+            disabled={disabled}
           >
             {tf.label}
           </Button>

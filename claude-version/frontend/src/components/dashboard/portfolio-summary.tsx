@@ -10,6 +10,12 @@ import {
 } from "lucide-react";
 import { activeStrategies } from "@/lib/mock-data/dashboard";
 
+export interface PortfolioSummaryProps {
+  /** Override the active-strategies count (e.g. from the API). */
+  totalStrategies?: number;
+  runningStrategies?: number;
+}
+
 interface StatCardProps {
   title: string;
   value: string;
@@ -52,10 +58,15 @@ function StatCard({
   );
 }
 
-export function PortfolioSummary(): React.ReactElement {
-  const runningCount = activeStrategies.filter(
+export function PortfolioSummary({
+  totalStrategies,
+  runningStrategies,
+}: PortfolioSummaryProps = {}): React.ReactElement {
+  const fallbackRunning = activeStrategies.filter(
     (s) => s.status === "running",
   ).length;
+  const total = totalStrategies ?? activeStrategies.length;
+  const running = runningStrategies ?? fallbackRunning;
 
   return (
     <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -82,8 +93,8 @@ export function PortfolioSummary(): React.ReactElement {
       />
       <StatCard
         title="Active Strategies"
-        value={`${runningCount}/${activeStrategies.length}`}
-        change={`${runningCount} running`}
+        value={`${running}/${total}`}
+        change={`${running} running`}
         trend="up"
         icon={Activity}
       />

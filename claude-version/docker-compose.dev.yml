@@ -109,6 +109,7 @@ services:
       - ./frontend/eslint.config.mjs:/app/eslint.config.mjs:ro
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8800
+      NEXT_PUBLIC_MSAI_API_KEY: ${MSAI_API_KEY:-msai-dev-key}
 
 volumes:
   postgres_data:

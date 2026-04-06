@@ -17,11 +17,11 @@ export interface StrategyCardProps {
     id: string;
     name: string;
     description: string;
-    status: "running" | "stopped" | "error";
-    sharpeRatio: number;
-    totalReturn: number;
-    winRate: number;
-    instruments: string[];
+    status?: "running" | "stopped" | "error";
+    sharpeRatio?: number;
+    totalReturn?: number;
+    winRate?: number;
+    instruments?: string[];
   };
 }
 
@@ -39,6 +39,16 @@ function statusColor(status: "running" | "stopped" | "error"): string {
 export function StrategyCard({
   strategy,
 }: StrategyCardProps): React.ReactElement {
+  const status = strategy.status ?? "stopped";
+  const sharpeRatio = strategy.sharpeRatio ?? 0;
+  const totalReturn = strategy.totalReturn ?? 0;
+  const winRate = strategy.winRate ?? 0;
+  const instruments = strategy.instruments ?? [];
+  const hasMetrics =
+    strategy.sharpeRatio !== undefined ||
+    strategy.totalReturn !== undefined ||
+    strategy.winRate !== undefined;
+
   return (
     <Card className="border-border/50 flex flex-col">
       <CardHeader>
@@ -49,8 +59,8 @@ export function StrategyCard({
               {strategy.description}
             </CardDescription>
           </div>
-          <Badge variant="secondary" className={statusColor(strategy.status)}>
-            {strategy.status}
+          <Badge variant="secondary" className={statusColor(status)}>
+            {status}
           </Badge>
         </div>
       </CardHeader>
@@ -63,7 +73,7 @@ export function StrategyCard({
               Sharpe
             </div>
             <p className="text-lg font-semibold">
-              {strategy.sharpeRatio.toFixed(2)}
+              {hasMetrics ? sharpeRatio.toFixed(2) : "--"}
             </p>
           </div>
           <div className="space-y-1">
@@ -73,10 +83,14 @@ export function StrategyCard({
             </div>
             <p
               className={`text-lg font-semibold ${
-                strategy.totalReturn >= 0 ? "text-emerald-500" : "text-red-500"
+                hasMetrics
+                  ? totalReturn >= 0
+                    ? "text-emerald-500"
+                    : "text-red-500"
+                  : ""
               }`}
             >
-              {formatPercent(strategy.totalReturn)}
+              {hasMetrics ? formatPercent(totalReturn) : "--"}
             </p>
           </div>
           <div className="space-y-1">
@@ -85,7 +99,7 @@ export function StrategyCard({
               Win Rate
             </div>
             <p className="text-lg font-semibold">
-              {strategy.winRate.toFixed(1)}%
+              {hasMetrics ? `${winRate.toFixed(1)}%` : "--"}
             </p>
           </div>
         </div>
@@ -93,15 +107,19 @@ export function StrategyCard({
         <div className="mt-4">
           <p className="text-xs text-muted-foreground">Instruments</p>
           <div className="mt-1 flex flex-wrap gap-1.5">
-            {strategy.instruments.map((inst) => (
-              <Badge
-                key={inst}
-                variant="outline"
-                className="text-xs font-normal"
-              >
-                {inst}
-              </Badge>
-            ))}
+            {instruments.length === 0 ? (
+              <span className="text-xs text-muted-foreground">--</span>
+            ) : (
+              instruments.map((inst) => (
+                <Badge
+                  key={inst}
+                  variant="outline"
+                  className="text-xs font-normal"
+                >
+                  {inst}
+                </Badge>
+              ))
+            )}
           </div>
         </div>
       </CardContent>

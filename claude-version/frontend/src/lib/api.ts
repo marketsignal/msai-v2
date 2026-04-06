@@ -1,16 +1,166 @@
+/**
+ * API client for MSAI v2 backend.
+ *
+ * Supports two auth modes:
+ * 1. Bearer token (Entra ID JWT) — for browser SSO
+ * 2. X-API-Key header — for dev/local, passed via NEXT_PUBLIC_MSAI_API_KEY
+ *
+ * If a token is provided via the `token` argument it takes precedence.
+ * Otherwise, if NEXT_PUBLIC_MSAI_API_KEY is set, the API key is used.
+ */
+
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API_KEY = process.env.NEXT_PUBLIC_MSAI_API_KEY || "";
+
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+    public body: unknown,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
 
 export async function apiFetch(
   path: string,
   options: RequestInit = {},
   token?: string | null,
 ): Promise<Response> {
-  const headers: HeadersInit = {
+  const headers: Record<string, string> = {
     "Content-Type": "application/json",
     ...(options.headers as Record<string, string>),
   };
   if (token) {
-    (headers as Record<string, string>)["Authorization"] = `Bearer ${token}`;
+    headers["Authorization"] = `Bearer ${token}`;
+  } else if (API_KEY) {
+    headers["X-API-Key"] = API_KEY;
   }
   return fetch(`${API_BASE}${path}`, { ...options, headers });
+}
+
+/** Fetch JSON from the API, throwing ApiError on non-2xx. */
+export async function apiGet<T>(
+  path: string,
+  token?: string | null,
+): Promise<T> {
+  const res = await apiFetch(path, { method: "GET" }, token);
+  if (!res.ok) {
+    let body: unknown = null;
+    try {
+      body = await res.json();
+    } catch {
+      // ignore
+    }
+    throw new ApiError(`GET ${path} failed: ${res.status}`, res.status, body);
+  }
+  return (await res.json()) as T;
+}
+
+/** POST JSON to the API, throwing ApiError on non-2xx. */
+export async function apiPost<T>(
+  path: string,
+  body: unknown,
+  token?: string | null,
+): Promise<T> {
+  const res = await apiFetch(
+    path,
+    { method: "POST", body: JSON.stringify(body) },
+    token,
+  );
+  if (!res.ok) {
+    let errBody: unknown = null;
+    try {
+      errBody = await res.json();
+    } catch {
+      // ignore
+    }
+    throw new ApiError(
+      `POST ${path} failed: ${res.status}`,
+      res.status,
+      errBody,
+    );
+  }
+  return (await res.json()) as T;
+}
+
+// =====================================================================
+// API response types — mirror of backend Pydantic schemas
+// =====================================================================
+
+export interface SymbolsResponse {
+  symbols: Record<string, string[]>;
+}
+
+export interface BarPoint {
+  timestamp: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+export interface BarsResponse {
+  symbol: string;
+  interval: string;
+  bars: BarPoint[];
+  count: number;
+}
+
+export interface StrategyResponse {
+  id: string;
+  name: string;
+  description: string;
+  strategy_class: string;
+  code_hash: string;
+  file_path: string;
+  config_schema: Record<string, unknown> | null;
+  default_config: Record<string, unknown> | null;
+  created_at: string;
+}
+
+export interface StrategyListResponse {
+  items: StrategyResponse[];
+  total: number;
+}
+
+export interface BacktestHistoryItem {
+  id: string;
+  strategy_id: string;
+  status: "pending" | "running" | "completed" | "failed";
+  start_date: string;
+  end_date: string;
+  created_at: string;
+}
+
+export interface BacktestHistoryResponse {
+  items: BacktestHistoryItem[];
+  total: number;
+}
+
+export interface BacktestStatusResponse {
+  id: string;
+  status: "pending" | "running" | "completed" | "failed";
+  progress: number;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export interface BacktestMetrics {
+  sharpe_ratio: number;
+  sortino_ratio: number;
+  max_drawdown: number;
+  total_return: number;
+  win_rate: number;
+  num_trades: number;
+  final_equity?: number;
+  initial_cash?: number;
+}
+
+export interface BacktestResultsResponse {
+  id: string;
+  metrics: BacktestMetrics;
+  trade_count: number;
 }

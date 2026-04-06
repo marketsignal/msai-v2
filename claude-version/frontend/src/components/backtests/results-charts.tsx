@@ -27,9 +27,18 @@ import {
   Activity,
   Zap,
 } from "lucide-react";
-import type { Backtest, EquityPoint } from "@/lib/mock-data/backtests";
+import type { EquityPoint } from "@/lib/mock-data/backtests";
 import { generateMonthlyReturns } from "@/lib/mock-data/backtests";
 import { formatCurrency, formatPercent } from "@/lib/format";
+
+export interface ResultsChartsBacktest {
+  sharpeRatio: number;
+  sortinoRatio: number;
+  maxDrawdown: number; // percent (e.g. -8.3 for -8.3%)
+  totalReturn: number; // percent (e.g. 24.5 for 24.5%)
+  winRate: number; // percent (e.g. 62.3 for 62.3%)
+  totalTrades: number;
+}
 
 function MetricCard({
   title,
@@ -131,7 +140,7 @@ function MonthlyReturnsHeatmap(): React.ReactElement {
 }
 
 interface ResultsChartsProps {
-  backtest: Backtest;
+  backtest: ResultsChartsBacktest;
   equityCurve: EquityPoint[];
 }
 

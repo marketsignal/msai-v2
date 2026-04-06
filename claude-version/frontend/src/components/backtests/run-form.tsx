@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -23,49 +23,104 @@ import {
 } from "@/components/ui/dialog";
 import { FlaskConical, Play } from "lucide-react";
 import { useAuth } from "@/lib/auth";
-import { apiFetch } from "@/lib/api";
-import { strategies } from "@/lib/mock-data/strategies";
+import {
+  apiGet,
+  apiPost,
+  ApiError,
+  type StrategyListResponse,
+  type StrategyResponse,
+} from "@/lib/api";
 
 interface RunBacktestFormProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  onSubmitted?: () => void;
 }
 
 export function RunBacktestForm({
   open,
   onOpenChange,
+  onSubmitted,
 }: RunBacktestFormProps): React.ReactElement {
   const { getToken } = useAuth();
-  const [selectedStrategy, setSelectedStrategy] = useState("");
-  const [instruments, setInstruments] = useState("");
-  const [startDate, setStartDate] = useState("2025-01-01");
-  const [endDate, setEndDate] = useState("2025-12-31");
-  const [config, setConfig] = useState("{}");
+  const [strategies, setStrategies] = useState<StrategyResponse[]>([]);
+  const [strategiesLoading, setStrategiesLoading] = useState<boolean>(true);
+  const [selectedStrategy, setSelectedStrategy] = useState<string>("");
+  const [instruments, setInstruments] = useState<string>("");
+  const [startDate, setStartDate] = useState<string>("2025-01-02");
+  const [endDate, setEndDate] = useState<string>("2025-01-15");
+  const [config, setConfig] = useState<string>("{}");
+  const [submitting, setSubmitting] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Load strategies when dialog opens.
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    const load = async (): Promise<void> => {
+      setStrategiesLoading(true);
+      try {
+        const data = await apiGet<StrategyListResponse>("/api/v1/strategies/");
+        if (cancelled) return;
+        setStrategies(data.items);
+        if (data.items.length > 0 && !selectedStrategy) {
+          setSelectedStrategy(data.items[0].id);
+        }
+      } catch (err) {
+        if (cancelled) return;
+        const msg =
+          err instanceof ApiError
+            ? `Failed to load strategies (${err.status})`
+            : "Failed to load strategies";
+        setError(msg);
+      } finally {
+        if (!cancelled) setStrategiesLoading(false);
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
 
   const handleRunBacktest = async (): Promise<void> => {
+    setSubmitting(true);
+    setError(null);
     try {
+      // getToken returns null when MSAL has no account; apiPost will fall
+      // back to the API key from NEXT_PUBLIC_MSAI_API_KEY automatically.
       const token = await getToken();
-      await apiFetch(
+      const parsedConfig = config.trim() ? JSON.parse(config) : {};
+      const parsedInstruments = instruments
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+      await apiPost(
         "/api/v1/backtests/run",
         {
-          method: "POST",
-          body: JSON.stringify({
-            strategy_id: selectedStrategy,
-            config: JSON.parse(config),
-            instruments: instruments
-              .split(",")
-              .map((s) => s.trim())
-              .filter(Boolean),
-            start_date: startDate,
-            end_date: endDate,
-          }),
+          strategy_id: selectedStrategy,
+          config: parsedConfig,
+          instruments: parsedInstruments,
+          start_date: startDate,
+          end_date: endDate,
         },
         token,
       );
-    } catch (error) {
-      console.error("Run backtest failed:", error);
+      onSubmitted?.();
+      onOpenChange(false);
+    } catch (err) {
+      const msg =
+        err instanceof ApiError
+          ? `Backtest failed to start (${err.status})`
+          : err instanceof SyntaxError
+            ? "Configuration JSON is invalid"
+            : "Failed to start backtest";
+      setError(msg);
+    } finally {
+      setSubmitting(false);
     }
-    onOpenChange(false);
   };
 
   return (
@@ -89,9 +144,18 @@ export function RunBacktestForm({
             <Select
               value={selectedStrategy}
               onValueChange={setSelectedStrategy}
+              disabled={strategiesLoading || strategies.length === 0}
             >
               <SelectTrigger>
-                <SelectValue placeholder="Select strategy..." />
+                <SelectValue
+                  placeholder={
+                    strategiesLoading
+                      ? "Loading..."
+                      : strategies.length === 0
+                        ? "No strategies registered"
+                        : "Select strategy..."
+                  }
+                />
               </SelectTrigger>
               <SelectContent>
                 {strategies.map((s) => (
@@ -137,14 +201,27 @@ export function RunBacktestForm({
               placeholder='{ "fast_period": 12, "slow_period": 26 }'
             />
           </div>
+          {error && (
+            <div className="rounded-md border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-400">
+              {error}
+            </div>
+          )}
         </div>
         <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
+          <Button
+            variant="outline"
+            onClick={() => onOpenChange(false)}
+            disabled={submitting}
+          >
             Cancel
           </Button>
-          <Button className="gap-1.5" onClick={handleRunBacktest}>
+          <Button
+            className="gap-1.5"
+            onClick={handleRunBacktest}
+            disabled={submitting || !selectedStrategy}
+          >
             <FlaskConical className="size-3.5" />
-            Run Backtest
+            {submitting ? "Starting..." : "Run Backtest"}
           </Button>
         </DialogFooter>
       </DialogContent>
