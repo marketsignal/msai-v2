@@ -16,11 +16,14 @@ from msai.api import (
     websocket_router,
 )
 from msai.core.audit import audit_middleware
+from msai.core.auth import _API_KEY_CLAIMS
 from msai.core.config import settings
-from msai.core.database import get_db
+from msai.core.database import async_session_factory, get_db
 from msai.core.logging import get_logger, request_context_logging_middleware, setup_logging
 from msai.core.queue import close_redis_pool, get_redis_pool
+from msai.models import User
 from msai.services.ib_probe import ib_probe
+from sqlalchemy import select
 
 setup_logging(settings.environment)
 logger = get_logger("main")
@@ -30,6 +33,27 @@ async def lifespan(_: FastAPI):
     settings.data_root.mkdir(parents=True, exist_ok=True)
     settings.parquet_root.mkdir(parents=True, exist_ok=True)
     settings.reports_root.mkdir(parents=True, exist_ok=True)
+
+    # Ensure API key user exists so X-API-Key writes don't hit FK violations
+    if settings.msai_api_key:
+        try:
+            async with async_session_factory() as session:
+                api_user_id = _API_KEY_CLAIMS["sub"]
+                result = await session.execute(
+                    select(User).where(User.entra_id == api_user_id)
+                )
+                if result.scalar_one_or_none() is None:
+                    session.add(User(
+                        id=api_user_id,
+                        entra_id=api_user_id,
+                        email=_API_KEY_CLAIMS["preferred_username"],
+                        display_name=_API_KEY_CLAIMS.get("name", "API Key User"),
+                        role="admin",
+                    ))
+                    await session.commit()
+        except Exception as exc:
+            logger.warning("api_key_user_bootstrap_failed", error=str(exc))
+
     ib_probe.start()
     logger.info("app_started", environment=settings.environment)
     try:

@@ -41,8 +41,8 @@ class LiveDeployment(Base):
     stopped_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-    started_by: Mapped[UUID] = mapped_column(
-        ForeignKey("users.id"), index=True, nullable=False
+    started_by: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id"), index=True, nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
