@@ -29,6 +29,6 @@ async def test_model_metadata_creates_tables(postgres_url: str) -> None:
         "live_deployments",
         "trades",
         "strategy_daily_pnl",
-        "audit_log",
+        "audit_logs",
     }
     assert expected.issubset(tables)
