@@ -17,7 +17,7 @@ from msai.services.strategy_registry import StrategyInfo
 # Fixtures
 # ---------------------------------------------------------------------------
 
-STRATEGIES_DIR = Path(__file__).resolve().parents[2] / "strategies" / "example"
+STRATEGIES_DIR = Path(__file__).resolve().parents[3] / "strategies" / "example"
 
 
 @pytest.fixture

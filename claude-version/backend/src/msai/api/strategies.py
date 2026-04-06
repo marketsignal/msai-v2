@@ -31,10 +31,7 @@ log = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/strategies", tags=["strategies"])
 
-# Resolve the strategies directory relative to the backend root.
-# In production this would be configurable via settings; for now we derive it
-# from the ``data_root`` setting or fall back to the project layout.
-_STRATEGIES_DIR = Path(__file__).resolve().parents[3] / "strategies"
+_STRATEGIES_DIR = settings.strategies_root
 
 
 @router.get("/", response_model=StrategyListResponse)

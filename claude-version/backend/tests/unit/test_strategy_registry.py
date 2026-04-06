@@ -17,7 +17,7 @@ from msai.services.strategy_registry import (
 # Fixtures
 # ---------------------------------------------------------------------------
 
-STRATEGIES_DIR = Path(__file__).resolve().parents[2] / "strategies" / "example"
+STRATEGIES_DIR = Path(__file__).resolve().parents[3] / "strategies" / "example"
 
 
 @pytest.fixture()
@@ -53,9 +53,7 @@ def strategies_dir_with_init_and_config(tmp_path: Path) -> Path:
 class TestDiscoverStrategies:
     """Tests for discover_strategies function."""
 
-    def test_discover_strategies_finds_example(
-        self, example_strategies_dir: Path
-    ) -> None:
+    def test_discover_strategies_finds_example(self, example_strategies_dir: Path) -> None:
         """discover_strategies finds EMACrossStrategy in the example directory."""
         results = discover_strategies(example_strategies_dir)
 
@@ -69,9 +67,7 @@ class TestDiscoverStrategies:
         assert ema.description is not None
         assert "EMA crossover" in ema.description
 
-    def test_discover_strategies_returns_code_hash(
-        self, example_strategies_dir: Path
-    ) -> None:
+    def test_discover_strategies_returns_code_hash(self, example_strategies_dir: Path) -> None:
         """Discovered strategies include a 64-character hex SHA256 hash."""
         results = discover_strategies(example_strategies_dir)
 
@@ -81,9 +77,7 @@ class TestDiscoverStrategies:
             # Verify it is a valid hex string
             int(info.code_hash, 16)
 
-    def test_discover_strategies_empty_dir(
-        self, empty_strategies_dir: Path
-    ) -> None:
+    def test_discover_strategies_empty_dir(self, empty_strategies_dir: Path) -> None:
         """An empty directory returns an empty list."""
         results = discover_strategies(empty_strategies_dir)
 
@@ -112,9 +106,7 @@ class TestDiscoverStrategies:
 class TestComputeFileHash:
     """Tests for compute_file_hash function."""
 
-    def test_compute_file_hash_deterministic(
-        self, example_strategies_dir: Path
-    ) -> None:
+    def test_compute_file_hash_deterministic(self, example_strategies_dir: Path) -> None:
         """Hashing the same file twice produces the same result."""
         path = example_strategies_dir / "ema_cross.py"
         hash1 = compute_file_hash(path)
@@ -141,9 +133,7 @@ class TestComputeFileHash:
 class TestLoadStrategyClass:
     """Tests for load_strategy_class function."""
 
-    def test_load_strategy_class_success(
-        self, example_strategies_dir: Path
-    ) -> None:
+    def test_load_strategy_class_success(self, example_strategies_dir: Path) -> None:
         """load_strategy_class returns the EMACrossStrategy class."""
         module_path = example_strategies_dir / "ema_cross.py"
         cls = load_strategy_class(module_path, "EMACrossStrategy")
@@ -156,9 +146,7 @@ class TestLoadStrategyClass:
         assert instance.fast_period == 5
         assert instance.slow_period == 15
 
-    def test_load_strategy_class_missing_class(
-        self, example_strategies_dir: Path
-    ) -> None:
+    def test_load_strategy_class_missing_class(self, example_strategies_dir: Path) -> None:
         """Requesting a nonexistent class raises ImportError."""
         module_path = example_strategies_dir / "ema_cross.py"
 

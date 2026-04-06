@@ -11,7 +11,7 @@ import pytest
 from msai.services.nautilus.backtest_runner import BacktestResult, BacktestRunner
 from msai.services.strategy_registry import load_strategy_class
 
-_STRATEGY_PATH = Path(__file__).resolve().parents[2] / "strategies" / "example" / "ema_cross.py"
+_STRATEGY_PATH = Path(__file__).resolve().parents[3] / "strategies" / "example" / "ema_cross.py"
 
 
 # ---------------------------------------------------------------------------
