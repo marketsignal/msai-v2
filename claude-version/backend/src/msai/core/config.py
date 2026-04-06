@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     environment: str = "development"
     azure_tenant_id: str = ""
     azure_client_id: str = ""
+    msai_api_key: str = ""
     cors_origins: list[str] = ["http://localhost:3000"]
     polygon_api_key: str = ""
     databento_api_key: str = ""

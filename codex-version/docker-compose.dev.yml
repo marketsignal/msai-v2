@@ -49,6 +49,7 @@ services:
       ENVIRONMENT: development
       JWT_TENANT_ID: dev-tenant-id
       JWT_CLIENT_ID: dev-client-id
+      MSAI_API_KEY: ${MSAI_API_KEY:-msai-dev-key}
     depends_on:
       postgres:
         condition: service_healthy
@@ -72,6 +73,7 @@ services:
       ENVIRONMENT: development
       JWT_TENANT_ID: dev-tenant-id
       JWT_CLIENT_ID: dev-client-id
+      MSAI_API_KEY: ${MSAI_API_KEY:-msai-dev-key}
     depends_on:
       postgres:
         condition: service_healthy

@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives.serialization import (
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
-from msai.core.auth import EntraIDValidator, get_current_user, get_validator
+from msai.core.auth import EntraIDValidator, get_current_user, init_validator
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -100,12 +100,12 @@ def _mock_jwks_client(public_key_pem: bytes) -> MagicMock:
 
 def _create_test_app(validator: EntraIDValidator) -> FastAPI:
     """Build a minimal FastAPI app wired with the auth dependency."""
+    import msai.core.auth as auth_module
+
+    # Install the validator at module level so get_current_user can find it
+    auth_module._validator = validator
+
     app = FastAPI()
-
-    def _override_get_validator() -> EntraIDValidator:
-        return validator
-
-    app.dependency_overrides[get_validator] = _override_get_validator
 
     @app.get("/me")
     async def me(
@@ -124,9 +124,7 @@ def _create_test_app(validator: EntraIDValidator) -> FastAPI:
 class TestValidateToken:
     """Tests for EntraIDValidator.validate_token."""
 
-    def test_validate_token_success(
-        self, rsa_keypair: tuple[rsa.RSAPrivateKey, bytes]
-    ) -> None:
+    def test_validate_token_success(self, rsa_keypair: tuple[rsa.RSAPrivateKey, bytes]) -> None:
         """A valid token with correct claims is decoded successfully."""
         private_key, public_pem = rsa_keypair
         token = _make_token(private_key)
@@ -224,9 +222,7 @@ class TestGetCurrentUser:
         app = _create_test_app(validator)
         client = TestClient(app)
 
-        response = client.get(
-            "/me", headers={"Authorization": "Bearer bad.token.here"}
-        )
+        response = client.get("/me", headers={"Authorization": "Bearer bad.token.here"})
 
         assert response.status_code == 401
         assert "Invalid token" in response.json()["detail"]
@@ -244,9 +240,7 @@ class TestGetCurrentUser:
         app = _create_test_app(validator)
         client = TestClient(app)
 
-        response = client.get(
-            "/me", headers={"Authorization": f"Bearer {token}"}
-        )
+        response = client.get("/me", headers={"Authorization": f"Bearer {token}"})
 
         assert response.status_code == 200
         body = response.json()

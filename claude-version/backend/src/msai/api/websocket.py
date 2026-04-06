@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from msai.core.auth import get_validator
+from msai.core.auth import validate_token_or_api_key
 from msai.core.logging import get_logger
 
 log = get_logger(__name__)
@@ -43,8 +43,7 @@ async def live_stream(websocket: WebSocket) -> None:
             timeout=_AUTH_TIMEOUT_SECONDS,
         )
         try:
-            validator = get_validator()
-            claims = validator.validate_token(token.strip())
+            claims = validate_token_or_api_key(token)
             log.info("ws_authenticated", user=claims.get("sub"))
         except Exception:
             await websocket.close(code=4001, reason="Invalid token")

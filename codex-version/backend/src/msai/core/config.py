@@ -20,6 +20,7 @@ class Settings(BaseSettings):
 
     jwt_tenant_id: str = "dev-tenant-id"
     jwt_client_id: str = "dev-client-id"
+    msai_api_key: str = ""
 
     azure_key_vault_url: str | None = None
     polygon_api_key: str | None = None

@@ -7,7 +7,7 @@ import jwt
 from fastapi import APIRouter, WebSocket
 from fastapi.websockets import WebSocketDisconnect
 
-from msai.core.auth import get_token_validator
+from msai.core.auth import validate_token_or_api_key
 from msai.core.queue import get_redis_pool
 
 router = APIRouter(tags=["live-stream"])
@@ -19,8 +19,8 @@ async def live_stream(websocket: WebSocket) -> None:
 
     try:
         token = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
-        get_token_validator().validate_token(token)
-    except (TimeoutError, jwt.InvalidTokenError, jwt.PyJWTError):
+        validate_token_or_api_key(token)
+    except (TimeoutError, jwt.InvalidTokenError, jwt.PyJWTError, Exception):
         await websocket.close(code=4001, reason="Authentication failed or timed out")
         return
 
