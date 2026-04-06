@@ -1,0 +1,98 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file:
+      - .env.prod
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-msai}
+      POSTGRES_USER: ${POSTGRES_USER:-msai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-msai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    restart: unless-stopped
+    command: ["uv", "run", "uvicorn", "msai.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file:
+      - .env.prod
+    environment:
+      ENVIRONMENT: production
+      DATA_ROOT: /app/data
+    volumes:
+      - ./data:/app/data
+      - ./strategies:/app/strategies:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+
+  backtest-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    restart: unless-stopped
+    command: ["uv", "run", "arq", "msai.workers.settings.WorkerSettings"]
+    env_file:
+      - .env.prod
+    environment:
+      ENVIRONMENT: production
+      DATA_ROOT: /app/data
+    volumes:
+      - ./data:/app/data
+      - ./strategies:/app/strategies:ro
+    depends_on:
+      - redis
+      - postgres
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+      NEXT_PUBLIC_ENTRA_CLIENT_ID: ${NEXT_PUBLIC_ENTRA_CLIENT_ID}
+      NEXT_PUBLIC_ENTRA_TENANT_ID: ${NEXT_PUBLIC_ENTRA_TENANT_ID}
+      NEXT_PUBLIC_ENTRA_REDIRECT_URI: ${NEXT_PUBLIC_ENTRA_REDIRECT_URI}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:10.30.1t
+    restart: unless-stopped
+    environment:
+      TWS_USERID: ${TWS_USERID}
+      TWS_PASSWORD: ${TWS_PASSWORD}
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      READ_ONLY_API: "yes"
+      VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-msai-dev-vnc}
+    volumes:
+      - ./scripts/ib-gateway-config:/root/ibc
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 4002"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  postgres_data:
+  redis_data:

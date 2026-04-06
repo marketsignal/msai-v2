@@ -1,0 +1,61 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: msai_test
+          POSTGRES_USER: msai
+          POSTGRES_PASSWORD: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: astral-sh/setup-uv@v4.3.0
+        with:
+          version: "0.6.0"
+      - run: cd backend && uv sync --frozen --extra dev
+      - run: cd backend && uv run ruff check src/
+      - run: cd backend && uv run mypy src/ --strict
+      - run: cd backend && uv run pytest tests/ -v --cov=msai
+        env:
+          DATABASE_URL: postgresql+asyncpg://msai:test@localhost:5432/msai_test
+          REDIS_URL: redis://localhost:6379
+          ENVIRONMENT: test
+
+  frontend:
+    runs-on: ubuntu-24.04
+    if: hashFiles('frontend/pnpm-lock.yaml') != ''
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: pnpm/action-setup@v4.1.0
+        with:
+          version: "9.15.0"
+      - uses: actions/setup-node@v4.2.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - run: cd frontend && pnpm install --frozen-lockfile
+      - run: cd frontend && pnpm lint
+      - run: cd frontend && pnpm build

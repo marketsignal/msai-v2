@@ -1,0 +1,36 @@
+@import "tailwindcss";
+
+:root {
+  --obsidian: #06090e;
+  --ink: #0f1724;
+  --steel: #172638;
+  --cyan: #2dd4bf;
+  --amber: #f59e0b;
+}
+
+@theme inline {
+  --font-sans: var(--font-display);
+  --font-mono: var(--font-mono);
+  --color-obsidian: var(--obsidian);
+  --color-ink: var(--ink);
+  --color-steel: var(--steel);
+  --color-cyan: var(--cyan);
+  --color-amber: var(--amber);
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  background-color: var(--obsidian);
+  background-image:
+    radial-gradient(circle at 14% 20%, rgba(45, 212, 191, 0.12), transparent 34%),
+    radial-gradient(circle at 86% 4%, rgba(245, 158, 11, 0.12), transparent 30%),
+    linear-gradient(160deg, #06090e 0%, #0d1320 45%, #111827 100%);
+}
+
+* {
+  scrollbar-color: rgba(148, 163, 184, 0.45) transparent;
+}

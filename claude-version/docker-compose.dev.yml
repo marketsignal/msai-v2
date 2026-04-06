@@ -1,0 +1,96 @@
+# MSAI v2 — Claude Version (Dev)
+# Ports: Frontend 3300, Backend 8800, PostgreSQL 5433, Redis 6380
+# Run: docker compose -f docker-compose.dev.yml up -d
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: msai-claude-postgres
+    environment:
+      POSTGRES_DB: msai
+      POSTGRES_USER: msai
+      POSTGRES_PASSWORD: msai_dev_password
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U msai"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: msai-claude-redis
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: msai-claude-backend
+    ports:
+      - "8800:8000"
+    volumes:
+      - ./backend/src:/app/src:ro
+      - ./strategies:/app/strategies:ro
+      - ./data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:msai_dev_password@postgres:5432/msai
+      REDIS_URL: redis://redis:6379
+      DATA_ROOT: /app/data
+      ENVIRONMENT: development
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  backtest-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: msai-claude-worker
+    command: ["uv", "run", "arq", "msai.workers.settings.WorkerSettings"]
+    volumes:
+      - ./backend/src:/app/src:ro
+      - ./strategies:/app/strategies:ro
+      - ./data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:msai_dev_password@postgres:5432/msai
+      REDIS_URL: redis://redis:6379
+      DATA_ROOT: /app/data
+      ENVIRONMENT: development
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: msai-claude-frontend
+    ports:
+      - "3300:3000"
+    volumes:
+      - ./frontend/src:/app/src:ro
+      - ./frontend/public:/app/public:ro
+      - ./frontend/tsconfig.json:/app/tsconfig.json:ro
+      - ./frontend/next.config.ts:/app/next.config.ts:ro
+      - ./frontend/postcss.config.mjs:/app/postcss.config.mjs:ro
+      - ./frontend/components.json:/app/components.json:ro
+      - ./frontend/eslint.config.mjs:/app/eslint.config.mjs:ro
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8800
+
+volumes:
+  postgres_data:

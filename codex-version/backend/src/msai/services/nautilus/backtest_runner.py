@@ -1,0 +1,238 @@
+from __future__ import annotations
+
+import multiprocessing as mp
+import queue
+import traceback
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, cast
+
+import pandas as pd
+
+from msai.services.nautilus.strategy_loader import resolve_importable_strategy_paths
+
+try:
+    from nautilus_trader.backtest.config import (
+        BacktestDataConfig,
+        BacktestEngineConfig,
+        BacktestRunConfig,
+        BacktestVenueConfig,
+    )
+    from nautilus_trader.backtest.node import BacktestNode
+    from nautilus_trader.trading.config import ImportableStrategyConfig
+
+    _NAUTILUS_IMPORT_ERROR: Exception | None = None
+except Exception as exc:  # pragma: no cover - environment-dependent import
+    _NAUTILUS_IMPORT_ERROR = exc
+
+
+@dataclass(slots=True)
+class BacktestResult:
+    orders_df: pd.DataFrame
+    positions_df: pd.DataFrame
+    account_df: pd.DataFrame
+    metrics: dict[str, float | int]
+
+
+@dataclass(slots=True)
+class _RunInput:
+    strategy_path: str
+    config: dict[str, Any]
+    instruments: list[str]
+    start_date: str
+    end_date: str
+    data_path: str
+
+
+class BacktestRunner:
+    def run(
+        self,
+        strategy_path: str,
+        config: dict[str, Any],
+        instruments: list[str],
+        start_date: str,
+        end_date: str,
+        data_path: Path,
+        timeout_seconds: int = 30 * 60,
+    ) -> BacktestResult:
+        payload = _RunInput(
+            strategy_path=strategy_path,
+            config=config,
+            instruments=instruments,
+            start_date=start_date,
+            end_date=end_date,
+            data_path=str(data_path),
+        )
+        ctx = mp.get_context("spawn")
+        result_queue: Any = ctx.Queue()
+        process = ctx.Process(target=_subprocess_run, args=(payload, result_queue))
+        process.start()
+        process.join(timeout_seconds)
+
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            raise TimeoutError("Backtest subprocess exceeded timeout")
+
+        try:
+            result = cast("dict[str, Any]", result_queue.get(timeout=2))
+        except queue.Empty as exc:
+            raise RuntimeError("Backtest subprocess exited without result") from exc
+        if not bool(result.get("ok")):
+            raise RuntimeError(str(result.get("error", "Unknown backtest error")))
+
+        return BacktestResult(
+            orders_df=pd.DataFrame(result.get("orders", [])),
+            positions_df=pd.DataFrame(result.get("positions", [])),
+            account_df=pd.DataFrame(result.get("account", [])),
+            metrics=cast("dict[str, float | int]", result.get("metrics", {})),
+        )
+
+
+def _subprocess_run(payload: _RunInput, result_queue: Any) -> None:
+    if _NAUTILUS_IMPORT_ERROR is not None:
+        result_queue.put({"ok": False, "error": f"Nautilus import failed: {_NAUTILUS_IMPORT_ERROR}"})
+        return
+
+    try:
+        run_config = _build_backtest_run_config(payload)
+        node = BacktestNode([run_config])
+        try:
+            results = node.run()
+            if not results:
+                result_queue.put(
+                    {
+                        "ok": True,
+                        "orders": [],
+                        "positions": [],
+                        "account": [],
+                        "metrics": _zero_metrics(),
+                    }
+                )
+                return
+
+            raw_result = results[0]
+            run_config_id = getattr(raw_result, "run_config_id", None)
+            engine = node.get_engine(run_config_id) if run_config_id else None
+            if engine is None:
+                result_queue.put(
+                    {
+                        "ok": True,
+                        "orders": [],
+                        "positions": [],
+                        "account": [],
+                        "metrics": _extract_metrics(raw_result, pd.DataFrame()),
+                    }
+                )
+                return
+
+            orders_df = engine.trader.generate_orders_report()
+            positions_df = engine.trader.generate_positions_report()
+            account_df = engine.trader.generate_account_report()
+
+            result_queue.put(
+                {
+                    "ok": True,
+                    "orders": orders_df.to_dict(orient="records"),
+                    "positions": positions_df.to_dict(orient="records"),
+                    "account": account_df.to_dict(orient="records"),
+                    "metrics": _extract_metrics(raw_result, orders_df),
+                }
+            )
+        finally:
+            cast("Any", node).dispose()
+    except Exception:
+        result_queue.put({"ok": False, "error": traceback.format_exc()})
+
+
+def _build_backtest_run_config(payload: _RunInput) -> BacktestRunConfig:
+    import_paths = resolve_importable_strategy_paths(payload.strategy_path)
+
+    strategy_config = ImportableStrategyConfig(
+        strategy_path=import_paths.strategy_path,
+        config_path=import_paths.config_path,
+        config=payload.config,
+    )
+    engine_config = BacktestEngineConfig(strategies=[strategy_config])
+
+    venue_config = BacktestVenueConfig(
+        name="SIM",
+        oms_type="NETTING",
+        account_type="MARGIN",
+        starting_balances=["1000000 USD"],
+        base_currency="USD",
+    )
+
+    data_config = BacktestDataConfig(
+        catalog_path=payload.data_path,
+        data_cls="nautilus_trader.model.data:Bar",
+        instrument_ids=payload.instruments,
+        start_time=payload.start_date,
+        end_time=payload.end_date,
+    )
+
+    return BacktestRunConfig(
+        venues=[venue_config],
+        data=[data_config],
+        engine=engine_config,
+        start=payload.start_date,
+        end=payload.end_date,
+        raise_exception=True,
+        dispose_on_completion=False,
+    )
+
+
+def _extract_metrics(raw_result: object, orders_df: pd.DataFrame) -> dict[str, float | int]:
+    returns_stats = getattr(raw_result, "stats_returns", {})
+
+    sharpe = _extract_float_metric(returns_stats, ["sharpe", "sharpe_ratio"]) if returns_stats else 0.0
+    sortino = _extract_float_metric(returns_stats, ["sortino", "sortino_ratio"]) if returns_stats else 0.0
+    max_drawdown = (
+        _extract_float_metric(returns_stats, ["max_drawdown", "maximum_drawdown"]) if returns_stats else 0.0
+    )
+    total_return = (
+        _extract_float_metric(returns_stats, ["total_return", "return", "cumulative_return"])
+        if returns_stats
+        else 0.0
+    )
+
+    win_rate = 0.0
+    if not orders_df.empty and "pnl" in orders_df.columns:
+        pnl = orders_df["pnl"].fillna(0.0)
+        win_rate = float((pnl > 0).mean())
+
+    return {
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "max_drawdown": max_drawdown,
+        "total_return": total_return,
+        "win_rate": win_rate,
+        "num_trades": int(len(orders_df)),
+    }
+
+
+def _extract_float_metric(stats: object, candidates: list[str]) -> float:
+    if not isinstance(stats, dict):
+        return 0.0
+
+    for _, value in stats.items():
+        if isinstance(value, dict):
+            lower_map = {str(key).lower(): val for key, val in value.items()}
+            for name in candidates:
+                if name in lower_map:
+                    try:
+                        return float(lower_map[name])
+                    except Exception:
+                        continue
+    return 0.0
+
+
+def _zero_metrics() -> dict[str, float | int]:
+    return {
+        "sharpe": 0.0,
+        "sortino": 0.0,
+        "max_drawdown": 0.0,
+        "total_return": 0.0,
+        "win_rate": 0.0,
+        "num_trades": 0,
+    }

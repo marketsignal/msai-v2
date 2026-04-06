@@ -1,0 +1,122 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: msai
+      POSTGRES_USER: msai
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U msai"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - app_data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:${POSTGRES_PASSWORD}@postgres:5432/msai
+      REDIS_URL: redis://redis:6379
+      DATA_ROOT: /app/data
+      ENVIRONMENT: production
+      POLYGON_API_KEY: ${POLYGON_API_KEY:-}
+      DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
+  backtest-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "-m", "arq", "msai.workers.settings.WorkerSettings"]
+    volumes:
+      - app_data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:${POSTGRES_PASSWORD}@postgres:5432/msai
+      REDIS_URL: redis://redis:6379
+      DATA_ROOT: /app/data
+      ENVIRONMENT: production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost:8000}
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    environment:
+      TWS_USERID: ${TWS_USERID:?Set TWS_USERID in .env}
+      TWS_PASSWORD: ${TWS_PASSWORD:?Set TWS_PASSWORD in .env}
+      TRADING_MODE: paper
+      TWS_ACCEPT_INCOMING: "yes"
+      READ_ONLY_API: "no"
+    ports:
+      - "4002:4002"
+      - "5900:5900"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
+
+volumes:
+  postgres_data:
+  app_data:

@@ -1,0 +1,112 @@
+# MSAI v2 — Codex Version (Dev)
+# Ports: Frontend 3400, Backend 8400, PostgreSQL 5434, Redis 6381
+# Run: docker compose -f docker-compose.dev.yml up -d
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: msai-codex-postgres
+    environment:
+      POSTGRES_DB: msai
+      POSTGRES_USER: msai
+      POSTGRES_PASSWORD: msai_dev_password
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U msai"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: msai-codex-redis
+    ports:
+      - "6381:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: msai-codex-backend
+    ports:
+      - "8400:8000"
+    volumes:
+      - ./backend/src:/app/src:ro
+      - ./strategies:/app/strategies:ro
+      - ./data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:msai_dev_password@postgres:5432/msai
+      REDIS_URL: redis://redis:6379
+      DATA_ROOT: /app/data
+      ENVIRONMENT: development
+      JWT_TENANT_ID: dev-tenant-id
+      JWT_CLIENT_ID: dev-client-id
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  backtest-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: msai-codex-worker
+    command: ["uv", "run", "arq", "msai.workers.settings.WorkerSettings"]
+    volumes:
+      - ./backend/src:/app/src:ro
+      - ./strategies:/app/strategies:ro
+      - ./data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:msai_dev_password@postgres:5432/msai
+      REDIS_URL: redis://redis:6379
+      DATA_ROOT: /app/data
+      ENVIRONMENT: development
+      JWT_TENANT_ID: dev-tenant-id
+      JWT_CLIENT_ID: dev-client-id
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:10.30.1t
+    container_name: msai-codex-ib-gateway
+    environment:
+      TWS_USERID: ${TWS_USERID:-dev-user}
+      TWS_PASSWORD: ${TWS_PASSWORD:-dev-password}
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      READ_ONLY_API: "yes"
+      VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-msai-dev-vnc}
+    volumes:
+      - ./scripts/ib-gateway-config:/root/ibc
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 4002"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: msai-codex-frontend
+    ports:
+      - "3400:3000"
+    volumes:
+      - ./frontend/src:/app/src:ro
+      - ./frontend/public:/app/public:ro
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8400
+
+volumes:
+  postgres_data:
