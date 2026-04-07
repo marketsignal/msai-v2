@@ -1,6 +1,6 @@
-# Claude — Nautilus Production Hardening (Revision 7)
+# Claude — Nautilus Production Hardening (Revision 8)
 
-**Status:** Plan v7 (incorporates Codex v6 re-review — single startup-liveness authority, heartbeat-based watchdog deadline, cold-read hydrates ProjectionState, structured EndpointOutcome replaces status-code idempotency branching)
+**Status:** Plan v8 (incorporates Codex v7 re-review — lock-first atomic watchdog, reservation ownership for commit/release, `failure_kind` writers wired, only-if-still-cold hydration, `startup_hard_timeout_s` raised + per-deployment override)
 **Branch:** `feat/claude-nautilus-production-hardening`
 **Scope:** `claude-version/` ONLY. The `codex-version/` directory is not touched by this plan; Codex CLI is hardening that codebase independently in parallel.
 
@@ -11,6 +11,40 @@
 - `docs/nautilus-natives-audit.md` — what Nautilus already provides natively vs what we have to build
 - `.claude/rules/nautilus.md` — auto-loaded short-form gotchas list
 - `docs/plans/2026-04-06-claude-nautilus-production-hardening.md` (this file)
+
+## What changed in revision 8
+
+Codex re-reviewed v7 and rejected it with 2 P0 + 2 P1 + 1 P2 findings. **No new Nautilus-native issues** — Codex confirmed "v7 does not add a new Nautilus API dependency; the problems are all in supervisor/DB/Redis glue." The four glue-code bugs are all in the new v7 paths: the watchdog's scan-then-kill-then-update sequence still has a race window, the idempotency `BodyMismatchReservation` branch wrongly treats the reply as cacheable even though the caller doesn't own the reservation, `failure_kind` was added to the schema but the supervisor's `_mark_failed` and the subprocess finally block still don't write it, and cold-read hydration can overwrite fresher pub/sub state. The 600s startup hard ceiling is also too tight for large options universes.
+
+**Architectural corrections from v7:**
+
+1. **Watchdog uses lock-first atomic path** (Codex v7 P0). v7 implemented `scan stale rows → SIGKILL → SELECT FOR UPDATE → UPDATE status='failed'`, which still had a race: between the scan and the SIGKILL, the child could flip to `ready` (subprocess finished startup), `stopping` (concurrent `/stop`), or refresh its heartbeat. After the SIGKILL, the filter `status IN ('starting','building')` would miss the row, the UPDATE would be skipped, and the dead child would leave the row stuck in `ready`/`stopping` — a silent desync. v8 rewrites the path to `SELECT FOR UPDATE inside a single transaction, re-check status AFTER the lock, SIGKILL, UPDATE, COMMIT`. The row-level lock prevents concurrent writers from flipping the status while the kill is in flight. If the re-check shows the row is no longer in a startup status (benign race — healthy completion, heartbeat refresh after the scan, etc.) the watchdog aborts without killing. If it IS still startup, the kill is guaranteed atomic with the UPDATE.
+
+2. **Only the `Reserved` branch owns `commit` / `release`** (Codex v7 P0). v7's `body_mismatch` factory returned `cacheable=True`, and step N of the workflow let the endpoint call `commit()` from any outcome where `cacheable=True`. But `BodyMismatchReservation` means **the caller does not own the reservation** — another request is already in-flight or has already completed. Calling `commit()` there would overwrite the original correct response with a 422, poisoning all subsequent correct retries with the same key. v8 changes two things:
+   - `body_mismatch` factory returns `cacheable=False`
+   - The endpoint uses pattern matching on the `reserve()` result. **Only the `Reserved(redis_key)` branch** is allowed to touch the store. `CachedOutcome`, `InFlight`, and `BodyMismatchReservation` return their outcome directly without calling `commit` or `release`. The endpoint tracks "I own the reservation" via the `redis_key` from the `Reserved` result, not via `outcome.cacheable`.
+3. **`failure_kind` writers wired + safe parser** (Codex v7 P1). v7 added the `failure_kind` column to the schema and had the `/start` endpoint read it to decide cacheability — but I forgot to update the writers. The supervisor's `_mark_failed` and the subprocess's finally block only set `status` / `error_message` / `exit_code`. Result: the endpoint always saw `failure_kind=None` on real failures and couldn't classify anything. v8 wires every failure path:
+   - `_mark_failed(row_id, reason, failure_kind: FailureKind)` takes the enum as a required argument
+   - ProcessManager.spawn phase B halt-flag block writes `FailureKind.HALT_ACTIVE`
+   - ProcessManager.spawn phase B `process.start()` failure writes `FailureKind.SPAWN_FAILED_PERMANENT`
+   - ProcessManager.watchdog_loop writes `FailureKind.BUILD_TIMEOUT` (on heartbeat stale OR hard wall-clock backstop)
+   - HeartbeatMonitor writes `FailureKind.NONE` (it's a post-startup orphan, not a structured failure — the endpoint reads the live_node_processes row only for pre-ready outcomes)
+   - Trading subprocess finally block writes the right kind per exception: `StartupHealthCheckFailed` → `FailureKind.RECONCILIATION_FAILED` (the subprocess doesn't have finer granularity), `BuildTimeoutError` → `FailureKind.BUILD_TIMEOUT`, generic `Exception` → `FailureKind.SPAWN_FAILED_PERMANENT`
+   - New `FailureKind.UNKNOWN = "unknown"` variant for defensive parsing
+   - `FailureKind.parse_or_unknown(db_string: str | None) -> FailureKind` helper that returns `UNKNOWN` for any value not in the enum (including `None` and stale values from an older worker after a schema migration). The endpoint calls this — never `FailureKind(db_string)` directly.
+
+4. **Cold-read hydration is only-if-still-cold** (Codex v7 P1). v7's `hydrate_from_cold_read` merged into existing positions (so a close event arriving during the cold read could be rolled back) and unconditionally overwrote account state. v8 uses an "only promote if nobody else promoted first" pattern:
+   - `hydrate_from_cold_read(deployment_id, *, positions=None, account=None)` checks `is_positions_hydrated` and `is_account_hydrated` AT THE MOMENT OF THE WRITE (not when the caller started the cold read). If the state has been hydrated by another path (StateApplier pub/sub) since the cold read started, the hydrate call is a no-op for that domain.
+   - PositionReader's cold-path code: `(1) read from Cache`, `(2) hydrate_from_cold_read`, `(3) return the CURRENT state value (not the cold-read result)`. Even in the rare case where the StateApplier wins the race between the cold read and the hydrate, the caller returns the fresher state — never the stale cold read result.
+
+5. **`startup_hard_timeout_s` default raised to 1800s + per-deployment override** (Codex v7 P2). v7's 600s backstop was tighter than the legitimate slow-build case (large options universes can take 900s+). v8 raises the default to 1800s (30 min) and adds a nullable `startup_hard_timeout_s: Mapped[int | None]` column on `live_deployments` — NULL falls back to the supervisor default. Operators who know they have large options chains can set a per-deployment value.
+
+**v7 → v8 changes (still in effect from prior revisions):**
+
+- All v7 corrections (single startup-liveness authority, heartbeat-based watchdog, per-domain hydration, EndpointOutcome + FailureKind, schema `failure_kind` column)
+- All v6 corrections (supervisor watchdog concept, subprocess self-writes pid, MsgSpecSerializer, idempotency TTL, heartbeat-before-build, validated-config hash)
+- All v5 corrections (broader identity tuple, INSERT-commit pattern, supervisor halt-flag check, dual pub/sub, canonical trader.is_running, DLQ)
+- All prior corrections
 
 ## What changed in revision 7
 
@@ -761,6 +795,17 @@ class LiveDeployment(Base):
 
     last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    startup_hard_timeout_s: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # v8 addition (Codex v7 P2): per-deployment override for the
+    # supervisor watchdog's hard wall-clock ceiling. NULL → use the
+    # supervisor default (1800s in v8, up from 600s in v7). Operators
+    # with large options universes (30+ underlyings, 10000+ strikes)
+    # can raise this per deployment. The watchdog's HEARTBEAT-based
+    # primary condition is independent of this value — a subprocess
+    # whose heartbeat thread keeps advancing is never killed regardless
+    # of this timeout. This is only the secondary "degenerate loop"
+    # backstop.
     # Replace the old started_at/stopped_at — those tracked the FIRST
     # start, but a deployment can be (re-)started many times.
 
@@ -1417,7 +1462,11 @@ class ProcessManager:
         # the supervisor. This is the supervisor-side enforcement.
         if await self._redis.exists("msai:risk:halt"):
             logger.warning("spawn_blocked_by_halt", deployment_id=str(deployment_id))
-            await self._mark_failed(row_id, reason="blocked by halt flag")
+            await self._mark_failed(
+                row_id,
+                reason="blocked by halt flag",
+                failure_kind=FailureKind.HALT_ACTIVE,  # v8 (Codex v7 P1)
+            )
             return True  # Successfully handled — caller ACKs (no retry until /resume)
 
         try:
@@ -1429,7 +1478,11 @@ class ProcessManager:
             process.start()
         except Exception as exc:
             logger.exception("spawn_process_start_failed", deployment_id=str(deployment_id))
-            await self._mark_failed(row_id, reason=f"process.start() failed: {exc}")
+            await self._mark_failed(
+                row_id,
+                reason=f"process.start() failed: {exc}",
+                failure_kind=FailureKind.SPAWN_FAILED_PERMANENT,  # v8 (Codex v7 P1)
+            )
             return True  # Caller ACKs; the row is in 'failed' so the next retry will succeed
 
         self._handles[deployment_id] = process
@@ -1453,7 +1506,18 @@ class ProcessManager:
 
         return True
 
-    async def _mark_failed(self, row_id: UUID | None, reason: str) -> None:
+    async def _mark_failed(
+        self,
+        row_id: UUID | None,
+        reason: str,
+        failure_kind: FailureKind,  # v8: REQUIRED (Codex v7 P1)
+    ) -> None:
+        """Mark a row as failed with a structured failure_kind.
+
+        v8 change: failure_kind is now a REQUIRED parameter. v7 added
+        the column to the schema but the writer never populated it,
+        leaving /start unable to classify failures.
+        """
         if row_id is None:
             return
         async with self._db() as session, session.begin():
@@ -1461,6 +1525,7 @@ class ProcessManager:
             if row is None:
                 return
             row.status = "failed"
+            row.failure_kind = failure_kind.value
             row.error_message = reason
             row.exit_code = None
 
@@ -1543,114 +1608,207 @@ class ProcessManager:
     async def watchdog_loop(
         self,
         stop_event: asyncio.Event,
-        stale_seconds: int = 30,
-        startup_hard_timeout_s: int = 600,
+        default_stale_seconds: int = 30,
+        default_startup_hard_timeout_s: int = 1800,  # v8: was 600 (Codex v7 P2)
     ) -> None:
         """Background task: SOLE liveness authority for rows in
-        status IN ('starting','building'). Kills wedged startup
-        subprocesses via SIGKILL, then marks the row failed in the
-        same transaction.
+        status IN ('starting','building'). Uses the lock-first
+        atomic path so the SIGKILL and the UPDATE are guaranteed
+        consistent.
 
-        v7 changes from v6 (Codex v6 P0 + P1):
+        v8 changes from v7 (Codex v7 P0 + P2):
 
-        1. Heartbeat-based kill condition instead of wall-clock.
-           v6 killed any row with started_at < now() - 180s. That
-           falsely killed legitimate slow IB builds (30 options
-           underlyings, 100 instruments) — see nautilus-reference.md
-           lines 482 and 513. v7 kills only when
-           last_heartbeat_at < now() - stale_seconds (default 30s):
-           a subprocess that is making progress (heartbeat thread
-           advancing the timestamp) is left alone.
+        1. **Lock-first atomic path.** v7 was `scan → SIGKILL →
+           SELECT FOR UPDATE → maybe UPDATE`, which had a race: if
+           the child flipped to `ready` or `stopping` between the
+           initial scan and the kill, the post-kill SELECT FOR
+           UPDATE's `status IN ('starting','building')` filter would
+           miss the row, the UPDATE would be skipped, and the dead
+           process would leave a row in `ready`/`stopping` with
+           no writer. v8 holds a row-level lock across the entire
+           kill-and-update sequence:
 
-        2. Wall-clock hard backstop at startup_hard_timeout_s (default
-           600s) for pathological cases where the heartbeat thread
-           is somehow alive but the process is stuck in a degenerate
-           loop. Secondary safety; the primary signal is heartbeat
-           staleness.
+               BEGIN;
+               SELECT ... FOR UPDATE
+                 WHERE id = :row_id
+                   AND status IN ('starting','building');
+               -- still in scope under the lock?
+               if row is None → COMMIT (noop, benign race)
+               os.kill(pid, SIGKILL)
+               UPDATE status='failed', failure_kind=..., exit_code=-9
+               COMMIT;  -- releases the lock
 
-        3. Kill FIRST, then mark failed — in the SAME transaction.
-           v6 had the HeartbeatMonitor mark stale startup rows as
-           failed at 30s and the watchdog kill them at 180s. Between
-           those, the row was out of the active set (slot freed,
-           /stop and /kill-all couldn't find it) but the real
-           process was still alive — a retry could spawn a duplicate
-           child (Codex v6 P0). v7 makes the watchdog the ONLY writer
-           for startup rows: SIGKILL first, then UPDATE status='failed'
-           inside a transaction that selects FOR UPDATE the same row.
-           During the kill window the row stays in 'starting'/'building'
-           so the partial unique index still blocks duplicate spawns.
+           Postgres row-level lock blocks any concurrent writer
+           (heartbeat thread UPDATE, /stop handler, reap_loop) from
+           flipping the status while the kill is in flight. After
+           the COMMIT, the row is in its final 'failed' state
+           atomically with the kill.
 
-        4. HeartbeatMonitor no longer touches startup rows (see its
-           docstring below). The watchdog has exclusive ownership of
-           'starting'/'building'. The HeartbeatMonitor owns
-           'ready'/'running'/'stopping' (post-startup orphan
-           detection for supervisor-restart recovery).
+        2. **Default hard timeout raised to 1800s** (Codex v7 P2).
+           docs/nautilus-reference.md:482,513 documents that large
+           options universes can legitimately take 900s+ to build.
+           v7's 600s default would false-kill them. 1800s covers
+           realistic worst cases. Operators with larger setups can
+           override per-deployment via live_deployments.startup_hard_timeout_s.
+
+        3. **Per-deployment override.** The watchdog reads
+           live_deployments.startup_hard_timeout_s (nullable) for
+           each row; NULL falls back to default_startup_hard_timeout_s.
+
+        Still in effect from v7:
+        - Heartbeat-based primary kill condition
+        - Watchdog is SOLE liveness authority for startup statuses
+          (HeartbeatMonitor excludes them — see decision #17)
+        - All reasons for the kill are recorded in failure_kind +
+          error_message (v8: failure_kind is REQUIRED on writes — see
+          _mark_failed in ProcessManager)
         """
         while not stop_event.is_set():
-            now = utcnow()
+            # Scan candidates (non-locking read — just to know which
+            # rows to examine). The actual kill decision is made inside
+            # the per-row locked transaction.
             async with self._db() as session:
-                # Heartbeat-stale startup rows (primary condition)
-                stale_rows = (await session.execute(
-                    select(LiveNodeProcess).where(
+                now = utcnow()
+                # Candidate rows: startup status + (stale heartbeat OR hard ceiling past)
+                candidate_rows = (await session.execute(
+                    select(LiveNodeProcess.id, LiveNodeProcess.deployment_id)
+                    .join(LiveDeployment, LiveDeployment.id == LiveNodeProcess.deployment_id)
+                    .where(
                         LiveNodeProcess.status.in_(("starting", "building")),
-                        LiveNodeProcess.last_heartbeat_at < now - timedelta(seconds=stale_seconds),
+                        or_(
+                            LiveNodeProcess.last_heartbeat_at < now - timedelta(seconds=default_stale_seconds),
+                            LiveNodeProcess.started_at < now - timedelta(
+                                seconds=func.coalesce(
+                                    LiveDeployment.startup_hard_timeout_s,
+                                    default_startup_hard_timeout_s,
+                                )
+                            ),
+                        ),
                     )
-                )).scalars().all()
-                # Hard wall-clock backstop (secondary safety)
-                hard_rows = (await session.execute(
-                    select(LiveNodeProcess).where(
-                        LiveNodeProcess.status.in_(("starting", "building")),
-                        LiveNodeProcess.started_at < now - timedelta(seconds=startup_hard_timeout_s),
-                    )
-                )).scalars().all()
-            # Dedupe (a row can be in both sets)
-            rows_by_id = {r.id: r for r in stale_rows}
-            for r in hard_rows:
-                rows_by_id.setdefault(r.id, r)
+                )).all()
 
-            for row in rows_by_id.values():
-                reason = (
-                    f"watchdog: no heartbeat progress for > {stale_seconds}s"
-                    if row in stale_rows
-                    else f"watchdog: hard wall-clock timeout > {startup_hard_timeout_s}s"
-                )
-                logger.error(
-                    "watchdog_kill",
-                    deployment_id=str(row.deployment_id),
-                    pid=row.pid,
-                    status=row.status,
-                    started_at=row.started_at.isoformat(),
-                    last_heartbeat_at=row.last_heartbeat_at.isoformat(),
-                    reason=reason,
-                )
-                # STEP 1: SIGKILL the pid (pid is always populated because
-                # the subprocess self-writes it in 1.8 step 4, with a
-                # phase-C fallback from ProcessManager.spawn)
-                if row.pid is not None:
-                    try:
-                        os.kill(row.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass  # already gone
-                # STEP 2: Atomically flip status to failed, guarded by
-                # a row-level lock to prevent a racing /stop from
-                # interleaving. The row must still be in a startup
-                # status — if another code path already moved it out,
-                # skip (no double-write).
-                async with self._db() as session, session.begin():
-                    cur = await session.execute(
-                        select(LiveNodeProcess)
-                        .where(LiveNodeProcess.id == row.id)
-                        .with_for_update()
+            for row_id, deployment_id in candidate_rows:
+                # Per-row locked transaction: SELECT FOR UPDATE, re-check,
+                # SIGKILL, UPDATE, COMMIT. The entire kill-and-update
+                # sequence happens under the row-level lock so no
+                # concurrent writer can interleave.
+                try:
+                    await self._watchdog_kill_one(
+                        row_id=row_id,
+                        deployment_id=deployment_id,
+                        stale_seconds=default_stale_seconds,
+                        default_hard_timeout_s=default_startup_hard_timeout_s,
                     )
-                    cur = cur.scalar_one_or_none()
-                    if cur is not None and cur.status in ("starting", "building"):
-                        cur.status = "failed"
-                        cur.error_message = reason
-                        cur.exit_code = -9
-                self._handles.pop(row.deployment_id, None)
-                alert_service.fire("watchdog_kill", deployment_id=str(row.deployment_id))
+                except Exception as exc:
+                    logger.exception(
+                        "watchdog_kill_failed",
+                        row_id=str(row_id),
+                        deployment_id=str(deployment_id),
+                        error=str(exc),
+                    )
 
             await asyncio.sleep(5)
+
+    async def _watchdog_kill_one(
+        self,
+        row_id: UUID,
+        deployment_id: UUID,
+        stale_seconds: int,
+        default_hard_timeout_s: int,
+    ) -> None:
+        """Lock-first atomic kill (v8). Called from watchdog_loop
+        per candidate row.
+
+        Inside a single transaction:
+        1. SELECT FOR UPDATE the row (blocks concurrent writers)
+        2. Re-check: is it still in a startup status? Is it still
+           stale (heartbeat OR hard ceiling)? If not, COMMIT and
+           return — benign race, row moved out of scope or caught up.
+        3. os.kill(pid, SIGKILL) — synchronous, in-kernel
+        4. UPDATE row: status='failed', failure_kind=BUILD_TIMEOUT,
+           exit_code=-9, error_message=reason
+        5. COMMIT — releases the lock
+
+        No concurrent writer can interleave between steps 2 and 4
+        because the row-level lock is held.
+        """
+        async with self._db() as session, session.begin():
+            now = utcnow()
+            # 1. Acquire the lock + read the row
+            result = await session.execute(
+                select(LiveNodeProcess, LiveDeployment.startup_hard_timeout_s)
+                .join(LiveDeployment, LiveDeployment.id == LiveNodeProcess.deployment_id)
+                .where(LiveNodeProcess.id == row_id)
+                .with_for_update(of=LiveNodeProcess)
+            )
+            record = result.one_or_none()
+            if record is None:
+                return
+            row, per_deployment_hard_timeout = record
+
+            # 2. Re-check status UNDER THE LOCK. If the subprocess
+            # flipped to ready/stopping/stopped/failed while we were
+            # waiting for the lock, the benign race wins — do nothing.
+            if row.status not in ("starting", "building"):
+                logger.info(
+                    "watchdog_race_skipped",
+                    row_id=str(row.id),
+                    current_status=row.status,
+                )
+                return
+
+            # Re-check the kill conditions under the lock (the
+            # candidate scan used pre-lock values that may be stale)
+            effective_hard_timeout = per_deployment_hard_timeout or default_hard_timeout_s
+            heartbeat_stale = row.last_heartbeat_at < now - timedelta(seconds=stale_seconds)
+            hard_ceiling_hit = row.started_at < now - timedelta(seconds=effective_hard_timeout)
+
+            if not (heartbeat_stale or hard_ceiling_hit):
+                # The subprocess made progress between the scan and the
+                # lock. Leave it alone.
+                logger.info(
+                    "watchdog_progress_detected",
+                    row_id=str(row.id),
+                    last_heartbeat_at=row.last_heartbeat_at.isoformat(),
+                )
+                return
+
+            reason = (
+                f"watchdog: no heartbeat progress for > {stale_seconds}s"
+                if heartbeat_stale
+                else f"watchdog: hard wall-clock timeout > {effective_hard_timeout}s"
+            )
+            logger.error(
+                "watchdog_kill",
+                row_id=str(row.id),
+                deployment_id=str(row.deployment_id),
+                pid=row.pid,
+                status=row.status,
+                started_at=row.started_at.isoformat(),
+                last_heartbeat_at=row.last_heartbeat_at.isoformat(),
+                reason=reason,
+            )
+
+            # 3. SIGKILL — synchronous, completes before the next line
+            # runs. The subprocess cannot write to the row after this
+            # because the row lock is still held AND the process is dead.
+            if row.pid is not None:
+                try:
+                    os.kill(row.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # already gone — we still own the row update
+
+            # 4. UPDATE the row in the same transaction
+            row.status = "failed"
+            row.failure_kind = FailureKind.BUILD_TIMEOUT.value  # v8 (Codex v7 P1)
+            row.error_message = reason
+            row.exit_code = -9
+            # COMMIT happens at session.begin() exit — releases the lock
+
+        # Outside the transaction: drop the handle and fire the alert.
+        # These are side effects; if they fail the row is still correct.
+        self._handles.pop(deployment_id, None)
+        alert_service.fire("watchdog_kill", deployment_id=str(deployment_id))
 
     async def _on_child_exit(self, deployment_id: UUID, exit_code: int | None) -> None:
         """Called when self._handles[deployment_id] is no longer alive.
@@ -1898,11 +2056,27 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> None:
         - node.stop_async() — Nautilus closes positions / cancels orders
           via manage_stop=True
         - node.dispose() — releases Rust logger and sockets (gotcha #20)
-        - On clean exit: status='stopped', exit_code=0
-        - On StartupHealthCheckFailed: status='failed',
+        - On clean exit: status='stopped', failure_kind=NONE, exit_code=0
+        - On StartupHealthCheckFailed (v8, Codex v7 P1):
+          status='failed', failure_kind=RECONCILIATION_FAILED,
           error_message=diagnosis, exit_code=2
-        - On any other exception: status='failed',
+          (RECONCILIATION_FAILED is the closest match — the
+          subprocess can't distinguish engine-connect failure from
+          reconciliation failure from portfolio init failure without
+          reading internal state; the diagnosis string in
+          error_message has the details)
+        - On any other exception during build/start: status='failed',
+          failure_kind=SPAWN_FAILED_PERMANENT, error_message=traceback,
+          exit_code=1
+        - On any other exception during node.run() (post-ready):
+          status='failed', failure_kind=SPAWN_FAILED_PERMANENT,
           error_message=traceback, exit_code=1
+          (post-ready exceptions are still permanent for idempotency
+          purposes — the endpoint has already returned; the cached
+          201 is correct for that deployment, and the next attempt
+          at the same identity_signature will go through the endpoint
+          again because the caller's retry has a different logical
+          lifecycle)
 """
 ```
 
@@ -2293,43 +2467,68 @@ async def start_live_deployment(
          in (starting,building,ready,running), return 200 with the existing
          deployment_id WITHOUT publishing a new command
 
-    Workflow (v7, all branches produce an EndpointOutcome):
+    Workflow (v8, all branches produce an EndpointOutcome,
+    only the Reserved branch touches the idempotency store):
 
-    A. If Idempotency-Key set: try to RESERVE via SETNX (TTL 300s).
-       - Reserved → proceed
-       - InFlight → return EndpointOutcome(425, cacheable=False, failure_kind=IN_FLIGHT)
-       - Cached → return the cached outcome unchanged
-       - BodyMismatch → return EndpointOutcome(422, cacheable=True, ...)
-    B. No Idempotency-Key → skip layer 1, rely on the lower layers
-    C. Check halt flag: if set → EndpointOutcome(503, cacheable=False, failure_kind=HALT_ACTIVE)
+    A. If Idempotency-Key set: call idem.reserve(user_id, key, body_hash).
+       Pattern-match on the result:
+       - Reserved(redis_key):
+           store_key = redis_key  # we own it
+           (continue to step C)
+       - InFlight():
+           return EndpointOutcome.in_flight()  # NO store access
+       - CachedOutcome(outcome=cached):
+           return cached  # NO store access
+       - BodyMismatchReservation():
+           return EndpointOutcome.body_mismatch()  # NO store access
+    B. No Idempotency-Key → store_key = None, skip layer 1
+    C. Check halt flag: if set →
+           outcome = EndpointOutcome.halt_active()  # cacheable=False
+           jump to step N
     D. Compute identity_signature from the VALIDATED config model
        (derive_deployment_identity called with the Pydantic model)
     E. Look up live_deployments by identity_signature
        - Found: reuse row + deployment_slug (warm restart)
        - Not found: INSERT new row with new deployment_slug (cold start)
     F. Look up active live_node_processes
-       - Active: EndpointOutcome(200, cacheable=True, response={existing deployment_id})
+       - Active:
+           outcome = EndpointOutcome.already_active(existing_deployment_id, ...)  # 200, cacheable=True
+           jump to step N
        - Not active: continue
     G. Publish start command via LiveCommandBus.publish_start
     H. Poll live_node_processes for status='ready' or 'failed' with timeout (60s)
-    I. On 'ready': EndpointOutcome(201, cacheable=True, response={deployment_id, ready})
-    J. On 'failed' with reason in {SPAWN_FAILED_PERMANENT, RECONCILIATION_FAILED, BUILD_TIMEOUT}:
-       EndpointOutcome(503, cacheable=True, failure_kind=<that reason>)
-    K. On 'failed' with reason HALT_ACTIVE (spawned but supervisor blocked):
-       EndpointOutcome(503, cacheable=False, failure_kind=HALT_ACTIVE)
-    L. On poll timeout: EndpointOutcome(504, cacheable=False, failure_kind=API_POLL_TIMEOUT)
-    M. Any raised exception → release reservation, let FastAPI convert
+    I. On 'ready':
+           outcome = EndpointOutcome.ready(deployment_id, body)  # 201, cacheable=True
+    J. On 'failed', read row.failure_kind via FailureKind.parse_or_unknown(row.failure_kind):
+       - SPAWN_FAILED_PERMANENT, RECONCILIATION_FAILED, BUILD_TIMEOUT, UNKNOWN →
+             outcome = EndpointOutcome.permanent_failure(kind, row.error_message)  # 503, cacheable=True
+       - HALT_ACTIVE →
+             outcome = EndpointOutcome.halt_active()  # 503, cacheable=False
+       - other/unexpected → treat as UNKNOWN (permanent failure)
+    K. On poll timeout: outcome = EndpointOutcome.api_poll_timeout()  # 504, cacheable=False
+    L. Any raised exception during the endpoint body → release reservation
+       (if store_key is not None), re-raise to FastAPI
 
-    Step N (final): if Idempotency-Key was used:
-       - outcome.cacheable == True → idem.commit(redis_key, outcome)
-       - outcome.cacheable == False → idem.release(redis_key)
+    Step N (final — only if store_key is not None, i.e. Reserved branch):
+       if outcome.cacheable:
+           await idem.commit(store_key, body_hash, outcome)
+       else:
+           await idem.release(store_key)
+       return outcome
 
-    Why `failure_kind` lives on the row, not the detail string:
+    v8 change (Codex v7 P0): only the Reserved branch of the reserve()
+    result may call commit() or release(). The other branches return
+    their outcome directly. This prevents a BodyMismatchReservation
+    from overwriting the original correct cached response.
+
+    Why `failure_kind` lives on the row (not the detail string):
       The subprocess (1.8) and the supervisor (1.7) both write
       `error_message` to live_node_processes, but each failure path
       ALSO sets a `failure_kind` column (StrEnum) so the endpoint can
       translate the row into an EndpointOutcome without parsing
-      strings. The ENUM is the contract; the string is for humans.
+      strings. The endpoint reads via FailureKind.parse_or_unknown()
+      so stale/corrupted/NULL values degrade safely to UNKNOWN (treated
+      as permanent failure, cacheable=True — human operator escalation).
     """
 ```
 
@@ -2355,12 +2554,37 @@ class FailureKind(StrEnum):
 
     NONE = "none"                             # success path
     IN_FLIGHT = "in_flight"                   # another request holds the reservation (HTTP 425)
-    HALT_ACTIVE = "halt_active"               # kill switch is set (HTTP 503)
+    HALT_ACTIVE = "halt_active"               # kill switch is set (HTTP 503, NOT cacheable)
     SPAWN_FAILED_PERMANENT = "spawn_failed_permanent"  # HTTP 503, cacheable
     RECONCILIATION_FAILED = "reconciliation_failed"    # HTTP 503, cacheable
     BUILD_TIMEOUT = "build_timeout"                    # HTTP 503, cacheable
     API_POLL_TIMEOUT = "api_poll_timeout"              # HTTP 504, NOT cacheable (retryable)
-    BODY_MISMATCH = "body_mismatch"                    # HTTP 422
+    BODY_MISMATCH = "body_mismatch"                    # HTTP 422, NOT cacheable (v8 — Codex v7 P0)
+    UNKNOWN = "unknown"                       # v8: fallback for unrecognized DB values (Codex v7 P1)
+
+    @classmethod
+    def parse_or_unknown(cls, db_string: str | None) -> "FailureKind":
+        """Safe parser: any unrecognized or NULL value maps to UNKNOWN.
+
+        v8 addition (Codex v7 P1): the endpoint reads
+        live_node_processes.failure_kind and must not crash on:
+        - NULL (an older migration or a row never touched by a v8
+          writer)
+        - A value from a future schema version
+        - A typo or corruption
+
+        The endpoint should treat UNKNOWN like a permanent failure
+        (cacheable=True, HTTP 503) so the operator sees the error
+        in the cached response but retries with the same
+        Idempotency-Key don't re-attempt automatically. The human
+        operator is the escalation path.
+        """
+        if db_string is None:
+            return cls.UNKNOWN
+        try:
+            return cls(db_string)
+        except ValueError:
+            return cls.UNKNOWN
 
 
 @dataclass(slots=True, frozen=True)
@@ -2423,10 +2647,20 @@ class EndpointOutcome:
         row_failure_kind: FailureKind,
         error_message: str,
     ) -> "EndpointOutcome":
+        """Build a cacheable 503 from a row's failure_kind.
+
+        v8: accepts UNKNOWN in addition to the known permanent kinds.
+        UNKNOWN comes from FailureKind.parse_or_unknown() when the
+        database row has a NULL, stale, or corrupted value — the
+        endpoint treats it as a permanent failure (cacheable=True)
+        with the human-readable error_message so the operator can
+        investigate.
+        """
         assert row_failure_kind in {
             FailureKind.SPAWN_FAILED_PERMANENT,
             FailureKind.RECONCILIATION_FAILED,
             FailureKind.BUILD_TIMEOUT,
+            FailureKind.UNKNOWN,  # v8 (Codex v7 P1)
         }
         return cls(
             status_code=503,
@@ -2437,10 +2671,35 @@ class EndpointOutcome:
 
     @classmethod
     def body_mismatch(cls) -> "EndpointOutcome":
+        """v8 fix (Codex v7 P0): cacheable=False.
+
+        A body-mismatch response means the caller does NOT own the
+        reservation slot — another request already holds it. Caching
+        this 422 would overwrite the original correct response at the
+        same key, poisoning all subsequent correct retries. The
+        endpoint must NOT call commit() on this outcome; the correct
+        dispatch is 'return this outcome without touching the store'.
+
+        The endpoint code path uses pattern matching on the
+        `reserve()` result:
+
+            match reservation:
+                case Reserved(redis_key=redis_key):
+                    # we own the slot; may commit or release
+                    ...
+                case BodyMismatchReservation():
+                    return EndpointOutcome.body_mismatch()  # no store access
+                case CachedOutcome(outcome=cached):
+                    return cached  # no store access
+                case InFlight():
+                    return EndpointOutcome.in_flight()  # no store access
+
+        Only the Reserved branch is allowed to call commit() / release().
+        """
         return cls(
             status_code=422,
             response={"detail": "Idempotency-Key reused with a different request body."},
-            cacheable=True,
+            cacheable=False,  # v8: NOT cacheable (Codex v7 P0)
             failure_kind=FailureKind.BODY_MISMATCH,
         )
 
@@ -3483,33 +3742,43 @@ class ProjectionState:
     def hydrate_from_cold_read(
         self,
         deployment_id: UUID,
+        *,
         positions: list[PositionSnapshot] | None = None,
         account: AccountStateUpdate | None = None,
     ) -> None:
-        """Cold-read write path (v7). PositionReader calls this after
-        a successful Cache.cache_all() read. Populates the in-memory
-        state with whatever the cold read returned (including the
-        empty case).
+        """Cold-read write path.
 
-        Called with positions=[] marks the deployment as hydrated
-        with zero positions. Subsequent fast-path reads return []
-        without touching Redis.
+        v8 change (Codex v7 P1): ONLY-IF-STILL-COLD semantics.
+        v7 blindly merged cold-read positions into existing state,
+        which could overwrite a fresher `PositionClosed` that
+        StateApplier applied between the cold read and this call.
+        v8 skips the write for any domain that was hydrated between
+        the caller starting the cold read and this call.
 
-        positions=None / account=None mean the caller didn't read
-        that domain on this call (e.g. get_open_positions hydrates
-        only positions, not the account); the other domain stays
-        in whatever state it was.
+        The caller MUST check `is_positions_hydrated` / `is_account_hydrated`
+        BEFORE starting the cold read (PositionReader does this in
+        get_open_positions / get_account). If the check is False at
+        call time and still False here, we hydrate. If another write
+        path (StateApplier) raced in between, we drop the cold data
+        on the floor — the newer event wins.
+
+        The caller then returns the CURRENT state value, not the
+        cold-read result, so even in the race case the caller sees
+        the freshest data.
+
+        Called with positions=[] marks positions as hydrated with
+        zero content. Subsequent fast-path reads return [] without
+        touching Redis.
         """
-        if positions is not None:
-            existing = self._positions.get(deployment_id, {})
+        if positions is not None and deployment_id not in self._positions:
+            # Only-if-still-cold: another writer has not populated
+            # self._positions[deployment_id] yet. Safe to hydrate.
+            snapshot_map: dict[str, PositionSnapshot] = {}
             for snapshot in positions:
-                existing[str(snapshot.instrument_id)] = snapshot
-            # Even if positions is empty, create the key so
-            # is_positions_hydrated returns True on the next read.
-            self._positions.setdefault(deployment_id, existing)
-            if not positions and deployment_id not in self._positions:
-                self._positions[deployment_id] = {}
-        if account is not None:
+                snapshot_map[str(snapshot.instrument_id)] = snapshot
+            self._positions[deployment_id] = snapshot_map
+        if account is not None and deployment_id not in self._accounts:
+            # Only-if-still-cold for the account domain too
             self._accounts[deployment_id] = account
 
     def is_positions_hydrated(self, deployment_id: UUID) -> bool:
@@ -3697,9 +3966,15 @@ class PositionReader:
         positions = await self._read_via_ephemeral_cache_positions(
             deployment_id, trader_id, strategy_id_full
         )
-        # Write back to ProjectionState so subsequent reads hit fast path.
+        # v8 (Codex v7 P1): hydrate is only-if-still-cold. If the
+        # StateApplier raced us between the fast-path check and the
+        # cold read, the hydrate is a no-op and state.positions()
+        # returns the fresher pub/sub data instead of our stale
+        # cold-read result.
         self._state.hydrate_from_cold_read(deployment_id, positions=positions)
-        return positions
+        # Return the CURRENT state value, not the cold-read result.
+        # In the race case, this returns the fresher data.
+        return self._state.positions(deployment_id)
 
     async def get_account(
         self,
@@ -3713,7 +3988,8 @@ class PositionReader:
             deployment_id, trader_id, account_id
         )
         self._state.hydrate_from_cold_read(deployment_id, account=account)
-        return account
+        # v8: return CURRENT state, not the cold-read result
+        return self._state.account(deployment_id)
 
     def _build_adapter(self, trader_id: str) -> CacheDatabaseAdapter:
         """Construct a fresh CacheDatabaseAdapter with the verified
@@ -4735,9 +5011,9 @@ Existing backtest pipeline keeps working at every phase boundary. Phase 2 includ
 
 ---
 
-**Plan version:** 7.0
+**Plan version:** 8.0
 **Last updated:** 2026-04-07
-**Approved by:** [pending Codex v7 re-review]
+**Approved by:** [pending Codex v8 re-review]
 
 ## Revision history
 
@@ -4793,3 +5069,9 @@ Existing backtest pipeline keeps working at every phase boundary. Phase 2 includ
   - **Watchdog deadline is heartbeat-based, not wall-clock** (Codex v6 P1). v6 killed rows with `started_at < now() - 180s` regardless of heartbeat progress — would have falsely killed legitimate slow IB contract loading (30 options underlyings at 10-30s each; see `docs/nautilus-reference.md:482,513`). v7 kills when `last_heartbeat_at < now() - stale_seconds` (default 30s) — a subprocess whose heartbeat thread is still advancing the timestamp is considered making progress and left alone. A secondary hard wall-clock ceiling at `startup_hard_timeout_s = 600s` catches pathological degenerate-loop cases.
   - **Cold-read hydrates `ProjectionState`; `has_seen` is removed** (Codex v6 P1). v6's `has_seen` flag had two failure modes: (a) `FillEvent` and `OrderStatusChange` flipped the flag without populating positions, so `get_open_positions` returned `[]` from the fast path even when Redis had the real state; (b) filtered events never flipped the flag, so the cold path fired forever. v7 replaces the single flag with per-domain `is_positions_hydrated` / `is_account_hydrated` and has `PositionReader`'s cold path **write its result back into `ProjectionState`** via a new `hydrate_from_cold_read()` method. After the first cold read, subsequent reads naturally hit the fast path because the state has a non-missing key (even if empty).
   - **`EndpointOutcome` dataclass + `FailureKind` enum** (Codex v6 P1). v6's `commit_terminal` allowlisted `{201, 422}` but the workflow docstring told callers to call `commit_terminal(503, ...)` on permanent failure — the helper would throw. v6 also distinguished "permanent 503" from "transient 503" by parsing the detail string (fragile), and had a 200-vs-201 mismatch in the already-active branch. v7 introduces a structured `EndpointOutcome(status_code, response, cacheable, failure_kind)` with factory methods (`ready`, `already_active`, `halt_active`, `in_flight`, `api_poll_timeout`, `permanent_failure`, `body_mismatch`). The idempotency layer's `commit()` reads `outcome.cacheable` directly — no status-code allowlist, no string parsing. A new `failure_kind` column is added to `live_node_processes` so the endpoint can read the enum (not parse strings) to decide cacheability. The `already_active` branch returns 200 (correctly, not 201).
+- **v8.0** (2026-04-07): incorporates Codex re-review of v7 (2 P0 + 2 P1 + 1 P2 fixed). Codex confirmed no new Nautilus-native issues — "v7 does not add a new Nautilus API dependency; the problems are all in supervisor/DB/Redis glue." v8 fixes five glue-code bugs.
+  - **Lock-first atomic watchdog path** (Codex v7 P0). v7's watchdog was still `scan → SIGKILL → SELECT FOR UPDATE → UPDATE`, which had a race: between the scan and the SIGKILL, the subprocess could flip to `ready`/`stopping`, and the post-kill SELECT FOR UPDATE's `status IN ('starting','building')` filter would miss the row. v8 holds the row-level lock across the entire kill-and-update sequence: SELECT FOR UPDATE inside a single transaction, re-check status UNDER the lock, SIGKILL, UPDATE, COMMIT. No concurrent writer can interleave.
+  - **Only the `Reserved` branch owns `commit` / `release`** (Codex v7 P0). v7's `body_mismatch` factory was `cacheable=True`, and the workflow let step N call `commit()` from any cacheable outcome. But `BodyMismatchReservation` means the caller does NOT own the reservation slot — calling `commit()` there would overwrite the original correct response with a 422. v8 makes `body_mismatch` `cacheable=False` AND restricts `commit()`/`release()` to the `Reserved` branch only. `InFlight`, `CachedOutcome`, and `BodyMismatchReservation` return their outcome directly without touching the store.
+  - **`failure_kind` writers wired + safe parser** (Codex v7 P1). v7 added the `failure_kind` column to the schema and had `/start` read it to decide cacheability, but the supervisor's `_mark_failed` and the subprocess finally block never populated it. v8 makes `_mark_failed(row_id, reason, failure_kind: FailureKind)` take the enum as a required arg and wires every failure path (halt-flag block → `HALT_ACTIVE`; `process.start()` failure → `SPAWN_FAILED_PERMANENT`; watchdog kill → `BUILD_TIMEOUT`; subprocess `StartupHealthCheckFailed` → `RECONCILIATION_FAILED`; generic exceptions → `SPAWN_FAILED_PERMANENT`). Also adds `FailureKind.UNKNOWN` variant and `FailureKind.parse_or_unknown(db_string)` helper — the endpoint never crashes on NULL or stale values.
+  - **Cold-read hydration is only-if-still-cold** (Codex v7 P1). v7's `hydrate_from_cold_read` blindly merged cold-read positions into existing state and overwrote account state. If StateApplier applied a newer event between the cold read and the hydrate, the older cold snapshot would overwrite fresher pub/sub data. v8 makes `hydrate_from_cold_read` a no-op for any domain that was hydrated between the caller's fast-path check and the hydrate call (the check is `deployment_id not in self._positions/_accounts` at hydrate time). `PositionReader` also returns the CURRENT state value (not the cold-read result) after the hydrate — in the race case, the caller sees the fresher data.
+  - **`startup_hard_timeout_s` raised to 1800s + per-deployment override** (Codex v7 P2). v7's 600s hard ceiling was tighter than legitimate large-options-universe builds (`docs/nautilus-reference.md:482,513` documents 900s+ is possible). v8 raises the supervisor default to 1800s (30 min) and adds a nullable `startup_hard_timeout_s` column on `live_deployments` so operators can raise it per deployment for extra-large universes.
