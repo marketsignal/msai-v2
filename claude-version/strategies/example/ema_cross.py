@@ -1,116 +1,134 @@
-"""EMA Cross Strategy -- buys when fast EMA crosses above slow EMA.
+"""EMA crossover strategy built on NautilusTrader.
 
-A portable crossover strategy that works with the MSAI backtesting framework.
-For NautilusTrader deployment, a separate adapter wraps this logic.
+A minimal "golden cross / death cross" reference strategy used by MSAI's
+backtests and live deployments.  It registers two
+``ExponentialMovingAverage`` indicators (a fast one and a slow one), feeds
+them with every incoming :class:`Bar`, and flips a single position long
+whenever the fast EMA crosses above the slow EMA, closing the position
+when it crosses back below.
+
+Design notes
+------------
+* This is a **real** NautilusTrader :class:`Strategy` subclass -- it is not
+  a portable Python loop with a Nautilus adapter.  The backtest engine
+  instantiates it directly inside the spawned subprocess via
+  ``ImportableStrategyConfig``.
+* Position management is deliberately simple: one symbol, one position at a
+  time, market orders only.  This mirrors the way most educational EMA
+  examples ship and is enough to verify the end-to-end backtest pipeline
+  produces non-zero trades.
+* The matching configuration model lives in
+  :mod:`strategies.example.config` and is imported here by Nautilus via the
+  ``ImportableStrategyConfig.config_path`` resolved by
+  :mod:`msai.services.nautilus.strategy_loader`.
 """
 
-from collections import deque
+from __future__ import annotations
+
+from nautilus_trader.indicators import ExponentialMovingAverage
+from nautilus_trader.model.data import Bar, BarType
+from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.objects import Quantity
+from nautilus_trader.trading.strategy import Strategy
+
+from strategies.example.config import EMACrossConfig
 
 
-class EMACrossConfig:
-    """Configuration for the EMA crossover strategy."""
+class EMACrossStrategy(Strategy):
+    """Buy-on-golden-cross / sell-on-death-cross EMA strategy.
 
-    def __init__(
-        self,
-        fast_period: int = 10,
-        slow_period: int = 20,
-        trade_size: float = 100.0,
-        instrument: str = "AAPL",
-    ) -> None:
-        self.fast_period = fast_period
-        self.slow_period = slow_period
-        self.trade_size = trade_size
-        self.instrument = instrument
+    The strategy subscribes to a single bar type and keeps two EMAs
+    updated from those bars.  Trading rules:
 
+    * When both EMAs are initialised and ``fast > slow`` and the portfolio
+      is flat on the instrument -> submit a market **BUY** for the
+      configured trade size.  If we are currently short, flatten first
+      then go long.
+    * When ``fast < slow`` and we are net long -> close the position.
 
-class EMACrossStrategy:
-    """Simple EMA crossover strategy.
-
-    Buys when fast EMA crosses above slow EMA,
-    sells when fast EMA crosses below slow EMA.
-
-    Portable implementation that works with the MSAI backtesting framework.
-    For NautilusTrader deployment, a separate adapter wraps this logic.
+    The intentionally coarse logic makes it trivial to reason about how
+    many trades a given historical window should produce, which is
+    important for smoke-testing the full Nautilus backtest pipeline.
     """
 
-    def __init__(
-        self,
-        fast_period: int = 10,
-        slow_period: int = 20,
-        trade_size: float = 100.0,
-        instrument: str = "AAPL",
-        config: "EMACrossConfig | None" = None,
-    ) -> None:
-        if config is not None:
-            self.fast_period = config.fast_period
-            self.slow_period = config.slow_period
-            self.trade_size = config.trade_size
-            self.instrument = config.instrument
-        else:
-            self.fast_period = fast_period
-            self.slow_period = slow_period
-            self.trade_size = trade_size
-            self.instrument = instrument
-
-        self.fast_ema: deque[float] = deque(maxlen=2)
-        self.slow_ema: deque[float] = deque(maxlen=2)
-        self.position: int = 0  # 0=flat, 1=long, -1=short
-        self.trades: list = []
-
-    def on_bar(self, bar: dict) -> "dict | None":
-        """Process a bar and return a trade signal dict or None.
+    def __init__(self, config: EMACrossConfig) -> None:
+        """Initialise EMAs and remember the instrument / bar spec.
 
         Args:
-            bar: Dictionary with at least a ``close`` key containing the price.
-
-        Returns:
-            A trade signal dict with ``side``, ``price``, ``quantity`` keys,
-            or ``None`` if no signal is generated.
+            config: Frozen :class:`EMACrossConfig` containing the
+                instrument ID, bar type, EMA periods and trade size.
         """
-        price = float(bar["close"])
-        self._update_ema(price)
+        super().__init__(config=config)
+        self.instrument_id: InstrumentId = config.instrument_id
+        self.bar_type: BarType = config.bar_type
+        self.trade_size: Quantity = Quantity.from_str(str(config.trade_size))
 
-        if len(self.fast_ema) < 2:
-            return None
+        self.fast_ema = ExponentialMovingAverage(config.fast_ema_period)
+        self.slow_ema = ExponentialMovingAverage(config.slow_ema_period)
 
-        # Crossover detection: fast crosses above slow -> BUY
-        if self.fast_ema[-1] > self.slow_ema[-1] and self.fast_ema[-2] <= self.slow_ema[-2]:
-            if self.position <= 0:
-                self.position = 1
-                signal = {
-                    "side": "BUY",
-                    "price": price,
-                    "quantity": self.trade_size,
-                }
-                self.trades.append(signal)
-                return signal
+    def on_start(self) -> None:
+        """Subscribe to bars and wire indicators into the bar stream.
 
-        # Crossover detection: fast crosses below slow -> SELL
-        elif self.fast_ema[-1] < self.slow_ema[-1] and self.fast_ema[-2] >= self.slow_ema[-2]:
-            if self.position >= 0:
-                self.position = -1
-                signal = {
-                    "side": "SELL",
-                    "price": price,
-                    "quantity": self.trade_size,
-                }
-                self.trades.append(signal)
-                return signal
-
-        return None
-
-    def _update_ema(self, price: float) -> None:
-        """Update EMA values with a new price observation.
-
-        Uses the standard exponential moving average formula:
-        ``EMA_new = price * k + EMA_prev * (1 - k)`` where ``k = 2 / (period + 1)``.
+        Called once by Nautilus after the strategy is registered with the
+        engine.  We only need bar data here -- no ticks, no order book.
         """
-        for period, ema_list in [
-            (self.fast_period, self.fast_ema),
-            (self.slow_period, self.slow_ema),
-        ]:
-            if not ema_list:
-                ema_list.append(price)
-            else:
-                k = 2.0 / (period + 1)
-                ema_list.append(price * k + ema_list[-1] * (1.0 - k))
+        self.register_indicator_for_bars(self.bar_type, self.fast_ema)
+        self.register_indicator_for_bars(self.bar_type, self.slow_ema)
+        self.subscribe_bars(self.bar_type)
+
+    def on_bar(self, bar: Bar) -> None:
+        """Evaluate the crossover on every incoming bar.
+
+        Args:
+            bar: The current :class:`Bar` emitted by the engine.  Only
+                used for the implicit indicator update -- we read EMA
+                values directly since they're already updated by the
+                time this callback fires.
+        """
+        # Wait until both indicators have enough history to emit values.
+        if not self.fast_ema.initialized or not self.slow_ema.initialized:
+            return
+
+        # Golden cross: fast above slow -> be long.
+        if self.fast_ema.value > self.slow_ema.value:
+            if self.portfolio.is_flat(self.instrument_id):
+                self._submit_market_order(OrderSide.BUY)
+                return
+            if self.portfolio.is_net_short(self.instrument_id):
+                self.close_all_positions(self.instrument_id)
+                self._submit_market_order(OrderSide.BUY)
+                return
+
+        # Death cross: fast below slow -> flatten any long position.
+        elif self.fast_ema.value < self.slow_ema.value:
+            if self.portfolio.is_net_long(self.instrument_id):
+                self.close_all_positions(self.instrument_id)
+
+    def on_stop(self) -> None:
+        """Flatten positions and cancel working orders on shutdown.
+
+        Called by Nautilus when the engine tears down the strategy --
+        either at the end of a backtest run or when a live deployment is
+        stopped.  Leaving orders or open positions here would leak across
+        runs in the shared engine state.
+        """
+        self.cancel_all_orders(self.instrument_id)
+        self.close_all_positions(self.instrument_id)
+
+    def _submit_market_order(self, side: OrderSide) -> None:
+        """Build and submit a market order for the configured trade size.
+
+        Extracted into a helper so the ``on_bar`` logic stays readable and
+        so we only have one place to tweak if we ever swap market orders
+        for limit orders or add slippage controls.
+
+        Args:
+            side: :class:`OrderSide.BUY` or :class:`OrderSide.SELL`.
+        """
+        order = self.order_factory.market(
+            instrument_id=self.instrument_id,
+            order_side=side,
+            quantity=self.trade_size,
+        )
+        self.submit_order(order)

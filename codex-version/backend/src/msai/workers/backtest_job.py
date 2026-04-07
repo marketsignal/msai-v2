@@ -78,12 +78,12 @@ async def run_backtest(ctx: dict, backtest_id: str, strategy_path: str, config: 
                         deployment_id=None,
                         strategy_id=row.strategy_id,
                         strategy_code_hash=row.strategy_code_hash,
-                        instrument=str(trade.get("symbol", "UNKNOWN")),
+                        instrument=str(trade.get("instrument_id") or trade.get("symbol", "UNKNOWN")),
                         side=str(trade.get("side", "BUY")),
-                        quantity=float(trade.get("quantity", 0.0)),
-                        price=float(trade.get("price", 0.0)),
+                        quantity=float(trade.get("filled_qty") or trade.get("quantity", 0.0)),
+                        price=float(trade.get("avg_px") or trade.get("price", 0.0)),
                         commission=0.0,
-                        pnl=float(trade.get("pnl", 0.0)),
+                        pnl=float(trade.get("realized_pnl") or trade.get("pnl", 0.0)),
                         is_live=False,
                         executed_at=timestamp,
                     )
@@ -104,7 +104,7 @@ async def run_backtest(ctx: dict, backtest_id: str, strategy_path: str, config: 
 
 
 def _trade_timestamp_utc(trade: dict[str, object]) -> datetime:
-    for candidate in ("timestamp", "ts_event", "ts_last", "ts_init"):
+    for candidate in ("ts_last", "ts_init", "ts_event", "timestamp"):
         raw = trade.get(candidate)
         if raw is None:
             continue

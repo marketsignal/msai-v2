@@ -184,47 +184,55 @@ def _build_backtest_run_config(payload: _RunInput) -> BacktestRunConfig:
 
 
 def _extract_metrics(raw_result: object, orders_df: pd.DataFrame) -> dict[str, float | int]:
-    returns_stats = getattr(raw_result, "stats_returns", {})
+    """Pull normalized metrics from NautilusTrader's result dicts.
 
-    sharpe = _extract_float_metric(returns_stats, ["sharpe", "sharpe_ratio"]) if returns_stats else 0.0
-    sortino = _extract_float_metric(returns_stats, ["sortino", "sortino_ratio"]) if returns_stats else 0.0
-    max_drawdown = (
-        _extract_float_metric(returns_stats, ["max_drawdown", "maximum_drawdown"]) if returns_stats else 0.0
-    )
-    total_return = (
-        _extract_float_metric(returns_stats, ["total_return", "return", "cumulative_return"])
-        if returns_stats
-        else 0.0
-    )
+    Nautilus exposes two relevant dicts:
+    - ``stats_returns`` (flat): keys like "Sharpe Ratio (252 days)", "Sortino Ratio (252 days)"
+    - ``stats_pnls`` (nested by currency): {"USD": {"PnL% (total)": ..., "Win Rate": ...}}
+    """
+    import math
 
-    win_rate = 0.0
-    if not orders_df.empty and "pnl" in orders_df.columns:
-        pnl = orders_df["pnl"].fillna(0.0)
-        win_rate = float((pnl > 0).mean())
+    def _nan_safe(v: float) -> float:
+        return 0.0 if not math.isfinite(v) else v
+
+    returns_stats = getattr(raw_result, "stats_returns", None) or {}
+    pnls_stats = getattr(raw_result, "stats_pnls", None) or {}
+
+    sharpe = _find_stat(returns_stats, ["sharpe ratio", "sharpe"])
+    sortino = _find_stat(returns_stats, ["sortino ratio", "sortino"])
+    max_drawdown = _find_stat(returns_stats, ["max drawdown", "maximum drawdown"])
+
+    currency_stats: dict[str, object] = {}
+    if isinstance(pnls_stats, dict) and pnls_stats:
+        first = next(iter(pnls_stats.values()))
+        if isinstance(first, dict):
+            currency_stats = first
+
+    total_return = _find_stat(currency_stats, ["pnl% (total)", "pnl%", "return"])
+    win_rate = _find_stat(currency_stats, ["win rate"])
 
     return {
-        "sharpe": sharpe,
-        "sortino": sortino,
-        "max_drawdown": max_drawdown,
-        "total_return": total_return,
-        "win_rate": win_rate,
+        "sharpe": _nan_safe(sharpe),
+        "sortino": _nan_safe(sortino),
+        "max_drawdown": _nan_safe(max_drawdown),
+        "total_return": _nan_safe(total_return),
+        "win_rate": _nan_safe(win_rate),
         "num_trades": int(len(orders_df)),
     }
 
 
-def _extract_float_metric(stats: object, candidates: list[str]) -> float:
+def _find_stat(stats: dict[str, object] | object, prefixes: list[str]) -> float:
+    """Case-insensitive prefix lookup for Nautilus stats keys."""
     if not isinstance(stats, dict):
         return 0.0
-
-    for _, value in stats.items():
-        if isinstance(value, dict):
-            lower_map = {str(key).lower(): val for key, val in value.items()}
-            for name in candidates:
-                if name in lower_map:
-                    try:
-                        return float(lower_map[name])
-                    except Exception:
-                        continue
+    for key, value in stats.items():
+        key_lower = str(key).lower()
+        for prefix in prefixes:
+            if key_lower.startswith(prefix):
+                try:
+                    return float(value)  # type: ignore[arg-type]
+                except (TypeError, ValueError):
+                    return 0.0
     return 0.0
 
 

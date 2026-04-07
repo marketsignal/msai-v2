@@ -32,11 +32,17 @@ class BacktestStatusResponse(BaseModel):
 
 
 class BacktestResultsResponse(BaseModel):
-    """Response schema for backtest results."""
+    """Response schema for backtest results.
+
+    Includes the aggregate metrics dict (may be ``None`` until the job
+    completes) and the full list of individual trades so the UI can
+    render the trade log in one round-trip.
+    """
 
     id: UUID
-    metrics: dict[str, Any] | None
+    metrics: dict[str, Any] | None = None
     trade_count: int
+    trades: list[dict[str, Any]] = []
 
     model_config = {"from_attributes": True}
 

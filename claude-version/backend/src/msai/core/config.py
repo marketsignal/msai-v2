@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     polygon_api_key: str = ""
     databento_api_key: str = ""
 
+    # Backtest execution tuning
+    backtest_timeout_seconds: int = 30 * 60
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
     @field_validator("data_root", "strategies_root", mode="before")
@@ -45,6 +48,34 @@ class Settings(BaseSettings):
         if isinstance(value, Path):
             return value
         return Path(str(value))
+
+    @property
+    def parquet_root(self) -> Path:
+        """Root directory for raw OHLCV Parquet files (``{data_root}/parquet``).
+
+        Organized by ``{asset_class}/{symbol}/{YYYY}/{MM}.parquet`` and written
+        by the data ingestion pipeline.
+        """
+        return self.data_root / "parquet"
+
+    @property
+    def reports_root(self) -> Path:
+        """Root directory for generated QuantStats HTML reports
+        (``{data_root}/reports``).
+        """
+        return self.data_root / "reports"
+
+    @property
+    def nautilus_catalog_root(self) -> Path:
+        """Root directory for the NautilusTrader ``ParquetDataCatalog``
+        (``{data_root}/nautilus``).
+
+        The catalog is lazily built from raw Parquet files on the first
+        backtest request for a given symbol (see
+        :mod:`msai.services.nautilus.catalog_builder`) and is read directly
+        by ``BacktestNode`` during backtest execution.
+        """
+        return self.data_root / "nautilus"
 
 
 settings: Settings = Settings()

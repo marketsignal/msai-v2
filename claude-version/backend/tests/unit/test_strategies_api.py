@@ -14,7 +14,6 @@ import pytest
 from msai.core.database import get_db
 from msai.main import app
 from msai.models.strategy import Strategy
-from msai.services.strategy_registry import StrategyInfo
 
 
 # ---------------------------------------------------------------------------
@@ -142,27 +141,42 @@ class TestListStrategies:
 class TestValidateStrategy:
     """Tests for POST /api/v1/strategies/{id}/validate."""
 
-    async def test_validate_strategy_returns_200(self, client: httpx.AsyncClient) -> None:
+    async def test_validate_strategy_returns_200(
+        self,
+        client: httpx.AsyncClient,
+        fake_db_session: _FakeSession,
+    ) -> None:
         """POST /api/v1/strategies/{id}/validate returns 200 for a valid strategy."""
-        strategy_id = UUID(int=0)
+        # Arrange: seed a real Strategy row pointing at the example EMA file.
+        strategy = Strategy(
+            name="example.ema_cross",
+            description="EMA Cross",
+            file_path=str(STRATEGIES_DIR / "ema_cross.py"),
+            strategy_class="EMACrossStrategy",
+            config_schema=None,
+            default_config=None,
+        )
+        fake_db_session.add(strategy)
+        assert strategy.id is not None
 
-        with patch("msai.api.strategies._STRATEGIES_DIR", STRATEGIES_DIR):
-            response = await client.post(f"/api/v1/strategies/{strategy_id}/validate")
+        # Act
+        response = await client.post(f"/api/v1/strategies/{strategy.id}/validate")
 
+        # Assert
         assert response.status_code == 200
         body = response.json()
         assert "message" in body
         assert "validated successfully" in body["message"]
 
-    async def test_validate_strategy_no_strategies_returns_404(
-        self, client: httpx.AsyncClient, tmp_path: Path
+    async def test_validate_strategy_missing_row_returns_404(
+        self, client: httpx.AsyncClient, fake_db_session: _FakeSession
     ) -> None:
-        """POST /validate returns 404 when no strategies exist on disk."""
+        """POST /validate returns 404 when the strategy row does not exist."""
+        # Arrange: empty session -> scalar_one_or_none() returns None
         strategy_id = UUID(int=0)
-        empty_dir = tmp_path / "empty"
-        empty_dir.mkdir()
 
-        with patch("msai.api.strategies._STRATEGIES_DIR", empty_dir):
-            response = await client.post(f"/api/v1/strategies/{strategy_id}/validate")
+        # Act
+        response = await client.post(f"/api/v1/strategies/{strategy_id}/validate")
 
+        # Assert
         assert response.status_code == 404

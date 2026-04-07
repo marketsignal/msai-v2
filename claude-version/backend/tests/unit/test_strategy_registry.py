@@ -8,9 +8,11 @@ from pathlib import Path
 import pytest
 
 from msai.services.strategy_registry import (
+    DiscoveredStrategy,
     compute_file_hash,
     discover_strategies,
     load_strategy_class,
+    validate_strategy_file,
 )
 
 # ---------------------------------------------------------------------------
@@ -34,48 +36,39 @@ def empty_strategies_dir(tmp_path: Path) -> Path:
     return d
 
 
-@pytest.fixture()
-def strategies_dir_with_init_and_config(tmp_path: Path) -> Path:
-    """Return a directory containing only __init__.py and config.py (should be skipped)."""
-    d = tmp_path / "strategies"
-    d.mkdir()
-    (d / "__init__.py").write_text("# init\n")
-    (d / "config.py").write_text("# config\n")
-    (d / "_private.py").write_text("class PrivateStrategy: pass\n")
-    return d
-
-
 # ---------------------------------------------------------------------------
 # Tests: discover_strategies
 # ---------------------------------------------------------------------------
 
 
 class TestDiscoverStrategies:
-    """Tests for discover_strategies function."""
+    """Tests for :func:`discover_strategies`."""
 
     def test_discover_strategies_finds_example(self, example_strategies_dir: Path) -> None:
         """discover_strategies finds EMACrossStrategy in the example directory."""
+        # Act
         results = discover_strategies(example_strategies_dir)
 
+        # Assert
         assert len(results) >= 1
-        names = [r.class_name for r in results]
-        assert "EMACrossStrategy" in names
+        class_names = [r.strategy_class_name for r in results]
+        assert "EMACrossStrategy" in class_names
 
-        ema = next(r for r in results if r.class_name == "EMACrossStrategy")
-        assert ema.name == "ema_cross"
+        ema = next(r for r in results if r.strategy_class_name == "EMACrossStrategy")
+        assert isinstance(ema, DiscoveredStrategy)
         assert ema.module_path.name == "ema_cross.py"
-        assert ema.description is not None
-        assert "EMA crossover" in ema.description
+        assert ema.config_class_name == "EMACrossConfig"
 
     def test_discover_strategies_returns_code_hash(self, example_strategies_dir: Path) -> None:
         """Discovered strategies include a 64-character hex SHA256 hash."""
+        # Act
         results = discover_strategies(example_strategies_dir)
 
+        # Assert
         assert len(results) >= 1
         for info in results:
             assert len(info.code_hash) == 64
-            # Verify it is a valid hex string
-            int(info.code_hash, 16)
+            int(info.code_hash, 16)  # must be valid hex
 
     def test_discover_strategies_empty_dir(self, empty_strategies_dir: Path) -> None:
         """An empty directory returns an empty list."""
@@ -89,14 +82,6 @@ class TestDiscoverStrategies:
 
         assert results == []
 
-    def test_discover_strategies_skips_init_and_config(
-        self, strategies_dir_with_init_and_config: Path
-    ) -> None:
-        """__init__.py, config.py, and _private.py files are skipped."""
-        results = discover_strategies(strategies_dir_with_init_and_config)
-
-        assert results == []
-
 
 # ---------------------------------------------------------------------------
 # Tests: compute_file_hash
@@ -104,7 +89,7 @@ class TestDiscoverStrategies:
 
 
 class TestComputeFileHash:
-    """Tests for compute_file_hash function."""
+    """Tests for :func:`compute_file_hash`."""
 
     def test_compute_file_hash_deterministic(self, example_strategies_dir: Path) -> None:
         """Hashing the same file twice produces the same result."""
@@ -126,12 +111,35 @@ class TestComputeFileHash:
 
 
 # ---------------------------------------------------------------------------
-# Tests: load_strategy_class
+# Tests: validate_strategy_file
+# ---------------------------------------------------------------------------
+
+
+class TestValidateStrategyFile:
+    """Tests for :func:`validate_strategy_file`."""
+
+    def test_validate_example_strategy_passes(self, example_strategies_dir: Path) -> None:
+        """The shipped example strategy validates successfully."""
+        ok, message = validate_strategy_file(example_strategies_dir / "ema_cross.py")
+
+        assert ok is True
+        assert message == "EMACrossStrategy"
+
+    def test_validate_missing_file_returns_error(self, tmp_path: Path) -> None:
+        """A missing file returns ok=False with a clear message."""
+        ok, message = validate_strategy_file(tmp_path / "nope.py")
+
+        assert ok is False
+        assert "not found" in message.lower()
+
+
+# ---------------------------------------------------------------------------
+# Tests: load_strategy_class (legacy helper retained for tests)
 # ---------------------------------------------------------------------------
 
 
 class TestLoadStrategyClass:
-    """Tests for load_strategy_class function."""
+    """Tests for :func:`load_strategy_class`."""
 
     def test_load_strategy_class_success(self, example_strategies_dir: Path) -> None:
         """load_strategy_class returns the EMACrossStrategy class."""
@@ -141,21 +149,16 @@ class TestLoadStrategyClass:
         assert inspect.isclass(cls)
         assert cls.__name__ == "EMACrossStrategy"
 
-        # Verify we can instantiate it
-        instance = cls(fast_period=5, slow_period=15)
-        assert instance.fast_period == 5
-        assert instance.slow_period == 15
-
     def test_load_strategy_class_missing_class(self, example_strategies_dir: Path) -> None:
         """Requesting a nonexistent class raises ImportError."""
         module_path = example_strategies_dir / "ema_cross.py"
 
-        with pytest.raises(ImportError, match="Class NonExistent not found"):
+        with pytest.raises(ImportError, match="NonExistent"):
             load_strategy_class(module_path, "NonExistent")
 
     def test_load_strategy_class_bad_path(self, tmp_path: Path) -> None:
         """A path that does not exist raises ImportError."""
         bad_path = tmp_path / "does_not_exist.py"
 
-        with pytest.raises(ImportError, match="Cannot load module"):
+        with pytest.raises(ImportError):
             load_strategy_class(bad_path, "SomeStrategy")

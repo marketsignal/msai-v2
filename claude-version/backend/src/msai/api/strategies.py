@@ -1,16 +1,21 @@
-"""Strategies API router -- CRUD and validation for trading strategies.
+"""Strategies API router -- discover, list, update, and validate strategies.
 
-Discovers strategy files on disk and manages their database records.
+Syncs the on-disk ``strategies/`` directory with the ``strategies`` table
+on every list request so the frontend always sees real database IDs it
+can pass to the backtest endpoint.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 from msai.core.auth import get_current_user
 from msai.core.config import settings
@@ -20,9 +25,10 @@ from msai.models.strategy import Strategy
 from msai.schemas.common import MessageResponse
 from msai.schemas.strategy import StrategyListResponse, StrategyResponse, StrategyUpdate
 from msai.services.strategy_registry import (
-    StrategyInfo,
+    DiscoveredStrategy,
+    compute_file_hash,
     discover_strategies,
-    load_strategy_class,
+    validate_strategy_file,
 )
 
 log = get_logger(__name__)
@@ -39,20 +45,18 @@ async def list_strategies(
 ) -> StrategyListResponse:
     """Scan the strategies directory, sync with DB, and return real strategy IDs.
 
-    Discovered files are upserted into the ``strategies`` table so that every
-    response row has a stable database ID that ``/{id}`` and backtest
-    endpoints can look up.
+    Discovered files are upserted into the ``strategies`` table so that
+    every response row has a stable database ID that ``/{id}`` and the
+    backtest endpoints can look up.
     """
-    strategies_dir = _STRATEGIES_DIR
-    discovered: list[StrategyInfo] = discover_strategies(strategies_dir)
+    discovered: list[DiscoveredStrategy] = discover_strategies(_STRATEGIES_DIR)
 
-    # Index existing rows by file path
+    # Index existing rows by file path for upsert
     existing_result = await db.execute(select(Strategy))
     existing: dict[str, Strategy] = {
         row.file_path: row for row in existing_result.scalars().all()
     }
 
-    # Upsert each discovered strategy and collect the DB rows
     db_rows: list[Strategy] = []
     for info in discovered:
         file_path = str(info.module_path)
@@ -62,7 +66,7 @@ async def list_strategies(
                 name=info.name,
                 description=info.description,
                 file_path=file_path,
-                strategy_class=info.class_name,
+                strategy_class=info.strategy_class_name,
                 config_schema=None,
                 default_config=None,
             )
@@ -70,7 +74,7 @@ async def list_strategies(
         else:
             row.name = info.name
             row.description = info.description
-            row.strategy_class = info.class_name
+            row.strategy_class = info.strategy_class_name
         db_rows.append(row)
 
     await db.commit()
@@ -114,6 +118,12 @@ async def get_strategy(
             detail=f"Strategy {strategy_id} not found",
         )
 
+    code_hash = ""
+    if strategy.file_path:
+        file_path = Path(strategy.file_path)
+        if file_path.exists():
+            code_hash = compute_file_hash(file_path)
+
     return StrategyResponse(
         id=strategy.id,
         name=strategy.name,
@@ -122,7 +132,7 @@ async def get_strategy(
         strategy_class=strategy.strategy_class,
         config_schema=strategy.config_schema,
         default_config=strategy.default_config,
-        code_hash="",  # TODO: compute from file_path
+        code_hash=code_hash,
         created_at=strategy.created_at,
     )
 
@@ -151,6 +161,12 @@ async def update_strategy(
     await db.commit()
     await db.refresh(strategy)
 
+    code_hash = ""
+    if strategy.file_path:
+        file_path = Path(strategy.file_path)
+        if file_path.exists():
+            code_hash = compute_file_hash(file_path)
+
     return StrategyResponse(
         id=strategy.id,
         name=strategy.name,
@@ -159,7 +175,7 @@ async def update_strategy(
         strategy_class=strategy.strategy_class,
         config_schema=strategy.config_schema,
         default_config=strategy.default_config,
-        code_hash="",  # TODO: compute from file_path
+        code_hash=code_hash,
         created_at=strategy.created_at,
     )
 
@@ -168,42 +184,39 @@ async def update_strategy(
 async def validate_strategy(
     strategy_id: UUID,
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> MessageResponse:
-    """Validate that a strategy class can be loaded and instantiated.
+    """Validate that a strategy's source file exposes a Nautilus Strategy class.
 
-    Scans the strategies directory for a matching strategy (by name derived
-    from the strategy_id path), loads the class dynamically, and verifies
-    it can be instantiated.
-
-    For now this endpoint uses filesystem discovery rather than a DB lookup
-    to keep it simple for M2.
-
-    TODO: Look up strategy from DB by ID and use file_path + strategy_class.
+    Uses the database row to locate the source file, then defers to
+    :func:`validate_strategy_file` so the API never tries to instantiate
+    a Nautilus ``Strategy`` subclass (which would require a configured
+    backtest / live engine that does not exist in the API process).
     """
-    strategies_dir = _STRATEGIES_DIR
-    discovered: list[StrategyInfo] = discover_strategies(strategies_dir)
+    result = await db.execute(select(Strategy).where(Strategy.id == strategy_id))
+    strategy: Strategy | None = result.scalar_one_or_none()
 
-    if not discovered:
+    if strategy is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="No strategies found on disk",
+            detail=f"Strategy {strategy_id} not found",
         )
 
-    # For M2 we validate the first discovered strategy as a proof of concept.
-    # In M3+ this will look up the strategy by DB ID.
-    info = discovered[0]
-
-    try:
-        cls = load_strategy_class(info.module_path, info.class_name)
-        # Verify we can instantiate (strategies typically accept **kwargs)
-        _instance = cls()
-    except (ImportError, TypeError) as exc:
+    file_path = Path(strategy.file_path) if strategy.file_path else None
+    if file_path is None or not file_path.is_file():
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Strategy validation failed: {exc}",
-        ) from exc
+            detail=f"Strategy file not found on disk: {strategy.file_path}",
+        )
 
-    return MessageResponse(message=f"Strategy '{info.class_name}' validated successfully")
+    ok, message = validate_strategy_file(file_path)
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Strategy validation failed: {message}",
+        )
+
+    return MessageResponse(message=f"Strategy '{message}' validated successfully")
 
 
 @router.delete("/{strategy_id}", response_model=MessageResponse)
@@ -214,7 +227,8 @@ async def delete_strategy(
 ) -> MessageResponse:
     """Soft-delete / unregister a strategy.
 
-    TODO: Implement actual soft-delete flag on the Strategy model.
+    TODO: Implement a real soft-delete flag on the Strategy model so we
+    can preserve historical backtest references.
     """
     result = await db.execute(select(Strategy).where(Strategy.id == strategy_id))
     strategy: Strategy | None = result.scalar_one_or_none()
