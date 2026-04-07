@@ -1,6 +1,6 @@
-# Claude — Nautilus Production Hardening (Revision 3)
+# Claude — Nautilus Production Hardening (Revision 4)
 
-**Status:** Plan v3 (incorporates Codex v2 re-review — container topology and process ownership corrections)
+**Status:** Plan v4 (incorporates Codex v3 re-review — Redis Streams PEL semantics, idempotency, readiness gate, identity/schema model corrections)
 **Branch:** `feat/claude-nautilus-production-hardening`
 **Scope:** `claude-version/` ONLY. The `codex-version/` directory is not touched by this plan; Codex CLI is hardening that codebase independently in parallel.
 
@@ -11,6 +11,41 @@
 - `docs/nautilus-natives-audit.md` — what Nautilus already provides natively vs what we have to build
 - `.claude/rules/nautilus.md` — auto-loaded short-form gotchas list
 - `docs/plans/2026-04-06-claude-nautilus-production-hardening.md` (this file)
+
+## What changed in revision 4
+
+Codex re-reviewed v3 and rejected it with 3 new P0 + 5 P1 + 2 P2 findings. Container topology and ownership are now directionally correct, but v3 had errors in Redis Streams semantics, command idempotency, the readiness gate, and the identity/schema model. v4 corrects these.
+
+**Architectural corrections from v3:**
+
+1. **Stable `deployment_slug` decoupled from `live_deployments.id`.** v3 derived `trader_id`/`order_id_tag` from `deployment_id`, but the live_deployments model creates a fresh row on every restart, so the deterministic identity changed across restarts and Phase 4 state reload broke. v4 adds a stable `deployment_slug` (16 hex chars = 64 bits, ~no collisions until 4 billion deployments) on the `live_deployments` row that is computed once at first deployment and reused across restarts. The stable slug is also persisted on the strategy row for cross-restart logical identity. Per-restart per-process state lives only in `live_node_processes` (run records), not in `live_deployments`.
+2. **Redis Streams PEL recovery via `XAUTOCLAIM`.** v3 assumed un-ACKed messages are auto-redelivered to a new consumer in the same group. They are not — they sit parked in the Pending Entries List (PEL) until a consumer explicitly claims them. v4 uses `XAUTOCLAIM` (Redis ≥ 6.2) on consumer startup to reclaim entries idle longer than `min_idle_time_ms`. Both `LiveCommandBus.consume` (1.6) and the projection consumer (3.4) implement explicit PEL recovery. Tests verify that an un-ACKed message IS picked up by a new consumer after the recovery sweep, NOT by automatic redelivery.
+3. **Idempotency at every layer.** v3's `ProcessManager.spawn` had no "already active" guard and `run_forever()` ACKed in `finally` even on failure. v4 adds: (a) a database-level unique partial index on `live_node_processes(deployment_id) WHERE status IN ('starting','building','ready','running','stopping')` so duplicate spawns fail at the DB; (b) the supervisor's command handler ACKs **only on success**, leaving failed messages in the PEL for `XAUTOCLAIM` recovery; (c) the `/api/v1/live/start` endpoint accepts an `Idempotency-Key` HTTP header and short-circuits to return the existing deployment if a duplicate retry arrives within the idempotency TTL.
+4. **Post-start health check before `status="ready"`.** v3 treated `kernel.start_async()` returning as proof that reconciliation completed and trading was ready. v4 adds an explicit health check: after `kernel.start_async()` returns, the subprocess polls `node.is_running and trader.is_running and data_engine.is_connected and exec_engine.is_connected and not exec_engine.reconciliation_active` for up to `startup_health_timeout_seconds` (default 60). Only if **all** conditions are true does it write `status="ready"`. On timeout, the subprocess writes `status="failed"`, error_message includes which condition failed, and exits.
+5. **`live_node_processes.pid` is nullable; `building` added to status enum.** v3's schema was inconsistent with its workflow (row is inserted before `process.start()` but pid was non-nullable). v4 fixes the column nullability and adds `building` to the status enum which the subprocess writes during the `kernel.build()` phase.
+6. **`live_deployments` schema additions in a dedicated migration.** v3 referenced new columns (`trader_id`, `account_id`, `message_bus_stream`, `strategy_id_full`, `deployment_slug`) without a task that creates them. v4 adds task 1.1b which migrates the existing `live_deployments` model to add these columns and makes the existing model docstring "A new deployment row is created each time a strategy is (re-)started" obsolete — the new model reuses rows across restarts when keyed by stable `deployment_slug`.
+7. **PositionReader rebuild model corrected.** v3's `Cache(database=adapter)` then `cache_all()` once is wrong: the `Cache` does not subscribe to Redis updates and would drift after the first read. v4's PositionReader builds a fresh `CacheDatabaseAdapter` and `Cache` per request, calls `cache_all()`, reads, and disposes — so every read is fresh. The import path is corrected to `from nautilus_trader.cache.config import CacheConfig` (not `nautilus_trader.common.config`). For the WebSocket initial snapshot the cost is acceptable (one snapshot per connect); for high-frequency reads, the projection consumer maintains an in-memory `dict[deployment_id, PositionState]` populated from the message bus stream, which the WebSocket already uses for live updates anyway.
+8. **`RiskAwareStrategy` uses correct portfolio API names.** `portfolio.total_pnl()` and `portfolio.net_exposure()` take `InstrumentId` (per-instrument), not `Venue`. The venue-level aggregate methods are `portfolio.total_pnls(venue)` and `portfolio.net_exposures(venue)` — plural — and return `dict[Currency, Money]`. v4 fixes the mixin to use the plural forms for venue-level checks and the singular forms for per-instrument checks.
+9. **Restart-continuity test runs against testcontainers Redis.** v3 invented an "on-disk KV-store StateSerializer" that doesn't exist in this Nautilus install — `DatabaseConfig` here is Redis-only. v4's restart test brings up a testcontainers Redis, points two consecutive `BacktestNode` runs at it via `CacheConfig.database = redis`, and verifies state persists across runs. Phase 4 Scenario D (live-feed restart assertion) is dropped — it's non-deterministic and the BacktestNode-twice test already proves the save/load contract.
+10. **Supervisor keeps in-memory `dict[deployment_id, mp.Process]`.** v3 threw away child handles and relied solely on heartbeat. v4 keeps the handle map (parent and child are in the same namespace, so `Process.is_alive()`/`exitcode` ARE meaningful and give instant exit detection). Heartbeat is used only as the recovery/discovery signal after a supervisor restart — when the live handles are gone but the rows survive.
+11. **Kill switch is push-based, not bar-poll.** v3's "strategy reads halt flag on `on_bar`" allows up to one bar of lag (up to a minute). v4 makes `/kill-all` publish a `stop` command for every running deployment to the supervisor (immediate SIGTERM → `manage_stop=True` flatten), AND set the persistent halt flag (so a future `/start` is rejected until `/resume`), AND have the audit hook in the strategy mixin reject any new orders the moment the in-process halt flag is observed. Three layers, no bar-poll lag.
+
+**v3 → v4 changes (still in effect from prior revisions):**
+
+- Dedicated `live-supervisor` Docker container (not arq-hosted)
+- `stream_per_topic = False` — one deterministic Redis stream per trader
+- Redis pub/sub for WebSocket fan-out (multi-uvicorn-worker correctness)
+- FastAPI imports `nautilus_trader` for the Cache Python API
+- `StrategyConfig.manage_stop = True` for native flatten on stop
+- Parity harness: determinism + config round-trip + intent contract
+- Heartbeat-only liveness for **cross-container recovery** (not for in-process exit detection — see #10 above)
+- Custom `RiskEngine` subclass deleted; replaced with `RiskAwareStrategy` mixin
+- `PositionSnapshotCache` deleted (use Nautilus Cache + projection state)
+- `buffer_interval_ms = None` (write-through)
+- Audit `client_order_id` correlation key
+- Strategy code hash from file bytes
+- `instrument_cache.trading_hours` JSONB column
+- Phase 1 tasks 1.7-1.11 sequential
 
 ## What changed in revision 3
 
@@ -141,19 +176,31 @@ Service-level behavior:
 - **FastAPI is never killed by a supervisor restart** — they're separate containers. `GET /status/{deployment_id}` keeps working. If the supervisor is dead, `status` will show stale heartbeats and the `/start` and `/stop` endpoints will return 503 until the supervisor is back.
 - **Killing FastAPI** does not touch the supervisor or its children. The trading subprocess keeps running. The projection consumer (Phase 3) reconnects to the Redis consumer group on FastAPI restart and resumes streaming events from where it left off.
 
-**7. Deterministic identities derived from `deployment_id`.**
+**7. Deterministic identities derived from a stable `deployment_slug`, NOT from `deployment_id`.**
 
-Nautilus defaults `trader_id` to `TRADER-001` (collisions between deployments) and leaves `order_id_tag` at `None` (unstable strategy IDs — Codex v2 P1). v3 locks them in:
+Nautilus defaults `trader_id` to `TRADER-001` (collisions between deployments) and leaves `order_id_tag` at `None` (unstable strategy IDs — Codex v2 P1). v3 derived these from `deployment_id`, but the existing `LiveDeployment` model creates a fresh row on every restart, so `deployment_id` (and therefore `trader_id`/`order_id_tag`) changed across restarts and Phase 4 state reload could never find prior state (Codex v3 P1).
+
+v4 introduces a **stable** `deployment_slug` that survives restarts:
 
 ```python
-deployment_slug = deployment_id.hex[:8]  # 8 hex chars = 16M deployments
-trader_id = f"MSAI-{deployment_slug}"  # e.g. "MSAI-a1b2c3d4"
-order_id_tag = deployment_slug           # e.g. "a1b2c3d4"
+import secrets
+
+# At first deployment of (strategy_id, instruments_set) for a user:
+deployment_slug = secrets.token_hex(8)  # 16 hex chars = 64 bits
+                                        # birthday-collision threshold ≈ 4 billion
+trader_id = f"MSAI-{deployment_slug}"   # e.g. "MSAI-a1b2c3d4e5f60718"
+order_id_tag = deployment_slug          # e.g. "a1b2c3d4e5f60718"
 # Nautilus Strategy.id is built from f"{class_name}-{order_id_tag}"
-# -> e.g. "EMACrossStrategy-a1b2c3d4"
+# -> e.g. "EMACrossStrategy-a1b2c3d4e5f60718"
 ```
 
-These are persisted on the `live_deployments` row at creation time so `on_save`/`on_load` can key state against the same strategy_id across restarts (Phase 4 state reload is keyed by `strategy_id`, not `deployment_id`).
+The slug is persisted on the `live_deployments` row at FIRST creation. On subsequent restarts of the same logical deployment, the existing row is reused — `/api/v1/live/start` looks up `(strategy_id, instruments, paper_trading)` first, and if a stopped deployment exists, it reuses that row's `deployment_slug`. The model docstring "A new deployment row is created each time a strategy is (re-)started" is obsolete — see task 1.1b for the migration.
+
+This is the key change that makes Phase 4 state reload work: `EMACrossStrategy.on_save` writes state keyed by `f"EMACrossStrategy-{deployment_slug}"`, and on restart `on_load` reads state keyed by the same string because the slug didn't change.
+
+`live_node_processes` rows are still created per restart — they record the per-process lifecycle (pid, status, heartbeat). They reference `live_deployments.id` via FK. The split is: **`live_deployments` is the stable logical record; `live_node_processes` is the per-restart run record.**
+
+**Why 16 hex / 64 bits, not 8 / 32:** Birthday-collision likelihood for 32 bits hits ~50% at ~65k deployments. For a personal hedge fund that's far enough away to be theoretically safe but the cost of upgrading to 64 bits is zero — `secrets.token_hex(8)` is the same one-line call.
 
 **8. `stream_per_topic = False` — one Redis stream per trader.**
 
@@ -163,22 +210,30 @@ With `stream_per_topic = True`, Nautilus publishes to `events.order.{strategy_id
 
 FastAPI runs with `--workers 2`. In-memory queues live inside a single uvicorn worker, so a WebSocket client only sees events from the worker that processed them (Codex v2 P1). v3 uses a Redis pub/sub channel per deployment (`msai:live:events:{deployment_id}`). The projection consumer (one per uvicorn worker) publishes translated events to the channel; every uvicorn worker subscribes and broadcasts to its own WebSocket clients. No in-memory state shared across workers.
 
-**10. FastAPI imports `nautilus_trader` to use the Cache Python API.**
+**10. FastAPI imports `nautilus_trader` to use the Cache Python API — but ephemerally per request, not as a long-lived Cache.**
 
-Reading Nautilus's Redis keys directly is wrong — those names are internal implementation details. The right pattern is to build a transient `Cache` in FastAPI pointed at the same Redis backend:
+Reading Nautilus's Redis keys directly is wrong — those names are internal implementation details. The right pattern is to build a transient `Cache` in FastAPI pointed at the same Redis backend, populate it via `cache_all()`, read from it, and dispose it. **Each request gets a fresh `Cache`.** v3 wrongly kept long-lived `Cache` instances; the `Cache` does not subscribe to Redis updates so its view drifts after `cache_all()` (Codex v3 P1). v4 corrects both the import path and the lifetime model:
 
 ```python
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.cache.database import CacheDatabaseAdapter
-from nautilus_trader.common.config import CacheConfig, DatabaseConfig
+from nautilus_trader.cache.config import CacheConfig             # NOT common.config
+from nautilus_trader.common.config import DatabaseConfig
+from nautilus_trader.model.identifiers import StrategyId, TraderId
 
-_cache_config = CacheConfig(database=DatabaseConfig(type="redis", host=..., port=...))
-_cache_adapter = CacheDatabaseAdapter(trader_id=..., config=_cache_config)
-_cache = Cache(database=_cache_adapter)
 
-# Then:
-positions = _cache.positions_open(strategy_id=StrategyId(f"EMACrossStrategy-{slug}"))
+def read_open_positions(redis_host: str, redis_port: int, trader_id: str, strategy_id: str) -> list[Position]:
+    cfg = CacheConfig(database=DatabaseConfig(type="redis", host=redis_host, port=redis_port), encoding="msgpack")
+    adapter = CacheDatabaseAdapter(trader_id=TraderId(trader_id), config=cfg)
+    try:
+        cache = Cache(database=adapter)
+        cache.cache_all()  # one-shot batch load — NOT a live subscription
+        return cache.positions_open(strategy_id=StrategyId(strategy_id))
+    finally:
+        adapter.close()
 ```
+
+The cost (one Redis batch read per request) is acceptable because it only runs in two places: (a) the WebSocket initial-snapshot handler on connect, and (b) PositionReader's cold path when `ProjectionState` doesn't have a deployment yet (Phase 3 task 3.5). Steady-state UI reads come from `ProjectionState` (in-memory, populated by the projection consumer in 3.4), not from Cache rebuilds.
 
 This requires `nautilus_trader` as a runtime dep of the FastAPI backend (it already is). No raw key access.
 
@@ -186,7 +241,117 @@ This requires `nautilus_trader` as a runtime dep of the FastAPI backend (it alre
 
 `StrategyConfig.manage_stop = True` tells Nautilus to close all positions and cancel all orders automatically on strategy stop. v3 uses this instead of custom `on_stop` flatten code (Codex v2 P2 — we were still reinventing).
 
-**12. Each phase ends with a docker-based E2E test** that exercises the actual subprocess lifecycle, IB Gateway, Postgres, Redis, and (where relevant) the frontend.
+**12. Redis Streams PEL recovery via `XAUTOCLAIM`, not "automatic redelivery".**
+
+v3 wrongly assumed un-ACKed messages on a Redis Stream would be redelivered to a new consumer in the same group (Codex v3 P0). They are not. They sit parked in the **Pending Entries List** (PEL) for the original consumer until they are explicitly claimed by another consumer via `XCLAIM` or `XAUTOCLAIM` (Redis ≥ 6.2).
+
+v4 makes both consumer-group users (the supervisor command bus, 1.6, and the projection consumer, 3.4) explicitly recover stale pending entries:
+
+```python
+# On consumer startup, before first XREADGROUP:
+async def _recover_pending(self) -> None:
+    """Reclaim entries idle longer than min_idle_time_ms.
+
+    Run as the FIRST step in consume(): if the previous consumer
+    crashed mid-message, its un-ACKed entries are now ours to retry.
+    """
+    cursor = "0-0"
+    while True:
+        cursor, claimed, _ = await self._redis.xautoclaim(
+            name=self._stream,
+            groupname=self._group,
+            consumername=self._consumer_id,
+            min_idle_time=self._min_idle_ms,
+            start_id=cursor,
+            count=100,
+        )
+        for entry_id, fields in claimed:
+            yield self._decode(entry_id, fields)
+        if cursor == "0-0":
+            break
+```
+
+After `_recover_pending()`, the consumer enters its normal `XREADGROUP BLOCK ...` loop. On every iteration the consumer also calls `_recover_pending()` periodically (e.g. every 30 seconds) to handle the case where a peer consumer crashes mid-flight in steady state.
+
+**13. Idempotency at every layer.**
+
+v3 had no idempotency. A retried `/start` after a 504 timeout, or a supervisor crash between `process.start()` and the Redis ACK, both produced duplicate trading subprocesses with the same deterministic identity (Codex v3 P0). v4 adds three layers:
+
+- **Database layer:** A unique partial index on `live_node_processes(deployment_id)` `WHERE status IN ('starting','building','ready','running','stopping')`. Two concurrent spawns for the same `deployment_id` cannot both insert active rows.
+- **Supervisor layer:** Before spawning, the supervisor runs `SELECT ... FOR UPDATE SKIP LOCKED` on the `live_deployments` row by `deployment_slug`, then checks `live_node_processes` for an active row. If one exists, the spawn is a no-op and the command is ACKed (idempotent success). If not, it inserts and spawns. The command is ACKed **only after** the spawn is observed to succeed (`live_node_processes.status` reached `building` or later) — NOT in `finally`.
+- **API layer:** `/api/v1/live/start` accepts an `Idempotency-Key` HTTP header (RFC draft). The key is hashed to a Redis key `msai:idem:start:{hash}` with the result and a 24-hour TTL. A retry with the same key returns the cached response immediately and does NOT publish a new command. Without an idempotency key, the API still de-duplicates by checking if an active deployment exists for `(strategy_id, instruments_set)` and returns the existing one.
+
+**14. Post-start health check before writing `status="ready"`.**
+
+v3 treated `kernel.start_async()` returning as proof that reconciliation completed and trading was ready (Codex v3 P0). It is not. Nautilus can return early on:
+
+- Failed engine connect (data engine, exec engine)
+- Failed reconciliation (returns False instead of raising)
+- Failed portfolio init
+- Pending instruments not yet loaded
+
+v4 adds an explicit post-start health check in the trading subprocess (1.8):
+
+```python
+async def _wait_until_ready(node: TradingNode, timeout_s: int = 60) -> None:
+    deadline = monotonic() + timeout_s
+    while monotonic() < deadline:
+        kernel = node.kernel
+        ok = (
+            node.is_running
+            and kernel.trader.is_running
+            and kernel.data_engine.is_connected
+            and kernel.exec_engine.is_connected
+            and not kernel.exec_engine.reconciliation_active
+            and len(kernel.cache.instruments()) > 0  # at least one instrument loaded
+        )
+        if ok:
+            return
+        await asyncio.sleep(0.5)
+    raise StartupHealthCheckFailed(_diagnose(node))
+```
+
+`_diagnose` builds a structured failure reason listing exactly which condition failed. The trading subprocess catches `StartupHealthCheckFailed` in its outer try/except, writes `live_node_processes.status="failed"` with the diagnosis as `error_message`, then exits cleanly via the `finally` block (which still runs `node.dispose()`).
+
+Only when `_wait_until_ready` returns successfully does the subprocess write `status="ready"`. The `/start` API (1.14) polls for `ready` OR `failed` and returns the right HTTP status accordingly.
+
+**15. Supervisor keeps an in-memory `dict[deployment_id, mp.Process]`.**
+
+v3 threw away the `mp.Process` handles immediately after `process.start()` and relied solely on heartbeat staleness for liveness (Codex v3 P2). That works for cross-container recovery but loses **instant** in-process exit detection: the supervisor can't reap zombies, can't observe real exit codes, and can't detect a crash for up to 30 seconds.
+
+The parent (supervisor) and child (trading subprocess) are in the **same** Linux namespace (same container), so `Process.is_alive()` and `Process.exitcode` ARE meaningful. v4 keeps the handle map:
+
+```python
+class ProcessManager:
+    def __init__(self, ...) -> None:
+        self._handles: dict[UUID, mp.Process] = {}  # in-memory, supervisor-local
+        ...
+
+    async def _reap_loop(self) -> None:
+        """Background task: poll handles for exits, surface real exit codes."""
+        while not self._stop_event.is_set():
+            for deployment_id, proc in list(self._handles.items()):
+                if not proc.is_alive():
+                    await self._on_child_exit(deployment_id, proc.exitcode)
+                    del self._handles[deployment_id]
+            await asyncio.sleep(1)
+```
+
+Heartbeat freshness is still the **recovery/discovery** signal — when the supervisor itself restarts, the in-memory map is empty and we have to rediscover via the database. But for normal in-process operation, the handle map is faster, more accurate, and surfaces real exit codes.
+
+**16. Kill switch is push-based, not bar-poll.**
+
+v3's "strategy reads `msai:risk:halt` flag on every `on_bar`" allowed up to one bar of lag — for a 1-minute bar that's a 60-second lag on an emergency halt (Codex v3 P2). v4 makes `/api/v1/live/kill-all` a push:
+
+1. Set `msai:risk:halt = true` in Redis with a long TTL (persistence — survives any restart)
+2. For every `live_node_processes` row with `status IN ('ready','running')`, publish a `stop` command to the supervisor's command stream with `reason="kill_switch"` and a special flag that requests immediate flatten (the supervisor SIGTERMs the child, `manage_stop=True` flattens automatically)
+3. The pre-submit risk check in `RiskAwareStrategy` is the **third layer of defense**: it reads the halt flag from the cached value updated by an async task on every `on_bar` (still bar-cadence). This is defense-in-depth, NOT the primary mechanism.
+
+Latency from operator click to flatten: bounded by the `XADD` latency to the supervisor command stream + the supervisor's `XREADGROUP BLOCK 5000` window + SIGTERM delivery + Nautilus stop. Realistically < 5 seconds. Compared to v3's "up to one bar," this is a 12× improvement on a 1m bar and 720× on a 1h bar.
+
+`POST /api/v1/live/resume` clears `msai:risk:halt` and is required before `/start` will accept new deployments. There is no auto-resume.
+
+**17. Each phase ends with a docker-based E2E test** that exercises the actual subprocess lifecycle, IB Gateway, Postgres, Redis, and (where relevant) the frontend.
 
 ---
 
@@ -221,23 +386,177 @@ class LiveNodeProcess(Base, TimestampMixin):
     __tablename__ = "live_node_processes"
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     deployment_id: Mapped[UUID] = mapped_column(ForeignKey("live_deployments.id"), index=True)
-    pid: Mapped[int] = mapped_column(Integer, nullable=False)
+    pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # NULLABLE because the row is inserted with status="starting" BEFORE
+    # process.start() returns a pid (Codex v3 P1 fix). The supervisor
+    # updates pid to the real value after spawn.
     host: Mapped[str] = mapped_column(String(255), nullable=False)  # docker container hostname
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
-    # values: starting | ready | running | stopping | stopped | failed
+    # values: starting | building | ready | running | stopping | stopped | failed
+    # 'building' is written by the subprocess during kernel.build() — Codex v3 P1 added.
     exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        # Idempotency layer (decision #13): a deployment can have at most ONE
+        # active process row at any time. Two concurrent spawns racing on the
+        # same deployment_id will fail at the database with a uniqueness
+        # violation, which the supervisor catches and treats as "already
+        # active, ACK the command."
+        Index(
+            "uq_live_node_processes_active_deployment",
+            "deployment_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('starting','building','ready','running','stopping')"
+            ),
+        ),
+    )
 ```
 
-TDD: write a model integration test that creates a row and queries it back; then write the model + migration.
+TDD:
 
-Acceptance: integration test green; `alembic upgrade head` succeeds on a fresh database.
+1. Model integration test: create a row, query it back
+2. Insert two rows with the same `deployment_id` and `status='ready'`, assert the second insert raises `IntegrityError`
+3. Insert two rows with the same `deployment_id` where one is `status='stopped'` and the other is `status='ready'`, assert both succeed
+4. Insert a row with `pid=None`, assert success (column is nullable)
+5. Insert a row with `status='building'`, assert success
+6. Then write the model + migration
+
+Acceptance: all six tests pass; `alembic upgrade head` succeeds on a fresh database.
 
 Effort: S
 Depends on: nothing
-Gotchas: none
+Gotchas: Codex v3 P1 (nullable pid, building status, partial unique index for idempotency)
+
+---
+
+#### 1.1b — `live_deployments` schema migration (stable identity)
+
+Files:
+
+- `claude-version/backend/src/msai/models/live_deployment.py` (modify)
+- `claude-version/backend/alembic/versions/<rev>_live_deployments_stable_identity.py` (new)
+- `claude-version/backend/tests/integration/test_live_deployment_stable_identity.py` (new)
+
+The existing model docstring says "A new deployment row is created each time a strategy is (re-)started." That contradicts the v4 stable-identity model (decision #7) and breaks Phase 4 state reload (Codex v3 P1). v4 makes a `live_deployments` row a **logical, stable** record that survives restarts. Per-run state lives only in `live_node_processes`.
+
+New columns added by this migration:
+
+```python
+class LiveDeployment(Base):
+    """A live or paper-trading deployment of a strategy.
+
+    A deployment is a STABLE logical record. It is created once for a
+    given (strategy_id, instruments_set, paper_trading) tuple per user
+    and reused across restarts. Per-restart state lives in
+    live_node_processes.
+    """
+
+    # ... existing columns above ...
+
+    deployment_slug: Mapped[str] = mapped_column(String(16), nullable=False, unique=True, index=True)
+    # 16 hex chars = 64 bits, derived from secrets.token_hex(8) at first
+    # creation. Used to derive trader_id, order_id_tag, and the Nautilus
+    # message bus stream name. Stable across restarts (decision #7).
+
+    trader_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    # f"MSAI-{deployment_slug}" — convenience denormalization for log queries.
+
+    strategy_id_full: Mapped[str] = mapped_column(String(64), nullable=False)
+    # f"{strategy_class_name}-{deployment_slug}" — the Nautilus StrategyId.value
+
+    account_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    # IB account id (e.g. "DU1234567" for paper, "U1234567" for live).
+    # Stored here so PositionReader and the projection consumer can find it.
+
+    message_bus_stream: Mapped[str] = mapped_column(String(96), nullable=False)
+    # f"trader-MSAI-{deployment_slug}-stream" — the deterministic Redis
+    # stream name where Nautilus publishes events for this trader
+    # (Phase 3 task 3.2). Persisted here so the projection consumer
+    # knows what to subscribe to without polling Redis for stream names.
+
+    last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Replace the old started_at/stopped_at — those tracked the FIRST
+    # start, but a deployment can be (re-)started many times.
+
+    __table_args__ = (
+        # Logical-identity uniqueness: at most one stable deployment
+        # per (user, strategy, instruments, paper_trading). The instruments
+        # array is normalized to a sorted, comma-joined string in a
+        # generated column to make this work as a constraint.
+        Index(
+            "uq_live_deployment_logical",
+            "started_by",
+            "strategy_id",
+            "paper_trading",
+            "instruments_signature",
+            unique=True,
+        ),
+    )
+
+    instruments_signature: Mapped[str] = mapped_column(String(512), nullable=False)
+    # Sorted, comma-joined canonical instrument IDs. Computed at deployment
+    # creation time. The unique index above uses this for logical-identity
+    # de-duplication: starting the "same" deployment twice reuses the row.
+```
+
+The migration:
+
+1. Adds the new columns with default placeholders for any pre-existing rows
+2. Backfills `deployment_slug` for existing rows via `secrets.token_hex(8)` per-row
+3. Backfills `trader_id`, `strategy_id_full`, `message_bus_stream` from the slug
+4. Backfills `account_id` from the IBSettings env vars (stamped at migration time as a best-effort)
+5. Backfills `instruments_signature` by sorting and joining `instruments`
+6. Backfills `last_started_at` from `started_at`, `last_stopped_at` from `stopped_at`
+7. Creates the partial unique index on `instruments_signature`
+8. Drops the old `started_at` / `stopped_at` columns (they're now redundant)
+
+A helper service is added to compute the `instruments_signature` from a list of canonical IDs (sorted, joined with `,`). Used by `/api/v1/live/start` to look up existing deployments.
+
+```python
+# claude-version/backend/src/msai/services/live/deployment_identity.py
+def compute_instruments_signature(instruments: list[str]) -> str:
+    """Stable, normalized signature for the instrument set.
+
+    Used for logical-identity de-duplication: a 'restart' of the
+    same strategy on the same instruments returns the same row.
+    """
+    return ",".join(sorted(instruments))
+
+
+def generate_deployment_slug() -> str:
+    """16 hex chars = 64 bits. Used as the stable, deterministic
+    Nautilus identity (trader_id, order_id_tag, strategy_id)."""
+    return secrets.token_hex(8)
+
+
+def derive_trader_id(slug: str) -> str:
+    return f"MSAI-{slug}"
+
+
+def derive_message_bus_stream(slug: str) -> str:
+    return f"trader-{derive_trader_id(slug)}-stream"
+```
+
+TDD:
+
+1. Migration test: starting with the existing schema, run the upgrade, verify all new columns exist with correct types
+2. Migration test: insert a pre-existing row before the migration, run the migration, verify the row has a backfilled `deployment_slug` and `instruments_signature`
+3. Logical de-duplication test: insert two `LiveDeployment` rows with the same `(started_by, strategy_id, paper_trading, instruments_signature)`, assert the second raises `IntegrityError`
+4. Logical de-duplication test: same tuple but different `paper_trading` → both succeed
+5. Helper test: `compute_instruments_signature(["MSFT.NASDAQ", "AAPL.NASDAQ"]) == "AAPL.NASDAQ,MSFT.NASDAQ"` (sorted)
+6. Helper test: `derive_message_bus_stream("a1b2c3d4e5f60718") == "trader-MSAI-a1b2c3d4e5f60718-stream"`
+7. Implement
+
+Acceptance: all seven tests pass; `alembic upgrade head` succeeds on a fresh database AND on a database with pre-existing rows.
+
+Effort: M
+Depends on: 1.1
+Gotchas: Codex v3 P1 (schema dependencies were missing); decision #7 (stable slug)
 
 ---
 
@@ -392,7 +711,7 @@ Gotchas: #3 (client_id collision), #6 (port/account mismatch)
 
 ---
 
-#### 1.6 — Redis command stream (start/stop messages from API to worker)
+#### 1.6 — Redis command stream with explicit PEL recovery (XAUTOCLAIM)
 
 Files:
 
@@ -404,37 +723,99 @@ LIVE_COMMAND_STREAM = "msai:live:commands"
 LIVE_COMMAND_GROUP = "live-supervisor"
 
 class LiveCommandBus:
-    """Thin wrapper over Redis Streams for the API ↔ worker control plane.
+    """Thin wrapper over Redis Streams for the API ↔ supervisor control plane.
 
     Why a stream not pub/sub: pub/sub messages are lost if no consumer is
-    listening. Streams + consumer groups give us durable delivery and
-    let us survive worker restarts.
+    listening. Streams + consumer groups give us durable delivery — but
+    NOT automatic redelivery. Un-ACKed entries sit in the per-consumer
+    PEL (Pending Entries List) until explicitly claimed (Codex v3 P0).
+    This class implements XAUTOCLAIM-based recovery so a crashed
+    supervisor's un-ACKed messages are picked up by the next supervisor
+    instance (or the next iteration of the same supervisor).
+
+    Decision #12 in the pre-phase decisions documents the rationale.
     """
 
-    async def publish_start(self, deployment_id: UUID, payload: dict) -> str:
-        """Publish a start command. Returns the Redis stream entry ID."""
+    def __init__(
+        self,
+        redis: Redis,
+        stream: str = LIVE_COMMAND_STREAM,
+        group: str = LIVE_COMMAND_GROUP,
+        min_idle_ms: int = 30_000,  # entries idle longer than this are eligible for reclaim
+        recovery_interval_s: int = 30,
+    ) -> None: ...
 
-    async def publish_stop(self, deployment_id: UUID) -> str:
+    async def publish_start(self, deployment_id: UUID, payload: dict) -> str:
+        """Publish a start command. Returns the Redis stream entry ID.
+
+        Adds an `idempotency_key` field to the payload (the caller's
+        Idempotency-Key header value, or a hash of the deployment_id).
+        Used by the supervisor to deduplicate retries (decision #13).
+        """
+
+    async def publish_stop(self, deployment_id: UUID, reason: str = "user") -> str:
         """Publish a stop command."""
 
+    async def ensure_group(self) -> None:
+        """Idempotently create the consumer group via XGROUP CREATE MKSTREAM."""
+
     async def consume(self, consumer_id: str) -> AsyncIterator[LiveCommand]:
-        """Consume from the stream as part of LIVE_COMMAND_GROUP. Used by
-        the live-supervisor service in 1.7. ACKs are explicit so a crashed
-        supervisor can replay un-ACKed messages on restart.
+        """Consume from the stream as part of LIVE_COMMAND_GROUP.
+
+        Lifecycle per call to consume():
+        1. ensure_group() — idempotent XGROUP CREATE MKSTREAM
+        2. _recover_pending() — XAUTOCLAIM stale entries from any
+           crashed peer (or our own previous run); yield each one
+        3. Enter the steady-state XREADGROUP BLOCK 5000 COUNT N loop
+        4. Every recovery_interval_s, call _recover_pending() again to
+           handle peers crashing in steady state
+        5. Each yielded LiveCommand has an `entry_id` the caller MUST
+           pass back to ack(entry_id) — explicit ack semantics, no
+           auto-ack-on-yield. The caller decides when to ACK (decision
+           #13: ACK only on success, never in finally).
+        """
+
+    async def ack(self, entry_id: str) -> None:
+        """XACK the entry. Call only after the command has been
+        successfully handled and observed in the database (e.g.,
+        live_node_processes row reached 'building' or later)."""
+
+    async def _recover_pending(self) -> AsyncIterator[LiveCommand]:
+        """Reclaim entries from peers that have been idle longer than
+        min_idle_ms. Yields the same LiveCommand stream as the steady
+        state. Implementation:
+
+        cursor = "0-0"
+        while True:
+            cursor, claimed, _ = await redis.xautoclaim(
+                name=stream, groupname=group,
+                consumername=consumer_id,
+                min_idle_time=min_idle_ms,
+                start_id=cursor,
+                count=100,
+            )
+            for entry_id, fields in claimed:
+                yield LiveCommand.from_redis(entry_id, fields)
+            if cursor == "0-0":
+                break
         """
 ```
 
 TDD:
 
-1. Integration test against testcontainers Redis: publish 3 commands, consume them, ACK each, verify they're not redelivered
-2. Test that an un-ACKed command IS redelivered to a new consumer in the same group
-3. Implement
+1. Integration test against testcontainers Redis: publish 3 commands, consume + ACK each, verify they don't reappear on next consume
+2. Integration test: publish a command, consume it WITHOUT ACKing (simulating a crash), call consume again from the SAME consumer_id with `min_idle_ms=0` — verify the pending entry is yielded
+3. Integration test: publish a command, consume from `consumer_a` without ACKing, then call consume from `consumer_b` (different consumer_id) with `min_idle_ms=0` — verify `consumer_b` reclaims and yields the pending entry via `_recover_pending`
+4. Integration test: verify that without `_recover_pending`, the entry would NOT be auto-redelivered (sanity check that the recovery is necessary)
+5. Test the idempotency_key field is preserved through publish → consume
+6. Test that `ack` outside the yielded entry does not crash
+7. Implement
 
-Acceptance: tests pass.
+Acceptance: tests pass; the documentation explicitly notes "un-ACKed entries are NOT auto-redelivered, see \_recover_pending".
 
 Effort: M
 Depends on: nothing
-Gotchas: none (Codex finding #5 informs the consumer group choice)
+Gotchas: Codex v3 P0 (PEL semantics — explicit XAUTOCLAIM, not auto-redelivery)
 
 ---
 
@@ -460,14 +841,18 @@ async def run_forever() -> None:
     """Main supervisor loop.
 
     Consumes commands from msai:live:commands via a Redis consumer
-    group. Runs a background heartbeat monitor that marks orphaned
-    processes as failed.
+    group with explicit XAUTOCLAIM-based PEL recovery (decision #12).
+    Maintains an in-memory dict[deployment_id, mp.Process] handle map
+    (decision #15) and a background reap loop that surfaces real exit
+    codes the moment a child dies.
 
     Runs until SIGTERM. On shutdown:
     - stop consuming new commands
+    - drain in-flight handlers
     - do NOT send SIGTERM to any running trading subprocesses —
       they're owned by this container's OS and will be reaped when
-      the container exits
+      the container exits. The next supervisor start re-discovers
+      surviving subprocesses via heartbeat-fresh rows.
     """
     bus = LiveCommandBus(redis=get_redis())
     process_manager = ProcessManager(db=async_session_factory)
@@ -477,50 +862,237 @@ async def run_forever() -> None:
     install_signal_handlers(stop_event)
 
     monitor_task = asyncio.create_task(heartbeat_monitor.run_forever(stop_event))
+    reap_task = asyncio.create_task(process_manager.reap_loop(stop_event))
 
     try:
         async for command in bus.consume("supervisor-1", stop_event):
+            ok = False
             try:
                 if command.action == "start":
-                    await process_manager.spawn(command.deployment_id, command.payload)
+                    ok = await process_manager.spawn(
+                        deployment_id=command.deployment_id,
+                        deployment_slug=command.deployment_slug,
+                        payload=command.payload,
+                        idempotency_key=command.idempotency_key,
+                    )
                 elif command.action == "stop":
-                    await process_manager.stop(command.deployment_id)
+                    ok = await process_manager.stop(command.deployment_id, reason=command.reason)
                 else:
                     logger.warning("unknown_command", action=command.action)
+                    ok = True  # ACK so we don't loop forever on a malformed command
             except Exception as exc:
-                logger.exception("command_failed", error=str(exc))
-            finally:
-                await bus.ack(command)
+                logger.exception("command_failed", entry_id=command.entry_id, error=str(exc))
+                ok = False  # leave it in the PEL for XAUTOCLAIM-based retry
+
+            # Decision #13: ACK only on success. Failures stay in the PEL
+            # so a future _recover_pending() sweep retries them.
+            if ok:
+                await bus.ack(command.entry_id)
     finally:
         monitor_task.cancel()
+        reap_task.cancel()
 ```
 
 `process_manager.py`:
 
 ```python
 class ProcessManager:
-    async def spawn(self, deployment_id: UUID, payload: dict) -> None:
-        """Spawn a new trading subprocess and write its row to live_node_processes."""
-        row_id = await self._insert_starting_row(deployment_id)
-        ctx = multiprocessing.get_context("spawn")
-        process = ctx.Process(
-            target=_trading_node_subprocess,
-            args=(TradingNodePayload.from_dict(payload),),
-        )
-        process.start()
-        await self._update_pid(row_id, process.pid)
+    """Owns the trading subprocesses spawned by this supervisor instance.
 
-    async def stop(self, deployment_id: UUID) -> None:
-        """Send SIGTERM to the subprocess pid. Escalate to SIGKILL after 30s."""
-        row = await self._get_running_row(deployment_id)
-        if row is None:
-            return
-        os.kill(row.pid, signal.SIGTERM)
-        await self._wait_for_stop(row.id, timeout_seconds=30)
-        # If still running, escalate
-        if await self._status(row.id) not in ("stopped", "failed"):
-            os.kill(row.pid, signal.SIGKILL)
-            await self._mark_failed(row.id, reason="hard kill on stop timeout")
+    Idempotency model (decision #13):
+    - The DB has a unique partial index on live_node_processes(deployment_id)
+      WHERE status IN active states. Two concurrent spawns for the same
+      deployment cannot both insert active rows.
+    - spawn() pre-checks for an existing active row. If found, returns
+      True (idempotent success — the command can be ACKed).
+    - spawn() catches IntegrityError on the partial index as the second
+      line of defense and treats it as idempotent success.
+
+    Handle map (decision #15):
+    - self._handles maps deployment_id → mp.Process while the supervisor
+      is alive. Used by reap_loop for instant exit detection (parent and
+      child are in the same Linux namespace, so Process.is_alive() works).
+    - On supervisor restart, the map is empty. Rediscovery is via the
+      heartbeat: stale rows are flipped to 'failed' by HeartbeatMonitor;
+      fresh rows are still running (their pids may even still match,
+      but we don't rely on that).
+    """
+
+    def __init__(self, db: async_sessionmaker[AsyncSession]) -> None:
+        self._db = db
+        self._handles: dict[UUID, mp.Process] = {}
+
+    async def spawn(
+        self,
+        deployment_id: UUID,
+        deployment_slug: str,
+        payload: dict,
+        idempotency_key: str,
+    ) -> bool:
+        """Spawn a new trading subprocess. Returns True on success or
+        idempotent no-op, False on hard failure (caller should NOT ACK).
+
+        Steps:
+        1. SELECT FOR UPDATE on the live_deployments row by deployment_slug
+        2. Check live_node_processes for an active row for this deployment_id
+           - If found and status in (starting, building, ready, running):
+             return True (idempotent — already running)
+           - If found and status in (stopping): return False (busy, retry later)
+        3. INSERT live_node_processes with status='starting', pid=NULL
+           (catch IntegrityError on the partial unique index → return True)
+        4. ctx = mp.get_context("spawn"); process = ctx.Process(...); start()
+        5. UPDATE live_node_processes.pid with the real pid
+        6. Stash process in self._handles[deployment_id]
+        7. Return True
+        """
+        async with self._db() as session, session.begin():
+            deployment = await session.execute(
+                select(LiveDeployment)
+                .where(LiveDeployment.deployment_slug == deployment_slug)
+                .with_for_update()
+            )
+            deployment = deployment.scalar_one_or_none()
+            if deployment is None:
+                logger.error("spawn_no_deployment", deployment_slug=deployment_slug)
+                return False  # Hard failure — leave in PEL for ops investigation
+
+            existing = await session.execute(
+                select(LiveNodeProcess).where(
+                    LiveNodeProcess.deployment_id == deployment_id,
+                    LiveNodeProcess.status.in_(("starting", "building", "ready", "running")),
+                )
+            )
+            if existing.scalar_one_or_none() is not None:
+                logger.info("spawn_idempotent", deployment_id=str(deployment_id))
+                return True  # Already active — idempotent success
+
+            try:
+                row = LiveNodeProcess(
+                    deployment_id=deployment_id,
+                    pid=None,  # filled after process.start()
+                    host=socket.gethostname(),
+                    started_at=utcnow(),
+                    last_heartbeat_at=utcnow(),
+                    status="starting",
+                )
+                session.add(row)
+                await session.flush()
+            except IntegrityError:
+                # Partial unique index caught a race
+                logger.info("spawn_race_idempotent", deployment_id=str(deployment_id))
+                return True
+
+            ctx = mp.get_context("spawn")
+            process = ctx.Process(
+                target=_trading_node_subprocess,
+                args=(TradingNodePayload.from_dict(payload),),
+            )
+            process.start()
+            row.pid = process.pid
+            await session.flush()
+            self._handles[deployment_id] = process
+
+        return True
+
+    async def stop(self, deployment_id: UUID, reason: str = "user") -> bool:
+        """Send SIGTERM to the subprocess. Escalate to SIGKILL after 30s.
+
+        Returns True on success (or idempotent no-op), False on hard failure.
+
+        Uses self._handles[deployment_id] for in-process cases. For supervisor-
+        restart-discovered subprocesses (no handle), reads pid from the row
+        and signals it directly. Both paths are in the same container
+        namespace so the pid is meaningful.
+        """
+        async with self._db() as session:
+            row = await session.execute(
+                select(LiveNodeProcess)
+                .where(
+                    LiveNodeProcess.deployment_id == deployment_id,
+                    LiveNodeProcess.status.in_(("starting", "building", "ready", "running")),
+                )
+                .order_by(LiveNodeProcess.started_at.desc())
+                .limit(1)
+            )
+            row = row.scalar_one_or_none()
+            if row is None:
+                logger.info("stop_idempotent", deployment_id=str(deployment_id))
+                return True  # Already stopped
+            row.status = "stopping"
+            await session.commit()
+
+        process = self._handles.get(deployment_id)
+        pid = process.pid if process is not None else row.pid
+        if pid is None:
+            logger.error("stop_no_pid", deployment_id=str(deployment_id))
+            return False
+
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            # Already gone — reap_loop will catch up
+            return True
+
+        # Wait up to 30s for the row to flip to stopped/failed
+        async with self._db() as session:
+            for _ in range(30):
+                await asyncio.sleep(1)
+                cur = await session.get(LiveNodeProcess, row.id)
+                if cur.status in ("stopped", "failed"):
+                    return True
+            # Escalate
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            cur.status = "failed"
+            cur.error_message = "hard kill on stop timeout"
+            cur.exit_code = -9
+            await session.commit()
+        return True
+
+    async def reap_loop(self, stop_event: asyncio.Event) -> None:
+        """Background task: poll handles for exits, surface real exit codes.
+
+        Decision #15: parent + child are in the same namespace, so
+        Process.is_alive() and Process.exitcode are meaningful and
+        give instant exit detection. Heartbeat is only the recovery
+        signal across supervisor restarts.
+        """
+        while not stop_event.is_set():
+            for deployment_id, proc in list(self._handles.items()):
+                if not proc.is_alive():
+                    proc.join(timeout=1)
+                    await self._on_child_exit(deployment_id, proc.exitcode)
+                    del self._handles[deployment_id]
+            await asyncio.sleep(1)
+
+    async def _on_child_exit(self, deployment_id: UUID, exit_code: int | None) -> None:
+        """Called when self._handles[deployment_id] is no longer alive.
+
+        Updates live_node_processes.status to 'stopped' (exit_code 0)
+        or 'failed' (non-zero), records the real exit_code, and emits
+        an alert if the exit was unexpected.
+        """
+        async with self._db() as session, session.begin():
+            row = await session.execute(
+                select(LiveNodeProcess)
+                .where(
+                    LiveNodeProcess.deployment_id == deployment_id,
+                    LiveNodeProcess.status.in_(("starting", "building", "ready", "running", "stopping")),
+                )
+                .order_by(LiveNodeProcess.started_at.desc())
+                .limit(1)
+            )
+            row = row.scalar_one_or_none()
+            if row is None:
+                return
+            if exit_code == 0:
+                row.status = "stopped"
+            else:
+                row.status = "failed"
+                row.error_message = f"child exited with code {exit_code}"
+            row.exit_code = exit_code
 ```
 
 `heartbeat_monitor.py`:
@@ -564,26 +1136,34 @@ live-supervisor:
 
 TDD:
 
-1. Unit test `ProcessManager.spawn` with a patched `multiprocessing`: verify a row is inserted with status="starting", verify `start()` is called, verify the pid is updated
-2. Unit test `ProcessManager.stop` with a patched `os.kill`: verify SIGTERM, wait loop, SIGKILL escalation
-3. Unit test `HeartbeatMonitor._mark_stale_as_failed` with a mock DB
-4. Integration test against testcontainers Postgres + Redis: publish a start command via `LiveCommandBus`, verify the supervisor consumes it and inserts a row (use a no-op stub for `_trading_node_subprocess`)
-5. Implement
+1. Unit test `ProcessManager.spawn` with a patched `multiprocessing`: verify a row is inserted with `status="starting"` and `pid=None`, then updated with the real pid after `start()`
+2. **Idempotency unit test #1**: pre-seed an active row for `deployment_id`, call `spawn(deployment_id)`, verify it returns True without spawning a new process and without inserting a new row
+3. **Idempotency unit test #2**: simulate a race — patch `INSERT` to raise `IntegrityError` (the partial unique index fired), assert `spawn` catches it and returns True
+4. Unit test `ProcessManager.stop` with the handle map populated: verify SIGTERM, wait loop, SIGKILL escalation, real exit code recorded
+5. Unit test `ProcessManager.stop` when the handle map is empty (rediscovered subprocess): verify pid is read from the row and signaled
+6. **Reap loop unit test**: stash a fake `Process` whose `is_alive()` returns False and `exitcode == 1`, run one iteration of `reap_loop`, verify `live_node_processes` row is `status='failed'`, `exit_code=1`, error_message contains "child exited with code 1"
+7. Unit test `HeartbeatMonitor._mark_stale_as_failed` with a mock DB
+8. **ACK-on-success-only test**: invoke `run_forever`'s command handler with a mock that returns False (failure), assert `bus.ack` is NOT called; with True (success), assert ack IS called
+9. Integration test against testcontainers Postgres + Redis: publish a start command via `LiveCommandBus`, verify the supervisor consumes it, inserts a row, calls `_trading_node_subprocess` (use a no-op stub)
+10. Integration test: publish two `start` commands for the same deployment_id back-to-back, verify only one trading subprocess is spawned and the second command is also ACKed
+11. Implement
 
 Acceptance: tests pass; the service stands up in `docker compose up -d live-supervisor`.
 
 Effort: L
-Depends on: 1.1, 1.5, 1.6
-Gotchas: #18 (asyncio.run conflict — the supervisor owns its own event loop via `asyncio.run(run_forever())`)
+Depends on: 1.1, 1.1b, 1.5, 1.6
+Gotchas: Codex v3 P0 (idempotency at DB + supervisor + ACK-on-success), Codex v3 P2 (handle map for instant exit detection), #18 (asyncio.run conflict — the supervisor owns its own event loop via `asyncio.run(run_forever())`)
 
 ---
 
-#### 1.8 — Trading subprocess entry point (with deterministic identities)
+#### 1.8 — Trading subprocess entry point (with deterministic identities + post-start health check)
 
 Files:
 
 - `claude-version/backend/src/msai/services/nautilus/trading_node.py` (full rewrite)
+- `claude-version/backend/src/msai/services/nautilus/startup_health.py` (new)
 - `claude-version/backend/tests/unit/test_trading_node_subprocess.py` (new)
+- `claude-version/backend/tests/unit/test_startup_health.py` (new)
 
 Top-level function (must be importable for `spawn` pickling):
 
@@ -598,41 +1178,135 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> None:
     3. Connect to Postgres, write LiveNodeProcess.status="building"
     4. Install the SIGTERM handler: calls node.stop_async() via asyncio.run_coroutine_threadsafe
     5. Build the TradingNodeConfig via build_live_trading_node_config
-       - trader_id = f"MSAI-{deployment_slug}"  (deterministic, from payload)
+       - trader_id = f"MSAI-{deployment_slug}"  (deterministic, from payload — STABLE across restarts, decision #7)
        - strategies[0].order_id_tag = deployment_slug
        - manage_stop = True  (native flatten on stop — no custom on_stop needed)
     6. Construct TradingNode
     7. Register IB factories under key "IB"
     8. node.build()
     9. Start the heartbeat thread (1.9)
-    10. node.run() — blocks until SIGTERM (kernel internally completes
-        reconciliation before returning from start_async, so reaching run()
-        means reconciliation is complete — gotchas #5/#10 handled by kernel)
-    11. Immediately after node.run() enters its main loop (via a post-start
-        callback registered on the kernel), write LiveNodeProcess.status="ready"
-    12. finally:
+    10. node.start_async() — connects to engines, runs reconciliation
+    11. POST-START HEALTH CHECK (decision #14, NEW IN v4):
+        - Wait until is_running AND data_engine.is_connected AND
+          exec_engine.is_connected AND not exec_engine.reconciliation_active
+          AND len(cache.instruments()) > 0
+        - Raises StartupHealthCheckFailed on timeout (default 60s) with
+          a structured diagnosis describing which condition failed
+        - This is the v4 fix for Codex v3 P0: kernel.start_async() can
+          return without raising even when reconciliation, engine connect,
+          or portfolio init failed silently. Don't trust the return; verify.
+    12. Only after the health check passes, write LiveNodeProcess.status="ready"
+    13. node.run() — blocks until SIGTERM
+    14. finally:
         - Heartbeat thread stopped
         - node.stop_async() — Nautilus closes positions and cancels orders
           automatically because manage_stop=True
         - node.dispose() — releases Rust logger and sockets (gotcha #20)
-        - LiveNodeProcess.status="stopped", exit_code=0
+        - On clean exit: LiveNodeProcess.status="stopped", exit_code=0
+        - On StartupHealthCheckFailed: LiveNodeProcess.status="failed",
+          error_message=diagnosis, exit_code=2
+        - On any other exception: status="failed", error_message=traceback,
+          exit_code=1
 """
 ```
 
-The deterministic identities from decision #7 are injected here. `payload.deployment_slug` comes from the supervisor, which reads it from the `live_deployments` row. The `trader_id` and `order_id_tag` are stable across restarts so Nautilus's cache and state persistence can key against them consistently.
+`startup_health.py`:
+
+```python
+@dataclass(slots=True, frozen=True)
+class StartupHealthDiagnosis:
+    is_running: bool
+    data_engine_connected: bool
+    exec_engine_connected: bool
+    reconciliation_complete: bool
+    instruments_loaded: int
+    failure_reason: str  # human-readable
+
+    def is_healthy(self) -> bool:
+        return (
+            self.is_running
+            and self.data_engine_connected
+            and self.exec_engine_connected
+            and self.reconciliation_complete
+            and self.instruments_loaded > 0
+        )
+
+
+class StartupHealthCheckFailed(Exception):
+    def __init__(self, diagnosis: StartupHealthDiagnosis) -> None:
+        self.diagnosis = diagnosis
+        super().__init__(diagnosis.failure_reason)
+
+
+def diagnose_node(node: "TradingNode") -> StartupHealthDiagnosis:
+    """Inspect the running node and return the current health snapshot.
+
+    Pure inspection — no side effects, safe to call repeatedly.
+    """
+    kernel = node.kernel
+    is_running = bool(node.is_running and kernel.trader.is_running)
+    data_connected = bool(kernel.data_engine.is_connected)
+    exec_connected = bool(kernel.exec_engine.is_connected)
+    reconciled = not bool(kernel.exec_engine.reconciliation_active)
+    instruments = len(kernel.cache.instruments())
+
+    if not is_running:
+        reason = "trader not running"
+    elif not data_connected:
+        reason = "data engine not connected"
+    elif not exec_connected:
+        reason = "exec engine not connected"
+    elif not reconciled:
+        reason = "reconciliation still active"
+    elif instruments == 0:
+        reason = "no instruments loaded into cache"
+    else:
+        reason = "healthy"
+
+    return StartupHealthDiagnosis(
+        is_running=is_running,
+        data_engine_connected=data_connected,
+        exec_engine_connected=exec_connected,
+        reconciliation_complete=reconciled,
+        instruments_loaded=instruments,
+        failure_reason=reason,
+    )
+
+
+async def wait_until_ready(node: "TradingNode", timeout_s: int = 60) -> StartupHealthDiagnosis:
+    """Poll the node until all health conditions are true or timeout.
+
+    Returns the healthy diagnosis on success.
+    Raises StartupHealthCheckFailed with the LAST diagnosis on timeout.
+    """
+    deadline = monotonic() + timeout_s
+    diagnosis = diagnose_node(node)
+    while monotonic() < deadline:
+        diagnosis = diagnose_node(node)
+        if diagnosis.is_healthy():
+            return diagnosis
+        await asyncio.sleep(0.5)
+    raise StartupHealthCheckFailed(diagnosis)
+```
+
+The deterministic identities from decision #7 are injected here. `payload.deployment_slug` comes from the supervisor, which reads it from the `live_deployments` row (now stable across restarts per task 1.1b). The `trader_id` and `order_id_tag` are stable across restarts so Nautilus's cache and state persistence can key against them consistently.
 
 TDD:
 
-1. Unit test with all `nautilus_trader` imports mocked: verify policy reset is called, verify the status state machine writes the right rows, verify `dispose()` is called in finally, verify `trader_id` is `f"MSAI-{slug}"`, verify `manage_stop=True` is set
-2. Unit test that an exception inside `node.run()` still triggers the finally block
-3. Unit test that SIGTERM triggers `node.stop_async`
-4. Implement
+1. Unit test `diagnose_node` with mock TradingNode in each failure state (data not connected, exec not connected, reconciliation active, no instruments) — verify the right `failure_reason`
+2. Unit test `wait_until_ready` with a stub that flips to healthy on the third poll — verify it returns the healthy diagnosis
+3. Unit test `wait_until_ready` with a stub that never becomes healthy — verify `StartupHealthCheckFailed` is raised after timeout with the last diagnosis attached
+4. Unit test `_trading_node_subprocess` with all `nautilus_trader` imports mocked: verify policy reset is called, verify `status="starting"` → `building` → `ready` state machine, verify `dispose()` is called in finally, verify `trader_id` is `f"MSAI-{slug}"`, verify `manage_stop=True` is set
+5. Unit test that `StartupHealthCheckFailed` causes the subprocess to write `status="failed"` with the diagnosis as `error_message`, exit_code=2, and still call `dispose()` in finally
+6. Unit test that an exception inside `node.run()` still triggers the finally block with status="failed", exit_code=1
+7. Unit test that SIGTERM triggers `node.stop_async`
+8. Implement
 
 Acceptance: tests pass.
 
 Effort: L
 Depends on: 1.1, 1.5
-Gotchas: #1 (uvloop), #5 (kernel handles), #10 (kernel handles), #13 (manage_stop handles), #18 (asyncio.run), #20 (dispose)
+Gotchas: #1 (uvloop), Codex v3 P0 (post-start health check — kernel.start_async return is NOT proof of readiness), #13 (manage_stop handles flatten), #18 (asyncio.run), #20 (dispose)
 
 ---
 
@@ -857,40 +1531,125 @@ Gotchas: Codex #13 (route was missing)
 
 ---
 
-#### 1.14 — Wire `/api/v1/live/start` and `/stop` to the command bus
+#### 1.14 — Wire `/api/v1/live/start` and `/stop` to the command bus (with idempotency)
 
 Files:
 
 - `claude-version/backend/src/msai/api/live.py` (modify start/stop endpoints)
+- `claude-version/backend/src/msai/services/live/idempotency.py` (new — Idempotency-Key store)
 - `claude-version/backend/tests/integration/test_live_start_stop_endpoints.py` (new)
+- `claude-version/backend/tests/integration/test_live_start_idempotency.py` (new)
 
 `POST /api/v1/live/start`:
 
-1. Create the `live_deployments` row with `strategy_code_hash` from 1.12
-2. Publish a start command to the Redis stream via `LiveCommandBus.publish_start`
-3. Poll `live_node_processes` for `status="ready"` or `status="failed"` with timeout (30s default)
-4. On `ready`: return 201 + deployment_id
-5. On `failed`: return 503 + error message
-6. On timeout: return 504, supervisor will eventually clean up
+```python
+@router.post("/start", status_code=201, response_model=LiveDeploymentResponse)
+async def start_live_deployment(
+    body: LiveDeploymentStartRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    db: AsyncSession = Depends(get_db),
+    bus: LiveCommandBus = Depends(get_command_bus),
+    user: User = Depends(get_current_user),
+) -> LiveDeploymentResponse:
+    """Start (or re-start) a live deployment.
+
+    Idempotency layers (decision #13):
+
+    1. HTTP Idempotency-Key: if the header is set, the (key, hash(body))
+       pair is looked up in Redis. A retry within the TTL returns the
+       cached response unchanged. Mismatch (same key, different body)
+       returns 422.
+
+    2. Logical de-duplication by (started_by, strategy_id, paper_trading,
+       instruments_signature): if a STABLE live_deployments row already
+       exists for this user+strategy+instrument-set, reuse it. The
+       deployment_slug, trader_id, etc. all stay the same.
+
+    3. Active-process de-duplication: if the existing deployment already
+       has a live_node_processes row in (starting,building,ready,running),
+       return 200 with the existing deployment_id WITHOUT publishing a
+       new command.
+
+    Workflow:
+    A. If Idempotency-Key set, check the cache; on hit, return cached response
+    B. Look up existing live_deployments by (user, strategy_id, instruments_signature, paper_trading)
+       - Found: reuse row, keep deployment_slug
+       - Not found: INSERT new row with secrets.token_hex(8) as deployment_slug
+    C. Look up active live_node_processes for that deployment
+       - Active: return 200 + existing deployment_id (no new command)
+       - Not active: continue
+    D. Publish start command via LiveCommandBus.publish_start (carries
+       deployment_id, deployment_slug, idempotency_key, trader_id, etc.)
+    E. Poll live_node_processes for status='ready' or status='failed' with
+       a configurable timeout (default 60s, matches the subprocess
+       startup_health_timeout_seconds from decision #14)
+    F. On 'ready': return 201 + LiveDeploymentResponse
+    G. On 'failed': return 503 + error_message from the row
+    H. On timeout: return 504 (the supervisor will eventually catch up;
+       caller can retry with the SAME Idempotency-Key)
+    I. Cache the response in the Idempotency-Key store with 24h TTL
+    """
+```
+
+`idempotency.py` — Idempotency-Key store:
+
+```python
+class IdempotencyStore:
+    """Redis-backed Idempotency-Key cache for /start.
+
+    Key: msai:idem:start:{sha256(idempotency_key)}
+    Value: msgpack-encoded {body_hash, status_code, response_json}
+    TTL: 24 hours
+
+    Behavior:
+    - get(key, body_hash): None if no entry, the cached response if hit
+                           with matching body_hash, raises BodyMismatch
+                           if same key but different body
+    - put(key, body_hash, response, status_code): write with TTL
+    """
+
+    async def get(self, key: str, body_hash: str) -> CachedResponse | None: ...
+    async def put(self, key: str, body_hash: str, response: dict, status_code: int) -> None: ...
+```
 
 `POST /api/v1/live/stop`:
 
-1. Publish a stop command via `LiveCommandBus.publish_stop`
-2. Poll `live_node_processes` for `status in ("stopped", "failed")` with timeout (30s)
-3. Return 200
+```python
+@router.post("/stop")
+async def stop_live_deployment(
+    body: LiveDeploymentStopRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    db: AsyncSession = Depends(get_db),
+    bus: LiveCommandBus = Depends(get_command_bus),
+    _user: User = Depends(get_current_user),
+):
+    """Stop a running deployment.
+
+    Idempotent: if no active live_node_processes row exists, return 200
+    immediately (already stopped). Otherwise publish a stop command and
+    poll for status in (stopped, failed) with a 60s timeout.
+
+    Idempotency-Key handling identical to /start.
+    """
+```
 
 TDD:
 
-1. Integration test: start endpoint publishes to stream, mocked supervisor flips status to "ready", endpoint returns 201
-2. Integration test: stop endpoint publishes, mocked supervisor flips status to "stopped"
-3. Test timeouts return the right HTTP status codes
-4. Implement
+1. Integration test: `/start` with no `Idempotency-Key` header for a fresh strategy → publishes, mocked supervisor flips to ready, returns 201
+2. Integration test: `/start` twice with the SAME `Idempotency-Key` and identical body within the TTL → second call returns the cached 201 without re-publishing
+3. Integration test: `/start` twice with the SAME `Idempotency-Key` but different body → second returns 422
+4. Integration test: `/start` twice without `Idempotency-Key` for the same `(strategy_id, instruments_signature)` while the first is still running → second returns 200 (logical de-dup) with the existing deployment_id and does NOT publish a new command
+5. Integration test: `/start` for a previously stopped deployment of the same `(strategy_id, instruments_signature)` → reuses the existing live_deployments row (verify same `deployment_slug`)
+6. Integration test: stop endpoint publishes, mocked supervisor flips status to stopped
+7. Integration test: stop endpoint when no active row exists → returns 200 immediately
+8. Test timeouts return 504
+9. Implement
 
 Acceptance: tests pass.
 
 Effort: M
-Depends on: 1.6, 1.13
-Gotchas: none
+Depends on: 1.1b, 1.6, 1.13
+Gotchas: Codex v3 P0 (idempotency layer #3 — HTTP Idempotency-Key + logical + DB)
 
 ---
 
@@ -1574,16 +2333,55 @@ Files:
 
 Background asyncio task in **each** FastAPI uvicorn worker that:
 
-1. On startup, queries `live_deployments` for all rows with `status in ("ready", "running")` and pulls their `message_bus_stream` name (from 3.2)
+1. On startup, queries `live_deployments` for all rows with an active `live_node_processes` row (status in ready/running) and pulls their `message_bus_stream` name (from 3.2)
 2. Joins the Redis consumer group `msai-projection` on each active stream via `XGROUP CREATE MKSTREAM` (idempotent)
-3. Consumes via `XREADGROUP BLOCK 5000 COUNT 100` — durable: un-ACKed messages survive FastAPI restart
-4. Decodes Nautilus events using `MsgSpecSerializer` from `nautilus_trader.serialization.serializer`
-5. Routes by the in-message `topic` field — the translator is a `dict[topic_prefix, translator_fn]` lookup
-6. Translates each Nautilus event to the internal schema (3.3) via `translator.py`
-7. **Publishes** the translated internal event to the per-deployment Redis pub/sub channel `msai:live:events:{deployment_id}` via `PUBLISH` (JSON-encoded)
-8. `XACK`s the Redis stream message only after `PUBLISH` returns successfully (at-least-once delivery)
-9. On deployment start, a new stream is registered via the `StreamRegistry` (3.4 sub-module) — the consumer picks it up on the next iteration of its loop
-10. On deployment stop, the stream is deregistered and the consumer closes it after draining
+3. **Recovers any pending entries from the PEL** via `XAUTOCLAIM` for entries idle longer than `min_idle_ms` (default 30s) — un-ACKed messages from a previously crashed projection consumer (Codex v3 P0). This is the v4 fix for the false assumption that messages are auto-redelivered.
+4. Consumes via `XREADGROUP BLOCK 5000 COUNT 100`
+5. Decodes Nautilus events using `MsgSpecSerializer` from `nautilus_trader.serialization.serializer`
+6. Routes by the in-message `topic` field — the translator is a `dict[topic_prefix, translator_fn]` lookup
+7. Translates each Nautilus event to the internal schema (3.3) via `translator.py`
+8. **Publishes** the translated internal event to the per-deployment Redis pub/sub channel `msai:live:events:{deployment_id}` via `PUBLISH` (JSON-encoded)
+9. **Updates the in-memory projection state** (`projection_state.py`, see below) so PositionReader can serve fast snapshot reads without rebuilding a Cache
+10. `XACK`s the Redis stream message ONLY after both `PUBLISH` and the in-memory state update succeed (at-least-once delivery, ACK only on success — never in `finally`, mirrors decision #13)
+11. Every `recovery_interval_s` (default 30s), re-runs `XAUTOCLAIM` to catch entries from peers that crashed mid-flight after the initial recovery sweep
+12. On deployment start, a new stream is registered via the `StreamRegistry` — the consumer picks it up on the next iteration of its loop
+13. On deployment stop, the stream is deregistered and the consumer closes it after draining
+
+**`projection_state.py`** — in-memory live state populated by the consumer (added in v4 to make `PositionReader` work without long-lived Caches):
+
+```python
+class ProjectionState:
+    """In-memory rolling state of every active deployment, populated by the
+    projection consumer from translated MessageBus events. Used by
+    PositionReader (3.5) for fast UI reads — no Nautilus Cache rebuild
+    on every request.
+
+    State is per-uvicorn-worker. The pub/sub fan-out (step 8 above) is
+    what keeps WebSocket clients consistent across workers. The internal
+    state is for snapshot reads only.
+    """
+
+    def __init__(self) -> None:
+        self._positions: dict[UUID, dict[str, PositionSnapshot]] = {}
+        self._accounts: dict[UUID, AccountStateUpdate] = {}
+
+    def apply(self, deployment_id: UUID, event: InternalEvent) -> None:
+        """Single dispatcher: routes the translated event into the right
+        in-memory bucket. Called by the projection consumer after a
+        successful translate but BEFORE the XACK."""
+        match event:
+            case PositionSnapshot(): self._upsert_position(deployment_id, event)
+            case OrderStatusChange(): pass  # not state-relevant
+            case FillEvent(): pass  # the resulting PositionSnapshot covers it
+            case AccountStateUpdate(): self._accounts[deployment_id] = event
+            case PositionClosedEvent(): self._remove_position(deployment_id, event.instrument_id)
+
+    def positions(self, deployment_id: UUID) -> list[PositionSnapshot]:
+        return list(self._positions.get(deployment_id, {}).values())
+
+    def account(self, deployment_id: UUID) -> AccountStateUpdate | None:
+        return self._accounts.get(deployment_id)
+```
 
 `registry.py` — `StreamRegistry`:
 
@@ -1629,77 +2427,88 @@ async def publish_event(
 TDD:
 
 1. Unit test translator with each Nautilus event type (order filled, order rejected, position opened, position closed, account state)
-2. Integration test: publish a synthetic `OrderFilled` payload to the Redis stream, verify the consumer receives it via the group, translates it, publishes to pub/sub, and ACKs
+2. Integration test: publish a synthetic `OrderFilled` payload to the Redis stream, verify the consumer receives it via the group, translates it, publishes to pub/sub, updates ProjectionState, and ACKs
 3. Integration test: two pub/sub subscribers (simulating two uvicorn workers), publish one event via the consumer, verify both receive it
-4. Integration test: kill the consumer mid-message (simulate crash before ACK), restart, verify the un-ACKed message is redelivered and the new consumer pub/sub-publishes it
-5. Integration test: stream registry change — add a new deployment mid-loop, verify the consumer picks up the new stream within one iteration
-6. Implement
+4. **PEL recovery integration test**: publish a message, consume it WITHOUT ACKing (simulate consumer crash before publish), restart the consumer with `min_idle_ms=0` — verify `XAUTOCLAIM` reclaims the entry, the new consumer publishes to pub/sub, updates state, and ACKs
+5. **PEL recovery negative test**: publish a message, consume + ACK normally, restart the consumer — verify the entry is NOT redelivered (idempotency proof)
+6. **ACK-on-success-only test**: stub `publish_event` to raise, verify the message is NOT ACKed and is reclaimed on the next recovery sweep
+7. Integration test: stream registry change — add a new deployment mid-loop, verify the consumer picks up the new stream within one iteration
+8. Implement
 
 Acceptance: tests pass.
 
 Effort: L
 Depends on: 3.2, 3.3
-Gotchas: #17, Codex #5, Codex v2 P1 (multi-worker fan-out)
+Gotchas: Codex v3 P0 (PEL semantics — explicit XAUTOCLAIM, ACK only on success)
 
 ---
 
-#### 3.5 — Position state via Nautilus `Cache` Python API
+#### 3.5 — `PositionReader` from in-memory `ProjectionState` (primary) + ephemeral `Cache` (fallback)
 
 Files:
 
 - `claude-version/backend/src/msai/services/nautilus/projection/position_reader.py` (new)
 - `claude-version/backend/tests/integration/test_position_reader.py` (new)
 
-The natives audit DELETED the planned `PositionSnapshotCache`. FastAPI reads positions by importing `nautilus_trader` and constructing a transient `Cache` pointed at the same Redis backend the trading subprocess writes to (v3 decision #10). **No raw Redis key access** — those key names are internal Nautilus implementation details that can change across releases.
+v3's `PositionReader` kept long-lived `Cache` instances and called `cache_all()` once. That is wrong: a Nautilus `Cache` does NOT subscribe to Redis updates — `cache_all()` is a one-shot batch load. Snapshot reads would drift after the first call (Codex v3 P1). The import path was also wrong (`nautilus_trader.common.config` should be `nautilus_trader.cache.config`).
+
+v4 has two reading paths:
+
+**Primary: In-memory `ProjectionState` populated by the projection consumer (3.4).**
+
+The projection consumer is already translating every `PositionOpened`, `PositionChanged`, `PositionClosed`, and `AccountState` event from the Nautilus message bus stream. The same translation step updates a per-uvicorn-worker `ProjectionState` (defined in 3.4), so by the time a UI request arrives the state is already up-to-date in memory. PositionReader serves snapshot reads from this state directly — no Cache, no Redis round-trip.
+
+**Fallback: Ephemeral `Cache` rebuilt per request, used only for the initial snapshot before any events have been observed.**
+
+If `ProjectionState` has nothing for a `deployment_id` yet (e.g. a freshly-restarted FastAPI worker that hasn't processed any events), PositionReader builds a fresh `Cache`, calls `cache_all()`, reads, and discards the `Cache`. This is intentionally per-request — the Cache is a one-shot loader, not a live view, and treating it that way avoids drift. The cost (one Redis batch read per cold-start request) is acceptable: it only happens once per deployment per worker per restart.
 
 ```python
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.cache.database import CacheDatabaseAdapter
-from nautilus_trader.common.config import CacheConfig, DatabaseConfig
-from nautilus_trader.model.identifiers import StrategyId, TraderId
+from nautilus_trader.cache.config import CacheConfig  # NOT common.config — Codex v3 P1 fix
+from nautilus_trader.common.config import DatabaseConfig
+from nautilus_trader.model.identifiers import AccountId, StrategyId, TraderId
 
 
 class PositionReader:
-    """Reads current positions and accounts from Nautilus's own Cache,
-    backed by the same Redis instance the live trading subprocess writes to
-    (CacheConfig.database = redis from 3.1).
+    """Snapshot reads of positions/accounts for the live UI.
 
-    Why a transient Cache, not raw Redis reads: the underlying Redis key
-    format is an internal implementation detail of CacheDatabaseAdapter.
-    Reading via the Cache Python API insulates us from Nautilus version
-    upgrades (v3 decision #10).
+    Read order:
+    1. ProjectionState (in-memory, updated by the projection consumer
+       in step 9 of 3.4) — fast path
+    2. If absent (cold worker), build an ephemeral Cache, cache_all(),
+       read, dispose — slow but correct path
 
-    Why one Cache per trader_id (deployment): CacheDatabaseAdapter is
-    constructed with a TraderId and namespaces its reads. We build one
-    per deployment and cache the instances in a dict keyed by deployment_id.
+    NEVER keeps a long-lived Cache. The Cache is a one-shot loader, not
+    a live view (Codex v3 P1).
     """
 
-    def __init__(self, redis_host: str, redis_port: int) -> None:
+    def __init__(
+        self,
+        projection_state: ProjectionState,
+        redis_host: str,
+        redis_port: int,
+    ) -> None:
+        self._state = projection_state
         self._cache_config = CacheConfig(
             database=DatabaseConfig(type="redis", host=redis_host, port=redis_port),
             encoding="msgpack",
         )
-        self._caches: dict[UUID, Cache] = {}
-
-    def _get_cache(self, deployment_id: UUID, trader_id: str) -> Cache:
-        if deployment_id not in self._caches:
-            adapter = CacheDatabaseAdapter(
-                trader_id=TraderId(trader_id),
-                config=self._cache_config,
-            )
-            self._caches[deployment_id] = Cache(database=adapter)
-            self._caches[deployment_id].cache_all()  # Load from Redis once
-        return self._caches[deployment_id]
 
     async def get_open_positions(
         self,
         deployment_id: UUID,
         trader_id: str,
-        strategy_id: str,
+        strategy_id_full: str,
     ) -> list[PositionSnapshot]:
-        cache = self._get_cache(deployment_id, trader_id)
-        positions = cache.positions_open(strategy_id=StrategyId(strategy_id))
-        return [self._to_snapshot(p, deployment_id) for p in positions]
+        # Fast path
+        positions = self._state.positions(deployment_id)
+        if positions:
+            return positions
+        # Cold path
+        return await self._read_via_ephemeral_cache_positions(
+            deployment_id, trader_id, strategy_id_full
+        )
 
     async def get_account(
         self,
@@ -1707,34 +2516,70 @@ class PositionReader:
         trader_id: str,
         account_id: str,
     ) -> AccountStateUpdate | None:
-        cache = self._get_cache(deployment_id, trader_id)
-        account = cache.account(AccountId(account_id))
-        if account is None:
-            return None
-        return self._to_account_update(account, deployment_id)
+        # Fast path
+        account = self._state.account(deployment_id)
+        if account is not None:
+            return account
+        # Cold path
+        return await self._read_via_ephemeral_cache_account(
+            deployment_id, trader_id, account_id
+        )
 
-    async def refresh(self, deployment_id: UUID) -> None:
-        """Drop the cached Cache instance and rebuild on next access.
-        Called when the projection consumer sees a PositionClosed event
-        for this deployment (keeps the reader's view fresh for UI reads
-        that race against the event stream)."""
-        self._caches.pop(deployment_id, None)
+    async def _read_via_ephemeral_cache_positions(
+        self,
+        deployment_id: UUID,
+        trader_id: str,
+        strategy_id_full: str,
+    ) -> list[PositionSnapshot]:
+        """Build a fresh Cache, load, read, dispose. Per-request."""
+        adapter = CacheDatabaseAdapter(
+            trader_id=TraderId(trader_id),
+            config=self._cache_config,
+        )
+        try:
+            cache = Cache(database=adapter)
+            cache.cache_all()
+            raw_positions = cache.positions_open(strategy_id=StrategyId(strategy_id_full))
+            return [self._to_snapshot(p, deployment_id) for p in raw_positions]
+        finally:
+            adapter.close()  # release the Redis connection promptly
+
+    async def _read_via_ephemeral_cache_account(
+        self,
+        deployment_id: UUID,
+        trader_id: str,
+        account_id: str,
+    ) -> AccountStateUpdate | None:
+        adapter = CacheDatabaseAdapter(
+            trader_id=TraderId(trader_id),
+            config=self._cache_config,
+        )
+        try:
+            cache = Cache(database=adapter)
+            cache.cache_all()
+            account = cache.account(AccountId(account_id))
+            return self._to_account_update(account, deployment_id) if account else None
+        finally:
+            adapter.close()
 ```
 
-**Note on freshness:** The `Cache` is built with `cache_all()` on first access, which reads the current Redis state once. Between reads, the live subprocess writes updates through `CacheConfig.database = redis` with `buffer_interval_ms = None` (write-through). For position UI reads we trust the Cache's view; for event-stream consistency we rely on the projection consumer. A `refresh()` hook is called when `PositionClosed` events are translated so the snapshot read after a close reflects reality.
+**Note on the actual `CacheDatabaseAdapter` constructor signature:** the exact parameters can vary between Nautilus releases. The integration test in this task pins the package version and verifies the constructor call works. If a future Nautilus upgrade changes the signature, the test fails loudly and the wrapper is updated in one place.
 
 TDD:
 
-1. Integration test: start a minimal live subprocess with `CacheConfig.database = redis`, submit a synthetic order that opens a position, call `PositionReader.get_open_positions`, assert position appears
-2. Integration test: close the position, call `refresh()`, assert no open positions
-3. Integration test: two deployments with distinct `trader_id`s — assert PositionReader correctly isolates them
-4. Implement
+1. Unit test fast-path: pre-populate `ProjectionState` with one position, call `get_open_positions`, verify the position is returned without touching Redis (mock the Redis client and assert no calls)
+2. Unit test cold-path: empty `ProjectionState`, mock the ephemeral Cache to return one position, verify the position is returned and the adapter is closed
+3. Integration test: start a minimal live subprocess writing to a testcontainers Redis with `CacheConfig.database = redis`, submit a synthetic order that opens a position, call `get_open_positions` from a fresh PositionReader (empty ProjectionState), verify the position appears via the cold path
+4. Integration test: feed an event through the projection consumer, assert ProjectionState is updated, then call `get_open_positions` and assert the fast path serves it
+5. Integration test: two deployments with distinct `trader_id`s — assert PositionReader correctly isolates them via the trader_id parameter
+6. **Drift test (regression for Codex v3 P1)**: build a long-lived `Cache`, `cache_all()`, write a new position to Redis from a different process, re-read from the same long-lived `Cache` — assert it does NOT see the new position (proves the v3 design was wrong and the v4 ephemeral pattern is necessary)
+7. Implement
 
 Acceptance: tests pass.
 
 Effort: M
-Depends on: 3.1
-Gotchas: decision #10 — import nautilus_trader in FastAPI
+Depends on: 3.1, 3.4 (ProjectionState definition lives there)
+Gotchas: Codex v3 P1 (correct import path, ephemeral Cache, no long-lived Cache drift)
 
 ---
 
@@ -1835,11 +2680,26 @@ Files:
 
 Per the natives audit and Codex finding #2: the Nautilus `LiveRiskEngine` cannot be subclassed via config. We use a Strategy mixin instead.
 
-**Portfolio API, not direct Cache reads:** Inside a Strategy, `self.portfolio` exposes the exact accessors the risk checks need — `portfolio.account(venue)`, `portfolio.net_exposure(venue)`, `portfolio.total_pnl(venue)`, `portfolio.unrealized_pnl(instrument_id)`. These are the canonical, version-stable API for PnL and exposure queries on the strategy side. v2's direct `cache.positions_open` / `cache.account` was reinventing the portfolio aggregation.
+**Portfolio API — correct method names per Codex v3 P1:**
+
+The Nautilus `Portfolio` API has both per-instrument and per-venue accessors with **different names**:
+
+| Scope                                  | PnL                                      | Exposure                                    | Returns                              |
+| -------------------------------------- | ---------------------------------------- | ------------------------------------------- | ------------------------------------ |
+| Per-instrument                         | `total_pnl(instrument_id)`               | `net_exposure(instrument_id)`               | `Money \| None`                      |
+| Per-venue (aggregated, multi-currency) | `total_pnls(venue)` (plural)             | `net_exposures(venue)` (plural)             | `dict[Currency, Money]`              |
+| Per-venue, per-currency                | `total_pnls(venue, target_currency=USD)` | `net_exposures(venue, target_currency=USD)` | `dict[Currency, Money]` (single key) |
+
+v3 wrongly called `portfolio.total_pnl(venue)` (singular form, expects InstrumentId, not Venue). v4 uses the correct plurals for venue-level aggregates.
+
+**Halt flag is no longer the primary kill switch (decision #16):**
+
+v3 had the strategy poll `msai:risk:halt` on every `on_bar` and refuse new orders if set. That allowed up to one bar of lag on an emergency halt. v4 makes the kill switch push-based (decision #16 / task 3.9): the supervisor SIGTERMs every running deployment immediately on `/kill-all`, and Nautilus's `manage_stop=True` flattens automatically. The halt flag in the strategy mixin remains as **defense in depth** — a third layer to refuse new orders if for some reason the supervisor's stop didn't reach the subprocess (e.g., a network blip in the command bus). The lag is acceptable because it's the third layer, not the primary.
 
 ```python
 from decimal import Decimal
-from nautilus_trader.model.identifiers import Venue
+from nautilus_trader.model.identifiers import InstrumentId, Venue
+from nautilus_trader.model.objects import Money
 from nautilus_trader.model.orders import Order
 
 
@@ -1848,10 +2708,11 @@ class RiskAwareStrategy(AuditedStrategy):
     calling submit_order.
 
     Checks (in order):
-    1. Sticky kill switch (Redis key msai:risk:halt) — if set, deny
-    2. Per-strategy max position (read from RiskLimits on the deployment row)
-    3. Daily loss limit (via self.portfolio.total_pnl(venue))
-    4. Max notional exposure (via self.portfolio.net_exposure(venue))
+    1. Sticky kill switch (Redis key msai:risk:halt, cached) — defense
+       in depth; primary kill switch is push-based (3.9, decision #16)
+    2. Per-strategy max position (per-instrument net position vs limit)
+    3. Daily loss limit (per-venue total PnL via portfolio.total_pnls)
+    4. Max notional exposure (per-venue net exposure via portfolio.net_exposures)
     5. Market hours (via MarketHoursService reading instrument_cache.trading_hours from Phase 2)
 
     On any failure: log a structured warning, write a "denied" row to
@@ -1869,27 +2730,30 @@ class RiskAwareStrategy(AuditedStrategy):
 
     def submit_order_with_risk_check(self, order: Order) -> None:
         venue = Venue(order.instrument_id.venue.value)
+        instrument_id = order.instrument_id
 
-        # 1. Kill switch
-        if self._is_halted():
+        # 1. Kill switch (defense in depth — primary is 3.9)
+        if self._halt_flag_cached:
             self._audit.write_denied(order, reason="risk:halt")
             return
 
-        # 2. Per-strategy max position
-        position_for_instrument = self.portfolio.net_position(order.instrument_id)
+        # 2. Per-strategy max position (per-instrument)
+        position_for_instrument = self.portfolio.net_position(instrument_id)
         if not self._within_position_limit(order, position_for_instrument):
             self._audit.write_denied(order, reason="risk:position_limit")
             return
 
-        # 3. Daily loss limit via portfolio.total_pnl
-        total_pnl = self.portfolio.total_pnl(venue)  # returns Money | None
-        if total_pnl is not None and not self._within_daily_loss_limit(total_pnl):
+        # 3. Daily loss limit via portfolio.total_pnls(venue) — PLURAL
+        # Returns dict[Currency, Money]; we sum across currencies after
+        # converting to USD via target_currency.
+        venue_pnls = self.portfolio.total_pnls(venue, target_currency=USD)
+        if venue_pnls and not self._within_daily_loss_limit(venue_pnls):
             self._audit.write_denied(order, reason="risk:daily_loss")
             return
 
-        # 4. Max notional exposure via portfolio.net_exposure
-        net_exposure = self.portfolio.net_exposure(venue)  # returns Money | None
-        if net_exposure is not None and not self._within_exposure_limit(net_exposure, order):
+        # 4. Max notional exposure via portfolio.net_exposures(venue) — PLURAL
+        venue_exposures = self.portfolio.net_exposures(venue, target_currency=USD)
+        if venue_exposures and not self._within_exposure_limit(venue_exposures, order):
             self._audit.write_denied(order, reason="risk:exposure")
             return
 
@@ -1900,30 +2764,50 @@ class RiskAwareStrategy(AuditedStrategy):
 
         self.submit_order_with_audit(order)
 
-    def _is_halted(self) -> bool:
-        # Async from an async Strategy context — cached with on_bar refresh
-        return self._halt_flag_cached
+    def _within_daily_loss_limit(self, pnls: dict[Currency, Money]) -> bool:
+        """Sum the per-currency PnLs (already converted to USD by Nautilus
+        because we passed target_currency=USD). Compare against the
+        configured daily loss limit on the deployment.
+        """
+        total = sum(money.as_double() for money in pnls.values())
+        return total > -float(self._risk_limits.daily_loss_limit_usd)
+
+    def _within_exposure_limit(self, exposures: dict[Currency, Money], order: Order) -> bool:
+        """Sum the venue-level net exposures (USD-converted) and add the
+        order's notional. Reject if the projected total exceeds the limit.
+        """
+        current_total = sum(money.as_double() for money in exposures.values())
+        order_notional = float(order.quantity) * float(order.price or 0)
+        projected = current_total + order_notional
+        return projected <= float(self._risk_limits.max_notional_exposure_usd)
 
     async def _refresh_halt_flag(self) -> None:
-        """Called from on_bar via async task. Reads msai:risk:halt."""
+        """Called from on_bar via async task. Reads msai:risk:halt.
+
+        Defense in depth — the primary kill switch is the supervisor
+        SIGTERM in 3.9. This cached read just refuses any new orders the
+        strategy might emit between the SIGTERM being sent and the
+        subprocess actually exiting.
+        """
         self._halt_flag_cached = bool(await self._redis.get("msai:risk:halt"))
 ```
 
-**Why the halt flag is cached:** `submit_order_with_risk_check` is called synchronously from `on_bar` (Nautilus strategies are sync). An async Redis read inside a sync method is awkward; we instead refresh the halt flag **before** running the bar logic via an async refresher task scheduled on `on_bar` entry, and read the cached boolean inside the sync risk check. The cache lag is at most one bar (~1 minute for 1m bars), which is acceptable for a manual kill switch.
-
-**Why `net_position`/`net_exposure`/`total_pnl`:** These are the stable Strategy-side accessors (`nautilus_trader.portfolio.portfolio.pyx`). They aggregate across the strategy's open positions and account state and are populated by Nautilus itself from the Cache. No manual iteration over `cache.positions_open()`.
+**Why per-venue plurals not singulars:** `Portfolio.total_pnl(instrument_id)` is a per-instrument query. `Portfolio.total_pnls(venue)` (plural) returns the venue-level aggregate as `dict[Currency, Money]`. The same naming applies to `net_exposure(instrument_id)` vs `net_exposures(venue)`. v3 mixed them up (Codex v3 P1).
 
 TDD:
 
 1. Unit test each check in isolation with a mock `self.portfolio`
-2. Test that orders pass through when within limits
-3. Test that orders are denied when over limits, with the right `reason` on the audit row
-4. Test that halt-flag refresh is called from `on_bar` before the risk check
-5. Implement
+2. **Per-venue API test (regression for Codex v3 P1)**: assert the mixin calls `portfolio.total_pnls(venue, target_currency=USD)` (plural) NOT `portfolio.total_pnl(venue)` (singular)
+3. **Per-instrument API test**: assert `net_position(instrument_id)` (not `net_position(venue)`)
+4. **Multi-currency aggregation test**: feed a `dict[Currency, Money]` with USD and EUR, verify `_within_daily_loss_limit` sums them via `as_double()`
+5. Test that orders pass through when within limits
+6. Test that orders are denied when over limits, with the right `reason` on the audit row
+7. Test that halt-flag refresh is called from `on_bar` before the risk check
+8. Implement
 
 Effort: L
 Depends on: 1.11, 1.2 (audit table)
-Gotchas: Codex #2 (don't subclass LiveRiskEngine); decision #10 (Portfolio API over direct Cache reads)
+Gotchas: Codex v3 P1 (Portfolio API plurals vs singulars), decision #16 (halt flag is defense in depth, not primary)
 
 ---
 
@@ -1964,7 +2848,7 @@ Gotchas: Codex #2
 
 ---
 
-#### 3.9 — Sticky kill switch in Redis
+#### 3.9 — Push-based kill switch (supervisor SIGTERM + persistent halt flag)
 
 Files:
 
@@ -1972,24 +2856,85 @@ Files:
 - `claude-version/backend/src/msai/api/live.py` (modify `/kill-all`, add `/resume`)
 - `claude-version/backend/tests/integration/test_kill_switch.py` (new)
 
-`POST /api/v1/live/kill-all`:
+v3 had the strategy poll the halt flag on every `on_bar` — up to one bar of lag (Codex v3 P2). v4 makes the kill switch a push, with three layers of defense (decision #16):
 
-1. Sets Redis key `msai:risk:halt = true` with a long TTL
-2. Publishes a "flatten all positions" command to the live command bus for every running deployment
-3. Each subprocess's strategy receives the command via the Strategy event hook (or via the pre-existing `Strategy.on_event` mechanism), invokes `cancel_all_orders` + `close_all_positions`, then waits for new instructions
-4. The `RiskAwareStrategy` mixin reads `msai:risk:halt` on every `on_bar` and refuses new orders
-5. Returns count of deployments halted
+**Layer 1 — Persistent halt flag (prevents NEW starts):**
 
-`POST /api/v1/live/resume`: clears the halt flag (manual, requires explicit operator action).
+`POST /api/v1/live/kill-all` first sets `msai:risk:halt = true` in Redis with a long TTL (24h). The `/api/v1/live/start` endpoint reads this flag at the very top and returns 503 immediately if set. This blocks any new deployment from being launched while the kill is active.
+
+**Layer 2 — Supervisor push (immediate flatten of running deployments):**
+
+For every `live_node_processes` row with `status IN ('starting','building','ready','running')`, the kill-all endpoint publishes a `stop` command via `LiveCommandBus.publish_stop(deployment_id, reason="kill_switch")`. The supervisor processes these commands the same way it processes a normal `/stop`: SIGTERM the subprocess, escalate to SIGKILL after 30s. Because the strategy is built with `manage_stop = True` (decision #11), Nautilus's native exit loop cancels orders and flattens positions automatically when the strategy receives the stop signal.
+
+Latency from operator click to flatten: roughly the `XADD` round-trip + the supervisor's `XREADGROUP BLOCK 5000` window + SIGTERM delivery + Nautilus stop. Realistically < 5 seconds. This is the **primary** mechanism.
+
+**Layer 3 — Strategy in-process halt (defense in depth):**
+
+The `RiskAwareStrategy` mixin (3.7) caches the halt flag and refuses new orders if set. This is the third layer — it catches any orders the strategy might emit between the supervisor sending SIGTERM and Nautilus actually processing it. The lag is acceptable because it's the third layer, not the primary.
+
+```python
+@router.post("/kill-all", status_code=200)
+async def kill_all(
+    db: AsyncSession = Depends(get_db),
+    bus: LiveCommandBus = Depends(get_command_bus),
+    redis: Redis = Depends(get_redis),
+    user: User = Depends(get_current_user),
+) -> KillAllResponse:
+    # Layer 1: persistent halt flag
+    await redis.set("msai:risk:halt", "true", ex=86400)
+    await redis.set("msai:risk:halt:set_by", user.id.hex, ex=86400)
+    await redis.set("msai:risk:halt:set_at", utcnow().isoformat(), ex=86400)
+
+    # Layer 2: push stop commands to every active deployment
+    rows = await db.execute(
+        select(LiveNodeProcess).where(
+            LiveNodeProcess.status.in_(("starting", "building", "ready", "running"))
+        )
+    )
+    halted = 0
+    for row in rows.scalars():
+        await bus.publish_stop(row.deployment_id, reason="kill_switch")
+        halted += 1
+
+    logger.warning("kill_switch_triggered", deployments=halted, set_by=str(user.id))
+    return KillAllResponse(deployments_halted=halted)
+
+
+@router.post("/resume", status_code=200)
+async def resume(
+    redis: Redis = Depends(get_redis),
+    user: User = Depends(get_current_user),
+) -> ResumeResponse:
+    """Clear the halt flag. Required before /start will accept new deployments.
+    No auto-resume — operator must explicitly unblock."""
+    await redis.delete("msai:risk:halt")
+    logger.warning("kill_switch_resumed", resumed_by=str(user.id))
+    return ResumeResponse(resumed=True)
+```
+
+`/api/v1/live/start` is updated (small change to 1.14) to read the halt flag at the very top:
+
+```python
+@router.post("/start", ...)
+async def start_live_deployment(...):
+    if await redis.exists("msai:risk:halt"):
+        raise HTTPException(status_code=503, detail="Kill switch is active. POST /api/v1/live/resume to clear.")
+    # ... rest of /start ...
+```
 
 TDD:
 
-1. Integration test: start two subprocesses, set kill-all, verify both close positions, verify the halt flag prevents new starts
-2. Implement
+1. Integration test: start two stub subprocesses, call `/kill-all`, verify two stop commands published to the bus, verify halt flag set
+2. Integration test: with halt flag set, call `/start`, verify 503 returned with the right detail
+3. Integration test: call `/resume`, verify halt flag cleared and `/start` accepts new deployments
+4. Integration test (real subprocess): start one trading subprocess via the supervisor with the smoke strategy, call `/kill-all`, verify the subprocess exits with status="stopped", verify position count is zero (manage_stop flatten worked)
+5. **Latency test**: from `/kill-all` POST to subprocess `status="stopping"` row update, assert < 5 seconds
+6. **Defense-in-depth test**: bypass the supervisor (don't actually publish stop commands), instead set the halt flag directly and call `RiskAwareStrategy.submit_order_with_risk_check` from a unit test — verify the order is denied with reason="risk:halt"
+7. Implement
 
 Effort: M
-Depends on: 3.7
-Gotchas: #13
+Depends on: 3.7, 1.6
+Gotchas: decision #16 (push not poll), #13 (manage_stop handles flatten)
 
 ---
 
@@ -2058,16 +3003,17 @@ Depends on: 3.1–3.10
 
 **Goal:** Production-grade resilience. Mostly enabling Nautilus's built-in features and testing them.
 
-**Phase 4 acceptance (revised per Codex):**
+**Phase 4 acceptance (revised per Codex v3):**
 
-- `LiveExecEngineConfig.reconciliation = True` runs at startup; the subprocess writes `status="ready"` only after `kernel.start_async()` returns (which means reconciliation completed)
-- `NautilusKernelConfig.load_state = True` and `save_state = True` are enabled; `EMACrossStrategy.on_save` and `on_load` are implemented and validated by a round-trip test
-- A restart-continuity test verifies: after subprocess restart, the strategy resumes from validated state AND the next bar does NOT generate a duplicate decision
-- Killing the FastAPI container does NOT interrupt trading (already true from Phase 1, re-tested here)
-- Killing the trading subprocess is detected by the API (heartbeat stops) and the deployment is marked failed with an alert
+- `LiveExecEngineConfig.reconciliation = True` runs at startup; the subprocess writes `status="ready"` only after `wait_until_ready()` (decision #14) confirms `is_running AND data_engine.is_connected AND exec_engine.is_connected AND not exec_engine.reconciliation_active AND len(cache.instruments()) > 0`
+- `NautilusKernelConfig.load_state = True` and `save_state = True` are enabled; `EMACrossStrategy.on_save` and `on_load` are implemented and validated by a unit round-trip test
+- A two-leg `BacktestNode` restart-continuity test against testcontainers Redis verifies: leg 2 loads state written by leg 1, the EMA values are continuous, the next bar does NOT generate a duplicate decision (decision #7 stable trader_id is what makes the cache keys collide across legs)
+- Killing the FastAPI container does NOT interrupt trading (already true from Phase 1, re-tested in scenario A; the projection consumer reconnects and reclaims via XAUTOCLAIM)
+- Killing the trading subprocess is detected by the supervisor's `reap_loop` within seconds (decision #15) and the row is flipped to `failed` with the real exit_code; if the supervisor is also dead, the heartbeat monitor flips it on the next supervisor restart
 - IB Gateway disconnect for >2 minutes halts the strategy; on reconnect the strategy stays paused until manual `/resume`
 - Equity strategies auto-pause outside RTH (using `instrument_cache.trading_hours` from Phase 2)
 - Prometheus metrics exposed at `/metrics`
+- **Scenario D dropped:** the live-feed restart assertion was non-deterministic. The deterministic equivalent is the two-leg `BacktestNode` integration test in 4.5, which exercises the exact same Nautilus save_state/load_state path with a Redis backend identical to production.
 
 **The acceptance is NOT "strategy resumes" unconditionally** (Codex #10 correction): strategies either resume from validated state OR remain paused until operator manually warms them.
 
@@ -2094,7 +3040,7 @@ load_state=True,  # gotcha — defaults to False; Codex #10
 save_state=True,  # same
 ```
 
-The trading subprocess in 1.8 already writes `status="ready"` after `kernel.start_async()` returns. Since the kernel internally awaits reconciliation BEFORE returning (`live/node.py` lifecycle), the readiness signal IS the reconciliation completion signal. No log scraping, no private internals (Codex #11 fix).
+The trading subprocess in 1.8 writes `status="ready"` only after `wait_until_ready(node)` (decision #14) confirms is_running, both engines connected, reconciliation complete, and at least one instrument loaded. v3 wrongly assumed `kernel.start_async()` returning was equivalent to "reconciliation completed" — it isn't (Codex v3 P0). v4 verifies explicitly via the post-start health check.
 
 TDD:
 
@@ -2287,47 +3233,71 @@ def on_load(self, state: dict[str, bytes]) -> None:
 
 **Idempotency key (`last_decision_bar_ts`):** Nautilus replays any un-processed bars from its cache on restart. To prevent a duplicate decision on the first bar after restart, the strategy records the `ts_event` of the last bar that produced a trade decision. On restart, `on_bar` checks `bar.ts_event > self._last_decision_bar_ts_ns` before acting. This is the pattern that makes restart-continuity achievable without operator intervention.
 
-**Why BacktestNode twice, not a live subprocess restart:** v2 proposed to restart a live TradingNode subprocess and feed it the next bar. That requires a deterministic bar feeder we don't have — IB Gateway's live feed is not reproducible. `BacktestNode` gives us deterministic, reproducible bar feeding AND full Nautilus kernel lifecycle (including `on_save`/`on_load`). It's the correct test vehicle (Codex v2 P1).
+**Why BacktestNode twice, not a live subprocess restart:** v2 proposed to restart a live TradingNode subprocess and feed it the next bar. That requires a deterministic bar feeder we don't have — IB Gateway's live feed is not reproducible. `BacktestNode` gives us deterministic, reproducible bar feeding AND full Nautilus kernel lifecycle (including `on_save`/`on_load`). It's the correct test vehicle.
+
+**Why testcontainers Redis (NOT an "on-disk KV store"):** v3 invented an on-disk KV-store `StateSerializer` that does not exist in this Nautilus install — `nautilus_trader.common.config.DatabaseConfig` only supports `type="redis"` here (Codex v3 P1). v4 brings up a testcontainers Redis and points both BacktestNode runs at it via `CacheConfig.database = redis`. Nautilus writes the strategy state via its native cache-backed save_state path, the same path the live system uses.
 
 The **restart-continuity test**:
 
 ```python
-def test_ema_cross_restart_continuity(tmp_path) -> None:
-    """Two-leg test:
+@pytest.fixture(scope="module")
+def redis_container() -> Iterator[Redis]:
+    """Spin up an isolated Redis for this test only."""
+    from testcontainers.redis import RedisContainer
+    with RedisContainer("redis:7-alpine") as container:
+        yield container
+
+
+def test_ema_cross_restart_continuity(redis_container) -> None:
+    """Two-leg test against testcontainers Redis:
 
     Leg 1: Run BacktestNode on a N-bar catalog that triggers an EMA cross.
-           Save strategy state to disk (via save_state=True and an
-           on-disk KV-store StateSerializer).
+           save_state=True writes strategy state to the Redis-backed cache
+           via Nautilus's native CacheDatabaseAdapter.
 
-    Leg 2: Construct a new BacktestNode with load_state=True and the
-           saved state. Feed it the (N+1)-th bar ONLY. Assert:
-           (a) The EMA fast/slow values at the start of leg 2 equal
-               the values at the end of leg 1 (continuity)
-           (b) The strategy does NOT emit a duplicate buy/sell order
-               on bar N+1 (idempotency via last_decision_bar_ts)
-           (c) After one more "signal" bar, the strategy DOES emit a
-               new decision (it's not frozen)
+    Leg 2: New BacktestNode with the SAME trader_id and the SAME
+           CacheConfig pointing at the SAME Redis. load_state=True reads
+           the prior state on startup. Feed bar (N+1) only. Assert:
+           (a) EMA fast/slow at the start of leg 2 == end of leg 1 (continuity)
+           (b) No duplicate order on bar N+1 (idempotency via last_decision_bar_ts)
+           (c) A subsequent "signal" bar still emits a new decision (not frozen)
     """
-    catalog = build_deterministic_catalog(n_bars=120, ema_cross_at_bar=60)
+    redis_host = redis_container.get_container_host_ip()
+    redis_port = redis_container.get_exposed_port(6379)
+    cache_config = CacheConfig(
+        database=DatabaseConfig(type="redis", host=redis_host, port=int(redis_port)),
+        encoding="msgpack",
+    )
 
-    # Leg 1: bars 0..99, crossing at bar 60, expect ≥1 decision
-    result_a = run_backtest(
+    catalog = build_deterministic_catalog(n_bars=120, ema_cross_at_bar=60)
+    common_kwargs = dict(
         strategy_path="strategies.example.ema_cross:EMACrossStrategy",
-        strategy_config={"order_id_tag": "test1", "load_state": False, "save_state": True},
         catalog_path=catalog,
-        state_dir=tmp_path / "state",
+        cache_config=cache_config,
+        trader_id="MSAI-restart-test-0001",  # stable across both legs (decision #7)
+    )
+
+    # Leg 1: bars 0..99, crossing at bar 60, expect ≥1 decision; save_state=True
+    result_a = run_backtest(
+        **common_kwargs,
+        strategy_config={"order_id_tag": "restart-test-0001"},
+        load_state=False,
+        save_state=True,
         bars_range=(0, 100),
     )
     assert len(result_a.orders) >= 1, "expected at least one order in leg 1"
-    saved_state = read_saved_state(tmp_path / "state")
-    assert b"fast_ema_value" in saved_state
 
-    # Leg 2: bar 100 ONLY, load_state, expect NO duplicate
+    # Verify state was actually written to Redis (sanity)
+    redis_client = Redis(host=redis_host, port=int(redis_port))
+    state_keys = redis_client.keys(f"trader-MSAI-restart-test-0001:*")
+    assert len(state_keys) > 0, "leg 1 should have written state to Redis"
+
+    # Leg 2: bar 100 ONLY, load_state=True, expect NO duplicate
     result_b = run_backtest(
-        strategy_path="strategies.example.ema_cross:EMACrossStrategy",
-        strategy_config={"order_id_tag": "test1", "load_state": True, "save_state": True},
-        catalog_path=catalog,
-        state_dir=tmp_path / "state",
+        **common_kwargs,
+        strategy_config={"order_id_tag": "restart-test-0001"},
+        load_state=True,
+        save_state=True,
         bars_range=(100, 101),
     )
     assert len(result_b.orders) == 0, "leg 2 bar should not emit a duplicate"
@@ -2336,18 +3306,21 @@ def test_ema_cross_restart_continuity(tmp_path) -> None:
     assert result_b.initial_fast_ema == pytest.approx(result_a.final_fast_ema, rel=1e-9)
     assert result_b.initial_slow_ema == pytest.approx(result_a.final_slow_ema, rel=1e-9)
 
-    # Freshness check: feed a bar that WOULD trigger a new decision, expect one
+    # Freshness check: a bar that WOULD trigger a new decision still does
     result_c = run_backtest(
-        strategy_path="strategies.example.ema_cross:EMACrossStrategy",
-        strategy_config={"order_id_tag": "test1", "load_state": True, "save_state": True},
+        **common_kwargs,
+        strategy_config={"order_id_tag": "restart-test-0001"},
+        load_state=True,
+        save_state=True,
         catalog_path=build_deterministic_catalog(n_bars=121, ema_cross_at_bar=120),
-        state_dir=tmp_path / "state",
         bars_range=(100, 121),
     )
     assert len(result_c.orders) >= 1
 ```
 
-`run_backtest` is a test helper that wraps `BacktestNode` with `save_state` / `load_state` and a `state_dir` argument. The `state_dir` is an on-disk KV-store `StateSerializer` that Nautilus writes to via the kernel's `save_state` hook. (Nautilus ships serializers; the test uses a simple file-backed one.)
+`run_backtest` is a test helper that wraps `BacktestNode` with the kernel's `load_state`/`save_state` flags and the Redis `CacheConfig`. The same trader_id across both legs is what makes the cache keys collide and the state reload — enforced by decision #7 (stable deployment_slug).
+
+**Why this is a test of the production path, not a test fixture artifact:** the live system also uses `CacheConfig.database = redis` (3.1) and `load_state=True`/`save_state=True` (4.1) with the same trader_id pattern. The integration test exercises the exact same code path Nautilus runs in production — only the data feed differs (deterministic bars instead of IB live).
 
 **Separate round-trip test** (simpler, faster):
 
@@ -2372,12 +3345,12 @@ def test_ema_cross_on_save_on_load_roundtrip() -> None:
 TDD:
 
 1. Round-trip unit test (above)
-2. Two-leg BacktestNode restart-continuity integration test (above)
+2. Two-leg BacktestNode restart-continuity integration test against testcontainers Redis (above)
 3. Implement
 
 Effort: M
-Depends on: 4.1, 1.8
-Gotchas: #16, Codex #10, Codex v2 P1 (BacktestNode twice, not live subprocess restart)
+Depends on: 3.1 (Redis CacheConfig), 4.1, 1.8
+Gotchas: #16, Codex v2 P1 (BacktestNode twice, not live subprocess restart), Codex v3 P1 (testcontainers Redis, not on-disk KV-store), decision #7 (stable trader_id across legs)
 
 ---
 
@@ -2419,37 +3392,30 @@ Files: `claude-version/backend/tests/e2e/test_recovery_phase4.py` (new)
 3. `docker kill msai-claude-backend`
 4. Sleep 5s
 5. `docker compose up -d backend`
-6. Verify trading subprocess still running (heartbeat advancing)
-7. Verify `GET /api/v1/live/status/{deployment_id}` discovers it
-8. Verify the projection consumer rejoins the consumer group and resumes streaming events from where it left off
+6. Verify trading subprocess still running (heartbeat advancing — supervisor's reap loop and heartbeat monitor are both unaffected by the FastAPI restart)
+7. Verify `GET /api/v1/live/status/{deployment_id}` discovers it from the database
+8. Verify the projection consumer joins the consumer group, runs `XAUTOCLAIM` to recover any pending entries from the previous instance's PEL, and resumes publishing to pub/sub
 
 **Scenario B: Kill TradingNode subprocess**
 
 1. Deploy strategy
 2. SIGKILL the trading subprocess pid directly
-3. Wait 30s (heartbeat stale)
-4. Verify the API marks the deployment as failed via Phase 4 task 4.4
-5. Verify an alert was emitted
+3. Within 1–2 seconds: verify the supervisor's `reap_loop` (decision #15) flips the row to `status="failed"` with the real exit_code (-9 for SIGKILL)
+4. Verify an alert was emitted
+5. **(Recovery path)** SIGKILL the supervisor as well, then `docker compose up -d live-supervisor` — verify the supervisor's heartbeat monitor flips any other lingering rows to `failed` based on stale heartbeat (decision #15 fallback path)
 
 **Scenario C: Disconnect IB Gateway**
 
 1. Deploy strategy
 2. `docker pause msai-claude-ib-gateway`
 3. Wait 130 seconds (past `disconnect_grace_seconds`)
-4. Verify the strategy halted (orders cancelled, positions closed)
+4. Verify the strategy halted (orders cancelled, positions closed via `manage_stop=True`)
 5. `docker unpause msai-claude-ib-gateway`
 6. Verify the strategy stays halted (manual resume required)
 7. POST `/api/v1/live/resume`
 8. Verify the strategy is restartable
 
-**Scenario D: Restart with state persistence**
-
-1. Deploy EMA strategy with `save_state=True`, `load_state=True` (Phase 4 config)
-2. Feed bars until EMAs are populated
-3. Stop deployment via `/api/v1/live/stop` (graceful)
-4. Restart deployment with the same strategy
-5. Verify EMA state is restored (not reset to zero)
-6. Verify the strategy does NOT submit a duplicate order on the first bar after restart
+**Scenario D — DROPPED in v4.** Codex v3 P1 flagged that the original Scenario D (restart a live deployment, feed it the next live bar, assert no duplicate) is non-deterministic against IB Gateway: the next live bar's contents and timing are uncontrollable, and flake risk is high. The same contract is now proven by the deterministic two-leg `BacktestNode` integration test in 4.5, which exercises the exact same Nautilus save_state/load_state path with a Redis backend identical to production (testcontainers Redis). The E2E loses no production-relevant coverage.
 
 Effort: L
 Depends on: 4.1–4.6
@@ -2541,9 +3507,9 @@ Existing backtest pipeline keeps working at every phase boundary. Phase 2 includ
 
 ---
 
-**Plan version:** 3.0
-**Last updated:** 2026-04-06
-**Approved by:** [pending Codex v3 re-review]
+**Plan version:** 4.0
+**Last updated:** 2026-04-07
+**Approved by:** [pending Codex v4 re-review]
 
 ## Revision history
 
@@ -2560,3 +3526,16 @@ Existing backtest pipeline keeps working at every phase boundary. Phase 2 includ
   - Parity harness redesigned: determinism test + config round-trip + intent contract (no more "TradingNode against IB paper")
   - Restart-continuity test uses `BacktestNode` run twice (deterministic bar feed) instead of live subprocess restart
   - `RiskAwareStrategy` uses `self.portfolio.account()/total_pnl()/net_exposure()` (stable Strategy-side API) instead of raw cache reads
+- **v4.0** (2026-04-07): incorporates Codex re-review of v3 (3 P0 + 5 P1 + 2 P2 fixed) covering Redis Streams semantics, idempotency, the readiness gate, and the identity/schema model.
+  - **Stable `deployment_slug`** decoupled from `live_deployments.id`. The slug is created once and reused across restarts so Phase 4 state reload actually works. 16 hex chars (64 bits) instead of 8 (32 bits).
+  - **Redis Streams PEL recovery** via explicit `XAUTOCLAIM`. v3 wrongly assumed un-ACKed messages are auto-redelivered. They aren't — they sit in the per-consumer PEL until claimed. Both `LiveCommandBus` and the projection consumer recover stale pending entries explicitly.
+  - **Idempotency at three layers**: DB-level partial unique index on `live_node_processes(deployment_id) WHERE status IN active`, supervisor-level pre-spawn check + ACK-only-on-success, HTTP-level `Idempotency-Key` header with Redis cache.
+  - **Post-start health check** before writing `status="ready"`. `kernel.start_async()` returning is NOT proof of readiness. v4 polls `is_running and data_engine.is_connected and exec_engine.is_connected and not reconciliation_active and instruments_loaded > 0` until timeout.
+  - **`live_deployments` schema migration** (task 1.1b) adds `deployment_slug`, `trader_id`, `strategy_id_full`, `account_id`, `message_bus_stream`, `instruments_signature`, `last_started_at`, `last_stopped_at`. Logical de-duplication via unique index on `(started_by, strategy_id, paper_trading, instruments_signature)`.
+  - **`live_node_processes.pid` is nullable**, `building` added to status enum (v3 inconsistency fixed).
+  - **`PositionReader` rebuilt**: in-memory `ProjectionState` populated by the projection consumer is the fast path; ephemeral per-request `Cache` is the cold-start fallback. Long-lived `Cache` instances are gone (they don't subscribe to Redis updates and would drift). Import path corrected.
+  - **`RiskAwareStrategy` portfolio API names corrected**: `total_pnls(venue)` and `net_exposures(venue)` (plural — venue-level aggregates returning `dict[Currency, Money]`), not `total_pnl(venue)` / `net_exposure(venue)` (singular — those expect `InstrumentId`).
+  - **Restart-continuity test against testcontainers Redis** instead of an invented "on-disk KV-store StateSerializer" (which doesn't exist in this Nautilus install). Two `BacktestNode` runs share the same Redis-backed cache via the same trader_id.
+  - **Phase 4 Scenario D dropped**: live-feed restart was non-deterministic. The deterministic two-leg `BacktestNode` integration test in 4.5 covers the same contract with no production-relevant coverage loss.
+  - **Supervisor keeps `dict[deployment_id, mp.Process]` handle map** for instant in-process exit detection via a `reap_loop` background task. Heartbeat is now only the cross-restart recovery signal.
+  - **Kill switch is push-based**, not bar-poll. `/kill-all` sets the persistent halt flag AND publishes stop commands to the supervisor for every running deployment AND keeps the strategy-side mixin halt check as defense in depth. Latency from operator click to flatten < 5 seconds.
