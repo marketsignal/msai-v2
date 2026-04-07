@@ -71,19 +71,37 @@ async def run_backtest(ctx: dict, backtest_id: str, strategy_path: str, config: 
             row.completed_at = datetime.now(UTC)
 
             for trade in result.orders_df.to_dict(orient="records"):
+                # Skip unfilled/cancelled orders — no real trade happened.
+                filled = trade.get("filled_qty")
+                if filled is None:
+                    filled = trade.get("quantity", 0.0)
+                filled_qty = float(filled)
+                if filled_qty == 0.0:
+                    continue
+
                 timestamp = _trade_timestamp_utc(trade)
+                instrument = trade.get("instrument_id")
+                if instrument is None:
+                    instrument = trade.get("symbol", "UNKNOWN")
+                price = trade.get("avg_px")
+                if price is None:
+                    price = trade.get("price", 0.0)
+                pnl = trade.get("realized_pnl")
+                if pnl is None:
+                    pnl = trade.get("pnl", 0.0)
+
                 session.add(
                     Trade(
                         backtest_id=row.id,
                         deployment_id=None,
                         strategy_id=row.strategy_id,
                         strategy_code_hash=row.strategy_code_hash,
-                        instrument=str(trade.get("instrument_id") or trade.get("symbol", "UNKNOWN")),
+                        instrument=str(instrument),
                         side=str(trade.get("side", "BUY")),
-                        quantity=float(trade.get("filled_qty") or trade.get("quantity", 0.0)),
-                        price=float(trade.get("avg_px") or trade.get("price", 0.0)),
+                        quantity=filled_qty,
+                        price=float(price),
                         commission=0.0,
-                        pnl=float(trade.get("realized_pnl") or trade.get("pnl", 0.0)),
+                        pnl=float(pnl),
                         is_live=False,
                         executed_at=timestamp,
                     )

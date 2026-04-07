@@ -84,6 +84,11 @@ async def run_backtest_job(
     end_iso: str = backtest_row["end_date"].isoformat()
     strategy_id = backtest_row["strategy_id"]
     strategy_code_hash = backtest_row["strategy_code_hash"]
+    # Asset class is passed through the config dict so the worker can
+    # look up raw Parquet data under the correct subdirectory
+    # (stocks, futures, crypto, ...). Defaults to stocks for backwards
+    # compatibility with older payloads.
+    asset_class: str = str(config.get("asset_class", "stocks"))
 
     try:
         # --- 2. Build / refresh the Nautilus catalog ----------------------
@@ -91,6 +96,7 @@ async def run_backtest_job(
             symbols=symbols,
             raw_parquet_root=settings.parquet_root,
             catalog_root=settings.nautilus_catalog_root,
+            asset_class=asset_class,
         )
         log.info(
             "backtest_catalog_ready",
@@ -310,24 +316,50 @@ def _prepare_strategy_config(
 
 
 def _extract_returns_series(account_df: pd.DataFrame) -> pd.Series:  # type: ignore[type-arg]
-    """Pull a returns series out of the Nautilus account report.
+    """Pull a time-indexed returns series out of the Nautilus account report.
 
     Nautilus's :func:`generate_account_report` does not always include a
     ``returns`` column (it depends on how the account evolved over the
     run).  We handle that gracefully by returning an empty series so the
     QuantStats fallback report still renders.
 
+    The series MUST have a ``DatetimeIndex`` -- QuantStats uses the index
+    to compute annualisation, monthly heatmaps, and chart x-axes.  If we
+    return a bare ``RangeIndex`` the tearsheet ends up dated 1970 and
+    every time-based statistic becomes meaningless.
+
     Args:
         account_df: DataFrame returned by
             ``engine.trader.generate_account_report(venue=...)``.
 
     Returns:
-        A pandas Series of period-over-period returns, or an empty
-        float series if the column is missing.
+        A pandas Series of period-over-period returns with a UTC
+        ``DatetimeIndex``, or an empty float series if the column is
+        missing.
     """
     if account_df.empty or "returns" not in account_df.columns:
         return pd.Series(dtype=float)
-    return account_df["returns"].astype(float)
+
+    returns = account_df["returns"].astype(float)
+
+    # Find an appropriate timestamp column; Nautilus reports use
+    # ``ts_init``/``ts_last`` (nanosecond ints) or a plain ``timestamp``
+    # column depending on the version. Fall back to the DataFrame index
+    # if it already carries datetimes.
+    for ts_col in ("ts_last", "ts_init", "timestamp"):
+        if ts_col in account_df.columns:
+            index = pd.to_datetime(account_df[ts_col], utc=True, errors="coerce")
+            if not index.isna().all():
+                returns = returns.copy()
+                returns.index = index
+                return returns
+
+    if isinstance(account_df.index, pd.DatetimeIndex):
+        returns = returns.copy()
+        returns.index = account_df.index
+        return returns
+
+    return returns
 
 
 def _order_row_to_trade(
@@ -380,8 +412,14 @@ def _order_row_to_trade(
 
 
 def _pick_timestamp(row: dict[str, Any]) -> datetime:
-    """Return a UTC datetime from the first populated candidate field."""
-    for key in ("ts_init", "ts_last", "ts_event", "timestamp"):
+    """Return a UTC datetime from the first populated candidate field.
+
+    Order matters: ``ts_last`` is the fill/event timestamp (when the
+    trade actually executed). ``ts_init`` is just the order creation
+    timestamp, which is earlier and would mis-order the trade log for
+    any strategy that doesn't fill immediately.
+    """
+    for key in ("ts_last", "ts_event", "ts_init", "timestamp"):
         raw = row.get(key)
         if raw is None:
             continue
