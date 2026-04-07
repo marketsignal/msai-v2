@@ -1,6 +1,6 @@
-# Claude — Nautilus Production Hardening (Revision 8)
+# Claude — Nautilus Production Hardening (Revision 9 — IMPLEMENTATION-READY)
 
-**Status:** Plan v8 (incorporates Codex v7 re-review — lock-first atomic watchdog, reservation ownership for commit/release, `failure_kind` writers wired, only-if-still-cold hydration, `startup_hard_timeout_s` raised + per-deployment override)
+**Status:** Plan v9 (final sanity pass on Codex v8 findings; review loop CLOSED, implementation begins at Phase 1). Contains the four v8 fixes (pid-fallback, SKIP LOCKED, stale references, failure_kind on remaining writers). **Does not undergo another Codex review round** — remaining marginal risk will be caught during implementation and Phase 5 paper soak.
 **Branch:** `feat/claude-nautilus-production-hardening`
 **Scope:** `claude-version/` ONLY. The `codex-version/` directory is not touched by this plan; Codex CLI is hardening that codebase independently in parallel.
 
@@ -11,6 +11,31 @@
 - `docs/nautilus-natives-audit.md` — what Nautilus already provides natively vs what we have to build
 - `.claude/rules/nautilus.md` — auto-loaded short-form gotchas list
 - `docs/plans/2026-04-06-claude-nautilus-production-hardening.md` (this file)
+
+## What changed in revision 9 (final sanity pass — review loop CLOSED)
+
+Codex v8 review identified 1 P0 + 2 P1 + 1 P2 findings, all in our supervisor/DB glue (no new Nautilus-native issues). v9 is a tightly-scoped final pass that addresses the four remaining findings; **it does not undergo another Codex review round**. Rationale: seven review iterations have converged the architectural direction (Codex explicitly verified every Nautilus-native claim in v6, v7, and v8 as correct). The remaining glue-code issues find one new bug per iteration at diminishing returns. Phase 1 implementation will catch any remaining bugs faster than continued review, and the Phase 5 paper soak is the real validation gate for production readiness.
+
+**Corrections from v8:**
+
+1. **Watchdog consults `self._handles` for pid fallback** (Codex v8 P0). v8's phase-C failure path accepted `pid=NULL` while keeping the live `mp.Process` in `self._handles`. If such a subprocess wedged before self-writing its pid, the watchdog's `if row.pid is not None: os.kill(...)` skipped the SIGKILL entirely but still flipped the row to `failed`. The child survived with a terminal row → a retry could spawn a duplicate. v9 fixes `_watchdog_kill_one` to source the pid from `row.pid OR self._handles[deployment_id].pid`. If neither source yields a pid, the watchdog logs ERROR, pages the operator, and DOES NOT flip the row to `failed` — leaves it for the next iteration to try again. This eliminates the silent-survival window.
+
+2. **Watchdog uses `SELECT FOR UPDATE SKIP LOCKED` + per-row `asyncio.wait_for` safety belt** (Codex v8 P1). v8's `_watchdog_kill_one` had no lock timeout or SKIP LOCKED clause — one row whose lock was held by a concurrent transaction could block the whole serial candidate loop. v9 switches to `with_for_update(of=LiveNodeProcess, skip_locked=True)`: if the row is contended, the SELECT returns nothing and the watchdog skips it for this pass (picks it up 5s later). Wraps each per-row call in `asyncio.wait_for(kill_one, timeout=5)` so a hung Postgres operation can't block the whole loop.
+
+3. **Stale references pruned from task sections and TDD** (Codex v8 P1). Codex found four places where older-revision prose contradicts the v8 summary:
+   - The idempotency TDD still asserted `body_mismatch` was cacheable (v7 behavior; v8 changed it to `cacheable=False`)
+   - The Phase 4 recovery section widened `HeartbeatMonitor` back to include `starting` (v6 behavior; v7 narrowed it to `ready`/`running`/`stopping`)
+   - The 600s stale hard timeout reference (v7 value; v8 raised to 1800s)
+   - A `_mark_stale_as_failed` snippet aging out hung builds (v6 behavior)
+     v9 updates or deletes each one. If an implementer reads only a task section and misses the pre-phase summary, they no longer get the wrong behavior.
+
+4. **`failure_kind` wired in `_on_child_exit` and `_mark_stale_as_failed`** (Codex v8 P2). v8 added `failure_kind` writes to `_mark_failed` (halt block, spawn_start failure, watchdog kill) and the subprocess finally block, but two paths still wrote `status='failed'` without touching `failure_kind`. v9 finishes the job:
+   - `_on_child_exit(deployment_id, exit_code)`: `failure_kind = FailureKind.NONE if exit_code == 0 else FailureKind.SPAWN_FAILED_PERMANENT`
+   - `HeartbeatMonitor._mark_stale_as_failed`: writes `failure_kind = FailureKind.UNKNOWN` (post-startup stale — the subprocess died without reporting why; the endpoint only reads failure_kind for pre-ready outcomes anyway, so UNKNOWN is fine here)
+
+**v9 CLOSES the plan review loop.** Further iterations have reached diminishing returns; implementation begins immediately. Any additional edge cases will be caught and fixed as they arise during Phase 1 implementation, and the Phase 5 paper soak is the release gate.
+
+---
 
 ## What changed in revision 8
 
@@ -628,7 +653,7 @@ v5 tried to fix that by starting the heartbeat before `node.build()` and includi
 v7's rule is strict: **during `starting`/`building`, only the Watchdog may mark a row as `failed`, and only after it has already SIGKILLed the process**. The HeartbeatMonitor scans `'ready'`, `'running'`, and `'stopping'` only — it never touches startup statuses.
 
 - **Trading subprocess (1.8):** unchanged from v6 — start the heartbeat thread immediately after writing `pid=os.getpid()` and `status='building'`, BEFORE `node.build()`. Heartbeat advances every 5 seconds throughout build. A slow-but-healthy build keeps the heartbeat fresh; the watchdog sees progress and does not kill.
-- **Watchdog (1.7 `ProcessManager.watchdog_loop`, v7):** heartbeat-based kill condition instead of wall-clock. SELECT rows where `status IN ('starting','building') AND last_heartbeat_at < now() - stale_seconds` (default 30s). For each match: SIGKILL the pid, then flip the row to `failed` in the SAME transaction (so there's no window where the row is out of the active set but the process is still alive). A secondary hard wall-clock backstop at `started_at < now() - startup_hard_timeout_s` (default 600s) catches pathological degenerate-loop cases where the heartbeat thread somehow stays alive but the process is hosed.
+- **Watchdog (1.7 `ProcessManager.watchdog_loop`):** heartbeat-based kill condition instead of wall-clock. SELECT rows where `status IN ('starting','building') AND last_heartbeat_at < now() - stale_seconds` (default 30s). For each match: SIGKILL the pid, then flip the row to `failed` in the SAME transaction (so there's no window where the row is out of the active set but the process is still alive). A secondary hard wall-clock backstop at `started_at < now() - default_startup_hard_timeout_s` (default 1800s in v8, was 600s in v7 — Codex v7 P2) catches pathological degenerate-loop cases where the heartbeat thread somehow stays alive but the process is hosed. Per-deployment override via `live_deployments.startup_hard_timeout_s` (nullable — NULL falls back to the supervisor default).
 - **HeartbeatMonitor (1.7, v7):** stale-sweep query is narrowed to `status IN ('ready','running','stopping')`. This is the post-startup orphan detector — for cross-supervisor-restart discovery of deployments that were running but lost their parent. Startup statuses are the watchdog's exclusive domain.
 
 Combined, a wedged build is detected within `stale_seconds` (default 30s). A slow-but-healthy build taking 60–300 seconds is NOT falsely killed because its heartbeat keeps advancing. Only the single `watchdog_loop` can flip a startup row to `failed`, eliminating the race between two writers.
@@ -1688,16 +1713,27 @@ class ProcessManager:
                 )).all()
 
             for row_id, deployment_id in candidate_rows:
-                # Per-row locked transaction: SELECT FOR UPDATE, re-check,
-                # SIGKILL, UPDATE, COMMIT. The entire kill-and-update
-                # sequence happens under the row-level lock so no
-                # concurrent writer can interleave.
+                # Per-row locked transaction wrapped in asyncio.wait_for
+                # as a safety belt (v9, Codex v8 P1): a Postgres-side
+                # lock contention bounded by a 5s outer timeout means
+                # the candidate loop can make forward progress even
+                # when one row is contended.
                 try:
-                    await self._watchdog_kill_one(
-                        row_id=row_id,
-                        deployment_id=deployment_id,
-                        stale_seconds=default_stale_seconds,
-                        default_hard_timeout_s=default_startup_hard_timeout_s,
+                    await asyncio.wait_for(
+                        self._watchdog_kill_one(
+                            row_id=row_id,
+                            deployment_id=deployment_id,
+                            stale_seconds=default_stale_seconds,
+                            default_hard_timeout_s=default_startup_hard_timeout_s,
+                        ),
+                        timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "watchdog_lock_timeout",
+                        row_id=str(row_id),
+                        deployment_id=str(deployment_id),
+                        note="row locked by concurrent writer; retry next iteration",
                     )
                 except Exception as exc:
                     logger.exception(
@@ -1716,39 +1752,50 @@ class ProcessManager:
         stale_seconds: int,
         default_hard_timeout_s: int,
     ) -> None:
-        """Lock-first atomic kill (v8). Called from watchdog_loop
-        per candidate row.
+        """Lock-first atomic kill. Called from watchdog_loop per
+        candidate row, wrapped in asyncio.wait_for(timeout=5).
 
         Inside a single transaction:
-        1. SELECT FOR UPDATE the row (blocks concurrent writers)
+        1. SELECT FOR UPDATE SKIP LOCKED the row (v9 — Codex v8 P1:
+           skip-locked means a contended row is silently no-oped
+           instead of blocking the whole candidate loop)
         2. Re-check: is it still in a startup status? Is it still
            stale (heartbeat OR hard ceiling)? If not, COMMIT and
            return — benign race, row moved out of scope or caught up.
-        3. os.kill(pid, SIGKILL) — synchronous, in-kernel
-        4. UPDATE row: status='failed', failure_kind=BUILD_TIMEOUT,
+        3. Determine pid from row.pid OR self._handles[deployment_id].pid
+           (v9 — Codex v8 P0: fallback to handle map when phase-C
+           never persisted the pid). If neither source has a pid,
+           log ERROR, do NOT flip the row to failed, return — next
+           iteration will try again.
+        4. os.kill(pid, SIGKILL) — synchronous, in-kernel
+        5. UPDATE row: status='failed', failure_kind=BUILD_TIMEOUT,
            exit_code=-9, error_message=reason
-        5. COMMIT — releases the lock
+        6. COMMIT — releases the lock
 
-        No concurrent writer can interleave between steps 2 and 4
-        because the row-level lock is held.
+        No concurrent writer can interleave between steps 2 and 5
+        because the row-level lock is held for the whole transaction.
         """
         async with self._db() as session, session.begin():
             now = utcnow()
-            # 1. Acquire the lock + read the row
+            # 1. Acquire the lock + read the row. SKIP LOCKED returns
+            # nothing if the row is held by another writer — the
+            # candidate gets retried on the next iteration (5s later).
             result = await session.execute(
                 select(LiveNodeProcess, LiveDeployment.startup_hard_timeout_s)
                 .join(LiveDeployment, LiveDeployment.id == LiveNodeProcess.deployment_id)
                 .where(LiveNodeProcess.id == row_id)
-                .with_for_update(of=LiveNodeProcess)
+                .with_for_update(of=LiveNodeProcess, skip_locked=True)
             )
             record = result.one_or_none()
             if record is None:
+                # Either the row was deleted or it's currently locked
+                # by another transaction. Either way: skip this pass.
                 return
             row, per_deployment_hard_timeout = record
 
             # 2. Re-check status UNDER THE LOCK. If the subprocess
-            # flipped to ready/stopping/stopped/failed while we were
-            # waiting for the lock, the benign race wins — do nothing.
+            # flipped to ready/stopping/stopped/failed between the
+            # scan and the lock, the benign race wins.
             if row.status not in ("starting", "building"):
                 logger.info(
                     "watchdog_race_skipped",
@@ -1757,15 +1804,12 @@ class ProcessManager:
                 )
                 return
 
-            # Re-check the kill conditions under the lock (the
-            # candidate scan used pre-lock values that may be stale)
+            # Re-check the kill conditions under the lock.
             effective_hard_timeout = per_deployment_hard_timeout or default_hard_timeout_s
             heartbeat_stale = row.last_heartbeat_at < now - timedelta(seconds=stale_seconds)
             hard_ceiling_hit = row.started_at < now - timedelta(seconds=effective_hard_timeout)
 
             if not (heartbeat_stale or hard_ceiling_hit):
-                # The subprocess made progress between the scan and the
-                # lock. Leave it alone.
                 logger.info(
                     "watchdog_progress_detected",
                     row_id=str(row.id),
@@ -1778,35 +1822,62 @@ class ProcessManager:
                 if heartbeat_stale
                 else f"watchdog: hard wall-clock timeout > {effective_hard_timeout}s"
             )
+
+            # 3. Determine pid — row.pid with self._handles fallback
+            # (v9, Codex v8 P0). Phase-C can leave row.pid=NULL while
+            # the live mp.Process is still in self._handles; without
+            # this fallback the watchdog would flip the row to failed
+            # without killing the child, which could survive and cause
+            # a retry duplicate spawn.
+            pid_to_kill = row.pid
+            handle = self._handles.get(deployment_id)
+            if pid_to_kill is None and handle is not None:
+                pid_to_kill = handle.pid
+
+            if pid_to_kill is None:
+                # Neither row.pid nor handle.pid is populated. This is
+                # an unexpected state — log, alert, and DO NOT flip the
+                # row. Next iteration (or the subprocess's own finally)
+                # will converge. v9 (Codex v8 P0): do NOT make the row
+                # terminal without a kill, because the live child could
+                # still be running invisibly.
+                logger.error(
+                    "watchdog_no_pid_giveup_this_pass",
+                    row_id=str(row.id),
+                    deployment_id=str(row.deployment_id),
+                    reason=reason,
+                )
+                alert_service.fire("watchdog_no_pid", deployment_id=str(deployment_id))
+                return
+
             logger.error(
                 "watchdog_kill",
                 row_id=str(row.id),
                 deployment_id=str(row.deployment_id),
-                pid=row.pid,
+                pid=pid_to_kill,
+                pid_source="row" if row.pid is not None else "handle_map",
                 status=row.status,
                 started_at=row.started_at.isoformat(),
                 last_heartbeat_at=row.last_heartbeat_at.isoformat(),
                 reason=reason,
             )
 
-            # 3. SIGKILL — synchronous, completes before the next line
+            # 4. SIGKILL — synchronous, completes before the next line
             # runs. The subprocess cannot write to the row after this
             # because the row lock is still held AND the process is dead.
-            if row.pid is not None:
-                try:
-                    os.kill(row.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass  # already gone — we still own the row update
+            try:
+                os.kill(pid_to_kill, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # already gone — we still own the row update
 
-            # 4. UPDATE the row in the same transaction
+            # 5. UPDATE the row in the same transaction
             row.status = "failed"
-            row.failure_kind = FailureKind.BUILD_TIMEOUT.value  # v8 (Codex v7 P1)
+            row.failure_kind = FailureKind.BUILD_TIMEOUT.value
             row.error_message = reason
             row.exit_code = -9
             # COMMIT happens at session.begin() exit — releases the lock
 
         # Outside the transaction: drop the handle and fire the alert.
-        # These are side effects; if they fail the row is still correct.
         self._handles.pop(deployment_id, None)
         alert_service.fire("watchdog_kill", deployment_id=str(deployment_id))
 
@@ -1816,26 +1887,44 @@ class ProcessManager:
         Updates live_node_processes.status to 'stopped' (exit_code 0)
         or 'failed' (non-zero), records the real exit_code, and emits
         an alert if the exit was unexpected.
+
+        v9 (Codex v8 P2): writes failure_kind. exit_code == 0 maps to
+        FailureKind.NONE (clean exit), non-zero maps to
+        FailureKind.SPAWN_FAILED_PERMANENT (the subprocess died
+        without writing a more specific failure_kind — the only
+        finer-grained writer is the subprocess's own finally block,
+        which already sets failure_kind before exiting, so a reap-loop
+        observation with a still-NULL failure_kind means the subprocess
+        never got to the finally or died uncleanly).
         """
         async with self._db() as session, session.begin():
-            row = (await session.execute(
-                select(LiveNodeProcess)
-                .where(
-                    LiveNodeProcess.deployment_id == deployment_id,
-                    LiveNodeProcess.status.in_(
-                        ("starting", "building", "ready", "running", "stopping")
-                    ),
+            row = (
+                await session.execute(
+                    select(LiveNodeProcess)
+                    .where(
+                        LiveNodeProcess.deployment_id == deployment_id,
+                        LiveNodeProcess.status.in_(
+                            ("starting", "building", "ready", "running", "stopping")
+                        ),
+                    )
+                    .order_by(LiveNodeProcess.started_at.desc())
+                    .limit(1)
                 )
-                .order_by(LiveNodeProcess.started_at.desc())
-                .limit(1)
-            )).scalar_one_or_none()
+            ).scalar_one_or_none()
             if row is None:
                 return
             if exit_code == 0:
                 row.status = "stopped"
+                # Only overwrite failure_kind if it's still NULL —
+                # don't clobber a more specific value the subprocess
+                # already wrote in its finally block.
+                if row.failure_kind is None:
+                    row.failure_kind = FailureKind.NONE.value
             else:
                 row.status = "failed"
                 row.error_message = f"child exited with code {exit_code}"
+                if row.failure_kind is None:
+                    row.failure_kind = FailureKind.SPAWN_FAILED_PERMANENT.value
             row.exit_code = exit_code
 ```
 
@@ -1851,8 +1940,10 @@ async def run_forever() -> None:
     watchdog_task = asyncio.create_task(
         process_manager.watchdog_loop(
             stop_event,
-            stale_seconds=settings.startup_stale_seconds,         # default 30
-            startup_hard_timeout_s=settings.startup_hard_timeout_s,  # default 600
+            default_stale_seconds=settings.startup_stale_seconds,  # default 30
+            # v8: default raised from 600s to 1800s to cover large options universes.
+            # Per-deployment overrides live on live_deployments.startup_hard_timeout_s.
+            default_startup_hard_timeout_s=settings.startup_hard_timeout_s,  # default 1800
         )
     )
     reap_task = asyncio.create_task(process_manager.reap_loop(stop_event))
@@ -1906,14 +1997,20 @@ class HeartbeatMonitor:
                 update(LiveNodeProcess)
                 .where(
                     # v7: startup statuses EXCLUDED — watchdog owns them
-                    LiveNodeProcess.status.in_(
-                        ("ready", "running", "stopping")
-                    ),
-                    LiveNodeProcess.last_heartbeat_at < utcnow() - timedelta(seconds=self._stale_seconds),
+                    LiveNodeProcess.status.in_(("ready", "running", "stopping")),
+                    LiveNodeProcess.last_heartbeat_at
+                    < utcnow() - timedelta(seconds=self._stale_seconds),
                 )
                 .values(
                     status="failed",
                     error_message="heartbeat timeout",
+                    # v9 (Codex v8 P2): write failure_kind. Post-startup
+                    # stale means the subprocess died without reporting
+                    # a more specific failure — UNKNOWN is the honest
+                    # classification. The endpoint only reads failure_kind
+                    # for pre-ready outcomes, so this value is primarily
+                    # for operator visibility.
+                    failure_kind=FailureKind.UNKNOWN.value,
                 )
                 .returning(LiveNodeProcess.deployment_id)
             )
@@ -1960,21 +2057,26 @@ TDD:
 6. Unit test `ProcessManager.stop` when the handle map is empty (rediscovered subprocess after a supervisor restart): verify pid is read from the row (populated by the subprocess self-write in 1.8) and signaled successfully
 7. **Stop-after-supervisor-restart test (Codex v5 P0 regression)**: seed a row with `status='running'`, `pid=<live pid>`, clear the handle map (simulating a supervisor restart), call `stop(deployment_id)` — verify `os.kill(pid, SIGTERM)` IS called (NOT a silent success)
 8. **Reap loop unit test**: stash a fake `Process` whose `is_alive()` returns False and `exitcode == 1`, run one iteration of `reap_loop`, verify `live_node_processes` row is `status='failed'`, `exit_code=1`, error_message contains "child exited with code 1"
-9. **Watchdog unit test — no-progress kill (v7, Codex v6 P1 regression)**: seed a row with `status='building'`, `pid=<live pid of a fake sleeping child>`, `last_heartbeat_at = now() - 45s` (past the 30s stale threshold), `started_at = now() - 50s` (well within the 600s hard backstop), run one iteration of `watchdog_loop`, verify:
+9. **Watchdog unit test — no-progress kill (v7, Codex v6 P1 regression)**: seed a row with `status='building'`, `pid=<live pid of a fake sleeping child>`, `last_heartbeat_at = now() - 45s` (past the 30s stale threshold), `started_at = now() - 50s` (well within the 1800s hard backstop), run one iteration of `watchdog_loop`, verify:
    - `os.kill(pid, SIGKILL)` IS called
    - The row flips to `status='failed'`, `error_message` contains "no heartbeat progress", `exit_code=-9`
    - The handle is removed from `self._handles`
    - The alert service fires
 10. **Watchdog unit test — slow-but-healthy build untouched (v7, Codex v6 P1 regression)**: seed a row with `status='building'`, `started_at = now() - 300s` (well past v6's old 180s wall-clock), but `last_heartbeat_at = now() - 5s` (heartbeat thread still advancing). Run `watchdog_loop`. Verify the row is NOT killed, NOT marked failed, and `os.kill` is NOT called. This is the regression test for the slow-IB-contract-loading case.
-11. **Watchdog unit test — hard wall-clock backstop**: seed a row with `status='building'`, `last_heartbeat_at = now() - 10s` (not stale enough to trip the primary condition), BUT `started_at = now() - 700s` (past the 600s hard backstop). Verify the row IS killed via the secondary backstop path (`error_message` contains "hard wall-clock timeout").
-12. **Watchdog ownership test (v7, Codex v6 P0 regression)**: assert that running both the HeartbeatMonitor AND the Watchdog concurrently against a stale-heartbeat `starting` row produces exactly ONE kill and one final `status='failed'` write — NOT a race where the HeartbeatMonitor flips the row first and leaves the process alive. Verify by checking `os.kill` was called AND the row's final `error_message` is the watchdog message, not "heartbeat timeout".
-13. **Watchdog untouched by ready/running/stopping**: seed rows with `status='ready'`, `status='running'`, `status='stopping'`, all with stale heartbeats. Run `watchdog_loop`. Verify NONE are touched — those statuses belong to the HeartbeatMonitor.
-14. **HeartbeatMonitor ownership test (v7, Codex v6 P0 regression)**: seed rows with `status='starting'` and `status='building'` with stale heartbeats. Run `HeartbeatMonitor._mark_stale_as_failed`. Verify NEITHER is touched — startup statuses belong to the watchdog.
-15. **HeartbeatMonitor stale sweep**: seed rows with `status='ready'`, `status='running'`, `status='stopping'` with stale heartbeats. Run `HeartbeatMonitor._mark_stale_as_failed`. Verify all three flip to `failed`.
-16. **ACK-on-success-only test**: invoke `run_forever`'s command handler with a mock that returns False (failure), assert `bus.ack` is NOT called; with True (success), assert ack IS called
-17. Integration test against testcontainers Postgres + Redis: publish a start command via `LiveCommandBus`, verify the supervisor consumes it, inserts a row, calls `_trading_node_subprocess` (use a no-op stub)
-18. Integration test: publish two `start` commands for the same deployment_id back-to-back, verify only one trading subprocess is spawned and the second command is also ACKed
-19. Implement
+11. **Watchdog unit test — hard wall-clock backstop**: seed a row with `status='building'`, `last_heartbeat_at = now() - 10s` (not stale enough to trip the primary condition), BUT `started_at = now() - 2000s` (past the 1800s hard backstop). Verify the row IS killed via the secondary backstop path (`error_message` contains "hard wall-clock timeout").
+12. **Watchdog per-deployment override test (v8)**: seed a row with `started_at = now() - 1000s` (past default 1800s? no, within), set `live_deployments.startup_hard_timeout_s = 500` for that deployment, run watchdog — verify the row IS killed via the per-deployment override (500s exceeded, 1000s > 500s).
+13. **Watchdog pid-fallback test (v9, Codex v8 P0 regression)**: seed a row with `pid=NULL` (simulating phase-C failure) but stash a live `mp.Process` in `self._handles[deployment_id]` (handle.pid is a real pid). Make heartbeat stale. Run watchdog — verify `os.kill(handle.pid, SIGKILL)` IS called (pid sourced from the handle map), row flips to `failed`, handle is dropped. The pid_source log field should be "handle_map".
+14. **Watchdog no-pid giveup test (v9, Codex v8 P0 regression)**: seed a row with `pid=NULL` AND an empty `self._handles` (supervisor restart scenario — the handle map was wiped). Run watchdog — verify `os.kill` is NOT called, the row is NOT flipped to `failed` (stays in `building`), an alert fires with name `watchdog_no_pid`. The next iteration (or the subprocess's own convergence) will handle it.
+15. **Watchdog SKIP LOCKED test (v9, Codex v8 P1 regression)**: open a concurrent transaction that holds a row-level lock on one candidate row. Run the watchdog loop. Verify the locked row is silently skipped (no exception) and that OTHER candidate rows in the same pass ARE still processed. Also verify that the `asyncio.wait_for(timeout=5)` outer safety belt bounds the per-row time so even a hung DB doesn't block the whole loop beyond 5s per row.
+16. **Watchdog ownership test (v7/v9, Codex v6 P0 regression)**: assert that running both the HeartbeatMonitor AND the Watchdog concurrently against a stale-heartbeat `building` row produces exactly ONE kill (by the Watchdog) and the HeartbeatMonitor DOES NOT touch the row at all. Verify by checking `os.kill` was called AND the row's final `error_message` is the watchdog message ("no heartbeat progress" or "hard wall-clock timeout"), not "heartbeat timeout".
+17. **HeartbeatMonitor excludes startup statuses test (v9, Codex v8 P1 regression)**: seed `status='starting'`, `status='building'` rows with stale heartbeats. Run `HeartbeatMonitor._mark_stale_as_failed`. Verify NEITHER row is touched (the query filters them out).
+18. **Watchdog untouched by ready/running/stopping**: seed rows with `status='ready'`, `status='running'`, `status='stopping'`, all with stale heartbeats. Run `watchdog_loop`. Verify NONE are touched — those statuses belong to the HeartbeatMonitor.
+19. **HeartbeatMonitor ownership test (v7, Codex v6 P0 regression)**: seed rows with `status='starting'` and `status='building'` with stale heartbeats. Run `HeartbeatMonitor._mark_stale_as_failed`. Verify NEITHER is touched — startup statuses belong to the watchdog.
+20. **HeartbeatMonitor stale sweep**: seed rows with `status='ready'`, `status='running'`, `status='stopping'` with stale heartbeats. Run `HeartbeatMonitor._mark_stale_as_failed`. Verify all three flip to `failed`.
+21. **ACK-on-success-only test**: invoke `run_forever`'s command handler with a mock that returns False (failure), assert `bus.ack` is NOT called; with True (success), assert ack IS called
+22. Integration test against testcontainers Postgres + Redis: publish a start command via `LiveCommandBus`, verify the supervisor consumes it, inserts a row, calls `_trading_node_subprocess` (use a no-op stub)
+23. Integration test: publish two `start` commands for the same deployment_id back-to-back, verify only one trading subprocess is spawned and the second command is also ACKed
+24. Implement
 
 Acceptance: tests pass; the service stands up in `docker compose up -d live-supervisor`.
 
@@ -2877,31 +2979,33 @@ async def stop_live_deployment(
 
 TDD:
 
-1. **EndpointOutcome factory test (v7)**: construct each factory method (`ready`, `already_active`, `halt_active`, `in_flight`, `api_poll_timeout`, `permanent_failure`, `body_mismatch`) and assert the `status_code`, `cacheable`, and `failure_kind` fields are correct:
+1. **EndpointOutcome factory test (v7/v8/v9)**: construct each factory method (`ready`, `already_active`, `halt_active`, `in_flight`, `api_poll_timeout`, `permanent_failure`, `body_mismatch`) and assert the `status_code`, `cacheable`, and `failure_kind` fields are correct:
    - `ready` → 201, cacheable=True, NONE
    - `already_active` → 200 (NOT 201), cacheable=True, NONE — regression for Codex v6 P1 status-code mismatch
    - `halt_active` → 503, cacheable=**False**, HALT_ACTIVE
    - `in_flight` → 425, cacheable=False, IN_FLIGHT
    - `api_poll_timeout` → 504, cacheable=False, API_POLL_TIMEOUT
    - `permanent_failure(SPAWN_FAILED_PERMANENT, ...)` → 503, cacheable=**True**, SPAWN_FAILED_PERMANENT
-   - `body_mismatch` → 422, cacheable=True, BODY_MISMATCH
+   - `permanent_failure(UNKNOWN, ...)` → 503, cacheable=True, UNKNOWN (v8)
+   - `body_mismatch` → 422, cacheable=**False**, BODY_MISMATCH (v8 — Codex v7 P0 fix; caller does NOT own the reservation, so the outcome must be non-cacheable to prevent poisoning the original cached response)
 2. **commit() rejects non-cacheable (v7)**: construct `EndpointOutcome.halt_active()`, call `idem.commit(key, outcome)`, assert it raises `ValueError` (programming error — should have called release)
-3. Integration test: `/start` with no `Idempotency-Key` for a fresh strategy → publishes, mocked supervisor flips to ready, returns 201
-4. Integration test: `/start` twice with the SAME `Idempotency-Key` and identical body → second call returns the cached outcome via `CachedOutcome`
-5. Integration test: `/start` twice with the SAME `Idempotency-Key` but different body → second returns 422 (BodyMismatchReservation)
-6. **In-flight race test (regression for Codex v4 P2)**: launch two concurrent `/start` requests with the SAME `Idempotency-Key` (`asyncio.gather`); assert exactly one wins SETNX and the other gets 425 `IN_FLIGHT`; assert exactly one publish command is sent
-7. **User-scoping test**: two different users send `/start` with the SAME `Idempotency-Key` value AND different bodies; assert both succeed
-8. **Halt-flag outcome (v7, regression for Codex v6 P1)**: set `msai:risk:halt`, call `/start` → returns 503 with `failure_kind=HALT_ACTIVE`; verify `idem.release()` IS called and `idem.commit()` is NOT; subsequent retry with the same key re-attempts (the reservation was released, not cached)
-9. **Permanent-failure outcome (v7)**: mock the subprocess to write `failure_kind='spawn_failed_permanent'` to the row; call `/start`; verify it returns 503 with `failure_kind=SPAWN_FAILED_PERMANENT` AND `idem.commit()` IS called; subsequent retry with the same key returns the CACHED 503 without re-attempting
-10. **API poll timeout (v7)**: mock the poll to never observe `ready`; verify `/start` returns 504 with `failure_kind=API_POLL_TIMEOUT`; verify `idem.release()` is called; subsequent retry re-attempts
-11. **failure_kind sourced from row, not string parsing (v7, regression for Codex v6 P1)**: seed a row with `failure_kind='reconciliation_failed'` and `error_message='whatever human-readable string'`; call `/start`; verify the endpoint reads the enum column, NOT the error_message string, to decide cacheability
-12. **Reservation release on raised exception**: patch `bus.publish_start` to raise; verify `idem.release(redis_key)` is called in the handler's exception path; a subsequent retry with the SAME key re-attempts
-13. Integration test: `/start` twice without `Idempotency-Key` for the same identity_signature while the first is still running → second returns 200 `already_active` (NOT 201) with the existing deployment_id and does NOT publish a new command
-14. Integration test: `/start` for a previously stopped deployment with the SAME identity_signature → reuses the existing live_deployments row (same `deployment_slug` — warm restart)
-15. Integration test: `/start` for the same strategy with a CHANGED config → produces a different `identity_signature`, inserts a new row with a fresh `deployment_slug` (cold start)
-16. Integration test: stop endpoint publishes, mocked supervisor flips status to stopped
-17. Integration test: stop endpoint when no active row exists → returns 200 immediately
-18. Implement
+3. **Reserved-only commit enforcement (v8/v9, Codex v7 P0)**: pattern-match test verifying that the endpoint code NEVER calls `commit()` or `release()` from the `InFlight`, `CachedOutcome`, or `BodyMismatchReservation` branches. Use a spy on `idem.commit` / `idem.release` and assert zero calls from those three branches across all test inputs.
+4. Integration test: `/start` with no `Idempotency-Key` for a fresh strategy → publishes, mocked supervisor flips to ready, returns 201
+5. Integration test: `/start` twice with the SAME `Idempotency-Key` and identical body → second call returns the cached outcome via `CachedOutcome`
+6. Integration test: `/start` twice with the SAME `Idempotency-Key` but different body → second returns 422 (BodyMismatchReservation)
+7. **In-flight race test (regression for Codex v4 P2)**: launch two concurrent `/start` requests with the SAME `Idempotency-Key` (`asyncio.gather`); assert exactly one wins SETNX and the other gets 425 `IN_FLIGHT`; assert exactly one publish command is sent
+8. **User-scoping test**: two different users send `/start` with the SAME `Idempotency-Key` value AND different bodies; assert both succeed
+9. **Halt-flag outcome (v7, regression for Codex v6 P1)**: set `msai:risk:halt`, call `/start` → returns 503 with `failure_kind=HALT_ACTIVE`; verify `idem.release()` IS called and `idem.commit()` is NOT; subsequent retry with the same key re-attempts (the reservation was released, not cached)
+10. **Permanent-failure outcome (v7)**: mock the subprocess to write `failure_kind='spawn_failed_permanent'` to the row; call `/start`; verify it returns 503 with `failure_kind=SPAWN_FAILED_PERMANENT` AND `idem.commit()` IS called; subsequent retry with the same key returns the CACHED 503 without re-attempting
+11. **API poll timeout (v7)**: mock the poll to never observe `ready`; verify `/start` returns 504 with `failure_kind=API_POLL_TIMEOUT`; verify `idem.release()` is called; subsequent retry re-attempts
+12. **failure_kind sourced from row, not string parsing (v7, regression for Codex v6 P1)**: seed a row with `failure_kind='reconciliation_failed'` and `error_message='whatever human-readable string'`; call `/start`; verify the endpoint reads the enum column, NOT the error_message string, to decide cacheability
+13. **Reservation release on raised exception**: patch `bus.publish_start` to raise; verify `idem.release(redis_key)` is called in the handler's exception path; a subsequent retry with the SAME key re-attempts
+14. Integration test: `/start` twice without `Idempotency-Key` for the same identity_signature while the first is still running → second returns 200 `already_active` (NOT 201) with the existing deployment_id and does NOT publish a new command
+15. Integration test: `/start` for a previously stopped deployment with the SAME identity_signature → reuses the existing live_deployments row (same `deployment_slug` — warm restart)
+16. Integration test: `/start` for the same strategy with a CHANGED config → produces a different `identity_signature`, inserts a new row with a fresh `deployment_slug` (cold start)
+17. Integration test: stop endpoint publishes, mocked supervisor flips status to stopped
+18. Integration test: stop endpoint when no active row exists → returns 200 immediately
+19. Implement
 
 Acceptance: tests pass.
 
@@ -4638,17 +4742,27 @@ v2 proposed `os.kill(pid, 0)` from FastAPI to detect orphaned subprocesses. That
 class HeartbeatMonitor:
     """Runs inside the live-supervisor container.
 
+    v9 authority split (Codex v6 P0): HeartbeatMonitor scans
+    POST-STARTUP statuses only — ready / running / stopping. The
+    Watchdog (ProcessManager.watchdog_loop) is the sole liveness
+    authority during starting / building. See decision #17 for the
+    full rationale. If a prior revision of this file said this
+    scanned 'starting'/'building' rows, that is v6 behavior that
+    was removed in v7.
+
     Every 10 seconds:
-    1. Selects live_node_processes rows with status in ('starting','ready','running')
+    1. Selects live_node_processes rows with status in ('ready','running','stopping')
     2. For each row where last_heartbeat_at < now() - stale_seconds (default 30s):
-       - Updates row: status='failed', error_message='heartbeat timeout'
+       - Updates row: status='failed', error_message='heartbeat timeout',
+         failure_kind='unknown' (v9, Codex v8 P2 — post-startup stale
+         means the subprocess died without reporting why)
        - Fires the AlertService with deployment_id, last_heartbeat_at, duration_stale
     3. Sleeps 10 seconds
     """
     async def _mark_stale_as_failed(self) -> None: ...
 ```
 
-This is the **authoritative** orphan detector. It runs in the same container as the subprocess's parent (the supervisor spawned it via `mp.get_context("spawn").Process`), so even if the subprocess OS-died, the row's heartbeat will stop advancing and the monitor will flip it to `failed` within 30–40 seconds.
+This is the **post-startup** orphan detector. It runs in the same container as the subprocess's parent (the supervisor spawned it via `mp.get_context("spawn").Process`), so even if the subprocess OS-died, the row's heartbeat will stop advancing and the monitor will flip it to `failed` within 30–40 seconds. **Startup statuses are the Watchdog's exclusive domain** — this monitor must never touch them.
 
 **FastAPI side (recovery discovery only):**
 
@@ -5011,9 +5125,9 @@ Existing backtest pipeline keeps working at every phase boundary. Phase 2 includ
 
 ---
 
-**Plan version:** 8.0
+**Plan version:** 9.0 — IMPLEMENTATION-READY
 **Last updated:** 2026-04-07
-**Approved by:** [pending Codex v8 re-review]
+**Approved by:** Plan review loop CLOSED after v9 sanity pass. Seven iterations with Codex converged the architectural direction; remaining marginal risk is in diminishing-returns territory and will be caught during Phase 1 implementation and Phase 5 paper soak.
 
 ## Revision history
 
@@ -5075,3 +5189,10 @@ Existing backtest pipeline keeps working at every phase boundary. Phase 2 includ
   - **`failure_kind` writers wired + safe parser** (Codex v7 P1). v7 added the `failure_kind` column to the schema and had `/start` read it to decide cacheability, but the supervisor's `_mark_failed` and the subprocess finally block never populated it. v8 makes `_mark_failed(row_id, reason, failure_kind: FailureKind)` take the enum as a required arg and wires every failure path (halt-flag block → `HALT_ACTIVE`; `process.start()` failure → `SPAWN_FAILED_PERMANENT`; watchdog kill → `BUILD_TIMEOUT`; subprocess `StartupHealthCheckFailed` → `RECONCILIATION_FAILED`; generic exceptions → `SPAWN_FAILED_PERMANENT`). Also adds `FailureKind.UNKNOWN` variant and `FailureKind.parse_or_unknown(db_string)` helper — the endpoint never crashes on NULL or stale values.
   - **Cold-read hydration is only-if-still-cold** (Codex v7 P1). v7's `hydrate_from_cold_read` blindly merged cold-read positions into existing state and overwrote account state. If StateApplier applied a newer event between the cold read and the hydrate, the older cold snapshot would overwrite fresher pub/sub data. v8 makes `hydrate_from_cold_read` a no-op for any domain that was hydrated between the caller's fast-path check and the hydrate call (the check is `deployment_id not in self._positions/_accounts` at hydrate time). `PositionReader` also returns the CURRENT state value (not the cold-read result) after the hydrate — in the race case, the caller sees the fresher data.
   - **`startup_hard_timeout_s` raised to 1800s + per-deployment override** (Codex v7 P2). v7's 600s hard ceiling was tighter than legitimate large-options-universe builds (`docs/nautilus-reference.md:482,513` documents 900s+ is possible). v8 raises the supervisor default to 1800s (30 min) and adds a nullable `startup_hard_timeout_s` column on `live_deployments` so operators can raise it per deployment for extra-large universes.
+- **v9.0** (2026-04-07): FINAL sanity pass on Codex v8 review (1 P0 + 2 P1 + 1 P2). Codex confirmed no new Nautilus-native issues. Plan review loop CLOSED after v9 — implementation begins at Phase 1.
+  - **Watchdog pid-fallback via `self._handles`** (Codex v8 P0). v8's `_watchdog_kill_one` skipped SIGKILL when `row.pid is None` but still flipped the row to `failed`. A phase-C failure that left `pid=NULL` with a live handle in `self._handles` would cause the child to survive with a terminal row — retry → duplicate. v9 sources the pid from `row.pid OR self._handles[deployment_id].pid`. If neither has a pid, the watchdog logs ERROR, fires `watchdog_no_pid` alert, and DOES NOT flip the row — leaves it for the next iteration.
+  - **SKIP LOCKED + per-row asyncio.wait_for(5s)** (Codex v8 P1). v8's serial candidate loop could stall the whole watchdog pass on one locked row. v9 uses `with_for_update(skip_locked=True)` so contended rows are silently skipped until the next pass, and wraps each `_watchdog_kill_one` call in `asyncio.wait_for(timeout=5)` as a safety belt against Postgres-side hangs.
+  - **Stale prose references pruned** (Codex v8 P1). Four places where older-revision text contradicted the v8 summary were updated: (a) idempotency TDD test 1 now asserts `body_mismatch` is `cacheable=False` + adds a reserved-only commit enforcement test, (b) Phase 4 recovery-section HeartbeatMonitor prose now correctly says it scans `ready/running/stopping` only (removed the stale "starting/ready/running" list), (c) watchdog test 9 uses the 1800s backstop, not 600s, (d) watchdog decision #17 prose and in-code comments aligned to v9 parameter names (`default_stale_seconds` / `default_startup_hard_timeout_s`).
+  - **`failure_kind` wired in `_on_child_exit` + `_mark_stale_as_failed`** (Codex v8 P2). v8 added failure_kind to `_mark_failed` but missed these two paths. v9 updates `_on_child_exit` to write `NONE` on clean exit and `SPAWN_FAILED_PERMANENT` on non-zero exit (only if still NULL — doesn't clobber a more specific value the subprocess already wrote in its finally block), and `HeartbeatMonitor._mark_stale_as_failed` to write `UNKNOWN` (post-startup stale without a root cause).
+
+  **Plan review loop closed.** Further iterations have reached diminishing returns. The remaining marginal risk will be caught during Phase 1 implementation (where the actual code is in front of a compiler and tests) and the Phase 5 paper soak is the release gate for production readiness.
