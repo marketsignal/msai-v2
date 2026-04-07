@@ -9,6 +9,7 @@ from msai.core.database import async_session_factory
 from msai.core.logging import get_logger
 from msai.models import Backtest, Trade
 from msai.services.nautilus.backtest_runner import BacktestRunner
+from msai.services.nautilus.catalog_builder import ensure_catalog_data
 from msai.services.report_generator import ReportGenerator
 
 logger = get_logger("workers.backtest")
@@ -28,14 +29,22 @@ async def run_backtest(ctx: dict, backtest_id: str, strategy_path: str, config: 
         await session.commit()
 
     try:
+        # Ensure the Nautilus catalog has data for the requested instruments.
+        # Converts raw OHLCV Parquet → Nautilus Bar+Instrument catalog on demand.
+        instrument_ids = ensure_catalog_data(
+            symbols=backtest.instruments,
+            raw_parquet_root=settings.parquet_root,
+            catalog_root=settings.nautilus_catalog_root,
+        )
+
         runner = BacktestRunner()
         result = runner.run(
             strategy_path=strategy_path,
             config=config,
-            instruments=backtest.instruments,
+            instruments=instrument_ids,
             start_date=backtest.start_date.isoformat(),
             end_date=backtest.end_date.isoformat(),
-            data_path=settings.parquet_root,
+            data_path=settings.nautilus_catalog_root,
             timeout_seconds=settings.backtest_timeout_seconds,
         )
 

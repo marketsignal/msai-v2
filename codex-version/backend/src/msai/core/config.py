@@ -58,5 +58,9 @@ class Settings(BaseSettings):
     def reports_root(self) -> Path:
         return self.data_root / "reports"
 
+    @property
+    def nautilus_catalog_root(self) -> Path:
+        return self.data_root / "nautilus"
+
 
 settings = Settings()

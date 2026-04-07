@@ -19,6 +19,7 @@ try:
         BacktestVenueConfig,
     )
     from nautilus_trader.backtest.node import BacktestNode
+    from nautilus_trader.model.identifiers import Venue
     from nautilus_trader.trading.config import ImportableStrategyConfig
 
     _NAUTILUS_IMPORT_ERROR: Exception | None = None
@@ -128,7 +129,7 @@ def _subprocess_run(payload: _RunInput, result_queue: Any) -> None:
 
             orders_df = engine.trader.generate_orders_report()
             positions_df = engine.trader.generate_positions_report()
-            account_df = engine.trader.generate_account_report()
+            account_df = engine.trader.generate_account_report(venue=Venue("SIM"))
 
             result_queue.put(
                 {
