@@ -22,6 +22,7 @@ import {
   type SymbolsResponse,
   type BarsResponse,
 } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import { formatCurrency, formatPercent, formatNumber } from "@/lib/format";
 
 function formatDateForApi(date: Date): string {
@@ -39,6 +40,7 @@ function dateRangeForTimeframe(days: number): { start: string; end: string } {
 }
 
 export default function MarketDataPage(): React.ReactElement {
+  const { getToken } = useAuth();
   const [symbols, setSymbols] = useState<SymbolOption[]>([]);
   const [selectedSymbol, setSelectedSymbol] = useState<string>("");
   const [selectedTimeframe, setSelectedTimeframe] = useState<number>(7);
@@ -52,8 +54,10 @@ export default function MarketDataPage(): React.ReactElement {
     let cancelled = false;
     const load = async (): Promise<void> => {
       try {
+        const token = await getToken();
         const data = await apiGet<SymbolsResponse>(
           "/api/v1/market-data/symbols",
+          token,
         );
         if (cancelled) return;
         const flat: SymbolOption[] = [];
@@ -85,7 +89,7 @@ export default function MarketDataPage(): React.ReactElement {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [getToken]);
 
   // Fetch bars whenever symbol or timeframe changes.
   useEffect(() => {
@@ -95,11 +99,13 @@ export default function MarketDataPage(): React.ReactElement {
       setBarsLoading(true);
       setError(null);
       try {
+        const token = await getToken();
         const { start, end } = dateRangeForTimeframe(selectedTimeframe);
         const data = await apiGet<BarsResponse>(
           `/api/v1/market-data/bars/${encodeURIComponent(
             selectedSymbol,
           )}?start=${start}&end=${end}&interval=1m`,
+          token,
         );
         if (cancelled) return;
         const bars: OHLCVBar[] = data.bars.map((b) => ({
@@ -127,7 +133,7 @@ export default function MarketDataPage(): React.ReactElement {
     return () => {
       cancelled = true;
     };
-  }, [selectedSymbol, selectedTimeframe]);
+  }, [selectedSymbol, selectedTimeframe, getToken]);
 
   // Derived stats
   const stats = useMemo(() => {

@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
 
+from msai.core.database import get_db
 from msai.main import app
+from msai.models.strategy import Strategy
 from msai.services.strategy_registry import StrategyInfo
 
 
@@ -20,9 +24,64 @@ from msai.services.strategy_registry import StrategyInfo
 STRATEGIES_DIR = Path(__file__).resolve().parents[3] / "strategies" / "example"
 
 
+class _FakeSession:
+    """Minimal async DB session for unit tests.
+
+    Supports the tiny subset of the SQLAlchemy async API used by the
+    strategies endpoint: ``execute(select(...))`` → result with ``scalars()``,
+    ``add``, ``commit``, ``refresh``. The fake records every added row
+    and returns them on subsequent scalar queries.
+    """
+
+    def __init__(self) -> None:
+        self._rows: list[Strategy] = []
+
+    async def execute(self, _stmt: object) -> "_FakeSession":
+        return self
+
+    def scalars(self) -> "_FakeSession":
+        return self
+
+    def all(self) -> list[Strategy]:
+        return list(self._rows)
+
+    def scalar_one_or_none(self) -> Strategy | None:
+        return self._rows[0] if self._rows else None
+
+    def add(self, row: Strategy) -> None:
+        if row.id is None:
+            row.id = uuid4()
+        if row.created_at is None:
+            row.created_at = datetime.now(timezone.utc)
+        self._rows.append(row)
+
+    async def commit(self) -> None:
+        pass
+
+    async def refresh(self, _row: Strategy) -> None:
+        pass
+
+    async def delete(self, row: Strategy) -> None:
+        if row in self._rows:
+            self._rows.remove(row)
+
+
 @pytest.fixture
-def client() -> httpx.AsyncClient:
-    """Async test client wired to the MSAI FastAPI application."""
+def fake_db_session() -> _FakeSession:
+    """Return a fake DB session and install it as the get_db override."""
+    session = _FakeSession()
+
+    async def _override() -> AsyncGenerator[_FakeSession, None]:
+        yield session
+
+    app.dependency_overrides[get_db] = _override
+    yield session
+    app.dependency_overrides.pop(get_db, None)
+
+
+@pytest.fixture
+def client(fake_db_session: _FakeSession) -> httpx.AsyncClient:
+    """Async test client wired to the MSAI FastAPI application with fake DB."""
     transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://testserver")
 

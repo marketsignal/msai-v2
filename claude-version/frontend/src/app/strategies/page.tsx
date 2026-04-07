@@ -8,8 +8,10 @@ import {
   type StrategyListResponse,
   type StrategyResponse,
 } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 
 export default function StrategiesPage(): React.ReactElement {
+  const { getToken } = useAuth();
   const [strategies, setStrategies] = useState<StrategyResponse[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
@@ -18,7 +20,11 @@ export default function StrategiesPage(): React.ReactElement {
     let cancelled = false;
     const load = async (): Promise<void> => {
       try {
-        const data = await apiGet<StrategyListResponse>("/api/v1/strategies/");
+        const token = await getToken();
+        const data = await apiGet<StrategyListResponse>(
+          "/api/v1/strategies/",
+          token,
+        );
         if (cancelled) return;
         setStrategies(data.items);
       } catch (err) {
@@ -36,7 +42,7 @@ export default function StrategiesPage(): React.ReactElement {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [getToken]);
 
   return (
     <div className="space-y-6">

@@ -161,6 +161,6 @@ export interface BacktestMetrics {
 
 export interface BacktestResultsResponse {
   id: string;
-  metrics: BacktestMetrics;
+  metrics: BacktestMetrics | null;
   trade_count: number;
 }

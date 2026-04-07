@@ -32,6 +32,7 @@ import {
   Hash,
 } from "lucide-react";
 import { apiGet, ApiError, type StrategyResponse } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import { formatDate } from "@/lib/format";
 
 export default function StrategyDetailPage({
@@ -41,6 +42,7 @@ export default function StrategyDetailPage({
 }): React.ReactElement {
   const { id } = use(params);
   const router = useRouter();
+  const { getToken } = useAuth();
   const [strategy, setStrategy] = useState<StrategyResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [notFound, setNotFound] = useState<boolean>(false);
@@ -53,8 +55,10 @@ export default function StrategyDetailPage({
     let cancelled = false;
     const load = async (): Promise<void> => {
       try {
+        const token = await getToken();
         const data = await apiGet<StrategyResponse>(
           `/api/v1/strategies/${encodeURIComponent(id)}`,
+          token,
         );
         if (cancelled) return;
         setStrategy(data);
@@ -82,7 +86,7 @@ export default function StrategyDetailPage({
     return () => {
       cancelled = true;
     };
-  }, [id]);
+  }, [id, getToken]);
 
   function handleValidate(): void {
     try {

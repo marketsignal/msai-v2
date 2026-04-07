@@ -12,11 +12,13 @@ import {
 } from "@/components/backtests/results-charts";
 import { TradeLog } from "@/components/backtests/trade-log";
 import {
+  apiFetch,
   apiGet,
   ApiError,
   type BacktestResultsResponse,
   type BacktestStatusResponse,
 } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import { generateEquityCurve, backtestTrades } from "@/lib/mock-data/backtests";
 
 function statusColor(status: string): string {
@@ -41,6 +43,7 @@ export default function BacktestDetailPage({
 }): React.ReactElement {
   const { id } = use(params);
   const router = useRouter();
+  const { getToken } = useAuth();
   const [status, setStatus] = useState<BacktestStatusResponse | null>(null);
   const [results, setResults] = useState<BacktestResultsResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
@@ -53,8 +56,10 @@ export default function BacktestDetailPage({
       setLoading(true);
       setError(null);
       try {
+        const token = await getToken();
         const statusData = await apiGet<BacktestStatusResponse>(
           `/api/v1/backtests/${encodeURIComponent(id)}/status`,
+          token,
         );
         if (cancelled) return;
         setStatus(statusData);
@@ -62,6 +67,7 @@ export default function BacktestDetailPage({
         if (statusData.status === "completed") {
           const resultsData = await apiGet<BacktestResultsResponse>(
             `/api/v1/backtests/${encodeURIComponent(id)}/results`,
+            token,
           );
           if (cancelled) return;
           setResults(resultsData);
@@ -85,11 +91,41 @@ export default function BacktestDetailPage({
     return () => {
       cancelled = true;
     };
-  }, [id]);
+  }, [id, getToken]);
+
+  const handleDownloadReport = async (): Promise<void> => {
+    try {
+      const token = await getToken();
+      const res = await apiFetch(
+        `/api/v1/backtests/${encodeURIComponent(id)}/report`,
+        {},
+        token,
+      );
+      if (!res.ok) {
+        throw new Error(`Download failed: ${res.status}`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `backtest-${id}.html`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("Report download failed:", err);
+      setError(
+        err instanceof Error
+          ? `Report download failed: ${err.message}`
+          : "Report download failed",
+      );
+    }
+  };
 
   // Adapt API metrics (ratios 0-1) into the percent shape ResultsCharts expects.
   const backtestForCharts: ResultsChartsBacktest | null = useMemo(() => {
-    if (!results) return null;
+    if (!results || !results.metrics) return null;
     const m = results.metrics;
     return {
       sharpeRatio: m.sharpe_ratio,
@@ -162,15 +198,13 @@ export default function BacktestDetailPage({
           </div>
         </div>
         {status.status === "completed" && (
-          <Button variant="outline" className="gap-1.5" asChild>
-            <a
-              href={`/api/v1/backtests/${status.id}/report`}
-              target="_blank"
-              rel="noreferrer"
-            >
-              <Download className="size-3.5" />
-              Download Report
-            </a>
+          <Button
+            variant="outline"
+            className="gap-1.5"
+            onClick={handleDownloadReport}
+          >
+            <Download className="size-3.5" />
+            Download Report
           </Button>
         )}
       </div>
@@ -188,6 +222,11 @@ export default function BacktestDetailPage({
             : status.status === "running"
               ? `Backtest in progress (${Math.round((status.progress ?? 0) * 100)}%)`
               : "Backtest not yet complete."}
+        </div>
+      ) : results && !results.metrics ? (
+        <div className="flex h-48 items-center justify-center rounded-md border border-border/50 text-sm text-muted-foreground">
+          Backtest completed but no metrics are available. The worker may have
+          failed to populate results.
         </div>
       ) : backtestForCharts ? (
         <>

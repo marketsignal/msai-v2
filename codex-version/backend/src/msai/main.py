@@ -28,31 +28,49 @@ from sqlalchemy import select
 setup_logging(settings.environment)
 logger = get_logger("main")
 
+_api_key_user_ready = False
+
+
+async def _ensure_api_key_user() -> bool:
+    """Idempotently create the API-key user.
+
+    Returns True if the user exists (or was just created), False if the
+    DB is unreachable. Safe to call repeatedly — caches success in a
+    module-level flag so hot-path calls skip the DB query entirely.
+    """
+    global _api_key_user_ready
+    if _api_key_user_ready or not settings.msai_api_key:
+        return True
+    try:
+        async with async_session_factory() as session:
+            api_user_id = _API_KEY_CLAIMS["sub"]
+            result = await session.execute(
+                select(User).where(User.entra_id == api_user_id)
+            )
+            if result.scalar_one_or_none() is None:
+                session.add(User(
+                    id=api_user_id,
+                    entra_id=api_user_id,
+                    email=_API_KEY_CLAIMS["preferred_username"],
+                    display_name=_API_KEY_CLAIMS.get("name", "API Key User"),
+                    role="admin",
+                ))
+                await session.commit()
+            _api_key_user_ready = True
+            return True
+    except Exception as exc:
+        logger.warning("api_key_user_bootstrap_deferred", error=str(exc))
+        return False
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     settings.data_root.mkdir(parents=True, exist_ok=True)
     settings.parquet_root.mkdir(parents=True, exist_ok=True)
     settings.reports_root.mkdir(parents=True, exist_ok=True)
 
-    # Ensure API key user exists so X-API-Key writes don't hit FK violations
-    if settings.msai_api_key:
-        try:
-            async with async_session_factory() as session:
-                api_user_id = _API_KEY_CLAIMS["sub"]
-                result = await session.execute(
-                    select(User).where(User.entra_id == api_user_id)
-                )
-                if result.scalar_one_or_none() is None:
-                    session.add(User(
-                        id=api_user_id,
-                        entra_id=api_user_id,
-                        email=_API_KEY_CLAIMS["preferred_username"],
-                        display_name=_API_KEY_CLAIMS.get("name", "API Key User"),
-                        role="admin",
-                    ))
-                    await session.commit()
-        except Exception as exc:
-            logger.warning("api_key_user_bootstrap_failed", error=str(exc))
+    # Best-effort — retried on /ready if DB is not yet reachable
+    await _ensure_api_key_user()
 
     ib_probe.start()
     logger.info("app_started", environment=settings.environment)
@@ -88,4 +106,6 @@ async def ready(db: AsyncSession = Depends(get_db)) -> dict[str, str]:
     await db.execute(text("SELECT 1"))
     redis = await get_redis_pool()
     await redis.ping()
+    # Retry the API key user bootstrap if lifespan couldn't reach the DB
+    await _ensure_api_key_user()
     return {"status": "ready"}

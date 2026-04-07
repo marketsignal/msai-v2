@@ -7,11 +7,13 @@ import { EquityChart } from "@/components/dashboard/equity-chart";
 import { ActiveStrategies } from "@/components/dashboard/active-strategies";
 import { RecentTrades } from "@/components/dashboard/recent-trades";
 import { apiGet, ApiError, type StrategyListResponse } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 
 // NOTE: Account/portfolio stats and recent trades remain mocked for now —
 // the backend does not yet expose dashboard-aggregated endpoints.
 
 export default function DashboardPage(): React.ReactElement {
+  const { getToken } = useAuth();
   const equityCurve = useMemo(() => generateEquityCurve(), []);
   const [strategyCount, setStrategyCount] = useState<number | undefined>(
     undefined,
@@ -22,7 +24,11 @@ export default function DashboardPage(): React.ReactElement {
     let cancelled = false;
     const load = async (): Promise<void> => {
       try {
-        const data = await apiGet<StrategyListResponse>("/api/v1/strategies/");
+        const token = await getToken();
+        const data = await apiGet<StrategyListResponse>(
+          "/api/v1/strategies/",
+          token,
+        );
         if (cancelled) return;
         setStrategyCount(data.total);
       } catch (err) {
@@ -38,7 +44,7 @@ export default function DashboardPage(): React.ReactElement {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [getToken]);
 
   return (
     <div className="space-y-6">

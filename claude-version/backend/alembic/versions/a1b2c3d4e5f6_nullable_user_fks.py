@@ -30,6 +30,13 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Rows created via API-key auth may have NULL user FKs. Delete them
+    # before re-adding the NOT NULL constraint so the migration is
+    # reversible in environments that exercised the new behavior.
+    op.execute("DELETE FROM backtests WHERE created_by IS NULL")
+    op.execute("DELETE FROM strategies WHERE created_by IS NULL")
+    op.execute("DELETE FROM live_deployments WHERE started_by IS NULL")
+
     op.alter_column("live_deployments", "started_by", nullable=False)
     op.alter_column("strategies", "created_by", nullable=False)
     op.alter_column("backtests", "created_by", nullable=False)

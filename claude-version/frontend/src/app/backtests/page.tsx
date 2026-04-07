@@ -29,6 +29,7 @@ import {
   type StrategyListResponse,
   type StrategyResponse,
 } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import { formatDate } from "@/lib/format";
 
 function statusColor(status: string): string {
@@ -47,6 +48,7 @@ function statusColor(status: string): string {
 }
 
 export default function BacktestsPage(): React.ReactElement {
+  const { getToken } = useAuth();
   const [runDialogOpen, setRunDialogOpen] = useState<boolean>(false);
   const [backtests, setBacktests] = useState<BacktestHistoryItem[]>([]);
   const [strategiesById, setStrategiesById] = useState<
@@ -59,9 +61,10 @@ export default function BacktestsPage(): React.ReactElement {
     setLoading(true);
     setError(null);
     try {
+      const token = await getToken();
       const [history, strategies] = await Promise.all([
-        apiGet<BacktestHistoryResponse>("/api/v1/backtests/history"),
-        apiGet<StrategyListResponse>("/api/v1/strategies/"),
+        apiGet<BacktestHistoryResponse>("/api/v1/backtests/history", token),
+        apiGet<StrategyListResponse>("/api/v1/strategies/", token),
       ]);
       setBacktests(history.items);
       const map: Record<string, StrategyResponse> = {};
@@ -76,7 +79,7 @@ export default function BacktestsPage(): React.ReactElement {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [getToken]);
 
   useEffect(() => {
     void load();

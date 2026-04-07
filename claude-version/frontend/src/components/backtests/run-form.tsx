@@ -60,7 +60,11 @@ export function RunBacktestForm({
     const load = async (): Promise<void> => {
       setStrategiesLoading(true);
       try {
-        const data = await apiGet<StrategyListResponse>("/api/v1/strategies/");
+        const token = await getToken();
+        const data = await apiGet<StrategyListResponse>(
+          "/api/v1/strategies/",
+          token,
+        );
         if (cancelled) return;
         setStrategies(data.items);
         if (data.items.length > 0 && !selectedStrategy) {
@@ -82,7 +86,7 @@ export function RunBacktestForm({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
+  }, [open, getToken]);
 
   const handleRunBacktest = async (): Promise<void> => {
     setSubmitting(true);

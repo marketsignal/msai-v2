@@ -5,8 +5,6 @@ Discovers strategy files on disk and manages their database records.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -37,28 +35,64 @@ _STRATEGIES_DIR = settings.strategies_root
 @router.get("/", response_model=StrategyListResponse)
 async def list_strategies(
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> StrategyListResponse:
-    """Scan the strategies directory and return all discovered strategies.
+    """Scan the strategies directory, sync with DB, and return real strategy IDs.
 
-    This endpoint performs a filesystem scan each time it is called so that
-    newly added strategy files are picked up immediately.
+    Discovered files are upserted into the ``strategies`` table so that every
+    response row has a stable database ID that ``/{id}`` and backtest
+    endpoints can look up.
     """
     strategies_dir = _STRATEGIES_DIR
     discovered: list[StrategyInfo] = discover_strategies(strategies_dir)
 
+    # Index existing rows by file path
+    existing_result = await db.execute(select(Strategy))
+    existing: dict[str, Strategy] = {
+        row.file_path: row for row in existing_result.scalars().all()
+    }
+
+    # Upsert each discovered strategy and collect the DB rows
+    db_rows: list[Strategy] = []
+    for info in discovered:
+        file_path = str(info.module_path)
+        row = existing.get(file_path)
+        if row is None:
+            row = Strategy(
+                name=info.name,
+                description=info.description,
+                file_path=file_path,
+                strategy_class=info.class_name,
+                config_schema=None,
+                default_config=None,
+            )
+            db.add(row)
+        else:
+            row.name = info.name
+            row.description = info.description
+            row.strategy_class = info.class_name
+        db_rows.append(row)
+
+    await db.commit()
+    for row in db_rows:
+        await db.refresh(row)
+
     items: list[StrategyResponse] = [
         StrategyResponse(
-            id=UUID(int=0),
-            name=info.name,
-            description=info.description,
-            file_path=str(info.module_path),
-            strategy_class=info.class_name,
-            config_schema=None,
-            default_config=None,
-            code_hash=info.code_hash,
-            created_at=datetime.fromtimestamp(info.module_path.stat().st_mtime, tz=timezone.utc),
+            id=row.id,
+            name=row.name,
+            description=row.description,
+            file_path=row.file_path,
+            strategy_class=row.strategy_class,
+            config_schema=row.config_schema,
+            default_config=row.default_config,
+            code_hash=next(
+                (info.code_hash for info in discovered if str(info.module_path) == row.file_path),
+                "",
+            ),
+            created_at=row.created_at,
         )
-        for info in discovered
+        for row in db_rows
     ]
 
     return StrategyListResponse(items=items, total=len(items))

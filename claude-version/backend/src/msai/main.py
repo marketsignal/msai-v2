@@ -37,29 +37,41 @@ if settings.azure_tenant_id and settings.azure_client_id:
     init_validator(settings.azure_tenant_id, settings.azure_client_id)
 
 
+_api_key_user_ready: bool = False
+
+
+async def _ensure_api_key_user() -> bool:
+    """Idempotently create the API-key user. Returns True on success/no-op."""
+    global _api_key_user_ready  # noqa: PLW0603
+    if _api_key_user_ready or not settings.msai_api_key:
+        return True
+    try:
+        from msai.core.database import async_session_factory
+        from msai.models.user import User
+
+        async with async_session_factory() as session:
+            api_user_id = _API_KEY_CLAIMS["sub"]
+            result = await session.execute(
+                select(User).where(User.entra_id == api_user_id)
+            )
+            if result.scalar_one_or_none() is None:
+                session.add(User(
+                    entra_id=api_user_id,
+                    email=_API_KEY_CLAIMS["preferred_username"],
+                    display_name=_API_KEY_CLAIMS.get("name", "API Key User"),
+                    role="admin",
+                ))
+                await session.commit()
+            _api_key_user_ready = True
+            return True
+    except Exception:
+        return False  # DB may not be ready yet (migrations pending)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Startup/shutdown lifecycle — ensure API key user exists in DB."""
-    if settings.msai_api_key:
-        try:
-            from msai.core.database import async_session_factory
-            from msai.models.user import User
-
-            async with async_session_factory() as session:
-                api_user_id = _API_KEY_CLAIMS["sub"]
-                result = await session.execute(
-                    select(User).where(User.entra_id == api_user_id)
-                )
-                if result.scalar_one_or_none() is None:
-                    session.add(User(
-                        entra_id=api_user_id,
-                        email=_API_KEY_CLAIMS["preferred_username"],
-                        display_name=_API_KEY_CLAIMS.get("name", "API Key User"),
-                        role="admin",
-                    ))
-                    await session.commit()
-        except Exception:
-            pass  # DB may not be ready yet (migrations pending)
+    await _ensure_api_key_user()  # best-effort, retried on /ready
     yield
 
 
@@ -114,13 +126,22 @@ async def health() -> dict[str, str]:
 
 @app.get("/ready")
 async def ready(request: Request) -> JSONResponse:
-    """Readiness probe -- confirms external dependencies are reachable.
+    """Readiness probe -- confirms PostgreSQL is reachable.
 
-    TODO: Replace the placeholder with real checks once the database session
-    and Redis pool are wired up:
-      - PostgreSQL: ``SELECT 1`` via SQLAlchemy async session
-      - Redis: ``ping`` via arq connection pool
+    Also retries the API-key user bootstrap if it deferred at startup.
     """
-    # TODO: Check PostgreSQL connectivity (SELECT 1 via async session)
-    # TODO: Check Redis connectivity (ping via arq pool)
+    from sqlalchemy import text
+
+    from msai.core.database import async_session_factory
+
+    try:
+        async with async_session_factory() as session:
+            await session.execute(text("SELECT 1"))
+    except Exception as exc:
+        return JSONResponse(
+            content={"status": "not_ready", "error": str(exc)},
+            status_code=503,
+        )
+
+    await _ensure_api_key_user()
     return JSONResponse(content={"status": "ready"}, status_code=200)
