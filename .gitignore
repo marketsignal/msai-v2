@@ -55,3 +55,4 @@ docker-compose.override.yml
 
 # IB Gateway credentials
 scripts/ib-gateway-config/*.ini
+.worktrees/
