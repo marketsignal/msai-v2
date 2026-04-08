@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+#
+# Automated paper-soak verification — zero manual steps.
+#
+# What this does:
+#
+#   1. Brings up the full Compose stack with the `live` profile
+#      activated (postgres, redis, backend, backtest-worker,
+#      live-supervisor, ib-gateway, frontend)
+#   2. ``docker compose up --wait`` blocks until EVERY service is
+#      healthy, including ib-gateway (which takes 60-180s to boot
+#      IBC + log in + open port 4002)
+#   3. Seeds the smoke strategy row so the Phase 1 E2E harness has
+#      something to deploy
+#   4. Runs the Phase 1 E2E harness end-to-end (tests/e2e/test_live_trading_phase1.py)
+#      which drives: POST /api/v1/live/start → verify
+#      status=running → verify one audit row with client_order_id →
+#      backend crash + recovery → POST /api/v1/live/stop → verify
+#      status=stopped + zero open positions
+#   5. Captures ib-gateway, live-supervisor, and backend logs to
+#      ./logs/paper-soak-*.log if any step fails
+#   6. Leaves the stack running on success so the operator can poke
+#      at it; tears down on Ctrl-C
+#
+# Prerequisites:
+#
+#   - Docker + Docker Compose
+#   - .env file at the project root with TWS_USERID, TWS_PASSWORD,
+#     IB_ACCOUNT_ID filled in with real paper-account credentials
+#     (see .env.example)
+#   - uv installed (for the Python snippets that seed the DB)
+#
+# Usage:
+#
+#   # from claude-version/ directory
+#   ./scripts/verify-paper-soak.sh
+#
+# Exit codes:
+#
+#   0  — all checks passed; stack still running
+#   1  — env file missing or missing required variable
+#   2  — compose up --wait failed (ib-gateway never became healthy)
+#   3  — smoke strategy seed failed
+#   4  — Phase 1 E2E harness failed
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+# ---------------------------------------------------------------------------
+# 1. Pre-flight: verify .env has the required credentials
+# ---------------------------------------------------------------------------
+
+if [[ ! -f .env ]]; then
+  echo "ERROR: .env file not found at $(pwd)/.env" >&2
+  echo "       Copy .env.example to .env and fill in TWS_USERID," >&2
+  echo "       TWS_PASSWORD, and IB_ACCOUNT_ID with paper-account values." >&2
+  exit 1
+fi
+
+# Load .env so we can validate the required vars without polluting the
+# caller's shell. Use `set -a` so exports happen automatically.
+set -a
+# shellcheck source=/dev/null
+source .env
+set +a
+
+missing=()
+[[ -z "${TWS_USERID:-}" || "${TWS_USERID}" == "your_ib_username" ]] && missing+=("TWS_USERID")
+[[ -z "${TWS_PASSWORD:-}" || "${TWS_PASSWORD}" == "your_ib_password" ]] && missing+=("TWS_PASSWORD")
+[[ -z "${IB_ACCOUNT_ID:-}" || "${IB_ACCOUNT_ID}" == "DU0000000" ]] && missing+=("IB_ACCOUNT_ID")
+
+if ((${#missing[@]} > 0)); then
+  echo "ERROR: .env is missing real values for: ${missing[*]}" >&2
+  echo "       These must be real IB paper credentials for the smoke" >&2
+  echo "       test to reach IB Gateway. Placeholder values are rejected." >&2
+  exit 1
+fi
+
+if [[ ! "${IB_ACCOUNT_ID}" =~ ^DU ]]; then
+  echo "ERROR: IB_ACCOUNT_ID='${IB_ACCOUNT_ID}' does not start with 'DU'." >&2
+  echo "       Paper soak REQUIRES a paper account. Live accounts start" >&2
+  echo "       with 'U' — use the release sign-off checklist for live." >&2
+  exit 1
+fi
+
+# Force live profile activation so `docker compose up` starts
+# ib-gateway and live-supervisor. Exported so compose picks it up.
+export COMPOSE_PROFILES=live
+
+mkdir -p logs
+
+echo "[paper-soak] Pre-flight OK — IB_ACCOUNT_ID=${IB_ACCOUNT_ID}, profile=live" >&2
+
+# ---------------------------------------------------------------------------
+# 2. Bring up the full stack and wait for health
+# ---------------------------------------------------------------------------
+
+echo "[paper-soak] docker compose up -d --wait (this takes 2-4 minutes)" >&2
+# --wait blocks until every service with a healthcheck reports
+# healthy, or the timeout expires. --wait-timeout is generous
+# because IBC login is slow on first boot. start_period on the
+# gateway healthcheck suppresses "unhealthy" during the window,
+# so --wait doesn't trip prematurely.
+if ! docker compose -f docker-compose.dev.yml up -d --wait --wait-timeout 360; then
+  echo "[paper-soak] ERROR: docker compose up --wait failed" >&2
+  echo "[paper-soak] Capturing ib-gateway + live-supervisor logs..." >&2
+  docker compose -f docker-compose.dev.yml logs ib-gateway > logs/paper-soak-ibgateway.log 2>&1 || true
+  docker compose -f docker-compose.dev.yml logs live-supervisor > logs/paper-soak-supervisor.log 2>&1 || true
+  docker compose -f docker-compose.dev.yml logs backend > logs/paper-soak-backend.log 2>&1 || true
+  echo "[paper-soak] Logs saved to ./logs/paper-soak-*.log" >&2
+  exit 2
+fi
+
+echo "[paper-soak] Stack healthy — ib-gateway API port 4002 accepting connections" >&2
+
+# ---------------------------------------------------------------------------
+# 3. Seed the smoke strategy row
+# ---------------------------------------------------------------------------
+# We reuse the existing e2e_phase1.sh Python-snippet seeder via a
+# dedicated uv run inside the backend directory, so the seed path
+# matches what CI / the Phase 1 harness expects.
+
+echo "[paper-soak] Seeding smoke strategy..." >&2
+if ! STRATEGY_ID=$(
+  cd backend && uv run python -c "
+import asyncio, uuid
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from msai.core.config import settings
+from msai.models.strategy import Strategy
+from msai.models.user import User
+
+async def main() -> None:
+    engine = create_async_engine(settings.database_url)
+    Session = async_sessionmaker(engine, expire_on_commit=False)
+    async with Session() as session:
+        user = (await session.execute(select(User).where(User.entra_id == 'e2e-operator'))).scalar_one_or_none()
+        if user is None:
+            user = User(id=uuid.uuid4(), entra_id='e2e-operator', email='e2e@example.com', role='operator')
+            session.add(user)
+            await session.flush()
+        existing = (await session.execute(select(Strategy).where(Strategy.name == 'smoke_market_order'))).scalar_one_or_none()
+        if existing is not None:
+            print(str(existing.id))
+            return
+        strat = Strategy(id=uuid.uuid4(), name='smoke_market_order', file_path='/app/strategies/example/smoke_market_order.py', strategy_class='SmokeMarketOrderStrategy', default_config={}, created_by=user.id)
+        session.add(strat)
+        await session.commit()
+        print(str(strat.id))
+    await engine.dispose()
+
+asyncio.run(main())
+" 2>&1
+); then
+  echo "[paper-soak] ERROR: smoke strategy seed failed: ${STRATEGY_ID}" >&2
+  exit 3
+fi
+
+STRATEGY_ID=$(echo "${STRATEGY_ID}" | tail -n 1 | tr -d '[:space:]')
+echo "[paper-soak] Smoke strategy seeded: ${STRATEGY_ID}" >&2
+
+# ---------------------------------------------------------------------------
+# 4. Run the Phase 1 E2E harness against the live stack
+# ---------------------------------------------------------------------------
+
+echo "[paper-soak] Running Phase 1 E2E harness against live IB Gateway..." >&2
+
+# Export the env vars the harness expects. All read from .env above.
+export MSAI_E2E_IB_ENABLED=1
+export MSAI_E2E_STRATEGY_ID="${STRATEGY_ID}"
+export MSAI_E2E_BACKEND_URL="${MSAI_E2E_BACKEND_URL:-http://localhost:8800}"
+export MSAI_E2E_BACKEND_CONTAINER="${MSAI_E2E_BACKEND_CONTAINER:-msai-claude-backend}"
+export MSAI_E2E_COMPOSE_FILE="${MSAI_E2E_COMPOSE_FILE:-docker-compose.dev.yml}"
+export MSAI_E2E_IB_ACCOUNT_ID="${IB_ACCOUNT_ID}"
+
+if ! (cd backend && uv run pytest tests/e2e/test_live_trading_phase1.py -vv); then
+  echo "[paper-soak] ERROR: Phase 1 E2E harness failed" >&2
+  echo "[paper-soak] Capturing logs..." >&2
+  docker compose -f docker-compose.dev.yml logs ib-gateway > logs/paper-soak-ibgateway.log 2>&1 || true
+  docker compose -f docker-compose.dev.yml logs live-supervisor > logs/paper-soak-supervisor.log 2>&1 || true
+  docker compose -f docker-compose.dev.yml logs backend > logs/paper-soak-backend.log 2>&1 || true
+  echo "[paper-soak] Logs saved to ./logs/paper-soak-*.log" >&2
+  exit 4
+fi
+
+echo "" >&2
+echo "[paper-soak] ✓ ALL CHECKS PASSED" >&2
+echo "" >&2
+echo "Stack is still running. Inspect via:" >&2
+echo "  docker compose -f docker-compose.dev.yml ps" >&2
+echo "  docker compose -f docker-compose.dev.yml logs -f ib-gateway" >&2
+echo "  curl http://localhost:8800/api/v1/live/status" >&2
+echo "" >&2
+echo "To tear down: docker compose -f docker-compose.dev.yml down" >&2

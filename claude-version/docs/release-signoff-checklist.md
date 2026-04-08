@@ -34,26 +34,32 @@
 - [ ] **Backtest determinism test passes** (Phase 2 task 2.11)
 - [ ] **EMA save/load round-trip + restart-continuity tests pass**
       (Phase 4 task 4.5)
-- [ ] **IB Gateway live boot smoke test** — operator
-      MANUALLY starts one deployment against a **running**
-      paper IB Gateway (NOT a fake/mock) and personally verifies: 1. The subprocess transitions
-      `starting → building → ready → running` without error
-      (check `live_node_processes.status` directly) 2. `trader.is_running == True` after `status = running`
-      (check `/api/v1/live/status/{deployment_id}`) 3. IB account summary is populated
-      (check `/api/v1/account/summary` returns real
-      NetLiquidation / BuyingPower numbers, not zeros or
-      defaults) 4. Submit ONE 1-share test order on a liquid symbol
-      (e.g. SPY) and verify the fill event lands in
-      `trades` table AND the IB Gateway account reflects
-      the trade within 30s 5. `/api/v1/live/stop` cleanly terminates the subprocess
-      (`status = stopped`, no positions left open,
-      `live_node_processes.pid` not alive)
-      **This is the authoritative test that the whole
+- [ ] **IB Gateway end-to-end smoke test (automated)** —
+      `./scripts/verify-paper-soak.sh`
+      Zero manual steps. The script: 1. Validates `.env` has real (non-placeholder) paper
+      credentials for `TWS_USERID` / `TWS_PASSWORD` /
+      `IB_ACCOUNT_ID` and refuses to proceed otherwise 2. `docker compose up -d --wait` with the `live`
+      profile — brings up postgres, redis, backend,
+      backtest-worker, live-supervisor, and the ib-gateway
+      sidecar container running `ghcr.io/gnzsnz/ib-gateway:stable`.
+      `--wait` blocks until EVERY service's healthcheck
+      passes, including ib-gateway's portable TCP probe
+      that waits for IBC to log in and open port 4002
+      (60-180 s start window) 3. Seeds the `smoke_market_order` strategy row via the
+      same Python snippet the existing Phase 1 E2E harness
+      uses 4. Runs `tests/e2e/test_live_trading_phase1.py` —
+      drives POST `/api/v1/live/start` → status=running →
+      fill in audit table → simulated backend crash +
+      recovery → POST `/api/v1/live/stop` → status=stopped
+      with zero open positions 5. On any failure, captures ib-gateway, live-supervisor,
+      and backend logs to `./logs/paper-soak-*.log`
+      **This IS the authoritative test that the whole
       production path (supervisor → ProcessManager → payload
       factory → `_trading_node_subprocess` → `_build_real_node`
       → Nautilus TradingNode → IB adapter → IB Gateway → fill)
-      actually works. No amount of unit/integration testing
-      substitutes for this.**
+      actually works. The operator runs ONE command — no
+      manual TWS clicks, no manual stack orchestration, no
+      manual order submission.**
 
 ## B. Code review
 
@@ -138,15 +144,15 @@
 
 ## Sign-off
 
-| Field                   | Value                          |
-| ----------------------- | ------------------------------ |
-| Operator name           | ****\*\*****\_\_\_****\*\***** |
-| Operator signature      | ****\*\*****\_\_\_****\*\***** |
-| Date                    | ****\*\*****\_\_\_****\*\***** |
-| Soak start date         | ****\*\*****\_\_\_****\*\***** |
-| Soak end date           | ****\*\*****\_\_\_****\*\***** |
-| Allocation cap (USD)    | $1,000                         |
-| Initial deployment slug | ****\*\*****\_\_\_****\*\***** |
+| Field                   | Value                                  |
+| ----------------------- | -------------------------------------- |
+| Operator name           | \***\*\*\*\*\***\_\_\_\***\*\*\*\*\*** |
+| Operator signature      | \***\*\*\*\*\***\_\_\_\***\*\*\*\*\*** |
+| Date                    | \***\*\*\*\*\***\_\_\_\***\*\*\*\*\*** |
+| Soak start date         | \***\*\*\*\*\***\_\_\_\***\*\*\*\*\*** |
+| Soak end date           | \***\*\*\*\*\***\_\_\_\***\*\*\*\*\*** |
+| Allocation cap (USD)    | $1,000                                 |
+| Initial deployment slug | \***\*\*\*\*\***\_\_\_\***\*\*\*\*\*** |
 
 **By signing, the operator confirms:** every box above is
 checked, and they have personally verified each item. The

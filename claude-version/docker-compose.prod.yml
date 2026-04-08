@@ -100,15 +100,32 @@ services:
       DATABASE_URL: postgresql+asyncpg://msai:${POSTGRES_PASSWORD}@postgres:5432/msai
       REDIS_URL: redis://redis:6379
       DATA_ROOT: /app/data
-      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:?Set IB_ACCOUNT_ID in .env}
       ENVIRONMENT: production
+      # Phase 4 task #154 scope-B: the trading subprocess reads
+      # these to construct TradingNodePayload. Inside the Compose
+      # network, the gateway is reachable at ``ib-gateway:4002``
+      # (paper) or ``ib-gateway:4001`` (live).
+      IB_HOST: ib-gateway
+      IB_PORT: ${IB_PORT:-4002}
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:?Set IB_ACCOUNT_ID in .env}
+      # Force-present so compose fails fast if the operator left
+      # ib-gateway's credentials out of .env — otherwise the
+      # gateway would crash-loop and live-supervisor would wait
+      # forever on the health dependency.
+      TWS_USERID: ${TWS_USERID:?Set TWS_USERID in .env}
+      TWS_PASSWORD: ${TWS_PASSWORD:?Set TWS_PASSWORD in .env}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
       ib-gateway:
-        condition: service_started
+        # service_healthy (not service_started) — the gateway's
+        # healthcheck only passes once IBC has logged in and the
+        # TWS API port is accepting connections. Without this the
+        # supervisor boots, attempts to connect, and crashes before
+        # the gateway is ready.
+        condition: service_healthy
     restart: unless-stopped
     deploy:
       resources:
@@ -131,17 +148,62 @@ services:
           cpus: "1.0"
           memory: 1G
 
+  # Interactive Brokers Gateway running inside the Compose network.
+  # IBC handles the IB Gateway GUI automatically — no manual clicks.
+  # Credentials come from .env via the :? guards which fail compose
+  # instantly if missing.
+  #
+  # Volume mounts preserve TWS settings + IBC state across restarts
+  # so "first run" dialogs only fire once. Without this, a container
+  # restart after an IB Gateway version bump hits edge cases where
+  # IBC can't dismiss the new version's "welcome" dialogs.
   ib-gateway:
     image: ghcr.io/gnzsnz/ib-gateway:stable
     environment:
       TWS_USERID: ${TWS_USERID:?Set TWS_USERID in .env}
       TWS_PASSWORD: ${TWS_PASSWORD:?Set TWS_PASSWORD in .env}
-      TRADING_MODE: paper
-      TWS_ACCEPT_INCOMING: "yes"
-      READ_ONLY_API: "no"
+      # TRADING_MODE is configurable in prod because the checklist
+      # explicitly walks the operator through flipping from paper
+      # to live. Dev compose hard-codes paper to prevent accidents.
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      # Required for the trading subprocess to submit orders.
+      # Override to `yes` only if you're intentionally running in
+      # market-data-only mode (no strategy can place orders).
+      READ_ONLY_API: ${READ_ONLY_API:-no}
+      # Auto-accept the "Accept Incoming Connection" dialog that
+      # IB Gateway pops on every new API client connection. Without
+      # this the trading subprocess's first connect hangs waiting
+      # for a human click.
+      TWS_ACCEPT_INCOMING: "accept"
+      # Bypass "you are running a newer version than the saved
+      # settings" dialog after an IB Gateway version bump.
+      BYPASS_WARNING: "yes"
+      # 2FA handling. Paper accounts don't require 2FA. For live
+      # accounts you must configure IBKR Mobile Authenticator and
+      # set TWOFA_DEVICE — see gnzsnz docs for details.
+      TWOFA_TIMEOUT_ACTION: ${TWOFA_TIMEOUT_ACTION:-exit}
     ports:
-      - "4002:4002"
-      - "5900:5900"
+      # Host-side mapping for optional debugging (VNC / curl).
+      # Bound to localhost to prevent LAN exposure.
+      - "127.0.0.1:4002:4002"
+      - "127.0.0.1:5900:5900"
+    volumes:
+      - ib_gateway_settings:/home/ibgateway/Jts
+    healthcheck:
+      # Portable TCP probe via bash's /dev/tcp builtin. Works on
+      # the gnzsnz Debian image without requiring nc. The probe
+      # opens a TCP connection to the API port and exits 0 on
+      # successful connect. IBC typically takes 60-120s to log
+      # in before the port is ready, so start_period is generous.
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'exec 3<>/dev/tcp/localhost/4002' 2>/dev/null",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 180s
     restart: unless-stopped
     deploy:
       resources:
@@ -152,3 +214,4 @@ services:
 volumes:
   postgres_data:
   app_data:
+  ib_gateway_settings:
