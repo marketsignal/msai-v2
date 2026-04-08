@@ -54,12 +54,47 @@ except Exception as exc:  # pragma: no cover - environment-specific
     _NAUTILUS_IMPORT_ERROR = exc
 
 
-# Canonical simulated venue -- MUST match the name used when resolving
-# instruments in ``msai.services.nautilus.instruments``.  If these diverge
-# NautilusTrader will refuse to run with
-# ``Venue '<X>' does not have a BacktestVenueConfig``.
-_SIM_VENUE_NAME = "SIM"
+# Phase 2 task 2.9: the backtest runner no longer hard-codes ``SIM``.
+# Instead it derives the per-backtest venue list from the canonical
+# instrument IDs in the payload (each ``AAPL.NASDAQ``-shape id carries
+# its venue suffix). A backtest spanning multiple venues gets one
+# ``BacktestVenueConfig`` per unique venue, which matches how
+# Nautilus's ``BacktestNode`` wires the engine.
 _DEFAULT_STARTING_BALANCE = "1000000 USD"
+
+
+def _extract_venues_from_instrument_ids(instrument_ids: list[str]) -> list[str]:
+    """Derive the unique, deterministically ordered list of venue
+    suffixes from a list of canonical Nautilus instrument ids.
+
+    ``"AAPL.NASDAQ"`` → venue ``"NASDAQ"``. For option ids the
+    venue suffix is everything after the FINAL ``.`` (Nautilus's
+    simplified symbology puts the venue last —
+    ``"C AAPL 20260515 150.SMART"``). A single backtest spanning
+    multiple venues (e.g. ``["AAPL.NASDAQ", "ESM5.XCME"]``) returns
+    both names so the runner can build one ``BacktestVenueConfig``
+    per unique venue.
+
+    Raises ``ValueError`` when ``instrument_ids`` is empty OR any
+    id has no venue suffix — both are programming errors that
+    would otherwise surface as an opaque Nautilus runtime crash.
+    """
+    if not instrument_ids:
+        raise ValueError("backtest payload must contain at least one instrument id")
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for instrument_id in instrument_ids:
+        if "." not in instrument_id:
+            raise ValueError(
+                f"instrument_id {instrument_id!r} has no venue suffix — "
+                "migrate to canonical IDs via SecurityMaster "
+                "(Phase 2 task 2.6)",
+            )
+        venue = instrument_id.rsplit(".", 1)[-1]
+        if venue not in seen_set:
+            seen_set.add(venue)
+            seen.append(venue)
+    return seen
 
 
 # ---------------------------------------------------------------------------
@@ -173,18 +208,14 @@ class BacktestRunner:
         # Rust/Cython state from any earlier Nautilus imports and crash.
         ctx = mp.get_context("spawn")
         result_queue: Any = ctx.Queue()
-        process = ctx.Process(
-            target=_run_in_subprocess, args=(payload, result_queue)
-        )
+        process = ctx.Process(target=_run_in_subprocess, args=(payload, result_queue))
         process.start()
         process.join(timeout_seconds)
 
         if process.is_alive():
             process.terminate()
             process.join(timeout=5)
-            raise TimeoutError(
-                f"Backtest subprocess exceeded timeout of {timeout_seconds}s"
-            )
+            raise TimeoutError(f"Backtest subprocess exceeded timeout of {timeout_seconds}s")
 
         try:
             raw = cast("dict[str, Any]", result_queue.get(timeout=2))
@@ -262,15 +293,17 @@ def _run_in_subprocess(payload: _RunPayload, result_queue: Any) -> None:
                 )
                 return
 
-            # The venue kwarg is REQUIRED -- calling
-            # ``generate_account_report()`` without it raises on current
-            # Nautilus versions.  This cost us an entire debugging session
-            # before; do not remove the ``venue=`` argument.
+            # The venue kwarg is REQUIRED on ``generate_account_report()``
+            # (gotcha #2). Phase 2 task 2.9: derive the venue from the
+            # FIRST instrument id in the payload so a backtest runs
+            # against whatever canonical venue the caller supplied.
+            # For multi-venue backtests, Nautilus's account report is
+            # per-venue — we take the primary (first) venue here; the
+            # full multi-venue reporting path lands in a later task.
             orders_df = engine.trader.generate_orders_report()
             positions_df = engine.trader.generate_positions_report()
-            account_df = engine.trader.generate_account_report(
-                venue=Venue(_SIM_VENUE_NAME)
-            )
+            primary_venue_name = _extract_venues_from_instrument_ids(payload.instrument_ids)[0]
+            account_df = engine.trader.generate_account_report(venue=Venue(primary_venue_name))
 
             result_queue.put(
                 {
@@ -310,13 +343,24 @@ def _build_backtest_run_config(payload: _RunPayload) -> BacktestRunConfig:
     )
     engine_config = BacktestEngineConfig(strategies=[strategy_config])
 
-    venue_config = BacktestVenueConfig(
-        name=_SIM_VENUE_NAME,
-        oms_type="NETTING",
-        account_type="MARGIN",
-        starting_balances=[_DEFAULT_STARTING_BALANCE],
-        base_currency="USD",
-    )
+    # Phase 2 task 2.9: one BacktestVenueConfig per unique venue
+    # in the instruments list. A single-venue equity backtest
+    # produces one config; a multi-venue (e.g. equities + futures)
+    # backtest produces one per venue. If any venue is missing a
+    # config Nautilus refuses to run with
+    # ``Venue '<X>' does not have a BacktestVenueConfig`` — gotcha
+    # #4 in the Nautilus reference.
+    venue_names = _extract_venues_from_instrument_ids(payload.instrument_ids)
+    venue_configs = [
+        BacktestVenueConfig(
+            name=venue_name,
+            oms_type="NETTING",
+            account_type="MARGIN",
+            starting_balances=[_DEFAULT_STARTING_BALANCE],
+            base_currency="USD",
+        )
+        for venue_name in venue_names
+    ]
 
     data_config = BacktestDataConfig(
         catalog_path=payload.catalog_path,
@@ -327,7 +371,7 @@ def _build_backtest_run_config(payload: _RunPayload) -> BacktestRunConfig:
     )
 
     return BacktestRunConfig(
-        venues=[venue_config],
+        venues=venue_configs,
         data=[data_config],
         engine=engine_config,
         start=payload.start_date,

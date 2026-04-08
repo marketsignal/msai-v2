@@ -104,6 +104,7 @@ cd codex-version && docker compose -f docker-compose.dev.yml up -d
 ---
 
 ### Visual Design Preferences
+
 - Never generate plain static rectangles for hero sections, landing pages, or key visual moments
 - Always include at least one dynamic/animated element: SVG waves, Lottie, shader gradients, or canvas particles
 - Prefer organic shapes (blobs, curves, clip-paths) over straight edges and 90-degree corners
@@ -122,4 +123,5 @@ These files are auto-loaded by Claude Code with the same priority as this file.
 - `critical-rules.md` — Non-negotiable rules (branch safety, TDD, etc.)
 - `memory.md` — How to use persistent memory and save learnings
 - `security.md`, `testing.md`, `api-design.md` — Coding standards
+- `nautilus.md` — **NautilusTrader top-20 gotchas** (read before any Nautilus code work). Full reference: `docs/nautilus-reference.md`
 - Language-specific: `python-style.md`, `typescript-style.md`, `database.md`, `frontend-design.md`

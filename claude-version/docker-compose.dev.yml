@@ -1,6 +1,12 @@
 # MSAI v2 — Claude Version (Dev)
 # Ports: Frontend 3300, Backend 8800, PostgreSQL 5433, Redis 6380
+#
 # Run: docker compose -f docker-compose.dev.yml up -d
+#
+# Live trading is behind the `live` Compose profile — see
+# .env.example for how to activate it with COMPOSE_PROFILES=live.
+# Without that profile, the ib-gateway + live-supervisor services
+# are skipped and the stack boots without IB credentials.
 
 services:
   postgres:
@@ -49,11 +55,41 @@ services:
       STRATEGIES_ROOT: /app/strategies
       ENVIRONMENT: development
       MSAI_API_KEY: ${MSAI_API_KEY:-msai-dev-key}
+      # Codex iter4 P1: ``api/live.py`` reads
+      # ``settings.ib_account_id`` when creating the deployment row
+      # and the live-supervisor's payload factory reads it again
+      # to verify the deployment matches the supervisor's
+      # configuration. Both containers MUST see the same value or
+      # the live-mode safety guard rejects every new deployment.
+      # Using the same defaults + fail-fast behavior as
+      # live-supervisor so the two stay in lockstep.
+      IB_HOST: ${IB_HOST:-ib-gateway}
+      IB_PORT: ${IB_PORT:-4002}
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:-DU0000000}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      # Probe the unauthenticated /health endpoint so `docker compose
+      # up --wait` actually waits for uvicorn to be accepting
+      # requests. Without this, --wait only checks container state
+      # (running) and verify-paper-soak.sh's first POST to
+      # /api/v1/live/start can race uvicorn's bind (Codex P2 iter1).
+      # Uses python stdlib (always available in the image) to avoid
+      # pulling curl/wget into Dockerfile.dev.
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status == 200 else 1)",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
 
   backtest-worker:
     build:
@@ -78,19 +114,136 @@ services:
       redis:
         condition: service_healthy
 
+  # Phase 1 task 1.7: standalone Python service that owns all live trading
+  # subprocesses. Runs as its own container so it can outlive FastAPI
+  # restarts AND because arq's on_startup blocks the poll loop (Codex v2 P0).
+  # Consumes start/stop commands from the msai:live:commands Redis stream
+  # via LiveCommandBus, with XAUTOCLAIM PEL recovery + DLQ.
+  #
+  # Gated behind the `live` Compose profile — activating this service
+  # REQUIRES setting TWS_USERID / TWS_PASSWORD / IB_ACCOUNT_ID in .env
+  # because it depends on ib-gateway which requires those credentials.
+  live-supervisor:
+    profiles: ["live"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: msai-claude-live-supervisor
+    command: ["uv", "run", "python", "-m", "msai.live_supervisor"]
+    volumes:
+      - ./backend/src:/app/src:ro
+      - ./strategies:/app/strategies:ro
+      - ./data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:msai_dev_password@postgres:5432/msai
+      REDIS_URL: redis://redis:6379
+      DATA_ROOT: /app/data
+      STRATEGIES_ROOT: /app/strategies
+      ENVIRONMENT: development
+      MSAI_API_KEY: ${MSAI_API_KEY:-msai-dev-key}
+      # Phase 4 task #154 scope-B: the trading subprocess needs to
+      # know where IB Gateway lives. Inside the Compose network, the
+      # gateway is reachable at ``ib-gateway:4002`` (paper). The
+      # backend service bypasses Docker's host-port remapping and
+      # hits the container's internal port directly.
+      IB_HOST: ib-gateway
+      IB_PORT: "4002"
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:?Set IB_ACCOUNT_ID in .env — must be DU* for paper}
+      # TWS_USERID / TWS_PASSWORD are NOT consumed by the supervisor
+      # itself, but we force them present here so `docker compose up`
+      # fails fast if the operator activated the live profile without
+      # providing the credentials ib-gateway needs.
+      TWS_USERID: ${TWS_USERID:?Set TWS_USERID in .env}
+      TWS_PASSWORD: ${TWS_PASSWORD:?Set TWS_PASSWORD in .env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ib-gateway:
+        # service_healthy (not service_started) — the ib-gateway
+        # healthcheck only passes once IBC has finished logging in
+        # and the TWS API port is accepting connections. Without
+        # this condition, the supervisor would boot, try to connect,
+        # and crash before the gateway is ready.
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Interactive Brokers Gateway running inside the Compose network.
+  # IBC (Interactive Brokers Controller) handles the GUI dance
+  # automatically — no manual clicks, no VNC required for normal
+  # operation. Credentials come from .env via the :? guards which
+  # fail compose instantly if missing.
+  #
+  # Gated behind the `live` profile to keep frontend-only dev stacks
+  # from needing IB credentials. See .env.example for activation.
   ib-gateway:
+    profiles: ["live"]
     image: ghcr.io/gnzsnz/ib-gateway:stable
     container_name: msai-claude-ib-gateway
     environment:
-      TWS_USERID: ${TWS_USERID:-dev-user}
-      TWS_PASSWORD: ${TWS_PASSWORD:-dev-password}
-      TRADING_MODE: ${TRADING_MODE:-paper}
-      READ_ONLY_API: "yes"
+      TWS_USERID: ${TWS_USERID:?Set TWS_USERID in .env}
+      TWS_PASSWORD: ${TWS_PASSWORD:?Set TWS_PASSWORD in .env}
+      # Paper mode ONLY in dev compose. Flipping to `live` here
+      # would let a dev accidentally wire a real money account
+      # into a dev stack — guard against it by hard-coding paper.
+      # The prod compose file is the one that reads TRADING_MODE
+      # from env.
+      TRADING_MODE: paper
+      # Must be `no` for paper soak order submission. Override via
+      # env to `yes` for safer dev runs where you don't want
+      # strategies to actually submit orders.
+      READ_ONLY_API: ${READ_ONLY_API:-no}
+      # Auto-accept the "Accept Incoming Connection" dialog that IB
+      # Gateway pops on every new API client connection. Without
+      # this the trading subprocess's first connect hangs waiting
+      # for a human click.
+      TWS_ACCEPT_INCOMING: "accept"
+      # Bypass the "you are running a newer version than the saved
+      # settings" dialog that fires after an IB Gateway version bump.
+      BYPASS_WARNING: "yes"
+      # If 2FA is required (live accounts only — paper accounts
+      # usually don't hit this), time out after 1 cycle and exit
+      # the container so docker restart policy gives it a clean
+      # retry. Paper soak MUST use a non-2FA paper account.
+      TWOFA_TIMEOUT_ACTION: exit
+    ports:
+      # Host-side port published for debugging/inspection from the
+      # dev machine (optional — remove if you don't need it). The
+      # INTERCONTAINER connection from live-supervisor uses the
+      # container's internal port 4002 directly via Docker DNS
+      # (``ib-gateway:4002``), not this host mapping.
+      - "127.0.0.1:4002:4002"
+      # VNC server for one-time manual troubleshooting (e.g.
+      # checking why IBC login failed). Bound to localhost only so
+      # it's not exposed to LAN.
+      - "127.0.0.1:5900:5900"
+    volumes:
+      # Persist TWS settings across container restarts so
+      # "first-run" dialogs (timezone, accept disclaimers, etc.)
+      # only fire once. Without this the gateway rebuilds its
+      # settings from scratch every restart and can hit edge
+      # cases where IBC can't dismiss a new-to-it dialog.
+      - ib_gateway_settings:/home/ibgateway/Jts
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 4002"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      # Portable TCP probe using bash's built-in ``/dev/tcp`` —
+      # works on the gnzsnz Debian-based image without requiring
+      # nc/netcat to be installed. The probe opens a TCP
+      # connection to localhost:4002 (paper API port inside the
+      # container) and exits 0 if it connects. IBC typically
+      # takes 60-120 s to log in and bring the API up; start_period
+      # suppresses the container being marked unhealthy during
+      # that window.
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'exec 3<>/dev/tcp/localhost/4002' 2>/dev/null",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 180s
+    restart: unless-stopped
 
   frontend:
     build:
@@ -113,3 +266,4 @@ services:
 
 volumes:
   postgres_data:
+  ib_gateway_settings:

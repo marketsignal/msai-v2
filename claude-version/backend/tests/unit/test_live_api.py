@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from msai.api.live_deps import get_command_bus
 from msai.core.database import get_db
 from msai.main import app
+from msai.services.live_command_bus import LiveCommandBus
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
 
 
 # ---------------------------------------------------------------------------
@@ -35,17 +40,43 @@ def mock_db() -> AsyncMock:
 
 
 @pytest.fixture
-def client_with_mock_db(mock_db: AsyncMock) -> httpx.AsyncClient:
-    """Async test client with the DB dependency overridden to use a mock."""
+def mock_command_bus() -> MagicMock:
+    """Stub LiveCommandBus that records publishes and serves
+    Redis-y methods needed by the kill-switch endpoint."""
+    bus = MagicMock(spec=LiveCommandBus)
+    bus.publish_stop = AsyncMock(return_value="1-0")
+    # The kill_all endpoint pokes bus._redis directly for the
+    # halt-flag SET/DELETE — provide a fake redis with the
+    # async methods it calls.
+    fake_redis = MagicMock()
+    fake_redis.set = AsyncMock(return_value=True)
+    fake_redis.delete = AsyncMock(return_value=1)
+    fake_redis.exists = AsyncMock(return_value=0)
+    bus._redis = fake_redis  # noqa: SLF001
+    return bus
+
+
+@pytest.fixture
+def client_with_mock_db(
+    mock_db: AsyncMock,
+    mock_command_bus: MagicMock,
+) -> httpx.AsyncClient:
+    """Async test client with the DB and command bus
+    dependencies overridden to use mocks."""
 
     async def _override_get_db() -> AsyncGenerator[AsyncMock, None]:
         yield mock_db
 
+    async def _override_get_bus() -> LiveCommandBus:
+        return mock_command_bus
+
     app.dependency_overrides[get_db] = _override_get_db
+    app.dependency_overrides[get_command_bus] = _override_get_bus
 
     transport = httpx.ASGITransport(app=app)
     yield httpx.AsyncClient(transport=transport, base_url="http://testserver")  # type: ignore[misc]
     app.dependency_overrides.pop(get_db, None)
+    app.dependency_overrides.pop(get_command_bus, None)
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +105,8 @@ class TestLiveStatus:
 
 
 class TestLiveKillAll:
-    """Tests for POST /api/v1/live/kill-all."""
+    """Tests for POST /api/v1/live/kill-all (Phase 3 task 3.9 —
+    push-based kill switch with persistent halt flag)."""
 
     async def test_kill_all_returns_200(self, client_with_mock_db: httpx.AsyncClient) -> None:
         """POST /api/v1/live/kill-all returns 200 with stopped count."""
@@ -85,6 +117,136 @@ class TestLiveKillAll:
         assert "stopped" in body
         assert "risk_halted" in body
         assert isinstance(body["stopped"], int)
+
+    async def test_kill_all_sets_persistent_halt_flag(
+        self,
+        client_with_mock_db: httpx.AsyncClient,
+        mock_command_bus: MagicMock,
+    ) -> None:
+        """Layer 1: ``msai:risk:halt`` must be SET on every
+        kill-all so subsequent ``/start`` calls return 503."""
+        await client_with_mock_db.post("/api/v1/live/kill-all")
+
+        set_calls = mock_command_bus._redis.set.call_args_list  # noqa: SLF001
+        halt_keys = [call.args[0] for call in set_calls]
+        assert "msai:risk:halt" in halt_keys
+        # 24h TTL applied
+        for call in set_calls:
+            if call.args[0] == "msai:risk:halt":
+                assert call.kwargs.get("ex") == 86400
+
+    async def test_kill_all_publishes_stop_for_each_active_row(
+        self,
+        client_with_mock_db: httpx.AsyncClient,
+        mock_db: AsyncMock,
+        mock_command_bus: MagicMock,
+    ) -> None:
+        """Layer 3: a stop command must be published for every
+        ``live_node_processes`` row in an active status."""
+        from uuid import uuid4
+
+        from msai.models.live_node_process import LiveNodeProcess
+
+        rows = [
+            LiveNodeProcess(deployment_id=uuid4(), status="running"),
+            LiveNodeProcess(deployment_id=uuid4(), status="ready"),
+            LiveNodeProcess(deployment_id=uuid4(), status="building"),
+        ]
+        mock_result = MagicMock()
+        mock_scalars = MagicMock()
+        mock_scalars.all.return_value = rows
+        mock_result.scalars.return_value = mock_scalars
+        mock_db.execute.return_value = mock_result
+
+        response = await client_with_mock_db.post("/api/v1/live/kill-all")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["stopped"] == 3
+        assert mock_command_bus.publish_stop.await_count == 3
+        # Each call carries the kill_switch reason
+        for call in mock_command_bus.publish_stop.await_args_list:
+            assert call.kwargs.get("reason") == "kill_switch"
+
+    async def test_kill_all_continues_when_one_publish_fails(
+        self,
+        client_with_mock_db: httpx.AsyncClient,
+        mock_db: AsyncMock,
+        mock_command_bus: MagicMock,
+    ) -> None:
+        """Codex batch 9 P1 regression: an emergency-stop
+        endpoint MUST surface failures. If publishing a stop
+        command fails for one row, the endpoint continues
+        with the rest BUT returns 207 Multi-Status with the
+        failure count so the operator sees there's an
+        unstopped deployment requiring manual attention.
+        Earlier code returned 200 with no failure indicator
+        — a dangerous silent-failure mode."""
+        from uuid import uuid4
+
+        from msai.models.live_node_process import LiveNodeProcess
+
+        rows = [
+            LiveNodeProcess(deployment_id=uuid4(), status="running"),
+            LiveNodeProcess(deployment_id=uuid4(), status="running"),
+        ]
+        mock_result = MagicMock()
+        mock_scalars = MagicMock()
+        mock_scalars.all.return_value = rows
+        mock_result.scalars.return_value = mock_scalars
+        mock_db.execute.return_value = mock_result
+
+        # First call raises, second succeeds
+        mock_command_bus.publish_stop.side_effect = [RuntimeError("redis blip"), "1-0"]
+
+        response = await client_with_mock_db.post("/api/v1/live/kill-all")
+
+        # 207 Multi-Status: partial success — one stopped,
+        # one failed
+        assert response.status_code == 207
+        body = response.json()
+        assert body["stopped"] == 1
+        assert body["failed_publish"] == 1
+        # Halt flag was still set despite the publish error
+        assert body["risk_halted"] is True
+
+    async def test_kill_all_clean_path_includes_zero_failures(
+        self,
+        client_with_mock_db: httpx.AsyncClient,
+    ) -> None:
+        """Clean kill-all returns 200 with failed_publish=0."""
+        response = await client_with_mock_db.post("/api/v1/live/kill-all")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["failed_publish"] == 0
+
+
+class TestLiveResume:
+    """Tests for POST /api/v1/live/resume (Phase 3 task 3.9 —
+    clears the persistent halt flag)."""
+
+    async def test_resume_returns_200(self, client_with_mock_db: httpx.AsyncClient) -> None:
+        response = await client_with_mock_db.post("/api/v1/live/resume")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["resumed"] is True
+
+    async def test_resume_deletes_halt_flag(
+        self,
+        client_with_mock_db: httpx.AsyncClient,
+        mock_command_bus: MagicMock,
+    ) -> None:
+        """The endpoint must delete the persistent halt flag
+        AND its metadata keys (set_by, set_at)."""
+        await client_with_mock_db.post("/api/v1/live/resume")
+
+        delete_calls = mock_command_bus._redis.delete.call_args_list  # noqa: SLF001
+        deleted_keys = [call.args[0] for call in delete_calls]
+        assert "msai:risk:halt" in deleted_keys
+        assert "msai:risk:halt:set_by" in deleted_keys
+        assert "msai:risk:halt:set_at" in deleted_keys
 
 
 # ---------------------------------------------------------------------------

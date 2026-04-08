@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime  # noqa: TC003 — Pydantic resolves annotations at runtime
 from typing import Any
-from uuid import UUID
+from uuid import UUID  # noqa: TC003 — Pydantic resolves annotations at runtime
 
 from pydantic import BaseModel
 
@@ -46,11 +46,69 @@ class LiveStatusResponse(BaseModel):
     active_count: int
 
 
+class LiveDeploymentStatusResponse(BaseModel):
+    """Response schema for ``GET /api/v1/live/status/{deployment_id}``.
+
+    Combines the stable ``LiveDeployment`` row (logical record — survives
+    restarts, keyed by ``identity_signature``) with the most recent
+    ``LiveNodeProcess`` row (per-restart run record — pid, heartbeat,
+    terminal outcome). Returning both lets the UI show "this deployment
+    is running as pid 12345 on host box-3 with last heartbeat 1.2 s ago"
+    without hitting the supervisor directly.
+
+    Process fields (``pid``, ``host``, ``process_status``, etc.) are
+    nullable because a deployment that has never run (or whose newest
+    process row has been garbage-collected) has no live row.
+    """
+
+    # Logical deployment fields
+    id: UUID
+    strategy_id: UUID
+    deployment_slug: str
+    status: str
+    paper_trading: bool
+    instruments: list[str]
+    last_started_at: datetime | None = None
+    last_stopped_at: datetime | None = None
+
+    # Latest per-run process fields — nullable when no live_node_processes
+    # row exists for this deployment.
+    process_id: UUID | None = None
+    pid: int | None = None
+    host: str | None = None
+    process_status: str | None = None
+    last_heartbeat_at: datetime | None = None
+    exit_code: int | None = None
+    error_message: str | None = None
+    failure_kind: str | None = None
+
+    model_config = {"from_attributes": True}
+
+
 class LiveKillAllResponse(BaseModel):
-    """Response schema for the kill-all emergency endpoint."""
+    """Response schema for the kill-all emergency endpoint.
+
+    ``stopped`` is the count of stop commands SUCCESSFULLY
+    published to the supervisor command bus. ``failed_publish``
+    is the count of active deployments where the publish
+    raised — these are NOT acknowledged by the supervisor and
+    require manual intervention. ``risk_halted`` is always True
+    after a kill-all because the persistent halt flag is set
+    unconditionally as Layer 1, BEFORE any publishes. Codex
+    batch 9 P1: an emergency-stop endpoint must NOT silently
+    swallow failures — operators need to see them.
+    """
 
     stopped: int
+    failed_publish: int = 0
     risk_halted: bool
+
+
+class LiveResumeResponse(BaseModel):
+    """Response schema for the resume endpoint that clears the
+    persistent halt flag set by ``/kill-all``."""
+
+    resumed: bool
 
 
 class LivePositionsResponse(BaseModel):

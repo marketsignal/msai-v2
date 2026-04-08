@@ -48,11 +48,38 @@ services:
       ENVIRONMENT: production
       POLYGON_API_KEY: ${POLYGON_API_KEY:-}
       DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+      # Codex iter4 P1: ``api/live.py`` reads
+      # ``settings.ib_account_id`` when creating the deployment
+      # row; the live-supervisor's payload factory reads it again
+      # during spawn. Both must agree or the new paper/live safety
+      # guard rejects every live-mode deployment and silently uses
+      # the wrong account for paper. Same fail-fast ``:?``
+      # semantics as live-supervisor so compose fails instantly
+      # without credentials.
+      IB_HOST: ${IB_HOST:-ib-gateway}
+      IB_PORT: ${IB_PORT:-4002}
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:?Set IB_ACCOUNT_ID in .env}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      # See dev compose for rationale — Codex P2 iter1 fix: probe
+      # /health via python stdlib so --wait actually waits for
+      # uvicorn to bind, not just for the container to enter
+      # ``running`` state.
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status == 200 else 1)",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     restart: unless-stopped
     deploy:
       resources:
@@ -84,6 +111,55 @@ services:
           cpus: "2.0"
           memory: 4G
 
+  # Phase 1 task 1.7: live supervisor. Owns every trading subprocess the
+  # system spawns. Consumes commands from msai:live:commands via
+  # LiveCommandBus (XAUTOCLAIM PEL recovery + DLQ), runs ProcessManager
+  # spawn/reap + HeartbeatMonitor stale sweep. Isolated from arq because
+  # on_startup blocks the poll loop (Codex v2 P0).
+  live-supervisor:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "-m", "msai.live_supervisor"]
+    volumes:
+      - app_data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:${POSTGRES_PASSWORD}@postgres:5432/msai
+      REDIS_URL: redis://redis:6379
+      DATA_ROOT: /app/data
+      ENVIRONMENT: production
+      # Phase 4 task #154 scope-B: the trading subprocess reads
+      # these to construct TradingNodePayload. Inside the Compose
+      # network, the gateway is reachable at ``ib-gateway:4002``
+      # (paper) or ``ib-gateway:4001`` (live).
+      IB_HOST: ib-gateway
+      IB_PORT: ${IB_PORT:-4002}
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:?Set IB_ACCOUNT_ID in .env}
+      # Force-present so compose fails fast if the operator left
+      # ib-gateway's credentials out of .env — otherwise the
+      # gateway would crash-loop and live-supervisor would wait
+      # forever on the health dependency.
+      TWS_USERID: ${TWS_USERID:?Set TWS_USERID in .env}
+      TWS_PASSWORD: ${TWS_PASSWORD:?Set TWS_PASSWORD in .env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ib-gateway:
+        # service_healthy (not service_started) — the gateway's
+        # healthcheck only passes once IBC has logged in and the
+        # TWS API port is accepting connections. Without this the
+        # supervisor boots, attempts to connect, and crashes before
+        # the gateway is ready.
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
   frontend:
     build:
       context: ./frontend
@@ -99,17 +175,82 @@ services:
           cpus: "1.0"
           memory: 1G
 
+  # Interactive Brokers Gateway running inside the Compose network.
+  # IBC handles the IB Gateway GUI automatically — no manual clicks.
+  # Credentials come from .env via the :? guards which fail compose
+  # instantly if missing.
+  #
+  # Volume mounts preserve TWS settings + IBC state across restarts
+  # so "first run" dialogs only fire once. Without this, a container
+  # restart after an IB Gateway version bump hits edge cases where
+  # IBC can't dismiss the new version's "welcome" dialogs.
   ib-gateway:
     image: ghcr.io/gnzsnz/ib-gateway:stable
     environment:
       TWS_USERID: ${TWS_USERID:?Set TWS_USERID in .env}
       TWS_PASSWORD: ${TWS_PASSWORD:?Set TWS_PASSWORD in .env}
-      TRADING_MODE: paper
-      TWS_ACCEPT_INCOMING: "yes"
-      READ_ONLY_API: "no"
+      # TRADING_MODE is configurable in prod because the checklist
+      # explicitly walks the operator through flipping from paper
+      # to live. Dev compose hard-codes paper to prevent accidents.
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      # Required for the trading subprocess to submit orders.
+      # Override to `yes` only if you're intentionally running in
+      # market-data-only mode (no strategy can place orders).
+      READ_ONLY_API: ${READ_ONLY_API:-no}
+      # Auto-accept the "Accept Incoming Connection" dialog that
+      # IB Gateway pops on every new API client connection. Without
+      # this the trading subprocess's first connect hangs waiting
+      # for a human click.
+      TWS_ACCEPT_INCOMING: "accept"
+      # Bypass "you are running a newer version than the saved
+      # settings" dialog after an IB Gateway version bump.
+      BYPASS_WARNING: "yes"
+      # 2FA handling. Paper accounts don't require 2FA. For live
+      # accounts you must configure IBKR Mobile Authenticator and
+      # set TWOFA_DEVICE — see gnzsnz docs for details.
+      TWOFA_TIMEOUT_ACTION: ${TWOFA_TIMEOUT_ACTION:-exit}
+      # The healthcheck below reads ``IB_API_PORT`` at runtime from
+      # the container's env. When flipping to live trading the
+      # operator sets ``IB_PORT=4001`` + ``TRADING_MODE=live`` in
+      # .env and both the supervisor and this healthcheck probe the
+      # right port. Without this indirection the healthcheck would
+      # hard-pin 4002 and a live-mode stack would never become
+      # healthy, so ``live-supervisor`` (which depends on
+      # ``service_healthy``) would hang forever (Codex P1 iter1).
+      IB_API_PORT: ${IB_PORT:-4002}
     ports:
-      - "4002:4002"
-      - "5900:5900"
+      # Host-side mapping for optional debugging (VNC / curl).
+      # Bound to localhost to prevent LAN exposure. Use the same
+      # ${IB_PORT} as the supervisor + healthcheck so flipping
+      # paper→live moves every layer in lockstep.
+      - "127.0.0.1:${IB_PORT:-4002}:${IB_PORT:-4002}"
+      - "127.0.0.1:5900:5900"
+    volumes:
+      - ib_gateway_settings:/home/ibgateway/Jts
+    healthcheck:
+      # Portable TCP probe via bash's /dev/tcp builtin. Works on
+      # the gnzsnz Debian image without requiring nc. The probe
+      # opens a TCP connection to whichever API port matches
+      # TRADING_MODE (4002 paper, 4001 live) and exits 0 on
+      # successful connect.
+      #
+      # ``$$IB_API_PORT`` with the double-dollar escape tells
+      # Compose "don't interpolate this at YAML parse time" — the
+      # variable is expanded by bash INSIDE the container at
+      # healthcheck run time, reading the container's own
+      # IB_API_PORT env var (set above from IB_PORT).
+      #
+      # IBC typically takes 60-120s to log in before the port is
+      # ready, so start_period is generous.
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'exec 3<>/dev/tcp/localhost/$$IB_API_PORT' 2>/dev/null",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 180s
     restart: unless-stopped
     deploy:
       resources:
@@ -120,3 +261,4 @@ services:
 volumes:
   postgres_data:
   app_data:
+  ib_gateway_settings:

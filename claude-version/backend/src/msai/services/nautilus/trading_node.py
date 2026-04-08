@@ -11,11 +11,14 @@ Phase 2 will spawn real NautilusTrader ``TradingNode`` processes.
 
 from __future__ import annotations
 
-import subprocess
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from msai.core.logging import get_logger
-from msai.services.risk_engine import RiskEngine
+
+if TYPE_CHECKING:
+    import subprocess
+
+    from msai.services.risk_engine import RiskEngine
 
 log = get_logger(__name__)
 
@@ -36,6 +39,15 @@ class TradingNodeManager:
         self.risk_engine = risk_engine
         self._processes: dict[str, subprocess.Popen[bytes] | None] = {}
 
+    def has_deployment(self, deployment_id: str) -> bool:
+        """Return True if this manager is already tracking the given deployment.
+
+        Used by the live-start endpoint to distinguish "warm-restart of a
+        currently-running deployment" (a no-op that should not re-validate
+        capacity or mutate status) from "brand-new cold start".
+        """
+        return deployment_id in self._processes
+
     async def start(
         self,
         deployment_id: str,
@@ -45,8 +57,17 @@ class TradingNodeManager:
     ) -> bool:
         """Start a TradingNode for a deployment.
 
-        Validates with the risk engine first.  If rejected, logs a warning
-        and returns ``False``.
+        Idempotent: if the deployment is already tracked by this manager,
+        returns ``True`` immediately without re-validating capacity or
+        spawning a second process. Without this idempotency the warm-restart
+        path in ``/api/v1/live/start`` would re-check the risk engine with
+        ``num_active`` inflated by the already-running deployment itself
+        and could 409 at capacity, then overwrite the shared row's status
+        to ``rejected`` — corrupting a deployment that is actually running
+        (Codex Task 1.1b iteration 4, P1 fix).
+
+        Validates with the risk engine only for new deployments. If rejected,
+        logs a warning and returns ``False``.
 
         Args:
             deployment_id: Unique identifier for this deployment.
@@ -55,9 +76,17 @@ class TradingNodeManager:
             instruments: List of instrument identifiers to subscribe to.
 
         Returns:
-            ``True`` if the node was started (or marked as started),
-            ``False`` if the risk engine rejected it.
+            ``True`` if the node was started (or was already running),
+            ``False`` if the risk engine rejected a new deployment.
         """
+        if deployment_id in self._processes:
+            log.info(
+                "trading_node_start_idempotent",
+                deployment_id=deployment_id,
+                reason="already tracked",
+            )
+            return True
+
         allowed, reason = self.risk_engine.validate_deployment(config, len(self._processes))
         if not allowed:
             log.warning(
