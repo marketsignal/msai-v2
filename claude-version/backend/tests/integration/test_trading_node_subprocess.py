@@ -11,6 +11,7 @@ SAFETY: dedicated Postgres testcontainer per module.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -1096,3 +1097,332 @@ async def test_wait_until_ready_respects_shutdown_event(
     row = await _fetch_row(session_factory, seeded_row.id)
     assert row.status == "stopped"
     assert row.failure_kind == FailureKind.NONE.value
+
+
+# ---------------------------------------------------------------------------
+# IB disconnect handler sibling-task wiring (Phase 4 task 4.2 iter-2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_disconnect_handler_factory_none_means_no_task_spawned(
+    session_factory: async_sessionmaker[AsyncSession],
+    seeded_row: LiveNodeProcess,
+) -> None:
+    """Default behavior (and all pre-existing tests): if the
+    caller passes no ``disconnect_handler_factory``, no disconnect
+    task is spawned and the subprocess lifecycle is unchanged.
+    """
+    node = _FakeNode()
+    payload = _make_payload(
+        row_id=seeded_row.id,
+        deployment_id=seeded_row.deployment_id,
+        deployment_slug="abcd1234abcd1234",
+    )
+
+    exit_code = await run_subprocess_async(
+        payload,
+        session_factory=session_factory,
+        node_factory=lambda _p: node,
+        disconnect_handler_factory=None,
+    )
+
+    assert exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_disconnect_handler_spawn_and_clean_cancel(
+    session_factory: async_sessionmaker[AsyncSession],
+    seeded_row: LiveNodeProcess,
+) -> None:
+    """The factory returns a handler whose ``run`` method blocks
+    on the shared ``shutdown_event`` (standard handler contract).
+    Verify: factory called with (payload, node), run task spawned,
+    exits cleanly on shutdown, and aclose hook fires for cleanup.
+    """
+    # block_run_async=True so the node's run_async doesn't
+    # return until stop_async is called — gives the handler
+    # task time to actually start running.
+    node = _FakeNode(block_run_async=True)
+    payload = _make_payload(
+        row_id=seeded_row.id,
+        deployment_id=seeded_row.deployment_id,
+        deployment_slug="abcd1234abcd1234",
+    )
+
+    factory_calls: list[tuple[Any, Any]] = []
+    aclose_fired = {"count": 0}
+    run_entered = asyncio.Event()
+
+    class _FakeHandler:
+        async def run(self, stop_event: asyncio.Event) -> None:
+            run_entered.set()
+            await stop_event.wait()
+
+        async def aclose(self) -> None:
+            aclose_fired["count"] += 1
+
+    def _factory(p: TradingNodePayload, n: Any) -> _FakeHandler:
+        factory_calls.append((p, n))
+        return _FakeHandler()
+
+    shutdown = asyncio.Event()
+
+    async def _trigger_shutdown() -> None:
+        # Wait until the handler's ``run`` actually started, then
+        # simulate what SIGTERM would do in production: set the
+        # shared shutdown event AND stop the node (since we're
+        # running with ``install_signal_handlers=False`` nothing
+        # else drives ``node.stop_async``).
+        await run_entered.wait()
+        await asyncio.sleep(0.05)
+        shutdown.set()
+        await node.stop_async()
+
+    trigger = asyncio.create_task(_trigger_shutdown())
+    try:
+        exit_code = await run_subprocess_async(
+            payload,
+            session_factory=session_factory,
+            node_factory=lambda _p: node,
+            disconnect_handler_factory=_factory,
+            shutdown_event=shutdown,
+        )
+    finally:
+        trigger.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await trigger
+
+    assert exit_code == 0
+    assert len(factory_calls) == 1
+    assert factory_calls[0][0] is payload
+    assert factory_calls[0][1] is node
+    assert run_entered.is_set()
+    # aclose hook fires in the finally block regardless of
+    # whether the handler exited normally or was cancelled
+    assert aclose_fired["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_disconnect_handler_cancelled_when_still_running_at_cleanup(
+    session_factory: async_sessionmaker[AsyncSession],
+    seeded_row: LiveNodeProcess,
+) -> None:
+    """If the handler is still running when the cleanup block
+    begins (e.g. it ignores ``stop_event`` or is blocking on a
+    Redis operation), the cleanup path MUST cancel it so the
+    subprocess shutdown isn't blocked by a wedged handler."""
+    payload = _make_payload(
+        row_id=seeded_row.id,
+        deployment_id=seeded_row.deployment_id,
+        deployment_slug="abcd1234abcd1234",
+    )
+
+    run_cancelled = {"value": False}
+    run_entered = asyncio.Event()
+
+    class _StubbornHandler:
+        """Handler that ignores ``stop_event`` and can only be
+        shut down via ``asyncio.CancelledError`` — simulates a
+        handler wedged on a Redis call."""
+
+        async def run(self, stop_event: asyncio.Event) -> None:  # noqa: ARG002
+            run_entered.set()
+            try:
+                await asyncio.Event().wait()  # forever
+            except asyncio.CancelledError:
+                run_cancelled["value"] = True
+                raise
+
+    # block_run_async=True so the subprocess actually waits
+    # for shutdown (otherwise run_async returns immediately
+    # and the handler never gets a chance to run).
+    node = _FakeNode(block_run_async=True)
+
+    shutdown = asyncio.Event()
+
+    async def _trigger() -> None:
+        # Simulate SIGTERM behavior: flip shutdown + stop the node.
+        # ``install_signal_handlers=False`` here so the test is
+        # responsible for both actions that the production signal
+        # handler would perform.
+        await run_entered.wait()
+        await asyncio.sleep(0.05)
+        shutdown.set()
+        await node.stop_async()
+
+    trigger = asyncio.create_task(_trigger())
+    try:
+        exit_code = await run_subprocess_async(
+            payload,
+            session_factory=session_factory,
+            node_factory=lambda _p: node,
+            disconnect_handler_factory=lambda _p, _n: _StubbornHandler(),
+            shutdown_event=shutdown,
+        )
+    finally:
+        trigger.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await trigger
+
+    assert exit_code == 0
+    # The wedged handler was cancelled by the finally block so
+    # the subprocess could finish its shutdown sequence
+    assert run_cancelled["value"] is True
+
+
+@pytest.mark.asyncio
+async def test_disconnect_handler_async_factory_awaited(
+    session_factory: async_sessionmaker[AsyncSession],
+    seeded_row: LiveNodeProcess,
+) -> None:
+    """The production factory is async (it opens an aioredis
+    client via ``await``). Verify the subprocess path awaits
+    an async factory's return value via ``_maybe_await``."""
+    node = _FakeNode()
+    payload = _make_payload(
+        row_id=seeded_row.id,
+        deployment_id=seeded_row.deployment_id,
+        deployment_slug="abcd1234abcd1234",
+    )
+
+    built: list[str] = []
+
+    class _FakeHandler:
+        async def run(self, stop_event: asyncio.Event) -> None:
+            stop_event.set()
+
+    async def _async_factory(p: TradingNodePayload, n: Any) -> _FakeHandler:
+        await asyncio.sleep(0)
+        built.append("built")
+        return _FakeHandler()
+
+    exit_code = await run_subprocess_async(
+        payload,
+        session_factory=session_factory,
+        node_factory=lambda _p: node,
+        disconnect_handler_factory=_async_factory,
+    )
+
+    assert exit_code == 0
+    assert built == ["built"]
+
+
+@pytest.mark.asyncio
+async def test_disconnect_handler_factory_failure_does_not_fail_deployment(
+    session_factory: async_sessionmaker[AsyncSession],
+    seeded_row: LiveNodeProcess,
+) -> None:
+    """If the disconnect handler factory raises during
+    construction, the subprocess logs loudly but does NOT
+    fail the deployment — the heartbeat watchdog is the
+    fallback safety net, and losing disconnect monitoring
+    is a degraded-service condition, not a cause to tear
+    down a running deployment."""
+    node = _FakeNode()
+    payload = _make_payload(
+        row_id=seeded_row.id,
+        deployment_id=seeded_row.deployment_id,
+        deployment_slug="abcd1234abcd1234",
+    )
+
+    def _bad_factory(p: TradingNodePayload, n: Any) -> Any:
+        raise RuntimeError("fake redis construction failed")
+
+    exit_code = await run_subprocess_async(
+        payload,
+        session_factory=session_factory,
+        node_factory=lambda _p: node,
+        disconnect_handler_factory=_bad_factory,
+    )
+
+    assert exit_code == 0
+    row = await _fetch_row(session_factory, seeded_row.id)
+    assert row.status == "stopped"
+    assert row.failure_kind == FailureKind.NONE.value
+
+
+@pytest.mark.asyncio
+async def test_disconnect_handler_cancelled_before_node_stop(
+    session_factory: async_sessionmaker[AsyncSession],
+    seeded_row: LiveNodeProcess,
+) -> None:
+    """Cleanup ordering: a still-running disconnect task MUST
+    be cancelled BEFORE ``node.stop_async()`` so the handler
+    isn't probing the data engine while it's tearing down.
+    Uses a stubborn handler that only exits via cancellation
+    to make the cancellation observable in the events log.
+    """
+    events: list[str] = []
+    run_entered = asyncio.Event()
+    captured_node: dict[str, Any] = {}
+
+    class _OrderingNode(_FakeNode):
+        def __init__(self) -> None:
+            super().__init__(block_run_async=True)
+
+        async def stop_async(self) -> None:
+            events.append("node_stop_async")
+            await super().stop_async()
+
+    class _OrderingHandler:
+        async def run(self, stop_event: asyncio.Event) -> None:  # noqa: ARG002
+            run_entered.set()
+            try:
+                await asyncio.Event().wait()  # forever
+            except asyncio.CancelledError:
+                events.append("handler_cancelled")
+                raise
+
+    payload = _make_payload(
+        row_id=seeded_row.id,
+        deployment_id=seeded_row.deployment_id,
+        deployment_slug="abcd1234abcd1234",
+    )
+
+    shutdown = asyncio.Event()
+
+    def _node_factory(_p: TradingNodePayload) -> Any:
+        node = _OrderingNode()
+        captured_node["node"] = node
+        return node
+
+    async def _trigger() -> None:
+        # Wait until handler's ``run`` is in-flight, then cancel
+        # ``node_run_task`` directly to drive cleanup. In the real
+        # system the SIGTERM handler would call ``node.stop_async``
+        # which unblocks ``run_async``; the ordering assertion only
+        # cares that the disconnect handler cancel happens BEFORE
+        # ``node.stop_async()``, so we don't want the test to call
+        # ``stop_async`` itself from this trigger.
+        await run_entered.wait()
+        await asyncio.sleep(0.05)
+        # Cancel run_async by setting the stop_event on the fake —
+        # this mirrors what stop_async would do from the perspective
+        # of run_async but keeps the stop_async CALL for the finally
+        # block to make.
+        node = captured_node["node"]
+        node._run_started = False  # type: ignore[attr-defined]
+        node._stop_event.set()  # type: ignore[attr-defined]
+        shutdown.set()
+
+    trigger = asyncio.create_task(_trigger())
+    try:
+        exit_code = await run_subprocess_async(
+            payload,
+            session_factory=session_factory,
+            node_factory=_node_factory,
+            disconnect_handler_factory=lambda _p, _n: _OrderingHandler(),
+            shutdown_event=shutdown,
+        )
+    finally:
+        trigger.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await trigger
+
+    assert exit_code == 0
+    handler_idx = events.index("handler_cancelled")
+    stop_idx = events.index("node_stop_async")
+    assert handler_idx < stop_idx, (
+        f"disconnect handler must be cancelled before node.stop_async; events={events}"
+    )

@@ -52,6 +52,8 @@ Nautilus.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import inspect
 import logging
 import os
 import signal
@@ -114,6 +116,16 @@ class TradingNodePayload:
     """Async DB URL the subprocess uses to open its own
     ``AsyncEngine``. Passed explicitly (rather than reading ``settings``
     on import) so tests can point at testcontainers."""
+
+    redis_url: str = ""
+    """Redis URL the subprocess uses to construct the
+    :class:`IBDisconnectHandler` (Phase 4 task 4.2). The handler
+    sets ``msai:risk:halt`` when IB Gateway stays disconnected
+    past its grace window so the supervisor's push-based kill
+    switch tears down the deployment. Empty string means "no
+    disconnect monitoring" — tests that don't care about the
+    disconnect halt omit this field entirely and the subprocess
+    skips the handler construction."""
 
     startup_health_timeout_s: float = 60.0
 
@@ -324,6 +336,7 @@ async def run_subprocess_async(
     session_factory: async_sessionmaker[AsyncSession],
     node_factory: Any,
     heartbeat_factory: Any = None,
+    disconnect_handler_factory: Any = None,
     install_signal_handlers: bool = False,
     shutdown_event: asyncio.Event | None = None,
     skip_dispose: bool = False,
@@ -376,6 +389,15 @@ async def run_subprocess_async(
             (typically a :class:`_HeartbeatThread`). Tests that don't
             care about heartbeats pass ``None`` to skip it entirely.
             Production callers always pass a real factory.
+        disconnect_handler_factory: Optional async callable that takes
+            ``(payload, node)`` and returns an awaitable
+            :class:`IBDisconnectHandler` instance (Phase 4 task 4.2
+            wiring). When present, the handler runs as a sibling task
+            to ``node_run_task`` and fires the Redis halt flag if IB
+            Gateway stays disconnected past the grace window. Tests
+            pass ``None`` to skip; production passes a real factory
+            that opens an aioredis client and wires the connection
+            probe against the node's data engine.
         install_signal_handlers: When True, register async-aware
             SIGTERM/SIGINT handlers on the running loop that set the
             ``shutdown_event`` and schedule ``node.stop_async()``.
@@ -416,6 +438,14 @@ async def run_subprocess_async(
     # locals and the ``finally`` persists them.
     heartbeat: Any = None
     node: Any = None
+    # Phase 4 task 4.2 iter-2 wiring: optional sibling task that
+    # watches the node's data-engine connection state and fires
+    # the Redis halt flag if IB stays disconnected past the
+    # grace window. Nullable so tests that don't care about
+    # disconnect monitoring can pass ``disconnect_handler_factory=None``
+    # and the whole path is a no-op.
+    disconnect_handler: Any = None
+    disconnect_task: asyncio.Task[None] | None = None
 
     # Async-loop-aware SIGTERM handler. Runs in the context of the
     # running event loop (thanks to ``loop.add_signal_handler``), so
@@ -616,6 +646,31 @@ async def run_subprocess_async(
         await _mark_ready(session_factory, payload.row_id)
         await _mark_running(session_factory, payload.row_id)
 
+        # Phase 4 task 4.2 iter-2 wiring: spawn the IB disconnect
+        # monitor as a sibling task. We start it AFTER the node is
+        # running (not before) so the ``is_connected`` probe has a
+        # valid data engine to call. The handler runs until
+        # ``shutdown_requested`` is set, the grace window fires, or
+        # the finally block cancels it. A failure to construct the
+        # handler logs loudly but does NOT fail the deployment —
+        # the supervisor's heartbeat watchdog is the fallback
+        # safety net even with no disconnect monitor running.
+        if disconnect_handler_factory is not None:
+            try:
+                disconnect_handler = await _maybe_await(disconnect_handler_factory(payload, node))
+                if disconnect_handler is not None:
+                    disconnect_task = asyncio.create_task(
+                        disconnect_handler.run(shutdown_requested),
+                        name=f"ib_disconnect_handler-{payload.deployment_slug}",
+                    )
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "ib_disconnect_handler_spawn_failed",
+                    extra={"deployment_id": str(payload.deployment_id)},
+                )
+                disconnect_handler = None
+                disconnect_task = None
+
         if shutdown_requested.is_set():
             node_run_task.cancel()
             _record_clean_exit("before_node_run")
@@ -699,6 +754,24 @@ async def run_subprocess_async(
         # with ``Event loop stopped before Future completed``.
         # Tests use the default ``False`` because their fake
         # ``dispose()`` is a no-op and the test loop is unaffected.
+        # Cancel the disconnect handler task FIRST — it's a
+        # sibling of ``node_run_task`` and should wind down before
+        # ``node.stop_async()`` because the handler may still be
+        # probing the data engine and we want to stop those probes
+        # before the engine tears down. Phase 4 task 4.2 iter-2
+        # wiring.
+        if disconnect_task is not None:
+            disconnect_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await disconnect_task
+        if disconnect_handler is not None:
+            close_fn = getattr(disconnect_handler, "aclose", None)
+            if close_fn is not None:
+                try:
+                    await close_fn()
+                except Exception:  # noqa: BLE001
+                    log.exception("ib_disconnect_handler_aclose_failed")
+
         if node is not None:
             try:
                 await node.stop_async()
@@ -739,6 +812,20 @@ async def run_subprocess_async(
 # ---------------------------------------------------------------------------
 # Context manager: swallow dispose errors so the terminal write path runs
 # ---------------------------------------------------------------------------
+
+
+async def _maybe_await(value: Any) -> Any:
+    """Support both sync and async factories. The
+    ``disconnect_handler_factory`` hook can return either a
+    ready :class:`IBDisconnectHandler` instance OR an
+    awaitable that resolves to one (because constructing the
+    handler in production requires opening an async Redis
+    client, which is an async operation). Tests typically
+    pass a sync stub; production passes an async builder.
+    """
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 @contextmanager
@@ -811,6 +898,60 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
             row_id=p.row_id,
         )
 
+    async def _real_disconnect_handler_factory(
+        p: TradingNodePayload,
+        node: Any,
+    ) -> Any:
+        """Phase 4 task 4.2 iter-2 wiring: construct a real
+        :class:`IBDisconnectHandler` bound to this node's data
+        engine + the shared Redis. Returns ``None`` (no-op)
+        when ``redis_url`` is empty, which keeps existing
+        tests that don't care about disconnect monitoring
+        working with the legacy fake subprocess path.
+
+        The handler's ``aclose`` method is defined
+        dynamically on the instance so ``run_subprocess_async``
+        can close the Redis client without importing
+        aioredis up here — the subprocess path keeps its
+        imports narrow.
+        """
+        if not p.redis_url:
+            return None
+        import redis.asyncio as aioredis
+
+        from msai.services.nautilus.disconnect_handler import (
+            DEFAULT_GRACE_SECONDS,
+            IBDisconnectHandler,
+        )
+
+        redis_client = aioredis.from_url(  # type: ignore[no-untyped-call]
+            p.redis_url, decode_responses=False
+        )
+
+        def _is_connected() -> bool:
+            # Data engine's ``check_connected`` iterates every
+            # registered client and returns False if ANY client
+            # is disconnected. That's the right "IB is reachable"
+            # probe — Nautilus 1.223.0 data/engine.pyx:296.
+            try:
+                return bool(node.kernel.data_engine.check_connected())
+            except Exception:  # noqa: BLE001
+                return False
+
+        handler = IBDisconnectHandler(
+            redis=redis_client,
+            is_connected=_is_connected,
+            deployment_slug=p.deployment_slug,
+            grace_seconds=DEFAULT_GRACE_SECONDS,
+        )
+
+        async def _aclose() -> None:
+            with contextlib.suppress(Exception):
+                await redis_client.aclose()
+
+        handler.aclose = _aclose  # type: ignore[attr-defined]
+        return handler
+
     # Codex batch 3 iter11 P0 fix: dispose() must run AFTER
     # ``asyncio.run`` exits, because Nautilus 1.223.0
     # ``TradingNode.dispose()`` calls ``loop.stop()`` on the kernel's
@@ -832,6 +973,7 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
                 session_factory=session_factory,
                 node_factory=_build_real_node,
                 heartbeat_factory=_real_heartbeat_factory,
+                disconnect_handler_factory=_real_disconnect_handler_factory,
                 install_signal_handlers=True,
                 skip_dispose=True,
                 on_node_constructed=_capture_node,
