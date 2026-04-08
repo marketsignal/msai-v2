@@ -114,10 +114,19 @@ fi
 #
 # Codex iter2 P2: the checklist's prod-stack-validation step needs
 # to run this script with ``TRADING_MODE=live`` and a real live
-# account id (``U*``). Before this fix, the preflight hard-rejected
+# account id (``U*``). Before that fix, the preflight hard-rejected
 # any non-DU account, making the documented live-mode validation
 # impossible.
-_trading_mode="${TRADING_MODE:-paper}"
+#
+# Codex iter3 P2: read ``TRADING_MODE`` from .env the same way the
+# other vars are read. Before this fix, the script read
+# ``TRADING_MODE`` from the shell via ``${TRADING_MODE:-paper}`` and
+# everything else from .env — so an operator who set
+# ``TRADING_MODE=live`` in .env without exporting it to the shell
+# got a split-brain state where the script assumed paper but
+# ``docker compose`` started live.
+_trading_mode_from_env=$(_get_env_value TRADING_MODE)
+_trading_mode="${TRADING_MODE:-${_trading_mode_from_env:-paper}}"
 if [[ "${_trading_mode}" == "paper" ]]; then
   if [[ ! "${IB_ACCOUNT_ID}" =~ ^DU ]]; then
     echo "ERROR: TRADING_MODE=paper requires IB_ACCOUNT_ID starting with 'DU'." >&2

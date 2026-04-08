@@ -127,6 +127,74 @@ def _build_production_payload_factory(
             # to IB contracts via the security master.
             paper_symbols = [instrument.split(".")[0] for instrument in deployment.instruments]
 
+            # Codex iter3 P1: real-money safety gap.
+            #
+            # The deployment row carries TWO pieces of ground truth
+            # for IB target: ``paper_trading`` (boolean flag set at
+            # deployment-creation time) and ``account_id`` (the IB
+            # account string the operator requested). The process-
+            # wide settings carry ``ib_host`` / ``ib_port`` /
+            # ``ib_account_id`` from env vars.
+            #
+            # Before this check, the payload factory blindly used
+            # the settings values, ignoring the deployment row. A
+            # supervisor running with ``IB_PORT=4001`` +
+            # ``IB_ACCOUNT_ID=U*`` (live) but spawning a deployment
+            # with ``paper_trading=True`` would silently connect to
+            # the LIVE gateway and submit real-money orders under a
+            # row that claims paper. The ``/api/v1/live/start``
+            # idempotency layer, the frontend UI, and the operator's
+            # own mental model would all be wrong about what
+            # account that deployment was using.
+            #
+            # Fix: use ``deployment.account_id`` (not the settings
+            # default) so each row is self-consistent, and validate
+            # that ``paper_trading`` matches the ``IB_PORT`` the
+            # supervisor is configured to hit. Mismatch raises,
+            # which marks the row ``SPAWN_FAILED_PERMANENT`` and
+            # ACKs the command — the operator has to fix the
+            # supervisor's env or the deployment row before retrying.
+            #
+            # ``ib_host`` / ``ib_port`` still come from settings
+            # because they describe the supervisor's INFRASTRUCTURE
+            # connection (which gateway container to reach), not
+            # the DEPLOYMENT's business intent (which account to
+            # trade under).
+            _paper_port = 4002
+            _live_port = 4001
+            expected_port = _paper_port if deployment.paper_trading else _live_port
+            if settings.ib_port != expected_port:
+                raise ValueError(
+                    f"deployment {deployment_id} has paper_trading="
+                    f"{deployment.paper_trading} (expected IB_PORT="
+                    f"{expected_port}) but supervisor is configured "
+                    f"with IB_PORT={settings.ib_port}. Flipping modes "
+                    f"requires restarting the supervisor with matching "
+                    f"IB_PORT — otherwise the deployment would connect "
+                    f"to the wrong gateway (real money under a paper "
+                    f"row, or paper orders under a live row)."
+                )
+
+            # ``account_id`` consistency with ``paper_trading``.
+            # Paper accounts start with ``DU``; live accounts don't.
+            # This mirrors ``_validate_port_account_consistency`` in
+            # ``live_node_config.py`` but catches the mismatch one
+            # layer earlier (before build_live_trading_node_config
+            # even sees it).
+            deployment_account = (deployment.account_id or "").strip()
+            if deployment.paper_trading and not deployment_account.startswith("DU"):
+                raise ValueError(
+                    f"deployment {deployment_id} has paper_trading=True but "
+                    f"account_id='{deployment_account}' does not start with "
+                    f"'DU'. Paper accounts must use DU* account IDs."
+                )
+            if not deployment.paper_trading and deployment_account.startswith("DU"):
+                raise ValueError(
+                    f"deployment {deployment_id} has paper_trading=False but "
+                    f"account_id='{deployment_account}' starts with 'DU'. "
+                    f"Live deployments require non-paper account IDs."
+                )
+
             nautilus_payload = TradingNodePayload(
                 row_id=row_id,
                 deployment_id=deployment_id,
@@ -137,7 +205,13 @@ def _build_production_payload_factory(
                 paper_symbols=paper_symbols,
                 ib_host=settings.ib_host,
                 ib_port=settings.ib_port,
-                ib_account_id=settings.ib_account_id,
+                # Codex iter3 P1: use the deployment row's
+                # account_id, not the process-wide settings default.
+                # Different deployments on the same supervisor can
+                # target different IB accounts (e.g., two paper
+                # accounts used for A/B testing) as long as all of
+                # them match the supervisor's paper/live port.
+                ib_account_id=deployment_account,
                 database_url=settings.database_url,
                 redis_url=settings.redis_url,
                 startup_health_timeout_s=settings.startup_health_timeout_s,
@@ -151,6 +225,8 @@ def _build_production_payload_factory(
                     "paper_symbols": paper_symbols,
                     "ib_host": settings.ib_host,
                     "ib_port": settings.ib_port,
+                    "account_id": deployment_account,
+                    "paper_trading": deployment.paper_trading,
                 },
             )
             return (nautilus_payload,)

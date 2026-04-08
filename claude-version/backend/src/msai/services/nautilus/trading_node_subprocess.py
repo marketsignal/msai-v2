@@ -679,6 +679,65 @@ async def run_subprocess_async(
             try:
                 disconnect_handler = await _maybe_await(disconnect_handler_factory(payload, node))
                 if disconnect_handler is not None:
+                    # Codex iter3 P2: local on_halt fallback.
+                    #
+                    # The handler's primary halt path is setting
+                    # the Redis kill-switch flag which the
+                    # supervisor watches. But the exact scenario
+                    # ``IBDisconnectHandler`` was hardened for — an
+                    # extended IB outage with correlated Redis
+                    # trouble (network partition, datacenter
+                    # issue) — means the Redis writes can fail AND
+                    # the handler's retry loop exhausts. Without a
+                    # local fallback, ``_fire_halt()`` would just
+                    # log critical and exit, leaving the subprocess
+                    # running with a dead order channel.
+                    #
+                    # Fix: inject an ``_on_halt`` callback that
+                    # sets the local ``shutdown_requested`` event
+                    # and schedules ``node.stop_async()``. These
+                    # are purely in-process primitives — no Redis,
+                    # no DB, no network. ``_fire_halt()`` runs the
+                    # callback unconditionally (even when Redis
+                    # writes failed, per ``disconnect_handler.py``
+                    # Codex batch 10 P2 fix), so the subprocess
+                    # always tears down when the grace window
+                    # expires.
+                    #
+                    # The injection targets the private attribute
+                    # so it composes with any on_halt the factory
+                    # may have pre-configured (future extensibility).
+                    # Test fakes that don't use ``_on_halt`` are
+                    # unaffected — we check via ``hasattr``.
+                    if hasattr(disconnect_handler, "_on_halt"):
+                        _preexisting_on_halt = disconnect_handler._on_halt
+
+                        async def _local_shutdown_on_halt() -> None:
+                            """Fail-closed fallback: set the local
+                            shutdown event + stop the node. Runs
+                            AFTER any pre-existing on_halt the
+                            factory configured."""
+                            log.critical(
+                                "ib_disconnect_handler_local_halt_triggered",
+                                extra={
+                                    "deployment_id": str(payload.deployment_id),
+                                    "deployment_slug": payload.deployment_slug,
+                                    "reason": (
+                                        "grace window expired, triggering "
+                                        "local shutdown regardless of Redis "
+                                        "halt-flag write status"
+                                    ),
+                                },
+                            )
+                            if _preexisting_on_halt is not None:
+                                with contextlib.suppress(Exception):
+                                    await _preexisting_on_halt()
+                            shutdown_requested.set()
+                            with contextlib.suppress(Exception):
+                                await node.stop_async()
+
+                        disconnect_handler._on_halt = _local_shutdown_on_halt  # noqa: SLF001
+
                     disconnect_task = asyncio.create_task(
                         disconnect_handler.run(shutdown_requested),
                         name=f"ib_disconnect_handler-{payload.deployment_slug}",
