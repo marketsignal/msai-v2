@@ -242,17 +242,39 @@ from msai.models.user import User
 async def main() -> None:
     engine = create_async_engine(settings.database_url)
     Session = async_sessionmaker(engine, expire_on_commit=False)
+    SMOKE_FILE = '/app/strategies/example/smoke_market_order.py'
+    SMOKE_CLASS = 'SmokeMarketOrderStrategy'
     async with Session() as session:
         user = (await session.execute(select(User).where(User.entra_id == 'e2e-operator'))).scalar_one_or_none()
         if user is None:
             user = User(id=uuid.uuid4(), entra_id='e2e-operator', email='e2e@example.com', role='operator')
             session.add(user)
             await session.flush()
-        existing = (await session.execute(select(Strategy).where(Strategy.name == 'smoke_market_order'))).scalar_one_or_none()
+        # Codex iter5 P2: match by file_path + strategy_class, not
+        # name. ``strategies.name`` isn't unique, so a DB with two
+        # rows named ``smoke_market_order`` (leftover from a prior
+        # run with a different file path) would either raise
+        # MultipleResultsFound or — worse — reuse the wrong row and
+        # point the harness at the wrong strategy. file_path +
+        # class_name uniquely identifies the code we want to run.
+        existing = (await session.execute(
+            select(Strategy)
+            .where(Strategy.file_path == SMOKE_FILE)
+            .where(Strategy.strategy_class == SMOKE_CLASS)
+            .order_by(Strategy.created_at.desc())
+            .limit(1)
+        )).scalar_one_or_none()
         if existing is not None:
             print(str(existing.id))
             return
-        strat = Strategy(id=uuid.uuid4(), name='smoke_market_order', file_path='/app/strategies/example/smoke_market_order.py', strategy_class='SmokeMarketOrderStrategy', default_config={}, created_by=user.id)
+        strat = Strategy(
+            id=uuid.uuid4(),
+            name='smoke_market_order',
+            file_path=SMOKE_FILE,
+            strategy_class=SMOKE_CLASS,
+            default_config={},
+            created_by=user.id,
+        )
         session.add(strat)
         await session.commit()
         print(str(strat.id))
@@ -294,6 +316,16 @@ export MSAI_E2E_BACKEND_URL="${MSAI_E2E_BACKEND_URL:-${_BACKEND_URL}}"
 export MSAI_E2E_BACKEND_CONTAINER="${MSAI_E2E_BACKEND_CONTAINER:-${_BACKEND_CONTAINER}}"
 export MSAI_E2E_COMPOSE_FILE="${MSAI_E2E_COMPOSE_FILE:-${_COMPOSE_FILE}}"
 export MSAI_E2E_IB_ACCOUNT_ID="${IB_ACCOUNT_ID}"
+# Codex iter5 P1: tell the E2E harness whether to request a paper
+# or live deployment so the POST body matches the supervisor's
+# expected trading mode. Without this, the harness hard-codes
+# ``paper_trading: true`` and my new paper/live safety guard in
+# the payload factory rejects every live-mode run.
+if [[ "${_trading_mode}" == "paper" ]]; then
+  export MSAI_E2E_PAPER_TRADING=true
+else
+  export MSAI_E2E_PAPER_TRADING=false
+fi
 
 if ! (cd backend && uv run pytest tests/e2e/test_live_trading_phase1.py -vv); then
   echo "[paper-soak] ERROR: Phase 1 E2E harness failed" >&2

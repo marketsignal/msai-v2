@@ -58,6 +58,15 @@ class FailureKind(StrEnum):
     should surface it to the caller as a terminal error, not a
     transient to retry automatically."""
 
+    SPAWN_FAILED_TRANSIENT = "spawn_failed_transient"
+    """Payload factory raised a transient error — typically a
+    SQLAlchemy OperationalError when Postgres is briefly down or a
+    network/timeout error during module import. The row is marked
+    failed with this kind BUT the command is NOT ACKed — the caller
+    returns False so the PEL redelivers via XAUTOCLAIM once the
+    dependency recovers (Codex iter5 P2). The endpoint should treat
+    this as retryable, not a terminal failure."""
+
     BUILD_TIMEOUT = "build_timeout"
     """The supervisor watchdog SIGKILLed the subprocess because its
     heartbeat stalled during startup (``starting``/``building``

@@ -13,6 +13,7 @@ class TestFailureKindValues:
             "none",
             "halt_active",
             "spawn_failed_permanent",
+            "spawn_failed_transient",
             "build_timeout",
             "reconciliation_failed",
             "in_flight",

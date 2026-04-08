@@ -133,13 +133,22 @@ async def test_phase_1_e2e_full_lifecycle() -> None:  # noqa: C901, PLR0912, PLR
             "scripts/e2e_phase1.sh to seed it."
         )
 
+        # Codex iter5 P1: paper_trading must match the supervisor's
+        # configuration. When ``verify-paper-soak.sh`` runs with
+        # ``TRADING_MODE=live`` against the prod compose stack, the
+        # supervisor expects a live deployment. The payload factory
+        # in ``live_supervisor/__main__.py`` rejects the mismatch.
+        # Read from env so the harness works for both paper and live
+        # runs; default to paper for backward compat.
+        _paper_trading = os.environ.get("MSAI_E2E_PAPER_TRADING", "true").lower() == "true"
+
         start_resp = await client.post(
             "/api/v1/live/start",
             json={
                 "strategy_id": strategy_id,
                 "config": {},
                 "instruments": SMOKE_INSTRUMENTS,
-                "paper_trading": True,
+                "paper_trading": _paper_trading,
             },
             headers={"Idempotency-Key": f"e2e-{int(time.time())}"},
         )

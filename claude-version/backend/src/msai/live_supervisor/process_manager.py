@@ -239,20 +239,82 @@ class ProcessManager:
                     deployment_slug,
                     payload,
                 )
-            except Exception as exc:  # noqa: BLE001
+            except (
+                ValueError,
+                ImportError,
+                ModuleNotFoundError,
+                FileNotFoundError,
+                AttributeError,
+            ) as exc:
+                # Codex iter5 P2: distinguish permanent errors from
+                # transient ones.
+                #
+                # Permanent failures are OPERATOR CONFIG BUGS that
+                # retrying won't fix — the payload factory raises
+                # ``ValueError`` for our paper/live safety guards,
+                # ``ImportError`` / ``ModuleNotFoundError`` /
+                # ``FileNotFoundError`` when the strategy file
+                # doesn't exist at ``strategy.file_path``, and
+                # ``AttributeError`` when the strategy class isn't
+                # found in the module. All of these require the
+                # operator to fix the deployment row or strategy
+                # file — XAUTOCLAIM retry would just spin.
+                #
+                # Mark failed + ACK so the command is removed from
+                # the PEL.
                 log.exception(
-                    "spawn_payload_factory_failed",
+                    "spawn_payload_factory_failed_permanent",
                     extra={
                         "deployment_id": str(deployment_id),
                         "deployment_slug": deployment_slug,
+                        "exception_type": type(exc).__name__,
                     },
                 )
                 await self._mark_failed(
                     row_id=row_id,
-                    reason=f"payload factory failed: {exc}",
+                    reason=f"payload factory failed (permanent): {exc}",
                     failure_kind=FailureKind.SPAWN_FAILED_PERMANENT,
                 )
                 return True
+            except Exception as exc:  # noqa: BLE001
+                # TRANSIENT failure path (Codex iter5 P2).
+                #
+                # Everything else is treated as transient: SQLAlchemy
+                # ``OperationalError`` / ``DBAPIError`` when Postgres
+                # is briefly down, Redis errors, network timeouts,
+                # interpreter hiccups during module imports, etc.
+                # Retrying via XAUTOCLAIM once the dependency
+                # recovers is the right behavior — losing a
+                # ``/start`` because Postgres had a 3-second blip
+                # would be a user-visible outage.
+                #
+                # We do NOT call ``_mark_failed`` here because the
+                # row is still in ``starting`` state and a fresh
+                # XAUTOCLAIM attempt needs the row to remain
+                # available. Returning ``False`` keeps the command
+                # in the PEL for redelivery.
+                log.exception(
+                    "spawn_payload_factory_failed_transient",
+                    extra={
+                        "deployment_id": str(deployment_id),
+                        "deployment_slug": deployment_slug,
+                        "exception_type": type(exc).__name__,
+                        "note": (
+                            "treating as transient — command stays in PEL "
+                            "for XAUTOCLAIM retry"
+                        ),
+                    },
+                )
+                # Release the reserved row so the next retry can
+                # re-reserve it. We flip to ``failed`` with a
+                # transient failure_kind that the retry path
+                # ignores when deciding whether to spawn.
+                await self._mark_failed(
+                    row_id=row_id,
+                    reason=f"payload factory failed (transient): {exc}",
+                    failure_kind=FailureKind.SPAWN_FAILED_TRANSIENT,
+                )
+                return False  # NO ACK — retry via PEL
         else:
             spawn_args = self._spawn_args
 

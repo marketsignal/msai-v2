@@ -843,16 +843,17 @@ async def test_spawn_with_payload_factory_passes_returned_args_to_process(
 
 
 @pytest.mark.asyncio
-async def test_spawn_payload_factory_exception_marks_row_failed_and_acks(
+async def test_spawn_payload_factory_permanent_error_marks_row_failed_and_acks(
     session_factory: async_sessionmaker[AsyncSession],
     redis_client: AsyncRedis,
     deployment: LiveDeployment,
 ) -> None:
-    """A ``payload_factory`` exception must NOT retry via
-    XAUTOCLAIM: construction errors are operator config bugs, not
-    transient conditions. The row is marked ``failed`` /
-    :attr:`FailureKind.SPAWN_FAILED_PERMANENT` and the command is
-    ACKed so the PEL releases it."""
+    """A PERMANENT ``payload_factory`` exception (ValueError,
+    ImportError, etc.) must NOT retry via XAUTOCLAIM: these are
+    operator config bugs that retrying won't fix. The row is marked
+    ``SPAWN_FAILED_PERMANENT`` and the command is ACKed so the PEL
+    releases it.
+    """
 
     async def _bad_factory(
         row_id,  # noqa: ARG001
@@ -860,7 +861,10 @@ async def test_spawn_payload_factory_exception_marks_row_failed_and_acks(
         deployment_slug,  # noqa: ARG001
         payload_dict,  # noqa: ARG001
     ) -> tuple:
-        raise RuntimeError("strategy file not found")
+        # ValueError is our permanent-category exception — used by
+        # the paper/live safety guard in the production payload
+        # factory.
+        raise ValueError("paper_trading mismatch: supervisor expects live")
 
     pm = ProcessManager(
         db=session_factory,
@@ -890,7 +894,69 @@ async def test_spawn_payload_factory_exception_marks_row_failed_and_acks(
         assert row.status == "failed"
         assert row.failure_kind == FailureKind.SPAWN_FAILED_PERMANENT.value
         assert row.error_message is not None
-        assert "strategy file not found" in row.error_message
+        assert "paper_trading mismatch" in row.error_message
+
+
+@pytest.mark.asyncio
+async def test_spawn_payload_factory_transient_error_does_not_ack(
+    session_factory: async_sessionmaker[AsyncSession],
+    redis_client: AsyncRedis,
+    deployment: LiveDeployment,
+) -> None:
+    """A TRANSIENT ``payload_factory`` exception (generic Exception,
+    typically SQLAlchemy OperationalError when Postgres is briefly
+    down) must NOT ACK the command — the caller returns False so
+    the PEL redelivers via XAUTOCLAIM once the dependency recovers.
+    Codex iter5 P2 regression.
+    """
+
+    async def _transient_factory(
+        row_id,  # noqa: ARG001
+        deployment_id,  # noqa: ARG001
+        deployment_slug,  # noqa: ARG001
+        payload_dict,  # noqa: ARG001
+    ) -> tuple:
+        # A generic RuntimeError stands in for SQLAlchemy
+        # OperationalError / aioredis ConnectionError / network
+        # timeout — all of these are transient dependency
+        # failures, not operator config bugs.
+        raise RuntimeError("connection to postgres timed out")
+
+    pm = ProcessManager(
+        db=session_factory,
+        redis=redis_client,
+        spawn_target=_sleep_target,
+        payload_factory=_transient_factory,
+    )
+
+    ok = await pm.spawn(
+        deployment_id=deployment.id,
+        deployment_slug=deployment.deployment_slug,
+        payload={},
+        idempotency_key="transient-k1",
+    )
+    # Command must NOT be ACKed (return False) so XAUTOCLAIM
+    # redelivers it once the transient dependency recovers.
+    assert ok is False, (
+        "transient payload factory failures must return False so the "
+        "command stays in the PEL for redelivery"
+    )
+    # No process handle was registered
+    assert deployment.id not in pm.handles
+
+    # Row is marked failed with SPAWN_FAILED_TRANSIENT (not
+    # PERMANENT) so the endpoint can distinguish retryable
+    # failures from terminal ones.
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                select(LiveNodeProcess).where(LiveNodeProcess.deployment_id == deployment.id)
+            )
+        ).scalar_one()
+        assert row.status == "failed"
+        assert row.failure_kind == FailureKind.SPAWN_FAILED_TRANSIENT.value
+        assert row.error_message is not None
+        assert "connection to postgres timed out" in row.error_message
 
 
 @pytest.mark.asyncio
