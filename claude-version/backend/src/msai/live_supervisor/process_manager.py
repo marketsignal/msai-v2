@@ -74,10 +74,19 @@ from msai.models import LiveDeployment, LiveNodeProcess
 from msai.services.live.failure_kind import FailureKind
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable
 
     from redis.asyncio import Redis as AsyncRedis
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    PayloadFactory = Callable[[UUID, UUID, str, dict[str, Any]], Awaitable[tuple[Any, ...]]]
+    """Type alias for the per-spawn payload factory. Called with
+    ``(row_id, deployment_id, deployment_slug, payload_dict)`` and
+    returns the positional args tuple that will be passed to
+    :attr:`ProcessManager._spawn_target` via ``mp.Process(target=...,
+    args=...)``. Async so the factory can read the ``live_deployments``
+    row + joined ``strategies`` row to construct a fully-populated
+    :class:`TradingNodePayload`."""
 
 
 log = logging.getLogger(__name__)
@@ -107,10 +116,21 @@ class ProcessManager:
             Must be picklable (i.e. importable at top level). In
             production this is ``_trading_node_subprocess`` from
             Task 1.8; in tests it's a local sleep/exit stub.
-        spawn_args: Extra positional args to pass to ``spawn_target``.
-            In production the single argument is the
-            ``TradingNodePayload`` for the deployment; in tests it's
-            usually ``()``.
+        spawn_args: Static positional args passed to ``spawn_target``
+            for every spawn. Used when ``payload_factory`` is ``None``
+            (test path, where every deployment spawns the same stub).
+        payload_factory: Optional async callable that constructs the
+            per-deployment spawn args at phase-B time. When provided,
+            it is called with ``(row_id, deployment_id, deployment_slug,
+            payload_dict)`` and the return value REPLACES ``spawn_args``
+            for this single invocation. Production uses this to
+            construct a :class:`TradingNodePayload` for each deployment
+            (Phase 4 task #154 scope-B wiring). If construction raises,
+            the row is marked ``failed`` /
+            :attr:`FailureKind.SPAWN_FAILED_PERMANENT` and the command
+            is ACKed (no retry) — treating it like
+            ``process.start()`` failures because a malformed payload is
+            an operator config error, not a transient condition.
         spawn_ctx_method: ``multiprocessing`` context method, default
             ``"spawn"`` (clean interpreter). Overridable in tests
             that can't afford the spawn-fork cost.
@@ -123,6 +143,7 @@ class ProcessManager:
         redis: AsyncRedis,
         spawn_target: Callable[..., None],
         spawn_args: tuple[Any, ...] = (),
+        payload_factory: PayloadFactory | None = None,
         spawn_ctx_method: str = "spawn",
         startup_hard_timeout_s: float = 1800.0,
         watchdog_poll_interval_s: float = 30.0,
@@ -131,6 +152,7 @@ class ProcessManager:
         self._redis = redis
         self._spawn_target = spawn_target
         self._spawn_args = spawn_args
+        self._payload_factory = payload_factory
         self._spawn_ctx = mp.get_context(spawn_ctx_method)
         self.handles: dict[UUID, mp.process.BaseProcess] = {}
         # Watchdog config (Codex batch 3 iter8 P1 fix). Default 1800 s
@@ -154,7 +176,7 @@ class ProcessManager:
         *,
         deployment_id: UUID,
         deployment_slug: str,
-        payload: dict[str, Any],  # noqa: ARG002 — consumed by spawn_target in prod
+        payload: dict[str, Any],
         idempotency_key: str,  # noqa: ARG002 — reserved for Task 1.14 dedupe path
     ) -> bool:
         """Spawn a new trading subprocess.
@@ -176,11 +198,11 @@ class ProcessManager:
             # _PhaseAOutcome below). Re-implemented via helper so the
             # three-valued return is explicit.
             return False
-        if row_id is _PhaseAOutcome.ALREADY_ACTIVE:  # type: ignore[comparison-overlap]
+        if row_id is _PhaseAOutcome.ALREADY_ACTIVE:
             return True
-        if row_id is _PhaseAOutcome.BUSY_STOPPING:  # type: ignore[comparison-overlap]
+        if row_id is _PhaseAOutcome.BUSY_STOPPING:
             return False
-        if row_id is _PhaseAOutcome.NO_DEPLOYMENT:  # type: ignore[comparison-overlap]
+        if row_id is _PhaseAOutcome.NO_DEPLOYMENT:
             return False
 
         # row_id is a real UUID from here on.
@@ -200,10 +222,44 @@ class ProcessManager:
             )
             return True  # ACK — no retry until /resume
 
+        # Resolve the args tuple for this spawn. Production uses the
+        # payload factory to construct a per-deployment
+        # ``TradingNodePayload`` from the live_deployments row +
+        # settings (Phase 4 task #154 scope-B). Tests without a
+        # factory fall back to the static ``spawn_args`` tuple set at
+        # __init__ time. A factory exception → mark failed + ACK:
+        # payload construction errors are operator config issues,
+        # not transient conditions, so retrying via XAUTOCLAIM would
+        # just spin.
+        if self._payload_factory is not None:
+            try:
+                spawn_args = await self._payload_factory(
+                    row_id,
+                    deployment_id,
+                    deployment_slug,
+                    payload,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception(
+                    "spawn_payload_factory_failed",
+                    extra={
+                        "deployment_id": str(deployment_id),
+                        "deployment_slug": deployment_slug,
+                    },
+                )
+                await self._mark_failed(
+                    row_id=row_id,
+                    reason=f"payload factory failed: {exc}",
+                    failure_kind=FailureKind.SPAWN_FAILED_PERMANENT,
+                )
+                return True
+        else:
+            spawn_args = self._spawn_args
+
         try:
             process = self._spawn_ctx.Process(
                 target=self._spawn_target,
-                args=self._spawn_args,
+                args=spawn_args,
             )
             process.start()
         except Exception as exc:  # noqa: BLE001 — we want to catch any start() failure

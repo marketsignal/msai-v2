@@ -555,12 +555,32 @@ async def run_subprocess_async(
         node = node_factory(payload)
         if on_node_constructed is not None:
             on_node_constructed(node)
-        # node.build() is synchronous and may block for seconds
-        # (IB contract loading). Run it in a thread so the event
-        # loop stays responsive to signals. NO asyncio.wait_for
-        # around it — the supervisor watchdog is the external kill
-        # switch for wedged builds.
-        await asyncio.to_thread(node.build)
+        # node.build() is called directly on the loop thread — NOT
+        # via ``asyncio.to_thread``. Nautilus's IB adapter factories
+        # instantiate ``asyncio.Queue`` / ``asyncio.Event`` and call
+        # ``self._create_task`` (a Cython-bound loop.create_task) from
+        # inside ``InteractiveBrokersClient.__init__`` + ``_start``.
+        # Those APIs bind to the running loop in the CALLING thread —
+        # running them from a worker thread either binds the queues
+        # to the wrong loop or raises ``RuntimeError: no running
+        # event loop``. Nautilus's own examples all call ``build()``
+        # synchronously from the main thread for this reason.
+        #
+        # Consequence: while ``build()`` is blocked on IB contract
+        # loading, the loop can't dispatch signal-handler callbacks.
+        # SIGTERM lands but is processed only AFTER ``build()``
+        # returns. That is acceptable because:
+        #   1. The heartbeat thread keeps writing
+        #      (gotcha #20 / decision #17) so the watchdog sees
+        #      progress
+        #   2. The supervisor's ``startup_hard_timeout_s`` (default
+        #      1800 s) watchdog kills stuck ``building`` rows via
+        #      SIGKILL, which Python can't mask
+        #   3. The post-build ``shutdown_requested.is_set()`` check
+        #      catches any SIGTERM that landed during build
+        # NO ``asyncio.wait_for`` around it — the supervisor
+        # watchdog is the external kill switch for wedged builds.
+        node.build()
         if shutdown_requested.is_set():
             _record_clean_exit("after_build")
             return terminal_exit_code
@@ -1005,14 +1025,85 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
 def _build_real_node(payload: TradingNodePayload) -> Any:
     """Production node factory — constructs a real Nautilus TradingNode.
 
-    Stubbed to raise ``NotImplementedError`` in Phase 1 task 1.8. The
-    full wiring (``build_live_trading_node_config`` → ``TradingNode(config)``
-    → IB factory registration) lands in a follow-up task that can
-    integration-test against a real IB Gateway. Everything above this
-    line is already covered by unit tests with injected fake factories.
+    Imports are deferred inside the function so test invocations of
+    :func:`run_subprocess_async` (with fake factories) never pay
+    Nautilus's multi-second import cost. Under the ``mp.Process``
+    spawn context this function runs in a fresh interpreter anyway
+    so module-level vs function-level imports only matter for tests.
+
+    Steps (Nautilus 1.223.0 blessed pattern, live/node.py:230-281):
+
+    1. Build a ``TradingNodeConfig`` from the payload via
+       :func:`build_live_trading_node_config`. The config already
+       wires ``data_clients[IB_VENUE.value]`` /
+       ``exec_clients[IB_VENUE.value]`` with
+       :class:`InteractiveBrokersDataClientConfig` /
+       :class:`InteractiveBrokersExecClientConfig` instances.
+    2. Construct ``TradingNode(config)``. The node's
+       ``TradingNodeBuilder`` captures the current asyncio loop
+       during ``__init__`` — we rely on the caller
+       (:func:`run_subprocess_async` via ``asyncio.run``) to be
+       on the loop thread.
+    3. Register the two IB client factories against the ``"INTERACTIVE_BROKERS"``
+       key. The key MUST match ``IB_VENUE.value`` — the name that
+       :func:`build_live_trading_node_config` used when adding the
+       client configs to the ``data_clients`` / ``exec_clients``
+       dicts. A mismatch surfaces as "no factory for client X" at
+       ``node.build()`` time.
+
+    Gotchas honored:
+
+    - **#3** (unique ``client_id``): ``build_live_trading_node_config``
+      derives distinct ``ibg_data_client_id`` /
+      ``ibg_exec_client_id`` from the deployment slug so two
+      concurrent subprocesses can't silently steal each other's
+      IB connections.
+    - **#4** (venue name pinning): the config uses ``IB_VENUE``
+      (``"INTERACTIVE_BROKERS"``) consistently; we register the
+      factories under the same name here.
+    - **#6** (port/account consistency): validated inside
+      ``build_live_trading_node_config`` via
+      ``_validate_port_account_consistency``.
+    - **#10** (reconciliation on startup): already set via
+      ``LiveExecEngineConfig(reconciliation=True)`` in the config
+      builder; we do NOT override it here.
+    - **#18** (``asyncio.run`` loop conflict): we do NOT call
+      ``node.run()`` — :func:`run_subprocess_async` drives
+      ``node.run_async()`` as a scheduled task on the already-
+      running ``asyncio.run`` loop.
     """
-    raise NotImplementedError(
-        "Real TradingNode construction lands alongside the IB Gateway "
-        "integration test. For now, callers inject a node_factory "
-        "explicitly (see tests)."
+    from nautilus_trader.adapters.interactive_brokers.common import IB
+    from nautilus_trader.adapters.interactive_brokers.factories import (
+        InteractiveBrokersLiveDataClientFactory,
+        InteractiveBrokersLiveExecClientFactory,
     )
+    from nautilus_trader.live.node import TradingNode
+
+    from msai.services.nautilus.live_node_config import (
+        IBSettings,
+        build_live_trading_node_config,
+    )
+
+    ib_settings = IBSettings(
+        host=payload.ib_host,
+        port=payload.ib_port,
+        account_id=payload.ib_account_id,
+    )
+
+    config = build_live_trading_node_config(
+        deployment_slug=payload.deployment_slug,
+        strategy_path=payload.strategy_path,
+        strategy_config_path=payload.strategy_config_path,
+        strategy_config=payload.strategy_config,
+        paper_symbols=payload.paper_symbols,
+        ib_settings=ib_settings,
+    )
+
+    node = TradingNode(config=config)
+    # ``IB`` is the module-level constant ``"INTERACTIVE_BROKERS"``
+    # (nautilus_trader/adapters/interactive_brokers/common.py:32).
+    # Using the named constant instead of a string literal keeps
+    # us insulated from a Nautilus rename.
+    node.add_data_client_factory(IB, InteractiveBrokersLiveDataClientFactory)
+    node.add_exec_client_factory(IB, InteractiveBrokersLiveExecClientFactory)
+    return node

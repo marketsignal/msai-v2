@@ -10,8 +10,17 @@ in :mod:`msai.live_supervisor.main`, :mod:`process_manager`, and
 :mod:`heartbeat_monitor` so unit/integration tests can exercise each
 piece without standing up the full Docker stack.
 
-Task 1.8 will replace the ``_trading_node_subprocess`` placeholder
-with the real Nautilus entry point.
+Production wiring (Phase 4 task #154 scope-B):
+
+- ``spawn_target = _trading_node_subprocess`` — the real Nautilus
+  subprocess entry point that constructs a ``TradingNode``, builds
+  IB data + exec clients, and drives the node through its lifecycle
+  with the IB disconnect handler + heartbeat thread alive alongside.
+- ``payload_factory = _production_payload_factory`` — builds a
+  per-deployment :class:`TradingNodePayload` from the
+  ``live_deployments`` row (joined with ``strategies``) + the
+  process-wide ``settings``. Each spawn gets a fresh, fully-populated
+  payload.
 """
 
 from __future__ import annotations
@@ -20,26 +29,133 @@ import asyncio
 import logging
 import signal
 import sys
+from typing import Any
+from uuid import UUID  # noqa: TC003 — used at runtime in _factory signature
 
 import redis.asyncio as aioredis
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from msai.core.config import settings
 from msai.core.logging import setup_logging
 from msai.live_supervisor.heartbeat_monitor import HeartbeatMonitor
 from msai.live_supervisor.main import run_forever
 from msai.live_supervisor.process_manager import ProcessManager
+from msai.models import LiveDeployment, Strategy
 from msai.services.live_command_bus import LiveCommandBus
+from msai.services.nautilus.strategy_loader import resolve_importable_strategy_paths
+from msai.services.nautilus.trading_node_subprocess import (
+    TradingNodePayload,
+    _trading_node_subprocess,
+)
+
+log = logging.getLogger(__name__)
 
 
-def _placeholder_trading_subprocess() -> None:
-    """Placeholder entry point for Task 1.7 until Task 1.8 lands.
+def _build_production_payload_factory(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> Any:
+    """Closure factory so the returned callable captures the
+    session factory without needing a class wrapper. The returned
+    callable matches :data:`ProcessManager.PayloadFactory`.
 
-    Exits immediately with code 0 so any deployments spawned before
-    Task 1.8 arrives are observed by the reap loop as clean exits.
-    Task 1.8 will replace this with the real Nautilus subprocess
-    entry point (``msai.services.nautilus.trading_node._trading_node_subprocess``).
+    The factory reads the ``live_deployments`` row (joined with its
+    ``strategies`` row) to recover the operator-chosen strategy file,
+    class name, and per-deployment config. It then resolves those to
+    the two Nautilus importable path strings via
+    :func:`resolve_importable_strategy_paths` (which is the same
+    helper :class:`BacktestRunner` uses — single source of truth
+    for strategy path resolution).
+
+    Settings-sourced fields (``database_url``, ``redis_url``,
+    ``ib_account_id``) come from the process-wide
+    :data:`msai.core.config.settings` singleton. ``ib_host`` defaults
+    to ``127.0.0.1`` and ``ib_port`` to ``4002`` (paper) — the
+    operator overrides these via env vars if running against a
+    non-default IB Gateway.
+
+    Raises are propagated so :meth:`ProcessManager.spawn` can mark
+    the row as ``SPAWN_FAILED_PERMANENT``.
     """
+
+    async def _factory(
+        row_id: UUID,
+        deployment_id: UUID,
+        deployment_slug: str,
+        payload_dict: dict[str, Any],  # noqa: ARG001
+    ) -> tuple[TradingNodePayload]:
+        async with session_factory() as session:
+            deployment = (
+                await session.execute(
+                    select(LiveDeployment).where(LiveDeployment.id == deployment_id)
+                )
+            ).scalar_one_or_none()
+            if deployment is None:
+                raise ValueError(
+                    f"deployment {deployment_id} disappeared between "
+                    f"phase A and the payload factory"
+                )
+
+            strategy = (
+                await session.execute(select(Strategy).where(Strategy.id == deployment.strategy_id))
+            ).scalar_one_or_none()
+            if strategy is None:
+                raise ValueError(
+                    f"deployment {deployment_id} references strategy "
+                    f"{deployment.strategy_id} which does not exist"
+                )
+
+            # Resolve ``strategies/example/ema_cross.py`` → Nautilus
+            # importable strings. The same helper powers the backtest
+            # runner (services/nautilus/backtest_runner.py:341) so
+            # live and backtest always agree on how a strategy file
+            # turns into an ``ImportableStrategyConfig``.
+            paths = resolve_importable_strategy_paths(
+                strategy_file=strategy.file_path,
+                strategy_class_name=strategy.strategy_class,
+            )
+
+            # ``deployment.instruments`` is the stored instrument
+            # list (e.g. ``["AAPL.NASDAQ", "MSFT.NASDAQ"]``). Pass
+            # through the symbol portion (before the venue suffix)
+            # as ``paper_symbols`` — the Nautilus instrument
+            # provider expects bare symbols that it then resolves
+            # to IB contracts via the security master.
+            paper_symbols = [instrument.split(".")[0] for instrument in deployment.instruments]
+
+            nautilus_payload = TradingNodePayload(
+                row_id=row_id,
+                deployment_id=deployment_id,
+                deployment_slug=deployment_slug,
+                strategy_path=paths.strategy_path,
+                strategy_config_path=paths.config_path,
+                strategy_config=dict(deployment.config or {}),
+                paper_symbols=paper_symbols,
+                ib_host=settings.ib_host,
+                ib_port=settings.ib_port,
+                ib_account_id=settings.ib_account_id,
+                database_url=settings.database_url,
+                redis_url=settings.redis_url,
+                startup_health_timeout_s=settings.startup_health_timeout_s,
+            )
+            log.info(
+                "trading_node_payload_built",
+                extra={
+                    "deployment_id": str(deployment_id),
+                    "deployment_slug": deployment_slug,
+                    "strategy_path": paths.strategy_path,
+                    "paper_symbols": paper_symbols,
+                    "ib_host": settings.ib_host,
+                    "ib_port": settings.ib_port,
+                },
+            )
+            return (nautilus_payload,)
+
+    return _factory
 
 
 def _install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asyncio.Event) -> None:
@@ -68,13 +184,16 @@ async def _async_main() -> int:
 
     engine = create_async_engine(settings.database_url)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
-    redis_client = aioredis.from_url(settings.redis_url, decode_responses=True)
+    redis_client = aioredis.from_url(  # type: ignore[no-untyped-call]
+        settings.redis_url, decode_responses=True
+    )
 
     bus = LiveCommandBus(redis=redis_client)
     process_manager = ProcessManager(
         db=session_factory,
         redis=redis_client,
-        spawn_target=_placeholder_trading_subprocess,
+        spawn_target=_trading_node_subprocess,
+        payload_factory=_build_production_payload_factory(session_factory),
     )
     heartbeat_monitor = HeartbeatMonitor(db=session_factory)
 

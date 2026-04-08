@@ -43,6 +43,22 @@ class Settings(BaseSettings):
     # with isolated state. Paper accounts start with ``DU``, live with ``U``.
     ib_account_id: str = "DU0000000"
 
+    # Interactive Brokers Gateway connection (Phase 4 task #154
+    # scope-B). Host + port together must match the account type:
+    # paper accounts (``DU...``) with port 4002, live accounts
+    # (``U...``) with port 4001. The ``live_node_config.py`` builder
+    # validates this via ``_validate_port_account_consistency`` —
+    # a mismatch crashes the subprocess at ``build_live_trading_node_config``
+    # time rather than silently sending orders to the wrong venue.
+    ib_host: str = "127.0.0.1"
+    ib_port: int = 4002
+
+    # Maximum wait for ``trader.is_running`` to flip True after
+    # ``node.run_async`` starts (Phase 1 task 1.8 / decision #14).
+    # Exceeding this marks the row ``failed`` /
+    # ``FailureKind.RECONCILIATION_FAILED``.
+    startup_health_timeout_s: float = 60.0
+
     # Backtest execution tuning
     backtest_timeout_seconds: int = 30 * 60
 

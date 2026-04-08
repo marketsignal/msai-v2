@@ -747,3 +747,185 @@ async def test_stop_after_supervisor_restart_uses_row_pid(
         if child.is_alive():
             child.kill()
             child.join(timeout=2)
+
+
+# ---------------------------------------------------------------------------
+# Payload factory (Phase 4 task #154 scope-B wiring)
+# ---------------------------------------------------------------------------
+
+
+def _echo_target(marker: str, pid_sink: str) -> None:
+    """Spawn target that writes a marker + its pid to a file, then
+    exits. Used to prove the payload factory's return tuple reached
+    ``mp.Process(args=...)`` through the production path (as opposed
+    to the static ``spawn_args`` fallback)."""
+    import os
+    from pathlib import Path
+
+    Path(pid_sink).write_text(f"{marker}:{os.getpid()}")
+
+
+@pytest.mark.asyncio
+async def test_spawn_with_payload_factory_passes_returned_args_to_process(
+    session_factory: async_sessionmaker[AsyncSession],
+    redis_client: AsyncRedis,
+    deployment: LiveDeployment,
+    tmp_path,
+) -> None:
+    """Phase 4 task #154 scope-B: when a ``payload_factory`` is
+    configured, its return value becomes ``mp.Process(args=...)`` for
+    this spawn — the static ``spawn_args`` is NOT used.
+
+    Proven end-to-end by having the factory construct an args tuple
+    whose values are unique to this test run and having the spawn
+    target write them to a file the test reads back."""
+    from uuid import UUID
+
+    marker = f"factory-test-{uuid4().hex[:8]}"
+    pid_sink = str(tmp_path / "echo.out")
+
+    factory_calls: list[tuple[UUID, UUID, str, dict]] = []
+
+    async def _payload_factory(
+        row_id: UUID,
+        deployment_id: UUID,
+        deployment_slug: str,
+        payload_dict: dict,
+    ) -> tuple[str, str]:
+        factory_calls.append((row_id, deployment_id, deployment_slug, payload_dict))
+        return (marker, pid_sink)
+
+    pm = ProcessManager(
+        db=session_factory,
+        redis=redis_client,
+        spawn_target=_echo_target,
+        # Deliberately provide a different fallback — the test
+        # asserts the factory return overrides this.
+        spawn_args=("wrong-marker", "/nonexistent/path"),
+        payload_factory=_payload_factory,
+    )
+
+    try:
+        ok = await pm.spawn(
+            deployment_id=deployment.id,
+            deployment_slug=deployment.deployment_slug,
+            payload={"from_api": "hello"},
+            idempotency_key="factory-k1",
+        )
+        assert ok is True
+
+        # Wait for the echo subprocess to finish + flush
+        proc = pm.handles[deployment.id]
+        proc.join(timeout=5)
+        assert not proc.is_alive()
+
+        # Read the marker back — proves the factory tuple was used
+        from pathlib import Path
+
+        content = Path(pid_sink).read_text()
+        assert content.startswith(f"{marker}:"), (
+            f"expected marker {marker} at start of {content!r}, factory args "
+            f"were not wired into mp.Process(args=...)"
+        )
+    finally:
+        for proc in list(pm.handles.values()):
+            with contextlib.suppress(Exception):
+                proc.terminate()
+                proc.join(timeout=2)
+
+    # Factory was called once with the expected identifiers
+    assert len(factory_calls) == 1
+    row_id, dep_id, slug, payload_dict = factory_calls[0]
+    assert dep_id == deployment.id
+    assert slug == deployment.deployment_slug
+    assert payload_dict == {"from_api": "hello"}
+    assert isinstance(row_id, UUID)
+
+
+@pytest.mark.asyncio
+async def test_spawn_payload_factory_exception_marks_row_failed_and_acks(
+    session_factory: async_sessionmaker[AsyncSession],
+    redis_client: AsyncRedis,
+    deployment: LiveDeployment,
+) -> None:
+    """A ``payload_factory`` exception must NOT retry via
+    XAUTOCLAIM: construction errors are operator config bugs, not
+    transient conditions. The row is marked ``failed`` /
+    :attr:`FailureKind.SPAWN_FAILED_PERMANENT` and the command is
+    ACKed so the PEL releases it."""
+
+    async def _bad_factory(
+        row_id,  # noqa: ARG001
+        deployment_id,  # noqa: ARG001
+        deployment_slug,  # noqa: ARG001
+        payload_dict,  # noqa: ARG001
+    ) -> tuple:
+        raise RuntimeError("strategy file not found")
+
+    pm = ProcessManager(
+        db=session_factory,
+        redis=redis_client,
+        spawn_target=_sleep_target,
+        payload_factory=_bad_factory,
+    )
+
+    ok = await pm.spawn(
+        deployment_id=deployment.id,
+        deployment_slug=deployment.deployment_slug,
+        payload={},
+        idempotency_key="bad-k1",
+    )
+    # Command must be ACKed (return True) so it doesn't loop forever
+    assert ok is True
+    # No process handle was registered
+    assert deployment.id not in pm.handles
+
+    # Row is marked failed with SPAWN_FAILED_PERMANENT
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                select(LiveNodeProcess).where(LiveNodeProcess.deployment_id == deployment.id)
+            )
+        ).scalar_one()
+        assert row.status == "failed"
+        assert row.failure_kind == FailureKind.SPAWN_FAILED_PERMANENT.value
+        assert row.error_message is not None
+        assert "strategy file not found" in row.error_message
+
+
+@pytest.mark.asyncio
+async def test_spawn_without_payload_factory_uses_static_spawn_args(
+    session_factory: async_sessionmaker[AsyncSession],
+    redis_client: AsyncRedis,
+    deployment: LiveDeployment,
+) -> None:
+    """Backward compat: when ``payload_factory`` is ``None`` (test
+    path), the spawn must use the static ``spawn_args`` tuple set at
+    ``__init__`` time. This is the path every existing process
+    manager test implicitly relies on — a regression here would
+    break the 14 pre-existing tests too."""
+    pm = ProcessManager(
+        db=session_factory,
+        redis=redis_client,
+        spawn_target=_sleep_target,
+        spawn_args=(1.0,),  # short sleep so the test cleans up fast
+        # no payload_factory
+    )
+
+    try:
+        ok = await pm.spawn(
+            deployment_id=deployment.id,
+            deployment_slug=deployment.deployment_slug,
+            payload={},
+            idempotency_key="static-k1",
+        )
+        assert ok is True
+        # A live process exists with the expected handle
+        assert deployment.id in pm.handles
+        proc = pm.handles[deployment.id]
+        assert proc.is_alive() or proc.exitcode == 0
+    finally:
+        for proc in list(pm.handles.values()):
+            with contextlib.suppress(Exception):
+                proc.terminate()
+                proc.join(timeout=2)
