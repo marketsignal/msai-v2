@@ -795,6 +795,50 @@ class ProcessManager:
                     },
                 )
                 return True
+
+            # PR#1 Codex P1 regression: cross-host PID kill guard.
+            #
+            # In Phase 1 there is exactly one supervisor per host so
+            # ``row.host`` always matches ``socket.gethostname()``. In
+            # Phase 2 the architecture splits into a trading VM and a
+            # compute VM that share one Redis command stream. A STOP
+            # command published on the shared stream can be consumed
+            # by EITHER supervisor's command bus loop — and the
+            # supervisor on the wrong host would read ``row.pid``,
+            # ``os.kill(pid, SIGTERM)`` a local PID that happens to
+            # exist but belongs to a completely different process,
+            # while the actual trading subprocess continues running
+            # on its original host untouched.
+            #
+            # Fix: check ``row.host`` against our own hostname. If
+            # they don't match, return ``False`` (NOT an ACK) so the
+            # command stays in the Redis PEL for XAUTOCLAIM
+            # redelivery to the correct supervisor. Log a warning so
+            # the operator can see which command was routed to the
+            # wrong host.
+            #
+            # We do NOT flip ``row.status = 'stopping'`` in the
+            # wrong-host branch — that would be a remote-host state
+            # mutation and the right supervisor's own stop flow will
+            # do it when it picks up the redelivery.
+            local_host = socket.gethostname()
+            if row.host != local_host:
+                log.warning(
+                    "stop_wrong_host",
+                    extra={
+                        "deployment_id": str(deployment_id),
+                        "row_host": row.host,
+                        "local_host": local_host,
+                        "reason": reason,
+                        "note": (
+                            "STOP command routed to the wrong supervisor; "
+                            "not ACKing so redelivery reaches the host "
+                            "that owns the subprocess"
+                        ),
+                    },
+                )
+                return False  # NO ACK — let XAUTOCLAIM redeliver
+
             row.status = "stopping"
             row_pid = row.pid
 

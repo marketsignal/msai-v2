@@ -713,13 +713,17 @@ async def test_stop_after_supervisor_restart_uses_row_pid(
     try:
         # Seed the row with status='running' and the real pid —
         # simulating the "post-supervisor-restart discovered
-        # subprocess" case.
+        # subprocess" case. Use socket.gethostname() as the ``host``
+        # so the cross-host guard (PR#1 Codex P1) treats this as a
+        # same-host row and proceeds to the kill.
+        import socket as _socket
+
         async with session_factory() as session:
             row = LiveNodeProcess(
                 id=uuid4(),
                 deployment_id=deployment.id,
                 pid=child.pid,
-                host="preseed",
+                host=_socket.gethostname(),
                 started_at=datetime.now(UTC),
                 last_heartbeat_at=datetime.now(UTC),
                 status="running",
@@ -747,6 +751,75 @@ async def test_stop_after_supervisor_restart_uses_row_pid(
         if child.is_alive():
             child.kill()
             child.join(timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_stop_refuses_cross_host_row(
+    session_factory: async_sessionmaker[AsyncSession],
+    redis_client: AsyncRedis,
+    deployment: LiveDeployment,
+) -> None:
+    """PR#1 Codex P1 regression: cross-host PID kill guard.
+
+    The Phase 2 architecture has a trading VM + a compute VM
+    sharing one Redis command stream. If a STOP command gets
+    consumed by the wrong supervisor, the wrong supervisor must
+    NOT signal a local PID — that local PID might happen to exist
+    but belongs to a completely unrelated process while the real
+    trading subprocess keeps running on its original host.
+
+    Verify: a row with ``host != socket.gethostname()`` causes
+    ``stop()`` to return False (no ACK → PEL redelivery) and NOT
+    flip the row to ``stopping``.
+    """
+    import socket as _socket
+
+    # Seed a row from ``other-supervisor-host`` with a BOGUS pid
+    # that definitely doesn't correspond to anything on this host.
+    # Using a very large number avoids ProcessLookupError masking
+    # a real guard failure as ``ok=True``.
+    bogus_pid = 2**24 + 7
+    async with session_factory() as session:
+        row = LiveNodeProcess(
+            id=uuid4(),
+            deployment_id=deployment.id,
+            pid=bogus_pid,
+            host="other-supervisor-host",
+            started_at=datetime.now(UTC),
+            last_heartbeat_at=datetime.now(UTC),
+            status="running",
+        )
+        session.add(row)
+        await session.commit()
+
+    # Sanity check: we're clearly NOT on ``other-supervisor-host``.
+    assert _socket.gethostname() != "other-supervisor-host"
+
+    pm = ProcessManager(
+        db=session_factory,
+        redis=redis_client,
+        spawn_target=_sleep_target,
+    )
+    assert not pm.handles  # fresh PM, no local handle for this row
+
+    ok = await pm.stop(deployment.id, reason="user")
+    # NOT ACKed — the command stays in the PEL for the correct
+    # supervisor to pick up via XAUTOCLAIM redelivery.
+    assert ok is False
+
+    # Row status must NOT have been flipped to 'stopping' — that
+    # would be a cross-host state mutation. The right supervisor's
+    # own stop flow owns the row's state transitions.
+    async with session_factory() as session:
+        refetched = (
+            await session.execute(
+                select(LiveNodeProcess).where(LiveNodeProcess.deployment_id == deployment.id)
+            )
+        ).scalar_one()
+        assert refetched.status == "running", (
+            "cross-host stop must NOT flip row.status — row state belongs "
+            "to the supervisor that owns the process"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -15,7 +15,7 @@ from uuid import UUID  # noqa: TC003 — FastAPI resolves the type at runtime fo
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
@@ -396,9 +396,33 @@ async def live_start(  # noqa: PLR0912, PLR0915 — multi-branch dispatch by des
             config_hash=identity.config_hash,
             instruments_signature=identity.instruments_signature,
         )
+        # PR#1 Codex P1 regression: preserve the existing status when
+        # the row is already in an active state. Before this fix, the
+        # set_ clause unconditionally stomped ``status`` to
+        # ``"starting"``, so a retry against a RUNNING deployment
+        # would flip the deployment row from ``running`` back to
+        # ``starting`` even though the downstream active_process
+        # check returns already_active. That made
+        # ``/api/v1/live/status`` report the wrong state for a live
+        # deployment.
+        #
+        # The SQL CASE below keeps the existing status if it's in
+        # {starting, building, ready, running} (the active set) and
+        # otherwise resets it to ``starting`` for the cold-start /
+        # warm-restart paths. Atomic, no race.
+        _active_statuses = ("starting", "building", "ready", "running")
         upsert_stmt = stmt.on_conflict_do_update(
             index_elements=[deployment_table.c.identity_signature],
-            set_={"status": "starting", "last_started_at": now},
+            set_={
+                "status": case(
+                    (
+                        deployment_table.c.status.in_(_active_statuses),
+                        deployment_table.c.status,
+                    ),
+                    else_="starting",
+                ),
+                "last_started_at": now,
+            },
         ).returning(deployment_table.c.id, deployment_table.c.deployment_slug)
         upsert_row = (await db.execute(upsert_stmt)).one()
         deployment_id = upsert_row.id
