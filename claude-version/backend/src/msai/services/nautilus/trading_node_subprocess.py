@@ -949,14 +949,32 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
         )
 
         def _is_connected() -> bool:
-            # Data engine's ``check_connected`` iterates every
-            # registered client and returns False if ANY client
-            # is disconnected. That's the right "IB is reachable"
-            # probe — Nautilus 1.223.0 data/engine.pyx:296.
+            # Probe BOTH engines' connectivity (Codex iter2 P1).
+            # Nautilus opens SEPARATE IB clients for data
+            # (``InteractiveBrokersDataClient`` with
+            # ``ibg_data_client_id``) and exec
+            # (``InteractiveBrokersExecutionClient`` with
+            # ``ibg_exec_client_id``). If the exec client drops
+            # but the data client stays up, the deployment has
+            # market data but no working order channel — the
+            # disconnect handler MUST treat that as an outage.
+            #
+            # Each engine's ``check_connected()`` iterates its own
+            # registered clients and returns False if ANY client
+            # is disconnected (data/engine.pyx:296,
+            # execution/engine.pyx:similar). We AND them so either
+            # layer failing trips the grace-window countdown. This
+            # matches what ``startup_health.diagnose()`` already
+            # does for the startup readiness check.
             try:
-                return bool(node.kernel.data_engine.check_connected())
+                data_ok = bool(node.kernel.data_engine.check_connected())
             except Exception:  # noqa: BLE001
-                return False
+                data_ok = False
+            try:
+                exec_ok = bool(node.kernel.exec_engine.check_connected())
+            except Exception:  # noqa: BLE001
+                exec_ok = False
+            return data_ok and exec_ok
 
         handler = IBDisconnectHandler(
             redis=redis_client,

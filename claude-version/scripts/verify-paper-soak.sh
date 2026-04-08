@@ -104,10 +104,40 @@ if ((${#missing[@]} > 0)); then
   exit 1
 fi
 
-if [[ ! "${IB_ACCOUNT_ID}" =~ ^DU ]]; then
-  echo "ERROR: IB_ACCOUNT_ID='${IB_ACCOUNT_ID}' does not start with 'DU'." >&2
-  echo "       Paper soak REQUIRES a paper account. Live accounts start" >&2
-  echo "       with 'U' — use the release sign-off checklist for live." >&2
+# Trading-mode / account-id consistency — matches what
+# ``_validate_port_account_consistency`` in ``live_node_config.py``
+# enforces inside the subprocess. Paper mode (default) requires a
+# ``DU*`` account + port 4002; live mode requires a non-paper
+# account (not starting with ``DU``) + port 4001. This preflight
+# rejects the combinations that would crash the subprocess with
+# ``RECONCILIATION_FAILED`` seconds after startup.
+#
+# Codex iter2 P2: the checklist's prod-stack-validation step needs
+# to run this script with ``TRADING_MODE=live`` and a real live
+# account id (``U*``). Before this fix, the preflight hard-rejected
+# any non-DU account, making the documented live-mode validation
+# impossible.
+_trading_mode="${TRADING_MODE:-paper}"
+if [[ "${_trading_mode}" == "paper" ]]; then
+  if [[ ! "${IB_ACCOUNT_ID}" =~ ^DU ]]; then
+    echo "ERROR: TRADING_MODE=paper requires IB_ACCOUNT_ID starting with 'DU'." >&2
+    echo "       Got IB_ACCOUNT_ID='${IB_ACCOUNT_ID}'. Either use a paper" >&2
+    echo "       account or set TRADING_MODE=live IB_PORT=4001." >&2
+    exit 1
+  fi
+elif [[ "${_trading_mode}" == "live" ]]; then
+  if [[ "${IB_ACCOUNT_ID}" =~ ^DU ]]; then
+    echo "ERROR: TRADING_MODE=live requires a live IB_ACCOUNT_ID (not 'DU*')." >&2
+    echo "       Got IB_ACCOUNT_ID='${IB_ACCOUNT_ID}'. Either flip to paper" >&2
+    echo "       (unset TRADING_MODE + IB_PORT) or use a real live account." >&2
+    exit 1
+  fi
+  echo "[paper-soak] WARNING: running in LIVE trading mode — orders will" >&2
+  echo "[paper-soak]          hit real money. This should only be invoked" >&2
+  echo "[paper-soak]          from the release sign-off checklist's" >&2
+  echo "[paper-soak]          'Production compose stack validation' step." >&2
+else
+  echo "ERROR: TRADING_MODE='${_trading_mode}' — must be 'paper' or 'live'." >&2
   exit 1
 fi
 
@@ -117,7 +147,7 @@ export COMPOSE_PROFILES=live
 
 mkdir -p logs
 
-echo "[paper-soak] Pre-flight OK — IB_ACCOUNT_ID=${IB_ACCOUNT_ID}, profile=live" >&2
+echo "[paper-soak] Pre-flight OK — IB_ACCOUNT_ID=${IB_ACCOUNT_ID}, TRADING_MODE=${_trading_mode}, compose=${_COMPOSE_FILE}" >&2
 
 # ---------------------------------------------------------------------------
 # 2. Bring up the full stack and wait for health
@@ -139,7 +169,47 @@ if ! docker compose -f "${_COMPOSE_FILE}" up -d --wait --wait-timeout 360; then
   exit 2
 fi
 
-echo "[paper-soak] Stack healthy — ib-gateway API port 4002 accepting connections" >&2
+echo "[paper-soak] Stack healthy — all services reported healthy by compose" >&2
+
+# ---------------------------------------------------------------------------
+# 2b. Derive backend URL + container name from the running compose stack
+# ---------------------------------------------------------------------------
+# Codex iter2 P2: the script previously hardcoded dev compose defaults
+# (``localhost:8800`` + ``msai-claude-backend``). Prod compose uses
+# port 8000 and has no fixed container_name, so overriding
+# COMPOSE_FILE=docker-compose.prod.yml silently broke both the E2E
+# harness's HTTP calls and its ``docker kill`` crash-simulation step.
+#
+# Derive both values dynamically from ``docker compose port`` and
+# ``docker compose ps`` so the same script works against any compose
+# file — including operators' custom variants.
+_backend_port_info=$(
+  docker compose -f "${_COMPOSE_FILE}" port backend 8000 2>/dev/null || true
+)
+if [[ -z "${_backend_port_info}" ]]; then
+  echo "[paper-soak] ERROR: could not resolve backend host port via" >&2
+  echo "[paper-soak]        ``docker compose port backend 8000``. The" >&2
+  echo "[paper-soak]        backend service may not expose port 8000 in" >&2
+  echo "[paper-soak]        '${_COMPOSE_FILE}' — check the ports: section." >&2
+  exit 2
+fi
+# Output format is "host:port" (e.g. "0.0.0.0:8800" or "[::]:8000").
+# Extract the port portion from the last colon, accepting IPv6
+# addresses that have internal colons.
+_backend_host_port="${_backend_port_info##*:}"
+_BACKEND_URL="http://localhost:${_backend_host_port}"
+
+_BACKEND_CONTAINER=$(
+  docker compose -f "${_COMPOSE_FILE}" ps --format '{{.Name}}' backend 2>/dev/null | head -n1
+)
+if [[ -z "${_BACKEND_CONTAINER}" ]]; then
+  echo "[paper-soak] ERROR: could not resolve backend container name via" >&2
+  echo "[paper-soak]        ``docker compose ps``. Is the backend service" >&2
+  echo "[paper-soak]        actually running under '${_COMPOSE_FILE}'?" >&2
+  exit 2
+fi
+
+echo "[paper-soak] Resolved backend URL=${_BACKEND_URL} container=${_BACKEND_CONTAINER}" >&2
 
 # ---------------------------------------------------------------------------
 # 3. Seed the smoke strategy row
@@ -184,7 +254,13 @@ PY
 )
 
 if ! STRATEGY_ID=$(
-  docker compose -f "${_COMPOSE_FILE}" exec -T backend uv run python -c "${SEED_PY}" 2>&1
+  # Codex iter2 P2: use ``python`` directly, NOT ``uv run python``.
+  # The prod Dockerfile's runtime stage does not copy the uv binary,
+  # so ``uv run python`` fails in prod compose before the E2E harness
+  # starts. Plain ``python`` is always on PATH in both dev and prod
+  # images; the project's deps are already installed in the venv
+  # that ``python`` resolves to.
+  docker compose -f "${_COMPOSE_FILE}" exec -T backend python -c "${SEED_PY}" 2>&1
 ); then
   echo "[paper-soak] ERROR: smoke strategy seed failed: ${STRATEGY_ID}" >&2
   exit 3
@@ -199,11 +275,14 @@ echo "[paper-soak] Smoke strategy seeded: ${STRATEGY_ID}" >&2
 
 echo "[paper-soak] Running Phase 1 E2E harness against live IB Gateway..." >&2
 
-# Export the env vars the harness expects. All read from .env above.
+# Export the env vars the harness expects. Backend URL + container
+# name come from the dynamic ``docker compose port|ps`` probes above
+# (Codex iter2 P2 fix) so the same script works for dev AND prod
+# compose files. Operator overrides via ``MSAI_E2E_*`` still win.
 export MSAI_E2E_IB_ENABLED=1
 export MSAI_E2E_STRATEGY_ID="${STRATEGY_ID}"
-export MSAI_E2E_BACKEND_URL="${MSAI_E2E_BACKEND_URL:-http://localhost:8800}"
-export MSAI_E2E_BACKEND_CONTAINER="${MSAI_E2E_BACKEND_CONTAINER:-msai-claude-backend}"
+export MSAI_E2E_BACKEND_URL="${MSAI_E2E_BACKEND_URL:-${_BACKEND_URL}}"
+export MSAI_E2E_BACKEND_CONTAINER="${MSAI_E2E_BACKEND_CONTAINER:-${_BACKEND_CONTAINER}}"
 export MSAI_E2E_COMPOSE_FILE="${MSAI_E2E_COMPOSE_FILE:-${_COMPOSE_FILE}}"
 export MSAI_E2E_IB_ACCOUNT_ID="${IB_ACCOUNT_ID}"
 
