@@ -37,9 +37,34 @@ All notable changes to msai-v2 will be documented in this file.
 - **2026-04-06** — Plan: explicit `GET /api/v1/live/status/{deployment_id}` route task added (was missing in v1).
 - **2026-04-06** — Plan: Phase 1 task ordering corrected — 1.7/1.8/1.9/1.10/1.11 hot-edit the same files and must run sequentially, not in parallel as v1 claimed.
 
-### Removed
+- **2026-04-08 — Claude production hardening (PR marketsignal/msai-v2#1, merge `5ebdbc3`)**
+  - Complete live trading path wired end-to-end for Claude version: supervisor → `ProcessManager` → `_trading_node_subprocess` → Nautilus `TradingNode` → IB adapter → IB Gateway container
+  - `_build_real_node` constructs a real Nautilus 1.223.0 TradingNode following the blessed pattern from `live/node.py:230-281`: build config via `build_live_trading_node_config`, then `add_data_client_factory(IB, InteractiveBrokersLiveDataClientFactory)` + `add_exec_client_factory(IB, InteractiveBrokersLiveExecClientFactory)`
+  - `ProcessManager` accepts a `payload_factory` for per-deployment `TradingNodePayload` construction (backward-compat with static `spawn_args` path)
+  - Production payload factory in `live_supervisor/__main__.py` cross-validates `deployment.paper_trading` vs. `settings.ib_port` and rejects mismatches — real-money safety guard preventing live orders under a paper deployment row
+  - `IBDisconnectHandler` wired as sibling task of `node.run_async` with local `on_halt` fallback (sets `shutdown_requested` + `node.stop_async` so the subprocess tears down even if Redis halt-flag write fails during a correlated outage)
+  - Exec-engine + data-engine connectivity BOTH probed by `_is_connected()` so an exec-only IB outage trips the grace-window countdown
+  - Halt-flag re-check after `payload_factory` await closes a `/kill-all`-during-slow-DB-read race
+  - Permanent vs. transient payload_factory error classification: `ValueError` / `ImportError` / `ModuleNotFoundError` / `FileNotFoundError` / `AttributeError` → `SPAWN_FAILED_PERMANENT` + ACK; everything else → new `SPAWN_FAILED_TRANSIENT` + NO ACK (PEL retry)
+  - Cross-host PID-kill guard in `ProcessManager.stop()`: refuses to SIGTERM a `row.pid` when `row.host != socket.gethostname()`, returns False (no ACK) so XAUTOCLAIM redelivers to the correct supervisor (Phase 2 multi-host prep)
+  - `api/live.py` upsert uses SQL `CASE` to preserve existing `deployment.status` when it's already in the active set — fixes "retry against running deployment flipped status to starting" bug
+  - `/api/v1/live/start` classifies `SPAWN_FAILED_TRANSIENT` as a non-cacheable 503 via new `EndpointOutcome.spawn_failed_transient` factory
+- **2026-04-08 — IB Gateway docker-compose automation**
+  - New `ib-gateway` sidecar service in `docker-compose.dev.yml` + `.prod.yml` using `ghcr.io/gnzsnz/ib-gateway:stable` (MIT, 900+★ community image wrapping IBC for headless automated login)
+  - Compose profile `live` gates `ib-gateway` + `live-supervisor` so default `docker compose up` works for frontend-only devs without IB credentials
+  - Fail-fast `${TWS_USERID:?...}` guards — compose errors immediately if credentials missing
+  - Portable `bash /dev/tcp` healthcheck (no `nc` dependency), `start_period: 180s` for IBC login, dynamic `${IB_PORT:-4002}` for live-mode flip
+  - Persistent `ib_gateway_settings` volume so first-run dialogs only fire once
+  - Backend container receives `IB_HOST` / `IB_PORT` / `IB_ACCOUNT_ID` so `api/live.py` and `live_supervisor` read the same `settings.ib_account_id`
+  - Backend healthcheck via Python stdlib `urllib.request` probing `/health` so `docker compose up --wait` actually waits for uvicorn to bind
+- **2026-04-08 — `.env.example` + `scripts/verify-paper-soak.sh`**
+  - Committed `.env.example` template with `COMPOSE_PROFILES=live` pre-set
+  - Automated paper-soak smoke test: validates credentials via safe grep-based `.env` parser (NOT `source`, which would execute `$(...)` in passwords), `docker compose up -d --wait`, seeds smoke strategy INSIDE the backend container, derives backend URL + container name dynamically from `docker compose port|ps`, runs the Phase 1 E2E harness, captures logs on failure
+  - Script honors `COMPOSE_FILE` + `TRADING_MODE` env var overrides so the same one command runs dev OR prod compose validation
 
-(none yet — implementation has not started)
+- **2026-04-08** — `TradingNodePayload` gained `redis_url` field (subprocess uses it to build the `IBDisconnectHandler` aioredis client); `core/config.py::Settings` gained `ib_host` / `ib_port` / `startup_health_timeout_s`; `FailureKind` enum gained `SPAWN_FAILED_TRANSIENT`; `release-signoff-checklist.md` swapped the 5-step manual smoke item for `./scripts/verify-paper-soak.sh` plus a new "Production compose stack validation" step; `node.build()` in `run_subprocess_async` now runs directly on the loop thread (was `asyncio.to_thread`) because Nautilus's IB client factory binds `asyncio.Queue`/`Event`/`_create_task` to the calling thread's loop — cross-thread build bound to the wrong loop or raised `RuntimeError: no running event loop`. Supervisor's `startup_hard_timeout_s` watchdog remains the external kill switch for wedged builds.
+- **2026-04-08** — Seven Codex review iterations (6 local `codex exec` + 1 GitHub Codex bot PR review) addressed 0 P0 / 11 P1 / 12 P2 findings across PR#1. Every P1 had a corresponding fix commit and test. Full history in PR#1 commit range `f60ea56..f9eaabf`.
+- **2026-04-08** — `_placeholder_trading_subprocess` removed from `live_supervisor/__main__.py` — production subprocess is now wired directly via `spawn_target=_trading_node_subprocess`.
 
 ---
 
