@@ -48,6 +48,17 @@ services:
       ENVIRONMENT: production
       POLYGON_API_KEY: ${POLYGON_API_KEY:-}
       DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+      # Codex iter4 P1: ``api/live.py`` reads
+      # ``settings.ib_account_id`` when creating the deployment
+      # row; the live-supervisor's payload factory reads it again
+      # during spawn. Both must agree or the new paper/live safety
+      # guard rejects every live-mode deployment and silently uses
+      # the wrong account for paper. Same fail-fast ``:?``
+      # semantics as live-supervisor so compose fails instantly
+      # without credentials.
+      IB_HOST: ${IB_HOST:-ib-gateway}
+      IB_PORT: ${IB_PORT:-4002}
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:?Set IB_ACCOUNT_ID in .env}
     depends_on:
       postgres:
         condition: service_healthy

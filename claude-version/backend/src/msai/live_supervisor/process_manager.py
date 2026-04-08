@@ -256,6 +256,48 @@ class ProcessManager:
         else:
             spawn_args = self._spawn_args
 
+        # Codex iter4 P2: halt-flag re-check race.
+        #
+        # The first halt check happens in phase B above, immediately
+        # after reserving the DB slot. Between that check and
+        # ``process.start()`` we now await ``self._payload_factory(...)``
+        # which performs DB reads and potentially slow work (module
+        # imports, strategy path resolution). ``/api/v1/live/kill-all``
+        # firing DURING that await would set ``msai:risk:halt`` but
+        # the first check already passed, so we'd still reach
+        # ``process.start()`` and spawn a fresh subprocess under an
+        # active kill switch.
+        #
+        # Fix: re-check the halt flag right before ``process.start()``.
+        # The second check is cheap (a single Redis EXISTS) and
+        # closes the race. If the flag is now set, we mark the row
+        # ``HALT_ACTIVE`` (same as phase B's handling) and ACK the
+        # command — no subprocess spawned, no retry until ``/resume``.
+        #
+        # This preserves the ``layer-2`` guarantee documented in
+        # ``api/live.py``: every code path that could launch a
+        # trading subprocess has at LEAST two halt-flag checks
+        # bracketing its slow work.
+        halt_set_again = await self._redis.exists(_HALT_KEY)
+        if halt_set_again:
+            log.warning(
+                "spawn_blocked_by_halt_post_payload_factory",
+                extra={
+                    "deployment_id": str(deployment_id),
+                    "deployment_slug": deployment_slug,
+                    "note": (
+                        "halt flag raised during payload factory await — "
+                        "catching at second check, no subprocess spawned"
+                    ),
+                },
+            )
+            await self._mark_failed(
+                row_id=row_id,
+                reason="blocked by halt flag (post-payload-factory recheck)",
+                failure_kind=FailureKind.HALT_ACTIVE,
+            )
+            return True  # ACK — no retry until /resume
+
         try:
             process = self._spawn_ctx.Process(
                 target=self._spawn_target,

@@ -55,6 +55,17 @@ services:
       STRATEGIES_ROOT: /app/strategies
       ENVIRONMENT: development
       MSAI_API_KEY: ${MSAI_API_KEY:-msai-dev-key}
+      # Codex iter4 P1: ``api/live.py`` reads
+      # ``settings.ib_account_id`` when creating the deployment row
+      # and the live-supervisor's payload factory reads it again
+      # to verify the deployment matches the supervisor's
+      # configuration. Both containers MUST see the same value or
+      # the live-mode safety guard rejects every new deployment.
+      # Using the same defaults + fail-fast behavior as
+      # live-supervisor so the two stay in lockstep.
+      IB_HOST: ${IB_HOST:-ib-gateway}
+      IB_PORT: ${IB_PORT:-4002}
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:-DU0000000}
     depends_on:
       postgres:
         condition: service_healthy
