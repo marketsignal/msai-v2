@@ -53,6 +53,22 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      # See dev compose for rationale — Codex P2 iter1 fix: probe
+      # /health via python stdlib so --wait actually waits for
+      # uvicorn to bind, not just for the container to enter
+      # ``running`` state.
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status == 200 else 1)",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     restart: unless-stopped
     deploy:
       resources:
@@ -182,23 +198,43 @@ services:
       # accounts you must configure IBKR Mobile Authenticator and
       # set TWOFA_DEVICE — see gnzsnz docs for details.
       TWOFA_TIMEOUT_ACTION: ${TWOFA_TIMEOUT_ACTION:-exit}
+      # The healthcheck below reads ``IB_API_PORT`` at runtime from
+      # the container's env. When flipping to live trading the
+      # operator sets ``IB_PORT=4001`` + ``TRADING_MODE=live`` in
+      # .env and both the supervisor and this healthcheck probe the
+      # right port. Without this indirection the healthcheck would
+      # hard-pin 4002 and a live-mode stack would never become
+      # healthy, so ``live-supervisor`` (which depends on
+      # ``service_healthy``) would hang forever (Codex P1 iter1).
+      IB_API_PORT: ${IB_PORT:-4002}
     ports:
       # Host-side mapping for optional debugging (VNC / curl).
-      # Bound to localhost to prevent LAN exposure.
-      - "127.0.0.1:4002:4002"
+      # Bound to localhost to prevent LAN exposure. Use the same
+      # ${IB_PORT} as the supervisor + healthcheck so flipping
+      # paper→live moves every layer in lockstep.
+      - "127.0.0.1:${IB_PORT:-4002}:${IB_PORT:-4002}"
       - "127.0.0.1:5900:5900"
     volumes:
       - ib_gateway_settings:/home/ibgateway/Jts
     healthcheck:
       # Portable TCP probe via bash's /dev/tcp builtin. Works on
       # the gnzsnz Debian image without requiring nc. The probe
-      # opens a TCP connection to the API port and exits 0 on
-      # successful connect. IBC typically takes 60-120s to log
-      # in before the port is ready, so start_period is generous.
+      # opens a TCP connection to whichever API port matches
+      # TRADING_MODE (4002 paper, 4001 live) and exits 0 on
+      # successful connect.
+      #
+      # ``$$IB_API_PORT`` with the double-dollar escape tells
+      # Compose "don't interpolate this at YAML parse time" — the
+      # variable is expanded by bash INSIDE the container at
+      # healthcheck run time, reading the container's own
+      # IB_API_PORT env var (set above from IB_PORT).
+      #
+      # IBC typically takes 60-120s to log in before the port is
+      # ready, so start_period is generous.
       test:
         [
           "CMD-SHELL",
-          "bash -c 'exec 3<>/dev/tcp/localhost/4002' 2>/dev/null",
+          "bash -c 'exec 3<>/dev/tcp/localhost/$$IB_API_PORT' 2>/dev/null",
         ]
       interval: 15s
       timeout: 5s

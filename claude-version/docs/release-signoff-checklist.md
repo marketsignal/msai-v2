@@ -53,13 +53,27 @@
       recovery → POST `/api/v1/live/stop` → status=stopped
       with zero open positions 5. On any failure, captures ib-gateway, live-supervisor,
       and backend logs to `./logs/paper-soak-*.log`
-      **This IS the authoritative test that the whole
-      production path (supervisor → ProcessManager → payload
-      factory → `_trading_node_subprocess` → `_build_real_node`
-      → Nautilus TradingNode → IB adapter → IB Gateway → fill)
-      actually works. The operator runs ONE command — no
-      manual TWS clicks, no manual stack orchestration, no
-      manual order submission.**
+      **Scope caveat (Codex P2 iter1):** this step uses
+      `docker-compose.dev.yml` in PAPER mode only. It exercises
+      the full application path (supervisor → ProcessManager →
+      payload factory → `_trading_node_subprocess` →
+      `_build_real_node` → Nautilus TradingNode → IB adapter
+      → IB Gateway → fill) but it does NOT exercise
+      `docker-compose.prod.yml`-specific wiring. The prod
+      compose file's live-mode port selection, resource
+      limits, and (future) external secret mounts are
+      validated by the next item below.
+- [ ] **Production compose stack validation** — operator brings
+      up the prod stack on the deployment host in paper mode
+      (`COMPOSE_FILE=docker-compose.prod.yml TRADING_MODE=paper IB_PORT=4002 ./scripts/verify-paper-soak.sh`)
+      AND in live mode
+      (`COMPOSE_FILE=docker-compose.prod.yml TRADING_MODE=live IB_PORT=4001 ...`).
+      Confirms that the prod healthcheck probes the right port
+      for the selected mode and that both paper and live
+      wiring actually boot on the production image. The
+      verify script's `COMPOSE_FILE` env var override is
+      reserved for this step (dev runs use the default
+      `docker-compose.dev.yml`).
 
 ## B. Code review
 

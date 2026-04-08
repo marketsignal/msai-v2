@@ -60,6 +60,25 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      # Probe the unauthenticated /health endpoint so `docker compose
+      # up --wait` actually waits for uvicorn to be accepting
+      # requests. Without this, --wait only checks container state
+      # (running) and verify-paper-soak.sh's first POST to
+      # /api/v1/live/start can race uvicorn's bind (Codex P2 iter1).
+      # Uses python stdlib (always available in the image) to avoid
+      # pulling curl/wget into Dockerfile.dev.
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status == 200 else 1)",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
 
   backtest-worker:
     build:

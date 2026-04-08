@@ -47,6 +47,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Which compose file to drive. Defaults to dev; the release
+# sign-off checklist's "Production compose stack validation" step
+# sets ``COMPOSE_FILE=docker-compose.prod.yml`` to exercise the
+# prod wiring. Bound to a local var once so the rest of the script
+# can reference it without re-expanding the default everywhere.
+readonly _COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.dev.yml}"
+
 # ---------------------------------------------------------------------------
 # 1. Pre-flight: verify .env has the required credentials
 # ---------------------------------------------------------------------------
@@ -58,17 +65,37 @@ if [[ ! -f .env ]]; then
   exit 1
 fi
 
-# Load .env so we can validate the required vars without polluting the
-# caller's shell. Use `set -a` so exports happen automatically.
-set -a
-# shellcheck source=/dev/null
-source .env
-set +a
+# Codex P1 iter1 fix: DO NOT ``source .env``. A Compose .env file
+# is a KEY=VALUE format that Compose parses verbatim — it is NOT a
+# shell script. Passwords with ``$`` characters, ``#`` mid-value,
+# or any ``$(...)`` substring get mangled or executed when sourced
+# by bash. Compose itself reads .env natively for variable
+# interpolation; this script only needs to READ specific values
+# for validation, which we do with a literal grep.
+_get_env_value() {
+  # Returns the RHS of the first line matching ``^<key>=``,
+  # stripping surrounding double or single quotes. Lines starting
+  # with ``#`` are comments and skipped by the anchor. Empty match
+  # prints empty string — caller decides if that's OK.
+  local key=$1
+  local raw
+  raw=$(grep -E "^${key}=" .env | head -n1 | cut -d'=' -f2-) || true
+  # Strip one pair of outer quotes if present
+  raw=${raw#\"}
+  raw=${raw%\"}
+  raw=${raw#\'}
+  raw=${raw%\'}
+  printf '%s' "${raw}"
+}
+
+TWS_USERID=$(_get_env_value TWS_USERID)
+TWS_PASSWORD=$(_get_env_value TWS_PASSWORD)
+IB_ACCOUNT_ID=$(_get_env_value IB_ACCOUNT_ID)
 
 missing=()
-[[ -z "${TWS_USERID:-}" || "${TWS_USERID}" == "your_ib_username" ]] && missing+=("TWS_USERID")
-[[ -z "${TWS_PASSWORD:-}" || "${TWS_PASSWORD}" == "your_ib_password" ]] && missing+=("TWS_PASSWORD")
-[[ -z "${IB_ACCOUNT_ID:-}" || "${IB_ACCOUNT_ID}" == "DU0000000" ]] && missing+=("IB_ACCOUNT_ID")
+[[ -z "${TWS_USERID}" || "${TWS_USERID}" == "your_ib_username" ]] && missing+=("TWS_USERID")
+[[ -z "${TWS_PASSWORD}" || "${TWS_PASSWORD}" == "your_ib_password" ]] && missing+=("TWS_PASSWORD")
+[[ -z "${IB_ACCOUNT_ID}" || "${IB_ACCOUNT_ID}" == "DU0000000" ]] && missing+=("IB_ACCOUNT_ID")
 
 if ((${#missing[@]} > 0)); then
   echo "ERROR: .env is missing real values for: ${missing[*]}" >&2
@@ -102,12 +129,12 @@ echo "[paper-soak] docker compose up -d --wait (this takes 2-4 minutes)" >&2
 # because IBC login is slow on first boot. start_period on the
 # gateway healthcheck suppresses "unhealthy" during the window,
 # so --wait doesn't trip prematurely.
-if ! docker compose -f docker-compose.dev.yml up -d --wait --wait-timeout 360; then
+if ! docker compose -f "${_COMPOSE_FILE}" up -d --wait --wait-timeout 360; then
   echo "[paper-soak] ERROR: docker compose up --wait failed" >&2
   echo "[paper-soak] Capturing ib-gateway + live-supervisor logs..." >&2
-  docker compose -f docker-compose.dev.yml logs ib-gateway > logs/paper-soak-ibgateway.log 2>&1 || true
-  docker compose -f docker-compose.dev.yml logs live-supervisor > logs/paper-soak-supervisor.log 2>&1 || true
-  docker compose -f docker-compose.dev.yml logs backend > logs/paper-soak-backend.log 2>&1 || true
+  docker compose -f "${_COMPOSE_FILE}" logs ib-gateway > logs/paper-soak-ibgateway.log 2>&1 || true
+  docker compose -f "${_COMPOSE_FILE}" logs live-supervisor > logs/paper-soak-supervisor.log 2>&1 || true
+  docker compose -f "${_COMPOSE_FILE}" logs backend > logs/paper-soak-backend.log 2>&1 || true
   echo "[paper-soak] Logs saved to ./logs/paper-soak-*.log" >&2
   exit 2
 fi
@@ -117,13 +144,15 @@ echo "[paper-soak] Stack healthy — ib-gateway API port 4002 accepting connecti
 # ---------------------------------------------------------------------------
 # 3. Seed the smoke strategy row
 # ---------------------------------------------------------------------------
-# We reuse the existing e2e_phase1.sh Python-snippet seeder via a
-# dedicated uv run inside the backend directory, so the seed path
-# matches what CI / the Phase 1 harness expects.
+# Codex P1 iter1 fix: run the seed INSIDE the backend container via
+# ``docker compose exec`` so it uses the container's DATABASE_URL
+# (``postgres:5432`` via Docker DNS). Running host-side used
+# ``settings.database_url`` which defaults to ``localhost:5432`` and
+# missed the published Postgres port (5433 in dev compose), breaking
+# the seed on any fresh operator setup.
 
 echo "[paper-soak] Seeding smoke strategy..." >&2
-if ! STRATEGY_ID=$(
-  cd backend && uv run python -c "
+SEED_PY=$(cat <<'PY'
 import asyncio, uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -151,7 +180,11 @@ async def main() -> None:
     await engine.dispose()
 
 asyncio.run(main())
-" 2>&1
+PY
+)
+
+if ! STRATEGY_ID=$(
+  docker compose -f "${_COMPOSE_FILE}" exec -T backend uv run python -c "${SEED_PY}" 2>&1
 ); then
   echo "[paper-soak] ERROR: smoke strategy seed failed: ${STRATEGY_ID}" >&2
   exit 3
@@ -171,15 +204,15 @@ export MSAI_E2E_IB_ENABLED=1
 export MSAI_E2E_STRATEGY_ID="${STRATEGY_ID}"
 export MSAI_E2E_BACKEND_URL="${MSAI_E2E_BACKEND_URL:-http://localhost:8800}"
 export MSAI_E2E_BACKEND_CONTAINER="${MSAI_E2E_BACKEND_CONTAINER:-msai-claude-backend}"
-export MSAI_E2E_COMPOSE_FILE="${MSAI_E2E_COMPOSE_FILE:-docker-compose.dev.yml}"
+export MSAI_E2E_COMPOSE_FILE="${MSAI_E2E_COMPOSE_FILE:-${_COMPOSE_FILE}}"
 export MSAI_E2E_IB_ACCOUNT_ID="${IB_ACCOUNT_ID}"
 
 if ! (cd backend && uv run pytest tests/e2e/test_live_trading_phase1.py -vv); then
   echo "[paper-soak] ERROR: Phase 1 E2E harness failed" >&2
   echo "[paper-soak] Capturing logs..." >&2
-  docker compose -f docker-compose.dev.yml logs ib-gateway > logs/paper-soak-ibgateway.log 2>&1 || true
-  docker compose -f docker-compose.dev.yml logs live-supervisor > logs/paper-soak-supervisor.log 2>&1 || true
-  docker compose -f docker-compose.dev.yml logs backend > logs/paper-soak-backend.log 2>&1 || true
+  docker compose -f "${_COMPOSE_FILE}" logs ib-gateway > logs/paper-soak-ibgateway.log 2>&1 || true
+  docker compose -f "${_COMPOSE_FILE}" logs live-supervisor > logs/paper-soak-supervisor.log 2>&1 || true
+  docker compose -f "${_COMPOSE_FILE}" logs backend > logs/paper-soak-backend.log 2>&1 || true
   echo "[paper-soak] Logs saved to ./logs/paper-soak-*.log" >&2
   exit 4
 fi
@@ -188,8 +221,8 @@ echo "" >&2
 echo "[paper-soak] ✓ ALL CHECKS PASSED" >&2
 echo "" >&2
 echo "Stack is still running. Inspect via:" >&2
-echo "  docker compose -f docker-compose.dev.yml ps" >&2
-echo "  docker compose -f docker-compose.dev.yml logs -f ib-gateway" >&2
+echo "  docker compose -f "${_COMPOSE_FILE}" ps" >&2
+echo "  docker compose -f "${_COMPOSE_FILE}" logs -f ib-gateway" >&2
 echo "  curl http://localhost:8800/api/v1/live/status" >&2
 echo "" >&2
-echo "To tear down: docker compose -f docker-compose.dev.yml down" >&2
+echo "To tear down: docker compose -f "${_COMPOSE_FILE}" down" >&2
