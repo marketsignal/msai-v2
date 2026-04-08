@@ -512,6 +512,21 @@ async def live_start(  # noqa: PLR0912, PLR0915 — multi-branch dispatch by des
                 await idem.release(reservation.redis_key)
             return _apply_outcome(outcome)
 
+        # Codex iter6 P2: SPAWN_FAILED_TRANSIENT means the
+        # supervisor's payload factory raised a transient error
+        # (Postgres briefly down, network timeout). The command is
+        # still in the Redis PEL for XAUTOCLAIM redelivery, so the
+        # endpoint must NOT cache a permanent-looking response. A
+        # subsequent retry with the same Idempotency-Key should be
+        # allowed to re-attempt once the dependency recovers.
+        if kind is FailureKind.SPAWN_FAILED_TRANSIENT:
+            outcome = EndpointOutcome.spawn_failed_transient(
+                row.error_message or "transient supervisor failure"
+            )
+            if reservation is not None:
+                await idem.release(reservation.redis_key)
+            return _apply_outcome(outcome)
+
         # Map unexpected kinds (NONE on a failed row, or endpoint-only
         # values the subprocess wouldn't write) to UNKNOWN so the
         # endpoint doesn't crash.

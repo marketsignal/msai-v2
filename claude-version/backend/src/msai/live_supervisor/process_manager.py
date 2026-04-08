@@ -309,11 +309,38 @@ class ProcessManager:
                 # re-reserve it. We flip to ``failed`` with a
                 # transient failure_kind that the retry path
                 # ignores when deciding whether to spawn.
-                await self._mark_failed(
-                    row_id=row_id,
-                    reason=f"payload factory failed (transient): {exc}",
-                    failure_kind=FailureKind.SPAWN_FAILED_TRANSIENT,
-                )
+                #
+                # Codex iter6 P1: the most likely transient failure
+                # is a Postgres outage — the same outage that's
+                # blocking ``self._mark_failed``. Wrap in a
+                # try/except so a second DB failure doesn't escape
+                # as an unhandled exception. If _mark_failed ALSO
+                # fails, the row stays in ``starting``. The
+                # supervisor's ``startup_hard_timeout_s`` watchdog
+                # (default 1800s) is the backstop — it kills stale
+                # starting rows via a separate DB query path that
+                # may succeed even if _mark_failed is flaky. Log
+                # critical so operators notice.
+                try:
+                    await self._mark_failed(
+                        row_id=row_id,
+                        reason=f"payload factory failed (transient): {exc}",
+                        failure_kind=FailureKind.SPAWN_FAILED_TRANSIENT,
+                    )
+                except Exception:  # noqa: BLE001
+                    log.critical(
+                        "spawn_transient_cleanup_mark_failed_also_failed",
+                        extra={
+                            "deployment_id": str(deployment_id),
+                            "deployment_slug": deployment_slug,
+                            "row_id": str(row_id),
+                            "note": (
+                                "row may be stuck in 'starting' until the "
+                                "spawn watchdog clears it via its separate "
+                                "DB path — command stays in PEL for retry"
+                            ),
+                        },
+                    )
                 return False  # NO ACK — retry via PEL
         else:
             spawn_args = self._spawn_args

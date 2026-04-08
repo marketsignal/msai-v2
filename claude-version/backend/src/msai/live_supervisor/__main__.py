@@ -195,13 +195,50 @@ def _build_production_payload_factory(
                     f"Live deployments require non-paper account IDs."
                 )
 
+            # Codex iter6 P1: derive ``instrument_id`` + ``bar_type``
+            # into the strategy config if the caller didn't set them.
+            #
+            # Every bundled live strategy
+            # (``SmokeMarketOrderConfig``, ``EMACrossConfig``, ...)
+            # requires a Nautilus ``InstrumentId`` and ``BarType``
+            # string in its config. The ``/api/v1/live/start`` path
+            # accepts a bare ``instruments: ["AAPL"]`` list and
+            # stores it on ``deployment.instruments``, but the
+            # strategy config itself carries the canonical
+            # instrument_id + bar_type that the strategy subscribes
+            # to. Before this fix, a ``config: {}`` request reached
+            # the Nautilus strategy-config parser with no
+            # instrument_id and crashed the subprocess during
+            # ``node.build()``.
+            #
+            # The derivation is lossy (we pick the first instrument
+            # + assume 1-minute bars), but it's the minimal set of
+            # defaults needed so that the smoke test + the frontend
+            # "new deployment" flow both work without demanding the
+            # caller hand-craft Nautilus-internal identifiers. If
+            # the caller explicitly set ``instrument_id`` /
+            # ``bar_type`` in the request config, we do NOT
+            # override.
+            merged_strategy_config = dict(deployment.config or {})
+            if deployment.instruments:
+                first_instrument = deployment.instruments[0]
+                merged_strategy_config.setdefault("instrument_id", first_instrument)
+                # Default bar type matches what the backtest path
+                # uses for equities intraday bars. Format is
+                # documented in Nautilus 1.223.0 model/data.pyx:
+                # ``<instrument_id>-<step>-<agg>-<price>-<source>``.
+                merged_strategy_config.setdefault(
+                    "bar_type",
+                    f"{first_instrument}-1-MINUTE-LAST-EXTERNAL",
+                )
+
             nautilus_payload = TradingNodePayload(
                 row_id=row_id,
                 deployment_id=deployment_id,
                 deployment_slug=deployment_slug,
                 strategy_path=paths.strategy_path,
                 strategy_config_path=paths.config_path,
-                strategy_config=dict(deployment.config or {}),
+                strategy_config=merged_strategy_config,
                 paper_symbols=paper_symbols,
                 ib_host=settings.ib_host,
                 ib_port=settings.ib_port,

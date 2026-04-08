@@ -160,6 +160,27 @@ class EndpointOutcome:
         )
 
     @classmethod
+    def spawn_failed_transient(cls, error_message: str) -> EndpointOutcome:
+        """The supervisor's payload factory raised a transient error
+        (Postgres briefly down, network timeout during module import,
+        etc.). HTTP 503, **not cacheable** — Codex iter6 P2 regression.
+        The command stays in the Redis command bus PEL for XAUTOCLAIM
+        redelivery once the dependency recovers, so retrying with the
+        same Idempotency-Key should be allowed to re-attempt. Caching
+        this response would turn a recoverable blip into a terminal
+        failure that clients see forever until the key expires.
+        """
+        return cls(
+            status_code=503,
+            response={
+                "detail": f"Transient supervisor error, please retry: {error_message}",
+                "failure_kind": FailureKind.SPAWN_FAILED_TRANSIENT.value,
+            },
+            cacheable=False,
+            failure_kind=FailureKind.SPAWN_FAILED_TRANSIENT,
+        )
+
+    @classmethod
     def body_mismatch(cls) -> EndpointOutcome:
         """Same ``Idempotency-Key`` reused with a different request
         body. HTTP 422, **not cacheable** (Codex v7 P0 — a
