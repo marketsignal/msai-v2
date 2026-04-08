@@ -164,3 +164,30 @@ export interface BacktestResultsResponse {
   metrics: BacktestMetrics | null;
   trade_count: number;
 }
+
+// =====================================================================
+// Live trading types — mirror of backend schemas/live.py
+// =====================================================================
+
+export interface LiveDeploymentInfo {
+  id: string;
+  strategy_id: string;
+  status: string;
+  paper_trading: boolean;
+  instruments: string[] | null;
+  started_at: string | null;
+  stopped_at: string | null;
+}
+
+export interface LiveStatusResponse {
+  deployments: LiveDeploymentInfo[];
+  risk_halted: boolean;
+  active_count: number;
+}
+
+/** Fetch the current list of live deployments + global state. */
+export async function getLiveStatus(
+  token?: string | null,
+): Promise<LiveStatusResponse> {
+  return apiGet<LiveStatusResponse>("/api/v1/live/status", token);
+}

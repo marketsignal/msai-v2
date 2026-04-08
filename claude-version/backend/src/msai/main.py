@@ -11,13 +11,17 @@ Creates and configures the FastAPI application with:
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING
+from uuid import UUID  # noqa: TC003 — FastAPI resolves the type at runtime for path params
 
-from fastapi import FastAPI, Request, WebSocket
+from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
 
 from msai.api.account import router as account_router
 from msai.api.auth import router as auth_router
@@ -51,16 +55,16 @@ async def _ensure_api_key_user() -> bool:
 
         async with async_session_factory() as session:
             api_user_id = _API_KEY_CLAIMS["sub"]
-            result = await session.execute(
-                select(User).where(User.entra_id == api_user_id)
-            )
+            result = await session.execute(select(User).where(User.entra_id == api_user_id))
             if result.scalar_one_or_none() is None:
-                session.add(User(
-                    entra_id=api_user_id,
-                    email=_API_KEY_CLAIMS["preferred_username"],
-                    display_name=_API_KEY_CLAIMS.get("name", "API Key User"),
-                    role="admin",
-                ))
+                session.add(
+                    User(
+                        entra_id=api_user_id,
+                        email=_API_KEY_CLAIMS["preferred_username"],
+                        display_name=_API_KEY_CLAIMS.get("name", "API Key User"),
+                        role="admin",
+                    )
+                )
                 await session.commit()
             _api_key_user_ready = True
             return True
@@ -109,10 +113,33 @@ app.include_router(account_router)
 # ---------------------------------------------------------------------------
 # WebSocket endpoint
 # ---------------------------------------------------------------------------
-@app.websocket("/api/v1/live/stream")
-async def ws_live_stream(websocket: WebSocket) -> None:
-    """WebSocket endpoint for real-time live trading updates."""
-    await live_stream(websocket)
+@app.websocket("/api/v1/live/stream/{deployment_id}")
+async def ws_live_stream(websocket: WebSocket, deployment_id: UUID) -> None:
+    """WebSocket endpoint for real-time live trading updates
+    for one deployment. The handler subscribes to the
+    per-deployment Redis pub/sub channel and forwards every
+    event to the connected client. See ``api/websocket.py``
+    for the full protocol."""
+    await live_stream(websocket, deployment_id)
+
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics endpoint (Phase 4 task 4.6)
+# ---------------------------------------------------------------------------
+@app.get("/metrics")
+async def metrics() -> Response:
+    """Prometheus scrape endpoint. Exposes every counter and
+    gauge registered in :func:`get_registry`. The endpoint is
+    intentionally unauthenticated — operators expose it on a
+    private network or behind a reverse proxy, matching the
+    standard Prometheus deployment model."""
+    from msai.services.observability import get_registry
+
+    body = get_registry().render()
+    return Response(
+        content=body,
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
 
 
 # ---------------------------------------------------------------------------

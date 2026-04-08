@@ -37,6 +37,12 @@ class Settings(BaseSettings):
     polygon_api_key: str = ""
     databento_api_key: str = ""
 
+    # Interactive Brokers account id for live deployments. Part of the
+    # stable identity tuple (decision #7) — switching accounts produces
+    # a new ``identity_signature`` and therefore a cold-start deployment
+    # with isolated state. Paper accounts start with ``DU``, live with ``U``.
+    ib_account_id: str = "DU0000000"
+
     # Backtest execution tuning
     backtest_timeout_seconds: int = 30 * 60
 

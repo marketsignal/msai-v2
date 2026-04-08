@@ -28,6 +28,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pandas as pd
+import pyarrow.parquet as pq
 from nautilus_trader.model.data import BarType
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 from nautilus_trader.persistence.wranglers import BarDataWrangler
@@ -47,6 +48,14 @@ _BAR_SPEC = "1-MINUTE-LAST-EXTERNAL"
 
 # Columns the BarDataWrangler expects on the input DataFrame.
 _OHLCV_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close", "volume")
+
+# Batch size for streaming pyarrow reads (Phase 2 task 2.7). 100 000
+# rows is a compromise between wrangler-call overhead (fewer batches
+# is faster) and peak RSS (smaller batches keep memory flat). For a
+# 1 M-row input this caps the in-memory working set at ~6 MB per
+# column × 5 OHLCV cols ≈ 30 MB per batch plus the catalog's own
+# pyarrow buffers — well under the 200 MB target the plan calls for.
+_BATCH_SIZE = 100_000
 
 
 def build_catalog_for_symbol(
@@ -118,31 +127,49 @@ def build_catalog_for_symbol(
             "Run the data ingestion pipeline for this symbol before backtesting."
         )
 
-    # Concatenate all raw partitions and coerce the timestamp column to a
-    # proper UTC-aware DatetimeIndex -- BarDataWrangler is picky about this.
-    frames = [pd.read_parquet(path) for path in raw_files]
-    raw_df = pd.concat(frames, ignore_index=True)
-
-    indexed_df = (
-        raw_df.assign(timestamp=pd.to_datetime(raw_df["timestamp"], utc=True))
-        .set_index("timestamp")[list(_OHLCV_COLUMNS)]
-        .sort_index()
-    )
-
+    # Phase 2 task 2.7: streaming read via ``pyarrow.parquet.iter_batches``
+    # instead of slurping every partition into memory as a pandas
+    # DataFrame. The old ``pd.concat([pd.read_parquet(p) for p in
+    # raw_files])`` pattern OOMed on TB-scale catalogs (Codex
+    # architecture review finding #6). Each batch is converted to
+    # pandas individually, wrangled, and appended to the catalog
+    # before the next batch is read — peak RSS is bounded by
+    # ``_BATCH_SIZE × row_width × column_count`` plus pyarrow's own
+    # buffers.
     bar_type = BarType.from_str(f"{instrument_id_str}-{_BAR_SPEC}")
     wrangler = BarDataWrangler(bar_type=bar_type, instrument=instrument)
-    bars = wrangler.process(indexed_df)
 
-    # Order matters: the instrument must be written before its bars so the
-    # catalog indexes resolve correctly when BacktestNode starts up.
+    # Order matters: the instrument must be written BEFORE any bars
+    # so the catalog indexes resolve correctly when BacktestNode
+    # starts up.
     catalog.write_data([instrument])
-    catalog.write_data(bars)
+
+    total_bars = 0
+    columns_to_read = ["timestamp", *_OHLCV_COLUMNS]
+    for raw_file in raw_files:
+        parquet_file = pq.ParquetFile(raw_file)
+        for record_batch in parquet_file.iter_batches(
+            batch_size=_BATCH_SIZE,
+            columns=columns_to_read,
+        ):
+            batch_df = record_batch.to_pandas()
+            if batch_df.empty:
+                continue
+            indexed_df = (
+                batch_df.assign(timestamp=pd.to_datetime(batch_df["timestamp"], utc=True))
+                .set_index("timestamp")[list(_OHLCV_COLUMNS)]
+                .sort_index()
+            )
+            bars = wrangler.process(indexed_df)
+            catalog.write_data(bars)
+            total_bars += len(bars)
 
     log.info(
         "nautilus_catalog_built",
         instrument_id=instrument_id_str,
-        bar_count=len(bars),
+        bar_count=total_bars,
         partitions=len(raw_files),
+        batch_size=_BATCH_SIZE,
         catalog_root=str(catalog_root),
     )
     return instrument_id_str

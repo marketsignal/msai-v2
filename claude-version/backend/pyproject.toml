@@ -19,7 +19,12 @@ dependencies = [
     "httpx>=0.28.0",
     "arq>=0.26.0",
     "redis>=5.2.0",
-    "nautilus_trader>=1.222.0",
+    # Phase 1 task 1.4 needs the Interactive Brokers extras (ibapi /
+    # nautilus-ibapi) so we can build a real
+    # InteractiveBrokersInstrumentProviderConfig instead of the v0
+    # TestInstrumentProvider stub. Pinned via the [ib] extra so a
+    # fresh `uv sync` always pulls the matching ibapi version.
+    "nautilus_trader[ib]>=1.222.0",
     "quantstats>=0.0.81",
     "ib_async>=1.0.0",
     "databento>=0.43.0",

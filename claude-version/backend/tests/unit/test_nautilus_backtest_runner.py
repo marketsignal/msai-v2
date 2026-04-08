@@ -11,15 +11,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from msai.services.nautilus.backtest_runner import (
     _RunPayload,
     _build_backtest_run_config,
+    _extract_venues_from_instrument_ids,
     _zero_metrics,
 )
 
-_STRATEGY_FILE = (
-    Path(__file__).resolve().parents[3] / "strategies" / "example" / "ema_cross.py"
-)
+_STRATEGY_FILE = Path(__file__).resolve().parents[3] / "strategies" / "example" / "ema_cross.py"
 
 
 class TestBuildBacktestRunConfig:
@@ -80,6 +81,65 @@ class TestBuildBacktestRunConfig:
         venue = run_config.venues[0]
         assert venue.name == "SIM"
         assert venue.starting_balances[0].endswith("USD")
+
+
+class TestExtractVenuesFromInstrumentIds:
+    """Phase 2 task 2.9: derive per-backtest venue list from the
+    canonical instrument IDs in the payload so the runner builds
+    one ``BacktestVenueConfig`` per unique venue."""
+
+    def test_single_venue_equity(self) -> None:
+        assert _extract_venues_from_instrument_ids(["AAPL.NASDAQ"]) == ["NASDAQ"]
+
+    def test_duplicates_collapse(self) -> None:
+        assert _extract_venues_from_instrument_ids(["AAPL.NASDAQ", "MSFT.NASDAQ"]) == ["NASDAQ"]
+
+    def test_multi_venue_preserves_first_seen_order(self) -> None:
+        """A mixed backtest (equity + futures) produces both venues
+        in first-seen order — deterministic so tests can assert on
+        the resulting config list."""
+        result = _extract_venues_from_instrument_ids(["AAPL.NASDAQ", "ESM5.XCME", "MSFT.NASDAQ"])
+        assert result == ["NASDAQ", "XCME"]
+
+    def test_option_venue_is_last_dot_component(self) -> None:
+        """Option ids have internal spaces + multiple dots
+        (``"C AAPL 20260515 150.SMART"``). The venue is everything
+        after the FINAL ``.``."""
+        assert _extract_venues_from_instrument_ids(["C AAPL 20260515 150.SMART"]) == ["SMART"]
+
+    def test_empty_list_raises(self) -> None:
+        with pytest.raises(ValueError, match="at least one"):
+            _extract_venues_from_instrument_ids([])
+
+    def test_missing_venue_suffix_raises(self) -> None:
+        """A bare ticker without the ``.VENUE`` suffix is a migration
+        bug — we reject at config-build time rather than letting
+        Nautilus crash mid-backtest."""
+        with pytest.raises(ValueError, match="venue suffix"):
+            _extract_venues_from_instrument_ids(["AAPL"])
+
+
+class TestMultiVenueBuildConfig:
+    def test_multi_venue_produces_one_config_per_venue(self) -> None:
+        """A backtest spanning ``["AAPL.NASDAQ", "ESM5.XCME"]`` gets
+        TWO ``BacktestVenueConfig`` entries — one per unique
+        venue — so Nautilus's engine can route orders to the
+        correct simulated venue."""
+        payload = _RunPayload(
+            strategy_file=str(_STRATEGY_FILE),
+            strategy_config={
+                "instrument_id": "AAPL.NASDAQ",
+                "bar_type": "AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL",
+            },
+            instrument_ids=["AAPL.NASDAQ", "ESM5.XCME"],
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+            catalog_path="./data/nautilus",
+        )
+        run_config = _build_backtest_run_config(payload)
+
+        venue_names = sorted(v.name for v in run_config.venues)
+        assert venue_names == ["NASDAQ", "XCME"]
 
 
 class TestZeroMetrics:

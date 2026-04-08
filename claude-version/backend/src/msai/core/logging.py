@@ -8,14 +8,22 @@ automatic request_id injection via contextvars.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import structlog
 from starlette.requests import Request
-from structlog.contextvars import bind_contextvars, clear_contextvars
+from structlog.contextvars import (
+    bind_contextvars,
+    clear_contextvars,
+    get_contextvars,
+    unbind_contextvars,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from starlette.responses import Response
     from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -86,6 +94,50 @@ def get_logger(name: str) -> structlog.BoundLogger:
     """
     logger: structlog.BoundLogger = structlog.get_logger(logger_name=name)
     return logger
+
+
+@contextmanager
+def bind_deployment(deployment_id: UUID | str) -> Iterator[None]:
+    """Bind ``deployment_id`` to structlog contextvars for the duration of a block.
+
+    Every log call emitted inside the ``with`` block — including from
+    helper functions and async tasks scheduled within the block — will
+    automatically carry the ``deployment_id`` field. On exit (normal or
+    exceptional), the prior contextvars value is restored so concurrent
+    deployments don't leak ids into each other's log streams.
+
+    Nested usage is supported: an inner ``bind_deployment`` overrides
+    the outer id while it's in scope, and the outer id is restored when
+    the inner block exits.
+
+    Args:
+        deployment_id: Either a ``UUID`` (canonical DB form, hex-stringified
+            into the log record) or a string (slug-form id used by the
+            live trading subprocesses).
+
+    Example::
+
+        from msai.core.logging import bind_deployment, get_logger
+
+        log = get_logger(__name__)
+
+        with bind_deployment(deployment.id):
+            log.info("starting_node")  # → {... "deployment_id": "abc..."}
+            await trading_node.start_async()
+    """
+    serialized: str = deployment_id.hex if isinstance(deployment_id, UUID) else deployment_id
+    # Capture the prior value (if any) so we can restore it on exit.
+    prior: dict[str, Any] = get_contextvars()
+    prior_value: Any = prior.get("deployment_id")
+
+    bind_contextvars(deployment_id=serialized)
+    try:
+        yield
+    finally:
+        if prior_value is None:
+            unbind_contextvars("deployment_id")
+        else:
+            bind_contextvars(deployment_id=prior_value)
 
 
 class LoggingMiddleware:

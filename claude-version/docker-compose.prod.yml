@@ -84,6 +84,38 @@ services:
           cpus: "2.0"
           memory: 4G
 
+  # Phase 1 task 1.7: live supervisor. Owns every trading subprocess the
+  # system spawns. Consumes commands from msai:live:commands via
+  # LiveCommandBus (XAUTOCLAIM PEL recovery + DLQ), runs ProcessManager
+  # spawn/reap + HeartbeatMonitor stale sweep. Isolated from arq because
+  # on_startup blocks the poll loop (Codex v2 P0).
+  live-supervisor:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "-m", "msai.live_supervisor"]
+    volumes:
+      - app_data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:${POSTGRES_PASSWORD}@postgres:5432/msai
+      REDIS_URL: redis://redis:6379
+      DATA_ROOT: /app/data
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:?Set IB_ACCOUNT_ID in .env}
+      ENVIRONMENT: production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ib-gateway:
+        condition: service_started
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
   frontend:
     build:
       context: ./frontend
