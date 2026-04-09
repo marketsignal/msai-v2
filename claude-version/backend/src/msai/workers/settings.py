@@ -104,3 +104,15 @@ class WorkerSettings:
     max_jobs: int = 2
     job_timeout: int = max(settings.backtest_timeout_seconds, 60 * 60)
     max_tries: int = 2  # 1 retry
+
+    # Cron jobs — scheduled background work.
+    # Times are UTC; 20:30 UTC ≈ 4:30 PM ET (EDT), 05:00 UTC ≈ 1:00 AM ET (EDT).
+    from arq.cron import cron
+
+    from msai.workers.nightly_ingest import run_nightly_ingest
+    from msai.workers.pnl_aggregation import aggregate_daily_pnl
+
+    cron_jobs = [
+        cron(aggregate_daily_pnl, hour=20, minute=30),
+        cron(run_nightly_ingest, hour=5, minute=0),
+    ]
