@@ -956,21 +956,76 @@ async def get_live_deployment_status(
 @router.get("/positions")
 async def live_positions(
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> LivePositionsResponse:
-    """Current open positions.
+    """Open positions across all active deployments, read from ProjectionState."""
+    from msai.api.live_deps import get_position_reader
 
-    TODO: Wire to TradingNodeManager position tracking in Phase 2.
-    """
-    return LivePositionsResponse(positions=[])
+    reader = get_position_reader()
+
+    active_rows = (
+        await db.execute(
+            select(LiveDeployment).where(
+                LiveDeployment.status.in_(("running", "ready"))
+            )
+        )
+    ).scalars().all()
+
+    all_positions: list[dict[str, Any]] = []
+    for dep in active_rows:
+        snapshots = await reader.get_open_positions(
+            deployment_id=dep.id,
+            trader_id=dep.trader_id,
+            strategy_id_full=f"{dep.trader_id}-{dep.strategy_id}",
+        )
+        for snap in snapshots:
+            all_positions.append(snap.model_dump(mode="json"))
+
+    return LivePositionsResponse(positions=all_positions)
 
 
 @router.get("/trades")
 async def live_trades(
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
+    limit: int = 50,
+    offset: int = 0,
 ) -> LiveTradesResponse:
-    """Recent live trade executions.
+    """Recent live trade executions from order_attempt_audits."""
+    from msai.models.order_attempt_audit import OrderAttemptAudit
 
-    TODO: Query the trades table filtered by ``is_live=True``.
-    """
-    return LiveTradesResponse(trades=[], total=0)
+    count_q = select(func.count()).select_from(OrderAttemptAudit).where(
+        OrderAttemptAudit.is_live.is_(True),
+        OrderAttemptAudit.status.in_(("filled", "partially_filled")),
+    )
+    total = (await db.execute(count_q)).scalar_one()
+
+    rows_q = (
+        select(OrderAttemptAudit)
+        .where(
+            OrderAttemptAudit.is_live.is_(True),
+            OrderAttemptAudit.status.in_(("filled", "partially_filled")),
+        )
+        .order_by(OrderAttemptAudit.ts_attempted.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    rows = (await db.execute(rows_q)).scalars().all()
+
+    trades = [
+        {
+            "id": str(r.id),
+            "deployment_id": str(r.deployment_id) if r.deployment_id else None,
+            "instrument_id": r.instrument_id,
+            "side": r.side,
+            "quantity": str(r.quantity),
+            "price": str(r.price) if r.price else None,
+            "order_type": r.order_type,
+            "status": r.status,
+            "client_order_id": r.client_order_id,
+            "timestamp": r.ts_attempted.isoformat(),
+        }
+        for r in rows
+    ]
+
+    return LiveTradesResponse(trades=trades, total=total)
