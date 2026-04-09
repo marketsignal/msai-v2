@@ -185,7 +185,7 @@ services:
   # restart after an IB Gateway version bump hits edge cases where
   # IBC can't dismiss the new version's "welcome" dialogs.
   ib-gateway:
-    image: ghcr.io/gnzsnz/ib-gateway:stable
+    image: ghcr.io/gnzsnz/ib-gateway:10.45.1c
     environment:
       TWS_USERID: ${TWS_USERID:?Set TWS_USERID in .env}
       TWS_PASSWORD: ${TWS_PASSWORD:?Set TWS_PASSWORD in .env}

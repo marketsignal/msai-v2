@@ -179,7 +179,7 @@ services:
   # from needing IB credentials. See .env.example for activation.
   ib-gateway:
     profiles: ["live"]
-    image: ghcr.io/gnzsnz/ib-gateway:stable
+    image: ghcr.io/gnzsnz/ib-gateway:10.45.1c
     container_name: msai-claude-ib-gateway
     environment:
       TWS_USERID: ${TWS_USERID:?Set TWS_USERID in .env}
