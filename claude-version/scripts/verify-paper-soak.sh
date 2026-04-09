@@ -168,7 +168,7 @@ echo "[paper-soak] docker compose up -d --wait (this takes 2-4 minutes)" >&2
 # because IBC login is slow on first boot. start_period on the
 # gateway healthcheck suppresses "unhealthy" during the window,
 # so --wait doesn't trip prematurely.
-if ! docker compose -f "${_COMPOSE_FILE}" up -d --wait --wait-timeout 360; then
+if ! docker compose -f "${_COMPOSE_FILE}" up -d --wait --wait-timeout 480; then
   echo "[paper-soak] ERROR: docker compose up --wait failed" >&2
   echo "[paper-soak] Capturing ib-gateway + live-supervisor logs..." >&2
   docker compose -f "${_COMPOSE_FILE}" logs ib-gateway > logs/paper-soak-ibgateway.log 2>&1 || true
@@ -179,6 +179,48 @@ if ! docker compose -f "${_COMPOSE_FILE}" up -d --wait --wait-timeout 360; then
 fi
 
 echo "[paper-soak] Stack healthy — all services reported healthy by compose" >&2
+
+# ---------------------------------------------------------------------------
+# 2a. Run Alembic migrations (tables may not exist on a fresh DB)
+# ---------------------------------------------------------------------------
+echo "[paper-soak] Running database migrations..." >&2
+if ! docker compose -f "${_COMPOSE_FILE}" exec -T backend python -c "
+import asyncio
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+from msai.core.config import settings
+
+async def check():
+    engine = create_async_engine(settings.database_url)
+    async with engine.begin() as conn:
+        # Check if strategies table exists — if not, we need migrations
+        result = await conn.execute(text(
+            \"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'strategies')\"
+        ))
+        exists = result.scalar()
+        if not exists:
+            print('NEEDS_MIGRATION')
+        else:
+            print('OK')
+    await engine.dispose()
+
+asyncio.run(check())
+" 2>&1 | grep -q "NEEDS_MIGRATION"; then
+  echo "[paper-soak] Tables exist — skipping migrations" >&2
+else
+  echo "[paper-soak] Running alembic upgrade head inside backend container..." >&2
+  # Run alembic from the host against the published Postgres port since
+  # the backend container doesn't have alembic.ini or the alembic/ directory.
+  _pg_port=$(docker compose -f "${_COMPOSE_FILE}" port postgres 5432 2>/dev/null || true)
+  _pg_host_port="${_pg_port##*:}"
+  if [[ -n "${_pg_host_port}" ]] && command -v uv &>/dev/null; then
+    (cd backend && DATABASE_URL="postgresql+asyncpg://msai:${POSTGRES_PASSWORD:-msai_dev_password}@localhost:${_pg_host_port}/msai" uv run alembic upgrade head 2>&1) || {
+      echo "[paper-soak] WARNING: alembic migration failed — tables may be missing" >&2
+    }
+  else
+    echo "[paper-soak] WARNING: cannot run migrations (uv not found or postgres port not resolved)" >&2
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # 2b. Derive backend URL + container name from the running compose stack
