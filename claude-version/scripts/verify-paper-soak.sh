@@ -128,15 +128,15 @@ fi
 _trading_mode_from_env=$(_get_env_value TRADING_MODE)
 _trading_mode="${TRADING_MODE:-${_trading_mode_from_env:-paper}}"
 if [[ "${_trading_mode}" == "paper" ]]; then
-  if [[ ! "${IB_ACCOUNT_ID}" =~ ^DU ]]; then
-    echo "ERROR: TRADING_MODE=paper requires IB_ACCOUNT_ID starting with 'DU'." >&2
+  if [[ ! "${IB_ACCOUNT_ID}" =~ ^D(U|F) ]]; then
+    echo "ERROR: TRADING_MODE=paper requires IB_ACCOUNT_ID starting with 'DU' or 'DF'." >&2
     echo "       Got IB_ACCOUNT_ID='${IB_ACCOUNT_ID}'. Either use a paper" >&2
     echo "       account or set TRADING_MODE=live IB_PORT=4001." >&2
     exit 1
   fi
 elif [[ "${_trading_mode}" == "live" ]]; then
-  if [[ "${IB_ACCOUNT_ID}" =~ ^DU ]]; then
-    echo "ERROR: TRADING_MODE=live requires a live IB_ACCOUNT_ID (not 'DU*')." >&2
+  if [[ "${IB_ACCOUNT_ID}" =~ ^D(U|F) ]]; then
+    echo "ERROR: TRADING_MODE=live requires a live IB_ACCOUNT_ID (not 'DU*'/'DF*')." >&2
     echo "       Got IB_ACCOUNT_ID='${IB_ACCOUNT_ID}'. Either flip to paper" >&2
     echo "       (unset TRADING_MODE + IB_PORT) or use a real live account." >&2
     exit 1
