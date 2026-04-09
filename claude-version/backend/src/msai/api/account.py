@@ -19,8 +19,12 @@ log = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/account", tags=["account"])
 
-# Module-level singletons (per process)
-_ib_service = IBAccountService()
+# Module-level singletons (per process).
+# Use settings so the service connects to the IB Gateway container
+# (ib-gateway:4002 in Docker, 127.0.0.1:4002 locally).
+from msai.core.config import settings
+
+_ib_service = IBAccountService(host=settings.ib_host, port=settings.ib_port)
 _ib_probe = IBProbe()
 
 

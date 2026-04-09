@@ -1,23 +1,46 @@
 """IB account data queries via ib_async.
 
-Provides an escape hatch to query Interactive Brokers Gateway directly
-for account summary and portfolio data.  In Phase 1 the methods return
-mock data; the real ``ib_async`` connection will be wired in Phase 2
-once the IB Gateway container is running in the Docker stack.
+Connects to IB Gateway for account summary and portfolio data.
+Falls back to zero-valued responses if IB Gateway is unreachable
+or ib_async is not installed (e.g., running without the live profile).
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 from msai.core.logging import get_logger
 
 log = get_logger(__name__)
 
+try:
+    from ib_async import IB
+except ImportError:
+    IB = None  # type: ignore[assignment,misc]
+
+# Dedicated client ID for read-only account queries.
+# 0 is reserved by IB as the master client; live_node_config derives
+# per-deployment IDs from the deployment_slug hash. 99 is safe.
+_ACCOUNT_CLIENT_ID = 99
+
+_ZERO_SUMMARY: dict[str, float] = {
+    "net_liquidation": 0.0,
+    "buying_power": 0.0,
+    "margin_used": 0.0,
+    "available_funds": 0.0,
+    "unrealized_pnl": 0.0,
+    "realized_pnl": 0.0,
+}
+
 
 class IBAccountService:
     """Queries IB Gateway for account data.
 
+    Falls back gracefully to zero-valued responses if IB Gateway
+    is unreachable or ``ib_async`` is not installed.
+
     Args:
-        host: IB Gateway hostname (default ``"ib-gateway"`` for Docker).
+        host: IB Gateway hostname (default from settings).
         port: IB Gateway API port (default ``4002`` for paper trading).
     """
 
@@ -26,31 +49,66 @@ class IBAccountService:
         self.port = port
 
     async def get_summary(self) -> dict[str, float]:
-        """Return an account summary with key financial metrics.
+        """Return account summary. Zero-valued dict if IB unreachable."""
+        if IB is None:
+            log.debug("ib_async_not_installed")
+            return dict(_ZERO_SUMMARY)
 
-        Returns:
-            Dictionary with keys such as ``net_liquidation``,
-            ``buying_power``, ``margin_used``, etc.
+        ib = IB()
+        try:
+            await ib.connectAsync(
+                self.host, self.port, clientId=_ACCOUNT_CLIENT_ID, timeout=5
+            )
+            tags = await ib.accountSummaryAsync()
+            result = dict(_ZERO_SUMMARY)
+            tag_map = {
+                "NetLiquidation": "net_liquidation",
+                "BuyingPower": "buying_power",
+                "TotalCashValue": "available_funds",
+                "MaintMarginReq": "margin_used",
+                "UnrealizedPnL": "unrealized_pnl",
+                "RealizedPnL": "realized_pnl",
+            }
+            for item in tags:
+                key = tag_map.get(item.tag)
+                if key:
+                    try:
+                        result[key] = float(item.value)
+                    except (ValueError, TypeError):
+                        pass
+            return result
+        except Exception:
+            log.warning("ib_account_summary_failed", host=self.host, port=self.port)
+            return dict(_ZERO_SUMMARY)
+        finally:
+            ib.disconnect()
 
-        TODO: Connect via ib_async when IB Gateway is running.
-        """
-        log.debug("ib_account_summary_requested", host=self.host, port=self.port)
-        return {
-            "net_liquidation": 125_430.56,
-            "buying_power": 250_000.00,
-            "margin_used": 15_000.00,
-            "available_funds": 110_430.56,
-            "unrealized_pnl": 1_234.56,
-            "realized_pnl": 5_678.90,
-        }
+    async def get_portfolio(self) -> list[dict[str, Any]]:
+        """Return current IB portfolio positions. Empty list if unreachable."""
+        if IB is None:
+            return []
 
-    async def get_portfolio(self) -> list[dict[str, object]]:
-        """Return current portfolio positions.
-
-        Returns:
-            List of position dictionaries.  Empty in Phase 1.
-
-        TODO: Connect via ib_async when IB Gateway is running.
-        """
-        log.debug("ib_portfolio_requested", host=self.host, port=self.port)
-        return []
+        ib = IB()
+        try:
+            await ib.connectAsync(
+                self.host, self.port, clientId=_ACCOUNT_CLIENT_ID, timeout=5
+            )
+            positions = ib.portfolio()
+            return [
+                {
+                    "symbol": p.contract.symbol,
+                    "sec_type": p.contract.secType,
+                    "position": float(p.position),
+                    "market_price": float(p.marketPrice),
+                    "market_value": float(p.marketValue),
+                    "average_cost": float(p.averageCost),
+                    "unrealized_pnl": float(p.unrealizedPNL),
+                    "realized_pnl": float(p.realizedPNL),
+                }
+                for p in positions
+            ]
+        except Exception:
+            log.warning("ib_portfolio_failed", host=self.host, port=self.port)
+            return []
+        finally:
+            ib.disconnect()
