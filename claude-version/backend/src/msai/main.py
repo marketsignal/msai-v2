@@ -77,6 +77,25 @@ import asyncio
 _projection_tasks: list[asyncio.Task[None]] = []
 _projection_stop = asyncio.Event()
 
+# Module-level singleton so /api/v1/live/start can register new deployments
+# after boot. Lazy-initialized in _start_projection_tasks.
+_stream_registry: StreamRegistry | None = None  # type: ignore[name-defined]
+
+
+def get_stream_registry() -> StreamRegistry:  # type: ignore[name-defined]
+    """Return the per-worker StreamRegistry singleton.
+
+    Called by the live router when a new deployment is started so the
+    projection consumer discovers the new Nautilus message bus stream
+    without requiring a FastAPI restart.
+    """
+    from msai.services.nautilus.projection.registry import StreamRegistry as _SR
+
+    global _stream_registry  # noqa: PLW0603
+    if _stream_registry is None:
+        _stream_registry = _SR()
+    return _stream_registry
+
 
 async def _start_projection_tasks() -> None:
     """Start StateApplier + ProjectionConsumer as background tasks.
@@ -107,7 +126,7 @@ async def _start_projection_tasks() -> None:
 
     # ProjectionConsumer needs binary-mode Redis (Nautilus streams carry msgpack bytes)
     redis_binary = AsyncRedis.from_url(settings.redis_url, decode_responses=False)
-    registry = StreamRegistry()
+    registry = get_stream_registry()
 
     # Populate registry with active deployments from DB so the consumer
     # knows which Nautilus message bus streams to read on startup.

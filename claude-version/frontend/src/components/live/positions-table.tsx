@@ -28,7 +28,9 @@ interface PositionsTableProps {
 export function PositionsTable({
   livePositions,
 }: PositionsTableProps = {}): React.ReactElement {
-  const useLive = livePositions != null && livePositions.length > 0;
+  // null = not yet loaded / backend unreachable → show mock
+  // [] = real data, just no positions → show empty table
+  const useLive = livePositions != null;
 
   return (
     <Card className="border-border/50">

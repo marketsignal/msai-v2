@@ -1084,8 +1084,10 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
             from msai.services.nautilus.risk import RiskAwareStrategy
 
             svc = MarketHoursService()
-            # Prime with the deployment's instrument IDs
-            instrument_ids = list(p.strategy_config.get("instruments", []))
+            # Prime with the deployment's canonical instrument IDs from
+            # paper_symbols (the actual symbols the TradingNode subscribes to).
+            # strategy_config["instruments"] is NOT populated by the supervisor.
+            instrument_ids = list(p.paper_symbols) if p.paper_symbols else []
             if instrument_ids:
                 async with sf() as session:
                     await svc.prime(session, instrument_ids)

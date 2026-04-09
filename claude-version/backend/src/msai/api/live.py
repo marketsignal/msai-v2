@@ -481,6 +481,19 @@ async def live_start(  # noqa: PLR0912, PLR0915 — multi-branch dispatch by des
             idempotency_key=idempotency_key,
         )
 
+        # Register the new deployment with the projection consumer so
+        # it discovers the Nautilus message bus stream without a restart.
+        try:
+            from msai.main import get_stream_registry
+
+            get_stream_registry().register(
+                deployment_id=deployment.id,
+                deployment_slug=deployment.deployment_slug,
+                stream_name=deployment.message_bus_stream,
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("stream_registry_register_failed")
+
         # -------------------------------------------------------------
         # Poll live_node_processes for ready / failed / running
         # -------------------------------------------------------------
