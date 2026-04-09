@@ -202,6 +202,7 @@ services:
       # this the trading subprocess's first connect hangs waiting
       # for a human click.
       TWS_ACCEPT_INCOMING: "accept"
+      IBC_INI__IBGateway__TrustedIPs: "127.0.0.1,172.0.0.0/8,192.168.0.0/16"
       EXISTING_SESSION_DETECTED_ACTION: "primary"
       # Bypass "you are running a newer version than the saved
       # settings" dialog after an IB Gateway version bump.
