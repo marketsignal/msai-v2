@@ -72,11 +72,69 @@ async def _ensure_api_key_user() -> bool:
         return False  # DB may not be ready yet (migrations pending)
 
 
+import asyncio
+
+_projection_tasks: list[asyncio.Task[None]] = []
+_projection_stop = asyncio.Event()
+
+
+async def _start_projection_tasks() -> None:
+    """Start StateApplier + ProjectionConsumer as background tasks.
+
+    - StateApplier subscribes to ``msai:live:state:*`` pub/sub and
+      feeds every event into the per-worker ProjectionState.
+    - ProjectionConsumer reads Nautilus message bus streams via
+      consumer groups and publishes translated events to the dual
+      pub/sub channels (state + events).
+
+    Both run until ``_projection_stop`` is set.
+    """
+    from redis.asyncio import Redis as AsyncRedis
+
+    from msai.api.live_deps import get_projection_state
+    from msai.services.nautilus.projection.consumer import ProjectionConsumer
+    from msai.services.nautilus.projection.fanout import DualPublisher
+    from msai.services.nautilus.projection.registry import StreamRegistry
+    from msai.services.nautilus.projection.state_applier import StateApplier
+
+    state = get_projection_state()
+    redis_client = AsyncRedis.from_url(settings.redis_url, decode_responses=True)
+
+    # StateApplier — feeds pub/sub events into the local ProjectionState
+    applier = StateApplier(redis=redis_client, projection_state=state)
+    _projection_stop.clear()
+    _projection_tasks.append(asyncio.create_task(applier.run(_projection_stop)))
+
+    # ProjectionConsumer — reads Nautilus streams, fans out to pub/sub
+    registry = StreamRegistry()
+    publisher = DualPublisher(redis=redis_client)
+    consumer = ProjectionConsumer(
+        redis=redis_client,
+        registry=registry,
+        publisher=publisher,
+    )
+    _projection_tasks.append(asyncio.create_task(consumer.run(_projection_stop)))
+
+
+async def _stop_projection_tasks() -> None:
+    """Signal projection tasks to stop and await them."""
+    _projection_stop.set()
+    for task in _projection_tasks:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    _projection_tasks.clear()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Startup/shutdown lifecycle — ensure API key user exists in DB."""
+    """Startup/shutdown lifecycle."""
     await _ensure_api_key_user()  # best-effort, retried on /ready
+    await _start_projection_tasks()
     yield
+    await _stop_projection_tasks()
 
 
 app: FastAPI = FastAPI(
