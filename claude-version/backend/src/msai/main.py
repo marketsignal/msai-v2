@@ -98,18 +98,46 @@ async def _start_projection_tasks() -> None:
     from msai.services.nautilus.projection.state_applier import StateApplier
 
     state = get_projection_state()
-    redis_client = AsyncRedis.from_url(settings.redis_url, decode_responses=True)
-
-    # StateApplier — feeds pub/sub events into the local ProjectionState
-    applier = StateApplier(redis=redis_client, projection_state=state)
     _projection_stop.clear()
+
+    # StateApplier needs text-mode Redis (pub/sub payloads are JSON strings)
+    redis_text = AsyncRedis.from_url(settings.redis_url, decode_responses=True)
+    applier = StateApplier(redis=redis_text, projection_state=state)
     _projection_tasks.append(asyncio.create_task(applier.run(_projection_stop)))
 
-    # ProjectionConsumer — reads Nautilus streams, fans out to pub/sub
+    # ProjectionConsumer needs binary-mode Redis (Nautilus streams carry msgpack bytes)
+    redis_binary = AsyncRedis.from_url(settings.redis_url, decode_responses=False)
     registry = StreamRegistry()
-    publisher = DualPublisher(redis=redis_client)
+
+    # Populate registry with active deployments from DB so the consumer
+    # knows which Nautilus message bus streams to read on startup.
+    try:
+        from msai.core.database import async_session_factory
+        from msai.models.live_deployment import LiveDeployment
+
+        async with async_session_factory() as session:
+            active_deps = (
+                await session.execute(
+                    select(LiveDeployment).where(
+                        LiveDeployment.status.in_(("running", "ready", "starting", "building"))
+                    )
+                )
+            ).scalars().all()
+            for dep in active_deps:
+                if dep.message_bus_stream:
+                    registry.register(
+                        deployment_id=dep.id,
+                        deployment_slug=dep.deployment_slug,
+                        stream_name=dep.message_bus_stream,
+                    )
+    except Exception:  # noqa: BLE001
+        # DB may not be ready; consumer will start with empty registry
+        # and pick up streams as deployments are started via /api/v1/live/start
+        pass
+
+    publisher = DualPublisher(redis=redis_text)  # publishes JSON strings
     consumer = ProjectionConsumer(
-        redis=redis_client,
+        redis=redis_binary,
         registry=registry,
         publisher=publisher,
     )

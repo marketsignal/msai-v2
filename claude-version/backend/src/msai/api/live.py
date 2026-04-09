@@ -976,7 +976,7 @@ async def live_positions(
         snapshots = await reader.get_open_positions(
             deployment_id=dep.id,
             trader_id=dep.trader_id,
-            strategy_id_full=f"{dep.trader_id}-{dep.strategy_id}",
+            strategy_id_full=dep.strategy_id_full,
         )
         for snap in snapshots:
             all_positions.append(snap.model_dump(mode="json"))
