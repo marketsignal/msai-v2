@@ -249,6 +249,13 @@ class IBDisconnectHandler:
                 },
             )
 
+        # Best-effort email alert for extended IB disconnects.
+        try:
+            from msai.services.alerting import AlertService
+            await AlertService().alert_ib_disconnect()
+        except Exception:  # noqa: BLE001
+            log.debug("ib_disconnect_alert_failed")
+
         if self._on_halt is not None:
             try:
                 await self._on_halt()

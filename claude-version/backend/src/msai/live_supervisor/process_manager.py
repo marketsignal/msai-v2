@@ -519,6 +519,15 @@ class ProcessManager:
         from msai.services.observability.trading_metrics import DEPLOYMENTS_FAILED
         DEPLOYMENTS_FAILED.inc()
 
+        # Best-effort email alert for spawn failures.
+        try:
+            from msai.services.alerting import AlertService
+            await AlertService().alert_strategy_error(
+                strategy_name=str(row_id), error=reason
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
         async with self._db() as session, session.begin():
             row = await session.get(LiveNodeProcess, row_id)
             if row is None:
