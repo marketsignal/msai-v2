@@ -65,7 +65,7 @@ from msai.services.nautilus.live_instrument_bootstrap import (
 # the silent failure mode gotcha #6 catches.
 _IB_PAPER_PORT = 4002
 _IB_LIVE_PORT = 4001
-_IB_PAPER_PREFIX = "DU"  # IB paper-account ids start with "DU"
+_IB_PAPER_PREFIXES = ("DU", "DF")  # IB paper-account ids: DU (standard), DF/DFP (FA sub-accounts)
 
 
 def build_redis_database_config() -> DatabaseConfig:
@@ -183,19 +183,19 @@ def _validate_port_account_consistency(port: int, account_id: str) -> None:
             "IB account id is empty (or whitespace only) — set IB_ACCOUNT_ID "
             "to a real paper or live account id before starting a deployment."
         )
-    is_paper_account = normalized_account.startswith(_IB_PAPER_PREFIX)
+    is_paper_account = any(normalized_account.startswith(p) for p in _IB_PAPER_PREFIXES)
     if port == _IB_PAPER_PORT:
         if not is_paper_account:
             raise ValueError(
                 f"IB paper port {port} requires a paper account id (starts with "
-                f"'{_IB_PAPER_PREFIX}'); got live account {normalized_account!r}. "
+                f"one of {_IB_PAPER_PREFIXES}); got live account {normalized_account!r}. "
                 "This combination silently produces no data — see Nautilus gotcha #6."
             )
     elif port == _IB_LIVE_PORT:
         if is_paper_account:
             raise ValueError(
                 f"IB live port {port} requires a live account id (must NOT start "
-                f"with '{_IB_PAPER_PREFIX}'); got paper account {normalized_account!r}. "
+                f"with any of {_IB_PAPER_PREFIXES}); got paper account {normalized_account!r}. "
                 "This combination silently produces no data — see Nautilus gotcha #6."
             )
     else:
