@@ -10,6 +10,7 @@ import {
   deployments as mockDeployments,
   positions,
 } from "@/lib/mock-data/live-trading";
+import { getLivePositions, type LivePositionItem } from "@/lib/api";
 import { formatCurrency, formatSignedCurrency } from "@/lib/format";
 import { getLiveStatus, type LiveDeploymentInfo } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -76,6 +77,26 @@ export default function LiveTradingPage(): React.ReactElement {
     };
   }, [token]);
 
+  // REST fallback: fetch positions when WebSocket not yet connected
+  const [restPositions, setRestPositions] = useState<LivePositionItem[] | null>(
+    null,
+  );
+  useEffect(() => {
+    if (token === null) return;
+    let cancelled = false;
+    void (async (): Promise<void> => {
+      try {
+        const data = await getLivePositions(token);
+        if (!cancelled) setRestPositions(data.positions);
+      } catch {
+        // Backend unreachable — leave null
+      }
+    })();
+    return (): void => {
+      cancelled = true;
+    };
+  }, [token]);
+
   const activeRealDeployment = realDeployments?.find(
     (d) => d.status === "running",
   );
@@ -90,6 +111,9 @@ export default function LiveTradingPage(): React.ReactElement {
   // render as empty, not silently fall back to mock PnL.
   const usingLive = isConnected;
   const livePositions = live.positions;
+
+  // Positions for the table: WebSocket > REST > null (mock fallback in component)
+  const positionsForTable = usingLive ? livePositions : restPositions;
 
   const totalUnrealizedPnl = useMemo(() => {
     if (usingLive) {
@@ -214,7 +238,7 @@ export default function LiveTradingPage(): React.ReactElement {
       </div>
 
       <StrategyStatus />
-      <PositionsTable />
+      <PositionsTable livePositions={positionsForTable} />
     </div>
   );
 }

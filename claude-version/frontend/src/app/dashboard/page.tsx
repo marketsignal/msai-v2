@@ -6,7 +6,13 @@ import { PortfolioSummary } from "@/components/dashboard/portfolio-summary";
 import { EquityChart } from "@/components/dashboard/equity-chart";
 import { ActiveStrategies } from "@/components/dashboard/active-strategies";
 import { RecentTrades } from "@/components/dashboard/recent-trades";
-import { apiGet, ApiError, type StrategyListResponse } from "@/lib/api";
+import {
+  apiGet,
+  ApiError,
+  getAccountSummary,
+  type AccountSummary,
+  type StrategyListResponse,
+} from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 
 // NOTE: Account/portfolio stats and recent trades remain mocked for now —
@@ -19,24 +25,30 @@ export default function DashboardPage(): React.ReactElement {
     undefined,
   );
   const [error, setError] = useState<string | null>(null);
+  const [account, setAccount] = useState<AccountSummary | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     const load = async (): Promise<void> => {
       try {
         const token = await getToken();
-        const data = await apiGet<StrategyListResponse>(
-          "/api/v1/strategies/",
-          token,
-        );
+        const [strategies, accountData] = await Promise.allSettled([
+          apiGet<StrategyListResponse>("/api/v1/strategies/", token),
+          getAccountSummary(token),
+        ]);
         if (cancelled) return;
-        setStrategyCount(data.total);
+        if (strategies.status === "fulfilled") {
+          setStrategyCount(strategies.value.total);
+        }
+        if (accountData.status === "fulfilled") {
+          setAccount(accountData.value);
+        }
       } catch (err) {
         if (cancelled) return;
         const msg =
           err instanceof ApiError
-            ? `Failed to load strategies (${err.status})`
-            : "Failed to load strategies";
+            ? `Failed to load data (${err.status})`
+            : "Failed to load data";
         setError(msg);
       }
     };
@@ -63,7 +75,11 @@ export default function DashboardPage(): React.ReactElement {
       )}
 
       {/* Stats grid */}
-      <PortfolioSummary totalStrategies={strategyCount} runningStrategies={0} />
+      <PortfolioSummary
+        totalStrategies={strategyCount}
+        runningStrategies={0}
+        accountData={account}
+      />
 
       {/* Equity curve + Active strategies */}
       <div className="grid gap-6 lg:grid-cols-7">

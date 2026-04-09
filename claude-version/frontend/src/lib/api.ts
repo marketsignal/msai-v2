@@ -191,3 +191,74 @@ export async function getLiveStatus(
 ): Promise<LiveStatusResponse> {
   return apiGet<LiveStatusResponse>("/api/v1/live/status", token);
 }
+
+// ---------------------------------------------------------------------------
+// Account
+// ---------------------------------------------------------------------------
+
+export interface AccountSummary {
+  net_liquidation: number;
+  buying_power: number;
+  available_funds: number;
+  margin_used: number;
+  unrealized_pnl: number;
+  realized_pnl: number;
+}
+
+export async function getAccountSummary(
+  token?: string | null,
+): Promise<AccountSummary> {
+  return apiGet<AccountSummary>("/api/v1/account/summary", token);
+}
+
+// ---------------------------------------------------------------------------
+// Live Positions (REST — complement to WebSocket)
+// ---------------------------------------------------------------------------
+
+export interface LivePositionItem {
+  deployment_id: string;
+  instrument_id: string;
+  qty: string;
+  avg_price: string;
+  unrealized_pnl: string;
+  realized_pnl: string;
+  ts: string;
+}
+
+export interface LivePositionsResponse {
+  positions: LivePositionItem[];
+}
+
+export async function getLivePositions(
+  token?: string | null,
+): Promise<LivePositionsResponse> {
+  return apiGet<LivePositionsResponse>("/api/v1/live/positions", token);
+}
+
+// ---------------------------------------------------------------------------
+// Live Trades (REST)
+// ---------------------------------------------------------------------------
+
+export interface LiveTrade {
+  id: string;
+  deployment_id: string | null;
+  instrument_id: string;
+  side: string;
+  quantity: string;
+  price: string | null;
+  order_type: string;
+  status: string;
+  client_order_id: string;
+  timestamp: string;
+}
+
+export interface LiveTradesResponse {
+  trades: LiveTrade[];
+  total: number;
+}
+
+export async function getLiveTrades(
+  token?: string | null,
+): Promise<LiveTradesResponse> {
+  return apiGet<LiveTradesResponse>("/api/v1/live/trades", token);
+}
