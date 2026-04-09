@@ -72,7 +72,7 @@ BACKEND_URL = os.environ.get("MSAI_E2E_BACKEND_URL", "http://localhost:8800")
 SMOKE_STRATEGY_CLASS = "SmokeMarketOrderStrategy"
 SMOKE_STRATEGY_PATH = "strategies.example.smoke_market_order:SmokeMarketOrderStrategy"
 SMOKE_CONFIG_PATH = "strategies.example.smoke_market_order:SmokeMarketOrderConfig"
-SMOKE_INSTRUMENTS = ["AAPL"]
+SMOKE_INSTRUMENTS = ["AAPL.NASDAQ"]
 
 BACKEND_CONTAINER_NAME = os.environ.get("MSAI_E2E_BACKEND_CONTAINER", "msai-claude-backend")
 COMPOSE_FILE = os.environ.get("MSAI_E2E_COMPOSE_FILE", "docker-compose.dev.yml")
