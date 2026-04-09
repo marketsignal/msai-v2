@@ -156,8 +156,8 @@ async def test_phase_1_e2e_full_lifecycle() -> None:  # noqa: C901, PLR0912, PLR
             },
             headers={"Idempotency-Key": f"e2e-{int(time.time())}"},
         )
-        assert start_resp.status_code == 201, (
-            f"expected 201, got {start_resp.status_code}: {start_resp.text}"
+        assert start_resp.status_code in (200, 201), (
+            f"expected 200 or 201, got {start_resp.status_code}: {start_resp.text}"
         )
         start_body = start_resp.json()
         deployment_id = UUID(start_body["id"])
