@@ -1,20 +1,18 @@
-from __future__ import annotations
+import pandas as pd
 
-from datetime import UTC
-
-from msai.workers.backtest_job import _trade_timestamp_utc
+from msai.workers.backtest_job import _account_returns_series
 
 
-def test_trade_timestamp_uses_ts_event_fallback() -> None:
-    trade = {"ts_event": "2024-02-01T14:30:00Z"}
-    timestamp = _trade_timestamp_utc(trade)
+def test_account_returns_series_uses_timestamp_column_as_index() -> None:
+    account_df = pd.DataFrame(
+        {
+            "timestamp": ["2026-04-07T00:00:00Z", "2026-04-08T00:00:00Z"],
+            "returns": ["0.01", "-0.02"],
+        }
+    )
 
-    assert timestamp.tzinfo is UTC
-    assert timestamp.isoformat() == "2024-02-01T14:30:00+00:00"
+    series = _account_returns_series(account_df)
 
-
-def test_trade_timestamp_returns_now_when_no_supported_keys() -> None:
-    trade = {"id": "abc"}
-    timestamp = _trade_timestamp_utc(trade)
-
-    assert timestamp.tzinfo is UTC
+    assert isinstance(series.index, pd.DatetimeIndex)
+    assert list(series.values) == [0.01, -0.02]
+    assert list(series.index.strftime("%Y-%m-%d")) == ["2026-04-07", "2026-04-08"]

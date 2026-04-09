@@ -29,4 +29,6 @@ def redis_url() -> Generator[str, None, None]:
     from testcontainers.redis import RedisContainer
 
     with RedisContainer("redis:7-alpine") as redis:
-        yield redis.get_connection_url()
+        host = redis.get_container_host_ip()
+        port = redis.get_exposed_port(redis.port)
+        yield f"redis://{host}:{port}/0"

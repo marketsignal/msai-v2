@@ -11,17 +11,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from msai.core.auth import get_current_user
 from msai.core.config import settings
 from msai.core.database import get_db
+from msai.core.logging import get_logger
 from msai.core.queue import enqueue_backtest, get_redis_pool
 from msai.models import Backtest, Strategy, Trade
 from msai.schemas.backtest import (
+    BacktestAnalyticsResponse,
     BacktestResultsResponse,
     BacktestRunRequest,
     BacktestRunResponse,
     BacktestStatusResponse,
 )
+from msai.services.backtest_analytics import (
+    BacktestAnalyticsNotFoundError,
+    BacktestAnalyticsService,
+)
+from msai.services.nautilus.instrument_service import instrument_service
 from msai.services.strategy_registry import StrategyRegistry, file_sha256
+from msai.services.user_identity import resolve_user_id_from_claims
 
 router = APIRouter(prefix="/backtests", tags=["backtests"])
+logger = get_logger("api.backtests")
+analytics_service = BacktestAnalyticsService()
 
 
 @router.post("/run", response_model=BacktestRunResponse)
@@ -42,24 +52,44 @@ async def run_backtest(
             detail=f"Strategy file not found: {strategy.file_path}",
         )
 
-    user_id = str(claims.get("oid") or claims.get("sub") or "")
+    try:
+        canonical_instruments = await instrument_service.canonicalize_backtest_instruments(
+            db,
+            payload.instruments,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    user_id = await resolve_user_id_from_claims(db, claims)
     backtest = Backtest(
         strategy_id=strategy.id,
         strategy_code_hash=file_sha256(strategy_path),
         config=payload.config,
-        instruments=payload.instruments,
+        instruments=canonical_instruments,
         start_date=payload.start_date,
         end_date=payload.end_date,
         status="pending",
         progress=0,
-        created_by=user_id or None,
+        created_by=user_id,
     )
     db.add(backtest)
+    await db.flush()
+
+    try:
+        pool = await get_redis_pool()
+        queue_job_id = await enqueue_backtest(pool, backtest.id, str(strategy_path), payload.config)
+        backtest.queue_name = settings.backtest_queue_name
+        backtest.queue_job_id = queue_job_id or backtest.id
+    except Exception as exc:
+        await db.rollback()
+        logger.warning("backtest_enqueue_failed", error=str(exc), strategy_id=strategy.id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Backtest queue unavailable",
+        ) from exc
+
     await db.commit()
     await db.refresh(backtest)
-
-    pool = await get_redis_pool()
-    await enqueue_backtest(pool, backtest.id, str(strategy_path), payload.config)
     return BacktestRunResponse(job_id=backtest.id, status=backtest.status)
 
 
@@ -77,6 +107,11 @@ async def backtest_status(
         status=backtest.status,
         progress=backtest.progress,
         error_message=backtest.error_message,
+        queue_name=backtest.queue_name,
+        queue_job_id=backtest.queue_job_id,
+        worker_id=backtest.worker_id,
+        attempt=int(backtest.attempt or 0),
+        heartbeat_at=backtest.heartbeat_at.isoformat() if backtest.heartbeat_at else None,
     )
 
 
@@ -113,6 +148,18 @@ async def backtest_results(
         metrics=backtest.metrics,
         trades=rows,
     )
+
+
+@router.get("/{job_id}/analytics", response_model=BacktestAnalyticsResponse)
+async def backtest_analytics(
+    job_id: str,
+    _: Mapping[str, object] = Depends(get_current_user),
+) -> BacktestAnalyticsResponse:
+    try:
+        payload = analytics_service.load(job_id)
+    except BacktestAnalyticsNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return BacktestAnalyticsResponse(**payload)
 
 
 @router.get("/{job_id}/report")

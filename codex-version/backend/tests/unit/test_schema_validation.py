@@ -31,3 +31,14 @@ def test_market_data_ingest_requires_non_empty_symbols() -> None:
             start="2024-01-01",
             end="2024-01-02",
         )
+
+
+def test_market_data_ingest_rejects_unknown_provider() -> None:
+    with pytest.raises(ValidationError):
+        MarketDataIngestRequest(
+            asset_class="equities",
+            symbols=["AAPL"],
+            start="2024-01-01",
+            end="2024-01-02",
+            provider="unknown",
+        )

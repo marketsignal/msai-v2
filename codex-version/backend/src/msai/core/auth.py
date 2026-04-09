@@ -74,6 +74,7 @@ async def get_current_user(
     """FastAPI dependency: authenticate via X-API-Key header or Bearer token."""
     api_key = request.headers.get("X-API-Key")
     if api_key and validate_api_key(api_key):
+        request.state.user = _API_KEY_CLAIMS
         return _API_KEY_CLAIMS
 
     if credentials is None:
@@ -83,7 +84,9 @@ async def get_current_user(
         )
 
     try:
-        return get_token_validator().validate_token(credentials.credentials)
+        claims = get_token_validator().validate_token(credentials.credentials)
+        request.state.user = claims
+        return claims
     except jwt.PyJWTError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

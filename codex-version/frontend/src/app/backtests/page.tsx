@@ -14,6 +14,7 @@ export default function BacktestsPage() {
   const { token } = useAuth();
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [error, setError] = useState("");
 
   useEffect(() => {
     if (!token) return;
@@ -26,8 +27,10 @@ export default function BacktestsPage() {
         ]);
         setStrategies(strategyList);
         setJobs(history);
-      } catch {
-        setStrategies([{ id: "demo-ema", name: "example.ema_cross" }]);
+        setError("");
+      } catch (fetchError) {
+        const message = fetchError instanceof Error ? fetchError.message : "Failed to load backtest workspace";
+        setError(message);
       }
     }
 
@@ -36,6 +39,9 @@ export default function BacktestsPage() {
 
   return (
     <div className="space-y-6">
+      {error ? (
+        <div className="rounded-xl border border-rose-300/30 bg-rose-500/10 p-4 text-sm text-rose-100">{error}</div>
+      ) : null}
       <h2 className="text-2xl font-semibold text-white">Backtest Runner</h2>
       <RunForm
         strategies={strategies}
@@ -52,6 +58,7 @@ export default function BacktestsPage() {
       <section className="rounded-xl border border-white/10 bg-black/25 p-4">
         <h3 className="text-lg font-semibold text-white">Recent Backtests</h3>
         <div className="mt-3 space-y-2">
+          {jobs.length === 0 ? <p className="text-sm text-zinc-500">No backtest history yet.</p> : null}
           {jobs.map((job) => (
             <Link
               key={job.id}

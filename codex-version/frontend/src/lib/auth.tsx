@@ -4,11 +4,18 @@ import { createContext, useContext, useEffect, useMemo, useState } from "react";
 import type { AccountInfo } from "@azure/msal-browser";
 import { useIsAuthenticated, useMsal } from "@azure/msal-react";
 
+import { getApiKeyCredential, getAuthMode, type AuthMode, isApiKeyAuthMode } from "@/lib/auth-mode";
 import { loginRequest } from "@/lib/msal-config";
 
+type AuthUser = {
+  name: string | null;
+  username?: string | null;
+};
+
 type AuthContextValue = {
-  user: AccountInfo | null;
+  user: AuthUser | null;
   token: string | null;
+  authMode: AuthMode;
   isAuthenticated: boolean;
   loading: boolean;
   login: () => Promise<void>;
@@ -18,11 +25,40 @@ type AuthContextValue = {
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
+  if (isApiKeyAuthMode()) {
+    return <ApiKeyAuthProvider>{children}</ApiKeyAuthProvider>;
+  }
+  return <MsalAuthProvider>{children}</MsalAuthProvider>;
+}
+
+function ApiKeyAuthProvider({ children }: { children: React.ReactNode }) {
+  const token = getApiKeyCredential();
+  const value = useMemo<AuthContextValue>(
+    () => ({
+      user: {
+        name: "E2E API Key",
+        username: "api-key@msai.local",
+      },
+      token,
+      authMode: "api-key",
+      isAuthenticated: Boolean(token),
+      loading: false,
+      login: async () => {},
+      logout: async () => {},
+    }),
+    [token],
+  );
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
+
+function MsalAuthProvider({ children }: { children: React.ReactNode }) {
   const { instance, accounts } = useMsal();
   const isAuthenticated = useIsAuthenticated();
   const [token, setToken] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const user = accounts[0] ?? null;
+  const account = accounts[0] ?? null;
+  const user = account ? _mapAccount(account) : null;
 
   useEffect(() => {
     let mounted = true;
@@ -64,6 +100,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     () => ({
       user,
       token,
+      authMode: getAuthMode(),
       isAuthenticated,
       loading,
       login: async () => {
@@ -77,6 +114,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
+
+function _mapAccount(account: AccountInfo): AuthUser {
+  return {
+    name: account.name ?? account.username ?? "MSAI Operator",
+    username: account.username,
+  };
 }
 
 export function useAuth(): AuthContextValue {

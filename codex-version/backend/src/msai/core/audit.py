@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 
 from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,6 +9,7 @@ from starlette.responses import Response
 from msai.core.database import async_session_factory
 from msai.core.logging import get_logger
 from msai.models import AuditLog
+from msai.services.user_identity import resolve_user_id_from_claims
 
 _MUTATING_METHODS = {"POST", "PATCH", "DELETE"}
 logger = get_logger("audit")
@@ -55,11 +56,10 @@ async def audit_middleware(
 
     claims = getattr(request.state, "user", None)
     user_id = None
-    if isinstance(claims, dict):
-        user_id = claims.get("oid") or claims.get("sub")
-
     try:
         async with async_session_factory() as session:
+            if isinstance(claims, Mapping):
+                user_id = await resolve_user_id_from_claims(session, claims)
             await record_audit_event(
                 session=session,
                 user_id=user_id,

@@ -27,6 +27,7 @@ dependencies = [
     "quantstats>=0.0.81",
     "ib_async>=2.1.0",
     "databento>=0.43.0",
+    "optuna>=4.4.0",
     "structlog>=24.4.0",
     "typer>=0.15.0",
 ]

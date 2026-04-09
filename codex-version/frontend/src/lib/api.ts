@@ -1,3 +1,5 @@
+import { getApiKeyCredential, isApiKeyAuthMode } from "@/lib/auth-mode";
+
 const API_ROOT = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 export async function apiFetch<T>(
@@ -7,7 +9,12 @@ export async function apiFetch<T>(
 ): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("Content-Type", "application/json");
-  if (token) {
+  if (isApiKeyAuthMode()) {
+    const apiKey = getApiKeyCredential();
+    if (apiKey) {
+      headers.set("X-API-Key", apiKey);
+    }
+  } else if (token) {
     headers.set("Authorization", `Bearer ${token}`);
   }
 

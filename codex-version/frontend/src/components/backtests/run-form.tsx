@@ -17,7 +17,7 @@ type RunFormProps = {
 
 export function RunForm({ strategies, onRun }: RunFormProps) {
   const [strategyId, setStrategyId] = useState<string>(strategies[0]?.id ?? "");
-  const [instruments, setInstruments] = useState("AAPL");
+  const [instruments, setInstruments] = useState("AAPL.EQUS");
   const [startDate, setStartDate] = useState("2024-01-01");
   const [endDate, setEndDate] = useState("2024-12-31");
   const [configText, setConfigText] = useState("{}");
@@ -76,7 +76,7 @@ export function RunForm({ strategies, onRun }: RunFormProps) {
             className="w-full rounded-md border border-white/10 bg-black/40 p-2"
             value={instruments}
             onChange={(event) => setInstruments(event.target.value)}
-            placeholder="AAPL,MSFT"
+            placeholder="AAPL.EQUS,MSFT.EQUS"
           />
         </label>
         <label className="space-y-1 text-sm text-zinc-300">

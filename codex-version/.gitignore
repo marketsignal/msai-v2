@@ -24,13 +24,27 @@ node_modules/
 # Local env and overrides
 .env
 .env.*
+!.env*.example
 docker-compose.override.yml
 
-# Data artifacts
+# Data artifacts — runtime outputs, never committed
 data/parquet/*
 data/reports/*
+data/alerts/*
+data/databento/*
+data/ib-gateway/*
+data/research/*
+data/scheduler/*
+data/tmp/*
+data/ingestion_status.json
 !data/parquet/.gitkeep
 !data/reports/.gitkeep
+!data/alerts/.gitkeep
+!data/databento/.gitkeep
+!data/ib-gateway/.gitkeep
+!data/research/.gitkeep
+!data/scheduler/.gitkeep
+!data/tmp/.gitkeep
 
 # Logs
 *.log

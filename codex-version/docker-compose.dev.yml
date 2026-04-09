@@ -51,18 +51,33 @@ services:
       JWT_TENANT_ID: dev-tenant-id
       JWT_CLIENT_ID: dev-client-id
       MSAI_API_KEY: ${MSAI_API_KEY:-msai-dev-key}
+      DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:-}
+      IB_GATEWAY_HOST: ib-gateway
+      IB_GATEWAY_PORT_PAPER: 4004
+      IB_GATEWAY_PORT_LIVE: 4003
+      IB_CLIENT_ID: 10
+      IB_INSTRUMENT_CLIENT_ID: 20
+      IB_DATA_CLIENT_ID: 101
+      IB_EXEC_CLIENT_ID: 102
+      IB_ALLOW_MOCK_FALLBACK: ${IB_ALLOW_MOCK_FALLBACK:-true}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
-  backtest-worker:
+  ingest-worker:
     build:
       context: ./backend
       dockerfile: Dockerfile.dev
-    container_name: msai-codex-worker
-    command: ["uv", "run", "arq", "msai.workers.settings.WorkerSettings"]
+    container_name: msai-codex-ingest-worker
+    command: ["uv", "run", "arq", "msai.workers.ingest_settings.IngestWorkerSettings"]
     volumes:
       - ./backend/src:/app/src:ro
       - ./strategies:/app/strategies:ro
@@ -76,25 +91,260 @@ services:
       JWT_TENANT_ID: dev-tenant-id
       JWT_CLIENT_ID: dev-client-id
       MSAI_API_KEY: ${MSAI_API_KEY:-msai-dev-key}
+      DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:-}
+      IB_ALLOW_MOCK_FALLBACK: ${IB_ALLOW_MOCK_FALLBACK:-true}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "uv", "run", "python", "-c", "from redis import Redis; Redis.from_url('redis://redis:6379').ping()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  backtest-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: msai-codex-backtest-worker
+    command: ["uv", "run", "arq", "msai.workers.backtest_settings.BacktestWorkerSettings"]
+    volumes:
+      - ./backend/src:/app/src:ro
+      - ./strategies:/app/strategies:ro
+      - ./data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:msai_dev_password@postgres:5432/msai
+      REDIS_URL: redis://redis:6379
+      DATA_ROOT: /app/data
+      STRATEGIES_ROOT: /app/strategies
+      ENVIRONMENT: development
+      JWT_TENANT_ID: dev-tenant-id
+      JWT_CLIENT_ID: dev-client-id
+      MSAI_API_KEY: ${MSAI_API_KEY:-msai-dev-key}
+      DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:-}
+      IB_ALLOW_MOCK_FALLBACK: ${IB_ALLOW_MOCK_FALLBACK:-true}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "uv", "run", "python", "-c", "from redis import Redis; Redis.from_url('redis://redis:6379').ping()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  research-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    command: ["uv", "run", "arq", "msai.workers.research_settings.ResearchWorkerSettings"]
+    volumes:
+      - ./backend/src:/app/src:ro
+      - ./strategies:/app/strategies:ro
+      - ./data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:msai_dev_password@postgres:5432/msai
+      REDIS_URL: redis://redis:6379
+      DATA_ROOT: /app/data
+      STRATEGIES_ROOT: /app/strategies
+      ENVIRONMENT: development
+      JWT_TENANT_ID: dev-tenant-id
+      JWT_CLIENT_ID: dev-client-id
+      MSAI_API_KEY: ${MSAI_API_KEY:-msai-dev-key}
+      DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:-}
+      IB_ALLOW_MOCK_FALLBACK: ${IB_ALLOW_MOCK_FALLBACK:-true}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "uv", "run", "python", "-c", "from redis import Redis; Redis.from_url('redis://redis:6379').ping()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  portfolio-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: msai-codex-portfolio-worker
+    command: ["uv", "run", "arq", "msai.workers.portfolio_settings.PortfolioWorkerSettings"]
+    volumes:
+      - ./backend/src:/app/src:ro
+      - ./strategies:/app/strategies:ro
+      - ./data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:msai_dev_password@postgres:5432/msai
+      REDIS_URL: redis://redis:6379
+      DATA_ROOT: /app/data
+      STRATEGIES_ROOT: /app/strategies
+      ENVIRONMENT: development
+      JWT_TENANT_ID: dev-tenant-id
+      JWT_CLIENT_ID: dev-client-id
+      MSAI_API_KEY: ${MSAI_API_KEY:-msai-dev-key}
+      DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:-}
+      IB_ALLOW_MOCK_FALLBACK: ${IB_ALLOW_MOCK_FALLBACK:-true}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "uv", "run", "python", "-c", "from redis import Redis; Redis.from_url('redis://redis:6379').ping()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  job-watchdog:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: msai-codex-job-watchdog
+    command: ["uv", "run", "python", "-m", "msai.workers.job_watchdog"]
+    volumes:
+      - ./backend/src:/app/src:ro
+      - ./strategies:/app/strategies:ro
+      - ./data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:msai_dev_password@postgres:5432/msai
+      REDIS_URL: redis://redis:6379
+      DATA_ROOT: /app/data
+      STRATEGIES_ROOT: /app/strategies
+      ENVIRONMENT: development
+      JWT_TENANT_ID: dev-tenant-id
+      JWT_CLIENT_ID: dev-client-id
+      MSAI_API_KEY: ${MSAI_API_KEY:-msai-dev-key}
+      DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "uv", "run", "python", "-c", "from redis import Redis; Redis.from_url('redis://redis:6379').ping()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  live-runtime:
+    profiles: ["broker"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: msai-codex-live-runtime
+    command: ["uv", "run", "arq", "msai.workers.live_settings.LiveWorkerSettings"]
+    volumes:
+      - ./backend/src:/app/src:ro
+      - ./strategies:/app/strategies:ro
+      - ./data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:msai_dev_password@postgres:5432/msai
+      REDIS_URL: redis://redis:6379
+      DATA_ROOT: /app/data
+      STRATEGIES_ROOT: /app/strategies
+      ENVIRONMENT: development
+      JWT_TENANT_ID: dev-tenant-id
+      JWT_CLIENT_ID: dev-client-id
+      MSAI_API_KEY: ${MSAI_API_KEY:-msai-dev-key}
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:-}
+      IB_GATEWAY_HOST: ib-gateway
+      IB_GATEWAY_PORT_PAPER: 4004
+      IB_GATEWAY_PORT_LIVE: 4003
+      IB_CLIENT_ID: 30
+      IB_INSTRUMENT_CLIENT_ID: 40
+      IB_DATA_CLIENT_ID: 101
+      IB_EXEC_CLIENT_ID: 102
+      IB_ALLOW_MOCK_FALLBACK: ${IB_ALLOW_MOCK_FALLBACK:-true}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ib-gateway:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "uv", "run", "python", "-c", "from redis import Redis; Redis.from_url('redis://redis:6379').ping()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  daily-scheduler:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: msai-codex-daily-scheduler
+    command: ["uv", "run", "python", "-m", "msai.workers.daily_scheduler"]
+    volumes:
+      - ./backend/src:/app/src:ro
+      - ./strategies:/app/strategies:ro
+      - ./data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:msai_dev_password@postgres:5432/msai
+      REDIS_URL: redis://redis:6379
+      DATA_ROOT: /app/data
+      STRATEGIES_ROOT: /app/strategies
+      ENVIRONMENT: development
+      JWT_TENANT_ID: dev-tenant-id
+      JWT_CLIENT_ID: dev-client-id
+      MSAI_API_KEY: ${MSAI_API_KEY:-msai-dev-key}
+      DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+      DAILY_INGEST_ENABLED: ${DAILY_INGEST_ENABLED:-true}
+      DAILY_INGEST_TIMEZONE: ${DAILY_INGEST_TIMEZONE:-America/Chicago}
+      DAILY_INGEST_HOUR: ${DAILY_INGEST_HOUR:-18}
+      DAILY_INGEST_MINUTE: ${DAILY_INGEST_MINUTE:-30}
+      DAILY_INGEST_POLL_SECONDS: ${DAILY_INGEST_POLL_SECONDS:-60}
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "uv", "run", "python", "-c", "from redis import Redis; Redis.from_url('redis://redis:6379').ping()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
 
   ib-gateway:
+    profiles: ["broker"]
     image: ghcr.io/gnzsnz/ib-gateway:stable
     container_name: msai-codex-ib-gateway
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        if [ -z "${TWS_USERID}" ] || [ -z "${TWS_PASSWORD}" ]; then
+          echo "ib-gateway requires TWS_USERID and TWS_PASSWORD. Start it with --env-file .env.paper-e2e.local." >&2
+          exit 64
+        fi
+        if [ "${TWS_USERID}" = "dev-user" ] || [ "${TWS_PASSWORD}" = "dev-password" ]; then
+          echo "ib-gateway refused to start with placeholder credentials." >&2
+          exit 64
+        fi
+        exec /home/ibgateway/scripts/run.sh
     environment:
-      TWS_USERID: ${TWS_USERID:-dev-user}
-      TWS_PASSWORD: ${TWS_PASSWORD:-dev-password}
+      TWS_USERID: ${TWS_USERID:-}
+      TWS_PASSWORD: ${TWS_PASSWORD:-}
       TRADING_MODE: ${TRADING_MODE:-paper}
-      READ_ONLY_API: "yes"
+      READ_ONLY_API: ${READ_ONLY_API:-yes}
+      TWS_SETTINGS_PATH: ${IB_TWS_SETTINGS_PATH:-/home/ibgateway/tws_settings}
+      AUTO_RESTART_TIME: ${IB_AUTO_RESTART_TIME:-11:45 PM}
+      TWS_COLD_RESTART: ${IB_TWS_COLD_RESTART:-}
+      RELOGIN_AFTER_TWOFA_TIMEOUT: ${IB_RELOGIN_AFTER_TWOFA_TIMEOUT:-yes}
+      TWOFA_TIMEOUT_ACTION: ${IB_TWOFA_TIMEOUT_ACTION:-restart}
+      EXISTING_SESSION_DETECTED_ACTION: ${IB_EXISTING_SESSION_ACTION:-primary}
+      TWS_ACCEPT_INCOMING: ${IB_TWS_ACCEPT_INCOMING:-accept}
+      BYPASS_WARNING: ${IB_BYPASS_WARNING:-yes}
+      TIME_ZONE: ${IB_TIME_ZONE:-America/Chicago}
+      JAVA_HEAP_SIZE: ${IB_JAVA_HEAP_SIZE:-1024}
       VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-msai-dev-vnc}
     volumes:
-      - ./scripts/ib-gateway-config:/root/ibc
+      - ./data/ib-gateway:/home/ibgateway/tws_settings
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 4002"]
+      test: ["CMD-SHELL", "timeout 2 bash -lc ': >/dev/tcp/127.0.0.1/4002' || timeout 2 bash -lc ': >/dev/tcp/127.0.0.1/4001'"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -111,6 +361,14 @@ services:
       - ./frontend/public:/app/public:ro
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8400
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
 
 volumes:
   postgres_data:

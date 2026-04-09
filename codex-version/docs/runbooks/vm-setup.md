@@ -4,6 +4,6 @@
 2. Install Docker Engine + Docker Compose plugin.
 3. Install `uv`, `node`, and Azure CLI.
 4. Clone repo into `/opt/msai-v2`.
-5. Create `.env.prod` with DB, Redis, Entra, and IB credentials.
-6. Run `docker compose -f docker-compose.prod.yml up -d --build`.
+5. Copy [`.env.prod.example`](/Users/pablomarin/Code/msai-v2/codex-version/.env.prod.example) to `.env.prod` and fill in DB, Redis, Entra, Databento, and IB credentials.
+6. Run `docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build`.
 7. Verify `/health` and `/ready` endpoints before enabling trading.

@@ -117,18 +117,45 @@ class StrategyRegistry:
         if model_fields is not None:
             defaults: dict[str, Any] = {}
             for name, field in model_fields.items():
-                if field.default is not None:
-                    defaults[name] = field.default
+                default = getattr(field, "default", None)
+                if default is None:
+                    continue
+                if type(default).__name__ == "PydanticUndefinedType":
+                    continue
+                defaults[name] = default
+
+            schema_defaults = self._extract_schema_defaults(config_class)
+            for key, value in schema_defaults.items():
+                defaults.setdefault(key, value)
             return defaults
 
+        schema_defaults = self._extract_schema_defaults(config_class)
+        return schema_defaults or None
+
+    def _extract_schema_defaults(self, config_class: type) -> dict[str, Any]:
         schema = self._extract_schema(config_class)
         if schema is None:
-            return None
+            return {}
 
         schema_defaults: dict[str, Any] = {}
-        for key, value in schema.get("properties", {}).items():
-            if isinstance(value, dict) and "default" in value:
-                schema_defaults[key] = value["default"]
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            for key, value in properties.items():
+                if isinstance(value, dict) and "default" in value:
+                    schema_defaults[key] = value["default"]
+
+        defs = schema.get("$defs")
+        if isinstance(defs, dict):
+            for definition in defs.values():
+                if not isinstance(definition, dict):
+                    continue
+                definition_properties = definition.get("properties")
+                if not isinstance(definition_properties, dict):
+                    continue
+                for key, value in definition_properties.items():
+                    if isinstance(value, dict) and "default" in value:
+                        schema_defaults.setdefault(key, value["default"])
+
         return schema_defaults
 
     async def sync(self, session: AsyncSession) -> list[Strategy]:

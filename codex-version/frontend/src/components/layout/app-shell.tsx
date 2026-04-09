@@ -13,11 +13,13 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   }
 
   return (
-    <div className="min-h-screen md:grid md:grid-cols-[16rem_1fr]">
+    <div className="min-h-screen md:grid md:grid-cols-[18rem_1fr]">
       <Sidebar />
-      <div>
+      <div className="min-w-0">
         <Header />
-        <main className="px-4 py-6 md:px-6">{children}</main>
+        <main className="px-4 py-5 md:px-6 md:py-6">
+          <div className="mx-auto max-w-[1600px]">{children}</div>
+        </main>
       </div>
     </div>
   );

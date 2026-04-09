@@ -19,6 +19,6 @@ az vm run-command invoke \
 
 rsync -az --delete ./ "${VM_NAME}:${APP_DIR}/"
 
-ssh "${VM_NAME}" "cd ${APP_DIR}/codex-version && docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d --build"
+ssh "${VM_NAME}" "cd ${APP_DIR}/codex-version && docker compose --env-file .env.prod -f docker-compose.prod.yml pull && docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build"
 
 echo "Deployment complete"

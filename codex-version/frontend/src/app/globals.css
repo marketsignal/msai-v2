@@ -6,6 +6,8 @@
   --steel: #172638;
   --cyan: #2dd4bf;
   --amber: #f59e0b;
+  --violet: #818cf8;
+  --rose: #fb7185;
 }
 
 @theme inline {
@@ -16,6 +18,8 @@
   --color-steel: var(--steel);
   --color-cyan: var(--cyan);
   --color-amber: var(--amber);
+  --color-violet: var(--violet);
+  --color-rose: var(--rose);
 }
 
 html,
@@ -28,9 +32,22 @@ body {
   background-image:
     radial-gradient(circle at 14% 20%, rgba(45, 212, 191, 0.12), transparent 34%),
     radial-gradient(circle at 86% 4%, rgba(245, 158, 11, 0.12), transparent 30%),
+    radial-gradient(circle at 50% 110%, rgba(129, 140, 248, 0.12), transparent 40%),
     linear-gradient(160deg, #06090e 0%, #0d1320 45%, #111827 100%);
+  background-attachment: fixed;
 }
 
 * {
   scrollbar-color: rgba(148, 163, 184, 0.45) transparent;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+::selection {
+  background: rgba(45, 212, 191, 0.25);
+  color: white;
 }

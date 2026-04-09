@@ -18,6 +18,18 @@ def test_dedup_bars_keeps_last() -> None:
     assert int(out.iloc[0]["close"]) == 2
 
 
+def test_dedup_bars_falls_back_to_timestamp_when_symbol_missing() -> None:
+    df = pd.DataFrame(
+        [
+            {"timestamp": "2024-01-01T10:00:00", "close": 1},
+            {"timestamp": "2024-01-01T10:00:00", "close": 2},
+        ]
+    )
+    out = dedup_bars(df)
+    assert len(out) == 1
+    assert int(out.iloc[0]["close"]) == 2
+
+
 def test_atomic_write_parquet(tmp_path: Path) -> None:
     table = pa.Table.from_pydict({"a": [1, 2]})
     target = tmp_path / "x.parquet"

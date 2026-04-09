@@ -28,6 +28,7 @@ htmlcov/
 
 # Node
 node_modules/
+.pnpm-store/
 .next/
 out/
 npm-debug.log*

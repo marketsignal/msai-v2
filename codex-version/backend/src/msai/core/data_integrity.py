@@ -26,4 +26,7 @@ def atomic_write_parquet(table: Any, target_path: Path) -> str:
 
 def dedup_bars(df: Any, key_columns: tuple[str, str] = ("symbol", "timestamp")) -> Any:
     """Remove duplicate bars by natural key, keeping the latest row."""
-    return df.drop_duplicates(subset=list(key_columns), keep="last")
+    available = [column for column in key_columns if column in df.columns]
+    if not available:
+        raise KeyError(f"None of the dedup columns are present: {key_columns}")
+    return df.drop_duplicates(subset=available, keep="last")

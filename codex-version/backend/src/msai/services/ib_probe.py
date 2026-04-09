@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from msai.core.logging import get_logger
-from msai.services.alerting import AlertingService
+from msai.services.alerting import AlertingService, alerting_service
 from msai.services.ib_account import IBAccountService, ib_account_service
 
 logger = get_logger("ib_probe")
@@ -57,5 +57,4 @@ class IBProbe:
             "consecutive_failures": self._consecutive_failures,
         }
 
-
-ib_probe = IBProbe(ib_account_service, AlertingService())
+ib_probe = IBProbe(ib_account_service, alerting_service)

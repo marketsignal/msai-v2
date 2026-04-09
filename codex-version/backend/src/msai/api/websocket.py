@@ -9,6 +9,7 @@ from fastapi.websockets import WebSocketDisconnect
 
 from msai.core.auth import validate_token_or_api_key
 from msai.core.queue import get_redis_pool
+from msai.services.live_updates import LIVE_UPDATES_CHANNEL, load_live_snapshot, load_live_snapshots
 
 router = APIRouter(tags=["live-stream"])
 
@@ -26,9 +27,15 @@ async def live_stream(websocket: WebSocket) -> None:
 
     redis = await get_redis_pool()
     pubsub = redis.pubsub()
-    await pubsub.subscribe("live_updates")
+    await pubsub.subscribe(LIVE_UPDATES_CHANNEL)
 
     try:
+        for snapshot_name in ("risk", "status", "positions", "orders", "trades"):
+            snapshot = await load_live_snapshot(snapshot_name)
+            if snapshot is not None:
+                await websocket.send_json(snapshot)
+            for scoped_snapshot in await load_live_snapshots(snapshot_name):
+                await websocket.send_json(scoped_snapshot)
         while True:
             message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
             if message and message.get("data"):
@@ -43,5 +50,5 @@ async def live_stream(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         return
     finally:
-        await pubsub.unsubscribe("live_updates")
-        await pubsub.close()
+        await pubsub.unsubscribe(LIVE_UPDATES_CHANNEL)
+        await pubsub.aclose()

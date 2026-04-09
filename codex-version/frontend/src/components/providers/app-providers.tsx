@@ -4,10 +4,19 @@ import { useEffect, useState } from "react";
 import { PublicClientApplication } from "@azure/msal-browser";
 import { MsalProvider } from "@azure/msal-react";
 
+import { isApiKeyAuthMode } from "@/lib/auth-mode";
 import { AuthProvider } from "@/lib/auth";
 import { msalConfig } from "@/lib/msal-config";
 
 export function AppProviders({ children }: { children: React.ReactNode }) {
+  if (isApiKeyAuthMode()) {
+    return <AuthProvider>{children}</AuthProvider>;
+  }
+
+  return <MsalAppProviders>{children}</MsalAppProviders>;
+}
+
+function MsalAppProviders({ children }: { children: React.ReactNode }) {
   const [instance] = useState(() => new PublicClientApplication(msalConfig));
   const [ready, setReady] = useState(false);
 

@@ -3,16 +3,21 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, Depends, FastAPI
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from msai.api import (
     account_router,
+    alerts_router,
     auth_router,
     backtests_router,
+    graduation_router,
     live_router,
     market_data_router,
+    portfolio_router,
+    research_router,
     strategies_router,
+    strategy_templates_router,
     websocket_router,
 )
 from msai.core.audit import audit_middleware
@@ -23,7 +28,6 @@ from msai.core.logging import get_logger, request_context_logging_middleware, se
 from msai.core.queue import close_redis_pool, get_redis_pool
 from msai.models import User
 from msai.services.ib_probe import ib_probe
-from sqlalchemy import select
 
 setup_logging(settings.environment)
 logger = get_logger("main")
@@ -68,6 +72,7 @@ async def lifespan(_: FastAPI):
     settings.data_root.mkdir(parents=True, exist_ok=True)
     settings.parquet_root.mkdir(parents=True, exist_ok=True)
     settings.reports_root.mkdir(parents=True, exist_ok=True)
+    settings.research_root.mkdir(parents=True, exist_ok=True)
 
     # Best-effort — retried on /ready if DB is not yet reachable
     await _ensure_api_key_user()
@@ -87,11 +92,16 @@ app.middleware("http")(audit_middleware)
 
 api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(auth_router)
+api_router.include_router(strategy_templates_router)
 api_router.include_router(strategies_router)
 api_router.include_router(backtests_router)
+api_router.include_router(graduation_router)
 api_router.include_router(market_data_router)
+api_router.include_router(alerts_router)
 api_router.include_router(account_router)
 api_router.include_router(live_router)
+api_router.include_router(portfolio_router)
+api_router.include_router(research_router)
 api_router.include_router(websocket_router)
 app.include_router(api_router)
 

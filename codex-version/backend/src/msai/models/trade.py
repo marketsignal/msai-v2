@@ -3,7 +3,17 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Numeric, String, func
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Numeric,
+    String,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from msai.models.base import Base
@@ -21,6 +31,8 @@ class Trade(Base):
         Index("idx_trades_strategy", "strategy_id"),
         Index("idx_trades_executed", "executed_at"),
         Index("idx_trades_instrument", "instrument"),
+        Index("idx_trades_broker_trade", "broker_trade_id"),
+        UniqueConstraint("deployment_id", "broker_trade_id", name="uq_trades_deployment_broker_trade"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
@@ -34,6 +46,11 @@ class Trade(Base):
     price: Mapped[float] = mapped_column(Numeric(18, 8), nullable=False)
     commission: Mapped[float | None] = mapped_column(Numeric(18, 8), nullable=True)
     pnl: Mapped[float | None] = mapped_column(Numeric(18, 8), nullable=True)
+    broker_trade_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    client_order_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    venue_order_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    position_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    broker_account_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     is_live: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     executed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(

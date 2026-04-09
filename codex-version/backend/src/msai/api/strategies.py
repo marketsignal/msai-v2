@@ -40,6 +40,25 @@ async def list_strategies(
     ]
 
 
+@router.post("/sync", response_model=list[StrategySummary])
+async def sync_strategies(
+    _: Mapping[str, object] = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[StrategySummary]:
+    registry = StrategyRegistry(settings.strategies_root)
+    strategies = await registry.sync(db)
+    return [
+        StrategySummary(
+            id=s.id,
+            name=s.name,
+            description=s.description,
+            file_path=s.file_path,
+            strategy_class=s.strategy_class,
+        )
+        for s in strategies
+    ]
+
+
 @router.get("/{strategy_id}", response_model=StrategyDetail)
 async def get_strategy(
     strategy_id: str,

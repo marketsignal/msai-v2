@@ -22,11 +22,16 @@ services:
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   backend:
     build:
       context: ./backend
-      dockerfile: Dockerfile.dev
+      dockerfile: Dockerfile
     restart: unless-stopped
     command: ["uv", "run", "uvicorn", "msai.main:app", "--host", "0.0.0.0", "--port", "8000"]
     env_file:
@@ -34,37 +39,242 @@ services:
     environment:
       ENVIRONMENT: production
       DATA_ROOT: /app/data
+      DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:-}
+      IB_GATEWAY_HOST: ib-gateway
+      IB_GATEWAY_PORT_PAPER: 4004
+      IB_GATEWAY_PORT_LIVE: 4003
+      IB_CLIENT_ID: 10
+      IB_INSTRUMENT_CLIENT_ID: 20
+      IB_DATA_CLIENT_ID: 101
+      IB_EXEC_CLIENT_ID: 102
+      IB_ALLOW_MOCK_FALLBACK: ${IB_ALLOW_MOCK_FALLBACK:-true}
     volumes:
       - ./data:/app/data
       - ./strategies:/app/strategies:ro
     ports:
       - "8000:8000"
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
 
-  backtest-worker:
+  ingest-worker:
     build:
       context: ./backend
-      dockerfile: Dockerfile.dev
+      dockerfile: Dockerfile
     restart: unless-stopped
-    command: ["uv", "run", "arq", "msai.workers.settings.WorkerSettings"]
+    command: ["uv", "run", "arq", "msai.workers.ingest_settings.IngestWorkerSettings"]
     env_file:
       - .env.prod
     environment:
       ENVIRONMENT: production
       DATA_ROOT: /app/data
+      DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:-}
+      IB_ALLOW_MOCK_FALLBACK: ${IB_ALLOW_MOCK_FALLBACK:-true}
     volumes:
       - ./data:/app/data
       - ./strategies:/app/strategies:ro
     depends_on:
-      - redis
-      - postgres
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "uv", "run", "python", "-c", "from redis import Redis; Redis.from_url('redis://redis:6379').ping()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  backtest-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["uv", "run", "arq", "msai.workers.backtest_settings.BacktestWorkerSettings"]
+    env_file:
+      - .env.prod
+    environment:
+      ENVIRONMENT: production
+      DATA_ROOT: /app/data
+      DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:-}
+      IB_ALLOW_MOCK_FALLBACK: ${IB_ALLOW_MOCK_FALLBACK:-true}
+    volumes:
+      - ./data:/app/data
+      - ./strategies:/app/strategies:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "uv", "run", "python", "-c", "from redis import Redis; Redis.from_url('redis://redis:6379').ping()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  research-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["uv", "run", "arq", "msai.workers.research_settings.ResearchWorkerSettings"]
+    env_file:
+      - .env.prod
+    environment:
+      ENVIRONMENT: production
+      DATA_ROOT: /app/data
+      DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:-}
+      IB_ALLOW_MOCK_FALLBACK: ${IB_ALLOW_MOCK_FALLBACK:-true}
+    volumes:
+      - ./data:/app/data
+      - ./strategies:/app/strategies:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "uv", "run", "python", "-c", "from redis import Redis; Redis.from_url('redis://redis:6379').ping()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  portfolio-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["uv", "run", "arq", "msai.workers.portfolio_settings.PortfolioWorkerSettings"]
+    env_file:
+      - .env.prod
+    environment:
+      ENVIRONMENT: production
+      DATA_ROOT: /app/data
+      DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:-}
+      IB_ALLOW_MOCK_FALLBACK: ${IB_ALLOW_MOCK_FALLBACK:-true}
+    volumes:
+      - ./data:/app/data
+      - ./strategies:/app/strategies:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "uv", "run", "python", "-c", "from redis import Redis; Redis.from_url('redis://redis:6379').ping()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  job-watchdog:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["uv", "run", "python", "-m", "msai.workers.job_watchdog"]
+    env_file:
+      - .env.prod
+    environment:
+      ENVIRONMENT: production
+      DATA_ROOT: /app/data
+      DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+    volumes:
+      - ./data:/app/data
+      - ./strategies:/app/strategies:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "uv", "run", "python", "-c", "from redis import Redis; Redis.from_url('redis://redis:6379').ping()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  live-runtime:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["uv", "run", "arq", "msai.workers.live_settings.LiveWorkerSettings"]
+    env_file:
+      - .env.prod
+    environment:
+      ENVIRONMENT: production
+      DATA_ROOT: /app/data
+      IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:-}
+      IB_GATEWAY_HOST: ib-gateway
+      IB_GATEWAY_PORT_PAPER: 4004
+      IB_GATEWAY_PORT_LIVE: 4003
+      IB_CLIENT_ID: 30
+      IB_INSTRUMENT_CLIENT_ID: 40
+      IB_DATA_CLIENT_ID: 101
+      IB_EXEC_CLIENT_ID: 102
+      IB_ALLOW_MOCK_FALLBACK: ${IB_ALLOW_MOCK_FALLBACK:-true}
+    volumes:
+      - ./data:/app/data
+      - ./strategies:/app/strategies:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      ib-gateway:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "uv", "run", "python", "-c", "from redis import Redis; Redis.from_url('redis://redis:6379').ping()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  daily-scheduler:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["uv", "run", "python", "-m", "msai.workers.daily_scheduler"]
+    env_file:
+      - .env.prod
+    environment:
+      ENVIRONMENT: production
+      DATA_ROOT: /app/data
+      DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+      DAILY_INGEST_ENABLED: ${DAILY_INGEST_ENABLED:-true}
+      DAILY_INGEST_TIMEZONE: ${DAILY_INGEST_TIMEZONE:-America/Chicago}
+      DAILY_INGEST_HOUR: ${DAILY_INGEST_HOUR:-18}
+      DAILY_INGEST_MINUTE: ${DAILY_INGEST_MINUTE:-30}
+      DAILY_INGEST_POLL_SECONDS: ${DAILY_INGEST_POLL_SECONDS:-60}
+    volumes:
+      - ./data:/app/data
+      - ./strategies:/app/strategies:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "uv", "run", "python", "-c", "from redis import Redis; Redis.from_url('redis://redis:6379').ping()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
 
   frontend:
     build:
       context: ./frontend
-      dockerfile: Dockerfile.dev
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+        NEXT_PUBLIC_ENTRA_CLIENT_ID: ${NEXT_PUBLIC_ENTRA_CLIENT_ID}
+        NEXT_PUBLIC_ENTRA_TENANT_ID: ${NEXT_PUBLIC_ENTRA_TENANT_ID}
+        NEXT_PUBLIC_ENTRA_REDIRECT_URI: ${NEXT_PUBLIC_ENTRA_REDIRECT_URI}
     restart: unless-stopped
     environment:
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
@@ -74,21 +284,50 @@ services:
     ports:
       - "3000:3000"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
 
   ib-gateway:
     image: ghcr.io/gnzsnz/ib-gateway:stable
     restart: unless-stopped
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        if [ -z "${TWS_USERID}" ] || [ -z "${TWS_PASSWORD}" ]; then
+          echo "ib-gateway requires TWS_USERID and TWS_PASSWORD." >&2
+          exit 64
+        fi
+        if [ "${TWS_USERID}" = "dev-user" ] || [ "${TWS_PASSWORD}" = "dev-password" ]; then
+          echo "ib-gateway refused to start with placeholder credentials." >&2
+          exit 64
+        fi
+        exec /home/ibgateway/scripts/run.sh
     environment:
-      TWS_USERID: ${TWS_USERID}
-      TWS_PASSWORD: ${TWS_PASSWORD}
+      TWS_USERID: ${TWS_USERID:-}
+      TWS_PASSWORD: ${TWS_PASSWORD:-}
       TRADING_MODE: ${TRADING_MODE:-paper}
-      READ_ONLY_API: "yes"
+      READ_ONLY_API: ${READ_ONLY_API:-yes}
+      TWS_SETTINGS_PATH: ${IB_TWS_SETTINGS_PATH:-/home/ibgateway/tws_settings}
+      AUTO_RESTART_TIME: ${IB_AUTO_RESTART_TIME:-11:45 PM}
+      TWS_COLD_RESTART: ${IB_TWS_COLD_RESTART:-}
+      RELOGIN_AFTER_TWOFA_TIMEOUT: ${IB_RELOGIN_AFTER_TWOFA_TIMEOUT:-yes}
+      TWOFA_TIMEOUT_ACTION: ${IB_TWOFA_TIMEOUT_ACTION:-restart}
+      EXISTING_SESSION_DETECTED_ACTION: ${IB_EXISTING_SESSION_ACTION:-primary}
+      TWS_ACCEPT_INCOMING: ${IB_TWS_ACCEPT_INCOMING:-accept}
+      BYPASS_WARNING: ${IB_BYPASS_WARNING:-yes}
+      TIME_ZONE: ${IB_TIME_ZONE:-America/Chicago}
+      JAVA_HEAP_SIZE: ${IB_JAVA_HEAP_SIZE:-1024}
       VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-msai-dev-vnc}
     volumes:
-      - ./scripts/ib-gateway-config:/root/ibc
+      - ./data/ib-gateway:/home/ibgateway/tws_settings
     healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 4002"]
+      test: ["CMD-SHELL", "timeout 2 bash -lc ': >/dev/tcp/127.0.0.1/4002' || timeout 2 bash -lc ': >/dev/tcp/127.0.0.1/4001'"]
       interval: 30s
       timeout: 10s
       retries: 3
