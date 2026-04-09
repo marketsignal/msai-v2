@@ -366,7 +366,7 @@ else
   export MSAI_E2E_PAPER_TRADING=false
 fi
 
-if ! (cd backend && uv run pytest tests/e2e/test_live_trading_phase1.py -vv); then
+if ! (cd backend && PYTHONPATH=src uv run pytest tests/e2e/test_live_trading_phase1.py -vv); then
   echo "[paper-soak] ERROR: Phase 1 E2E harness failed" >&2
   echo "[paper-soak] Capturing logs..." >&2
   docker compose -f "${_COMPOSE_FILE}" logs ib-gateway > logs/paper-soak-ibgateway.log 2>&1 || true
