@@ -184,7 +184,7 @@ echo "[paper-soak] Stack healthy — all services reported healthy by compose" >
 # 2a. Run Alembic migrations (tables may not exist on a fresh DB)
 # ---------------------------------------------------------------------------
 echo "[paper-soak] Running database migrations..." >&2
-if ! docker compose -f "${_COMPOSE_FILE}" exec -T backend python -c "
+if ! docker compose -f "${_COMPOSE_FILE}" exec -T -e PYTHONPATH=/app/src backend /app/.venv/bin/python -c "
 import asyncio
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -327,13 +327,10 @@ PY
 )
 
 if ! STRATEGY_ID=$(
-  # Codex iter2 P2: use ``python`` directly, NOT ``uv run python``.
-  # The prod Dockerfile's runtime stage does not copy the uv binary,
-  # so ``uv run python`` fails in prod compose before the E2E harness
-  # starts. Plain ``python`` is always on PATH in both dev and prod
-  # images; the project's deps are already installed in the venv
-  # that ``python`` resolves to.
-  docker compose -f "${_COMPOSE_FILE}" exec -T backend python -c "${SEED_PY}" 2>&1
+  # Use the venv python directly — the dev Dockerfile.dev installs deps
+  # into /app/.venv via uv sync, and system python doesn't have them.
+  # Prod Dockerfile copies the venv to the same path, so this works for both.
+  docker compose -f "${_COMPOSE_FILE}" exec -T -e PYTHONPATH=/app/src backend /app/.venv/bin/python -c "${SEED_PY}" 2>&1
 ); then
   echo "[paper-soak] ERROR: smoke strategy seed failed: ${STRATEGY_ID}" >&2
   exit 3
