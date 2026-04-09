@@ -1055,3 +1055,41 @@ async def live_trades(
     ]
 
     return LiveTradesResponse(trades=trades, total=total)
+
+
+@router.get("/audits/{deployment_id}")
+async def live_audits(
+    deployment_id: UUID,
+    claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+) -> dict[str, Any]:
+    """Order attempt audits for a specific deployment.
+
+    Used by the E2E harness to verify order submission.
+    """
+    from msai.models.order_attempt_audit import OrderAttemptAudit
+
+    rows = (
+        await db.execute(
+            select(OrderAttemptAudit)
+            .where(OrderAttemptAudit.deployment_id == deployment_id)
+            .order_by(OrderAttemptAudit.ts_attempted.desc())
+            .limit(50)
+        )
+    ).scalars().all()
+
+    return {
+        "audits": [
+            {
+                "id": str(r.id),
+                "client_order_id": r.client_order_id,
+                "instrument_id": r.instrument_id,
+                "side": r.side,
+                "quantity": str(r.quantity),
+                "status": r.status,
+                "strategy_code_hash": r.strategy_code_hash,
+                "timestamp": r.ts_attempted.isoformat(),
+            }
+            for r in rows
+        ]
+    }
