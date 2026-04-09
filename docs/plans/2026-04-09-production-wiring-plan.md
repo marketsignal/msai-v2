@@ -182,7 +182,7 @@ async def live_trades(
             "instrument_id": r.instrument_id,
             "side": r.side,
             "quantity": str(r.quantity),
-            "price": str(r.fill_price) if r.fill_price else None,
+            "price": str(r.price) if r.price else None,
             "status": r.status,
             "client_order_id": r.client_order_id,
             "timestamp": r.updated_at.isoformat() if r.updated_at else None,
@@ -268,9 +268,13 @@ async def _start_projection_tasks() -> None:
 
     state = get_projection_state()
 
+    # StateApplier takes a prepared AsyncRedis instance, not a URL string
+    import redis.asyncio as aioredis
+    redis_client = aioredis.from_url(settings.redis_url, decode_responses=True)
+
     # StateApplier — subscribes to msai:live:state:* and feeds ProjectionState
     applier = StateApplier(
-        redis_url=settings.redis_url,
+        redis=redis_client,
         projection_state=state,
     )
     _projection_stop.clear()
@@ -616,16 +620,19 @@ Read `__main__.py` `_build_production_payload_factory` and `trading_node_subproc
 
 **Step 2: Implement**
 
-In `__main__.py`, inside `_build_production_payload_factory`, after the instrument resolution:
+**IMPORTANT:** Callables cannot be pickled across `mp.Process` boundaries. The `MarketHoursService` + `make_market_hours_check` must be constructed INSIDE the subprocess, not in `__main__.py`.
+
+In `trading_node_subprocess.py`, inside `_build_real_node` (the production node factory), AFTER the `TradingNode` is built but BEFORE the strategy is started:
 
 ```python
 from msai.services.nautilus.market_hours import MarketHoursService, make_market_hours_check
 
+# Construct market hours check inside the subprocess (cannot pickle callables across processes)
 market_hours_svc = MarketHoursService(session_factory=session_factory)
 market_hours_check = make_market_hours_check(market_hours_svc)
 ```
 
-Pass `market_hours_check` via `TradingNodePayload` (add field if needed) to the subprocess. In `_build_real_node`, pass it to the strategy config as `_market_hours_check=payload.market_hours_check`.
+Then pass `market_hours_check` to the strategy's `_market_hours_check` field when constructing the `RiskAwareStrategy` config. The `session_factory` is already available inside the subprocess (created from `payload.database_url`).
 
 **Step 3: Run existing tests**
 
