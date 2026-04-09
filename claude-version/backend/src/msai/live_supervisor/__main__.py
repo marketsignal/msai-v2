@@ -240,6 +240,7 @@ def _build_production_payload_factory(
                 strategy_config_path=paths.config_path,
                 strategy_config=merged_strategy_config,
                 paper_symbols=paper_symbols,
+                canonical_instruments=list(deployment.instruments),
                 ib_host=settings.ib_host,
                 ib_port=settings.ib_port,
                 # Codex iter3 P1: use the deployment row's

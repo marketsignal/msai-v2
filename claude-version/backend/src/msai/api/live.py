@@ -974,7 +974,13 @@ async def live_positions(
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> LivePositionsResponse:
-    """Open positions across all active deployments, read from ProjectionState."""
+    """Open positions across all active deployments, read from ProjectionState.
+
+    NOTE: This endpoint returns positions for ALL active deployments,
+    not scoped to the authenticated user. This is by design — MSAI is
+    a single-operator platform (not multi-tenant). If multi-operator
+    support is added, filter by deployment.started_by == user_id.
+    """
     from msai.api.live_deps import get_position_reader
 
     reader = get_position_reader()
@@ -1007,7 +1013,11 @@ async def live_trades(
     limit: int = 50,
     offset: int = 0,
 ) -> LiveTradesResponse:
-    """Recent live trade executions from order_attempt_audits."""
+    """Recent live trade executions from order_attempt_audits.
+
+    NOTE: Returns ALL live fills, not scoped to the authenticated user.
+    Single-operator design — see /positions docstring for rationale.
+    """
     from msai.models.order_attempt_audit import OrderAttemptAudit
 
     count_q = select(func.count()).select_from(OrderAttemptAudit).where(

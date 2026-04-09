@@ -109,6 +109,10 @@ class TradingNodePayload:
     strategy_config_path: str
     strategy_config: dict[str, Any] = field(default_factory=dict)
     paper_symbols: list[str] = field(default_factory=list)
+    canonical_instruments: list[str] = field(default_factory=list)
+    """Original canonical instrument IDs (e.g. ``AAPL.NASDAQ``) from the
+    deployment row. Used by MarketHoursService to prime trading hours
+    from the instrument_cache table (which keys on canonical_id)."""
     ib_host: str = "127.0.0.1"
     ib_port: int = 4002
     ib_account_id: str = "DU0000000"
@@ -1084,10 +1088,10 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
             from msai.services.nautilus.risk import RiskAwareStrategy
 
             svc = MarketHoursService()
-            # Prime with the deployment's canonical instrument IDs from
-            # paper_symbols (the actual symbols the TradingNode subscribes to).
-            # strategy_config["instruments"] is NOT populated by the supervisor.
-            instrument_ids = list(p.paper_symbols) if p.paper_symbols else []
+            # Prime with canonical instrument IDs (e.g. "AAPL.NASDAQ").
+            # paper_symbols contains bare tickers ("AAPL") which don't
+            # match instrument_cache.canonical_id. Codex review P1 fix.
+            instrument_ids = list(p.canonical_instruments) if p.canonical_instruments else []
             if instrument_ids:
                 async with sf() as session:
                     await svc.prime(session, instrument_ids)
