@@ -57,7 +57,7 @@ services:
       # semantics as live-supervisor so compose fails instantly
       # without credentials.
       IB_HOST: ${IB_HOST:-ib-gateway}
-      IB_PORT: ${IB_PORT:-4002}
+      IB_PORT: ${IB_PORT:-4004}
       IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:?Set IB_ACCOUNT_ID in .env}
     depends_on:
       postgres:
@@ -133,7 +133,7 @@ services:
       # network, the gateway is reachable at ``ib-gateway:4002``
       # (paper) or ``ib-gateway:4001`` (live).
       IB_HOST: ib-gateway
-      IB_PORT: ${IB_PORT:-4002}
+      IB_PORT: ${IB_PORT:-4004}
       IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:?Set IB_ACCOUNT_ID in .env}
       # Force-present so compose fails fast if the operator left
       # ib-gateway's credentials out of .env — otherwise the

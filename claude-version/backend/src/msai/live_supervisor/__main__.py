@@ -160,14 +160,15 @@ def _build_production_payload_factory(
             # connection (which gateway container to reach), not
             # the DEPLOYMENT's business intent (which account to
             # trade under).
-            _paper_port = 4002
-            _live_port = 4001
-            expected_port = _paper_port if deployment.paper_trading else _live_port
-            if settings.ib_port != expected_port:
+            # Accept both raw IB ports and socat proxy ports.
+            _paper_ports = (4002, 4004)
+            _live_ports = (4001, 4003)
+            expected_ports = _paper_ports if deployment.paper_trading else _live_ports
+            if settings.ib_port not in expected_ports:
                 raise ValueError(
                     f"deployment {deployment_id} has paper_trading="
-                    f"{deployment.paper_trading} (expected IB_PORT="
-                    f"{expected_port}) but supervisor is configured "
+                    f"{deployment.paper_trading} (expected IB_PORT in "
+                    f"{expected_ports}) but supervisor is configured "
                     f"with IB_PORT={settings.ib_port}. Flipping modes "
                     f"requires restarting the supervisor with matching "
                     f"IB_PORT — otherwise the deployment would connect "

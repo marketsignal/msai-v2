@@ -64,7 +64,7 @@ services:
       # Using the same defaults + fail-fast behavior as
       # live-supervisor so the two stay in lockstep.
       IB_HOST: ${IB_HOST:-ib-gateway}
-      IB_PORT: ${IB_PORT:-4002}
+      IB_PORT: ${IB_PORT:-4004}
       IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:-DU0000000}
     depends_on:
       postgres:
@@ -147,7 +147,7 @@ services:
       # backend service bypasses Docker's host-port remapping and
       # hits the container's internal port directly.
       IB_HOST: ib-gateway
-      IB_PORT: "4002"
+      IB_PORT: "4004"
       IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:?Set IB_ACCOUNT_ID in .env — must be DU* for paper}
       # TWS_USERID / TWS_PASSWORD are NOT consumed by the supervisor
       # itself, but we force them present here so `docker compose up`

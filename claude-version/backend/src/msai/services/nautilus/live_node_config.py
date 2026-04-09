@@ -63,8 +63,13 @@ from msai.services.nautilus.live_instrument_bootstrap import (
 # Both with the same wire protocol, distinguished only by which account
 # the gateway is logged into. Mismatching the port and account id is
 # the silent failure mode gotcha #6 catches.
-_IB_PAPER_PORT = 4002
-_IB_LIVE_PORT = 4001
+# Socat proxy ports used by the gnzsnz/ib-gateway-docker image.
+# The gateway's Java process listens on 127.0.0.1:4002 (paper) /
+# 127.0.0.1:4001 (live), but socat proxies them to 0.0.0.0:4004 /
+# 0.0.0.0:4003 so other containers can connect. Both raw and socat
+# ports are accepted.
+_IB_PAPER_PORTS = (4002, 4004)
+_IB_LIVE_PORTS = (4001, 4003)
 _IB_PAPER_PREFIXES = ("DU", "DF")  # IB paper-account ids: DU (standard), DF/DFP (FA sub-accounts)
 
 
@@ -184,14 +189,14 @@ def _validate_port_account_consistency(port: int, account_id: str) -> None:
             "to a real paper or live account id before starting a deployment."
         )
     is_paper_account = any(normalized_account.startswith(p) for p in _IB_PAPER_PREFIXES)
-    if port == _IB_PAPER_PORT:
+    if port in _IB_PAPER_PORTS:
         if not is_paper_account:
             raise ValueError(
                 f"IB paper port {port} requires a paper account id (starts with "
                 f"one of {_IB_PAPER_PREFIXES}); got live account {normalized_account!r}. "
                 "This combination silently produces no data — see Nautilus gotcha #6."
             )
-    elif port == _IB_LIVE_PORT:
+    elif port in _IB_LIVE_PORTS:
         if is_paper_account:
             raise ValueError(
                 f"IB live port {port} requires a live account id (must NOT start "
