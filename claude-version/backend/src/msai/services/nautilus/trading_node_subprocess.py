@@ -341,6 +341,7 @@ async def run_subprocess_async(
     shutdown_event: asyncio.Event | None = None,
     skip_dispose: bool = False,
     on_node_constructed: Any = None,
+    on_post_build: Any = None,
 ) -> int:
     """Execute one trading subprocess lifecycle end-to-end.
 
@@ -581,6 +582,13 @@ async def run_subprocess_async(
         # NO ``asyncio.wait_for`` around it — the supervisor
         # watchdog is the external kill switch for wedged builds.
         node.build()
+
+        # Post-build hook: lets the production wrapper inject
+        # collaborators (e.g., MarketHoursService check) into the
+        # strategy after Nautilus has constructed it during build().
+        if on_post_build is not None:
+            await on_post_build(node, payload, session_factory)
+
         if shutdown_requested.is_set():
             _record_clean_exit("after_build")
             return terminal_exit_code
@@ -1063,6 +1071,34 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
     def _capture_node(n: Any) -> None:
         node_box.append(n)
 
+    async def _wire_market_hours(
+        node: Any, p: TradingNodePayload, sf: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Post-build hook: construct MarketHoursService inside the
+        subprocess and inject it into any RiskAwareStrategy."""
+        try:
+            from msai.services.nautilus.market_hours import (
+                MarketHoursService,
+                make_market_hours_check,
+            )
+            from msai.services.nautilus.risk import RiskAwareStrategy
+
+            svc = MarketHoursService()
+            # Prime with the deployment's instrument IDs
+            instrument_ids = list(p.strategy_config.get("instruments", []))
+            if instrument_ids:
+                async with sf() as session:
+                    await svc.prime(session, instrument_ids)
+
+            check = make_market_hours_check(svc)
+
+            # Inject into every strategy that is a RiskAwareStrategy
+            for strategy in node.trader.strategies():
+                if isinstance(strategy, RiskAwareStrategy):
+                    strategy._market_hours_check = check  # noqa: SLF001
+        except Exception:  # noqa: BLE001
+            log.warning("market_hours_wiring_failed")
+
     try:
         exit_code = asyncio.run(
             run_subprocess_async(
@@ -1074,6 +1110,7 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
                 install_signal_handlers=True,
                 skip_dispose=True,
                 on_node_constructed=_capture_node,
+                on_post_build=_wire_market_hours,
             )
         )
     finally:
