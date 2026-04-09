@@ -305,11 +305,23 @@ def build_live_trading_node_config(
     data_client_id = _derive_data_client_id(deployment_slug)
     exec_client_id = _derive_exec_client_id(deployment_slug)
 
+    # Map the string config value to the Nautilus enum.
+    from nautilus_trader.adapters.interactive_brokers.config import IBMarketDataTypeEnum
+
+    _mdt_map = {
+        "REALTIME": IBMarketDataTypeEnum.REALTIME,
+        "DELAYED": IBMarketDataTypeEnum.DELAYED,
+        "DELAYED_FROZEN": IBMarketDataTypeEnum.DELAYED_FROZEN,
+    }
+    _mdt_str = settings.ib_market_data_type.upper()
+    _market_data_type = _mdt_map.get(_mdt_str, IBMarketDataTypeEnum.REALTIME)
+
     data_client = InteractiveBrokersDataClientConfig(
         ibg_host=ib_settings.host,
         ibg_port=ib_settings.port,
         ibg_client_id=data_client_id,
         instrument_provider=instrument_provider_config,
+        market_data_type=_market_data_type,
     )
     exec_client = InteractiveBrokersExecClientConfig(
         ibg_host=ib_settings.host,
