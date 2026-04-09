@@ -155,6 +155,8 @@ class OrderAuditWriter:
                 is_live=facts.is_live,
             )
             session.add(audit)
+        from msai.services.observability.trading_metrics import ORDERS_SUBMITTED
+        ORDERS_SUBMITTED.inc()
         log.info(
             "order_audit_submitted",
             extra={
@@ -178,6 +180,8 @@ class OrderAuditWriter:
 
     async def update_filled(self, client_order_id: str) -> None:
         """Order fully filled. Terminal state."""
+        from msai.services.observability.trading_metrics import ORDERS_FILLED
+        ORDERS_FILLED.inc()
         await self._update_status(client_order_id, status=_ORDER_STATUS_FILLED)
 
     async def update_partially_filled(self, client_order_id: str) -> None:

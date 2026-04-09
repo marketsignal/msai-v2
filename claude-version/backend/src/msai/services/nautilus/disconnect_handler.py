@@ -169,6 +169,8 @@ class IBDisconnectHandler:
                             "grace_s": self._grace_seconds,
                         },
                     )
+                    from msai.services.observability.trading_metrics import IB_DISCONNECTS
+                    IB_DISCONNECTS.inc()
                     await self._fire_halt()
                     return  # one-shot
 

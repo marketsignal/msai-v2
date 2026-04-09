@@ -714,6 +714,9 @@ async def live_kill_all(
     any concurrent ``/start`` request landing during the
     publish loop is also blocked.
     """
+    from msai.services.observability.trading_metrics import KILL_SWITCH_ACTIVATED
+    KILL_SWITCH_ACTIVATED.inc()
+
     halt_set_at = datetime.now(UTC)
     user_id = await _resolve_user_id(db, claims)
 
