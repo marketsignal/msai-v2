@@ -76,6 +76,7 @@ import asyncio
 
 _projection_tasks: list[asyncio.Task[None]] = []
 _projection_stop = asyncio.Event()
+_projection_redis_clients: list[Any] = []  # closed on shutdown
 
 # Module-level singleton so /api/v1/live/start can register new deployments
 # after boot. Lazy-initialized in _start_projection_tasks.
@@ -121,11 +122,13 @@ async def _start_projection_tasks() -> None:
 
     # StateApplier needs text-mode Redis (pub/sub payloads are JSON strings)
     redis_text = AsyncRedis.from_url(settings.redis_url, decode_responses=True)
+    _projection_redis_clients.append(redis_text)
     applier = StateApplier(redis=redis_text, projection_state=state)
     _projection_tasks.append(asyncio.create_task(applier.run(_projection_stop)))
 
     # ProjectionConsumer needs binary-mode Redis (Nautilus streams carry msgpack bytes)
     redis_binary = AsyncRedis.from_url(settings.redis_url, decode_responses=False)
+    _projection_redis_clients.append(redis_binary)
     registry = get_stream_registry()
 
     # Populate registry with active deployments from DB so the consumer
@@ -164,7 +167,7 @@ async def _start_projection_tasks() -> None:
 
 
 async def _stop_projection_tasks() -> None:
-    """Signal projection tasks to stop and await them."""
+    """Signal projection tasks to stop, await them, close Redis clients."""
     _projection_stop.set()
     for task in _projection_tasks:
         task.cancel()
@@ -173,6 +176,14 @@ async def _stop_projection_tasks() -> None:
         except asyncio.CancelledError:
             pass
     _projection_tasks.clear()
+
+    # Close Redis clients to avoid connection leaks on shutdown
+    for client in _projection_redis_clients:
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+    _projection_redis_clients.clear()
 
 
 @asynccontextmanager

@@ -59,7 +59,9 @@ class IBAccountService:
             await ib.connectAsync(
                 self.host, self.port, clientId=_ACCOUNT_CLIENT_ID, timeout=5
             )
-            tags = await ib.accountSummaryAsync()
+            import asyncio as _asyncio
+
+            tags = await _asyncio.wait_for(ib.accountSummaryAsync(), timeout=10)
             result = dict(_ZERO_SUMMARY)
             tag_map = {
                 "NetLiquidation": "net_liquidation",

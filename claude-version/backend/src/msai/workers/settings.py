@@ -107,12 +107,12 @@ class WorkerSettings:
 
     # Cron jobs — scheduled background work.
     # Times are UTC; 20:30 UTC ≈ 4:30 PM ET (EDT), 05:00 UTC ≈ 1:00 AM ET (EDT).
-    from arq.cron import cron
+    from arq.cron import cron as _cron
 
-    from msai.workers.nightly_ingest import run_nightly_ingest
-    from msai.workers.pnl_aggregation import aggregate_daily_pnl
+    from msai.workers.nightly_ingest import run_nightly_ingest as _nightly
+    from msai.workers.pnl_aggregation import aggregate_daily_pnl as _pnl
 
     cron_jobs = [
-        cron(aggregate_daily_pnl, hour=20, minute=30),
-        cron(run_nightly_ingest, hour=5, minute=0),
+        _cron(_pnl, hour=20, minute=30),
+        _cron(_nightly, hour=5, minute=0),
     ]
