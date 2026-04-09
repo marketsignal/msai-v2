@@ -10,7 +10,7 @@ Wire the remaining production gaps in claude-version so the system is fully func
 | --------- | ------------------------------------------ |
 | Command   | /new-feature msai-production-wiring        |
 | Phase     | 4 — Execute                                |
-| Next step | TDD execution (Task 4 — batch 2)            |
+| Next step | Task 11 (doc regeneration) then quality gates |
 
 ### Checklist
 
@@ -23,7 +23,7 @@ Wire the remaining production gaps in claude-version so the system is fully func
 - [x] Brainstorming complete
 - [x] Plan written
 - [x] Plan review loop (2 iterations) — Claude found 3 P1s (fixed), Codex found 7 P1s (documented as corrections). No P0s. Snippets marked directional.
-- [ ] TDD execution complete
+- [ ] TDD execution complete (Tasks 1-10 done, Task 11 remaining)
 - [ ] Code review loop (0 iterations) — iterate until no P0/P1/P2
 - [ ] Simplified
 - [ ] Verified (tests/lint/types)
