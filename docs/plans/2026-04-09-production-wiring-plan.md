@@ -10,6 +10,27 @@
 
 ---
 
+## Review Corrections (Iteration 1+2)
+
+**IMPORTANT: The code snippets in this plan are DIRECTIONAL, not copy-paste-ready.** The review loop found that several snippets were written from memory rather than from reading the actual source. During execution, each task MUST be implemented by reading the actual code first. The corrections below document what the reviews caught:
+
+| Task | Finding                                                                                         | Fix                                                                                                |
+| ---- | ----------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| 2    | `fill_price` column doesn't exist on `OrderAttemptAudit`                                        | Use `r.price` instead                                                                              |
+| 3    | `StateApplier` takes `AsyncRedis` object, not URL string                                        | Create `aioredis.from_url(...)` first, pass the client                                             |
+| 3    | Plan only starts `StateApplier`, not `ProjectionConsumer` + `StreamRegistry` + `DualPublisher`  | Must wire full projection stack for events to flow                                                 |
+| 4    | `clientId=0` conflicts with live-node config (reserved as master slot)                          | Use a dedicated client ID like `99` for account queries                                            |
+| 4    | Returning `{}` on offline breaks existing test assertions                                       | Return full dict with zero values on offline, not empty                                            |
+| 6    | `RiskAwareStrategy.submit_order_with_risk_check()` is synchronous, no `_alerting` slot          | Only wire alerts in async surfaces: `IBDisconnectHandler.on_halt` + `ProcessManager` spawn failure |
+| 7    | `MarketHoursService` has no `session_factory` kwarg — uses no-arg constructor + async `prime()` | Construct + prime inside subprocess using `payload.database_url`                                   |
+| 8    | PnL aggregation writes `pnl=0` — structurally wrong without fill price data                     | Need to source PnL from Nautilus `AccountState` events via projection, not from audit rows         |
+| 9    | UTC times wrong for EDT: 4:30 PM ET = 20:30 UTC (not 21:30), 1:00 AM ET = 05:00 UTC (not 06:00) | Fix cron hour values                                                                               |
+| 9    | Uses `settings.data_root` but worker writes to `settings.parquet_root`                          | Use correct config path                                                                            |
+| 10   | Components have internal mock data (props), not just page-level imports                         | Must update component props interfaces + pass real data down                                       |
+| 11   | `docs/architecture/` doesn't exist in worktree (only on main)                                   | Create the directory during execution                                                              |
+
+---
+
 ### Task 1: Wire `/api/v1/live/positions` to PositionReader
 
 **Files:**
