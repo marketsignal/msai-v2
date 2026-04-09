@@ -117,7 +117,11 @@ async def test_phase_1_e2e_full_lifecycle() -> None:  # noqa: C901, PLR0912, PLR
     """Full Phase 1 lifecycle: start → heartbeat → first order →
     backend crash → restart → stop → flat positions. See module
     docstring for the step breakdown."""
-    async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=START_TIMEOUT_S) as client:
+    _api_key = os.environ.get("MSAI_API_KEY", "msai-dev-key")
+    _auth_headers = {"X-API-Key": _api_key}
+    async with httpx.AsyncClient(
+        base_url=BACKEND_URL, timeout=START_TIMEOUT_S, headers=_auth_headers
+    ) as client:
         # ------------------------------------------------------------
         # Step 1: POST /start with the smoke strategy
         # ------------------------------------------------------------
