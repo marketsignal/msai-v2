@@ -114,7 +114,7 @@ class IBSettings(BaseModel):
     multi-account setup that runs paper and live nodes in parallel."""
 
     host: str = Field(default="127.0.0.1")
-    port: int = Field(default=_IB_PAPER_PORT)
+    port: int = Field(default=4004)
     account_id: str = Field(default="DU0000000")
 
 
@@ -205,8 +205,8 @@ def _validate_port_account_consistency(port: int, account_id: str) -> None:
             )
     else:
         raise ValueError(
-            f"unsupported IB Gateway port {port}: only {_IB_LIVE_PORT} (live) "
-            f"and {_IB_PAPER_PORT} (paper) are recognized."
+            f"unsupported IB Gateway port {port}: only {_IB_LIVE_PORTS} (live) "
+            f"and {_IB_PAPER_PORTS} (paper) are recognized."
         )
 
 
