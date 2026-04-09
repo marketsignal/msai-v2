@@ -176,22 +176,25 @@ def _build_production_payload_factory(
                 )
 
             # ``account_id`` consistency with ``paper_trading``.
-            # Paper accounts start with ``DU``; live accounts don't.
+            # Paper accounts start with ``DU`` or ``DF`` (FA sub-accounts
+            # use ``DFP`` prefix); live accounts don't start with ``D``.
             # This mirrors ``_validate_port_account_consistency`` in
             # ``live_node_config.py`` but catches the mismatch one
             # layer earlier (before build_live_trading_node_config
             # even sees it).
+            _paper_prefixes = ("DU", "DF")
             deployment_account = (deployment.account_id or "").strip()
-            if deployment.paper_trading and not deployment_account.startswith("DU"):
+            _is_paper = any(deployment_account.startswith(p) for p in _paper_prefixes)
+            if deployment.paper_trading and not _is_paper:
                 raise ValueError(
                     f"deployment {deployment_id} has paper_trading=True but "
                     f"account_id='{deployment_account}' does not start with "
-                    f"'DU'. Paper accounts must use DU* account IDs."
+                    f"any of {_paper_prefixes}. Paper accounts must use DU*/DF* IDs."
                 )
-            if not deployment.paper_trading and deployment_account.startswith("DU"):
+            if not deployment.paper_trading and _is_paper:
                 raise ValueError(
                     f"deployment {deployment_id} has paper_trading=False but "
-                    f"account_id='{deployment_account}' starts with 'DU'. "
+                    f"account_id='{deployment_account}' starts with a paper prefix. "
                     f"Live deployments require non-paper account IDs."
                 )
 
