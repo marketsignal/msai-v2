@@ -199,6 +199,10 @@ services:
       # this the trading subprocess's first connect hangs waiting
       # for a human click.
       TWS_ACCEPT_INCOMING: "accept"
+      # Auto-take-over when another session (TWS, another gateway) is
+      # already logged in with these credentials. Without this, IBC
+      # shows "Existing session detected" dialog and hangs.
+      EXISTING_SESSION_DETECTED_ACTION: "primary"
       # Bypass the "you are running a newer version than the saved
       # settings" dialog that fires after an IB Gateway version bump.
       BYPASS_WARNING: "yes"
