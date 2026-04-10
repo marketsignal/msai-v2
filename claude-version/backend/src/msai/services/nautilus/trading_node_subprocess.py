@@ -1105,6 +1105,68 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
         except Exception:  # noqa: BLE001
             log.warning("market_hours_wiring_failed")
 
+        # Engine-level audit hook: subscribe to ALL order events via
+        # the message bus so every order is audited regardless of
+        # whether the strategy uses RiskAwareStrategy or not.
+        # Topic pattern: events.order.{strategy_id}
+        try:
+            import asyncio as _aio
+            from datetime import UTC, datetime
+            from decimal import Decimal
+
+            from msai.services.nautilus.audit_hook import OrderAuditWriter, OrderSubmittedFacts
+
+            writer = OrderAuditWriter(sf)
+            _loop = _aio.get_running_loop()
+
+            def _on_order_event_sync(event: Any) -> None:
+                """Sync handler bridging to async audit writer.
+
+                The Nautilus msgbus calls handlers synchronously from
+                the Cython event loop. We schedule the async DB write
+                as a fire-and-forget task on the running loop.
+                """
+                event_type = type(event).__name__
+
+                async def _write() -> None:
+                    try:
+                        if event_type == "OrderSubmitted":
+                            await writer.write_submitted(
+                                OrderSubmittedFacts(
+                                    client_order_id=str(event.client_order_id),
+                                    strategy_id=p.deployment_id,
+                                    strategy_code_hash="engine-audit",
+                                    instrument_id=str(event.instrument_id),
+                                    side="UNKNOWN",
+                                    quantity=Decimal("0"),
+                                    price=None,
+                                    order_type="MARKET",
+                                    ts_attempted=datetime.now(UTC),
+                                    deployment_id=p.deployment_id,
+                                    is_live=True,
+                                )
+                            )
+                        elif event_type == "OrderFilled":
+                            await writer.update_filled(str(event.client_order_id))
+                        elif event_type == "OrderAccepted":
+                            broker_id = str(event.venue_order_id) if hasattr(event, "venue_order_id") else None
+                            await writer.update_accepted(str(event.client_order_id), broker_order_id=broker_id)
+                        elif event_type == "OrderCanceled":
+                            await writer.update_cancelled(str(event.client_order_id), reason=None)
+                        elif event_type == "OrderRejected":
+                            reason = str(event.reason) if hasattr(event, "reason") else None
+                            await writer.update_rejected(str(event.client_order_id), reason=reason)
+                    except Exception:  # noqa: BLE001
+                        log.debug("engine_audit_event_failed", extra={"event_type": event_type})
+
+                _loop.create_task(_write())
+
+            # Subscribe to ALL order events via wildcard pattern
+            node.kernel.msgbus.subscribe(topic="events.order.*", handler=_on_order_event_sync)
+            log.info("engine_audit_hook_wired")
+        except Exception:  # noqa: BLE001
+            log.warning("engine_audit_hook_wiring_failed")
+
     try:
         exit_code = asyncio.run(
             run_subprocess_async(
