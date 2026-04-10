@@ -316,12 +316,19 @@ def build_live_trading_node_config(
     _mdt_str = settings.ib_market_data_type.upper()
     _market_data_type = _mdt_map.get(_mdt_str, IBMarketDataTypeEnum.REALTIME)
 
+    # use_regular_trading_hours=False allows extended-hours data.
+    # Required for FX (24h) and for equity strategies that need
+    # after-hours bars. Without this, Nautilus filters bars older
+    # than the RTH subscription start (market_data.py:1305).
+    _use_rth = settings.ib_use_regular_trading_hours
+
     data_client = InteractiveBrokersDataClientConfig(
         ibg_host=ib_settings.host,
         ibg_port=ib_settings.port,
         ibg_client_id=data_client_id,
         instrument_provider=instrument_provider_config,
         market_data_type=_market_data_type,
+        use_regular_trading_hours=_use_rth,
     )
     exec_client = InteractiveBrokersExecClientConfig(
         ibg_host=ib_settings.host,

@@ -68,6 +68,7 @@ services:
       IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:-DU0000000}
       # IB market data type: REALTIME (requires subscription), DELAYED, DELAYED_FROZEN
       IB_MARKET_DATA_TYPE: ${IB_MARKET_DATA_TYPE:-REALTIME}
+      IB_USE_REGULAR_TRADING_HOURS: ${IB_USE_REGULAR_TRADING_HOURS:-false}
     depends_on:
       postgres:
         condition: service_healthy
@@ -152,6 +153,7 @@ services:
       IB_PORT: "4004"
       IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:?Set IB_ACCOUNT_ID in .env — must be DU* for paper}
       IB_MARKET_DATA_TYPE: ${IB_MARKET_DATA_TYPE:-REALTIME}
+      IB_USE_REGULAR_TRADING_HOURS: ${IB_USE_REGULAR_TRADING_HOURS:-false}
       # TWS_USERID / TWS_PASSWORD are NOT consumed by the supervisor
       # itself, but we force them present here so `docker compose up`
       # fails fast if the operator activated the live profile without
