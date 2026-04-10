@@ -60,6 +60,13 @@ PHASE_1_PAPER_SYMBOLS: dict[str, IBContract] = {
         primaryExchange="NASDAQ",
         currency="USD",
     ),
+    # FX — trades 24h, useful for after-hours smoke testing
+    "EUR/USD": IBContract(
+        secType="CASH",
+        symbol="EUR",
+        exchange="IDEALPRO",
+        currency="USD",
+    ),
 }
 
 
