@@ -1116,7 +1116,8 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
 
             from msai.services.nautilus.audit_hook import OrderAuditWriter, OrderSubmittedFacts
 
-            writer = OrderAuditWriter(sf)
+            writer = OrderAuditWriter(db=sf)  # keyword-only init (Codex fix)
+            _cache = node.kernel.cache  # for fetching full order details
             _loop = _aio.get_running_loop()
 
             def _on_order_event_sync(event: Any) -> None:
@@ -1131,16 +1132,25 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
                 async def _write() -> None:
                     try:
                         if event_type == "OrderSubmitted":
+                            # OrderSubmitted doesn't carry side/qty/price —
+                            # fetch the full order from Nautilus cache (Codex fix)
+                            order = _cache.order(event.client_order_id)
+                            _side = str(order.side) if order else "UNKNOWN"
+                            _qty = Decimal(str(order.quantity)) if order else Decimal("0")
+                            _price = None
+                            _order_type = str(order.order_type) if order else "UNKNOWN"
+                            _instrument = str(order.instrument_id) if order else str(event.instrument_id)
+
                             await writer.write_submitted(
                                 OrderSubmittedFacts(
                                     client_order_id=str(event.client_order_id),
                                     strategy_id=p.deployment_id,
                                     strategy_code_hash="engine-audit",
-                                    instrument_id=str(event.instrument_id),
-                                    side="UNKNOWN",
-                                    quantity=Decimal("0"),
-                                    price=None,
-                                    order_type="MARKET",
+                                    instrument_id=_instrument,
+                                    side=_side,
+                                    quantity=_qty,
+                                    price=_price,
+                                    order_type=_order_type,
                                     ts_attempted=datetime.now(UTC),
                                     deployment_id=p.deployment_id,
                                     is_live=True,
@@ -1165,11 +1175,6 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
             node.kernel.msgbus.subscribe(topic="events.order.*", handler=_on_order_event_sync)
             log.info("engine_audit_hook_wired")
         except Exception as _audit_exc:  # noqa: BLE001
-            # TODO: investigate msgbus.subscribe wildcard pattern support
-            # in Nautilus 1.223.0. The engine-level audit hook is the
-            # correct long-term solution (principle #5: every order
-            # auditable). For now, strategies that need audit trails
-            # should inherit from RiskAwareStrategy.
             log.warning(
                 "engine_audit_hook_wiring_failed",
                 extra={"error": repr(_audit_exc)},
