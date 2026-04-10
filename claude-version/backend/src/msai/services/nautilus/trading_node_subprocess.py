@@ -1165,7 +1165,15 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
             node.kernel.msgbus.subscribe(topic="events.order.*", handler=_on_order_event_sync)
             log.info("engine_audit_hook_wired")
         except Exception as _audit_exc:  # noqa: BLE001
-            log.warning("engine_audit_hook_wiring_failed", extra={"error": str(_audit_exc)})
+            # TODO: investigate msgbus.subscribe wildcard pattern support
+            # in Nautilus 1.223.0. The engine-level audit hook is the
+            # correct long-term solution (principle #5: every order
+            # auditable). For now, strategies that need audit trails
+            # should inherit from RiskAwareStrategy.
+            log.warning(
+                "engine_audit_hook_wiring_failed",
+                extra={"error": repr(_audit_exc)},
+            )
 
     try:
         exit_code = asyncio.run(
