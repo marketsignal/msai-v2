@@ -64,8 +64,11 @@ services:
       # Using the same defaults + fail-fast behavior as
       # live-supervisor so the two stay in lockstep.
       IB_HOST: ${IB_HOST:-ib-gateway}
-      IB_PORT: ${IB_PORT:-4002}
+      IB_PORT: ${IB_PORT:-4004}
       IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:-DU0000000}
+      # IB market data type: REALTIME (requires subscription), DELAYED, DELAYED_FROZEN
+      IB_MARKET_DATA_TYPE: ${IB_MARKET_DATA_TYPE:-REALTIME}
+      IB_USE_REGULAR_TRADING_HOURS: ${IB_USE_REGULAR_TRADING_HOURS:-false}
     depends_on:
       postgres:
         condition: service_healthy
@@ -147,8 +150,10 @@ services:
       # backend service bypasses Docker's host-port remapping and
       # hits the container's internal port directly.
       IB_HOST: ib-gateway
-      IB_PORT: "4002"
+      IB_PORT: "4004"
       IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:?Set IB_ACCOUNT_ID in .env — must be DU* for paper}
+      IB_MARKET_DATA_TYPE: ${IB_MARKET_DATA_TYPE:-REALTIME}
+      IB_USE_REGULAR_TRADING_HOURS: ${IB_USE_REGULAR_TRADING_HOURS:-false}
       # TWS_USERID / TWS_PASSWORD are NOT consumed by the supervisor
       # itself, but we force them present here so `docker compose up`
       # fails fast if the operator activated the live profile without
@@ -179,7 +184,7 @@ services:
   # from needing IB credentials. See .env.example for activation.
   ib-gateway:
     profiles: ["live"]
-    image: ghcr.io/gnzsnz/ib-gateway:stable
+    image: ghcr.io/gnzsnz/ib-gateway:10.43.1c
     container_name: msai-claude-ib-gateway
     environment:
       TWS_USERID: ${TWS_USERID:?Set TWS_USERID in .env}
@@ -199,6 +204,14 @@ services:
       # this the trading subprocess's first connect hangs waiting
       # for a human click.
       TWS_ACCEPT_INCOMING: "accept"
+      # Trust all IPs on the Docker bridge network so Nautilus clients
+      # from other containers can connect to the API. Without this,
+      # only 127.0.0.1 is trusted and API handshake silently fails.
+      IBC_INI__IBGateway__TrustedIPs: "127.0.0.1,172.0.0.0/8,192.168.0.0/16"
+      # Auto-take-over when another session (TWS, another gateway) is
+      # already logged in with these credentials. Without this, IBC
+      # shows "Existing session detected" dialog and hangs.
+      EXISTING_SESSION_DETECTED_ACTION: "primary"
       # Bypass the "you are running a newer version than the saved
       # settings" dialog that fires after an IB Gateway version bump.
       BYPASS_WARNING: "yes"

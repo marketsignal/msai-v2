@@ -14,6 +14,11 @@ export interface PortfolioSummaryProps {
   /** Override the active-strategies count (e.g. from the API). */
   totalStrategies?: number;
   runningStrategies?: number;
+  /** Real account data from IB Gateway (null = use hardcoded fallback). */
+  accountData?: {
+    net_liquidation: number;
+    unrealized_pnl: number;
+  } | null;
 }
 
 interface StatCardProps {
@@ -61,6 +66,7 @@ function StatCard({
 export function PortfolioSummary({
   totalStrategies,
   runningStrategies,
+  accountData,
 }: PortfolioSummaryProps = {}): React.ReactElement {
   const fallbackRunning = activeStrategies.filter(
     (s) => s.status === "running",
@@ -68,20 +74,24 @@ export function PortfolioSummary({
   const total = totalStrategies ?? activeStrategies.length;
   const running = runningStrategies ?? fallbackRunning;
 
+  // Use real account data if available, otherwise hardcoded fallback
+  const totalValue = accountData?.net_liquidation ?? 125_430.56;
+  const dailyPnl = accountData?.unrealized_pnl ?? 1_234.56;
+
   return (
     <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
       <StatCard
         title="Total Value"
-        value="$125,430.56"
-        change="+$2,340.12 from yesterday"
+        value={`$${totalValue.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+        change={accountData ? "From IB Gateway" : "Mock data"}
         trend="up"
         icon={DollarSign}
       />
       <StatCard
         title="Daily P&L"
-        value="+$1,234.56"
-        change="+0.99% today"
-        trend="up"
+        value={`${dailyPnl >= 0 ? "+" : ""}$${Math.abs(dailyPnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+        change={accountData ? "From IB Gateway" : "Mock data"}
+        trend={dailyPnl >= 0 ? "up" : "down"}
         icon={TrendingUp}
       />
       <StatCard

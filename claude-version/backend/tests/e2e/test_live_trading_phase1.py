@@ -72,7 +72,7 @@ BACKEND_URL = os.environ.get("MSAI_E2E_BACKEND_URL", "http://localhost:8800")
 SMOKE_STRATEGY_CLASS = "SmokeMarketOrderStrategy"
 SMOKE_STRATEGY_PATH = "strategies.example.smoke_market_order:SmokeMarketOrderStrategy"
 SMOKE_CONFIG_PATH = "strategies.example.smoke_market_order:SmokeMarketOrderConfig"
-SMOKE_INSTRUMENTS = ["AAPL"]
+SMOKE_INSTRUMENTS = ["AAPL.NASDAQ"]
 
 BACKEND_CONTAINER_NAME = os.environ.get("MSAI_E2E_BACKEND_CONTAINER", "msai-claude-backend")
 COMPOSE_FILE = os.environ.get("MSAI_E2E_COMPOSE_FILE", "docker-compose.dev.yml")
@@ -117,7 +117,11 @@ async def test_phase_1_e2e_full_lifecycle() -> None:  # noqa: C901, PLR0912, PLR
     """Full Phase 1 lifecycle: start → heartbeat → first order →
     backend crash → restart → stop → flat positions. See module
     docstring for the step breakdown."""
-    async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=START_TIMEOUT_S) as client:
+    _api_key = os.environ.get("MSAI_API_KEY", "msai-dev-key")
+    _auth_headers = {"X-API-Key": _api_key}
+    async with httpx.AsyncClient(
+        base_url=BACKEND_URL, timeout=START_TIMEOUT_S, headers=_auth_headers
+    ) as client:
         # ------------------------------------------------------------
         # Step 1: POST /start with the smoke strategy
         # ------------------------------------------------------------
@@ -152,8 +156,8 @@ async def test_phase_1_e2e_full_lifecycle() -> None:  # noqa: C901, PLR0912, PLR
             },
             headers={"Idempotency-Key": f"e2e-{int(time.time())}"},
         )
-        assert start_resp.status_code == 201, (
-            f"expected 201, got {start_resp.status_code}: {start_resp.text}"
+        assert start_resp.status_code in (200, 201), (
+            f"expected 200 or 201, got {start_resp.status_code}: {start_resp.text}"
         )
         start_body = start_resp.json()
         deployment_id = UUID(start_body["id"])

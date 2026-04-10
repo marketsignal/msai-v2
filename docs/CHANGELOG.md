@@ -63,6 +63,10 @@ All notable changes to msai-v2 will be documented in this file.
   - Script honors `COMPOSE_FILE` + `TRADING_MODE` env var overrides so the same one command runs dev OR prod compose validation
 
 - **2026-04-08** — `TradingNodePayload` gained `redis_url` field (subprocess uses it to build the `IBDisconnectHandler` aioredis client); `core/config.py::Settings` gained `ib_host` / `ib_port` / `startup_health_timeout_s`; `FailureKind` enum gained `SPAWN_FAILED_TRANSIENT`; `release-signoff-checklist.md` swapped the 5-step manual smoke item for `./scripts/verify-paper-soak.sh` plus a new "Production compose stack validation" step; `node.build()` in `run_subprocess_async` now runs directly on the loop thread (was `asyncio.to_thread`) because Nautilus's IB client factory binds `asyncio.Queue`/`Event`/`_create_task` to the calling thread's loop — cross-thread build bound to the wrong loop or raised `RuntimeError: no running event loop`. Supervisor's `startup_hard_timeout_s` watchdog remains the external kill switch for wedged builds.
+- **2026-04-09 — Production wiring (feat/msai-production-wiring, in progress)**
+  - `/api/v1/live/positions` wired to `PositionReader` — queries active deployments, reads from ProjectionState (fast path) or Nautilus Cache (cold path)
+  - `/api/v1/live/trades` wired to `order_attempt_audits` query — returns filled/partially_filled live orders with pagination
+  - FastAPI lifespan starts `StateApplier` + `ProjectionConsumer` + `DualPublisher` + `StreamRegistry` as background tasks so live position data flows from Nautilus message bus → Redis pub/sub → per-worker ProjectionState → `/positions` endpoint
 - **2026-04-08** — Seven Codex review iterations (6 local `codex exec` + 1 GitHub Codex bot PR review) addressed 0 P0 / 11 P1 / 12 P2 findings across PR#1. Every P1 had a corresponding fix commit and test. Full history in PR#1 commit range `f60ea56..f9eaabf`.
 - **2026-04-08** — `_placeholder_trading_subprocess` removed from `live_supervisor/__main__.py` — production subprocess is now wired directly via `spawn_target=_trading_node_subprocess`.
 

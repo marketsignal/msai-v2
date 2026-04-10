@@ -169,6 +169,8 @@ class IBDisconnectHandler:
                             "grace_s": self._grace_seconds,
                         },
                     )
+                    from msai.services.observability.trading_metrics import IB_DISCONNECTS
+                    IB_DISCONNECTS.inc()
                     await self._fire_halt()
                     return  # one-shot
 
@@ -247,8 +249,18 @@ class IBDisconnectHandler:
                 },
             )
 
+        # on_halt FIRST — this is the fail-closed local shutdown path.
+        # Must fire before the email alert because SMTP can be slow/hang
+        # and we must not delay the node shutdown. Codex review P1 fix.
         if self._on_halt is not None:
             try:
                 await self._on_halt()
             except Exception:  # noqa: BLE001
                 log.exception("ib_disconnect_on_halt_callback_failed")
+
+        # Best-effort email alert — after the node is already stopping.
+        try:
+            from msai.services.alerting import AlertService
+            await AlertService().alert_ib_disconnect()
+        except Exception:  # noqa: BLE001
+            log.debug("ib_disconnect_alert_failed")

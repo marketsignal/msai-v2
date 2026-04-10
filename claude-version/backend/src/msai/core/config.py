@@ -53,6 +53,19 @@ class Settings(BaseSettings):
     ib_host: str = "127.0.0.1"
     ib_port: int = 4002
 
+    # IB market data type: REALTIME (default, requires subscription),
+    # DELAYED (15-min delayed, free for most instruments),
+    # DELAYED_FROZEN (last available delayed snapshot).
+    # Set via IB_MARKET_DATA_TYPE env var. If your paper account
+    # doesn't have real-time US equity data, set to DELAYED.
+    ib_market_data_type: str = "REALTIME"
+
+    # Whether to restrict bar data to regular trading hours only.
+    # False = include extended/after-hours data (required for FX 24h
+    # and for equity strategies that trade pre/post market).
+    # True = RTH bars only (default for equity day-trading).
+    ib_use_regular_trading_hours: bool = False
+
     # Maximum wait for ``trader.is_running`` to flip True after
     # ``node.run_async`` starts (Phase 1 task 1.8 / decision #14).
     # Exceeding this marks the row ``failed`` /

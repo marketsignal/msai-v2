@@ -108,7 +108,16 @@ class TradingNodePayload:
     strategy_path: str
     strategy_config_path: str
     strategy_config: dict[str, Any] = field(default_factory=dict)
+    strategy_id: UUID | None = None
+    """FK to ``strategies.id``. Needed by the engine-level audit hook
+    to write valid ``order_attempt_audits`` rows."""
+    strategy_code_hash: str = ""
+    """SHA256 of the strategy file. Needed for audit trail."""
     paper_symbols: list[str] = field(default_factory=list)
+    canonical_instruments: list[str] = field(default_factory=list)
+    """Original canonical instrument IDs (e.g. ``AAPL.NASDAQ``) from the
+    deployment row. Used by MarketHoursService to prime trading hours
+    from the instrument_cache table (which keys on canonical_id)."""
     ib_host: str = "127.0.0.1"
     ib_port: int = 4002
     ib_account_id: str = "DU0000000"
@@ -341,6 +350,7 @@ async def run_subprocess_async(
     shutdown_event: asyncio.Event | None = None,
     skip_dispose: bool = False,
     on_node_constructed: Any = None,
+    on_post_build: Any = None,
 ) -> int:
     """Execute one trading subprocess lifecycle end-to-end.
 
@@ -581,6 +591,13 @@ async def run_subprocess_async(
         # NO ``asyncio.wait_for`` around it — the supervisor
         # watchdog is the external kill switch for wedged builds.
         node.build()
+
+        # Post-build hook: lets the production wrapper inject
+        # collaborators (e.g., MarketHoursService check) into the
+        # strategy after Nautilus has constructed it during build().
+        if on_post_build is not None:
+            await on_post_build(node, payload, session_factory)
+
         if shutdown_requested.is_set():
             _record_clean_exit("after_build")
             return terminal_exit_code
@@ -1063,6 +1080,109 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
     def _capture_node(n: Any) -> None:
         node_box.append(n)
 
+    async def _wire_market_hours(
+        node: Any, p: TradingNodePayload, sf: async_sessionmaker[AsyncSession]
+    ) -> None:
+        """Post-build hook: construct MarketHoursService inside the
+        subprocess and inject it into any RiskAwareStrategy."""
+        try:
+            from msai.services.nautilus.market_hours import (
+                MarketHoursService,
+                make_market_hours_check,
+            )
+            from msai.services.nautilus.risk import RiskAwareStrategy
+
+            svc = MarketHoursService()
+            # Prime with canonical instrument IDs (e.g. "AAPL.NASDAQ").
+            # paper_symbols contains bare tickers ("AAPL") which don't
+            # match instrument_cache.canonical_id. Codex review P1 fix.
+            instrument_ids = list(p.canonical_instruments) if p.canonical_instruments else []
+            if instrument_ids:
+                async with sf() as session:
+                    await svc.prime(session, instrument_ids)
+
+            check = make_market_hours_check(svc)
+
+            # Inject into every strategy that is a RiskAwareStrategy
+            for strategy in node.trader.strategies():
+                if isinstance(strategy, RiskAwareStrategy):
+                    strategy._market_hours_check = check  # noqa: SLF001
+        except Exception:  # noqa: BLE001
+            log.warning("market_hours_wiring_failed")
+
+        # Engine-level audit hook: subscribe to ALL order events via
+        # the message bus so every order is audited regardless of
+        # whether the strategy uses RiskAwareStrategy or not.
+        # Topic pattern: events.order.{strategy_id}
+        try:
+            import asyncio as _aio
+            from datetime import UTC, datetime
+            from decimal import Decimal
+
+            from msai.services.nautilus.audit_hook import OrderAuditWriter, OrderSubmittedFacts
+
+            writer = OrderAuditWriter(db=sf)  # keyword-only init (Codex fix)
+            _cache = node.kernel.cache  # for fetching full order details
+            _loop = _aio.get_running_loop()
+
+            def _on_order_event_sync(event: Any) -> None:
+                """Sync handler bridging to async audit writer.
+
+                The Nautilus msgbus calls handlers synchronously from
+                the Cython event loop. We schedule the async DB write
+                as a fire-and-forget task on the running loop.
+                """
+                event_type = type(event).__name__
+
+                async def _write() -> None:
+                    try:
+                        if event_type == "OrderSubmitted":
+                            # OrderSubmitted doesn't carry side/qty/price —
+                            # fetch the full order from Nautilus cache (Codex fix)
+                            order = _cache.order(event.client_order_id)
+                            _side = str(order.side) if order else "UNKNOWN"
+                            _qty = Decimal(str(order.quantity)) if order else Decimal("0")
+                            _price = None
+                            _order_type = str(order.order_type) if order else "UNKNOWN"
+                            _instrument = str(order.instrument_id) if order else str(event.instrument_id)
+
+                            await writer.write_submitted(
+                                OrderSubmittedFacts(
+                                    client_order_id=str(event.client_order_id),
+                                    strategy_id=p.strategy_id or p.deployment_id,
+                                    strategy_code_hash=p.strategy_code_hash or "engine-audit",
+                                    instrument_id=_instrument,
+                                    side=_side,
+                                    quantity=_qty,
+                                    price=_price,
+                                    order_type=_order_type,
+                                    ts_attempted=datetime.now(UTC),
+                                    deployment_id=p.deployment_id,
+                                    is_live=True,
+                                )
+                            )
+                        elif event_type == "OrderFilled":
+                            await writer.update_filled(str(event.client_order_id))
+                        elif event_type == "OrderAccepted":
+                            broker_id = str(event.venue_order_id) if hasattr(event, "venue_order_id") else None
+                            await writer.update_accepted(str(event.client_order_id), broker_order_id=broker_id)
+                        elif event_type == "OrderCanceled":
+                            await writer.update_cancelled(str(event.client_order_id), reason=None)
+                        elif event_type == "OrderRejected":
+                            reason = str(event.reason) if hasattr(event, "reason") else None
+                            await writer.update_rejected(str(event.client_order_id), reason=reason)
+                    except Exception as _evt_exc:  # noqa: BLE001
+                        print(f"[MSAI] Audit event {event_type} FAILED: {_evt_exc!r}", flush=True)  # noqa: T201
+
+                _loop.create_task(_write())
+
+            # Subscribe to ALL order events via wildcard pattern
+            node.kernel.msgbus.subscribe(topic="events.order.*", handler=_on_order_event_sync)
+            # Use print() because structlog isn't initialized in the subprocess
+            print("[MSAI] Engine-level audit hook wired via events.order.*", flush=True)  # noqa: T201
+        except Exception as _audit_exc:  # noqa: BLE001
+            print(f"[MSAI] Engine audit hook wiring FAILED: {_audit_exc!r}", flush=True)  # noqa: T201
+
     try:
         exit_code = asyncio.run(
             run_subprocess_async(
@@ -1074,6 +1194,7 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
                 install_signal_handlers=True,
                 skip_dispose=True,
                 on_node_constructed=_capture_node,
+                on_post_build=_wire_market_hours,
             )
         )
     finally:

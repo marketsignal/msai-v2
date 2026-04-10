@@ -406,6 +406,8 @@ class ProcessManager:
             return True
 
         self.handles[deployment_id] = process
+        from msai.services.observability.trading_metrics import DEPLOYMENTS_STARTED
+        DEPLOYMENTS_STARTED.inc()
 
         # Phase C: record the real pid on the row.
         try:
@@ -514,6 +516,18 @@ class ProcessManager:
         that previously skipped it left ``/start`` unable to classify
         outcomes.
         """
+        from msai.services.observability.trading_metrics import DEPLOYMENTS_FAILED
+        DEPLOYMENTS_FAILED.inc()
+
+        # Best-effort email alert for spawn failures.
+        try:
+            from msai.services.alerting import AlertService
+            await AlertService().alert_strategy_error(
+                strategy_name=str(row_id), error=reason
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
         async with self._db() as session, session.begin():
             row = await session.get(LiveNodeProcess, row_id)
             if row is None:
@@ -856,6 +870,9 @@ class ProcessManager:
         # Child may already be gone — reap_loop will catch up on its next pass.
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, signal.SIGTERM)
+
+        from msai.services.observability.trading_metrics import DEPLOYMENTS_STOPPED
+        DEPLOYMENTS_STOPPED.inc()
 
         return True
 

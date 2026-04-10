@@ -63,9 +63,14 @@ from msai.services.nautilus.live_instrument_bootstrap import (
 # Both with the same wire protocol, distinguished only by which account
 # the gateway is logged into. Mismatching the port and account id is
 # the silent failure mode gotcha #6 catches.
-_IB_PAPER_PORT = 4002
-_IB_LIVE_PORT = 4001
-_IB_PAPER_PREFIX = "DU"  # IB paper-account ids start with "DU"
+# Socat proxy ports used by the gnzsnz/ib-gateway-docker image.
+# The gateway's Java process listens on 127.0.0.1:4002 (paper) /
+# 127.0.0.1:4001 (live), but socat proxies them to 0.0.0.0:4004 /
+# 0.0.0.0:4003 so other containers can connect. Both raw and socat
+# ports are accepted.
+_IB_PAPER_PORTS = (4002, 4004)
+_IB_LIVE_PORTS = (4001, 4003)
+_IB_PAPER_PREFIXES = ("DU", "DF")  # IB paper-account ids: DU (standard), DF/DFP (FA sub-accounts)
 
 
 def build_redis_database_config() -> DatabaseConfig:
@@ -109,7 +114,7 @@ class IBSettings(BaseModel):
     multi-account setup that runs paper and live nodes in parallel."""
 
     host: str = Field(default="127.0.0.1")
-    port: int = Field(default=_IB_PAPER_PORT)
+    port: int = Field(default=4004)
     account_id: str = Field(default="DU0000000")
 
 
@@ -183,25 +188,25 @@ def _validate_port_account_consistency(port: int, account_id: str) -> None:
             "IB account id is empty (or whitespace only) — set IB_ACCOUNT_ID "
             "to a real paper or live account id before starting a deployment."
         )
-    is_paper_account = normalized_account.startswith(_IB_PAPER_PREFIX)
-    if port == _IB_PAPER_PORT:
+    is_paper_account = any(normalized_account.startswith(p) for p in _IB_PAPER_PREFIXES)
+    if port in _IB_PAPER_PORTS:
         if not is_paper_account:
             raise ValueError(
                 f"IB paper port {port} requires a paper account id (starts with "
-                f"'{_IB_PAPER_PREFIX}'); got live account {normalized_account!r}. "
+                f"one of {_IB_PAPER_PREFIXES}); got live account {normalized_account!r}. "
                 "This combination silently produces no data — see Nautilus gotcha #6."
             )
-    elif port == _IB_LIVE_PORT:
+    elif port in _IB_LIVE_PORTS:
         if is_paper_account:
             raise ValueError(
                 f"IB live port {port} requires a live account id (must NOT start "
-                f"with '{_IB_PAPER_PREFIX}'); got paper account {normalized_account!r}. "
+                f"with any of {_IB_PAPER_PREFIXES}); got paper account {normalized_account!r}. "
                 "This combination silently produces no data — see Nautilus gotcha #6."
             )
     else:
         raise ValueError(
-            f"unsupported IB Gateway port {port}: only {_IB_LIVE_PORT} (live) "
-            f"and {_IB_PAPER_PORT} (paper) are recognized."
+            f"unsupported IB Gateway port {port}: only {_IB_LIVE_PORTS} (live) "
+            f"and {_IB_PAPER_PORTS} (paper) are recognized."
         )
 
 
@@ -300,11 +305,30 @@ def build_live_trading_node_config(
     data_client_id = _derive_data_client_id(deployment_slug)
     exec_client_id = _derive_exec_client_id(deployment_slug)
 
+    # Map the string config value to the Nautilus enum.
+    from nautilus_trader.adapters.interactive_brokers.config import IBMarketDataTypeEnum
+
+    _mdt_map = {
+        "REALTIME": IBMarketDataTypeEnum.REALTIME,
+        "DELAYED": IBMarketDataTypeEnum.DELAYED,
+        "DELAYED_FROZEN": IBMarketDataTypeEnum.DELAYED_FROZEN,
+    }
+    _mdt_str = settings.ib_market_data_type.upper()
+    _market_data_type = _mdt_map.get(_mdt_str, IBMarketDataTypeEnum.REALTIME)
+
+    # use_regular_trading_hours=False allows extended-hours data.
+    # Required for FX (24h) and for equity strategies that need
+    # after-hours bars. Without this, Nautilus filters bars older
+    # than the RTH subscription start (market_data.py:1305).
+    _use_rth = settings.ib_use_regular_trading_hours
+
     data_client = InteractiveBrokersDataClientConfig(
         ibg_host=ib_settings.host,
         ibg_port=ib_settings.port,
         ibg_client_id=data_client_id,
         instrument_provider=instrument_provider_config,
+        market_data_type=_market_data_type,
+        use_regular_trading_hours=_use_rth,
     )
     exec_client = InteractiveBrokersExecClientConfig(
         ibg_host=ib_settings.host,

@@ -128,15 +128,15 @@ fi
 _trading_mode_from_env=$(_get_env_value TRADING_MODE)
 _trading_mode="${TRADING_MODE:-${_trading_mode_from_env:-paper}}"
 if [[ "${_trading_mode}" == "paper" ]]; then
-  if [[ ! "${IB_ACCOUNT_ID}" =~ ^DU ]]; then
-    echo "ERROR: TRADING_MODE=paper requires IB_ACCOUNT_ID starting with 'DU'." >&2
+  if [[ ! "${IB_ACCOUNT_ID}" =~ ^D(U|F) ]]; then
+    echo "ERROR: TRADING_MODE=paper requires IB_ACCOUNT_ID starting with 'DU' or 'DF'." >&2
     echo "       Got IB_ACCOUNT_ID='${IB_ACCOUNT_ID}'. Either use a paper" >&2
     echo "       account or set TRADING_MODE=live IB_PORT=4001." >&2
     exit 1
   fi
 elif [[ "${_trading_mode}" == "live" ]]; then
-  if [[ "${IB_ACCOUNT_ID}" =~ ^DU ]]; then
-    echo "ERROR: TRADING_MODE=live requires a live IB_ACCOUNT_ID (not 'DU*')." >&2
+  if [[ "${IB_ACCOUNT_ID}" =~ ^D(U|F) ]]; then
+    echo "ERROR: TRADING_MODE=live requires a live IB_ACCOUNT_ID (not 'DU*'/'DF*')." >&2
     echo "       Got IB_ACCOUNT_ID='${IB_ACCOUNT_ID}'. Either flip to paper" >&2
     echo "       (unset TRADING_MODE + IB_PORT) or use a real live account." >&2
     exit 1
@@ -168,7 +168,7 @@ echo "[paper-soak] docker compose up -d --wait (this takes 2-4 minutes)" >&2
 # because IBC login is slow on first boot. start_period on the
 # gateway healthcheck suppresses "unhealthy" during the window,
 # so --wait doesn't trip prematurely.
-if ! docker compose -f "${_COMPOSE_FILE}" up -d --wait --wait-timeout 360; then
+if ! docker compose -f "${_COMPOSE_FILE}" up -d --wait --wait-timeout 480; then
   echo "[paper-soak] ERROR: docker compose up --wait failed" >&2
   echo "[paper-soak] Capturing ib-gateway + live-supervisor logs..." >&2
   docker compose -f "${_COMPOSE_FILE}" logs ib-gateway > logs/paper-soak-ibgateway.log 2>&1 || true
@@ -179,6 +179,48 @@ if ! docker compose -f "${_COMPOSE_FILE}" up -d --wait --wait-timeout 360; then
 fi
 
 echo "[paper-soak] Stack healthy — all services reported healthy by compose" >&2
+
+# ---------------------------------------------------------------------------
+# 2a. Run Alembic migrations (tables may not exist on a fresh DB)
+# ---------------------------------------------------------------------------
+echo "[paper-soak] Running database migrations..." >&2
+if ! docker compose -f "${_COMPOSE_FILE}" exec -T -e PYTHONPATH=/app/src backend /app/.venv/bin/python -c "
+import asyncio
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+from msai.core.config import settings
+
+async def check():
+    engine = create_async_engine(settings.database_url)
+    async with engine.begin() as conn:
+        # Check if strategies table exists — if not, we need migrations
+        result = await conn.execute(text(
+            \"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'strategies')\"
+        ))
+        exists = result.scalar()
+        if not exists:
+            print('NEEDS_MIGRATION')
+        else:
+            print('OK')
+    await engine.dispose()
+
+asyncio.run(check())
+" 2>&1 | grep -q "NEEDS_MIGRATION"; then
+  echo "[paper-soak] Tables exist — skipping migrations" >&2
+else
+  echo "[paper-soak] Running alembic upgrade head inside backend container..." >&2
+  # Run alembic from the host against the published Postgres port since
+  # the backend container doesn't have alembic.ini or the alembic/ directory.
+  _pg_port=$(docker compose -f "${_COMPOSE_FILE}" port postgres 5432 2>/dev/null || true)
+  _pg_host_port="${_pg_port##*:}"
+  if [[ -n "${_pg_host_port}" ]] && command -v uv &>/dev/null; then
+    (cd backend && DATABASE_URL="postgresql+asyncpg://msai:${POSTGRES_PASSWORD:-msai_dev_password}@localhost:${_pg_host_port}/msai" uv run alembic upgrade head 2>&1) || {
+      echo "[paper-soak] WARNING: alembic migration failed — tables may be missing" >&2
+    }
+  else
+    echo "[paper-soak] WARNING: cannot run migrations (uv not found or postgres port not resolved)" >&2
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # 2b. Derive backend URL + container name from the running compose stack
@@ -285,13 +327,10 @@ PY
 )
 
 if ! STRATEGY_ID=$(
-  # Codex iter2 P2: use ``python`` directly, NOT ``uv run python``.
-  # The prod Dockerfile's runtime stage does not copy the uv binary,
-  # so ``uv run python`` fails in prod compose before the E2E harness
-  # starts. Plain ``python`` is always on PATH in both dev and prod
-  # images; the project's deps are already installed in the venv
-  # that ``python`` resolves to.
-  docker compose -f "${_COMPOSE_FILE}" exec -T backend python -c "${SEED_PY}" 2>&1
+  # Use the venv python directly — the dev Dockerfile.dev installs deps
+  # into /app/.venv via uv sync, and system python doesn't have them.
+  # Prod Dockerfile copies the venv to the same path, so this works for both.
+  docker compose -f "${_COMPOSE_FILE}" exec -T -e PYTHONPATH=/app/src backend /app/.venv/bin/python -c "${SEED_PY}" 2>&1
 ); then
   echo "[paper-soak] ERROR: smoke strategy seed failed: ${STRATEGY_ID}" >&2
   exit 3
@@ -327,7 +366,7 @@ else
   export MSAI_E2E_PAPER_TRADING=false
 fi
 
-if ! (cd backend && uv run pytest tests/e2e/test_live_trading_phase1.py -vv); then
+if ! (cd backend && PYTHONPATH=src uv run pytest tests/e2e/test_live_trading_phase1.py -vv); then
   echo "[paper-soak] ERROR: Phase 1 E2E harness failed" >&2
   echo "[paper-soak] Capturing logs..." >&2
   docker compose -f "${_COMPOSE_FILE}" logs ib-gateway > logs/paper-soak-ibgateway.log 2>&1 || true

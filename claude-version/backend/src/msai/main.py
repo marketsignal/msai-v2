@@ -72,11 +72,127 @@ async def _ensure_api_key_user() -> bool:
         return False  # DB may not be ready yet (migrations pending)
 
 
+import asyncio
+
+_projection_tasks: list[asyncio.Task[None]] = []
+_projection_stop = asyncio.Event()
+_projection_redis_clients: list[Any] = []  # closed on shutdown
+
+# Module-level singleton so /api/v1/live/start can register new deployments
+# after boot. Lazy-initialized in _start_projection_tasks.
+_stream_registry: StreamRegistry | None = None  # type: ignore[name-defined]
+
+
+def get_stream_registry() -> StreamRegistry:  # type: ignore[name-defined]
+    """Return the per-worker StreamRegistry singleton.
+
+    Called by the live router when a new deployment is started so the
+    projection consumer discovers the new Nautilus message bus stream
+    without requiring a FastAPI restart.
+    """
+    from msai.services.nautilus.projection.registry import StreamRegistry as _SR
+
+    global _stream_registry  # noqa: PLW0603
+    if _stream_registry is None:
+        _stream_registry = _SR()
+    return _stream_registry
+
+
+async def _start_projection_tasks() -> None:
+    """Start StateApplier + ProjectionConsumer as background tasks.
+
+    - StateApplier subscribes to ``msai:live:state:*`` pub/sub and
+      feeds every event into the per-worker ProjectionState.
+    - ProjectionConsumer reads Nautilus message bus streams via
+      consumer groups and publishes translated events to the dual
+      pub/sub channels (state + events).
+
+    Both run until ``_projection_stop`` is set.
+    """
+    from redis.asyncio import Redis as AsyncRedis
+
+    from msai.api.live_deps import get_projection_state
+    from msai.services.nautilus.projection.consumer import ProjectionConsumer
+    from msai.services.nautilus.projection.fanout import DualPublisher
+    from msai.services.nautilus.projection.registry import StreamRegistry
+    from msai.services.nautilus.projection.state_applier import StateApplier
+
+    state = get_projection_state()
+    _projection_stop.clear()
+
+    # StateApplier needs text-mode Redis (pub/sub payloads are JSON strings)
+    redis_text = AsyncRedis.from_url(settings.redis_url, decode_responses=True)
+    _projection_redis_clients.append(redis_text)
+    applier = StateApplier(redis=redis_text, projection_state=state)
+    _projection_tasks.append(asyncio.create_task(applier.run(_projection_stop)))
+
+    # ProjectionConsumer needs binary-mode Redis (Nautilus streams carry msgpack bytes)
+    redis_binary = AsyncRedis.from_url(settings.redis_url, decode_responses=False)
+    _projection_redis_clients.append(redis_binary)
+    registry = get_stream_registry()
+
+    # Populate registry with active deployments from DB so the consumer
+    # knows which Nautilus message bus streams to read on startup.
+    try:
+        from msai.core.database import async_session_factory
+        from msai.models.live_deployment import LiveDeployment
+
+        async with async_session_factory() as session:
+            active_deps = (
+                await session.execute(
+                    select(LiveDeployment).where(
+                        LiveDeployment.status.in_(("running", "ready", "starting", "building"))
+                    )
+                )
+            ).scalars().all()
+            for dep in active_deps:
+                if dep.message_bus_stream:
+                    registry.register(
+                        deployment_id=dep.id,
+                        deployment_slug=dep.deployment_slug,
+                        stream_name=dep.message_bus_stream,
+                    )
+    except Exception:  # noqa: BLE001
+        # DB may not be ready; consumer will start with empty registry
+        # and pick up streams as deployments are started via /api/v1/live/start
+        pass
+
+    publisher = DualPublisher(redis=redis_text)  # publishes JSON strings
+    consumer = ProjectionConsumer(
+        redis=redis_binary,
+        registry=registry,
+        publisher=publisher,
+    )
+    _projection_tasks.append(asyncio.create_task(consumer.run(_projection_stop)))
+
+
+async def _stop_projection_tasks() -> None:
+    """Signal projection tasks to stop, await them, close Redis clients."""
+    _projection_stop.set()
+    for task in _projection_tasks:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    _projection_tasks.clear()
+
+    # Close Redis clients to avoid connection leaks on shutdown
+    for client in _projection_redis_clients:
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+    _projection_redis_clients.clear()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Startup/shutdown lifecycle — ensure API key user exists in DB."""
+    """Startup/shutdown lifecycle."""
     await _ensure_api_key_user()  # best-effort, retried on /ready
+    await _start_projection_tasks()
     yield
+    await _stop_projection_tasks()
 
 
 app: FastAPI = FastAPI(

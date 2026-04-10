@@ -57,8 +57,10 @@ services:
       # semantics as live-supervisor so compose fails instantly
       # without credentials.
       IB_HOST: ${IB_HOST:-ib-gateway}
-      IB_PORT: ${IB_PORT:-4002}
+      IB_PORT: ${IB_PORT:-4004}
       IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:?Set IB_ACCOUNT_ID in .env}
+      IB_MARKET_DATA_TYPE: ${IB_MARKET_DATA_TYPE:-REALTIME}
+      IB_USE_REGULAR_TRADING_HOURS: ${IB_USE_REGULAR_TRADING_HOURS:-false}
     depends_on:
       postgres:
         condition: service_healthy
@@ -133,8 +135,10 @@ services:
       # network, the gateway is reachable at ``ib-gateway:4002``
       # (paper) or ``ib-gateway:4001`` (live).
       IB_HOST: ib-gateway
-      IB_PORT: ${IB_PORT:-4002}
+      IB_PORT: ${IB_PORT:-4004}
       IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:?Set IB_ACCOUNT_ID in .env}
+      IB_MARKET_DATA_TYPE: ${IB_MARKET_DATA_TYPE:-REALTIME}
+      IB_USE_REGULAR_TRADING_HOURS: ${IB_USE_REGULAR_TRADING_HOURS:-false}
       # Force-present so compose fails fast if the operator left
       # ib-gateway's credentials out of .env — otherwise the
       # gateway would crash-loop and live-supervisor would wait
@@ -185,7 +189,7 @@ services:
   # restart after an IB Gateway version bump hits edge cases where
   # IBC can't dismiss the new version's "welcome" dialogs.
   ib-gateway:
-    image: ghcr.io/gnzsnz/ib-gateway:stable
+    image: ghcr.io/gnzsnz/ib-gateway:10.43.1c
     environment:
       TWS_USERID: ${TWS_USERID:?Set TWS_USERID in .env}
       TWS_PASSWORD: ${TWS_PASSWORD:?Set TWS_PASSWORD in .env}
@@ -202,6 +206,8 @@ services:
       # this the trading subprocess's first connect hangs waiting
       # for a human click.
       TWS_ACCEPT_INCOMING: "accept"
+      IBC_INI__IBGateway__TrustedIPs: "127.0.0.1,172.0.0.0/8,192.168.0.0/16"
+      EXISTING_SESSION_DETECTED_ACTION: "primary"
       # Bypass "you are running a newer version than the saved
       # settings" dialog after an IB Gateway version bump.
       BYPASS_WARNING: "yes"

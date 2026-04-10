@@ -13,7 +13,7 @@ from time import monotonic
 from typing import TYPE_CHECKING, Any
 from uuid import UUID  # noqa: TC003 — FastAPI resolves the type at runtime for path params
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import case, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -481,6 +481,19 @@ async def live_start(  # noqa: PLR0912, PLR0915 — multi-branch dispatch by des
             idempotency_key=idempotency_key,
         )
 
+        # Register the new deployment with the projection consumer so
+        # it discovers the Nautilus message bus stream without a restart.
+        try:
+            from msai.main import get_stream_registry
+
+            get_stream_registry().register(
+                deployment_id=deployment.id,
+                deployment_slug=deployment.deployment_slug,
+                stream_name=deployment.message_bus_stream,
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("stream_registry_register_failed")
+
         # -------------------------------------------------------------
         # Poll live_node_processes for ready / failed / running
         # -------------------------------------------------------------
@@ -714,6 +727,9 @@ async def live_kill_all(
     any concurrent ``/start`` request landing during the
     publish loop is also blocked.
     """
+    from msai.services.observability.trading_metrics import KILL_SWITCH_ACTIVATED
+    KILL_SWITCH_ACTIVATED.inc()
+
     halt_set_at = datetime.now(UTC)
     user_id = await _resolve_user_id(db, claims)
 
@@ -956,21 +972,124 @@ async def get_live_deployment_status(
 @router.get("/positions")
 async def live_positions(
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> LivePositionsResponse:
-    """Current open positions.
+    """Open positions across all active deployments, read from ProjectionState.
 
-    TODO: Wire to TradingNodeManager position tracking in Phase 2.
+    NOTE: This endpoint returns positions for ALL active deployments,
+    not scoped to the authenticated user. This is by design — MSAI is
+    a single-operator platform (not multi-tenant). If multi-operator
+    support is added, filter by deployment.started_by == user_id.
     """
-    return LivePositionsResponse(positions=[])
+    from msai.api.live_deps import get_position_reader
+
+    reader = get_position_reader()
+
+    active_rows = (
+        await db.execute(
+            select(LiveDeployment).where(
+                LiveDeployment.status.in_(("running", "ready"))
+            )
+        )
+    ).scalars().all()
+
+    all_positions: list[dict[str, Any]] = []
+    for dep in active_rows:
+        snapshots = await reader.get_open_positions(
+            deployment_id=dep.id,
+            trader_id=dep.trader_id,
+            strategy_id_full=dep.strategy_id_full,
+        )
+        for snap in snapshots:
+            all_positions.append(snap.model_dump(mode="json"))
+
+    return LivePositionsResponse(positions=all_positions)
 
 
 @router.get("/trades")
 async def live_trades(
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
 ) -> LiveTradesResponse:
-    """Recent live trade executions.
+    """Recent live trade executions from order_attempt_audits.
 
-    TODO: Query the trades table filtered by ``is_live=True``.
+    NOTE: Returns ALL live fills, not scoped to the authenticated user.
+    Single-operator design — see /positions docstring for rationale.
     """
-    return LiveTradesResponse(trades=[], total=0)
+    from msai.models.order_attempt_audit import OrderAttemptAudit
+
+    count_q = select(func.count()).select_from(OrderAttemptAudit).where(
+        OrderAttemptAudit.is_live.is_(True),
+        OrderAttemptAudit.status.in_(("filled", "partially_filled")),
+    )
+    total = (await db.execute(count_q)).scalar_one()
+
+    rows_q = (
+        select(OrderAttemptAudit)
+        .where(
+            OrderAttemptAudit.is_live.is_(True),
+            OrderAttemptAudit.status.in_(("filled", "partially_filled")),
+        )
+        .order_by(OrderAttemptAudit.ts_attempted.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    rows = (await db.execute(rows_q)).scalars().all()
+
+    trades = [
+        {
+            "id": str(r.id),
+            "deployment_id": str(r.deployment_id) if r.deployment_id else None,
+            "instrument_id": r.instrument_id,
+            "side": r.side,
+            "quantity": str(r.quantity),
+            "price": str(r.price) if r.price else None,
+            "order_type": r.order_type,
+            "status": r.status,
+            "client_order_id": r.client_order_id,
+            "timestamp": r.ts_attempted.isoformat(),
+        }
+        for r in rows
+    ]
+
+    return LiveTradesResponse(trades=trades, total=total)
+
+
+@router.get("/audits/{deployment_id}")
+async def live_audits(
+    deployment_id: UUID,
+    claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+) -> dict[str, Any]:
+    """Order attempt audits for a specific deployment.
+
+    Used by the E2E harness to verify order submission.
+    """
+    from msai.models.order_attempt_audit import OrderAttemptAudit
+
+    rows = (
+        await db.execute(
+            select(OrderAttemptAudit)
+            .where(OrderAttemptAudit.deployment_id == deployment_id)
+            .order_by(OrderAttemptAudit.ts_attempted.desc())
+            .limit(50)
+        )
+    ).scalars().all()
+
+    return {
+        "audits": [
+            {
+                "id": str(r.id),
+                "client_order_id": r.client_order_id,
+                "instrument_id": r.instrument_id,
+                "side": r.side,
+                "quantity": str(r.quantity),
+                "status": r.status,
+                "strategy_code_hash": r.strategy_code_hash,
+                "timestamp": r.ts_attempted.isoformat(),
+            }
+            for r in rows
+        ]
+    }

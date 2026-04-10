@@ -160,14 +160,15 @@ def _build_production_payload_factory(
             # connection (which gateway container to reach), not
             # the DEPLOYMENT's business intent (which account to
             # trade under).
-            _paper_port = 4002
-            _live_port = 4001
-            expected_port = _paper_port if deployment.paper_trading else _live_port
-            if settings.ib_port != expected_port:
+            # Accept both raw IB ports and socat proxy ports.
+            _paper_ports = (4002, 4004)
+            _live_ports = (4001, 4003)
+            expected_ports = _paper_ports if deployment.paper_trading else _live_ports
+            if settings.ib_port not in expected_ports:
                 raise ValueError(
                     f"deployment {deployment_id} has paper_trading="
-                    f"{deployment.paper_trading} (expected IB_PORT="
-                    f"{expected_port}) but supervisor is configured "
+                    f"{deployment.paper_trading} (expected IB_PORT in "
+                    f"{expected_ports}) but supervisor is configured "
                     f"with IB_PORT={settings.ib_port}. Flipping modes "
                     f"requires restarting the supervisor with matching "
                     f"IB_PORT — otherwise the deployment would connect "
@@ -176,22 +177,25 @@ def _build_production_payload_factory(
                 )
 
             # ``account_id`` consistency with ``paper_trading``.
-            # Paper accounts start with ``DU``; live accounts don't.
+            # Paper accounts start with ``DU`` or ``DF`` (FA sub-accounts
+            # use ``DFP`` prefix); live accounts don't start with ``D``.
             # This mirrors ``_validate_port_account_consistency`` in
             # ``live_node_config.py`` but catches the mismatch one
             # layer earlier (before build_live_trading_node_config
             # even sees it).
+            _paper_prefixes = ("DU", "DF")
             deployment_account = (deployment.account_id or "").strip()
-            if deployment.paper_trading and not deployment_account.startswith("DU"):
+            _is_paper = any(deployment_account.startswith(p) for p in _paper_prefixes)
+            if deployment.paper_trading and not _is_paper:
                 raise ValueError(
                     f"deployment {deployment_id} has paper_trading=True but "
                     f"account_id='{deployment_account}' does not start with "
-                    f"'DU'. Paper accounts must use DU* account IDs."
+                    f"any of {_paper_prefixes}. Paper accounts must use DU*/DF* IDs."
                 )
-            if not deployment.paper_trading and deployment_account.startswith("DU"):
+            if not deployment.paper_trading and _is_paper:
                 raise ValueError(
                     f"deployment {deployment_id} has paper_trading=False but "
-                    f"account_id='{deployment_account}' starts with 'DU'. "
+                    f"account_id='{deployment_account}' starts with a paper prefix. "
                     f"Live deployments require non-paper account IDs."
                 )
 
@@ -223,23 +227,30 @@ def _build_production_payload_factory(
             if deployment.instruments:
                 first_instrument = deployment.instruments[0]
                 merged_strategy_config.setdefault("instrument_id", first_instrument)
-                # Default bar type matches what the backtest path
-                # uses for equities intraday bars. Format is
-                # documented in Nautilus 1.223.0 model/data.pyx:
-                # ``<instrument_id>-<step>-<agg>-<price>-<source>``.
+                # Default bar type: LAST for equities, MID for FX.
+                # IB returns error 162 for FX LAST bars — FX only
+                # supports BID, ASK, or MID. Codex verified this.
+                _is_fx = any(
+                    x in first_instrument.upper()
+                    for x in ("IDEALPRO", "CASH", "EUR", "GBP", "JPY", "AUD", "CHF")
+                )
+                _price_type = "MID" if _is_fx else "LAST"
                 merged_strategy_config.setdefault(
                     "bar_type",
-                    f"{first_instrument}-1-MINUTE-LAST-EXTERNAL",
+                    f"{first_instrument}-1-MINUTE-{_price_type}-EXTERNAL",
                 )
 
             nautilus_payload = TradingNodePayload(
                 row_id=row_id,
                 deployment_id=deployment_id,
                 deployment_slug=deployment_slug,
+                strategy_id=deployment.strategy_id,
+                strategy_code_hash=deployment.strategy_code_hash or "",
                 strategy_path=paths.strategy_path,
                 strategy_config_path=paths.config_path,
                 strategy_config=merged_strategy_config,
                 paper_symbols=paper_symbols,
+                canonical_instruments=list(deployment.instruments),
                 ib_host=settings.ib_host,
                 ib_port=settings.ib_port,
                 # Codex iter3 P1: use the deployment row's
