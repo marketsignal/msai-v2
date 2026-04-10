@@ -105,14 +105,14 @@ class TradingNodePayload:
 
     deployment_id: UUID
     deployment_slug: str
+    strategy_path: str
+    strategy_config_path: str
+    strategy_config: dict[str, Any] = field(default_factory=dict)
     strategy_id: UUID | None = None
     """FK to ``strategies.id``. Needed by the engine-level audit hook
     to write valid ``order_attempt_audits`` rows."""
     strategy_code_hash: str = ""
     """SHA256 of the strategy file. Needed for audit trail."""
-    strategy_path: str
-    strategy_config_path: str
-    strategy_config: dict[str, Any] = field(default_factory=dict)
     paper_symbols: list[str] = field(default_factory=list)
     canonical_instruments: list[str] = field(default_factory=list)
     """Original canonical instrument IDs (e.g. ``AAPL.NASDAQ``) from the
