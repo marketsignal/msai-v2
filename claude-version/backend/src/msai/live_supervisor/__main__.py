@@ -245,7 +245,7 @@ def _build_production_payload_factory(
                 deployment_id=deployment_id,
                 deployment_slug=deployment_slug,
                 strategy_id=deployment.strategy_id,
-                strategy_code_hash=deployment.config_hash or "",
+                strategy_code_hash=deployment.strategy_code_hash or "",
                 strategy_path=paths.strategy_path,
                 strategy_config_path=paths.config_path,
                 strategy_config=merged_strategy_config,

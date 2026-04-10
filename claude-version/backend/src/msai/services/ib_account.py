@@ -21,7 +21,12 @@ except ImportError:
 # Dedicated client ID for read-only account queries.
 # 0 is reserved by IB as the master client; live_node_config derives
 # per-deployment IDs from the deployment_slug hash. 99 is safe.
-_ACCOUNT_CLIENT_ID = 99
+# Incrementing client ID avoids collision when multiple workers
+# or concurrent requests connect simultaneously. IB rejects
+# duplicate client IDs on the same gateway.
+import itertools as _itertools
+
+_ACCOUNT_CLIENT_COUNTER = _itertools.count(start=900)
 
 _ZERO_SUMMARY: dict[str, float] = {
     "net_liquidation": 0.0,
@@ -57,7 +62,7 @@ class IBAccountService:
         ib = IB()
         try:
             await ib.connectAsync(
-                self.host, self.port, clientId=_ACCOUNT_CLIENT_ID, timeout=5
+                self.host, self.port, clientId=next(_ACCOUNT_CLIENT_COUNTER), timeout=5
             )
             import asyncio as _asyncio
 
@@ -93,7 +98,7 @@ class IBAccountService:
         ib = IB()
         try:
             await ib.connectAsync(
-                self.host, self.port, clientId=_ACCOUNT_CLIENT_ID, timeout=5
+                self.host, self.port, clientId=next(_ACCOUNT_CLIENT_COUNTER), timeout=5
             )
             positions = ib.portfolio()
             return [

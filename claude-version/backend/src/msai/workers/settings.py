@@ -106,13 +106,15 @@ class WorkerSettings:
     max_tries: int = 2  # 1 retry
 
     # Cron jobs — scheduled background work.
-    # Times are UTC; 20:30 UTC ≈ 4:30 PM ET (EDT), 05:00 UTC ≈ 1:00 AM ET (EDT).
+    # PnL: 21:30 UTC = safe for both EST (4:30 PM) and EDT (5:30 PM),
+    # always after US equity close (4:00 PM ET).
+    # Ingest: 06:00 UTC = safe for both EST (1:00 AM) and EDT (2:00 AM).
     from arq.cron import cron as _cron
 
     from msai.workers.nightly_ingest import run_nightly_ingest as _nightly
     from msai.workers.pnl_aggregation import aggregate_daily_pnl as _pnl
 
     cron_jobs = [
-        _cron(_pnl, hour=20, minute=30),
-        _cron(_nightly, hour=5, minute=0),
+        _cron(_pnl, hour=21, minute=30),
+        _cron(_nightly, hour=6, minute=0),
     ]

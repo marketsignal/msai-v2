@@ -25,7 +25,7 @@ router = APIRouter(prefix="/api/v1/account", tags=["account"])
 from msai.core.config import settings
 
 _ib_service = IBAccountService(host=settings.ib_host, port=settings.ib_port)
-_ib_probe = IBProbe()
+_ib_probe = IBProbe(host=settings.ib_host, port=settings.ib_port)
 
 
 @router.get("/summary")

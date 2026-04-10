@@ -115,19 +115,23 @@ export default function LiveTradingPage(): React.ReactElement {
   // Positions for the table: WebSocket > REST > null (mock fallback in component)
   const positionsForTable = usingLive ? livePositions : restPositions;
 
+  // Use the same position source for cards as for the table:
+  // WebSocket > REST > mock (Codex review P2 fix)
+  const _cardPositions = positionsForTable;
+
   const totalUnrealizedPnl = useMemo(() => {
-    if (usingLive) {
-      return livePositions.reduce(
+    if (_cardPositions != null) {
+      return _cardPositions.reduce(
         (sum, p) => sum + parseFloat(p.unrealized_pnl),
         0,
       );
     }
     return positions.reduce((sum, p) => sum + p.unrealizedPnl, 0);
-  }, [usingLive, livePositions]);
+  }, [_cardPositions]);
 
   const totalMarketValue = useMemo(() => {
-    if (usingLive) {
-      return livePositions.reduce(
+    if (_cardPositions != null) {
+      return _cardPositions.reduce(
         (sum, p) => sum + parseFloat(p.qty) * parseFloat(p.avg_price),
         0,
       );

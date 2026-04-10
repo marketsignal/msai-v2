@@ -39,6 +39,8 @@ export default function DashboardPage(): React.ReactElement {
         if (cancelled) return;
         if (strategies.status === "fulfilled") {
           setStrategyCount(strategies.value.total);
+        } else {
+          setError("Failed to load strategies");
         }
         if (accountData.status === "fulfilled") {
           setAccount(accountData.value);
