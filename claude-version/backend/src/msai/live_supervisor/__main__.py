@@ -227,13 +227,17 @@ def _build_production_payload_factory(
             if deployment.instruments:
                 first_instrument = deployment.instruments[0]
                 merged_strategy_config.setdefault("instrument_id", first_instrument)
-                # Default bar type matches what the backtest path
-                # uses for equities intraday bars. Format is
-                # documented in Nautilus 1.223.0 model/data.pyx:
-                # ``<instrument_id>-<step>-<agg>-<price>-<source>``.
+                # Default bar type: LAST for equities, MID for FX.
+                # IB returns error 162 for FX LAST bars — FX only
+                # supports BID, ASK, or MID. Codex verified this.
+                _is_fx = any(
+                    x in first_instrument.upper()
+                    for x in ("IDEALPRO", "CASH", "EUR", "GBP", "JPY", "AUD", "CHF")
+                )
+                _price_type = "MID" if _is_fx else "LAST"
                 merged_strategy_config.setdefault(
                     "bar_type",
-                    f"{first_instrument}-1-MINUTE-LAST-EXTERNAL",
+                    f"{first_instrument}-1-MINUTE-{_price_type}-EXTERNAL",
                 )
 
             nautilus_payload = TradingNodePayload(
