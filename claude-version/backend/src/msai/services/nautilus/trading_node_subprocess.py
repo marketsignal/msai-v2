@@ -1164,8 +1164,8 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
             # Subscribe to ALL order events via wildcard pattern
             node.kernel.msgbus.subscribe(topic="events.order.*", handler=_on_order_event_sync)
             log.info("engine_audit_hook_wired")
-        except Exception:  # noqa: BLE001
-            log.warning("engine_audit_hook_wiring_failed")
+        except Exception as _audit_exc:  # noqa: BLE001
+            log.warning("engine_audit_hook_wiring_failed", extra={"error": str(_audit_exc)})
 
     try:
         exit_code = asyncio.run(
