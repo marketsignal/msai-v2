@@ -105,6 +105,11 @@ class TradingNodePayload:
 
     deployment_id: UUID
     deployment_slug: str
+    strategy_id: UUID | None = None
+    """FK to ``strategies.id``. Needed by the engine-level audit hook
+    to write valid ``order_attempt_audits`` rows."""
+    strategy_code_hash: str = ""
+    """SHA256 of the strategy file. Needed for audit trail."""
     strategy_path: str
     strategy_config_path: str
     strategy_config: dict[str, Any] = field(default_factory=dict)
@@ -1144,8 +1149,8 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
                             await writer.write_submitted(
                                 OrderSubmittedFacts(
                                     client_order_id=str(event.client_order_id),
-                                    strategy_id=p.deployment_id,
-                                    strategy_code_hash="engine-audit",
+                                    strategy_id=p.strategy_id or p.deployment_id,
+                                    strategy_code_hash=p.strategy_code_hash or "engine-audit",
                                     instrument_id=_instrument,
                                     side=_side,
                                     quantity=_qty,
@@ -1166,19 +1171,17 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
                         elif event_type == "OrderRejected":
                             reason = str(event.reason) if hasattr(event, "reason") else None
                             await writer.update_rejected(str(event.client_order_id), reason=reason)
-                    except Exception:  # noqa: BLE001
-                        log.debug("engine_audit_event_failed", extra={"event_type": event_type})
+                    except Exception as _evt_exc:  # noqa: BLE001
+                        print(f"[MSAI] Audit event {event_type} FAILED: {_evt_exc!r}", flush=True)  # noqa: T201
 
                 _loop.create_task(_write())
 
             # Subscribe to ALL order events via wildcard pattern
             node.kernel.msgbus.subscribe(topic="events.order.*", handler=_on_order_event_sync)
-            log.info("engine_audit_hook_wired")
+            # Use print() because structlog isn't initialized in the subprocess
+            print("[MSAI] Engine-level audit hook wired via events.order.*", flush=True)  # noqa: T201
         except Exception as _audit_exc:  # noqa: BLE001
-            log.warning(
-                "engine_audit_hook_wiring_failed",
-                extra={"error": repr(_audit_exc)},
-            )
+            print(f"[MSAI] Engine audit hook wiring FAILED: {_audit_exc!r}", flush=True)  # noqa: T201
 
     try:
         exit_code = asyncio.run(
