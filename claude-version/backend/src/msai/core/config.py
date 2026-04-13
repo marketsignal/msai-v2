@@ -75,6 +75,12 @@ class Settings(BaseSettings):
     # Backtest execution tuning
     backtest_timeout_seconds: int = 30 * 60
 
+    # Compute slot management (Redis semaphore for concurrent job limits)
+    compute_slot_limit: int = 4
+    compute_slot_wait_seconds: int = 900  # max time to wait for a slot
+    compute_slot_lease_seconds: int = 120  # TTL per lease
+    compute_slot_poll_seconds: int = 2  # polling interval while waiting
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
     @field_validator("data_root", "strategies_root", mode="before")
