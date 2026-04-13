@@ -163,6 +163,9 @@ def discover_strategies(strategies_dir: Path) -> list[DiscoveredStrategy]:
             )
         )
 
+    # Run governance checks on discovered strategies (warn-only)
+    _run_governance_checks(discovered)
+
     return discovered
 
 
@@ -317,6 +320,31 @@ def _find_config_class(module: ModuleType) -> type | None:
         if cls.__name__.lower().endswith("config") and hasattr(cls, "parse"):
             return cls
     return None
+
+
+def _run_governance_checks(strategies: list[DiscoveredStrategy]) -> None:
+    """Run governance validation on discovered strategies (warn-only).
+
+    Updates each strategy's governance status in-memory and logs any
+    violations found.  This does NOT block registration -- violations
+    are advisory during discovery.
+
+    Args:
+        strategies: List of discovered strategies to validate.
+    """
+    from msai.services.strategy_governance import StrategyGovernanceService
+
+    gov = StrategyGovernanceService()
+    for strat in strategies:
+        violations = gov.validate_file(strat.module_path)
+        if violations:
+            log.warning(
+                "strategy_governance_violations",
+                strategy=strat.name,
+                violations=violations,
+            )
+        else:
+            log.info("strategy_governance_passed", strategy=strat.name)
 
 
 def _infer_strategies_root(module_path: Path) -> Path | None:
