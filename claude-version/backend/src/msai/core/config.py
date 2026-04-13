@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     # Backtest execution tuning
     backtest_timeout_seconds: int = 30 * 60
 
+    # Job watchdog thresholds
+    job_stale_seconds: int = 600  # 10 min without heartbeat = stale
+    job_pending_grace_seconds: int = 600  # 10 min pending without starting = stuck
+
     # Compute slot management (Redis semaphore for concurrent job limits)
     compute_slot_limit: int = 4
     compute_slot_wait_seconds: int = 900  # max time to wait for a slot

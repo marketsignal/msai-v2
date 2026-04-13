@@ -26,7 +26,9 @@ import asyncio
 from typing import TYPE_CHECKING, Any
 
 from msai.core.config import settings
+from msai.core.logging import get_logger
 from msai.core.queue import _parse_redis_url
+from msai.services.job_watchdog import run_watchdog_once
 from msai.workers.backtest_job import run_backtest_job
 
 if TYPE_CHECKING:
@@ -96,6 +98,21 @@ async def run_ingest(
     await service.ingest_historical(asset_class, symbols, start, end)
 
 
+_watchdog_log = get_logger("workers.watchdog")
+
+
+async def _watchdog(ctx: dict[str, Any]) -> None:
+    """arq cron wrapper for the job watchdog.
+
+    Runs :func:`~msai.services.job_watchdog.run_watchdog_once` and logs
+    a summary when any jobs were cleaned up.
+    """
+    _ = ctx
+    result = await run_watchdog_once()
+    if result["backtests_cleaned"] or result["research_cleaned"]:
+        _watchdog_log.info("watchdog_cleaned", **result)
+
+
 class WorkerSettings:
     """arq worker configuration used by ``arq msai.workers.settings.WorkerSettings``."""
 
@@ -109,6 +126,7 @@ class WorkerSettings:
     # PnL: 21:30 UTC = safe for both EST (4:30 PM) and EDT (5:30 PM),
     # always after US equity close (4:00 PM ET).
     # Ingest: 06:00 UTC = safe for both EST (1:00 AM) and EDT (2:00 AM).
+    # Watchdog: every 60 seconds (minute=None, second=0 → fires at :00 each minute).
     from arq.cron import cron as _cron
 
     from msai.workers.nightly_ingest import run_nightly_ingest as _nightly
@@ -117,4 +135,5 @@ class WorkerSettings:
     cron_jobs = [
         _cron(_pnl, hour=21, minute=30),
         _cron(_nightly, hour=6, minute=0),
+        _cron(_watchdog, minute=None, second=0),  # every minute at :00
     ]
