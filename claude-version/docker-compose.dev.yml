@@ -46,6 +46,8 @@ services:
       - "8800:8000"
     volumes:
       - ./backend/src:/app/src:ro
+      - ./backend/alembic:/app/alembic:ro
+      - ./backend/alembic.ini:/app/alembic.ini:ro
       - ./strategies:/app/strategies:ro
       - ./data:/app/data
     environment:
