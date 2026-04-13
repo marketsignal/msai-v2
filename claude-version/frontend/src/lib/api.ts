@@ -348,3 +348,42 @@ export interface GraduationTransitionListResponse {
   items: GraduationTransitionResponse[];
   total: number;
 }
+
+// =====================================================================
+// Portfolio types — mirror of backend schemas/portfolio.py
+// =====================================================================
+
+export interface PortfolioResponse {
+  id: string;
+  name: string;
+  description: string | null;
+  objective: string;
+  base_capital: number;
+  requested_leverage: number;
+  benchmark_symbol: string | null;
+  account_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PortfolioListResponse {
+  items: PortfolioResponse[];
+  total: number;
+}
+
+export interface PortfolioRunResponse {
+  id: string;
+  portfolio_id: string;
+  status: string;
+  metrics: Record<string, unknown> | null;
+  report_path: string | null;
+  start_date: string;
+  end_date: string;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface PortfolioRunListResponse {
+  items: PortfolioRunResponse[];
+  total: number;
+}
