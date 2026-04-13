@@ -65,6 +65,7 @@ async def run_research_job(
     worker_id = f"{socket.gethostname()}:{os.getpid()}"
     lease_id: str | None = None
     stop_heartbeat = asyncio.Event()
+    cancel_requested = asyncio.Event()
     redis = await get_redis_pool()
 
     log.info(
@@ -77,8 +78,9 @@ async def run_research_job(
     heartbeat_task: asyncio.Task[None] | None = None
 
     try:
-        # --- 1. Mark running --------------------------------------------------
-        await _mark_running(job_id, worker_id)
+        # --- 1. Mark running (abort if already cancelled) ---------------------
+        if not await _mark_running(job_id, worker_id):
+            return
 
         # --- 2. Heartbeat task ------------------------------------------------
         async def _heartbeat_loop() -> None:
@@ -86,9 +88,10 @@ async def run_research_job(
 
             Best-effort cancellation: if the job's status has been set to
             ``"cancelled"`` or the ``progress_message`` starts with ``"Cancel"``,
-            we set ``stop_heartbeat`` so the outer function knows.  The engine
-            itself does not check mid-backtest — this will stop the job at the
-            next checkpoint (between trials).
+            we set ``cancel_requested`` so the outer function marks the job as
+            cancelled after the engine returns.  We keep heartbeating and
+            renewing the lease so the watchdog does not kill the job while
+            the engine is still winding down.
             """
             while not stop_heartbeat.is_set():
                 await asyncio.sleep(settings.compute_slot_lease_seconds / 3)
@@ -98,7 +101,7 @@ async def run_research_job(
                     await renew_compute_slots(redis, lease_id)
                 await _update_heartbeat(job_id, worker_id)
 
-                # Poll for cancellation
+                # Poll for cancellation — set flag but keep heartbeating
                 try:
                     async with async_session_factory() as session:
                         job = await session.get(ResearchJob, job_id)
@@ -106,9 +109,9 @@ async def run_research_job(
                             job.status == "cancelled"
                             or (job.progress_message or "").startswith("Cancel")
                         ):
-                            log.info("research_job_cancel_detected", job_id=job_id)
-                            stop_heartbeat.set()
-                            return
+                            if not cancel_requested.is_set():
+                                log.info("research_job_cancel_detected", job_id=job_id)
+                                cancel_requested.set()
                 except Exception:
                     log.warning("research_heartbeat_cancel_check_failed", job_id=job_id)
 
@@ -242,15 +245,18 @@ async def run_research_job(
         else:
             raise ValueError(f"Unsupported research job type: {job_type!r}")
 
-        # --- 7. Persist results -----------------------------------------------
-        await _finalize_job(job_id, report)
-
-        log.info(
-            "research_job_completed",
-            job_id=job_id,
-            job_type=job_type,
-            num_results=len(report.get("results", [])),
-        )
+        # --- 7. Persist results or honour cancellation -------------------------
+        if cancel_requested.is_set():
+            await _mark_cancelled(job_id)
+            log.info("research_job_cancelled_after_engine", job_id=job_id, job_type=job_type)
+        else:
+            await _finalize_job(job_id, report)
+            log.info(
+                "research_job_completed",
+                job_id=job_id,
+                job_type=job_type,
+                num_results=len(report.get("results", [])),
+            )
 
     except ComputeSlotUnavailableError as exc:
         log.error("research_job_slots_unavailable", job_id=job_id, error=str(exc))
@@ -278,18 +284,27 @@ async def run_research_job(
 # ---------------------------------------------------------------------------
 
 
-async def _mark_running(job_id: str, worker_id: str) -> None:
-    """Flip the research job row to ``running`` with worker identity."""
+async def _mark_running(job_id: str, worker_id: str) -> bool:
+    """Flip the research job row to ``running`` with worker identity.
+
+    Returns ``False`` if the job was not found or has already been cancelled,
+    indicating the caller should abort without executing the engine.
+    """
     async with async_session_factory() as session:
         job = await session.get(ResearchJob, job_id)
         if job is None:
-            return
+            log.error("research_job_not_found", job_id=job_id)
+            return False
+        if job.status == "cancelled":
+            log.info("research_job_already_cancelled", job_id=job_id)
+            return False
         job.status = "running"
         job.started_at = datetime.now(UTC)
         job.worker_id = worker_id
         job.heartbeat_at = datetime.now(UTC)
         job.attempt = (job.attempt or 0) + 1
         await session.commit()
+    return True
 
 
 async def _update_heartbeat(job_id: str, worker_id: str) -> None:
@@ -353,6 +368,21 @@ async def _finalize_job(job_id: str, report: dict[str, Any]) -> None:
             session.add(trial)
 
         await session.commit()
+
+
+async def _mark_cancelled(job_id: str) -> None:
+    """Mark the research job as cancelled after the engine has finished."""
+    try:
+        async with async_session_factory() as session:
+            job = await session.get(ResearchJob, job_id)
+            if job is None:
+                return
+            job.status = "cancelled"
+            job.progress_message = "Cancelled"
+            job.completed_at = datetime.now(UTC)
+            await session.commit()
+    except Exception:
+        log.exception("research_cancel_update_failed", job_id=job_id)
 
 
 async def _mark_failed(job_id: str, error_message: str) -> None:

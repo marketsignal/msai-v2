@@ -22,7 +22,6 @@ from msai.core.config import settings
 from msai.core.database import get_db
 from msai.core.logging import get_logger
 from msai.core.queue import enqueue_research, get_redis_pool
-from msai.models.graduation_candidate import GraduationCandidate
 from msai.models.research_job import ResearchJob
 from msai.models.research_trial import ResearchTrial
 from msai.models.strategy import Strategy
@@ -36,8 +35,11 @@ from msai.schemas.research import (
     ResearchTrialResponse,
     ResearchWalkForwardRequest,
 )
+from msai.services.graduation import GraduationService
 
 log = get_logger(__name__)
+
+_graduation_service = GraduationService()
 
 router = APIRouter(prefix="/api/v1/research", tags=["research"])
 
@@ -290,15 +292,16 @@ async def promote_research_result(
         config = dict(trial.config)
         metrics = dict(trial.metrics) if trial.metrics else {}
 
-    candidate = GraduationCandidate(
+    user_id = claims.get("sub")
+    candidate = await _graduation_service.create_candidate(
+        db,
         strategy_id=job.strategy_id,
-        research_job_id=job.id,
-        stage="discovery",
         config=config,
         metrics=metrics,
+        research_job_id=job.id,
         notes=body.notes,
+        user_id=user_id,
     )
-    db.add(candidate)
     await db.commit()
     await db.refresh(candidate)
 
@@ -374,6 +377,7 @@ def _build_sweep_payload(
         "strategy_name": strategy.name,
         "strategy_path": strategy_path,
         "instruments": body.instruments,
+        "asset_class": body.asset_class,
         "start_date": body.start_date.isoformat(),
         "end_date": body.end_date.isoformat(),
         "base_config": body.base_config,

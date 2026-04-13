@@ -46,7 +46,9 @@ async def _scan_backtests(session: AsyncSession) -> int:
     Returns:
         Number of backtests cleaned.
     """
-    now = datetime.now(UTC)
+    # Use naive UTC datetimes to match what asyncpg returns from
+    # server_default=func.now() columns (no timezone info).
+    now = datetime.now(UTC).replace(tzinfo=None)
     stale_cutoff = now - timedelta(seconds=settings.job_stale_seconds)
     pending_cutoff = now - timedelta(seconds=settings.job_pending_grace_seconds)
 
@@ -88,7 +90,9 @@ async def _scan_research_jobs(session: AsyncSession) -> int:
     Returns:
         Number of research jobs cleaned.
     """
-    now = datetime.now(UTC)
+    # Use naive UTC datetimes to match what asyncpg returns from
+    # server_default=func.now() columns (no timezone info).
+    now = datetime.now(UTC).replace(tzinfo=None)
     stale_cutoff = now - timedelta(seconds=settings.job_stale_seconds)
     pending_cutoff = now - timedelta(seconds=settings.job_pending_grace_seconds)
 

@@ -31,7 +31,7 @@ def _make_backtest(
     bt.id = uuid4()
     bt.status = status
     bt.heartbeat_at = heartbeat_at
-    bt.created_at = created_at or datetime.now(UTC)
+    bt.created_at = created_at or datetime.now(UTC).replace(tzinfo=None)
     bt.error_message = None
     bt.completed_at = None
     return bt
@@ -48,7 +48,7 @@ def _make_research_job(
     rj.id = uuid4()
     rj.status = status
     rj.heartbeat_at = heartbeat_at
-    rj.created_at = created_at or datetime.now(UTC)
+    rj.created_at = created_at or datetime.now(UTC).replace(tzinfo=None)
     rj.error_message = None
     rj.completed_at = None
     return rj
@@ -63,7 +63,7 @@ class TestCheckJobHealth:
     """Tests for the _check_job_health helper."""
 
     def test_stale_running_returns_reason(self) -> None:
-        now = datetime.now(UTC)
+        now = datetime.now(UTC).replace(tzinfo=None)
         result = _check_job_health(
             status="running",
             heartbeat_at=now - timedelta(seconds=1200),
@@ -77,7 +77,7 @@ class TestCheckJobHealth:
         assert "1200" in result
 
     def test_fresh_running_returns_none(self) -> None:
-        now = datetime.now(UTC)
+        now = datetime.now(UTC).replace(tzinfo=None)
         result = _check_job_health(
             status="running",
             heartbeat_at=now - timedelta(seconds=60),
@@ -90,7 +90,7 @@ class TestCheckJobHealth:
 
     def test_running_with_no_heartbeat_returns_none(self) -> None:
         """Running job with heartbeat_at=None should NOT be flagged (may have just started)."""
-        now = datetime.now(UTC)
+        now = datetime.now(UTC).replace(tzinfo=None)
         result = _check_job_health(
             status="running",
             heartbeat_at=None,
@@ -102,7 +102,7 @@ class TestCheckJobHealth:
         assert result is None
 
     def test_stuck_pending_returns_reason(self) -> None:
-        now = datetime.now(UTC)
+        now = datetime.now(UTC).replace(tzinfo=None)
         result = _check_job_health(
             status="pending",
             heartbeat_at=None,
@@ -116,7 +116,7 @@ class TestCheckJobHealth:
         assert "1200" in result
 
     def test_fresh_pending_returns_none(self) -> None:
-        now = datetime.now(UTC)
+        now = datetime.now(UTC).replace(tzinfo=None)
         result = _check_job_health(
             status="pending",
             heartbeat_at=None,
@@ -139,7 +139,7 @@ class TestScanBacktests:
     @pytest.mark.asyncio
     async def test_stale_running_backtest_marked_failed(self) -> None:
         # Arrange
-        now = datetime.now(UTC)
+        now = datetime.now(UTC).replace(tzinfo=None)
         bt = _make_backtest(
             status="running",
             heartbeat_at=now - timedelta(seconds=1200),
@@ -166,7 +166,7 @@ class TestScanBacktests:
     @pytest.mark.asyncio
     async def test_fresh_running_backtest_left_alone(self) -> None:
         # Arrange
-        now = datetime.now(UTC)
+        now = datetime.now(UTC).replace(tzinfo=None)
         bt = _make_backtest(
             status="running",
             heartbeat_at=now - timedelta(seconds=60),
@@ -191,7 +191,7 @@ class TestScanBacktests:
     @pytest.mark.asyncio
     async def test_stuck_pending_backtest_marked_failed(self) -> None:
         # Arrange
-        now = datetime.now(UTC)
+        now = datetime.now(UTC).replace(tzinfo=None)
         bt = _make_backtest(
             status="pending",
             heartbeat_at=None,
@@ -216,7 +216,7 @@ class TestScanBacktests:
     @pytest.mark.asyncio
     async def test_fresh_pending_backtest_left_alone(self) -> None:
         # Arrange
-        now = datetime.now(UTC)
+        now = datetime.now(UTC).replace(tzinfo=None)
         bt = _make_backtest(
             status="pending",
             heartbeat_at=None,
@@ -249,7 +249,7 @@ class TestScanResearchJobs:
     @pytest.mark.asyncio
     async def test_stale_running_research_job_marked_failed(self) -> None:
         # Arrange
-        now = datetime.now(UTC)
+        now = datetime.now(UTC).replace(tzinfo=None)
         rj = _make_research_job(
             status="running",
             heartbeat_at=now - timedelta(seconds=1200),
@@ -275,7 +275,7 @@ class TestScanResearchJobs:
     @pytest.mark.asyncio
     async def test_fresh_running_research_job_left_alone(self) -> None:
         # Arrange
-        now = datetime.now(UTC)
+        now = datetime.now(UTC).replace(tzinfo=None)
         rj = _make_research_job(
             status="running",
             heartbeat_at=now - timedelta(seconds=60),
@@ -307,7 +307,7 @@ class TestRunWatchdogOnce:
     @pytest.mark.asyncio
     async def test_returns_correct_counts(self) -> None:
         """run_watchdog_once returns a dict with counts from both scanners."""
-        now = datetime.now(UTC)
+        now = datetime.now(UTC).replace(tzinfo=None)
         stale_bt = _make_backtest(
             status="running",
             heartbeat_at=now - timedelta(seconds=1200),
@@ -359,7 +359,7 @@ class TestRunWatchdogOnce:
     @pytest.mark.asyncio
     async def test_no_stale_jobs_returns_zeros(self) -> None:
         """When all jobs are healthy, both counts are 0."""
-        now = datetime.now(UTC)
+        now = datetime.now(UTC).replace(tzinfo=None)
         fresh_bt = _make_backtest(
             status="running",
             heartbeat_at=now - timedelta(seconds=30),
