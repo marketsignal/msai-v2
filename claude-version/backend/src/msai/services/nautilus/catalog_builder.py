@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -37,9 +37,6 @@ from nautilus_trader.persistence.wranglers import BarDataWrangler
 
 from msai.core.logging import get_logger
 from msai.services.nautilus.instruments import resolve_instrument
-
-if TYPE_CHECKING:
-    from nautilus_trader.model.identifiers import InstrumentId
 
 log = get_logger(__name__)
 

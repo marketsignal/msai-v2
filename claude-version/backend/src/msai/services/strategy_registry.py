@@ -148,6 +148,22 @@ def discover_strategies(strategies_dir: Path) -> list[DiscoveredStrategy]:
                 path=str(py_file),
                 violations=violations,
             )
+            # Do NOT import — module-scope side effects are dangerous.
+            # Record the file as blocked so the UI can display it.
+            rel = py_file.relative_to(strategies_dir)
+            dotted_name = rel.with_suffix("").as_posix().replace("/", ".")
+            discovered.append(
+                DiscoveredStrategy(
+                    name=dotted_name,
+                    module_path=py_file,
+                    strategy_class_name="BLOCKED",
+                    config_class_name=None,
+                    code_hash=compute_file_hash(py_file),
+                    description=f"Governance violations: {'; '.join(violations)}",
+                    governance_status="blocked",
+                )
+            )
+            continue
 
         try:
             module = _import_strategy_module(py_file, strategies_dir)
@@ -172,7 +188,7 @@ def discover_strategies(strategies_dir: Path) -> list[DiscoveredStrategy]:
                 config_class_name=(config_cls.__name__ if config_cls else None),
                 code_hash=compute_file_hash(py_file),
                 description=(inspect.getdoc(strategy_cls) or None),
-                governance_status="violations" if violations else "passed",
+                governance_status="passed",
             )
         )
 
@@ -328,30 +344,6 @@ def _find_config_class(module: ModuleType) -> type | None:
             return cls
     return None
 
-
-def _run_governance_checks(strategies: list[DiscoveredStrategy]) -> None:
-    """Run governance validation on discovered strategies (warn-only).
-
-    Updates each strategy's governance status in-memory and logs any
-    violations found.  This does NOT block registration -- violations
-    are advisory during discovery.
-
-    Args:
-        strategies: List of discovered strategies to validate.
-    """
-    from msai.services.strategy_governance import StrategyGovernanceService
-
-    gov = StrategyGovernanceService()
-    for strat in strategies:
-        violations = gov.validate_file(strat.module_path)
-        if violations:
-            log.warning(
-                "strategy_governance_violations",
-                strategy=strat.name,
-                violations=violations,
-            )
-        else:
-            log.info("strategy_governance_passed", strategy=strat.name)
 
 
 def _infer_strategies_root(module_path: Path) -> Path | None:

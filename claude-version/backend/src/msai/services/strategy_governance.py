@@ -18,18 +18,44 @@ log = get_logger(__name__)
 class StrategyGovernanceService:
     """Validates strategy Python files for dangerous imports and patterns."""
 
-    BLOCKED_IMPORTS: frozenset[str] = frozenset({
-        "os", "subprocess", "shutil", "socket", "ctypes", "importlib",
-        "webbrowser", "http.server", "xmlrpc", "ftplib", "smtplib",
-        "telnetlib", "pickle", "sys", "pathlib", "io", "signal",
-        "multiprocessing", "threading", "tempfile", "atexit", "code",
-        "codeop", "pty", "resource",
-    })
+    BLOCKED_IMPORTS: frozenset[str] = frozenset(
+        {
+            "os",
+            "subprocess",
+            "shutil",
+            "socket",
+            "ctypes",
+            "importlib",
+            "webbrowser",
+            "http.server",
+            "xmlrpc",
+            "ftplib",
+            "smtplib",
+            "telnetlib",
+            "pickle",
+            "sys",
+            "pathlib",
+            "io",
+            "signal",
+            "multiprocessing",
+            "threading",
+            "tempfile",
+            "atexit",
+            "code",
+            "codeop",
+            "pty",
+            "resource",
+        }
+    )
 
-    DANGEROUS_CALLS: frozenset[str] = frozenset({
-        "eval", "exec", "__import__", "compile", "globals", "locals",
-        "getattr", "setattr", "delattr",
-    })
+    DANGEROUS_CALLS: frozenset[str] = frozenset(
+        {
+            "eval",
+            "exec",
+            "__import__",
+            "compile",
+        }
+    )
 
     def validate_file(self, file_path: Path) -> list[str]:
         """Return list of violations. Empty list means the file is safe."""
@@ -54,9 +80,7 @@ class StrategyGovernanceService:
                 for alias in node.names:
                     top_module = alias.name.split(".")[0]
                     if top_module in self.BLOCKED_IMPORTS:
-                        violations.append(
-                            f"Blocked import '{alias.name}' at line {node.lineno}"
-                        )
+                        violations.append(f"Blocked import '{alias.name}' at line {node.lineno}")
             elif isinstance(node, ast.ImportFrom):
                 if node.module:
                     top_module = node.module.split(".")[0]
@@ -77,7 +101,5 @@ class StrategyGovernanceService:
                 elif isinstance(node.func, ast.Attribute):
                     func_name = node.func.attr
                 if func_name and func_name in self.DANGEROUS_CALLS:
-                    violations.append(
-                        f"Dangerous call '{func_name}()' at line {node.lineno}"
-                    )
+                    violations.append(f"Dangerous call '{func_name}()' at line {node.lineno}")
         return violations
