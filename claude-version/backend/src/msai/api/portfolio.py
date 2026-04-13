@@ -77,7 +77,13 @@ async def create_portfolio(
 ) -> PortfolioResponse:
     """Create a new portfolio with weighted strategy allocations."""
     user_id = await resolve_user_id(db, claims)
-    portfolio = await _service.create(db, body, user_id=user_id)
+    try:
+        portfolio = await _service.create(db, body, user_id=user_id)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        )
     await db.commit()
     await db.refresh(portfolio)
 

@@ -12,6 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from msai.core.logging import get_logger
+from msai.models.graduation_candidate import GraduationCandidate
 from msai.models.portfolio import Portfolio
 from msai.models.portfolio_allocation import PortfolioAllocation
 from msai.models.portfolio_run import PortfolioRun
@@ -50,6 +51,14 @@ class PortfolioService:
         )
         session.add(portfolio)
         await session.flush()
+
+        # Validate all candidate IDs exist before inserting allocations
+        for alloc in data.allocations:
+            candidate = await session.get(GraduationCandidate, alloc.candidate_id)
+            if candidate is None:
+                raise ValueError(
+                    f"Graduation candidate {alloc.candidate_id} not found"
+                )
 
         for alloc in data.allocations:
             allocation = PortfolioAllocation(

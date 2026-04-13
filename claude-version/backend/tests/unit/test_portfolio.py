@@ -148,6 +148,10 @@ class TestCreatePortfolio:
         self, service: PortfolioService, mock_db: AsyncMock
     ) -> None:
         """create returns a portfolio and creates allocation rows."""
+
+        # Arrange: session.get returns a mock candidate for validation
+        mock_db.get.return_value = MagicMock()
+
         # Arrange: flush assigns an id
         async def _flush() -> None:
             for call_args in mock_db.add.call_args_list:
@@ -179,6 +183,8 @@ class TestCreatePortfolio:
         self, service: PortfolioService, mock_db: AsyncMock
     ) -> None:
         """create sets created_by when user_id is provided."""
+        mock_db.get.return_value = MagicMock()
+
         async def _flush() -> None:
             for call_args in mock_db.add.call_args_list:
                 obj = call_args[0][0]
@@ -210,9 +216,7 @@ class TestCreatePortfolio:
 class TestListAndGet:
     """Tests for PortfolioService.list and get."""
 
-    async def test_list_empty(
-        self, service: PortfolioService, mock_db: AsyncMock
-    ) -> None:
+    async def test_list_empty(self, service: PortfolioService, mock_db: AsyncMock) -> None:
         """list returns empty list when no portfolios exist."""
         result = await service.list(mock_db)
         assert result == []
@@ -328,9 +332,7 @@ class TestPortfolioRuns:
         assert result.status == "pending"
         assert result.portfolio_id == _PORTFOLIO_ID
 
-    async def test_list_runs_empty(
-        self, service: PortfolioService, mock_db: AsyncMock
-    ) -> None:
+    async def test_list_runs_empty(self, service: PortfolioService, mock_db: AsyncMock) -> None:
         """list_runs returns empty list when no runs exist."""
         result = await service.list_runs(mock_db)
         assert result == []
@@ -357,9 +359,7 @@ class TestPortfolioRuns:
         with pytest.raises(ValueError, match="not found"):
             await service.get_run(mock_db, uuid4())
 
-    async def test_get_run_returns_run(
-        self, service: PortfolioService, mock_db: AsyncMock
-    ) -> None:
+    async def test_get_run_returns_run(self, service: PortfolioService, mock_db: AsyncMock) -> None:
         """get_run returns run when it exists."""
         run = _make_run_row()
         mock_db.get.return_value = run
@@ -396,9 +396,7 @@ class TestPortfolioAPI:
         client_with_mock_db: httpx.AsyncClient,
     ) -> None:
         """GET /api/v1/portfolios/{id} with non-existent ID returns 404."""
-        response = await client_with_mock_db.get(
-            f"/api/v1/portfolios/{uuid4()}"
-        )
+        response = await client_with_mock_db.get(f"/api/v1/portfolios/{uuid4()}")
 
         assert response.status_code == 404
 
@@ -411,9 +409,7 @@ class TestPortfolioAPI:
         portfolio = _make_portfolio_row()
         mock_db.get.return_value = portfolio
 
-        response = await client_with_mock_db.get(
-            f"/api/v1/portfolios/{_PORTFOLIO_ID}"
-        )
+        response = await client_with_mock_db.get(f"/api/v1/portfolios/{_PORTFOLIO_ID}")
 
         assert response.status_code == 200
         body = response.json()
@@ -439,9 +435,7 @@ class TestPortfolioAPI:
         client_with_mock_db: httpx.AsyncClient,
     ) -> None:
         """GET /api/v1/portfolios/runs/{id} with non-existent ID returns 404."""
-        response = await client_with_mock_db.get(
-            f"/api/v1/portfolios/runs/{uuid4()}"
-        )
+        response = await client_with_mock_db.get(f"/api/v1/portfolios/runs/{uuid4()}")
 
         assert response.status_code == 404
 
@@ -454,9 +448,7 @@ class TestPortfolioAPI:
         run = _make_run_row()
         mock_db.get.return_value = run
 
-        response = await client_with_mock_db.get(
-            f"/api/v1/portfolios/runs/{_RUN_ID}"
-        )
+        response = await client_with_mock_db.get(f"/api/v1/portfolios/runs/{_RUN_ID}")
 
         assert response.status_code == 200
         body = response.json()
@@ -473,9 +465,7 @@ class TestPortfolioAPI:
         run.report_path = None
         mock_db.get.return_value = run
 
-        response = await client_with_mock_db.get(
-            f"/api/v1/portfolios/runs/{_RUN_ID}/report"
-        )
+        response = await client_with_mock_db.get(f"/api/v1/portfolios/runs/{_RUN_ID}/report")
 
         assert response.status_code == 404
 
@@ -483,5 +473,6 @@ class TestPortfolioAPI:
         """Verify the portfolio router is registered on the app."""
         routes = [route.path for route in app.routes]
         assert "/api/v1/portfolios" in routes or any(
-            r.startswith("/api/v1/portfolios") for r in routes  # type: ignore[union-attr]
+            r.startswith("/api/v1/portfolios")
+            for r in routes  # type: ignore[union-attr]
         )
