@@ -17,6 +17,7 @@ __all__ = [
     "RedisSettings",
     "enqueue_backtest",
     "enqueue_ingest",
+    "enqueue_research",
     "get_redis_pool",
 ]
 
@@ -83,6 +84,35 @@ async def enqueue_backtest(
         backtest_id=backtest_id,
         strategy_path=strategy_path,
         config=config,
+    )
+    return job.job_id if job else None
+
+
+async def enqueue_research(
+    pool: ArqRedis,
+    job_id: str,
+    job_type: str,
+    payload: dict[str, Any],
+) -> str | None:
+    """Enqueue a ``run_research_job`` job to the dedicated research queue.
+
+    Args:
+        pool: An active arq Redis connection pool.
+        job_id: UUID string of the :class:`ResearchJob` row.
+        job_type: Either ``"parameter_sweep"`` or ``"walk_forward"``.
+        payload: Full request payload forwarded verbatim to the worker.
+
+    Returns:
+        The arq job ID if enqueued, or None if the job was deduplicated.
+    """
+    from msai.core.config import settings as _settings  # lazy to avoid circular deps
+
+    job = await pool.enqueue_job(
+        "run_research_job",
+        job_id=job_id,
+        job_type=job_type,
+        payload=payload,
+        _queue_name=_settings.research_queue_name,
     )
     return job.job_id if job else None
 
