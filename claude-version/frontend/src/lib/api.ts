@@ -262,3 +262,50 @@ export async function getLiveTrades(
 ): Promise<LiveTradesResponse> {
   return apiGet<LiveTradesResponse>("/api/v1/live/trades", token);
 }
+
+// =====================================================================
+// Research types — mirror of backend schemas/research.py
+// =====================================================================
+
+export interface ResearchJobResponse {
+  id: string;
+  strategy_id: string;
+  job_type: string;
+  status: string;
+  progress: number;
+  progress_message: string | null;
+  best_config: Record<string, unknown> | null;
+  best_metrics: Record<string, unknown> | null;
+  error_message: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+}
+
+export interface ResearchJobListResponse {
+  items: ResearchJobResponse[];
+  total: number;
+}
+
+export interface ResearchTrialResponse {
+  id: string;
+  trial_number: number;
+  config: Record<string, unknown>;
+  metrics: Record<string, unknown> | null;
+  status: string;
+  objective_value: number | null;
+  backtest_id: string | null;
+  created_at: string;
+}
+
+export interface ResearchJobDetailResponse extends ResearchJobResponse {
+  config: Record<string, unknown>;
+  results: Record<string, unknown> | null;
+  trials: ResearchTrialResponse[];
+}
+
+export interface ResearchPromotionResponse {
+  candidate_id: string;
+  stage: string;
+  message: string;
+}
