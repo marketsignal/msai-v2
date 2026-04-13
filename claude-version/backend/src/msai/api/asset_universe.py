@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-from msai.core.auth import get_current_user
+from msai.core.auth import get_current_user, resolve_user_id
 from msai.core.database import get_db
 from msai.core.logging import get_logger
 from msai.schemas.asset_universe import (
@@ -60,8 +60,8 @@ async def add_asset(
 
     Returns 201 Created with the new asset record.
     """
-    user_id = claims.get("sub")
-    asset = await _service.add(db, body, user_id=user_id if isinstance(user_id, UUID) else None)
+    user_id = await resolve_user_id(db, claims)
+    asset = await _service.add(db, body, user_id=user_id)
     await db.commit()
     await db.refresh(asset)
     return AssetUniverseResponse.model_validate(asset)

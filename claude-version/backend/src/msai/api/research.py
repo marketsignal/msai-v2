@@ -232,9 +232,9 @@ async def cancel_research_job(
         job.status = "cancelled"
         job.progress_message = "Cancelled before starting"
     else:
-        # Running — signal the worker via progress_message; the heartbeat
-        # loop in the worker should check for cancellation.
-        job.progress_message = "Cancellation requested"
+        # Running — set status to "cancelled"; the worker's heartbeat loop
+        # polls for this status and sets the cancel_requested event.
+        job.status = "cancelled"
 
     await db.commit()
     await db.refresh(job)

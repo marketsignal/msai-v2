@@ -66,7 +66,12 @@ async def run_research_job(
     lease_id: str | None = None
     stop_heartbeat = asyncio.Event()
     cancel_requested = asyncio.Event()
-    redis = await get_redis_pool()
+    try:
+        redis = await get_redis_pool()
+    except Exception as exc:
+        log.error("research_redis_pool_failed", job_id=job_id, error=str(exc))
+        await _mark_failed(job_id, f"Redis connection failed: {exc}")
+        return
 
     log.info(
         "research_job_started",
@@ -246,6 +251,11 @@ async def run_research_job(
             raise ValueError(f"Unsupported research job type: {job_type!r}")
 
         # --- 7. Persist results or honour cancellation -------------------------
+        # Let any pending fire-and-forget progress writes flush before we
+        # write the final state — prevents a late progress callback from
+        # overwriting the completed/cancelled status.
+        await asyncio.sleep(0.15)
+
         if cancel_requested.is_set():
             await _mark_cancelled(job_id)
             log.info("research_job_cancelled_after_engine", job_id=job_id, job_type=job_type)
@@ -350,13 +360,44 @@ async def _finalize_job(job_id: str, report: dict[str, Any]) -> None:
         job.progress_message = "Completed"
         job.completed_at = datetime.now(UTC)
         job.results = report
+
         best = report.get("summary", {}).get("best_result")
+        if best is None:
+            # Walk-forward: derive best from window with best test Sharpe
+            windows = report.get("windows", [])
+            if windows:
+                best_window = max(
+                    (w for w in windows if w.get("test_result")),
+                    key=lambda w: (w.get("test_result") or {}).get("metrics", {}).get(
+                        "sharpe_ratio", 0
+                    ),
+                    default=None,
+                )
+                if best_window and best_window.get("best_train_result"):
+                    best = best_window["best_train_result"]
+
         job.best_config = best.get("config") if best else None
         job.best_metrics = best.get("metrics") if best else None
 
         # Create trial rows for each individual result
         objective = str(report.get("objective", "sharpe"))
         results_list: list[dict[str, Any]] = report.get("results", [])
+        if not results_list:
+            # Walk-forward: create trials from windows
+            for i, window in enumerate(report.get("windows", [])):
+                train = window.get("best_train_result") or {}
+                test = window.get("test_result") or {}
+                trial = ResearchTrial(
+                    research_job_id=job_id,
+                    trial_number=i,
+                    config=train.get("config", {}),
+                    metrics=test.get("metrics"),
+                    status="completed",
+                    objective_value=_safe_float(
+                        extract_objective_value(test.get("metrics", {}), objective)
+                    ),
+                )
+                session.add(trial)
         for index, result in enumerate(results_list):
             # Derive objective_value from metrics if not set directly
             raw_obj = result.get("objective_value")
