@@ -252,13 +252,12 @@ export default function ResearchPage(): React.ReactElement {
                               <div
                                 className="h-full rounded-full bg-blue-500 transition-all"
                                 style={{
-                                  width: `${Math.round(job.progress * 100)}%`,
+                                  width: `${job.progress}%`,
                                 }}
                               />
                             </div>
                             <p className="text-xs text-muted-foreground">
-                              {job.progress_message ??
-                                `${Math.round(job.progress * 100)}%`}
+                              {job.progress_message ?? `${job.progress}%`}
                             </p>
                           </div>
                         ) : job.status === "completed" ? (

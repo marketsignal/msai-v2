@@ -123,7 +123,7 @@ export function LaunchResearchForm({
         end_date: endDate,
         objective,
         base_config: parsedBaseConfig,
-        param_grid: parsedParamGrid,
+        parameter_grid: parsedParamGrid,
       };
 
       if (mode === "walk_forward") {
