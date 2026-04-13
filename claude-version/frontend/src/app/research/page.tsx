@@ -37,56 +37,8 @@ import {
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { formatDateTime } from "@/lib/format";
-
-function statusColor(status: string): string {
-  switch (status) {
-    case "completed":
-      return "bg-emerald-500/15 text-emerald-500 hover:bg-emerald-500/25";
-    case "running":
-      return "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25";
-    case "pending":
-      return "bg-amber-500/15 text-amber-500 hover:bg-amber-500/25";
-    case "failed":
-      return "bg-red-500/15 text-red-500 hover:bg-red-500/25";
-    case "cancelled":
-      return "bg-gray-500/15 text-gray-500 hover:bg-gray-500/25";
-    default:
-      return "bg-muted text-muted-foreground hover:bg-muted";
-  }
-}
-
-function jobTypeLabel(jobType: string): string {
-  switch (jobType) {
-    case "parameter_sweep":
-      return "Parameter Sweep";
-    case "walk_forward":
-      return "Walk Forward";
-    default:
-      return jobType;
-  }
-}
-
-interface KpiCardProps {
-  label: string;
-  value: number;
-  icon: React.ReactNode;
-}
-
-function KpiCard({ label, value, icon }: KpiCardProps): React.ReactElement {
-  return (
-    <Card className="border-border/50">
-      <CardContent className="flex items-center gap-3 p-4">
-        <div className="flex size-9 items-center justify-center rounded-md bg-muted">
-          {icon}
-        </div>
-        <div>
-          <p className="text-2xl font-semibold tracking-tight">{value}</p>
-          <p className="text-xs text-muted-foreground">{label}</p>
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
+import { statusColor, jobTypeLabel } from "@/lib/status";
+import { KpiCard } from "@/components/kpi-card";
 
 export default function ResearchPage(): React.ReactElement {
   const { getToken } = useAuth();
@@ -98,6 +50,24 @@ export default function ResearchPage(): React.ReactElement {
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const refreshJobs = useCallback(async (): Promise<void> => {
+    try {
+      const token = await getToken();
+      const jobsData = await apiGet<ResearchJobListResponse>(
+        "/api/v1/research/jobs",
+        token,
+      );
+      setJobs(jobsData.items);
+      setError(null);
+    } catch (err) {
+      const msg =
+        err instanceof ApiError
+          ? `Failed to load research jobs (${err.status})`
+          : "Failed to load research jobs";
+      setError(msg);
+    }
+  }, [getToken]);
 
   const load = useCallback(async (): Promise<void> => {
     try {
@@ -122,18 +92,18 @@ export default function ResearchPage(): React.ReactElement {
     }
   }, [getToken]);
 
-  // Initial load
+  // Initial load (fetches strategies + jobs)
   useEffect(() => {
     void load();
   }, [load]);
 
-  // Poll every 5s when there are active jobs
+  // Poll every 5s when there are active jobs (jobs only, not strategies)
   useEffect(() => {
     const hasActive = jobs.some(
       (j) => j.status === "pending" || j.status === "running",
     );
     if (hasActive) {
-      pollRef.current = setInterval(() => void load(), 5000);
+      pollRef.current = setInterval(() => void refreshJobs(), 5000);
     }
     return () => {
       if (pollRef.current) {

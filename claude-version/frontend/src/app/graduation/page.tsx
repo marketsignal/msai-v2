@@ -36,6 +36,7 @@ import {
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { formatDateTime } from "@/lib/format";
+import { KpiCard } from "@/components/kpi-card";
 
 // ---------------------------------------------------------------------------
 // Stage definitions
@@ -93,32 +94,6 @@ function metricValue(metrics: Record<string, unknown>, key: string): string {
   if (v === null || v === undefined) return "--";
   if (typeof v === "number") return v.toFixed(2);
   return String(v);
-}
-
-// ---------------------------------------------------------------------------
-// KPI card
-// ---------------------------------------------------------------------------
-
-interface KpiCardProps {
-  label: string;
-  value: number;
-  icon: React.ReactNode;
-}
-
-function KpiCard({ label, value, icon }: KpiCardProps): React.ReactElement {
-  return (
-    <Card className="border-border/50">
-      <CardContent className="flex items-center gap-3 p-4">
-        <div className="flex size-9 items-center justify-center rounded-md bg-muted">
-          {icon}
-        </div>
-        <div>
-          <p className="text-2xl font-semibold tracking-tight">{value}</p>
-          <p className="text-xs text-muted-foreground">{label}</p>
-        </div>
-      </CardContent>
-    </Card>
-  );
 }
 
 // ---------------------------------------------------------------------------
