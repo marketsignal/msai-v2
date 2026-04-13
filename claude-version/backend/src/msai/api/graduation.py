@@ -81,15 +81,21 @@ async def create_candidate(
 ) -> GraduationCandidateResponse:
     """Create a new graduation candidate in the 'discovery' stage."""
     user_id = await resolve_user_id(db, claims)
-    candidate = await _service.create_candidate(
-        db,
-        strategy_id=body.strategy_id,
-        config=body.config,
-        metrics=body.metrics,
-        research_job_id=body.research_job_id,
-        notes=body.notes,
-        user_id=user_id,
-    )
+    try:
+        candidate = await _service.create_candidate(
+            db,
+            strategy_id=body.strategy_id,
+            config=body.config,
+            metrics=body.metrics,
+            research_job_id=body.research_job_id,
+            notes=body.notes,
+            user_id=user_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        )
     await db.commit()
     await db.refresh(candidate)
 

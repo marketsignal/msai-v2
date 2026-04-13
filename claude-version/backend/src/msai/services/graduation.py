@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from msai.core.logging import get_logger
 from msai.models.graduation_candidate import GraduationCandidate
+from msai.models.strategy import Strategy
 from msai.models.graduation_stage_transition import GraduationStageTransition
 
 log = get_logger(__name__)
@@ -56,6 +57,19 @@ class GraduationService:
         user_id: UUID | None = None,
     ) -> GraduationCandidate:
         """Create a new candidate starting in 'discovery' stage."""
+        # Validate strategy exists
+        strategy = await session.get(Strategy, strategy_id)
+        if strategy is None:
+            raise ValueError(f"Strategy {strategy_id} not found")
+
+        # Validate research_job_id if provided
+        if research_job_id is not None:
+            from msai.models.research_job import ResearchJob
+
+            job = await session.get(ResearchJob, research_job_id)
+            if job is None:
+                raise ValueError(f"Research job {research_job_id} not found")
+
         candidate = GraduationCandidate(
             strategy_id=strategy_id,
             research_job_id=research_job_id,

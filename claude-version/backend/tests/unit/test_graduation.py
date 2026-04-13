@@ -84,7 +84,10 @@ def mock_db() -> AsyncMock:
     mock_result.scalar_one_or_none.return_value = None
 
     session.execute.return_value = mock_result
-    session.get.return_value = None
+
+    # Default: session.get returns a MagicMock (satisfies FK validation and
+    # candidate lookups). Tests that need 404 behavior override this per-test.
+    session.get.return_value = MagicMock()
     session.flush = AsyncMock()
     session.commit = AsyncMock()
     session.refresh = AsyncMock()
@@ -124,6 +127,7 @@ class TestCreateCandidate:
         self, service: GraduationService, mock_db: AsyncMock
     ) -> None:
         """create_candidate returns a candidate in 'discovery' stage."""
+
         # Arrange: flush assigns an id via side_effect
         async def _flush() -> None:
             # Simulate SQLAlchemy flush assigning an id
@@ -151,6 +155,7 @@ class TestCreateCandidate:
         self, service: GraduationService, mock_db: AsyncMock
     ) -> None:
         """create_candidate also creates an initial transition row."""
+
         # Arrange
         async def _flush() -> None:
             for call_args in mock_db.add.call_args_list:
@@ -221,16 +226,23 @@ class TestUpdateStage:
         candidate = _make_candidate_row(stage="live_running")
         mock_db.get.return_value = candidate
 
-        result = await service.update_stage(
-            mock_db, _CANDIDATE_ID, new_stage="paused"
-        )
+        result = await service.update_stage(mock_db, _CANDIDATE_ID, new_stage="paused")
 
         assert result.stage == "paused"
 
-    @pytest.mark.parametrize("stage", [
-        "discovery", "validation", "paper_candidate", "paper_running",
-        "paper_review", "live_candidate", "live_running", "paused",
-    ])
+    @pytest.mark.parametrize(
+        "stage",
+        [
+            "discovery",
+            "validation",
+            "paper_candidate",
+            "paper_running",
+            "paper_review",
+            "live_candidate",
+            "live_running",
+            "paused",
+        ],
+    )
     async def test_valid_transition_any_non_terminal_to_archived(
         self, service: GraduationService, mock_db: AsyncMock, stage: str
     ) -> None:
@@ -238,9 +250,7 @@ class TestUpdateStage:
         candidate = _make_candidate_row(stage=stage)
         mock_db.get.return_value = candidate
 
-        result = await service.update_stage(
-            mock_db, _CANDIDATE_ID, new_stage="archived"
-        )
+        result = await service.update_stage(mock_db, _CANDIDATE_ID, new_stage="archived")
 
         assert result.stage == "archived"
 
@@ -252,9 +262,7 @@ class TestUpdateStage:
         mock_db.get.return_value = candidate
 
         with pytest.raises(GraduationStageError, match="Cannot transition"):
-            await service.update_stage(
-                mock_db, _CANDIDATE_ID, new_stage="live_running"
-            )
+            await service.update_stage(mock_db, _CANDIDATE_ID, new_stage="live_running")
 
     async def test_invalid_transition_archived_to_anything_raises(
         self, service: GraduationService, mock_db: AsyncMock
@@ -264,9 +272,7 @@ class TestUpdateStage:
         mock_db.get.return_value = candidate
 
         with pytest.raises(GraduationStageError, match="terminal state"):
-            await service.update_stage(
-                mock_db, _CANDIDATE_ID, new_stage="discovery"
-            )
+            await service.update_stage(mock_db, _CANDIDATE_ID, new_stage="discovery")
 
     async def test_update_stage_candidate_not_found_raises(
         self, service: GraduationService, mock_db: AsyncMock
@@ -275,9 +281,7 @@ class TestUpdateStage:
         mock_db.get.return_value = None
 
         with pytest.raises(ValueError, match="not found"):
-            await service.update_stage(
-                mock_db, uuid4(), new_stage="validation"
-            )
+            await service.update_stage(mock_db, uuid4(), new_stage="validation")
 
 
 # ---------------------------------------------------------------------------
@@ -288,9 +292,7 @@ class TestUpdateStage:
 class TestGetAllowedTransitions:
     """Tests for GraduationService.get_allowed_transitions."""
 
-    def test_discovery_allows_validation_and_archived(
-        self, service: GraduationService
-    ) -> None:
+    def test_discovery_allows_validation_and_archived(self, service: GraduationService) -> None:
         result = service.get_allowed_transitions("discovery")
         assert result == ["archived", "validation"]
 
@@ -446,9 +448,7 @@ class TestGraduationAPI:
         """GET /candidates/{id} with non-existent ID returns 404."""
         mock_db.get.return_value = None
 
-        response = await client_with_mock_db.get(
-            f"/api/v1/graduation/candidates/{uuid4()}"
-        )
+        response = await client_with_mock_db.get(f"/api/v1/graduation/candidates/{uuid4()}")
 
         assert response.status_code == 404
 
@@ -461,9 +461,7 @@ class TestGraduationAPI:
         candidate = _make_candidate_row()
         mock_db.get.return_value = candidate
 
-        response = await client_with_mock_db.get(
-            f"/api/v1/graduation/candidates/{_CANDIDATE_ID}"
-        )
+        response = await client_with_mock_db.get(f"/api/v1/graduation/candidates/{_CANDIDATE_ID}")
 
         assert response.status_code == 200
         body = response.json()

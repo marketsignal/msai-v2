@@ -52,6 +52,15 @@ class PortfolioService:
         session.add(portfolio)
         await session.flush()
 
+        # Validate: no duplicate candidate IDs
+        seen_ids = set()
+        for alloc in data.allocations:
+            if alloc.candidate_id in seen_ids:
+                raise ValueError(
+                    f"Duplicate candidate {alloc.candidate_id} in allocations"
+                )
+            seen_ids.add(alloc.candidate_id)
+
         # Validate all candidate IDs exist before inserting allocations
         for alloc in data.allocations:
             candidate = await session.get(GraduationCandidate, alloc.candidate_id)
