@@ -17,7 +17,7 @@ from sqlalchemy import func, select
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-from msai.core.auth import get_current_user
+from msai.core.auth import get_current_user, resolve_user_id
 from msai.core.config import settings
 from msai.core.database import get_db
 from msai.core.logging import get_logger
@@ -292,7 +292,7 @@ async def promote_research_result(
         config = dict(trial.config)
         metrics = dict(trial.metrics) if trial.metrics else {}
 
-    user_id = claims.get("sub")
+    user_id = await resolve_user_id(db, claims)
     candidate = await _graduation_service.create_candidate(
         db,
         strategy_id=job.strategy_id,

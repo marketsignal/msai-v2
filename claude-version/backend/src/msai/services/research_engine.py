@@ -1266,6 +1266,7 @@ class ResearchEngine:
                     study.tell(trial, state=TrialState.PRUNED)
                 else:
                     study.tell(trial, state=TrialState.FAIL)
+                terminal_trials += 1  # advance loop to avoid infinite spin
                 continue
 
             history[cache_key] = {"state": "pending", "value": None}

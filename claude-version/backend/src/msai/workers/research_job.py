@@ -295,8 +295,8 @@ async def _mark_running(job_id: str, worker_id: str) -> bool:
         if job is None:
             log.error("research_job_not_found", job_id=job_id)
             return False
-        if job.status == "cancelled":
-            log.info("research_job_already_cancelled", job_id=job_id)
+        if job.status in ("completed", "failed", "cancelled"):
+            log.info("research_job_already_terminal", job_id=job_id, status=job.status)
             return False
         job.status = "running"
         job.started_at = datetime.now(UTC)

@@ -15,7 +15,7 @@ from sqlalchemy import func, select
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-from msai.core.auth import get_current_user
+from msai.core.auth import get_current_user, resolve_user_id
 from msai.core.database import get_db
 from msai.core.logging import get_logger
 from msai.models.graduation_candidate import GraduationCandidate
@@ -80,6 +80,7 @@ async def create_candidate(
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> GraduationCandidateResponse:
     """Create a new graduation candidate in the 'discovery' stage."""
+    user_id = await resolve_user_id(db, claims)
     candidate = await _service.create_candidate(
         db,
         strategy_id=body.strategy_id,
@@ -87,6 +88,7 @@ async def create_candidate(
         metrics=body.metrics,
         research_job_id=body.research_job_id,
         notes=body.notes,
+        user_id=user_id,
     )
     await db.commit()
     await db.refresh(candidate)
@@ -135,12 +137,14 @@ async def update_candidate_stage(
 
     Returns 422 if the transition is invalid, with the list of allowed transitions.
     """
+    user_id = await resolve_user_id(db, claims)
     try:
         candidate = await _service.update_stage(
             db,
             candidate_id,
             new_stage=body.stage,
             reason=body.reason,
+            user_id=user_id,
         )
     except ValueError:
         raise HTTPException(

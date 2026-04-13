@@ -97,8 +97,14 @@ async def run_nightly_ingest(ctx: dict[str, Any]) -> dict[str, int]:
             result = await svc.ingest_daily(asset_class=asset_class, symbols=symbols)
             combined_result.update(result)
 
-        # Mark all targets as ingested
-        await _mark_ingested(targets)
+        # Only mark assets whose ingestion returned non-zero rows as fresh
+        successful_targets = [
+            asset
+            for asset in targets
+            if combined_result.get(asset.symbol, 0) > 0
+        ]
+        if successful_targets:
+            await _mark_ingested(successful_targets)
         log.info("nightly_ingest_complete", source="database", result=combined_result)
     else:
         # Fallback to hardcoded list

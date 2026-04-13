@@ -21,7 +21,7 @@ from sqlalchemy.exc import IntegrityError
 
 from msai.api.live_deps import get_command_bus, get_idempotency_store
 from msai.core.audit import log_audit
-from msai.core.auth import get_current_user
+from msai.core.auth import get_current_user, resolve_user_id
 from msai.core.config import settings
 from msai.core.database import get_db
 from msai.core.logging import get_logger
@@ -173,56 +173,12 @@ def _apply_outcome(outcome: EndpointOutcome) -> JSONResponse:
 
 
 async def _resolve_user_id(db: AsyncSession, claims: dict[str, Any]) -> UUID | None:
-    """Resolve the authenticated user's database ID from JWT claims.
+    """Delegate to the shared helper in ``core.auth``.
 
-    If the ``users`` row for ``sub`` doesn't exist yet (JWT user calling
-    ``/start`` before ``/auth/me`` has provisioned them, or API-key user
-    hitting a DB that hadn't finished migrations at startup), provision
-    it inline. This is the only way to get a stable per-user
-    ``identity_signature`` without introducing a parallel ``sub``-keyed
-    identity universe (Codex Task 1.1b iteration 6, P1+P2 fix).
-
-    Concurrency:
-    A concurrent insert losing the race is handled inside a SAVEPOINT
-    (``db.begin_nested()``). That way the ``IntegrityError`` rollback
-    only unwinds the savepoint, NOT the outer transaction — preserving
-    any ORM objects the caller already loaded in the session
-    (e.g. the ``Strategy`` row fetched by ``live_start`` before calling
-    this helper). A plain ``db.rollback()`` would expire every loaded
-    ORM object and the caller's subsequent ``strategy.default_config``
-    / ``strategy.strategy_class`` access would trigger a lazy refresh
-    from the async session context and raise ``MissingGreenlet``
-    (Codex Task 1.5 iter2 P2 fix).
+    Kept as a thin wrapper so existing callers don't need renaming.
+    See :func:`msai.core.auth.resolve_user_id` for full docstring.
     """
-    sub = claims.get("sub")
-    if not sub:
-        return None
-    result = await db.execute(select(User.id).where(User.entra_id == sub))
-    row_id = result.scalar_one_or_none()
-    if row_id is not None:
-        return row_id
-
-    email = claims.get("preferred_username") or f"{sub}@unknown.local"
-    new_user = User(
-        entra_id=str(sub),
-        email=str(email),
-        display_name=claims.get("name"),
-        role="operator",
-    )
-    try:
-        async with db.begin_nested():
-            db.add(new_user)
-            # flush runs inside the SAVEPOINT so an IntegrityError only
-            # unwinds this nested transaction, not the outer session state.
-            await db.flush()
-    except IntegrityError:
-        # Savepoint already rolled back by the context manager. The
-        # outer session and all previously-loaded ORM objects are
-        # preserved — we just re-read the row the concurrent insert
-        # wrote.
-        result = await db.execute(select(User.id).where(User.entra_id == sub))
-        return result.scalar_one_or_none()
-    return new_user.id
+    return await resolve_user_id(db, claims)
 
 
 def _resolve_strategy_code_hash(strategy: Strategy) -> str:
