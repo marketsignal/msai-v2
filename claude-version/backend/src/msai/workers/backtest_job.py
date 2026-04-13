@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+import sys
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -39,7 +40,7 @@ from msai.core.logging import get_logger
 from msai.models.backtest import Backtest
 from msai.models.trade import Trade
 from msai.services.nautilus.backtest_runner import BacktestResult, BacktestRunner
-from msai.services.nautilus.catalog_builder import ensure_catalog_data
+from msai.services.nautilus.catalog_builder import describe_catalog, ensure_catalog_data
 from msai.services.report_generator import ReportGenerator
 
 log = get_logger(__name__)
@@ -108,6 +109,26 @@ async def run_backtest_job(
             "backtest_catalog_ready",
             backtest_id=backtest_id,
             instrument_ids=instrument_ids,
+        )
+
+        # --- 2b. Capture data lineage snapshot ----------------------------
+        lineage_snapshot = describe_catalog(
+            instruments=symbols,
+            data_path=str(settings.parquet_root),
+        )
+        python_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        try:
+            import nautilus_trader  # noqa: WPS433
+
+            nautilus_ver: str | None = nautilus_trader.__version__
+        except Exception:
+            nautilus_ver = None
+
+        await _persist_lineage(
+            backtest_id=backtest_id,
+            nautilus_version=nautilus_ver,
+            python_version=python_ver,
+            data_snapshot=lineage_snapshot,
         )
 
         # --- 3. Build the strategy config with the resolved instrument ----
@@ -244,6 +265,33 @@ async def _start_backtest(backtest_id: str) -> dict[str, Any] | None:
             "strategy_id": backtest.strategy_id,
             "strategy_code_hash": backtest.strategy_code_hash,
         }
+
+
+async def _persist_lineage(
+    *,
+    backtest_id: str,
+    nautilus_version: str | None,
+    python_version: str,
+    data_snapshot: dict[str, Any],
+) -> None:
+    """Write data lineage fields onto the backtest row.
+
+    Called right after the catalog is confirmed ready but before the
+    actual backtest subprocess starts.  This means even failed backtests
+    will carry their lineage info, which is important for debugging
+    data-related failures.
+    """
+    try:
+        async with async_session_factory() as session:
+            row = await session.get(Backtest, backtest_id)
+            if row is None:
+                return
+            row.nautilus_version = nautilus_version
+            row.python_version = python_version
+            row.data_snapshot = data_snapshot
+            await session.commit()
+    except Exception:
+        log.warning("backtest_lineage_persist_failed", backtest_id=backtest_id)
 
 
 async def _finalize_backtest(

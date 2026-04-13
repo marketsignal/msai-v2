@@ -25,7 +25,9 @@ Design goals
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from hashlib import sha256
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -37,7 +39,7 @@ from msai.core.logging import get_logger
 from msai.services.nautilus.instruments import resolve_instrument
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    pass
 
 log = get_logger(__name__)
 
@@ -214,3 +216,75 @@ def ensure_catalog_data(
             )
         )
     return instrument_ids
+
+
+def describe_catalog(
+    instruments: list[str],
+    data_path: str | Path,
+    date_range: tuple[str, str] | None = None,
+) -> dict[str, Any]:
+    """Describe the Parquet catalog data available for given instruments.
+
+    Scans the directory tree under *data_path* for Parquet files whose names
+    match the requested instruments and returns a lightweight summary suitable
+    for storing on a :class:`~msai.models.backtest.Backtest` row as
+    ``data_snapshot``.
+
+    The ``catalog_hash`` is a deterministic fingerprint derived from file
+    names, sizes, and modification times.  Two backtests that ran against
+    the exact same data files will share the same hash, making it trivial
+    to identify which results are comparable.
+
+    Args:
+        instruments: Nautilus instrument IDs (e.g. ``["AAPL.SIM"]``).
+        data_path: Root directory to scan for Parquet files.
+        date_range: Optional ``(start, end)`` ISO-date strings.  Currently
+            unused but reserved for future filtering.
+
+    Returns:
+        A dict with keys ``instruments``, ``file_count``, ``files``
+        (capped at 50 entries), and ``catalog_hash``.
+    """
+    _ = date_range  # reserved for future use
+
+    files_info: list[dict[str, Any]] = []
+    hash_parts: list[str] = []
+
+    data_root = Path(data_path)
+    for instrument_id in instruments:
+        # Extract the bare symbol from a Nautilus ID like "AAPL.SIM"
+        symbol = instrument_id.split(".")[0] if "." in instrument_id else instrument_id
+
+        # Look for a directory named exactly after the symbol (the MSAI
+        # convention: {data_root}/{asset_class}/{symbol}/{YYYY}/{MM}.parquet)
+        # and collect all .parquet files below it.  Fall back to a broad
+        # filename match if no such directory exists.
+        matching_files: list[Path] = []
+        for candidate_dir in data_root.rglob(symbol):
+            if candidate_dir.is_dir():
+                matching_files.extend(sorted(candidate_dir.rglob("*.parquet")))
+        if not matching_files:
+            matching_files = sorted(data_root.rglob(f"*{symbol}*.parquet"))
+
+        for f in matching_files:
+            stat = f.stat()
+            file_info: dict[str, Any] = {
+                "path": str(f.relative_to(data_root)),
+                "size_bytes": stat.st_size,
+                "modified": stat.st_mtime,
+            }
+            files_info.append(file_info)
+            hash_parts.append(f"{f.name}:{stat.st_size}:{stat.st_mtime}")
+
+    catalog_hash = (
+        sha256("|".join(sorted(hash_parts)).encode()).hexdigest()[:16]
+        if hash_parts
+        else "empty"
+    )
+
+    return {
+        "instruments": instruments,
+        "file_count": len(files_info),
+        "files": files_info[:50],  # Cap to avoid huge JSON in the DB
+        "catalog_hash": catalog_hash,
+    }
