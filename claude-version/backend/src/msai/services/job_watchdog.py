@@ -128,6 +128,19 @@ async def _scan_research_jobs(session: AsyncSession) -> int:
     return cleaned
 
 
+def _to_naive_utc(dt: datetime) -> datetime:
+    """Strip timezone info so naive/aware datetimes can be compared safely.
+
+    ``created_at`` columns use ``server_default=func.now()`` without
+    ``timezone=True``, so asyncpg returns naive datetimes.  ``heartbeat_at``
+    uses ``DateTime(timezone=True)``, so asyncpg returns aware datetimes.
+    This helper normalises both to naive-UTC for consistent comparison.
+    """
+    if dt.tzinfo is not None:
+        return dt.replace(tzinfo=None)
+    return dt
+
+
 def _check_job_health(
     *,
     status: str,
@@ -145,17 +158,21 @@ def _check_job_health(
         created_at: When the job was created.
         stale_cutoff: Threshold — running jobs with heartbeat before this are stale.
         pending_cutoff: Threshold — pending jobs created before this are stuck.
-        now: Current UTC time.
+        now: Current UTC time (naive).
 
     Returns:
         A human-readable failure reason, or ``None`` if the job is healthy.
     """
-    if status == "running" and heartbeat_at is not None and heartbeat_at < stale_cutoff:
-        elapsed = int((now - heartbeat_at).total_seconds())
-        return f"Watchdog: no heartbeat for {elapsed} seconds"
+    if status == "running" and heartbeat_at is not None:
+        hb = _to_naive_utc(heartbeat_at)
+        if hb < stale_cutoff:
+            elapsed = int((now - hb).total_seconds())
+            return f"Watchdog: no heartbeat for {elapsed} seconds"
 
-    if status == "pending" and created_at < pending_cutoff:
-        elapsed = int((now - created_at).total_seconds())
-        return f"Watchdog: stuck in pending for {elapsed} seconds"
+    if status == "pending":
+        ca = _to_naive_utc(created_at)
+        if ca < pending_cutoff:
+            elapsed = int((now - ca).total_seconds())
+            return f"Watchdog: stuck in pending for {elapsed} seconds"
 
     return None

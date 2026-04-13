@@ -39,7 +39,7 @@ from msai.services.compute_slots import (
     renew_compute_slots,
 )
 from msai.services.nautilus.catalog_builder import ensure_catalog_data
-from msai.services.research_engine import ResearchEngine
+from msai.services.research_engine import ResearchEngine, extract_objective_value
 
 log = get_logger("workers.research")
 
@@ -355,15 +355,21 @@ async def _finalize_job(job_id: str, report: dict[str, Any]) -> None:
         job.best_metrics = best.get("metrics") if best else None
 
         # Create trial rows for each individual result
+        objective = str(report.get("objective", "sharpe"))
         results_list: list[dict[str, Any]] = report.get("results", [])
         for index, result in enumerate(results_list):
+            # Derive objective_value from metrics if not set directly
+            raw_obj = result.get("objective_value")
+            if raw_obj is None:
+                metrics = result.get("metrics") or {}
+                raw_obj = extract_objective_value(metrics, objective)
             trial = ResearchTrial(
                 research_job_id=job_id,
                 trial_number=index,
                 config=result.get("config", {}),
                 metrics=result.get("metrics"),
                 status="completed" if result.get("error") is None else "failed",
-                objective_value=_safe_float(result.get("objective_value")),
+                objective_value=_safe_float(raw_obj),
             )
             session.add(trial)
 
