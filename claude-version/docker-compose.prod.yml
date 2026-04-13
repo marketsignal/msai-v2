@@ -113,6 +113,54 @@ services:
           cpus: "2.0"
           memory: 4G
 
+  research-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "-m", "arq", "msai.workers.research_settings.ResearchWorkerSettings"]
+    volumes:
+      - app_data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:${POSTGRES_PASSWORD}@postgres:5432/msai
+      REDIS_URL: redis://redis:6379
+      DATA_ROOT: /app/data
+      ENVIRONMENT: production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
+  portfolio-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "-m", "arq", "msai.workers.portfolio_settings.WorkerSettings"]
+    volumes:
+      - app_data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:${POSTGRES_PASSWORD}@postgres:5432/msai
+      REDIS_URL: redis://redis:6379
+      DATA_ROOT: /app/data
+      ENVIRONMENT: production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
   # Phase 1 task 1.7: live supervisor. Owns every trading subprocess the
   # system spawns. Consumes commands from msai:live:commands via
   # LiveCommandBus (XAUTOCLAIM PEL recovery + DLQ), runs ProcessManager
