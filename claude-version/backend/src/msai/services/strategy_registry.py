@@ -148,21 +148,9 @@ def discover_strategies(strategies_dir: Path) -> list[DiscoveredStrategy]:
                 path=str(py_file),
                 violations=violations,
             )
-            # Do NOT import — module-scope side effects are dangerous.
-            # Record the file as blocked so the UI can display it.
-            rel = py_file.relative_to(strategies_dir)
-            dotted_name = rel.with_suffix("").as_posix().replace("/", ".")
-            discovered.append(
-                DiscoveredStrategy(
-                    name=dotted_name,
-                    module_path=py_file,
-                    strategy_class_name="BLOCKED",
-                    config_class_name=None,
-                    code_hash=compute_file_hash(py_file),
-                    description=f"Governance violations: {'; '.join(violations)}",
-                    governance_status="blocked",
-                )
-            )
+            # Do NOT import or register — module-scope side effects are
+            # dangerous and blocked strategies must not appear as runnable
+            # in the UI or be selectable for backtests/research.
             continue
 
         try:
