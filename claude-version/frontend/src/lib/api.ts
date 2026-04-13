@@ -309,3 +309,42 @@ export interface ResearchPromotionResponse {
   stage: string;
   message: string;
 }
+
+// =====================================================================
+// Graduation types — mirror of backend schemas/graduation.py
+// =====================================================================
+
+export interface GraduationCandidateResponse {
+  id: string;
+  strategy_id: string;
+  research_job_id: string | null;
+  stage: string;
+  config: Record<string, unknown>;
+  metrics: Record<string, unknown>;
+  deployment_id: string | null;
+  notes: string | null;
+  promoted_by: string | null;
+  promoted_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GraduationCandidateListResponse {
+  items: GraduationCandidateResponse[];
+  total: number;
+}
+
+export interface GraduationTransitionResponse {
+  id: number;
+  candidate_id: string;
+  from_stage: string;
+  to_stage: string;
+  reason: string | null;
+  transitioned_by: string | null;
+  created_at: string;
+}
+
+export interface GraduationTransitionListResponse {
+  items: GraduationTransitionResponse[];
+  total: number;
+}
