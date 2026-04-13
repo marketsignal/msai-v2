@@ -24,6 +24,8 @@ logs.
 
 from __future__ import annotations
 
+import os
+import socket
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -40,6 +42,8 @@ from msai.services.nautilus.catalog_builder import ensure_catalog_data
 from msai.services.report_generator import ReportGenerator
 
 log = get_logger(__name__)
+
+_WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
 
 async def run_backtest_job(
@@ -205,6 +209,9 @@ async def _start_backtest(backtest_id: str) -> dict[str, Any] | None:
         backtest.status = "running"
         backtest.progress = 10
         backtest.started_at = datetime.now(UTC)
+        backtest.worker_id = _WORKER_ID
+        backtest.heartbeat_at = datetime.now(UTC)
+        backtest.attempt = (backtest.attempt or 0) + 1
         await session.commit()
         return {
             "instruments": list(backtest.instruments),

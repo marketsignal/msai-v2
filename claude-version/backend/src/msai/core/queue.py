@@ -24,22 +24,24 @@ _DEFAULT_REDIS_PORT = 6379
 
 
 def _parse_redis_url(url: str) -> RedisSettings:
-    """Parse a ``redis://host:port`` URL into arq :class:`RedisSettings`.
+    """Parse a ``redis://host:port/db`` URL into arq :class:`RedisSettings`.
 
-    Only the *host* and *port* components are extracted.  When the port is
-    omitted the default Redis port (6379) is used.
+    Extracts *host*, *port*, and *database* components.  When the port is
+    omitted the default Redis port (6379) is used.  When the database path
+    is omitted, database 0 is used.
 
     Args:
-        url: A Redis connection URL, e.g. ``redis://localhost:6379``.
+        url: A Redis connection URL, e.g. ``redis://localhost:6379/0``.
 
     Returns:
         An :class:`arq.connections.RedisSettings` configured with the
-        parsed host and port.
+        parsed host, port, and database.
     """
     parsed = urlparse(url)
     host: str = parsed.hostname or "localhost"
     port: int = parsed.port or _DEFAULT_REDIS_PORT
-    return RedisSettings(host=host, port=port)
+    database: int = int(parsed.path.lstrip("/") or "0")
+    return RedisSettings(host=host, port=port, database=database)
 
 
 async def get_redis_pool() -> ArqRedis:
@@ -64,7 +66,7 @@ async def enqueue_backtest(
     backtest_id: str,
     strategy_path: str,
     config: dict[str, Any],
-) -> None:
+) -> str | None:
     """Enqueue a ``run_backtest`` job.
 
     Args:
@@ -72,13 +74,17 @@ async def enqueue_backtest(
         backtest_id: Unique identifier for the backtest run.
         strategy_path: Dotted Python path to the strategy class/module.
         config: Arbitrary configuration dict forwarded to the worker.
+
+    Returns:
+        The arq job ID if enqueued, or None if the job was deduplicated.
     """
-    await pool.enqueue_job(
+    job = await pool.enqueue_job(
         "run_backtest",
         backtest_id=backtest_id,
         strategy_path=strategy_path,
         config=config,
     )
+    return job.job_id if job else None
 
 
 async def enqueue_ingest(
