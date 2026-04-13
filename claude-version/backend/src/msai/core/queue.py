@@ -17,6 +17,7 @@ __all__ = [
     "RedisSettings",
     "enqueue_backtest",
     "enqueue_ingest",
+    "enqueue_portfolio_run",
     "enqueue_research",
     "get_redis_pool",
 ]
@@ -113,6 +114,29 @@ async def enqueue_research(
         job_type=job_type,
         payload=payload,
         _queue_name=_settings.research_queue_name,
+    )
+    return job.job_id if job else None
+
+
+async def enqueue_portfolio_run(
+    pool: ArqRedis,
+    run_id: str,
+    portfolio_id: str,
+) -> str | None:
+    """Enqueue a ``run_portfolio`` job.
+
+    Args:
+        pool: An active arq Redis connection pool.
+        run_id: UUID string of the :class:`PortfolioRun` row.
+        portfolio_id: UUID string of the owning :class:`Portfolio`.
+
+    Returns:
+        The arq job ID if enqueued, or None if the job was deduplicated.
+    """
+    job = await pool.enqueue_job(
+        "run_portfolio",
+        run_id=run_id,
+        portfolio_id=portfolio_id,
     )
     return job.job_id if job else None
 
