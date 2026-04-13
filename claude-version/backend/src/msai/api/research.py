@@ -59,6 +59,7 @@ async def submit_parameter_sweep(
     strategy = await _resolve_strategy(db, body.strategy_id)
     strategy_path = _resolve_strategy_path(strategy)
     payload = _build_sweep_payload(body, strategy, strategy_path)
+    user_id = await resolve_user_id(db, claims)
 
     job = ResearchJob(
         strategy_id=body.strategy_id,
@@ -66,6 +67,7 @@ async def submit_parameter_sweep(
         config=payload,
         status="pending",
         progress=0,
+        created_by=user_id,
     )
     db.add(job)
     await db.flush()
@@ -107,6 +109,7 @@ async def submit_walk_forward(
     payload["test_days"] = body.test_days
     payload["step_days"] = body.step_days
     payload["mode"] = body.mode
+    user_id = await resolve_user_id(db, claims)
 
     job = ResearchJob(
         strategy_id=body.strategy_id,
@@ -114,6 +117,7 @@ async def submit_walk_forward(
         config=payload,
         status="pending",
         progress=0,
+        created_by=user_id,
     )
     db.add(job)
     await db.flush()

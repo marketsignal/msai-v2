@@ -6,6 +6,7 @@ the symbols in the asset universe table.
 
 from __future__ import annotations
 
+from datetime import date, timedelta
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -111,12 +112,13 @@ async def trigger_ingest(
     pool = await get_redis_pool()
     enqueued = 0
     for asset_class, symbols in groups.items():
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
         await enqueue_ingest(
             pool=pool,
             asset_class=asset_class,
             symbols=symbols,
-            start="yesterday",
-            end="yesterday",
+            start=yesterday,
+            end=yesterday,
         )
         enqueued += 1
         log.info(
