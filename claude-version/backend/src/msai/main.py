@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
 from msai.api.account import router as account_router
+from msai.api.asset_universe import router as universe_router
 from msai.api.auth import router as auth_router
 from msai.api.backtests import router as backtests_router
 from msai.api.live import router as live_router
@@ -224,6 +225,7 @@ app.include_router(backtests_router)
 app.include_router(market_data_router)
 app.include_router(live_router)
 app.include_router(account_router)
+app.include_router(universe_router)
 
 
 # ---------------------------------------------------------------------------
