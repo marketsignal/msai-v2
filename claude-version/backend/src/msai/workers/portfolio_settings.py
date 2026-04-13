@@ -50,6 +50,7 @@ class WorkerSettings:
 
     functions = [run_portfolio]
     redis_settings: RedisSettings = _parse_redis_url(settings.redis_url)
+    queue_name: str = settings.portfolio_queue_name
     max_jobs: int = 2
     job_timeout: int = 60 * 60  # 1 hour
     max_tries: int = 2  # 1 retry

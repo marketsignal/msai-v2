@@ -275,7 +275,6 @@ export function LaunchResearchForm({
               <SelectContent>
                 <SelectItem value="sharpe">Sharpe Ratio</SelectItem>
                 <SelectItem value="sortino">Sortino Ratio</SelectItem>
-                <SelectItem value="calmar">Calmar Ratio</SelectItem>
                 <SelectItem value="total_return">Total Return</SelectItem>
               </SelectContent>
             </Select>
@@ -357,7 +356,7 @@ export function LaunchResearchForm({
           </Button>
           <Button
             className="gap-1.5"
-            onClick={handleSubmit}
+            onClick={() => void handleSubmit()}
             disabled={submitting || !selectedStrategy}
           >
             <Microscope className="size-3.5" />

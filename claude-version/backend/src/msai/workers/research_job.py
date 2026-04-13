@@ -43,6 +43,14 @@ from msai.services.research_engine import ResearchEngine, extract_objective_valu
 
 log = get_logger("workers.research")
 
+# Maps user-facing objective names to their canonical metric key.
+_OBJECTIVE_METRIC_MAP: dict[str, str] = {
+    "sharpe": "sharpe_ratio",
+    "sortino": "sortino_ratio",
+    "total_return": "total_return",
+    "max_drawdown": "max_drawdown",
+}
+
 
 async def run_research_job(
     ctx: dict[str, Any],
@@ -361,26 +369,34 @@ async def _finalize_job(job_id: str, report: dict[str, Any]) -> None:
         job.completed_at = datetime.now(UTC)
         job.results = report
 
+        objective = str(report.get("objective", "sharpe"))
+        objective_metric_key = _OBJECTIVE_METRIC_MAP.get(objective, "sharpe_ratio")
         best = report.get("summary", {}).get("best_result")
         if best is None:
-            # Walk-forward: derive best from window with best test Sharpe
+            # Walk-forward: derive best from window with best test objective
             windows = report.get("windows", [])
             if windows:
                 best_window = max(
                     (w for w in windows if w.get("test_result")),
                     key=lambda w: (w.get("test_result") or {}).get("metrics", {}).get(
-                        "sharpe_ratio", 0
+                        objective_metric_key, 0
                     ),
                     default=None,
                 )
-                if best_window and best_window.get("best_train_result"):
-                    best = best_window["best_train_result"]
+                if best_window:
+                    # Use test metrics (out-of-sample) for best_metrics,
+                    # but train config for best_config
+                    train = best_window.get("best_train_result") or {}
+                    test = best_window.get("test_result") or {}
+                    best = {
+                        "config": train.get("config", {}),
+                        "metrics": test.get("metrics", train.get("metrics", {})),
+                    }
 
         job.best_config = best.get("config") if best else None
         job.best_metrics = best.get("metrics") if best else None
 
         # Create trial rows for each individual result
-        objective = str(report.get("objective", "sharpe"))
         results_list: list[dict[str, Any]] = report.get("results", [])
         if not results_list:
             # Walk-forward: create trials from windows

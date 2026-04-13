@@ -21,7 +21,9 @@ class StrategyGovernanceService:
     BLOCKED_IMPORTS: frozenset[str] = frozenset({
         "os", "subprocess", "shutil", "socket", "ctypes", "importlib",
         "webbrowser", "http.server", "xmlrpc", "ftplib", "smtplib",
-        "telnetlib", "pickle",
+        "telnetlib", "pickle", "sys", "pathlib", "io", "signal",
+        "multiprocessing", "threading", "tempfile", "atexit", "code",
+        "codeop", "pty", "resource",
     })
 
     DANGEROUS_CALLS: frozenset[str] = frozenset({
@@ -31,30 +33,22 @@ class StrategyGovernanceService:
 
     def validate_file(self, file_path: Path) -> list[str]:
         """Return list of violations. Empty list means the file is safe."""
-        violations: list[str] = []
-        violations.extend(self._check_syntax(file_path))
-        if violations:
-            return violations  # Can't do AST checks if syntax is broken
-        violations.extend(self._check_imports(file_path))
-        violations.extend(self._check_dangerous_patterns(file_path))
-        return violations
-
-    def _check_syntax(self, file_path: Path) -> list[str]:
-        """Verify the file is valid Python."""
         try:
             source = file_path.read_text(encoding="utf-8")
-            ast.parse(source, filename=str(file_path))
-            return []
+            tree = ast.parse(source, filename=str(file_path))
         except SyntaxError as exc:
             return [f"Syntax error at line {exc.lineno}: {exc.msg}"]
-        except Exception as exc:
+        except OSError as exc:
             return [f"Cannot read file: {exc}"]
 
-    def _check_imports(self, file_path: Path) -> list[str]:
+        violations: list[str] = []
+        violations.extend(self._check_imports(tree))
+        violations.extend(self._check_dangerous_patterns(tree))
+        return violations
+
+    def _check_imports(self, tree: ast.Module) -> list[str]:
         """Check for blocked module imports."""
         violations: list[str] = []
-        source = file_path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(file_path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -72,11 +66,9 @@ class StrategyGovernanceService:
                         )
         return violations
 
-    def _check_dangerous_patterns(self, file_path: Path) -> list[str]:
+    def _check_dangerous_patterns(self, tree: ast.Module) -> list[str]:
         """Check for dangerous function calls like eval(), exec(), __import__()."""
         violations: list[str] = []
-        source = file_path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(file_path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 func_name: str | None = None

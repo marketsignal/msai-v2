@@ -39,7 +39,7 @@ from msai.core.logging import get_logger
 from msai.services.nautilus.instruments import resolve_instrument
 
 if TYPE_CHECKING:
-    pass
+    from nautilus_trader.model.identifiers import InstrumentId
 
 log = get_logger(__name__)
 
@@ -255,16 +255,16 @@ def describe_catalog(
         # Extract the bare symbol from a Nautilus ID like "AAPL.SIM"
         symbol = instrument_id.split(".")[0] if "." in instrument_id else instrument_id
 
-        # Look for a directory named exactly after the symbol (the MSAI
-        # convention: {data_root}/{asset_class}/{symbol}/{YYYY}/{MM}.parquet)
-        # and collect all .parquet files below it.  Fall back to a broad
-        # filename match if no such directory exists.
+        # Use the known MSAI layout: {data_root}/{asset_class}/{symbol}/...
+        # rather than rglob which scans the entire (potentially huge) data tree.
         matching_files: list[Path] = []
-        for candidate_dir in data_root.rglob(symbol):
-            if candidate_dir.is_dir():
-                matching_files.extend(sorted(candidate_dir.rglob("*.parquet")))
-        if not matching_files:
-            matching_files = sorted(data_root.rglob(f"*{symbol}*.parquet"))
+        if data_root.is_dir():
+            for asset_class_dir in data_root.iterdir():
+                if not asset_class_dir.is_dir():
+                    continue
+                symbol_dir = asset_class_dir / symbol
+                if symbol_dir.is_dir():
+                    matching_files.extend(sorted(symbol_dir.rglob("*.parquet")))
 
         for f in matching_files:
             stat = f.stat()

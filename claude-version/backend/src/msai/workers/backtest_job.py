@@ -113,7 +113,7 @@ async def run_backtest_job(
 
         # --- 2b. Capture data lineage snapshot ----------------------------
         lineage_snapshot = describe_catalog(
-            instruments=symbols,
+            instruments=instrument_ids,
             data_path=str(settings.parquet_root),
         )
         python_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
@@ -291,7 +291,7 @@ async def _persist_lineage(
             row.data_snapshot = data_snapshot
             await session.commit()
     except Exception:
-        log.warning("backtest_lineage_persist_failed", backtest_id=backtest_id)
+        log.warning("backtest_lineage_persist_failed", backtest_id=backtest_id, exc_info=True)
 
 
 async def _finalize_backtest(

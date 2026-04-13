@@ -232,7 +232,7 @@ export default function ResearchDetailPage({
         {job.status === "completed" && !promotionResult && (
           <Button
             className="gap-1.5"
-            onClick={handlePromote}
+            onClick={() => void handlePromote()}
             disabled={promoting}
           >
             <Trophy className="size-3.5" />

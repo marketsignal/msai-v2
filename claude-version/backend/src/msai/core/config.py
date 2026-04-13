@@ -80,8 +80,9 @@ class Settings(BaseSettings):
     job_stale_seconds: int = 600  # 10 min without heartbeat = stale
     job_pending_grace_seconds: int = 600  # 10 min pending without starting = stuck
 
-    # Research engine tuning
+    # Queue names (dedicated queues prevent cross-worker job leakage)
     research_queue_name: str = "msai:research"
+    portfolio_queue_name: str = "msai:portfolio"
     research_worker_jobs: int = 2
     research_timeout_seconds: int = 14400  # 4 hours
     research_max_parallelism: int = max(1, min(4, (cpu_count() or 1) - 1))

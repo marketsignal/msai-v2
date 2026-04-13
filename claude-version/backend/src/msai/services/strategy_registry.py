@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from msai.core.logging import get_logger
+from msai.services.strategy_governance import StrategyGovernanceService
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -73,6 +74,7 @@ class DiscoveredStrategy:
     config_class_name: str | None
     code_hash: str
     description: str | None = None
+    governance_status: str = "unchecked"
 
 
 # ---------------------------------------------------------------------------
@@ -131,16 +133,26 @@ def discover_strategies(strategies_dir: Path) -> list[DiscoveredStrategy]:
 
     _ensure_strategies_importable(strategies_dir)
 
+    governance = StrategyGovernanceService()
+
     for py_file in sorted(strategies_dir.rglob("*.py")):
         if py_file.name in _SKIP_FILENAMES or py_file.name.startswith("_"):
             continue
 
+        # Run governance check BEFORE importing — prevents dangerous
+        # module-scope side effects (os.system, subprocess, etc.)
+        violations = governance.validate_file(py_file)
+        if violations:
+            log.warning(
+                "strategy_governance_violations",
+                path=str(py_file),
+                violations=violations,
+            )
+
         try:
             module = _import_strategy_module(py_file, strategies_dir)
         except Exception as exc:
-            log.warning(
-                "strategy_import_failed", path=str(py_file), error=str(exc)
-            )
+            log.warning("strategy_import_failed", path=str(py_file), error=str(exc))
             continue
 
         strategy_cls = _find_strategy_class(module)
@@ -160,11 +172,9 @@ def discover_strategies(strategies_dir: Path) -> list[DiscoveredStrategy]:
                 config_class_name=(config_cls.__name__ if config_cls else None),
                 code_hash=compute_file_hash(py_file),
                 description=(inspect.getdoc(strategy_cls) or None),
+                governance_status="violations" if violations else "passed",
             )
         )
-
-    # Run governance checks on discovered strategies (warn-only)
-    _run_governance_checks(discovered)
 
     return discovered
 
@@ -193,10 +203,7 @@ def validate_strategy_file(module_path: Path) -> tuple[bool, str]:
 
     strategies_dir = _infer_strategies_root(module_path)
     if strategies_dir is None:
-        return False, (
-            "Strategy file is not inside a 'strategies/' directory: "
-            f"{module_path}"
-        )
+        return False, (f"Strategy file is not inside a 'strategies/' directory: {module_path}")
 
     _ensure_strategies_importable(strategies_dir)
 
@@ -388,9 +395,7 @@ def load_strategy_class(module_path: Path, class_name: str) -> type[Any]:
     if strategies_dir is None:
         # Fall back to direct file-spec loading so callers outside the
         # ``strategies/`` convention still work (e.g. synthetic test files).
-        spec = importlib.util.spec_from_file_location(
-            f"_adhoc.{module_path.stem}", module_path
-        )
+        spec = importlib.util.spec_from_file_location(f"_adhoc.{module_path.stem}", module_path)
         if spec is None or spec.loader is None:
             raise ImportError(f"Cannot load module from {module_path}")
         module = importlib.util.module_from_spec(spec)

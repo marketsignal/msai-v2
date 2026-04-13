@@ -133,10 +133,13 @@ async def enqueue_portfolio_run(
     Returns:
         The arq job ID if enqueued, or None if the job was deduplicated.
     """
+    from msai.core.config import settings as _settings  # lazy to avoid circular deps
+
     job = await pool.enqueue_job(
         "run_portfolio",
         run_id=run_id,
         portfolio_id=portfolio_id,
+        _queue_name=_settings.portfolio_queue_name,
     )
     return job.job_id if job else None
 
