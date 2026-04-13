@@ -26,14 +26,14 @@ Merge the best Codex features into the Claude version: research engine (Optuna),
 - [x] Plan written — docs/plans/2026-04-12-hybrid-merge-implementation.md
 - [x] Plan review loop (2 iterations) — 18 execution rules. PASS.
 - [x] TDD execution complete (18/18 tasks done — 1133 tests pass)
-- [x] Code review loop (4 iterations) — iter1: 1P0+7P1+5P2, iter2: 5P1+2P2, iter3: 4P1+3P2, iter4: 1P1+6P2. All fixed. Only accepted P2s remain (TOCTOU, serial exec, Optuna study key). PASS.
-- [ ] Simplified
-- [ ] Verified (tests/lint/types)
-- [ ] E2E use cases tested (if user-facing)
-- [ ] Learnings documented (if any)
-- [ ] State files updated
-- [ ] Committed and pushed
-- [ ] PR created
+- [x] Code review loop (7 iterations) — iter1-4: Tasks 1-12. iter5: 3P1+5P2. iter6: 2P1+2P2. iter7: PRT clean + 1P2 Codex (f4b7121). PASS.
+- [x] Simplified (c6e3e34) — extracted statusColor, jobTypeLabel, KpiCard; split poll from initial load
+- [x] Verified — 1133 tests pass, frontend builds clean
+- [x] E2E use cases tested — N/A: new pages require full infra (DB+Redis+IB); service-layer integration tests cover the flows
+- [x] Learnings documented — N/A (learnings already in MEMORY.md from prior sessions)
+- [x] State files updated
+- [x] Committed and pushed
+- [x] PR created — marketsignal/msai-v2#3
 - [ ] PR reviews addressed
 - [ ] Branch finished
 

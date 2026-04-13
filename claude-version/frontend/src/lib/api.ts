@@ -264,6 +264,68 @@ export async function getLiveTrades(
 }
 
 // =====================================================================
+// Backtest detail types (equity curve, trades)
+// =====================================================================
+
+export interface EquityPoint {
+  date: string;
+  equity: number;
+  drawdown: number;
+}
+
+export interface BacktestTradeItem {
+  id: string;
+  timestamp: string;
+  instrument: string;
+  side: "BUY" | "SELL";
+  quantity: number;
+  entryPrice: number;
+  exitPrice: number;
+  pnl: number;
+  holdingPeriod: string;
+}
+
+export interface MonthlyReturn {
+  month: string;
+  year: number;
+  return_pct: number;
+}
+
+// =====================================================================
+// Market data status types — mirror of backend schemas/market_data.py
+// =====================================================================
+
+export interface StorageStatsResponse {
+  asset_classes: Record<string, number>;
+  total_files: number;
+  total_bytes: number;
+}
+
+export interface MarketDataStatusResponse {
+  status: string;
+  storage: StorageStatsResponse;
+}
+
+export async function getMarketDataStatus(
+  token?: string | null,
+): Promise<MarketDataStatusResponse> {
+  return apiGet<MarketDataStatusResponse>("/api/v1/market-data/status", token);
+}
+
+export interface MarketDataSymbolsResponse {
+  symbols: Record<string, string[]>;
+}
+
+export async function getMarketDataSymbols(
+  token?: string | null,
+): Promise<MarketDataSymbolsResponse> {
+  return apiGet<MarketDataSymbolsResponse>(
+    "/api/v1/market-data/symbols",
+    token,
+  );
+}
+
+// =====================================================================
 // Research types — mirror of backend schemas/research.py
 // =====================================================================
 

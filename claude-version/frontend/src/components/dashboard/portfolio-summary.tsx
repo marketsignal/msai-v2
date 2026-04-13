@@ -8,13 +8,12 @@ import {
   Activity,
   Percent,
 } from "lucide-react";
-import { activeStrategies } from "@/lib/mock-data/dashboard";
 
 export interface PortfolioSummaryProps {
   /** Override the active-strategies count (e.g. from the API). */
   totalStrategies?: number;
   runningStrategies?: number;
-  /** Real account data from IB Gateway (null = use hardcoded fallback). */
+  /** Real account data from IB Gateway (null = not yet loaded). */
   accountData?: {
     net_liquidation: number;
     unrealized_pnl: number;
@@ -68,35 +67,33 @@ export function PortfolioSummary({
   runningStrategies,
   accountData,
 }: PortfolioSummaryProps = {}): React.ReactElement {
-  const fallbackRunning = activeStrategies.filter(
-    (s) => s.status === "running",
-  ).length;
-  const total = totalStrategies ?? activeStrategies.length;
-  const running = runningStrategies ?? fallbackRunning;
+  const total = totalStrategies ?? 0;
+  const running = runningStrategies ?? 0;
 
-  // Use real account data if available, otherwise hardcoded fallback
-  const totalValue = accountData?.net_liquidation ?? 125_430.56;
-  const dailyPnl = accountData?.unrealized_pnl ?? 1_234.56;
+  // Use real account data if available, otherwise show zero
+  const totalValue = accountData?.net_liquidation ?? 0;
+  const dailyPnl = accountData?.unrealized_pnl ?? 0;
+  const hasAccount = accountData != null;
 
   return (
     <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
       <StatCard
         title="Total Value"
         value={`$${totalValue.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-        change={accountData ? "From IB Gateway" : "Mock data"}
+        change={hasAccount ? "From IB Gateway" : "No account connected"}
         trend="up"
         icon={DollarSign}
       />
       <StatCard
         title="Daily P&L"
         value={`${dailyPnl >= 0 ? "+" : ""}$${Math.abs(dailyPnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
-        change={accountData ? "From IB Gateway" : "Mock data"}
+        change={hasAccount ? "From IB Gateway" : "No account connected"}
         trend={dailyPnl >= 0 ? "up" : "down"}
         icon={TrendingUp}
       />
       <StatCard
         title="Total Return"
-        value="+12.5%"
+        value={hasAccount ? "--" : "--"}
         change="Since inception"
         trend="up"
         icon={Percent}
