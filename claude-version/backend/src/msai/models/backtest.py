@@ -53,6 +53,21 @@ class Backtest(Base):
     )
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
+    # Data lineage fields — captured before each backtest run so every result
+    # can be traced back to the exact software versions and data files used.
+    nautilus_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    python_version: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    data_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+    # Job lifecycle fields (used by the watchdog to detect stale/orphaned jobs)
+    queue_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    queue_job_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    attempt: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # Relationships
     strategy: Mapped["Strategy"] = relationship(lazy="selectin")  # noqa: F821
     creator: Mapped["User"] = relationship(lazy="selectin")  # noqa: F821

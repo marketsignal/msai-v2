@@ -1,6 +1,5 @@
 "use client";
 
-import { useMemo } from "react";
 import {
   Card,
   CardContent,
@@ -27,8 +26,7 @@ import {
   Activity,
   Zap,
 } from "lucide-react";
-import type { EquityPoint } from "@/lib/mock-data/backtests";
-import { generateMonthlyReturns } from "@/lib/mock-data/backtests";
+import type { EquityPoint } from "@/lib/api";
 import { formatCurrency, formatPercent } from "@/lib/format";
 
 export interface ResultsChartsBacktest {
@@ -67,74 +65,9 @@ function MetricCard({
 }
 
 function MonthlyReturnsHeatmap(): React.ReactElement {
-  const data = useMemo(() => generateMonthlyReturns(), []);
-  const months = [
-    "Jan",
-    "Feb",
-    "Mar",
-    "Apr",
-    "May",
-    "Jun",
-    "Jul",
-    "Aug",
-    "Sep",
-    "Oct",
-    "Nov",
-    "Dec",
-  ];
-  const years = [2024, 2025];
-
-  function getCellColor(val: number): string {
-    if (val >= 5) return "bg-emerald-600 text-white";
-    if (val >= 2) return "bg-emerald-500/40 text-emerald-300";
-    if (val >= 0) return "bg-emerald-500/15 text-emerald-400";
-    if (val >= -2) return "bg-red-500/15 text-red-400";
-    if (val >= -5) return "bg-red-500/40 text-red-300";
-    return "bg-red-600 text-white";
-  }
-
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-xs">
-        <thead>
-          <tr>
-            <th className="p-2 text-left font-medium text-muted-foreground">
-              Year
-            </th>
-            {months.map((m) => (
-              <th
-                key={m}
-                className="p-2 text-center font-medium text-muted-foreground"
-              >
-                {m}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {years.map((year) => (
-            <tr key={year}>
-              <td className="p-2 font-medium">{year}</td>
-              {months.map((month) => {
-                const entry = data.find(
-                  (d) => d.month === month && d.year === year,
-                );
-                const val = entry?.return_pct ?? 0;
-                return (
-                  <td key={month} className="p-1">
-                    <div
-                      className={`rounded-md px-2 py-1.5 text-center font-mono ${getCellColor(val)}`}
-                    >
-                      {val >= 0 ? "+" : ""}
-                      {val.toFixed(1)}%
-                    </div>
-                  </td>
-                );
-              })}
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <div className="flex h-24 items-center justify-center text-sm text-muted-foreground">
+      Monthly returns data not yet available from the backend.
     </div>
   );
 }

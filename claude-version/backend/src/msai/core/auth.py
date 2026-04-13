@@ -6,7 +6,11 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from uuid import UUID
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 import jwt
 from fastapi import Depends, HTTPException, Request, status
@@ -119,3 +123,47 @@ async def get_current_user(
         ) from exc
 
     return payload
+
+
+async def resolve_user_id(
+    db: "AsyncSession",
+    claims: dict[str, Any],
+) -> UUID | None:
+    """Resolve JWT claims to a ``users.id`` UUID, auto-creating the row if needed.
+
+    The ``sub`` claim from Entra ID (or the API-key sentinel) is an opaque
+    string, but FK columns (``promoted_by``, ``transitioned_by``, etc.)
+    reference ``users.id`` (UUID).  This helper bridges the gap.
+
+    Concurrency: a concurrent insert losing the race is handled inside a
+    SAVEPOINT so the outer transaction's ORM objects are preserved.
+    """
+    from sqlalchemy import select
+    from sqlalchemy.exc import IntegrityError
+
+    from msai.models.user import User
+
+    sub = claims.get("sub")
+    if not sub:
+        return None
+
+    result = await db.execute(select(User.id).where(User.entra_id == sub))
+    row_id = result.scalar_one_or_none()
+    if row_id is not None:
+        return row_id
+
+    email = claims.get("preferred_username") or f"{sub}@unknown.local"
+    new_user = User(
+        entra_id=str(sub),
+        email=str(email),
+        display_name=claims.get("name"),
+        role="operator",
+    )
+    try:
+        async with db.begin_nested():
+            db.add(new_user)
+            await db.flush()
+    except IntegrityError:
+        result = await db.execute(select(User.id).where(User.entra_id == sub))
+        return result.scalar_one_or_none()
+    return new_user.id

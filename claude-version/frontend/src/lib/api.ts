@@ -262,3 +262,190 @@ export async function getLiveTrades(
 ): Promise<LiveTradesResponse> {
   return apiGet<LiveTradesResponse>("/api/v1/live/trades", token);
 }
+
+// =====================================================================
+// Backtest detail types (equity curve, trades)
+// =====================================================================
+
+export interface EquityPoint {
+  date: string;
+  equity: number;
+  drawdown: number;
+}
+
+export interface BacktestTradeItem {
+  id: string;
+  timestamp: string;
+  instrument: string;
+  side: "BUY" | "SELL";
+  quantity: number;
+  entryPrice: number;
+  exitPrice: number;
+  pnl: number;
+  holdingPeriod: string;
+}
+
+export interface MonthlyReturn {
+  month: string;
+  year: number;
+  return_pct: number;
+}
+
+// =====================================================================
+// Market data status types — mirror of backend schemas/market_data.py
+// =====================================================================
+
+export interface StorageStatsResponse {
+  asset_classes: Record<string, number>;
+  total_files: number;
+  total_bytes: number;
+}
+
+export interface MarketDataStatusResponse {
+  status: string;
+  storage: StorageStatsResponse;
+}
+
+export async function getMarketDataStatus(
+  token?: string | null,
+): Promise<MarketDataStatusResponse> {
+  return apiGet<MarketDataStatusResponse>("/api/v1/market-data/status", token);
+}
+
+export interface MarketDataSymbolsResponse {
+  symbols: Record<string, string[]>;
+}
+
+export async function getMarketDataSymbols(
+  token?: string | null,
+): Promise<MarketDataSymbolsResponse> {
+  return apiGet<MarketDataSymbolsResponse>(
+    "/api/v1/market-data/symbols",
+    token,
+  );
+}
+
+// =====================================================================
+// Research types — mirror of backend schemas/research.py
+// =====================================================================
+
+export interface ResearchJobResponse {
+  id: string;
+  strategy_id: string;
+  job_type: string;
+  status: string;
+  progress: number;
+  progress_message: string | null;
+  best_config: Record<string, unknown> | null;
+  best_metrics: Record<string, unknown> | null;
+  error_message: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+}
+
+export interface ResearchJobListResponse {
+  items: ResearchJobResponse[];
+  total: number;
+}
+
+export interface ResearchTrialResponse {
+  id: string;
+  trial_number: number;
+  config: Record<string, unknown>;
+  metrics: Record<string, unknown> | null;
+  status: string;
+  objective_value: number | null;
+  backtest_id: string | null;
+  created_at: string;
+}
+
+export interface ResearchJobDetailResponse extends ResearchJobResponse {
+  config: Record<string, unknown>;
+  results: Record<string, unknown> | null;
+  trials: ResearchTrialResponse[];
+}
+
+export interface ResearchPromotionResponse {
+  candidate_id: string;
+  stage: string;
+  message: string;
+}
+
+// =====================================================================
+// Graduation types — mirror of backend schemas/graduation.py
+// =====================================================================
+
+export interface GraduationCandidateResponse {
+  id: string;
+  strategy_id: string;
+  research_job_id: string | null;
+  stage: string;
+  config: Record<string, unknown>;
+  metrics: Record<string, unknown>;
+  deployment_id: string | null;
+  notes: string | null;
+  promoted_by: string | null;
+  promoted_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GraduationCandidateListResponse {
+  items: GraduationCandidateResponse[];
+  total: number;
+}
+
+export interface GraduationTransitionResponse {
+  id: number;
+  candidate_id: string;
+  from_stage: string;
+  to_stage: string;
+  reason: string | null;
+  transitioned_by: string | null;
+  created_at: string;
+}
+
+export interface GraduationTransitionListResponse {
+  items: GraduationTransitionResponse[];
+  total: number;
+}
+
+// =====================================================================
+// Portfolio types — mirror of backend schemas/portfolio.py
+// =====================================================================
+
+export interface PortfolioResponse {
+  id: string;
+  name: string;
+  description: string | null;
+  objective: string;
+  base_capital: number;
+  requested_leverage: number;
+  benchmark_symbol: string | null;
+  account_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PortfolioListResponse {
+  items: PortfolioResponse[];
+  total: number;
+}
+
+export interface PortfolioRunResponse {
+  id: string;
+  portfolio_id: string;
+  status: string;
+  metrics: Record<string, unknown> | null;
+  report_path: string | null;
+  start_date: string;
+  end_date: string;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface PortfolioRunListResponse {
+  items: PortfolioRunResponse[];
+  total: number;
+}

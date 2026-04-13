@@ -24,11 +24,16 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
 from msai.api.account import router as account_router
+from msai.api.asset_universe import router as universe_router
 from msai.api.auth import router as auth_router
 from msai.api.backtests import router as backtests_router
+from msai.api.graduation import router as graduation_router
 from msai.api.live import router as live_router
+from msai.api.portfolio import router as portfolio_router
 from msai.api.market_data import router as market_data_router
+from msai.api.research import router as research_router
 from msai.api.strategies import router as strategies_router
+from msai.api.strategy_templates import router as strategy_templates_router
 from msai.api.websocket import live_stream
 from msai.core.auth import _API_KEY_CLAIMS, init_validator
 from msai.core.config import settings
@@ -224,6 +229,11 @@ app.include_router(backtests_router)
 app.include_router(market_data_router)
 app.include_router(live_router)
 app.include_router(account_router)
+app.include_router(universe_router)
+app.include_router(research_router)
+app.include_router(graduation_router)
+app.include_router(portfolio_router)
+app.include_router(strategy_templates_router)
 
 
 # ---------------------------------------------------------------------------

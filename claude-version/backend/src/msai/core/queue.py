@@ -17,6 +17,8 @@ __all__ = [
     "RedisSettings",
     "enqueue_backtest",
     "enqueue_ingest",
+    "enqueue_portfolio_run",
+    "enqueue_research",
     "get_redis_pool",
 ]
 
@@ -24,22 +26,24 @@ _DEFAULT_REDIS_PORT = 6379
 
 
 def _parse_redis_url(url: str) -> RedisSettings:
-    """Parse a ``redis://host:port`` URL into arq :class:`RedisSettings`.
+    """Parse a ``redis://host:port/db`` URL into arq :class:`RedisSettings`.
 
-    Only the *host* and *port* components are extracted.  When the port is
-    omitted the default Redis port (6379) is used.
+    Extracts *host*, *port*, and *database* components.  When the port is
+    omitted the default Redis port (6379) is used.  When the database path
+    is omitted, database 0 is used.
 
     Args:
-        url: A Redis connection URL, e.g. ``redis://localhost:6379``.
+        url: A Redis connection URL, e.g. ``redis://localhost:6379/0``.
 
     Returns:
         An :class:`arq.connections.RedisSettings` configured with the
-        parsed host and port.
+        parsed host, port, and database.
     """
     parsed = urlparse(url)
     host: str = parsed.hostname or "localhost"
     port: int = parsed.port or _DEFAULT_REDIS_PORT
-    return RedisSettings(host=host, port=port)
+    database: int = int(parsed.path.lstrip("/") or "0")
+    return RedisSettings(host=host, port=port, database=database)
 
 
 async def get_redis_pool() -> ArqRedis:
@@ -64,7 +68,7 @@ async def enqueue_backtest(
     backtest_id: str,
     strategy_path: str,
     config: dict[str, Any],
-) -> None:
+) -> str | None:
     """Enqueue a ``run_backtest`` job.
 
     Args:
@@ -72,13 +76,72 @@ async def enqueue_backtest(
         backtest_id: Unique identifier for the backtest run.
         strategy_path: Dotted Python path to the strategy class/module.
         config: Arbitrary configuration dict forwarded to the worker.
+
+    Returns:
+        The arq job ID if enqueued, or None if the job was deduplicated.
     """
-    await pool.enqueue_job(
+    job = await pool.enqueue_job(
         "run_backtest",
         backtest_id=backtest_id,
         strategy_path=strategy_path,
         config=config,
     )
+    return job.job_id if job else None
+
+
+async def enqueue_research(
+    pool: ArqRedis,
+    job_id: str,
+    job_type: str,
+    payload: dict[str, Any],
+) -> str | None:
+    """Enqueue a ``run_research_job`` job to the dedicated research queue.
+
+    Args:
+        pool: An active arq Redis connection pool.
+        job_id: UUID string of the :class:`ResearchJob` row.
+        job_type: Either ``"parameter_sweep"`` or ``"walk_forward"``.
+        payload: Full request payload forwarded verbatim to the worker.
+
+    Returns:
+        The arq job ID if enqueued, or None if the job was deduplicated.
+    """
+    from msai.core.config import settings as _settings  # lazy to avoid circular deps
+
+    job = await pool.enqueue_job(
+        "run_research_job",
+        job_id=job_id,
+        job_type=job_type,
+        payload=payload,
+        _queue_name=_settings.research_queue_name,
+    )
+    return job.job_id if job else None
+
+
+async def enqueue_portfolio_run(
+    pool: ArqRedis,
+    run_id: str,
+    portfolio_id: str,
+) -> str | None:
+    """Enqueue a ``run_portfolio`` job.
+
+    Args:
+        pool: An active arq Redis connection pool.
+        run_id: UUID string of the :class:`PortfolioRun` row.
+        portfolio_id: UUID string of the owning :class:`Portfolio`.
+
+    Returns:
+        The arq job ID if enqueued, or None if the job was deduplicated.
+    """
+    from msai.core.config import settings as _settings  # lazy to avoid circular deps
+
+    job = await pool.enqueue_job(
+        "run_portfolio",
+        run_id=run_id,
+        portfolio_id=portfolio_id,
+        _queue_name=_settings.portfolio_queue_name,
+    )
+    return job.job_id if job else None
 
 
 async def enqueue_ingest(

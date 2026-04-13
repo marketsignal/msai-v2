@@ -4,6 +4,20 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### Added (Hybrid Merge — feat/hybrid-merge)
+
+- **2026-04-12** — User stories document (`docs/user-stories.md`, 38 stories, 12 epics, 26 must-haves). Defines the full vision for the MSAI platform: strategy management, research/Optuna, graduation pipeline, portfolio management, live trading, risk, notifications, multi-account-ready architecture.
+- **2026-04-12** — Deep comparison of Claude vs Codex versions (`docs/claude-vs-codex-comparison.md`). 5 parallel agents explored both codebases. Codex GPT-5.4 reviewed and corrected 5 claims. Verdict: Claude as foundation (stronger Nautilus integration, production infra), port Codex features (research, graduation, portfolio).
+- **2026-04-12** — Hybrid merge design doc (`docs/plans/2026-04-12-hybrid-merge-design.md`). Feature-vertical approach, 8 new DB tables replacing Codex JSON files, graduation stage transition graph, multi-account-ready architecture.
+- **2026-04-12** — Hybrid merge implementation plan (`docs/plans/2026-04-12-hybrid-merge-implementation.md`, 18 tasks). Plan review loop: 2 iterations, 18 execution rules from Claude + Codex reviews.
+- **2026-04-12** — Task 1: Backtest lifecycle fields (commit `892e6fc`). Added queue_name, queue_job_id, worker_id, attempt, heartbeat_at to Backtest model. Fixed Redis URL parser to preserve DB component. backtests API and worker now populate lifecycle fields for job watchdog.
+- **2026-04-12** — Task 2: New DB models (commit `d81f5d5`). Created 8 models: asset_universe, research_job, research_trial, graduation_candidate, graduation_stage_transition, portfolio, portfolio_allocation, portfolio_run. Manual Alembic migration. 61 unit tests.
+- **2026-04-12** — Task 3: Pydantic schemas (commit `604a60a`). Request/response schemas for research, graduation, portfolio, asset universe. 40 tests.
+- **2026-04-12** — Task 4: Compute slots (commit `5aae72d`). Redis semaphore for concurrent job throttling. 11 tests.
+- **2026-04-12** — Task 5: Job watchdog (commit `27f33e0`). Scans stale/orphaned backtests and research jobs. Arq cron (every 60s). Added lifecycle fields to ResearchJob. 13 tests.
+- **2026-04-12** — Task 6: Asset universe (commit `e6a85d2`). DB-backed universe with add/remove/list/ingest API. Nightly ingest reads from DB instead of hardcoded list. 14 tests.
+- **2026-04-13** — Task 7: Research engine (commit `ac9a480`). Core engine (~800 LOC) with Optuna parameter sweeps, walk-forward CV, successive halving. Added optuna + jinja2 deps. 29 tests.
+
 ### Added
 
 - Initial project setup with Claude Code configuration

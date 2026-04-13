@@ -107,7 +107,9 @@ async def run_backtest(
     # Enqueue to arq BEFORE commit — if enqueue fails, rollback the row
     try:
         pool = await get_redis_pool()
-        await enqueue_backtest(pool, str(backtest.id), strategy.file_path, worker_config)
+        backtest.queue_name = "arq:queue"
+        job_id = await enqueue_backtest(pool, str(backtest.id), strategy.file_path, worker_config)
+        backtest.queue_job_id = job_id
     except Exception as exc:
         await db.rollback()
         log.error("backtest_enqueue_failed", error=str(exc))

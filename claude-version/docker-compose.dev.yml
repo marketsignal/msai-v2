@@ -46,6 +46,8 @@ services:
       - "8800:8000"
     volumes:
       - ./backend/src:/app/src:ro
+      - ./backend/alembic:/app/alembic:ro
+      - ./backend/alembic.ini:/app/alembic.ini:ro
       - ./strategies:/app/strategies:ro
       - ./data:/app/data
     environment:
@@ -116,6 +118,54 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+
+  research-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: msai-claude-research-worker
+    command: ["uv", "run", "arq", "msai.workers.research_settings.ResearchWorkerSettings"]
+    volumes:
+      - ./backend/src:/app/src:ro
+      - ./strategies:/app/strategies:ro
+      - ./data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:msai_dev_password@postgres:5432/msai
+      REDIS_URL: redis://redis:6379
+      DATA_ROOT: /app/data
+      STRATEGIES_ROOT: /app/strategies
+      ENVIRONMENT: development
+      MSAI_API_KEY: ${MSAI_API_KEY:-msai-dev-key}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  portfolio-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    container_name: msai-claude-portfolio-worker
+    command: ["uv", "run", "arq", "msai.workers.portfolio_settings.WorkerSettings"]
+    volumes:
+      - ./backend/src:/app/src:ro
+      - ./strategies:/app/strategies:ro
+      - ./data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:msai_dev_password@postgres:5432/msai
+      REDIS_URL: redis://redis:6379
+      DATA_ROOT: /app/data
+      STRATEGIES_ROOT: /app/strategies
+      ENVIRONMENT: development
+      MSAI_API_KEY: ${MSAI_API_KEY:-msai-dev-key}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
   # Phase 1 task 1.7: standalone Python service that owns all live trading
   # subprocesses. Runs as its own container so it can outlive FastAPI

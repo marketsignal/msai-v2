@@ -1,7 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { generateEquityCurve } from "@/lib/mock-data/dashboard";
+import { useEffect, useState } from "react";
 import { PortfolioSummary } from "@/components/dashboard/portfolio-summary";
 import { EquityChart } from "@/components/dashboard/equity-chart";
 import { ActiveStrategies } from "@/components/dashboard/active-strategies";
@@ -10,20 +9,20 @@ import {
   apiGet,
   ApiError,
   getAccountSummary,
+  getLiveStatus,
   type AccountSummary,
   type StrategyListResponse,
+  type LiveDeploymentInfo,
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 
-// NOTE: Account/portfolio stats and recent trades remain mocked for now —
-// the backend does not yet expose dashboard-aggregated endpoints.
-
 export default function DashboardPage(): React.ReactElement {
   const { getToken } = useAuth();
-  const equityCurve = useMemo(() => generateEquityCurve(), []);
   const [strategyCount, setStrategyCount] = useState<number | undefined>(
     undefined,
   );
+  const [runningCount, setRunningCount] = useState<number>(0);
+  const [deployments, setDeployments] = useState<LiveDeploymentInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [account, setAccount] = useState<AccountSummary | null>(null);
 
@@ -32,9 +31,10 @@ export default function DashboardPage(): React.ReactElement {
     const load = async (): Promise<void> => {
       try {
         const token = await getToken();
-        const [strategies, accountData] = await Promise.allSettled([
+        const [strategies, accountData, liveStatus] = await Promise.allSettled([
           apiGet<StrategyListResponse>("/api/v1/strategies/", token),
           getAccountSummary(token),
+          getLiveStatus(token),
         ]);
         if (cancelled) return;
         if (strategies.status === "fulfilled") {
@@ -44,6 +44,13 @@ export default function DashboardPage(): React.ReactElement {
         }
         if (accountData.status === "fulfilled") {
           setAccount(accountData.value);
+        }
+        if (liveStatus.status === "fulfilled") {
+          setDeployments(liveStatus.value.deployments);
+          setRunningCount(
+            liveStatus.value.deployments.filter((d) => d.status === "running")
+              .length,
+          );
         }
       } catch (err) {
         if (cancelled) return;
@@ -79,14 +86,14 @@ export default function DashboardPage(): React.ReactElement {
       {/* Stats grid */}
       <PortfolioSummary
         totalStrategies={strategyCount}
-        runningStrategies={0}
+        runningStrategies={runningCount}
         accountData={account}
       />
 
       {/* Equity curve + Active strategies */}
       <div className="grid gap-6 lg:grid-cols-7">
-        <EquityChart data={equityCurve} />
-        <ActiveStrategies />
+        <EquityChart data={[]} />
+        <ActiveStrategies deployments={deployments} />
       </div>
 
       {/* Recent trades */}

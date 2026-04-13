@@ -24,6 +24,10 @@ logs.
 
 from __future__ import annotations
 
+import asyncio
+import os
+import socket
+import sys
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -36,10 +40,13 @@ from msai.core.logging import get_logger
 from msai.models.backtest import Backtest
 from msai.models.trade import Trade
 from msai.services.nautilus.backtest_runner import BacktestResult, BacktestRunner
-from msai.services.nautilus.catalog_builder import ensure_catalog_data
+from msai.services.nautilus.catalog_builder import describe_catalog, ensure_catalog_data
 from msai.services.report_generator import ReportGenerator
 
 log = get_logger(__name__)
+
+_WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
+_HEARTBEAT_INTERVAL_S = 15
 
 
 async def run_backtest_job(
@@ -104,6 +111,26 @@ async def run_backtest_job(
             instrument_ids=instrument_ids,
         )
 
+        # --- 2b. Capture data lineage snapshot ----------------------------
+        lineage_snapshot = describe_catalog(
+            instruments=instrument_ids,
+            data_path=str(settings.parquet_root),
+        )
+        python_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        try:
+            import nautilus_trader  # noqa: WPS433
+
+            nautilus_ver: str | None = nautilus_trader.__version__
+        except Exception:
+            nautilus_ver = None
+
+        await _persist_lineage(
+            backtest_id=backtest_id,
+            nautilus_version=nautilus_ver,
+            python_version=python_ver,
+            data_snapshot=lineage_snapshot,
+        )
+
         # --- 3. Build the strategy config with the resolved instrument ----
         # If the caller didn't supply an instrument_id / bar_type we inject
         # them from the backtest row so the Nautilus StrategyConfig can be
@@ -111,16 +138,38 @@ async def run_backtest_job(
         strategy_config = _prepare_strategy_config(config, instrument_ids)
 
         # --- 4. Run the backtest ------------------------------------------
+        # Run in a thread with a parallel heartbeat task so the watchdog
+        # doesn't kill long-running backtests (>10 min default threshold).
         runner = BacktestRunner()
-        result: BacktestResult = runner.run(
-            strategy_file=strategy_path,
-            strategy_config=strategy_config,
-            instrument_ids=instrument_ids,
-            start_date=start_iso,
-            end_date=end_iso,
-            catalog_path=settings.nautilus_catalog_root,
-            timeout_seconds=settings.backtest_timeout_seconds,
-        )
+        stop_heartbeat = asyncio.Event()
+
+        async def _refresh_heartbeat() -> None:
+            while not stop_heartbeat.is_set():
+                try:
+                    async with async_session_factory() as hb_session:
+                        row = await hb_session.get(Backtest, backtest_id)
+                        if row is not None:
+                            row.heartbeat_at = datetime.now(UTC)
+                            await hb_session.commit()
+                except Exception:
+                    log.warning("backtest_heartbeat_refresh_failed", backtest_id=backtest_id)
+                await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
+
+        heartbeat_task = asyncio.create_task(_refresh_heartbeat())
+        try:
+            result: BacktestResult = await asyncio.to_thread(
+                runner.run,
+                strategy_file=strategy_path,
+                strategy_config=strategy_config,
+                instrument_ids=instrument_ids,
+                start_date=start_iso,
+                end_date=end_iso,
+                catalog_path=settings.nautilus_catalog_root,
+                timeout_seconds=settings.backtest_timeout_seconds,
+            )
+        finally:
+            stop_heartbeat.set()
+            heartbeat_task.cancel()
 
         # --- 5. Generate QuantStats report -------------------------------
         returns_series = _extract_returns_series(result.account_df)
@@ -205,6 +254,9 @@ async def _start_backtest(backtest_id: str) -> dict[str, Any] | None:
         backtest.status = "running"
         backtest.progress = 10
         backtest.started_at = datetime.now(UTC)
+        backtest.worker_id = _WORKER_ID
+        backtest.heartbeat_at = datetime.now(UTC)
+        backtest.attempt = (backtest.attempt or 0) + 1
         await session.commit()
         return {
             "instruments": list(backtest.instruments),
@@ -213,6 +265,33 @@ async def _start_backtest(backtest_id: str) -> dict[str, Any] | None:
             "strategy_id": backtest.strategy_id,
             "strategy_code_hash": backtest.strategy_code_hash,
         }
+
+
+async def _persist_lineage(
+    *,
+    backtest_id: str,
+    nautilus_version: str | None,
+    python_version: str,
+    data_snapshot: dict[str, Any],
+) -> None:
+    """Write data lineage fields onto the backtest row.
+
+    Called right after the catalog is confirmed ready but before the
+    actual backtest subprocess starts.  This means even failed backtests
+    will carry their lineage info, which is important for debugging
+    data-related failures.
+    """
+    try:
+        async with async_session_factory() as session:
+            row = await session.get(Backtest, backtest_id)
+            if row is None:
+                return
+            row.nautilus_version = nautilus_version
+            row.python_version = python_version
+            row.data_snapshot = data_snapshot
+            await session.commit()
+    except Exception:
+        log.warning("backtest_lineage_persist_failed", backtest_id=backtest_id, exc_info=True)
 
 
 async def _finalize_backtest(

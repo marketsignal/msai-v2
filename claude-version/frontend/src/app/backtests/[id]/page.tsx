@@ -19,7 +19,6 @@ import {
   type BacktestStatusResponse,
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import { generateEquityCurve, backtestTrades } from "@/lib/mock-data/backtests";
 
 function statusColor(status: string): string {
   switch (status) {
@@ -138,14 +137,8 @@ export default function BacktestDetailPage({
   }, [results]);
 
   // The backend results endpoint does not yet return an equity curve or
-  // a trade log, so we mock those for now from the total return percent.
-  const equityCurve = useMemo(
-    () =>
-      backtestForCharts
-        ? generateEquityCurve(backtestForCharts.totalReturn)
-        : [],
-    [backtestForCharts],
-  );
+  // a trade log. Show empty charts until the backend supports it.
+  const equityCurve: { date: string; equity: number; drawdown: number }[] = [];
 
   if (loading) {
     return (
@@ -234,7 +227,7 @@ export default function BacktestDetailPage({
             backtest={backtestForCharts}
             equityCurve={equityCurve}
           />
-          <TradeLog trades={backtestTrades} />
+          <TradeLog trades={[]} />
         </>
       ) : null}
     </div>

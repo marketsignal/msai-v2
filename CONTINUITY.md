@@ -2,48 +2,83 @@
 
 ## Goal
 
-Wire the remaining production gaps in claude-version so the system is fully functional for backtesting, paper trading, and live trading via Interactive Brokers. Then regenerate documentation from the now-complete code.
+Merge the best Codex features into the Claude version: research engine (Optuna), graduation pipeline, portfolio management, daily universe, job watchdog, compute slots, strategy templates, specialized workers. Claude is the foundation — Codex's JSON file persistence replaced with proper DB models.
 
 ## Workflow
 
-| Field     | Value                                      |
-| --------- | ------------------------------------------ |
-| Command   | /new-feature msai-production-wiring        |
-| Phase     | 5 — Quality Gates                          |
-| Next step | Code review loop                            |
+| Field     | Value                           |
+| --------- | ------------------------------- |
+| Command   | /new-feature hybrid-merge       |
+| Phase     | 4 — Execute                     |
+| Next step | Task 13: Frontend Research page |
 
 ### Checklist
 
 - [x] Worktree created
 - [x] Project state read
 - [x] Plugins verified
-- [x] PRD created
-- [x] Research done (gap analysis from doc audit served as research)
-- [x] Design guidance loaded — N/A (backend wiring, no new UI design)
-- [x] Brainstorming complete
-- [x] Plan written
-- [x] Plan review loop (2 iterations) — Claude found 3 P1s (fixed), Codex found 7 P1s (documented as corrections). No P0s. Snippets marked directional.
-- [x] TDD execution complete (all 11 tasks done, 18 commits)
-- [x] Code review loop (2 iterations) — iter1: 3 P1s fixed. iter2: Claude P0 Redis leak + P1 IB timeout + Codex P1 alert ordering, all fixed. Only P2s remaining (known limitations).
-- [x] Simplified — code is minimal wiring, no over-engineering
-- [x] Verified — 652/652 unit tests pass, lint has 56 pre-existing issues only
-- [x] E2E use cases tested — N/A: endpoints return real data but E2E requires live IB Gateway + Docker stack (covered by verify-paper-soak.sh)
-- [x] Learnings documented — plan corrections capture all review findings
-- [ ] State files updated
-- [ ] Committed and pushed
-- [ ] PR created
+- [x] PRD created — docs/user-stories.md (38 stories, 26 must-haves)
+- [x] Research done — 5 parallel agents explored both codebases, Codex second opinion
+- [x] Design guidance loaded — N/A for backend merge
+- [x] Brainstorming complete — 3 approaches, feature-vertical chosen
+- [x] Approach comparison filled
+- [x] Contrarian gate passed (skip) — Codex confirmed hybrid/Claude-first
+- [x] Plan written — docs/plans/2026-04-12-hybrid-merge-implementation.md
+- [x] Plan review loop (2 iterations) — 18 execution rules. PASS.
+- [x] TDD execution complete (18/18 tasks done — 1133 tests pass)
+- [x] Code review loop (7 iterations) — iter1-4: Tasks 1-12. iter5: 3P1+5P2. iter6: 2P1+2P2. iter7: PRT clean + 1P2 Codex (f4b7121). PASS.
+- [x] Simplified (c6e3e34) — extracted statusColor, jobTypeLabel, KpiCard; split poll from initial load
+- [x] Verified — 1133 tests pass, frontend builds clean
+- [x] E2E use cases tested — N/A: new pages require full infra (DB+Redis+IB); service-layer integration tests cover the flows
+- [x] Learnings documented — N/A (learnings already in MEMORY.md from prior sessions)
+- [x] State files updated
+- [x] Committed and pushed
+- [x] PR created — marketsignal/msai-v2#3
 - [ ] PR reviews addressed
 - [ ] Branch finished
 
 ## Context
 
-From the doc audit + gap analysis, 8 items need wiring:
+Design doc: `docs/plans/2026-04-12-hybrid-merge-design.md`
+Implementation plan: `docs/plans/2026-04-12-hybrid-merge-implementation.md`
+User stories: `docs/user-stories.md` (38 stories, 26 must-haves)
+Comparison: `docs/claude-vs-codex-comparison.md`
 
-1. Wire `/api/v1/live/positions` to PositionReader (~10 lines)
-2. Wire `/api/v1/live/trades` to order_attempt_audits query (~15 lines)
-3. Start ProjectionConsumer + StateApplier in FastAPI lifespan (~20 lines)
-4. Wire real ib_async connection for account endpoints (~50 lines)
-5. Add metrics counters at key trading lifecycle points (~30 lines)
-6. Wire alert triggers to disconnect + daily loss + errors (~30 lines)
-7. Wire MarketHoursService into RiskAwareStrategy (~5 lines)
-8. Regenerate all docs/architecture/ from the now-complete code
+Key decisions:
+
+- Claude version is the foundation (stronger Nautilus integration, production infra)
+- Codex features ported with DB persistence (not JSON files)
+- 18 tasks in dependency order
+- Live trading engine, risk management, security master are untouched
+- Single IB account for MVP, multi-account-ready architecture
+- Feature-vertical approach: model → service → API → UI per feature
+
+## Done
+
+- Task 1 (892e6fc): Backtest lifecycle fields — 5 columns + migration + populate in API/worker + fixed Redis URL parser
+- Task 2 (d81f5d5): 8 new DB models + migration + 61 tests
+- Task 3 (604a60a): Pydantic schemas — 40 tests
+- Task 4 (5aae72d): Compute slots Redis semaphore — 11 tests
+- Task 5 (27f33e0): Job watchdog + arq cron + ResearchJob lifecycle fields — 13 tests
+- Task 6 (e6a85d2): Asset universe service + 4 API endpoints + nightly ingest updated — 14 tests
+- Task 7 (ac9a480): Research engine core (~800 LOC) — Optuna, parameter sweeps, walk-forward CV — 29 tests
+- Task 8 (9ea1cf1): Research worker + 6 API endpoints + enqueue function — 13 tests
+- Task 9 (9d05cd9): Graduation pipeline with enforced stage transitions + 5 API endpoints — 31 tests
+- Task 10 (f501226): Portfolio management + 7 API endpoints + worker — 22 tests
+- Task 11 (1364e0d): Strategy templates + 2 API endpoints — 22 tests
+- Task 12 (4a73279): Docker Compose workers (research + portfolio) + ingest settings — 10 tests
+- Fix rounds: 0ca7382, 1b6fdf5, 8c85e52, bf796f9, 084cb35, 1870be8, 64c53d8 (7 fix commits from 4 review iterations)
+- Task 13 (af64d91, fc51649): Frontend Research page — list page with KPI cards + polling, launch form dialog, detail page with trials + promote button
+- Task 14 (ca75dc3): Frontend Graduation page — kanban board with 9 stage columns, detail panel with stage advance + transition history
+- Task 15 (8aa03e2): Frontend Portfolio page — portfolios table, create form with allocations, run backtest dialog, runs table with metrics
+- Task 16 (247da53): Strategy governance — AST-based validation, blocked imports/dangerous calls, governance_status column — 11 tests
+- Task 17 (aa1c3f7): Data lineage — nautilus_version, python_version, data_snapshot on backtests + describe_catalog() — 8 tests
+- Task 18 (6f37616): Integration tests — research lifecycle + graduation stage machine — 23 tests
+
+## Now
+
+Phase 5: Quality gates — code review loop
+
+## Next
+
+Simplify → verify → commit → push → PR
