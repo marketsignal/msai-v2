@@ -67,6 +67,7 @@ async def _scan_backtests(session: AsyncSession) -> int:
         if reason is None:
             continue
 
+        prior = backtest.status  # save before mutation
         backtest.status = "failed"
         backtest.error_message = reason
         backtest.completed_at = now
@@ -74,7 +75,7 @@ async def _scan_backtests(session: AsyncSession) -> int:
         log.warning(
             "watchdog_backtest_cleaned",
             backtest_id=str(backtest.id),
-            prior_status=backtest.status,
+            prior_status=prior,
             reason=reason,
         )
 
@@ -108,6 +109,7 @@ async def _scan_research_jobs(session: AsyncSession) -> int:
         if reason is None:
             continue
 
+        prior = job.status  # save before mutation
         job.status = "failed"
         job.error_message = reason
         job.completed_at = now
@@ -115,7 +117,7 @@ async def _scan_research_jobs(session: AsyncSession) -> int:
         log.warning(
             "watchdog_research_job_cleaned",
             research_job_id=str(job.id),
-            prior_status=job.status,
+            prior_status=prior,
             reason=reason,
         )
 

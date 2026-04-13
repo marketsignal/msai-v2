@@ -333,7 +333,11 @@ async def _resolve_strategy(db: AsyncSession, strategy_id: UUID) -> Strategy:
 
 
 def _resolve_strategy_path(strategy: Strategy) -> str:
-    """Validate the strategy file exists on disk and return its path."""
+    """Validate the strategy file exists on disk and return its path.
+
+    Also enforces that the resolved path is under ``strategies_root`` to
+    prevent path-traversal attacks (e.g. ``../../etc/passwd``).
+    """
     if not strategy.file_path:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -342,14 +346,21 @@ def _resolve_strategy_path(strategy: Strategy) -> str:
     strategy_file = Path(strategy.file_path)
     if not strategy_file.exists():
         # Try resolving relative to strategies_root
-        resolved = settings.strategies_root / strategy.file_path
-        if resolved.exists():
-            return str(resolved)
+        strategy_file = settings.strategies_root / strategy.file_path
+        if not strategy_file.exists():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Strategy file not found: {strategy.file_path}",
+            )
+
+    resolved = strategy_file.resolve()
+    strategies_root = settings.strategies_root.resolve()
+    if not str(resolved).startswith(str(strategies_root)):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Strategy file not found: {strategy.file_path}",
+            detail="Strategy path outside allowed directory",
         )
-    return str(strategy_file)
+    return str(resolved)
 
 
 def _build_sweep_payload(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
@@ -132,16 +133,22 @@ class TestSubmitParameterSweep:
 
     @patch("msai.api.research.get_redis_pool")
     @patch("msai.api.research.enqueue_research")
+    @patch("msai.api.research.settings")
     @patch("pathlib.Path.exists", return_value=True)
     async def test_submit_sweep_creates_job_returns_201(
         self,
         _mock_exists: MagicMock,
+        mock_settings: MagicMock,
         mock_enqueue: AsyncMock,
         mock_pool: AsyncMock,
         mock_db: AsyncMock,
         client_with_mock_db: httpx.AsyncClient,
     ) -> None:
         """POST /sweeps creates a ResearchJob and returns 201 with job_id."""
+        # Arrange: settings.strategies_root for path traversal defense
+        mock_settings.strategies_root = Path("/app/strategies")
+        mock_settings.research_queue_name = "msai:research"
+
         # Arrange: strategy lookup succeeds
         strategy = _make_strategy_row()
         strategy_result = MagicMock()

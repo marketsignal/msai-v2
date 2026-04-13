@@ -74,12 +74,22 @@ async def run_research_job(
         worker_id=worker_id,
     )
 
+    heartbeat_task: asyncio.Task[None] | None = None
+
     try:
         # --- 1. Mark running --------------------------------------------------
         await _mark_running(job_id, worker_id)
 
         # --- 2. Heartbeat task ------------------------------------------------
         async def _heartbeat_loop() -> None:
+            """Renew lease and heartbeat; also poll for cancellation.
+
+            Best-effort cancellation: if the job's status has been set to
+            ``"cancelled"`` or the ``progress_message`` starts with ``"Cancel"``,
+            we set ``stop_heartbeat`` so the outer function knows.  The engine
+            itself does not check mid-backtest — this will stop the job at the
+            next checkpoint (between trials).
+            """
             while not stop_heartbeat.is_set():
                 await asyncio.sleep(settings.compute_slot_lease_seconds / 3)
                 if stop_heartbeat.is_set():
@@ -87,6 +97,20 @@ async def run_research_job(
                 if lease_id is not None:
                     await renew_compute_slots(redis, lease_id)
                 await _update_heartbeat(job_id, worker_id)
+
+                # Poll for cancellation
+                try:
+                    async with async_session_factory() as session:
+                        job = await session.get(ResearchJob, job_id)
+                        if job is not None and (
+                            job.status == "cancelled"
+                            or (job.progress_message or "").startswith("Cancel")
+                        ):
+                            log.info("research_job_cancel_detected", job_id=job_id)
+                            stop_heartbeat.set()
+                            return
+                except Exception:
+                    log.warning("research_heartbeat_cancel_check_failed", job_id=job_id)
 
         heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
@@ -120,12 +144,14 @@ async def run_research_job(
         )
 
         # --- 5. Progress callback for the engine -----------------------------
+        loop = asyncio.get_running_loop()
+
         def _progress_callback(update: dict[str, Any]) -> None:
             """Synchronous callback invoked by the engine inside to_thread."""
             # Schedule the async DB update from inside the sync thread
             # without blocking the engine.  The event loop is running in
             # the main thread.
-            asyncio.get_event_loop().call_soon_threadsafe(
+            loop.call_soon_threadsafe(
                 lambda: asyncio.ensure_future(
                     _update_progress(
                         job_id,
@@ -237,7 +263,7 @@ async def run_research_job(
     finally:
         stop_heartbeat.set()
         # Wait for the heartbeat task to exit cleanly
-        if "heartbeat_task" in dir():
+        if heartbeat_task is not None:
             heartbeat_task.cancel()
             try:
                 await heartbeat_task
@@ -309,8 +335,9 @@ async def _finalize_job(job_id: str, report: dict[str, Any]) -> None:
         job.progress_message = "Completed"
         job.completed_at = datetime.now(UTC)
         job.results = report
-        job.best_config = report.get("best_config")
-        job.best_metrics = report.get("best_metrics")
+        best = report.get("summary", {}).get("best_result")
+        job.best_config = best.get("config") if best else None
+        job.best_metrics = best.get("metrics") if best else None
 
         # Create trial rows for each individual result
         results_list: list[dict[str, Any]] = report.get("results", [])
