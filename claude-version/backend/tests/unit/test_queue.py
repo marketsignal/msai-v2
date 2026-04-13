@@ -93,4 +93,37 @@ class TestEnqueueIngest:
             symbols=symbols,
             start=start,
             end=end,
+            provider="auto",
+            dataset=None,
+            schema=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_enqueue_ingest_with_provider_params(self) -> None:
+        """``enqueue_ingest`` forwards provider, dataset, and schema kwargs."""
+        # Arrange
+        pool = AsyncMock(spec=ArqRedis)
+
+        # Act
+        await enqueue_ingest(
+            pool,
+            "stocks",
+            ["AAPL"],
+            "2024-01-01",
+            "2024-12-31",
+            provider="databento",
+            dataset="EQUS.MINI",
+            schema="ohlcv-1m",
+        )
+
+        # Assert
+        pool.enqueue_job.assert_awaited_once_with(
+            "run_ingest",
+            asset_class="stocks",
+            symbols=["AAPL"],
+            start="2024-01-01",
+            end="2024-12-31",
+            provider="databento",
+            dataset="EQUS.MINI",
+            schema="ohlcv-1m",
         )

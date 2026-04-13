@@ -15,7 +15,6 @@ import typer
 
 from msai.core.config import settings
 from msai.core.logging import get_logger, setup_logging
-from msai.services.data_sources.polygon_client import PolygonClient
 from msai.services.data_ingestion import DataIngestionService
 from msai.services.parquet_store import ParquetStore
 
@@ -27,10 +26,13 @@ app = typer.Typer(name="msai", help="MSAI v2 -- Personal Hedge Fund Platform CLI
 
 @app.command()
 def ingest(
-    asset: str = typer.Argument(..., help="Asset class (stocks, futures, crypto)"),
+    asset: str = typer.Argument(..., help="Asset class (stocks, equities, futures, crypto)"),
     symbols: str = typer.Argument(..., help="Comma-separated ticker symbols"),
     start: str = typer.Argument(..., help="Start date YYYY-MM-DD"),
     end: str = typer.Argument(..., help="End date YYYY-MM-DD"),
+    provider: str = typer.Option("auto", help="Data provider: auto, databento, or polygon"),
+    dataset: str = typer.Option("", help="Override default Databento dataset"),
+    schema: str = typer.Option("", help="Override default Databento schema"),
 ) -> None:
     """Download historical market data for the given symbols and date range."""
     symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
@@ -38,36 +40,37 @@ def ingest(
         typer.echo("Error: no symbols provided", err=True)
         raise typer.Exit(code=1)
 
-    store = ParquetStore(str(settings.data_root / "parquet"))
-    polygon = PolygonClient(settings.polygon_api_key) if settings.polygon_api_key else None
-
-    databento = None
-    if settings.databento_api_key:
-        from msai.services.data_sources.databento_client import DatabentoClient
-
-        databento = DatabentoClient(settings.databento_api_key)
-
-    service = DataIngestionService(store, polygon=polygon, databento=databento)
+    service = DataIngestionService(ParquetStore(str(settings.parquet_root)))
 
     typer.echo(f"Ingesting {asset} data for {symbol_list} from {start} to {end}...")
-    results = asyncio.run(service.ingest_historical(asset, symbol_list, start, end))
+    typer.echo(f"  provider={provider}, dataset={dataset or '(default)'}, schema={schema or '(default)'}")
+    result = asyncio.run(
+        service.ingest_historical(
+            asset,
+            symbol_list,
+            start,
+            end,
+            provider=provider,
+            dataset=dataset or None,
+            schema=schema or None,
+        )
+    )
 
-    for sym, rows in results.items():
-        typer.echo(f"  {sym}: {rows} rows")
-
-    total = sum(results.values())
-    typer.echo(f"Done. Total rows written: {total}")
+    typer.echo(json.dumps(result, indent=2))
 
 
 @app.command()
 def ingest_daily(
-    asset: str = typer.Argument(..., help="Asset class (stocks, futures, crypto)"),
+    asset: str = typer.Argument(..., help="Asset class (stocks, equities, futures, crypto)"),
     symbols: str = typer.Argument(
         ..., help="Comma-separated ticker symbols (or 'all' to use stored symbols)"
     ),
+    provider: str = typer.Option("auto", help="Data provider: auto, databento, or polygon"),
+    dataset: str = typer.Option("", help="Override default Databento dataset"),
+    schema: str = typer.Option("", help="Override default Databento schema"),
 ) -> None:
     """Download yesterday's data for incremental daily update."""
-    store = ParquetStore(str(settings.data_root / "parquet"))
+    store = ParquetStore(str(settings.parquet_root))
 
     if symbols.lower() == "all":
         symbol_list = store.list_symbols(asset)
@@ -77,43 +80,27 @@ def ingest_daily(
     else:
         symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
 
-    polygon = PolygonClient(settings.polygon_api_key) if settings.polygon_api_key else None
-
-    databento = None
-    if settings.databento_api_key:
-        from msai.services.data_sources.databento_client import DatabentoClient
-
-        databento = DatabentoClient(settings.databento_api_key)
-
-    service = DataIngestionService(store, polygon=polygon, databento=databento)
+    service = DataIngestionService(ParquetStore(str(settings.parquet_root)))
 
     typer.echo(f"Running daily ingest for {asset}: {symbol_list}")
-    results = asyncio.run(service.ingest_daily(asset, symbol_list))
+    result = asyncio.run(
+        service.ingest_daily(
+            asset,
+            symbol_list,
+            provider=provider,
+            dataset=dataset or None,
+            schema=schema or None,
+        )
+    )
 
-    for sym, rows in results.items():
-        typer.echo(f"  {sym}: {rows} rows")
-
-    total = sum(results.values())
-    typer.echo(f"Done. Total rows written: {total}")
+    typer.echo(json.dumps(result, indent=2))
 
 
 @app.command()
 def data_status() -> None:
-    """Show storage stats and data summary."""
-    store = ParquetStore(str(settings.data_root / "parquet"))
-    stats = store.get_storage_stats()
-
-    typer.echo("Storage Statistics:")
-    typer.echo(f"  Total files:  {stats['total_files']}")
-    typer.echo(f"  Total size:   {stats['total_bytes']:,} bytes")
-
-    if stats["asset_classes"]:
-        typer.echo("\n  By asset class:")
-        for ac, size in stats["asset_classes"].items():
-            symbols = store.list_symbols(ac)
-            typer.echo(f"    {ac}: {size:,} bytes  ({len(symbols)} symbols)")
-    else:
-        typer.echo("  No data found.")
+    """Show storage stats, ingestion history, and data summary."""
+    service = DataIngestionService(ParquetStore(str(settings.parquet_root)))
+    typer.echo(json.dumps(service.data_status(), indent=2, default=str))
 
 
 _API_BASE = "http://localhost:8000"

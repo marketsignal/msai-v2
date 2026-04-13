@@ -69,11 +69,15 @@ async def run_ingest(
     symbols: list[str],
     start: str,
     end: str,
+    provider: str = "auto",
+    dataset: str | None = None,
+    schema: str | None = None,
 ) -> None:
     """arq job function for historical data ingestion.
 
-    Uses Polygon and Databento clients when API keys are configured and
-    persists the downloaded bars via :class:`ParquetStore`.
+    Delegates to :func:`msai.services.data_ingestion.run_ingest` which
+    uses the plan-based routing (Databento for equities/futures, Polygon
+    as fallback).
 
     Args:
         ctx: arq worker context.
@@ -81,21 +85,22 @@ async def run_ingest(
         symbols: List of ticker symbols to ingest.
         start: ISO-8601 start date.
         end: ISO-8601 end date.
+        provider: Data provider (``"auto"``, ``"databento"``, ``"polygon"``).
+        dataset: Override the default Databento dataset.
+        schema: Override the default Databento schema.
     """
-    _ = ctx
-    from msai.services.data_ingestion import DataIngestionService
-    from msai.services.data_sources.databento_client import DatabentoClient
-    from msai.services.data_sources.polygon_client import PolygonClient
-    from msai.services.parquet_store import ParquetStore
+    from msai.services.data_ingestion import run_ingest as _run_ingest
 
-    store = ParquetStore(str(settings.parquet_root))
-    polygon = PolygonClient(settings.polygon_api_key) if settings.polygon_api_key else None
-    databento = (
-        DatabentoClient(settings.databento_api_key) if settings.databento_api_key else None
+    await _run_ingest(
+        ctx,
+        asset_class,
+        symbols,
+        start,
+        end,
+        provider=provider,
+        dataset=dataset,
+        schema=schema,
     )
-
-    service = DataIngestionService(store, polygon=polygon, databento=databento)
-    await service.ingest_historical(asset_class, symbols, start, end)
 
 
 _watchdog_log = get_logger("workers.watchdog")
