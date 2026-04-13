@@ -24,6 +24,7 @@ logs.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import socket
 from datetime import UTC, datetime
@@ -44,6 +45,7 @@ from msai.services.report_generator import ReportGenerator
 log = get_logger(__name__)
 
 _WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
+_HEARTBEAT_INTERVAL_S = 15
 
 
 async def run_backtest_job(
@@ -115,16 +117,38 @@ async def run_backtest_job(
         strategy_config = _prepare_strategy_config(config, instrument_ids)
 
         # --- 4. Run the backtest ------------------------------------------
+        # Run in a thread with a parallel heartbeat task so the watchdog
+        # doesn't kill long-running backtests (>10 min default threshold).
         runner = BacktestRunner()
-        result: BacktestResult = runner.run(
-            strategy_file=strategy_path,
-            strategy_config=strategy_config,
-            instrument_ids=instrument_ids,
-            start_date=start_iso,
-            end_date=end_iso,
-            catalog_path=settings.nautilus_catalog_root,
-            timeout_seconds=settings.backtest_timeout_seconds,
-        )
+        stop_heartbeat = asyncio.Event()
+
+        async def _refresh_heartbeat() -> None:
+            while not stop_heartbeat.is_set():
+                try:
+                    async with async_session_factory() as hb_session:
+                        row = await hb_session.get(Backtest, backtest_id)
+                        if row is not None:
+                            row.heartbeat_at = datetime.now(UTC)
+                            await hb_session.commit()
+                except Exception:
+                    log.warning("backtest_heartbeat_refresh_failed", backtest_id=backtest_id)
+                await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
+
+        heartbeat_task = asyncio.create_task(_refresh_heartbeat())
+        try:
+            result: BacktestResult = await asyncio.to_thread(
+                runner.run,
+                strategy_file=strategy_path,
+                strategy_config=strategy_config,
+                instrument_ids=instrument_ids,
+                start_date=start_iso,
+                end_date=end_iso,
+                catalog_path=settings.nautilus_catalog_root,
+                timeout_seconds=settings.backtest_timeout_seconds,
+            )
+        finally:
+            stop_heartbeat.set()
+            heartbeat_task.cancel()
 
         # --- 5. Generate QuantStats report -------------------------------
         returns_series = _extract_returns_series(result.account_df)

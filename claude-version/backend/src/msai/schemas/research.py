@@ -16,6 +16,7 @@ class ResearchSweepRequest(BaseModel):
     instruments: list[str]
     start_date: date
     end_date: date
+    asset_class: str = "stocks"
     base_config: dict[str, Any] = Field(default_factory=dict)
     parameter_grid: dict[str, list[Any]]
     objective: str = "sharpe"
