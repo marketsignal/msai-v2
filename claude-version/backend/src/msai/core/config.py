@@ -7,6 +7,7 @@ for convenient import across the codebase.
 
 from __future__ import annotations
 
+from os import cpu_count
 from pathlib import Path
 
 from pydantic import field_validator
@@ -79,6 +80,14 @@ class Settings(BaseSettings):
     job_stale_seconds: int = 600  # 10 min without heartbeat = stale
     job_pending_grace_seconds: int = 600  # 10 min pending without starting = stuck
 
+    # Research engine tuning
+    research_queue_name: str = "msai:research"
+    research_worker_jobs: int = 2
+    research_timeout_seconds: int = 14400  # 4 hours
+    research_max_parallelism: int = max(1, min(4, (cpu_count() or 1) - 1))
+    optuna_enabled: bool = True
+    optuna_max_trials: int = 64
+
     # Compute slot management (Redis semaphore for concurrent job limits)
     compute_slot_limit: int = 4
     compute_slot_wait_seconds: int = 900  # max time to wait for a slot
@@ -109,6 +118,16 @@ class Settings(BaseSettings):
         (``{data_root}/reports``).
         """
         return self.data_root / "reports"
+
+    @property
+    def research_root(self) -> Path:
+        """Root directory for research engine output (``{data_root}/research``)."""
+        return self.data_root / "research"
+
+    @property
+    def optuna_root(self) -> Path:
+        """Root directory for Optuna study journals (``{research_root}/optuna``)."""
+        return self.research_root / "optuna"
 
     @property
     def nautilus_catalog_root(self) -> Path:
