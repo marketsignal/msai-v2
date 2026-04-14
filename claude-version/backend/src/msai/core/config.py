@@ -145,5 +145,15 @@ class Settings(BaseSettings):
         """
         return self.data_root / "nautilus"
 
+    @property
+    def alerts_path(self) -> Path:
+        """File-backed operational alert history (``{data_root}/alerts/alerts.json``).
+
+        Written by :class:`msai.services.alerting.AlertingService` and read
+        by the ``/api/v1/alerts/`` router for the dashboard audit trail.
+        Capped at 200 records (newest first).
+        """
+        return self.data_root / "alerts" / "alerts.json"
+
 
 settings: Settings = Settings()
