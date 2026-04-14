@@ -96,6 +96,11 @@ class TestAuthAndUrl:
 # ----------------------------------------------------------------------
 
 
+def _api_base_for_test() -> str:
+    """Default base URL the CLI assembles when no env override is set."""
+    return "http://localhost:8000"
+
+
 def _ok_response(body: dict[str, Any] | list[Any]) -> MagicMock:
     """Build a MagicMock httpx.Response equivalent for success cases."""
     response = MagicMock(spec=httpx.Response)
@@ -201,6 +206,42 @@ class TestHttpCommands:
         assert mock.called
         assert "Stopped 3" in result.output
 
+    def test_backtest_history_uses_page_params(self, runner: CliRunner) -> None:
+        # The backend endpoint paginates via ``page`` / ``page_size`` —
+        # ``limit`` is silently ignored.  Regression guard: keep the
+        # CLI param names aligned with the server contract.
+        with patch("msai.cli.httpx.request", return_value=_ok_response({"items": []})) as mock:
+            result = runner.invoke(app, ["backtest", "history", "--page", "2", "--page-size", "50"])
+        assert result.exit_code == 0
+        _, kwargs = mock.call_args
+        assert kwargs["params"] == {"page": 2, "page_size": 50}
+
+    def test_research_list_uses_page_params(self, runner: CliRunner) -> None:
+        with patch("msai.cli.httpx.request", return_value=_ok_response({"items": []})) as mock:
+            result = runner.invoke(app, ["research", "list", "--page", "3", "--page-size", "10"])
+        assert result.exit_code == 0
+        _, kwargs = mock.call_args
+        assert kwargs["params"] == {"page": 3, "page_size": 10}
+
+    def test_url_encoding_prevents_path_injection(self, runner: CliRunner) -> None:
+        # A hostile strategy-id containing "../" would otherwise let the
+        # authenticated CLI request a different endpoint (``httpx``
+        # normalizes paths).  Verify ``_url_id`` percent-encodes so the
+        # original segment is preserved as a path component.
+        with patch("msai.cli.httpx.request", return_value=_ok_response({"ok": True})) as mock:
+            result = runner.invoke(app, ["strategy", "show", "../account/summary"])
+        assert result.exit_code == 0
+        url = mock.call_args[0][1]
+        # `..` must be percent-encoded; the request must hit
+        # /api/v1/strategies/..%2F... not /api/v1/account/summary.
+        assert "%2F" in url
+        # The encoded id must stay inside /api/v1/strategies/ with NO
+        # raw `/` separators after "strategies/".  If there were, httpx
+        # would resolve the extra segment and the call would hit a
+        # different route.
+        tail = url.split("/api/v1/strategies/", 1)[1]
+        assert "/" not in tail
+
     def test_graduation_list_passes_stage_filter(self, runner: CliRunner) -> None:
         body = {"items": [], "total": 0}
         with patch("msai.cli.httpx.request", return_value=_ok_response(body)) as mock:
@@ -208,6 +249,42 @@ class TestHttpCommands:
         assert result.exit_code == 0
         _, kwargs = mock.call_args
         assert kwargs["params"]["stage"] == "promoted"
+
+    def test_graduation_show_merges_candidate_and_transitions(self, runner: CliRunner) -> None:
+        # ``show`` promises the transition audit trail — verify both
+        # endpoints are called and the outputs are merged.
+        candidate_response = _ok_response({"id": "c-1", "stage": "promoted"})
+        transitions_response = _ok_response([{"from_stage": "incubation", "to_stage": "promoted"}])
+        with (
+            patch("msai.cli.httpx.request", return_value=candidate_response) as req_mock,
+            patch("msai.cli.httpx.get", return_value=transitions_response) as get_mock,
+        ):
+            result = runner.invoke(app, ["graduation", "show", "c-1"])
+        assert result.exit_code == 0
+        assert req_mock.call_count == 1
+        assert get_mock.call_count == 1
+        assert "/candidates/c-1/transitions" in get_mock.call_args[0][0]
+        assert '"candidate"' in result.output
+        assert '"transitions"' in result.output
+
+    def test_system_health_treats_unhealthy_ib_body_as_not_ok(self, runner: CliRunner) -> None:
+        # /api/v1/account/health returns 200 even when IB is down,
+        # with {"status": "unhealthy", "gateway_connected": false}.
+        # Regression guard: system health must NOT report account ok
+        # in that case, or the command defeats its own purpose.
+        def _mock_get(url, **_kwargs):
+            if "/account/health" in url:
+                return _ok_response({"status": "unhealthy", "gateway_connected": False})
+            return _ok_response({"status": "ok"})
+
+        with patch("msai.cli.httpx.get", side_effect=_mock_get):
+            result = runner.invoke(app, ["system", "health"])
+        assert result.exit_code == 0
+        # Parse the JSON output — must have "ok": false for account,
+        # true for api/ready/live.
+        output_json = json.loads(result.output)
+        assert output_json["account"]["ok"] is False
+        assert output_json["api"]["ok"] is True
 
     def test_connection_error_surfaces_clear_message(self, runner: CliRunner) -> None:
         with patch(
@@ -217,6 +294,31 @@ class TestHttpCommands:
             result = runner.invoke(app, ["strategy", "list"])
         assert result.exit_code != 0
         assert "Connection refused" in result.output
+
+    def test_read_timeout_surfaces_clear_message(self, runner: CliRunner) -> None:
+        # Regression: before the fix, ReadTimeout on live-start (slow IB
+        # connection) leaked a raw httpx traceback to stderr.  Now it
+        # should land in the TimeoutException branch of _api_call.
+        with patch(
+            "msai.cli.httpx.request",
+            side_effect=httpx.ReadTimeout("slow"),
+        ):
+            result = runner.invoke(app, ["live", "start", "sid", "AAPL"])
+        assert result.exit_code != 0
+        assert "timed out" in result.output.lower()
+
+    def test_generic_request_error_surfaces_type(self, runner: CliRunner) -> None:
+        # `NetworkError` is a concrete `RequestError` subclass — covers
+        # DNS failures, TLS handshake breakdowns, etc. that aren't
+        # ConnectError or TimeoutException.
+        with patch(
+            "msai.cli.httpx.request",
+            side_effect=httpx.NetworkError("tls handshake failed"),
+        ):
+            result = runner.invoke(app, ["strategy", "list"])
+        assert result.exit_code != 0
+        assert "Request failed" in result.output
+        assert "NetworkError" in result.output
 
     def test_non_2xx_surfaces_body_in_error(self, runner: CliRunner) -> None:
         error_response = MagicMock(spec=httpx.Response)

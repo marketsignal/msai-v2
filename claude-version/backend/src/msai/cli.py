@@ -56,6 +56,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from urllib.parse import quote
 
 import httpx
 import typer
@@ -129,9 +130,10 @@ def _api_call(
 ) -> httpx.Response:
     """Make an authenticated request against the MSAI API.
 
-    Fails the CLI with a clear error message on connection failure or
-    non-2xx response; callers that want to inspect a specific status
-    should catch :class:`typer.Exit` and re-raise.
+    Fails the CLI with a clear error message on connection failure,
+    request timeout, generic request errors, or non-2xx response.
+    Callers that want to inspect a specific status should catch
+    :class:`typer.Exit` and re-raise.
     """
     url = f"{_api_base()}{path}"
     try:
@@ -145,6 +147,16 @@ def _api_call(
         )
     except httpx.ConnectError:
         _fail(f"Connection refused — is the backend running at {_api_base()}?")
+    except httpx.TimeoutException as exc:
+        # IB-connecting paths (live start, account health on cold IB) can
+        # exceed the default 30s.  Surface the timeout cleanly instead of
+        # leaking an httpx traceback; operators can retry or raise the
+        # per-command timeout if they know the op is slow.
+        _fail(f"Request timed out after {timeout}s against {url} ({type(exc).__name__})")
+    except httpx.RequestError as exc:
+        # Catchall for DNS, TLS, invalid URL, proxy failures — anything
+        # httpx raises before it gets a response.
+        _fail(f"Request failed: {type(exc).__name__}: {exc}")
     if not response.is_success:
         _fail(f"API error ({response.status_code}): {response.text}")
     return response
@@ -153,6 +165,17 @@ def _api_call(
 def _emit_json(payload: object) -> None:
     """Render a Python value as pretty JSON on stdout."""
     typer.echo(json.dumps(payload, indent=2, default=str))
+
+
+def _url_id(value: str) -> str:
+    """URL-encode an ID before interpolating into a path.
+
+    Prevents a malicious or typo-ed ID containing ``/``, ``..``, ``?``
+    from escaping the intended route.  Without this, ``httpx`` would
+    normalize ``/api/v1/strategies/../account/summary`` and silently
+    redirect an authenticated request to a different endpoint.
+    """
+    return quote(str(value), safe="")
 
 
 # ======================================================================
@@ -244,11 +267,14 @@ def data_status() -> None:
 
 
 @strategy_app.command("list")
-def strategy_list(
-    limit: int = typer.Option(100, help="Max rows to return"),
-) -> None:
-    """List registered strategies."""
-    response = _api_call("GET", "/api/v1/strategies/", params={"limit": limit})
+def strategy_list() -> None:
+    """List registered strategies.
+
+    The backend endpoint does not paginate today — all registered
+    strategies are returned.  When pagination is added server-side, a
+    matching ``--page-size`` option goes here.
+    """
+    response = _api_call("GET", "/api/v1/strategies/")
     _emit_json(response.json())
 
 
@@ -257,7 +283,7 @@ def strategy_show(
     strategy_id: str = typer.Argument(..., help="Strategy UUID"),
 ) -> None:
     """Show one strategy's details."""
-    response = _api_call("GET", f"/api/v1/strategies/{strategy_id}")
+    response = _api_call("GET", f"/api/v1/strategies/{_url_id(strategy_id)}")
     _emit_json(response.json())
 
 
@@ -266,7 +292,7 @@ def strategy_validate(
     strategy_id: str = typer.Argument(..., help="Strategy UUID"),
 ) -> None:
     """Validate that a strategy file can be loaded end-to-end."""
-    response = _api_call("POST", f"/api/v1/strategies/{strategy_id}/validate")
+    response = _api_call("POST", f"/api/v1/strategies/{_url_id(strategy_id)}/validate")
     _emit_json(response.json())
 
 
@@ -308,10 +334,22 @@ def backtest_run(
 
 @backtest_app.command("history")
 def backtest_history(
-    limit: int = typer.Option(20, help="Max rows to return"),
+    page: int = typer.Option(1, help="Page number (1-indexed)"),
+    page_size: int = typer.Option(
+        20, help="Rows per page (backend max is 100)"
+    ),
 ) -> None:
-    """List recent backtests with status + metrics."""
-    response = _api_call("GET", "/api/v1/backtests/history", params={"limit": limit})
+    """List recent backtests with status + metrics.
+
+    Uses the API's ``page`` / ``page_size`` pagination — ``limit`` is
+    NOT an accepted query param and is silently ignored by FastAPI, so
+    naming the CLI flags to match the server contract keeps both honest.
+    """
+    response = _api_call(
+        "GET",
+        "/api/v1/backtests/history",
+        params={"page": page, "page_size": page_size},
+    )
     _emit_json(response.json())
 
 
@@ -320,15 +358,21 @@ def backtest_show(
     backtest_id: str = typer.Argument(..., help="Backtest UUID"),
 ) -> None:
     """Show a backtest's current status + results (if complete)."""
-    status_response = _api_call("GET", f"/api/v1/backtests/{backtest_id}/status")
+    safe_id = _url_id(backtest_id)
+    status_response = _api_call("GET", f"/api/v1/backtests/{safe_id}/status")
     _emit_json(status_response.json())
     # Also pull results when the job has data — non-200 is fine
     # (pending/running jobs have no results yet), don't fail the CLI.
-    results = httpx.get(
-        f"{_api_base()}/api/v1/backtests/{backtest_id}/results",
-        headers=_api_headers(),
-        timeout=10.0,
-    )
+    # Swallow transport errors too: if results are unavailable the status
+    # above is the useful output and we shouldn't fail on a flaky GET.
+    try:
+        results = httpx.get(
+            f"{_api_base()}/api/v1/backtests/{safe_id}/results",
+            headers=_api_headers(),
+            timeout=10.0,
+        )
+    except httpx.RequestError:
+        return
     if results.is_success:
         typer.echo("\n--- Results ---")
         _emit_json(results.json())
@@ -341,10 +385,13 @@ def backtest_show(
 
 @research_app.command("list")
 def research_list(
-    limit: int = typer.Option(20, help="Max rows to return"),
+    page: int = typer.Option(1, help="Page number (1-indexed)"),
+    page_size: int = typer.Option(20, help="Rows per page (backend max is 100)"),
 ) -> None:
     """List research jobs (sweeps + walk-forward)."""
-    response = _api_call("GET", "/api/v1/research/jobs", params={"limit": limit})
+    response = _api_call(
+        "GET", "/api/v1/research/jobs", params={"page": page, "page_size": page_size}
+    )
     _emit_json(response.json())
 
 
@@ -353,7 +400,7 @@ def research_show(
     job_id: str = typer.Argument(..., help="Research job UUID"),
 ) -> None:
     """Show one research job's progress + leaderboard."""
-    response = _api_call("GET", f"/api/v1/research/jobs/{job_id}")
+    response = _api_call("GET", f"/api/v1/research/jobs/{_url_id(job_id)}")
     _emit_json(response.json())
 
 
@@ -362,7 +409,7 @@ def research_cancel(
     job_id: str = typer.Argument(..., help="Research job UUID"),
 ) -> None:
     """Cancel a running research job."""
-    response = _api_call("POST", f"/api/v1/research/jobs/{job_id}/cancel")
+    response = _api_call("POST", f"/api/v1/research/jobs/{_url_id(job_id)}/cancel")
     _emit_json(response.json())
 
 
@@ -398,9 +445,7 @@ def live_stop(
     deployment_id: str = typer.Argument(..., help="Deployment UUID to stop"),
 ) -> None:
     """Stop a running deployment."""
-    response = _api_call(
-        "POST", "/api/v1/live/stop", json_body={"deployment_id": deployment_id}
-    )
+    response = _api_call("POST", "/api/v1/live/stop", json_body={"deployment_id": deployment_id})
     data = response.json()
     typer.echo(f"Deployment {data['id']} stopped.")
 
@@ -415,9 +460,7 @@ def live_status() -> None:
     typer.echo(f"Deployments ({len(data['deployments'])}):")
     for d in data["deployments"]:
         mode = "PAPER" if d["paper_trading"] else "LIVE"
-        typer.echo(
-            f"  [{mode}] {d['id']}  status={d['status']}  instruments={d['instruments']}"
-        )
+        typer.echo(f"  [{mode}] {d['id']}  status={d['status']}  instruments={d['instruments']}")
     if not data["deployments"]:
         typer.echo("  (none)")
 
@@ -428,14 +471,10 @@ def live_kill_all(
 ) -> None:
     """Emergency-stop all strategies.  Requires confirmation unless --yes."""
     if not yes:
-        typer.confirm(
-            "Are you sure you want to STOP ALL running strategies?", abort=True
-        )
+        typer.confirm("Are you sure you want to STOP ALL running strategies?", abort=True)
     response = _api_call("POST", "/api/v1/live/kill-all")
     data = response.json()
-    typer.echo(
-        f"Stopped {data['stopped']} strategies. Risk halted: {data['risk_halted']}"
-    )
+    typer.echo(f"Stopped {data['stopped']} strategies. Risk halted: {data['risk_halted']}")
 
 
 # ======================================================================
@@ -460,9 +499,30 @@ def graduation_list(
 def graduation_show(
     candidate_id: str = typer.Argument(..., help="Candidate UUID"),
 ) -> None:
-    """Show one candidate + its stage-transition audit trail."""
-    response = _api_call("GET", f"/api/v1/graduation/candidates/{candidate_id}")
-    _emit_json(response.json())
+    """Show one candidate + its stage-transition audit trail.
+
+    The candidate detail and the transitions live on separate endpoints
+    (``/candidates/{id}`` and ``/candidates/{id}/transitions``).  We
+    fetch both and merge them into a single JSON object so operators
+    see the full audit history in one command — fulfilling the
+    docstring's promise.
+    """
+    safe_id = _url_id(candidate_id)
+    candidate = _api_call("GET", f"/api/v1/graduation/candidates/{safe_id}").json()
+    try:
+        transitions_response = httpx.get(
+            f"{_api_base()}/api/v1/graduation/candidates/{safe_id}/transitions",
+            headers=_api_headers(),
+            timeout=10.0,
+        )
+        transitions = (
+            transitions_response.json() if transitions_response.is_success else []
+        )
+    except httpx.RequestError:
+        # Transport error on the transitions fetch isn't fatal — the
+        # candidate body still has value.
+        transitions = []
+    _emit_json({"candidate": candidate, "transitions": transitions})
 
 
 # ======================================================================
@@ -497,7 +557,7 @@ def portfolio_show(
     portfolio_id: str = typer.Argument(..., help="Portfolio UUID"),
 ) -> None:
     """Show one portfolio's detail."""
-    response = _api_call("GET", f"/api/v1/portfolios/{portfolio_id}")
+    response = _api_call("GET", f"/api/v1/portfolios/{_url_id(portfolio_id)}")
     _emit_json(response.json())
 
 
@@ -515,7 +575,9 @@ def portfolio_run(
     if max_parallelism > 0:
         payload["max_parallelism"] = max_parallelism
     response = _api_call(
-        "POST", f"/api/v1/portfolios/{portfolio_id}/runs", json_body=payload
+        "POST",
+        f"/api/v1/portfolios/{_url_id(portfolio_id)}/runs",
+        json_body=payload,
     )
     _emit_json(response.json())
 
@@ -553,24 +615,62 @@ def account_health() -> None:
 
 @system_app.command("health")
 def system_health() -> None:
-    """Compound health check across API + live + account surfaces."""
+    """Compound health check across API + live + account surfaces.
+
+    Each probe is independent — a failure on one doesn't mask others.
+    Timeouts and request errors degrade to ``{"error": "..."}`` entries
+    so the operator can see which surfaces are reachable.
+
+    Note on ``/api/v1/account/health``: it returns HTTP 200 even when
+    the IB gateway is down, with ``status: "unhealthy"`` in the body.
+    Trusting ``response.is_success`` alone would report the account
+    surface healthy in exactly the outage case this command exists to
+    detect — we merge the response body and treat ``status != "healthy"``
+    as ``ok: false``.
+    """
+
+    def _parse_probe(response: httpx.Response, body_ok_fn) -> dict[str, object]:
+        """Derive ``ok`` from the response body when needed."""
+        body: object | None = None
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        body_ok = body_ok_fn(body) if body is not None else response.is_success
+        return {
+            "status_code": response.status_code,
+            "ok": bool(response.is_success and body_ok),
+            "body": body,
+        }
+
+    probes: list[tuple[str, str, object]] = [
+        # label, path, body-ok predicate
+        ("api", "/health", lambda _b: True),
+        ("ready", "/ready", lambda _b: True),
+        ("live", "/api/v1/live/status", lambda _b: True),
+        # IB health returns 200 even when the gateway is down; derive
+        # ok from the body status + gateway_connected fields.
+        (
+            "account",
+            "/api/v1/account/health",
+            lambda b: isinstance(b, dict)
+            and b.get("status") == "healthy"
+            and bool(b.get("gateway_connected")),
+        ),
+    ]
     parts: dict[str, object] = {}
-    for label, path in (
-        ("api", "/health"),
-        ("ready", "/ready"),
-        ("live", "/api/v1/live/status"),
-        ("account", "/api/v1/account/health"),
-    ):
+    for label, path, body_ok_fn in probes:
         try:
             response = httpx.get(
                 f"{_api_base()}{path}", headers=_api_headers(), timeout=5.0
             )
-            parts[label] = {
-                "status_code": response.status_code,
-                "ok": response.is_success,
-            }
+            parts[label] = _parse_probe(response, body_ok_fn)
         except httpx.ConnectError:
             parts[label] = {"error": "connection refused"}
+        except httpx.TimeoutException:
+            parts[label] = {"error": "timeout"}
+        except httpx.RequestError as exc:
+            parts[label] = {"error": f"{type(exc).__name__}: {exc}"}
     _emit_json(parts)
 
 
