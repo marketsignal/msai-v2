@@ -22,6 +22,7 @@ from msai.models.research_trial import ResearchTrial
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _col(model, name):  # noqa: ANN001, ANN202
     """Get a column object by name."""
     return model.__table__.columns[name]
@@ -43,6 +44,7 @@ def _unique_constraint_columns(model):  # noqa: ANN001, ANN202
     result = []
     for constraint in model.__table__.constraints:
         from sqlalchemy import UniqueConstraint
+
         if isinstance(constraint, UniqueConstraint):
             result.append(tuple(c.name for c in constraint.columns))
     return result
@@ -52,15 +54,23 @@ def _unique_constraint_columns(model):  # noqa: ANN001, ANN202
 # 1. AssetUniverse
 # ===========================================================================
 
+
 class TestAssetUniverse:
     def test_tablename(self) -> None:
         assert AssetUniverse.__tablename__ == "asset_universe"
 
     def test_expected_columns(self) -> None:
         expected = {
-            "id", "symbol", "exchange", "asset_class", "resolution",
-            "enabled", "last_ingested_at", "created_by",
-            "created_at", "updated_at",
+            "id",
+            "symbol",
+            "exchange",
+            "asset_class",
+            "resolution",
+            "enabled",
+            "last_ingested_at",
+            "created_by",
+            "created_at",
+            "updated_at",
         }
         assert expected.issubset(_col_names(AssetUniverse))
 
@@ -90,16 +100,28 @@ class TestAssetUniverse:
 # 2. ResearchJob
 # ===========================================================================
 
+
 class TestResearchJob:
     def test_tablename(self) -> None:
         assert ResearchJob.__tablename__ == "research_jobs"
 
     def test_expected_columns(self) -> None:
         expected = {
-            "id", "strategy_id", "job_type", "config", "status",
-            "progress", "progress_message", "results", "best_config",
-            "best_metrics", "error_message", "started_at", "completed_at",
-            "created_by", "created_at",
+            "id",
+            "strategy_id",
+            "job_type",
+            "config",
+            "status",
+            "progress",
+            "progress_message",
+            "results",
+            "best_config",
+            "best_metrics",
+            "error_message",
+            "started_at",
+            "completed_at",
+            "created_by",
+            "created_at",
         }
         assert expected.issubset(_col_names(ResearchJob))
 
@@ -130,14 +152,22 @@ class TestResearchJob:
 # 3. ResearchTrial
 # ===========================================================================
 
+
 class TestResearchTrial:
     def test_tablename(self) -> None:
         assert ResearchTrial.__tablename__ == "research_trials"
 
     def test_expected_columns(self) -> None:
         expected = {
-            "id", "research_job_id", "trial_number", "config", "metrics",
-            "status", "objective_value", "backtest_id", "created_at",
+            "id",
+            "research_job_id",
+            "trial_number",
+            "config",
+            "metrics",
+            "status",
+            "objective_value",
+            "backtest_id",
+            "created_at",
         }
         assert expected.issubset(_col_names(ResearchTrial))
 
@@ -166,15 +196,25 @@ class TestResearchTrial:
 # 4. GraduationCandidate
 # ===========================================================================
 
+
 class TestGraduationCandidate:
     def test_tablename(self) -> None:
         assert GraduationCandidate.__tablename__ == "graduation_candidates"
 
     def test_expected_columns(self) -> None:
         expected = {
-            "id", "strategy_id", "research_job_id", "stage", "config",
-            "metrics", "deployment_id", "notes", "promoted_by",
-            "promoted_at", "created_at", "updated_at",
+            "id",
+            "strategy_id",
+            "research_job_id",
+            "stage",
+            "config",
+            "metrics",
+            "deployment_id",
+            "notes",
+            "promoted_by",
+            "promoted_at",
+            "created_at",
+            "updated_at",
         }
         assert expected.issubset(_col_names(GraduationCandidate))
 
@@ -208,14 +248,20 @@ class TestGraduationCandidate:
 # 5. GraduationStageTransition
 # ===========================================================================
 
+
 class TestGraduationStageTransition:
     def test_tablename(self) -> None:
         assert GraduationStageTransition.__tablename__ == "graduation_stage_transitions"
 
     def test_expected_columns(self) -> None:
         expected = {
-            "id", "candidate_id", "from_stage", "to_stage",
-            "reason", "transitioned_by", "created_at",
+            "id",
+            "candidate_id",
+            "from_stage",
+            "to_stage",
+            "reason",
+            "transitioned_by",
+            "created_at",
         }
         assert expected.issubset(_col_names(GraduationStageTransition))
 
@@ -244,15 +290,24 @@ class TestGraduationStageTransition:
 # 6. Portfolio
 # ===========================================================================
 
+
 class TestPortfolio:
     def test_tablename(self) -> None:
         assert Portfolio.__tablename__ == "portfolios"
 
     def test_expected_columns(self) -> None:
         expected = {
-            "id", "name", "description", "objective", "base_capital",
-            "requested_leverage", "benchmark_symbol", "account_id",
-            "created_by", "created_at", "updated_at",
+            "id",
+            "name",
+            "description",
+            "objective",
+            "base_capital",
+            "requested_leverage",
+            "benchmark_symbol",
+            "account_id",
+            "created_by",
+            "created_at",
+            "updated_at",
         }
         assert expected.issubset(_col_names(Portfolio))
 
@@ -275,6 +330,7 @@ class TestPortfolio:
 # ===========================================================================
 # 7. PortfolioAllocation
 # ===========================================================================
+
 
 class TestPortfolioAllocation:
     def test_tablename(self) -> None:
@@ -308,14 +364,29 @@ class TestPortfolioAllocation:
 # 8. PortfolioRun
 # ===========================================================================
 
+
 class TestPortfolioRun:
     def test_tablename(self) -> None:
         assert PortfolioRun.__tablename__ == "portfolio_runs"
 
     def test_expected_columns(self) -> None:
         expected = {
-            "id", "portfolio_id", "status", "metrics", "report_path",
-            "start_date", "end_date", "created_by", "created_at", "completed_at",
+            "id",
+            "portfolio_id",
+            "status",
+            "metrics",
+            "series",
+            "allocations",
+            "report_path",
+            "start_date",
+            "end_date",
+            "max_parallelism",
+            "error_message",
+            "heartbeat_at",
+            "created_by",
+            "created_at",
+            "updated_at",
+            "completed_at",
         }
         assert expected.issubset(_col_names(PortfolioRun))
 
@@ -333,17 +404,22 @@ class TestPortfolioRun:
         assert col.server_default is not None
         assert "pending" in str(col.server_default.arg)
 
-    def test_no_updated_at(self) -> None:
-        assert "updated_at" not in _col_names(PortfolioRun)
+    def test_has_updated_at(self) -> None:
+        # Added as part of the portfolio orchestration port — the run row
+        # is now mutated during execution (heartbeat, status transitions),
+        # so it needs an onupdate-tracked timestamp.
+        assert "updated_at" in _col_names(PortfolioRun)
 
 
 # ===========================================================================
 # Cross-model: all 8 models importable from __init__
 # ===========================================================================
 
+
 class TestModelsInit:
     def test_all_new_models_exported(self) -> None:
         from msai.models import __all__ as exported
+
         new_models = {
             "AssetUniverse",
             "ResearchJob",

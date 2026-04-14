@@ -52,5 +52,9 @@ class WorkerSettings:
     redis_settings: RedisSettings = _parse_redis_url(settings.redis_url)
     queue_name: str = settings.portfolio_queue_name
     max_jobs: int = 2
-    job_timeout: int = 60 * 60  # 1 hour
+    # Wall-clock budget must cover the worst-case sequential candidate
+    # backtests (``N / parallelism``), each bounded by
+    # ``backtest_timeout_seconds`` — NOT a fixed hour.  See the setting's
+    # docstring for the sizing rationale.
+    job_timeout: int = settings.portfolio_job_timeout_seconds
     max_tries: int = 2  # 1 retry

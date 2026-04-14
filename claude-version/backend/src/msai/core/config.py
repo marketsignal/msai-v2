@@ -79,6 +79,21 @@ class Settings(BaseSettings):
     # Backtest execution tuning
     backtest_timeout_seconds: int = 30 * 60
 
+    # Portfolio job wall-clock budget.  Portfolio runs launch N candidate
+    # backtests, each bounded by ``backtest_timeout_seconds``; the arq
+    # ``job_timeout`` has to cover the *sequential* worst case —
+    # ``ceil(N / parallelism) × backtest_timeout`` with headroom — or
+    # otherwise valid portfolios get killed before any child actually
+    # times out.  Sizing:
+    #
+    #     portfolio_job_timeout_seconds ≈ ceil(max_N / compute_slot_limit)
+    #                                     × backtest_timeout_seconds × 1.1
+    #
+    # Defaults to ~8 sequential 30-min batches (4 h).  Operators who raise
+    # ``backtest_timeout_seconds`` or expect portfolios with >8 allocations
+    # AND low ``max_parallelism`` must bump this in lockstep.
+    portfolio_job_timeout_seconds: int = 8 * 30 * 60  # 4 hours
+
     # Job watchdog thresholds
     job_stale_seconds: int = 600  # 10 min without heartbeat = stale
     job_pending_grace_seconds: int = 600  # 10 min pending without starting = stuck

@@ -13,9 +13,11 @@ from msai.models.base import Base, TimestampMixin
 class Portfolio(TimestampMixin, Base):
     """A portfolio that allocates capital across graduated strategy candidates.
 
-    ``objective`` describes the optimization goal (e.g. ``max_sharpe``,
-    ``min_drawdown``, ``equal_weight``).  ``base_capital`` is the starting
-    notional, and ``requested_leverage`` is the target leverage multiplier.
+    ``objective`` describes the optimization goal — one of
+    :class:`msai.models.portfolio_enums.PortfolioObjective`
+    (``equal_weight``, ``manual``, ``maximize_profit``, ``maximize_sharpe``,
+    ``maximize_sortino``).  ``base_capital`` is the starting notional,
+    and ``requested_leverage`` is the target leverage multiplier.
     """
 
     __tablename__ = "portfolios"
@@ -28,6 +30,7 @@ class Portfolio(TimestampMixin, Base):
     requested_leverage: Mapped[float] = mapped_column(
         Numeric(8, 4), nullable=False, server_default="1.0"
     )
+    downside_target: Mapped[float | None] = mapped_column(Numeric(8, 4), nullable=True)
     benchmark_symbol: Mapped[str | None] = mapped_column(String(32), nullable=True)
     account_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_by: Mapped[UUID | None] = mapped_column(

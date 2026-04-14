@@ -21,9 +21,7 @@ class PortfolioAllocation(Base):
 
     __tablename__ = "portfolio_allocations"
     __table_args__ = (
-        UniqueConstraint(
-            "portfolio_id", "candidate_id", name="uq_portfolio_candidate"
-        ),
+        UniqueConstraint("portfolio_id", "candidate_id", name="uq_portfolio_candidate"),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
@@ -33,7 +31,11 @@ class PortfolioAllocation(Base):
     candidate_id: Mapped[UUID] = mapped_column(
         ForeignKey("graduation_candidates.id"), index=True, nullable=False
     )
-    weight: Mapped[float] = mapped_column(Numeric(8, 6), nullable=False)
+    # Nullable so callers can omit the weight and let the orchestration
+    # service derive it heuristically from the candidate's metrics at run
+    # time (see ``PortfolioObjective`` for the heuristics).  Manual-
+    # objective portfolios still supply explicit weights.
+    weight: Mapped[float | None] = mapped_column(Numeric(8, 6), nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     # Relationships
