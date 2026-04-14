@@ -20,12 +20,15 @@ from pydantic import BaseModel, Field
 class IngestRequest(BaseModel):
     """Request body for ``POST /api/v1/market-data/ingest``."""
 
-    asset_class: Literal["stocks", "indexes", "futures", "options", "crypto"] = Field(
+    asset_class: Literal["stocks", "equities", "indexes", "futures", "options", "crypto"] = Field(
         ..., description="Asset class"
     )
     symbols: list[str] = Field(..., min_length=1, description="Ticker symbols to ingest")
     start: date = Field(..., description="Start date YYYY-MM-DD")
     end: date = Field(..., description="End date YYYY-MM-DD")
+    provider: str = Field("auto", description="Data provider: auto, databento, or polygon")
+    dataset: str | None = Field(None, description="Override default Databento dataset")
+    data_schema: str | None = Field(None, description="Override default Databento schema")
 
 
 # ---------------------------------------------------------------------------

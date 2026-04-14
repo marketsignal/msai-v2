@@ -59,7 +59,9 @@ class ParquetStore:
 
         df = df.copy()
         df["timestamp"] = pd.to_datetime(df["timestamp"])
-        df = dedup_bars(df)
+        # Dedup by timestamp only — each file is already per-symbol.
+        dedup_key = ("timestamp",)
+        df = dedup_bars(df, key_columns=dedup_key)
 
         last_checksum = ""
         for (year, month), group in df.groupby([df["timestamp"].dt.year, df["timestamp"].dt.month]):
@@ -68,7 +70,7 @@ class ParquetStore:
             # Merge with existing data when the file already exists.
             if target.exists():
                 existing = pd.read_parquet(target)
-                group = dedup_bars(pd.concat([existing, group], ignore_index=True))
+                group = dedup_bars(pd.concat([existing, group], ignore_index=True), key_columns=dedup_key)
 
             table = pa.Table.from_pandas(group, preserve_index=False)
             last_checksum = atomic_write_parquet(table, target)

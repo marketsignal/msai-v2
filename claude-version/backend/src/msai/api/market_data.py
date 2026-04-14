@@ -105,7 +105,9 @@ async def trigger_ingest(
     """Trigger manual data ingestion by enqueuing an arq job.
 
     The actual ingestion runs asynchronously via the arq worker. This
-    endpoint returns 202 Accepted immediately.
+    endpoint returns 202 Accepted immediately.  Accepts optional
+    ``provider``, ``dataset``, and ``data_schema`` fields to control
+    routing (defaults to Databento for equities/futures).
     """
     try:
         from msai.core.queue import enqueue_ingest, get_redis_pool
@@ -117,6 +119,9 @@ async def trigger_ingest(
             symbols=body.symbols,
             start=body.start.isoformat(),
             end=body.end.isoformat(),
+            provider=body.provider,
+            dataset=body.dataset,
+            schema=body.data_schema,
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("ingest_enqueue_failed", error=str(exc))

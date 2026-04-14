@@ -13,26 +13,30 @@ subprocess, because:
 * The arq worker process can host many **sequential** runs because each
   one gets its own child process.
 
-The subprocess contract is deliberately narrow: the parent hands over a
-:class:`_RunPayload` with primitive types, and the child returns a plain
-``dict`` over an ``mp.Queue``.  This keeps the pickle surface tiny and
-avoids serialising Nautilus objects across process boundaries.
+IPC uses **file-based pickle** (write result to a tempfile, parent reads
+after ``process.join()``) instead of ``multiprocessing.Queue`` because
+Queue silently fails when the subprocess writes large DataFrames that
+exceed the OS pipe buffer.  The tempfile approach is more robust and
+avoids pipe deadlocks.
 """
 
 from __future__ import annotations
 
 import multiprocessing as mp
-import queue as queue_mod
+import pickle
+import tempfile
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import pandas as pd
 
+from msai.services.analytics_math import compute_series_metrics
 from msai.services.nautilus.strategy_loader import resolve_importable_strategy_paths
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    pass
 
 # NautilusTrader is heavy (pulls in Rust extensions).  We import eagerly
 # because this module is only imported inside the backtest worker, which
@@ -46,7 +50,7 @@ try:
         BacktestVenueConfig,
     )
     from nautilus_trader.backtest.node import BacktestNode
-    from nautilus_trader.model.identifiers import Venue
+    from nautilus_trader.model.identifiers import InstrumentId, Venue
     from nautilus_trader.trading.config import ImportableStrategyConfig
 
     _NAUTILUS_IMPORT_ERROR: Exception | None = None
@@ -67,16 +71,16 @@ def _extract_venues_from_instrument_ids(instrument_ids: list[str]) -> list[str]:
     """Derive the unique, deterministically ordered list of venue
     suffixes from a list of canonical Nautilus instrument ids.
 
-    ``"AAPL.NASDAQ"`` → venue ``"NASDAQ"``. For option ids the
+    ``"AAPL.NASDAQ"`` -> venue ``"NASDAQ"``. For option ids the
     venue suffix is everything after the FINAL ``.`` (Nautilus's
-    simplified symbology puts the venue last —
+    simplified symbology puts the venue last --
     ``"C AAPL 20260515 150.SMART"``). A single backtest spanning
     multiple venues (e.g. ``["AAPL.NASDAQ", "ESM5.XCME"]``) returns
     both names so the runner can build one ``BacktestVenueConfig``
     per unique venue.
 
     Raises ``ValueError`` when ``instrument_ids`` is empty OR any
-    id has no venue suffix — both are programming errors that
+    id has no venue suffix -- both are programming errors that
     would otherwise surface as an opaque Nautilus runtime crash.
     """
     if not instrument_ids:
@@ -86,7 +90,7 @@ def _extract_venues_from_instrument_ids(instrument_ids: list[str]) -> list[str]:
     for instrument_id in instrument_ids:
         if "." not in instrument_id:
             raise ValueError(
-                f"instrument_id {instrument_id!r} has no venue suffix — "
+                f"instrument_id {instrument_id!r} has no venue suffix -- "
                 "migrate to canonical IDs via SecurityMaster "
                 "(Phase 2 task 2.6)",
             )
@@ -135,6 +139,8 @@ class _RunPayload:
         start_date: ISO-8601 start of the backtest window (inclusive).
         end_date: ISO-8601 end of the backtest window (inclusive).
         catalog_path: Filesystem path to the Nautilus ``ParquetDataCatalog``.
+        result_path: Tempfile path where the subprocess writes its pickle
+            result.  Set by the parent before spawning.
     """
 
     strategy_file: str
@@ -143,6 +149,7 @@ class _RunPayload:
     start_date: str
     end_date: str
     catalog_path: str
+    result_path: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -204,33 +211,46 @@ class BacktestRunner:
             catalog_path=str(catalog_path),
         )
 
+        # Create a tempfile for the subprocess to write its result into.
+        with tempfile.NamedTemporaryFile(
+            prefix="msai-backtest-", suffix=".pkl", delete=False,
+        ) as tmp:
+            result_path = Path(tmp.name)
+        payload.result_path = str(result_path)
+
         # ``spawn`` is mandatory -- ``fork`` would inherit the parent's
         # Rust/Cython state from any earlier Nautilus imports and crash.
         ctx = mp.get_context("spawn")
-        result_queue: Any = ctx.Queue()
-        process = ctx.Process(target=_run_in_subprocess, args=(payload, result_queue))
-        process.start()
-        process.join(timeout_seconds)
-
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=5)
-            raise TimeoutError(f"Backtest subprocess exceeded timeout of {timeout_seconds}s")
-
+        process = ctx.Process(target=_run_in_subprocess, args=(payload,))
         try:
-            raw = cast("dict[str, Any]", result_queue.get(timeout=2))
-        except queue_mod.Empty as exc:
-            raise RuntimeError("Backtest subprocess exited without a result") from exc
+            process.start()
+            process.join(timeout_seconds)
 
-        if not bool(raw.get("ok")):
-            raise RuntimeError(str(raw.get("error", "Unknown backtest failure")))
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+                raise TimeoutError(f"Backtest subprocess exceeded timeout of {timeout_seconds}s")
 
-        return BacktestResult(
-            orders_df=pd.DataFrame(raw.get("orders", [])),
-            positions_df=pd.DataFrame(raw.get("positions", [])),
-            account_df=pd.DataFrame(raw.get("account", [])),
-            metrics=cast("dict[str, float | int]", raw.get("metrics", _zero_metrics())),
-        )
+            if not result_path.exists():
+                raise RuntimeError("Backtest subprocess exited without a result")
+
+            with result_path.open("rb") as handle:
+                raw = cast("dict[str, Any]", pickle.load(handle))
+
+            if not bool(raw.get("ok")):
+                raise RuntimeError(str(raw.get("error", "Unknown backtest failure")))
+
+            return BacktestResult(
+                orders_df=pd.DataFrame(raw.get("orders", [])),
+                positions_df=pd.DataFrame(raw.get("positions", [])),
+                account_df=pd.DataFrame(raw.get("account", [])),
+                metrics=cast("dict[str, float | int]", raw.get("metrics", _zero_metrics())),
+            )
+        finally:
+            if result_path.exists():
+                result_path.unlink()
+            if hasattr(process, "close"):
+                process.close()
 
 
 # ---------------------------------------------------------------------------
@@ -238,21 +258,22 @@ class BacktestRunner:
 # ---------------------------------------------------------------------------
 
 
-def _run_in_subprocess(payload: _RunPayload, result_queue: Any) -> None:
+def _run_in_subprocess(payload: _RunPayload) -> None:
     """Execute the backtest inside the spawned child process.
 
     This function runs in a completely fresh Python interpreter, so it
     has to re-import ``nautilus_trader`` itself.  Any error -- import
     failure, engine crash, user strategy exception -- is caught and
-    packaged into the ``result_queue`` so the parent can raise a
+    packaged into the result pickle so the parent can raise a
     meaningful ``RuntimeError``.
     """
     if _NAUTILUS_IMPORT_ERROR is not None:
-        result_queue.put(
+        _write_subprocess_result(
+            payload.result_path,
             {
                 "ok": False,
                 "error": f"NautilusTrader import failed: {_NAUTILUS_IMPORT_ERROR}",
-            }
+            },
         )
         return
 
@@ -264,14 +285,15 @@ def _run_in_subprocess(payload: _RunPayload, result_queue: Any) -> None:
 
             # No results at all -- Nautilus treated the window as empty.
             if not results:
-                result_queue.put(
+                _write_subprocess_result(
+                    payload.result_path,
                     {
                         "ok": True,
                         "orders": [],
                         "positions": [],
                         "account": [],
                         "metrics": _zero_metrics(),
-                    }
+                    },
                 )
                 return
 
@@ -282,44 +304,60 @@ def _run_in_subprocess(payload: _RunPayload, result_queue: Any) -> None:
             if engine is None:
                 # Backtest completed but we can't fish out the engine --
                 # return the stats we have without trade-level detail.
-                result_queue.put(
+                _write_subprocess_result(
+                    payload.result_path,
                     {
                         "ok": True,
                         "orders": [],
                         "positions": [],
                         "account": [],
-                        "metrics": _extract_metrics(primary, pd.DataFrame()),
-                    }
+                        "metrics": _extract_metrics(primary, pd.DataFrame(), pd.DataFrame()),
+                    },
                 )
                 return
 
             # The venue kwarg is REQUIRED on ``generate_account_report()``
-            # (gotcha #2). Phase 2 task 2.9: derive the venue from the
-            # FIRST instrument id in the payload so a backtest runs
-            # against whatever canonical venue the caller supplied.
-            # For multi-venue backtests, Nautilus's account report is
-            # per-venue — we take the primary (first) venue here; the
-            # full multi-venue reporting path lands in a later task.
+            # (gotcha #2). Phase 2 task 2.9: derive per-venue account
+            # reports and concatenate them for multi-venue backtests.
             orders_df = engine.trader.generate_orders_report()
             positions_df = engine.trader.generate_positions_report()
-            primary_venue_name = _extract_venues_from_instrument_ids(payload.instrument_ids)[0]
-            account_df = engine.trader.generate_account_report(venue=Venue(primary_venue_name))
+            venue_names = _extract_venues_from_instrument_ids(payload.instrument_ids)
+            account_frames = [
+                engine.trader.generate_account_report(venue=Venue(v))
+                for v in venue_names
+            ]
+            account_df = (
+                pd.concat(account_frames)
+                if account_frames
+                else pd.DataFrame()
+            )
+            account_payload = _compact_account_report(account_df)
 
-            result_queue.put(
+            _write_subprocess_result(
+                payload.result_path,
                 {
                     "ok": True,
                     "orders": orders_df.to_dict(orient="records"),
                     "positions": positions_df.to_dict(orient="records"),
-                    "account": account_df.to_dict(orient="records"),
-                    "metrics": _extract_metrics(primary, orders_df),
-                }
+                    "account": account_payload.to_dict(orient="records"),
+                    "metrics": _extract_metrics(primary, orders_df, account_payload),
+                },
             )
         finally:
             # ``dispose`` is not in Nautilus's public type stubs so we
             # cast to ``Any`` to keep mypy happy.
             cast("Any", node).dispose()
     except Exception:
-        result_queue.put({"ok": False, "error": traceback.format_exc()})
+        _write_subprocess_result(
+            payload.result_path,
+            {"ok": False, "error": traceback.format_exc()},
+        )
+
+
+def _write_subprocess_result(result_path: str, payload: dict[str, Any]) -> None:
+    """Write the subprocess result to a pickle file at ``result_path``."""
+    with Path(result_path).open("wb") as handle:
+        pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +386,7 @@ def _build_backtest_run_config(payload: _RunPayload) -> BacktestRunConfig:
     # produces one config; a multi-venue (e.g. equities + futures)
     # backtest produces one per venue. If any venue is missing a
     # config Nautilus refuses to run with
-    # ``Venue '<X>' does not have a BacktestVenueConfig`` — gotcha
+    # ``Venue '<X>' does not have a BacktestVenueConfig`` -- gotcha
     # #4 in the Nautilus reference.
     venue_names = _extract_venues_from_instrument_ids(payload.instrument_ids)
     venue_configs = [
@@ -382,11 +420,106 @@ def _build_backtest_run_config(payload: _RunPayload) -> BacktestRunConfig:
 
 
 # ---------------------------------------------------------------------------
+# Account report compaction
+# ---------------------------------------------------------------------------
+
+
+def _compact_account_report(account_df: pd.DataFrame) -> pd.DataFrame:
+    """Reduce the raw Nautilus account report to a daily equity/returns series.
+
+    The raw report can have thousands of intraday rows.  We compact it to
+    one row per day with ``timestamp``, ``equity``, and ``returns`` columns
+    so that downstream analytics and the QuantStats tearsheet generator
+    get a clean daily time series.
+    """
+    if account_df.empty:
+        return pd.DataFrame(columns=["timestamp", "returns", "equity"])
+
+    frame = account_df.copy()
+    if isinstance(frame.index, pd.DatetimeIndex):
+        frame = frame.reset_index().rename(columns={frame.index.name or "index": "timestamp"})
+    timestamp_col = _first_present(
+        frame.columns,
+        ("timestamp", "ts_last", "ts_event", "ts_init", "datetime", "date"),
+    )
+    if timestamp_col is None:
+        return frame
+
+    frame[timestamp_col] = pd.to_datetime(frame[timestamp_col], utc=True, errors="coerce")
+    frame = frame.dropna(subset=[timestamp_col]).sort_values(timestamp_col)
+    if frame.empty:
+        return pd.DataFrame(columns=["timestamp", "returns", "equity"])
+
+    equity_col = _first_present(
+        frame.columns,
+        ("equity", "equity_total", "balance_total", "total", "balance", "net_liquidation"),
+    )
+    returns_col = _first_present(frame.columns, ("returns", "return", "pnl_pct", "pnl_percent"))
+
+    if equity_col is not None:
+        frame[equity_col] = pd.to_numeric(frame[equity_col], errors="coerce")
+        frame = frame.dropna(subset=[equity_col])
+        if frame.empty:
+            return pd.DataFrame(columns=["timestamp", "returns", "equity"])
+        account_id_col = _first_present(frame.columns, ("account_id",))
+        if account_id_col is not None:
+            deduped = (
+                frame.groupby([timestamp_col, account_id_col], as_index=False)[equity_col]
+                .last()
+            )
+            intraday_equity = (
+                deduped.groupby(timestamp_col, as_index=True)[equity_col].sum().sort_index()
+            )
+        else:
+            intraday_equity = (
+                frame.groupby(timestamp_col, as_index=True)[equity_col].last().sort_index()
+            )
+        grouped = intraday_equity.groupby(intraday_equity.index.normalize(), as_index=True).last()
+        compact = pd.DataFrame(
+            {
+                "timestamp": grouped.index,
+                "equity": grouped.values,
+                "returns": grouped.pct_change().fillna(0.0).values,
+            }
+        )
+        return compact
+
+    if returns_col is not None:
+        grouped_returns = (
+            frame.groupby(frame[timestamp_col].dt.normalize(), as_index=True)[returns_col]
+            .apply(lambda values: (1.0 + pd.to_numeric(values, errors="coerce").fillna(0.0)).prod() - 1.0)
+            .sort_index()
+        )
+        return pd.DataFrame(
+            {
+                "timestamp": grouped_returns.index,
+                "returns": grouped_returns.values,
+            }
+        )
+
+    return frame
+
+
+def _first_present(columns: pd.Index, names: tuple[str, ...]) -> str | None:
+    """Return the first column name from ``names`` that exists in ``columns``."""
+    lowered = {str(column).lower(): str(column) for column in columns}
+    for name in names:
+        match = lowered.get(name.lower())
+        if match is not None:
+            return match
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Metrics extraction
 # ---------------------------------------------------------------------------
 
 
-def _extract_metrics(primary_result: object, orders_df: pd.DataFrame) -> dict[str, float | int]:
+def _extract_metrics(
+    primary_result: object,
+    orders_df: pd.DataFrame,
+    account_df: pd.DataFrame | None = None,
+) -> dict[str, float | int]:
     """Pull a normalised metrics dict out of the Nautilus result object.
 
     NautilusTrader exposes two relevant stat dicts with human-readable keys:
@@ -399,11 +532,15 @@ def _extract_metrics(primary_result: object, orders_df: pd.DataFrame) -> dict[st
     We look up each metric by a small list of candidate key prefixes so
     minor version changes ("Sharpe Ratio (252 days)" vs "Sharpe Ratio")
     don't silently zero-out the dashboard.
+
+    When Nautilus's built-in stats produce zeros (e.g. for short backtests),
+    we fall back to deriving metrics from the compacted account report
+    using ``compute_series_metrics``.
     """
     stats_returns = getattr(primary_result, "stats_returns", None) or {}
     stats_pnls = getattr(primary_result, "stats_pnls", None) or {}
 
-    # Flat returns stats — sharpe / sortino / drawdown
+    # Flat returns stats -- sharpe / sortino / drawdown
     sharpe = _find_float(stats_returns, ["sharpe ratio", "sharpe"])
     sortino = _find_float(stats_returns, ["sortino ratio", "sortino"])
     max_drawdown = _find_float(stats_returns, ["max drawdown", "maximum drawdown"])
@@ -415,10 +552,17 @@ def _extract_metrics(primary_result: object, orders_df: pd.DataFrame) -> dict[st
         if isinstance(first, dict):
             currency_stats = first
 
-    # "PnL% (total)" is the fraction return as a percentage (e.g. 0.138 == 0.138%).
-    # Nautilus returns it as an absolute percent — leave it as-is.
     total_return = _find_float(currency_stats, ["pnl% (total)", "pnl%", "return"])
     win_rate = _find_float(currency_stats, ["win rate"])
+
+    # Fall back to account-derived metrics when Nautilus stats are zero.
+    if account_df is not None:
+        derived = _derive_metrics_from_account(account_df)
+        if derived is not None:
+            if abs(max_drawdown) <= 1e-12:
+                max_drawdown = derived["max_drawdown"]
+            if abs(total_return) <= 1e-12:
+                total_return = derived["total_return"]
 
     return {
         "sharpe_ratio": _nan_safe(sharpe),
@@ -427,6 +571,37 @@ def _extract_metrics(primary_result: object, orders_df: pd.DataFrame) -> dict[st
         "total_return": _nan_safe(total_return),
         "win_rate": _nan_safe(win_rate),
         "num_trades": int(len(orders_df)),
+    }
+
+
+def _derive_metrics_from_account(account_df: pd.DataFrame) -> dict[str, float] | None:
+    """Derive total_return and max_drawdown from a compacted account report.
+
+    Uses :func:`compute_series_metrics` from ``analytics_math`` so the
+    calculation is consistent with any other place we compute metrics
+    from a returns series.
+    """
+    if account_df.empty or "returns" not in account_df.columns:
+        return None
+    frame = account_df.copy()
+    timestamp_col = _first_present(
+        frame.columns,
+        ("timestamp", "ts_last", "ts_event", "ts_init", "datetime", "date"),
+    )
+    if timestamp_col is None:
+        return None
+    frame[timestamp_col] = pd.to_datetime(frame[timestamp_col], utc=True, errors="coerce")
+    frame = frame.dropna(subset=[timestamp_col]).sort_values(timestamp_col)
+    if frame.empty:
+        return None
+    returns = pd.Series(
+        pd.to_numeric(frame["returns"], errors="coerce").fillna(0.0).values,
+        index=pd.DatetimeIndex(frame[timestamp_col]),
+    )
+    derived = compute_series_metrics(returns)
+    return {
+        "max_drawdown": float(derived.max_drawdown),
+        "total_return": float(derived.total_return),
     }
 
 
@@ -468,8 +643,3 @@ def _zero_metrics() -> dict[str, float | int]:
         "win_rate": 0.0,
         "num_trades": 0,
     }
-
-
-# Silence "imported but unused" warning for ``field`` -- reserved for
-# possible future payload extensions.
-_ = field

@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://localhost:3000"]
     polygon_api_key: str = ""
     databento_api_key: str = ""
+    databento_equities_dataset: str = "EQUS.MINI"
+    databento_futures_dataset: str = "GLBX.MDP3"
+    databento_default_schema: str = "ohlcv-1m"
 
     # Interactive Brokers account id for live deployments. Part of the
     # stable identity tuple (decision #7) — switching accounts produces

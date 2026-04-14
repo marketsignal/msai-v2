@@ -150,15 +150,22 @@ async def enqueue_ingest(
     symbols: list[str],
     start: str,
     end: str,
+    *,
+    provider: str = "auto",
+    dataset: str | None = None,
+    schema: str | None = None,
 ) -> None:
     """Enqueue a ``run_ingest`` job.
 
     Args:
         pool: An active arq Redis connection pool.
-        asset_class: Asset class identifier (e.g. ``"equity"``, ``"crypto"``).
+        asset_class: Asset class identifier (e.g. ``"stocks"``, ``"futures"``).
         symbols: List of ticker symbols to ingest.
         start: Start date as an ISO-8601 string (``"2024-01-01"``).
         end: End date as an ISO-8601 string (``"2024-12-31"``).
+        provider: Data provider (``"auto"``, ``"databento"``, or ``"polygon"``).
+        dataset: Override the default Databento dataset.
+        schema: Override the default Databento schema.
     """
     await pool.enqueue_job(
         "run_ingest",
@@ -166,4 +173,7 @@ async def enqueue_ingest(
         symbols=symbols,
         start=start,
         end=end,
+        provider=provider,
+        dataset=dataset,
+        schema=schema,
     )

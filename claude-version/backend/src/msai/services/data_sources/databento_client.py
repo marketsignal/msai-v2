@@ -1,109 +1,105 @@
-"""Databento API client for fetching futures OHLCV bar data.
+"""Databento API client for fetching OHLCV bar data.
 
 Uses the Databento Python SDK to retrieve historical minute bars for
-futures contracts.  Returns normalized DataFrames compatible with the
-ParquetStore write format.
+equities and futures contracts.  Returns normalized DataFrames compatible
+with the ParquetStore write format.
+
+Supports configurable dataset and schema parameters so the same client
+can serve both equities (EQUS.MINI) and futures (GLBX.MDP3).
 """
 
 from __future__ import annotations
 
-from typing import Any
+import re
 
 import pandas as pd
 
+from msai.core.config import settings
 from msai.core.logging import get_logger
 
 log = get_logger(__name__)
 
 
 class DatabentoClient:
-    """Client for the Databento Historical API (futures minute bars)."""
+    """Client for the Databento Historical API (equities + futures bars)."""
 
-    def __init__(self, api_key: str) -> None:
-        self.api_key = api_key
+    def __init__(self, api_key: str | None = None, dataset: str | None = None) -> None:
+        self.api_key = api_key or settings.databento_api_key
+        self.dataset = dataset or settings.databento_futures_dataset
 
-    async def fetch_futures_bars(
+    async def fetch_bars(
         self,
         symbol: str,
         start: str,
         end: str,
-        dataset: str = "GLBX.MDP3",
-        stype: str = "continuous",
+        *,
+        dataset: str | None = None,
+        schema: str | None = None,
     ) -> pd.DataFrame:
-        """Fetch futures minute bars from Databento.
+        """Fetch OHLCV bars from Databento.
 
         Uses the ``databento`` Python SDK's ``Historical`` client to request
-        OHLCV-1m bars.  The SDK call is synchronous, so it is run within the
-        async context (the SDK handles I/O internally).
+        bars with the given schema (default: ``ohlcv-1m``).
 
         Args:
-            symbol: Futures symbol (e.g. ``"ES.FUT"``, ``"NQ.FUT"``).
+            symbol: Ticker symbol (e.g. ``"AAPL"``, ``"ES.FUT"``).
             start: Start date as ``"YYYY-MM-DD"``.
             end: End date as ``"YYYY-MM-DD"``.
-            dataset: Databento dataset identifier.
-            stype: Symbol type (``"continuous"`` for front-month roll).
+            dataset: Databento dataset identifier (overrides instance default).
+            schema: Databento schema (e.g. ``"ohlcv-1m"``).
 
         Returns:
-            DataFrame with columns: ``symbol``, ``timestamp``, ``open``,
-            ``high``, ``low``, ``close``, ``volume``.
-            Returns an empty DataFrame on error or no data.
-        """
-        try:
-            import databento as db
-        except ImportError as exc:
-            log.error("databento_import_error", error=str(exc))
-            return _empty_bars_df()
+            DataFrame with columns: ``timestamp``, ``open``, ``high``,
+            ``low``, ``close``, ``volume``.
 
+        Raises:
+            RuntimeError: If ``DATABENTO_API_KEY`` is not configured or the
+                API request fails.
+        """
+        if not self.api_key:
+            raise RuntimeError("DATABENTO_API_KEY is not configured")
+
+        import databento as db
+
+        resolved_dataset = dataset or self.dataset
+        resolved_schema = schema or settings.databento_default_schema
+        client = db.Historical(key=self.api_key)
         try:
-            client = db.Historical(key=self.api_key)
             data = client.timeseries.get_range(
-                dataset=dataset,
+                dataset=resolved_dataset,
+                schema=resolved_schema,
                 symbols=[symbol],
-                stype_in=stype,
-                schema="ohlcv-1m",
                 start=start,
                 end=end,
+                stype_in=_databento_stype_in(symbol),
             )
-            df = data.to_df()
-        except Exception as exc:  # noqa: BLE001 — Databento SDK may raise varied errors
-            log.error("databento_fetch_error", symbol=symbol, error=str(exc))
-            return _empty_bars_df()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Databento historical request failed for {symbol} "
+                f"(dataset={resolved_dataset}, schema={resolved_schema}): {exc}"
+            ) from exc
 
+        df = data.to_df().reset_index()
         if df.empty:
-            return _empty_bars_df()
+            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+        if "ts_event" in df.columns:
+            df = df.rename(columns={"ts_event": "timestamp"})
+        if "volume" not in df.columns and "size" in df.columns:
+            df = df.rename(columns={"size": "volume"})
+        required = ["timestamp", "open", "high", "low", "close", "volume"]
+        missing = [col for col in required if col not in df.columns]
+        if missing:
+            raise RuntimeError(f"Databento response missing columns: {missing}")
+        return df[required]
 
-        return _normalize_databento_bars(df, symbol)
+
+_DATABENTO_CONTINUOUS_SYMBOL = re.compile(r"^[A-Za-z0-9_/-]+\.[A-Za-z]\.\d+$")
 
 
-def _normalize_databento_bars(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
-    """Convert a Databento OHLCV DataFrame to the canonical bar schema.
+def _databento_stype_in(symbol: str) -> str:
+    """Determine the Databento symbol type input parameter.
 
-    Databento's ``ohlcv-1m`` schema includes ``ts_event`` as the timestamp
-    and ``open``, ``high``, ``low``, ``close``, ``volume`` columns.
+    Continuous contract symbols (e.g. ``"ES.c.0"``) use ``"continuous"``
+    while all other symbols use ``"raw_symbol"``.
     """
-    result = pd.DataFrame()
-    result["symbol"] = [symbol] * len(df)
-
-    # ts_event is the canonical event timestamp in Databento data.
-    if "ts_event" in df.columns:
-        result["timestamp"] = pd.to_datetime(df["ts_event"], utc=True)
-    elif df.index.name == "ts_event":
-        result["timestamp"] = pd.to_datetime(df.index, utc=True)
-    else:
-        # Fallback: use the DataFrame index.
-        result["timestamp"] = pd.to_datetime(df.index, utc=True)
-
-    for col in ("open", "high", "low", "close", "volume"):
-        if col in df.columns:
-            result[col] = df[col].values
-
-    return result[["symbol", "timestamp", "open", "high", "low", "close", "volume"]].reset_index(
-        drop=True
-    )
-
-
-def _empty_bars_df() -> pd.DataFrame:
-    """Return an empty DataFrame with the canonical OHLCV schema."""
-    return pd.DataFrame(
-        columns=["symbol", "timestamp", "open", "high", "low", "close", "volume"]
-    )
+    return "continuous" if _DATABENTO_CONTINUOUS_SYMBOL.match(symbol) else "raw_symbol"

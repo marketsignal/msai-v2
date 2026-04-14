@@ -4,6 +4,16 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### Added (Codex Parity — post hybrid-merge)
+
+- **2026-04-13** — Hybrid merge PR#3 merged to main: 18 tasks, 99 files, ~15K lines. Research engine (Optuna), graduation pipeline, portfolio management, frontend pages, strategy governance, data lineage. 1133 tests passing, 7 code review iterations.
+- **2026-04-13** — Removed all mock data from frontend (6 files deleted, every component now uses real API calls). Dashboard shows honest empty states ($0.00 vs fake $125K).
+- **2026-04-13** — Docker Compose parity PR#4 merged: 12 operational gaps closed vs Codex. Added ingest-worker + job-watchdog containers, Redis healthchecks on all workers, IB Gateway on port 4004 (socat), separate client IDs, DATABENTO_API_KEY, frontend depends_on backend, `broker` profile replaces `live`. YAML extension fields eliminate worker config duplication.
+- **2026-04-13** — IB Gateway connected to paper trading advisor (marin1016test). Discovered 6 sub-accounts: DFP733210 (master) + DUP733211-DUP733215 (~$1M each). Saved to memory.
+- **2026-04-13** — Ported Codex data ingestion pipeline (`fix/port-codex-ingestion` branch). Databento as primary provider for equities + futures with plan-based routing. Configurable provider/dataset/schema in CLI, API, workers. Bar normalization, dedup, statistics. Nautilus catalog auto-built after ingestion. Fixed parquet_store dedup to use timestamp-only key. Verified: 5,402 AAPL+SPY bars ingested from Databento EQUS.MINI.
+- **2026-04-13** — Ported Codex backtest runner. File-based IPC (pickle to tempfile) replaces broken `multiprocessing.Queue` that silently failed on large DataFrames. Added `analytics_math.py` for series metric computation (SeriesMetrics, compute_series_metrics). Added `_compact_account_report()` for equity curve extraction, `_derive_metrics_from_account()` for fallback metrics, multi-venue account report support. **First real end-to-end backtest completed**: EMA Cross on AAPL, 100 trades, Sharpe -38.7 (expected — 1 week of data with simple strategy).
+- **2026-04-13** — **Honest revised assessment**: Codex version has significantly more mature operational infrastructure than initially reported. The hybrid-merge code review compared architecture/tests but missed DevOps/IPC/ingestion/runner maturity. Cumulative Codex advantages discovered via e2e testing: Docker Compose (12 gaps), IB Gateway config, data ingestion (plan-based), backtest IPC (file vs Queue), metric extraction, multi-venue support, daily scheduler, live command bus. Claude still better on: test discipline (1133 tests), new hybrid-merged features (research/graduation/portfolio code structure), governance/lineage. Strategy going forward: systematic subsystem-by-subsystem audit and port from Codex rather than discover-and-fix.
+
 ### Added (Hybrid Merge — feat/hybrid-merge)
 
 - **2026-04-12** — User stories document (`docs/user-stories.md`, 38 stories, 12 epics, 26 must-haves). Defines the full vision for the MSAI platform: strategy management, research/Optuna, graduation pipeline, portfolio management, live trading, risk, notifications, multi-account-ready architecture.
