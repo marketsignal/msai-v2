@@ -39,6 +39,7 @@ pnpm-debug.log*
 data/parquet/*.parquet
 data/reports/*.html
 data/reports/*.pdf
+data/alerts/
 
 # IDE
 .vscode/
