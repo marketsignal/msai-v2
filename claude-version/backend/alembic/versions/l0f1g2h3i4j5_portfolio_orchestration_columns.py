@@ -1,8 +1,13 @@
 """portfolio orchestration columns
 
-Revision ID: k9e0f1g2h3i4
-Revises: j8d9e0f1g2h3
+Revision ID: l0f1g2h3i4j5
+Revises: k9e0f1g2h3i4
 Create Date: 2026-04-13 16:00:00.000000
+
+Originally authored as revision ``k9e0f1g2h3i4`` chained off
+``j8d9e0f1g2h3``. The broker_trade_id migration (PR #15) landed on
+main with that same id first, so this migration was re-chained to
+follow it — same DDL, new rev id.
 """
 
 from __future__ import annotations
@@ -11,8 +16,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.postgresql import JSONB
 
-revision: str = "k9e0f1g2h3i4"
-down_revision: str = "j8d9e0f1g2h3"
+revision: str = "l0f1g2h3i4j5"
+down_revision: str = "k9e0f1g2h3i4"
 branch_labels: tuple[str, ...] | None = None
 depends_on: str | None = None
 
