@@ -42,8 +42,9 @@ from typing import TYPE_CHECKING
 from uuid import UUID, uuid4  # noqa: TC003 — used in dataclass field types
 
 from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from msai.models import OrderAttemptAudit
+from msai.models import OrderAttemptAudit, Trade
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -63,6 +64,37 @@ _ORDER_STATUS_PARTIALLY_FILLED = "partially_filled"
 _ORDER_STATUS_CANCELLED = "cancelled"
 _ORDER_STATUS_REJECTED = "rejected"
 _ORDER_STATUS_DENIED = "denied"
+
+
+@dataclass(frozen=True)
+class TradeFillFacts:
+    """One ``OrderFilled`` event, ready to INSERT into ``trades``.
+
+    Phase 2 #4 port: the drill on 2026-04-15 confirmed that the
+    existing ``order_attempt_audits`` table captures lifecycle state
+    but the ``trades`` table — which the tax/regulatory audit and
+    PnL aggregation depend on — was never populated from live fills.
+    Every ``OrderFilled`` event from Nautilus's msgbus now flows
+    through :meth:`OrderAuditWriter.write_trade_fill` to close that
+    gap without touching the existing audit path.
+
+    Nautilus assigns a unique ``trade_id`` per fill so this row can
+    be deduped on ``(deployment_id, broker_trade_id)`` — the
+    reconciliation-time replay on restart (nautilus.md gotcha 19)
+    would otherwise double-count every historical fill.
+    """
+
+    broker_trade_id: str
+    client_order_id: str
+    deployment_id: UUID
+    strategy_id: UUID
+    strategy_code_hash: str
+    instrument: str
+    side: str
+    quantity: Decimal
+    price: Decimal
+    commission: Decimal | None
+    executed_at: datetime
 
 
 @dataclass(frozen=True)
@@ -156,6 +188,7 @@ class OrderAuditWriter:
             )
             session.add(audit)
         from msai.services.observability.trading_metrics import ORDERS_SUBMITTED
+
         ORDERS_SUBMITTED.inc()
         log.info(
             "order_audit_submitted",
@@ -178,11 +211,97 @@ class OrderAuditWriter:
             broker_order_id=broker_order_id,
         )
 
-    async def update_filled(self, client_order_id: str) -> None:
-        """Order fully filled. Terminal state."""
-        await self._update_status(client_order_id, status=_ORDER_STATUS_FILLED)
-        from msai.services.observability.trading_metrics import ORDERS_FILLED
-        ORDERS_FILLED.inc()
+    async def update_filled(self, client_order_id: str) -> bool:
+        """Order fully filled. Terminal state.
+
+        Returns ``True`` when an existing audit row was flipped to
+        ``filled``; ``False`` when no matching row existed. A
+        ``False`` return means the caller saw an ``OrderFilled``
+        before the corresponding ``OrderSubmitted`` insert committed
+        (asyncio race between two ``create_task`` handlers) OR a
+        reconciliation-time replay arrived for a fill whose original
+        submit row was never persisted. The caller is responsible
+        for deciding how to close that audit gap (Codex review P1).
+
+        ``ORDERS_FILLED`` is NOT incremented here; the caller moves
+        it to fire only on a genuinely new fill (after
+        ``write_trade_fill`` returned ``True``) so a reconciliation
+        replay doesn't inflate the metric.
+        """
+        return await self._update_status(client_order_id, status=_ORDER_STATUS_FILLED)
+
+    async def write_trade_fill(self, facts: TradeFillFacts) -> bool:
+        """INSERT a ``Trade`` row for one live fill, deduped by
+        ``(deployment_id, broker_trade_id)``.
+
+        Returns ``True`` when a new row was inserted, ``False`` when
+        the partial unique index caught a duplicate (reconciliation
+        replay — nautilus.md gotcha 19 — or a retried msgbus event).
+        Uses ``INSERT ... ON CONFLICT DO NOTHING`` so dedup is atomic
+        at the DB layer; callers don't need to hold a client-side
+        cache to suppress replays.
+
+        Caller invariant: the Nautilus msgbus handler bridges to this
+        coroutine via ``loop.create_task`` so the DB write never
+        blocks the trading thread (Scalability Hawk P0 — the
+        Nautilus event loop must stay free for fill handlers even
+        when Postgres is slow).
+        """
+        stmt = (
+            pg_insert(Trade)
+            .values(
+                deployment_id=facts.deployment_id,
+                strategy_id=facts.strategy_id,
+                strategy_code_hash=facts.strategy_code_hash,
+                instrument=facts.instrument,
+                side=facts.side,
+                quantity=facts.quantity,
+                price=facts.price,
+                commission=facts.commission,
+                broker_trade_id=facts.broker_trade_id,
+                is_live=True,
+                executed_at=facts.executed_at,
+            )
+            # ``index_where`` must match the partial-index predicate
+            # on ``ix_trades_broker_trade_id_deployment`` exactly, or
+            # Postgres raises "no unique or exclusion constraint
+            # matching the ON CONFLICT specification".
+            .on_conflict_do_nothing(
+                index_elements=["deployment_id", "broker_trade_id"],
+                index_where=Trade.broker_trade_id.isnot(None),
+            )
+            .returning(Trade.id)
+        )
+        async with self._db() as session, session.begin():
+            result = await session.execute(stmt)
+            inserted_id = result.scalar_one_or_none()
+
+        if inserted_id is None:
+            log.info(
+                "trade_fill_dedup_hit",
+                extra={
+                    "client_order_id": facts.client_order_id,
+                    "broker_trade_id": facts.broker_trade_id,
+                    "deployment_id": str(facts.deployment_id),
+                    "note": "existing row with same broker_trade_id; likely reconciliation replay",
+                },
+            )
+            return False
+
+        log.info(
+            "trade_fill_persisted",
+            extra={
+                "trade_id": str(inserted_id),
+                "client_order_id": facts.client_order_id,
+                "broker_trade_id": facts.broker_trade_id,
+                "deployment_id": str(facts.deployment_id),
+                "instrument": facts.instrument,
+                "side": facts.side,
+                "quantity": str(facts.quantity),
+                "price": str(facts.price),
+            },
+        )
+        return True
 
     async def update_partially_filled(self, client_order_id: str) -> None:
         """Order partially filled — not yet terminal, further fills
@@ -216,7 +335,7 @@ class OrderAuditWriter:
         status: str,
         broker_order_id: str | None = None,
         reason: str | None = None,
-    ) -> None:
+    ) -> bool:
         """Apply one status transition to the row keyed by
         ``client_order_id``.
 
@@ -252,7 +371,7 @@ class OrderAuditWriter:
                     "status": status,
                 },
             )
-            return
+            return False
 
         log.info(
             "order_audit_status_updated",
@@ -262,6 +381,7 @@ class OrderAuditWriter:
                 "broker_order_id": broker_order_id,
             },
         )
+        return True
 
 
 async def lookup_by_client_order_id(
