@@ -1,14 +1,62 @@
-"""MSAI CLI for data ingestion, live trading control, and status reporting.
+"""MSAI operator CLI — organized into sub-apps per functional area.
 
-Provides command-line access to data ingestion workflows, live trading
-management, and storage diagnostics.  Installed as the ``msai`` console
-script via pyproject.toml.
+The CLI is structured as a root Typer app with eight sub-apps (seven
+functional + ``system``), each mapping to a functional area of the
+platform.  Most sub-commands are thin HTTP wrappers around
+``/api/v1/...`` endpoints so the CLI and dashboard stay in lock-step
+(single source of truth on the server).  Data-ingestion commands call
+the ingestion service directly — they need direct Parquet access and
+run fine without a running API server.
+
+Command tree::
+
+    msai health                         top-level health check
+    msai ingest ...                     historical data ingest
+    msai ingest-daily ...               daily incremental ingest
+    msai data-status                    storage stats
+
+    msai strategy list                  registered strategies
+    msai strategy show <id>             one strategy
+    msai strategy validate <id>         load a strategy file end-to-end
+
+    msai backtest run ...               enqueue a backtest
+    msai backtest history               last-N backtest rows
+    msai backtest show <id>             one backtest + metrics
+
+    msai research list                  research jobs
+    msai research show <id>             one research job
+    msai research cancel <id>           cancel a running job
+
+    msai live start ...                 deploy a strategy
+    msai live stop <id>                 stop one deployment
+    msai live status                    all deployments
+    msai live kill-all                  emergency halt
+
+    msai graduation list                graduation candidates
+    msai graduation show <id>           one candidate + transitions
+
+    msai portfolio list                 portfolios
+    msai portfolio runs                 all portfolio runs
+    msai portfolio show <id>            one portfolio
+    msai portfolio run <id> ...         trigger a portfolio backtest
+
+    msai account summary                IB account summary
+    msai account positions              IB portfolio
+    msai account health                 IB gateway status
+
+    msai system health                  overall platform health
+
+Auth: commands that hit the API send ``X-API-Key`` from ``$MSAI_API_KEY``
+or the settings-level key — matches the backend's dual-mode auth in
+``core/auth.py``.  Override the base URL with ``$MSAI_API_URL``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
+from urllib.parse import quote
 
 import httpx
 import typer
@@ -21,10 +69,128 @@ from msai.services.parquet_store import ParquetStore
 setup_logging(settings.environment)
 log = get_logger(__name__)
 
-app = typer.Typer(name="msai", help="MSAI v2 -- Personal Hedge Fund Platform CLI")
+# ----------------------------------------------------------------------
+# Typer app tree
+# ----------------------------------------------------------------------
+
+app = typer.Typer(name="msai", help="MSAI v2 — Personal Hedge Fund Platform CLI")
+
+strategy_app = typer.Typer(help="Strategy registry commands")
+backtest_app = typer.Typer(help="Backtest run + history commands")
+research_app = typer.Typer(help="Research job commands (sweeps, walk-forward)")
+live_app = typer.Typer(help="Live/paper trading commands")
+graduation_app = typer.Typer(help="Graduation pipeline commands")
+portfolio_app = typer.Typer(help="Portfolio management + combined backtest commands")
+account_app = typer.Typer(help="IB account commands")
+system_app = typer.Typer(help="Platform health + diagnostics")
+
+app.add_typer(strategy_app, name="strategy")
+app.add_typer(backtest_app, name="backtest")
+app.add_typer(research_app, name="research")
+app.add_typer(live_app, name="live")
+app.add_typer(graduation_app, name="graduation")
+app.add_typer(portfolio_app, name="portfolio")
+app.add_typer(account_app, name="account")
+app.add_typer(system_app, name="system")
 
 
-@app.command()
+# ----------------------------------------------------------------------
+# HTTP helper — every API-backed command shares this
+# ----------------------------------------------------------------------
+
+_DEFAULT_API_BASE = "http://localhost:8000"
+
+
+def _api_base() -> str:
+    """Base URL for the MSAI API — override via ``MSAI_API_URL`` env."""
+    return os.environ.get("MSAI_API_URL") or _DEFAULT_API_BASE
+
+
+def _api_headers() -> dict[str, str]:
+    """Request headers — attaches the API key when configured."""
+    key = os.environ.get("MSAI_API_KEY") or settings.msai_api_key
+    if key:
+        return {"X-API-Key": key}
+    return {}
+
+
+def _fail(message: str, *, code: int = 1) -> None:
+    """Print an error message to stderr and exit with non-zero code."""
+    typer.echo(message, err=True)
+    raise typer.Exit(code=code)
+
+
+def _api_call(
+    method: str,
+    path: str,
+    *,
+    json_body: dict | None = None,
+    params: dict | None = None,
+    timeout: float = 30.0,
+) -> httpx.Response:
+    """Make an authenticated request against the MSAI API.
+
+    Fails the CLI with a clear error message on connection failure,
+    request timeout, generic request errors, or non-2xx response.
+    Callers that want to inspect a specific status should catch
+    :class:`typer.Exit` and re-raise.
+    """
+    url = f"{_api_base()}{path}"
+    try:
+        response = httpx.request(
+            method,
+            url,
+            json=json_body,
+            params=params,
+            headers=_api_headers(),
+            timeout=timeout,
+        )
+    except httpx.ConnectError:
+        _fail(f"Connection refused — is the backend running at {_api_base()}?")
+    except httpx.TimeoutException as exc:
+        # IB-connecting paths (live start, account health on cold IB) can
+        # exceed the default 30s.  Surface the timeout cleanly instead of
+        # leaking an httpx traceback; operators can retry or raise the
+        # per-command timeout if they know the op is slow.
+        _fail(f"Request timed out after {timeout}s against {url} ({type(exc).__name__})")
+    except httpx.RequestError as exc:
+        # Catchall for DNS, TLS, invalid URL, proxy failures — anything
+        # httpx raises before it gets a response.
+        _fail(f"Request failed: {type(exc).__name__}: {exc}")
+    if not response.is_success:
+        _fail(f"API error ({response.status_code}): {response.text}")
+    return response
+
+
+def _emit_json(payload: object) -> None:
+    """Render a Python value as pretty JSON on stdout."""
+    typer.echo(json.dumps(payload, indent=2, default=str))
+
+
+def _url_id(value: str) -> str:
+    """URL-encode an ID before interpolating into a path.
+
+    Prevents a malicious or typo-ed ID containing ``/``, ``..``, ``?``
+    from escaping the intended route.  Without this, ``httpx`` would
+    normalize ``/api/v1/strategies/../account/summary`` and silently
+    redirect an authenticated request to a different endpoint.
+    """
+    return quote(str(value), safe="")
+
+
+# ======================================================================
+# Top-level: ingest + status
+# ======================================================================
+
+
+@app.command("health")
+def health() -> None:
+    """Quick CLI → backend round-trip check."""
+    response = _api_call("GET", "/health", timeout=5.0)
+    _emit_json(response.json())
+
+
+@app.command("ingest")
 def ingest(
     asset: str = typer.Argument(..., help="Asset class (stocks, equities, futures, crypto)"),
     symbols: str = typer.Argument(..., help="Comma-separated ticker symbols"),
@@ -37,13 +203,10 @@ def ingest(
     """Download historical market data for the given symbols and date range."""
     symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
     if not symbol_list:
-        typer.echo("Error: no symbols provided", err=True)
-        raise typer.Exit(code=1)
+        _fail("no symbols provided")
 
     service = DataIngestionService(ParquetStore(str(settings.parquet_root)))
-
-    typer.echo(f"Ingesting {asset} data for {symbol_list} from {start} to {end}...")
-    typer.echo(f"  provider={provider}, dataset={dataset or '(default)'}, schema={schema or '(default)'}")
+    typer.echo(f"Ingesting {asset} {symbol_list} from {start} to {end}...")
     result = asyncio.run(
         service.ingest_historical(
             asset,
@@ -55,15 +218,14 @@ def ingest(
             schema=schema or None,
         )
     )
+    _emit_json(result)
 
-    typer.echo(json.dumps(result, indent=2))
 
-
-@app.command()
+@app.command("ingest-daily")
 def ingest_daily(
     asset: str = typer.Argument(..., help="Asset class (stocks, equities, futures, crypto)"),
     symbols: str = typer.Argument(
-        ..., help="Comma-separated ticker symbols (or 'all' to use stored symbols)"
+        ..., help="Comma-separated tickers (or 'all' to use stored symbols)"
     ),
     provider: str = typer.Option("auto", help="Data provider: auto, databento, or polygon"),
     dataset: str = typer.Option("", help="Override default Databento dataset"),
@@ -71,17 +233,14 @@ def ingest_daily(
 ) -> None:
     """Download yesterday's data for incremental daily update."""
     store = ParquetStore(str(settings.parquet_root))
-
     if symbols.lower() == "all":
         symbol_list = store.list_symbols(asset)
         if not symbol_list:
-            typer.echo(f"No existing symbols found for asset class '{asset}'", err=True)
-            raise typer.Exit(code=1)
+            _fail(f"no existing symbols found for asset class '{asset}'")
     else:
         symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
 
-    service = DataIngestionService(ParquetStore(str(settings.parquet_root)))
-
+    service = DataIngestionService(store)
     typer.echo(f"Running daily ingest for {asset}: {symbol_list}")
     result = asyncio.run(
         service.ingest_daily(
@@ -92,71 +251,209 @@ def ingest_daily(
             schema=schema or None,
         )
     )
+    _emit_json(result)
 
-    typer.echo(json.dumps(result, indent=2))
 
-
-@app.command()
+@app.command("data-status")
 def data_status() -> None:
     """Show storage stats, ingestion history, and data summary."""
     service = DataIngestionService(ParquetStore(str(settings.parquet_root)))
-    typer.echo(json.dumps(service.data_status(), indent=2, default=str))
+    _emit_json(service.data_status())
 
 
-_API_BASE = "http://localhost:8000"
+# ======================================================================
+# strategy sub-app
+# ======================================================================
 
 
-@app.command()
+@strategy_app.command("list")
+def strategy_list() -> None:
+    """List registered strategies.
+
+    The backend endpoint does not paginate today — all registered
+    strategies are returned.  When pagination is added server-side, a
+    matching ``--page-size`` option goes here.
+    """
+    response = _api_call("GET", "/api/v1/strategies/")
+    _emit_json(response.json())
+
+
+@strategy_app.command("show")
+def strategy_show(
+    strategy_id: str = typer.Argument(..., help="Strategy UUID"),
+) -> None:
+    """Show one strategy's details."""
+    response = _api_call("GET", f"/api/v1/strategies/{_url_id(strategy_id)}")
+    _emit_json(response.json())
+
+
+@strategy_app.command("validate")
+def strategy_validate(
+    strategy_id: str = typer.Argument(..., help="Strategy UUID"),
+) -> None:
+    """Validate that a strategy file can be loaded end-to-end."""
+    response = _api_call("POST", f"/api/v1/strategies/{_url_id(strategy_id)}/validate")
+    _emit_json(response.json())
+
+
+# ======================================================================
+# backtest sub-app
+# ======================================================================
+
+
+@backtest_app.command("run")
+def backtest_run(
+    strategy_id: str = typer.Argument(..., help="Strategy UUID"),
+    instruments: str = typer.Argument(..., help="Comma-separated instrument IDs"),
+    start: str = typer.Argument(..., help="Start date YYYY-MM-DD"),
+    end: str = typer.Argument(..., help="End date YYYY-MM-DD"),
+    config_json: str = typer.Option("{}", help="Strategy config as a JSON string"),
+) -> None:
+    """Enqueue a backtest and print its job id.
+
+    The job runs asynchronously in the arq backtest worker.  Poll status
+    with ``msai backtest show <id>``.
+    """
+    instrument_list = [s.strip() for s in instruments.split(",") if s.strip()]
+    if not instrument_list:
+        _fail("no instruments provided")
+    try:
+        config = json.loads(config_json)
+    except json.JSONDecodeError as exc:
+        _fail(f"invalid --config-json: {exc}")
+    payload = {
+        "strategy_id": strategy_id,
+        "config": config,
+        "instruments": instrument_list,
+        "start_date": start,
+        "end_date": end,
+    }
+    response = _api_call("POST", "/api/v1/backtests/run", json_body=payload)
+    _emit_json(response.json())
+
+
+@backtest_app.command("history")
+def backtest_history(
+    page: int = typer.Option(1, help="Page number (1-indexed)"),
+    page_size: int = typer.Option(
+        20, help="Rows per page (backend max is 100)"
+    ),
+) -> None:
+    """List recent backtests with status + metrics.
+
+    Uses the API's ``page`` / ``page_size`` pagination — ``limit`` is
+    NOT an accepted query param and is silently ignored by FastAPI, so
+    naming the CLI flags to match the server contract keeps both honest.
+    """
+    response = _api_call(
+        "GET",
+        "/api/v1/backtests/history",
+        params={"page": page, "page_size": page_size},
+    )
+    _emit_json(response.json())
+
+
+@backtest_app.command("show")
+def backtest_show(
+    backtest_id: str = typer.Argument(..., help="Backtest UUID"),
+) -> None:
+    """Show a backtest's current status + results (if complete)."""
+    safe_id = _url_id(backtest_id)
+    status_response = _api_call("GET", f"/api/v1/backtests/{safe_id}/status")
+    _emit_json(status_response.json())
+    # Also pull results when the job has data — non-200 is fine
+    # (pending/running jobs have no results yet), don't fail the CLI.
+    # Swallow transport errors too: if results are unavailable the status
+    # above is the useful output and we shouldn't fail on a flaky GET.
+    try:
+        results = httpx.get(
+            f"{_api_base()}/api/v1/backtests/{safe_id}/results",
+            headers=_api_headers(),
+            timeout=10.0,
+        )
+    except httpx.RequestError:
+        return
+    if results.is_success:
+        typer.echo("\n--- Results ---")
+        _emit_json(results.json())
+
+
+# ======================================================================
+# research sub-app
+# ======================================================================
+
+
+@research_app.command("list")
+def research_list(
+    page: int = typer.Option(1, help="Page number (1-indexed)"),
+    page_size: int = typer.Option(20, help="Rows per page (backend max is 100)"),
+) -> None:
+    """List research jobs (sweeps + walk-forward)."""
+    response = _api_call(
+        "GET", "/api/v1/research/jobs", params={"page": page, "page_size": page_size}
+    )
+    _emit_json(response.json())
+
+
+@research_app.command("show")
+def research_show(
+    job_id: str = typer.Argument(..., help="Research job UUID"),
+) -> None:
+    """Show one research job's progress + leaderboard."""
+    response = _api_call("GET", f"/api/v1/research/jobs/{_url_id(job_id)}")
+    _emit_json(response.json())
+
+
+@research_app.command("cancel")
+def research_cancel(
+    job_id: str = typer.Argument(..., help="Research job UUID"),
+) -> None:
+    """Cancel a running research job."""
+    response = _api_call("POST", f"/api/v1/research/jobs/{_url_id(job_id)}/cancel")
+    _emit_json(response.json())
+
+
+# ======================================================================
+# live sub-app — mirrors the API contracts and preserves the tested
+# behavior of the original flat commands (live-start, live-stop, etc.).
+# ======================================================================
+
+
+@live_app.command("start")
 def live_start(
-    strategy: str = typer.Argument(..., help="Strategy UUID"),
-    instruments: str = typer.Argument(..., help="Comma-separated instrument identifiers"),
+    strategy_id: str = typer.Argument(..., help="Strategy UUID"),
+    instruments: str = typer.Argument(..., help="Comma-separated instrument IDs"),
     paper: bool = typer.Option(True, help="Paper trading mode (default: True)"),
 ) -> None:
     """Start live/paper trading for a strategy."""
     instrument_list = [s.strip() for s in instruments.split(",") if s.strip()]
     if not instrument_list:
-        typer.echo("Error: no instruments provided", err=True)
-        raise typer.Exit(code=1)
-
+        _fail("no instruments provided")
     payload = {
-        "strategy_id": strategy,
+        "strategy_id": strategy_id,
         "config": {},
         "instruments": instrument_list,
         "paper_trading": paper,
     }
-
-    response = httpx.post(f"{_API_BASE}/api/v1/live/start", json=payload, timeout=30.0)
-    if response.status_code == 201:
-        data = response.json()
-        typer.echo(f"Deployment started: {data['id']} (status: {data['status']})")
-    else:
-        typer.echo(f"Error ({response.status_code}): {response.text}", err=True)
-        raise typer.Exit(code=1)
+    response = _api_call("POST", "/api/v1/live/start", json_body=payload)
+    data = response.json()
+    typer.echo(f"Deployment started: {data['id']} (status: {data['status']})")
 
 
-@app.command()
+@live_app.command("stop")
 def live_stop(
     deployment_id: str = typer.Argument(..., help="Deployment UUID to stop"),
 ) -> None:
     """Stop a running deployment."""
-    payload = {"deployment_id": deployment_id}
-    response = httpx.post(f"{_API_BASE}/api/v1/live/stop", json=payload, timeout=30.0)
-    if response.status_code == 200:
-        data = response.json()
-        typer.echo(f"Deployment {data['id']} stopped.")
-    else:
-        typer.echo(f"Error ({response.status_code}): {response.text}", err=True)
-        raise typer.Exit(code=1)
+    response = _api_call("POST", "/api/v1/live/stop", json_body={"deployment_id": deployment_id})
+    data = response.json()
+    typer.echo(f"Deployment {data['id']} stopped.")
 
 
-@app.command()
+@live_app.command("status")
 def live_status() -> None:
-    """Show all active deployments."""
-    response = httpx.get(f"{_API_BASE}/api/v1/live/status", timeout=10.0)
-    if response.status_code != 200:
-        typer.echo(f"Error ({response.status_code}): {response.text}", err=True)
-        raise typer.Exit(code=1)
-
+    """Show all active deployments + risk-halt state."""
+    response = _api_call("GET", "/api/v1/live/status", timeout=10.0)
     data = response.json()
     typer.echo(f"Risk halted: {data['risk_halted']}")
     typer.echo(f"Active nodes: {data['active_count']}")
@@ -164,22 +461,217 @@ def live_status() -> None:
     for d in data["deployments"]:
         mode = "PAPER" if d["paper_trading"] else "LIVE"
         typer.echo(f"  [{mode}] {d['id']}  status={d['status']}  instruments={d['instruments']}")
-
     if not data["deployments"]:
         typer.echo("  (none)")
 
 
-@app.command()
-def live_kill_all() -> None:
-    """Emergency stop all strategies."""
-    typer.confirm("Are you sure you want to STOP ALL running strategies?", abort=True)
-    response = httpx.post(f"{_API_BASE}/api/v1/live/kill-all", timeout=30.0)
-    if response.status_code == 200:
-        data = response.json()
-        typer.echo(f"Stopped {data['stopped']} strategies. Risk halted: {data['risk_halted']}")
-    else:
-        typer.echo(f"Error ({response.status_code}): {response.text}", err=True)
-        raise typer.Exit(code=1)
+@live_app.command("kill-all")
+def live_kill_all(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """Emergency-stop all strategies.  Requires confirmation unless --yes."""
+    if not yes:
+        typer.confirm("Are you sure you want to STOP ALL running strategies?", abort=True)
+    response = _api_call("POST", "/api/v1/live/kill-all")
+    data = response.json()
+    typer.echo(f"Stopped {data['stopped']} strategies. Risk halted: {data['risk_halted']}")
+
+
+# ======================================================================
+# graduation sub-app
+# ======================================================================
+
+
+@graduation_app.command("list")
+def graduation_list(
+    stage: str = typer.Option("", help="Filter by stage (discovery/paper/incubation/promoted)"),
+    limit: int = typer.Option(50, help="Max rows to return"),
+) -> None:
+    """List graduation candidates, optionally filtered by stage."""
+    params: dict[str, object] = {"limit": limit}
+    if stage:
+        params["stage"] = stage
+    response = _api_call("GET", "/api/v1/graduation/candidates", params=params)
+    _emit_json(response.json())
+
+
+@graduation_app.command("show")
+def graduation_show(
+    candidate_id: str = typer.Argument(..., help="Candidate UUID"),
+) -> None:
+    """Show one candidate + its stage-transition audit trail.
+
+    The candidate detail and the transitions live on separate endpoints
+    (``/candidates/{id}`` and ``/candidates/{id}/transitions``).  We
+    fetch both and merge them into a single JSON object so operators
+    see the full audit history in one command — fulfilling the
+    docstring's promise.
+    """
+    safe_id = _url_id(candidate_id)
+    candidate = _api_call("GET", f"/api/v1/graduation/candidates/{safe_id}").json()
+    try:
+        transitions_response = httpx.get(
+            f"{_api_base()}/api/v1/graduation/candidates/{safe_id}/transitions",
+            headers=_api_headers(),
+            timeout=10.0,
+        )
+        transitions = (
+            transitions_response.json() if transitions_response.is_success else []
+        )
+    except httpx.RequestError:
+        # Transport error on the transitions fetch isn't fatal — the
+        # candidate body still has value.
+        transitions = []
+    _emit_json({"candidate": candidate, "transitions": transitions})
+
+
+# ======================================================================
+# portfolio sub-app
+# ======================================================================
+
+
+@portfolio_app.command("list")
+def portfolio_list(
+    limit: int = typer.Option(50, help="Max rows to return"),
+) -> None:
+    """List portfolios."""
+    response = _api_call("GET", "/api/v1/portfolios", params={"limit": limit})
+    _emit_json(response.json())
+
+
+@portfolio_app.command("runs")
+def portfolio_runs(
+    portfolio_id: str = typer.Option("", help="Filter to one portfolio's runs"),
+    limit: int = typer.Option(50, help="Max rows to return"),
+) -> None:
+    """List portfolio backtest runs, optionally filtered by portfolio."""
+    params: dict[str, object] = {"limit": limit}
+    if portfolio_id:
+        params["portfolio_id"] = portfolio_id
+    response = _api_call("GET", "/api/v1/portfolios/runs", params=params)
+    _emit_json(response.json())
+
+
+@portfolio_app.command("show")
+def portfolio_show(
+    portfolio_id: str = typer.Argument(..., help="Portfolio UUID"),
+) -> None:
+    """Show one portfolio's detail."""
+    response = _api_call("GET", f"/api/v1/portfolios/{_url_id(portfolio_id)}")
+    _emit_json(response.json())
+
+
+@portfolio_app.command("run")
+def portfolio_run(
+    portfolio_id: str = typer.Argument(..., help="Portfolio UUID"),
+    start: str = typer.Argument(..., help="Start date YYYY-MM-DD"),
+    end: str = typer.Argument(..., help="End date YYYY-MM-DD"),
+    max_parallelism: int = typer.Option(
+        0, help="Parallel candidate backtests (0 = backend default)"
+    ),
+) -> None:
+    """Trigger a portfolio-level backtest run."""
+    payload: dict[str, object] = {"start_date": start, "end_date": end}
+    if max_parallelism > 0:
+        payload["max_parallelism"] = max_parallelism
+    response = _api_call(
+        "POST",
+        f"/api/v1/portfolios/{_url_id(portfolio_id)}/runs",
+        json_body=payload,
+    )
+    _emit_json(response.json())
+
+
+# ======================================================================
+# account sub-app (IB)
+# ======================================================================
+
+
+@account_app.command("summary")
+def account_summary() -> None:
+    """Show IB account summary (cash, net liquidation, buying power)."""
+    response = _api_call("GET", "/api/v1/account/summary")
+    _emit_json(response.json())
+
+
+@account_app.command("positions")
+def account_positions() -> None:
+    """Show IB account portfolio positions."""
+    response = _api_call("GET", "/api/v1/account/portfolio")
+    _emit_json(response.json())
+
+
+@account_app.command("health")
+def account_health() -> None:
+    """Show IB gateway connection health."""
+    response = _api_call("GET", "/api/v1/account/health")
+    _emit_json(response.json())
+
+
+# ======================================================================
+# system sub-app
+# ======================================================================
+
+
+@system_app.command("health")
+def system_health() -> None:
+    """Compound health check across API + live + account surfaces.
+
+    Each probe is independent — a failure on one doesn't mask others.
+    Timeouts and request errors degrade to ``{"error": "..."}`` entries
+    so the operator can see which surfaces are reachable.
+
+    Note on ``/api/v1/account/health``: it returns HTTP 200 even when
+    the IB gateway is down, with ``status: "unhealthy"`` in the body.
+    Trusting ``response.is_success`` alone would report the account
+    surface healthy in exactly the outage case this command exists to
+    detect — we merge the response body and treat ``status != "healthy"``
+    as ``ok: false``.
+    """
+
+    def _parse_probe(response: httpx.Response, body_ok_fn) -> dict[str, object]:
+        """Derive ``ok`` from the response body when needed."""
+        body: object | None = None
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        body_ok = body_ok_fn(body) if body is not None else response.is_success
+        return {
+            "status_code": response.status_code,
+            "ok": bool(response.is_success and body_ok),
+            "body": body,
+        }
+
+    probes: list[tuple[str, str, object]] = [
+        # label, path, body-ok predicate
+        ("api", "/health", lambda _b: True),
+        ("ready", "/ready", lambda _b: True),
+        ("live", "/api/v1/live/status", lambda _b: True),
+        # IB health returns 200 even when the gateway is down; derive
+        # ok from the body status + gateway_connected fields.
+        (
+            "account",
+            "/api/v1/account/health",
+            lambda b: isinstance(b, dict)
+            and b.get("status") == "healthy"
+            and bool(b.get("gateway_connected")),
+        ),
+    ]
+    parts: dict[str, object] = {}
+    for label, path, body_ok_fn in probes:
+        try:
+            response = httpx.get(
+                f"{_api_base()}{path}", headers=_api_headers(), timeout=5.0
+            )
+            parts[label] = _parse_probe(response, body_ok_fn)
+        except httpx.ConnectError:
+            parts[label] = {"error": "connection refused"}
+        except httpx.TimeoutException:
+            parts[label] = {"error": "timeout"}
+        except httpx.RequestError as exc:
+            parts[label] = {"error": f"{type(exc).__name__}: {exc}"}
+    _emit_json(parts)
 
 
 if __name__ == "__main__":
