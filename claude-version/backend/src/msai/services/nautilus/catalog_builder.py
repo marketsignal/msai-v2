@@ -103,19 +103,6 @@ def build_catalog_for_symbol(
     catalog_root.mkdir(parents=True, exist_ok=True)
     catalog = ParquetDataCatalog(str(catalog_root))
 
-    # Idempotency guard: bail out early if the catalog already contains bars
-    # for this instrument.  The frontend re-triggers backtests on every
-    # config tweak and re-converting Parquet each time is wasteful.
-    if not force:
-        existing_bars = catalog.bars(instrument_ids=[instrument_id_str])
-        if existing_bars:
-            log.info(
-                "nautilus_catalog_already_populated",
-                instrument_id=instrument_id_str,
-                bar_count=len(existing_bars),
-            )
-            return instrument_id_str
-
     # Locate raw Parquet files.  We recurse because the ingestion pipeline
     # partitions by YYYY/MM and we want every partition in one sweep.
     symbol_dir = raw_parquet_root / asset_class / raw_symbol
@@ -125,6 +112,69 @@ def build_catalog_for_symbol(
             f"No raw Parquet files found for {raw_symbol!r} under {symbol_dir}. "
             "Run the data ingestion pipeline for this symbol before backtesting."
         )
+
+    # Idempotency guard: skip the rebuild only when the catalog
+    # already contains bars AND the raw parquet tree hasn't changed
+    # since the last build. The marker file lives under the catalog
+    # root so it follows the catalog if it's relocated. Drill
+    # 2026-04-15 hit the silent-stale variant: a partial ingest
+    # produced 2 653 bars; a follow-up full-year ingest grew the raw
+    # tree to 123 072 bars; the second backtest read the stale
+    # 2 653 bars because the old guard short-circuited on "any bars
+    # present" and never noticed the delta.
+    source_hash = _compute_raw_source_hash(raw_files, raw_root=raw_parquet_root)
+    marker_path = _source_marker_path(catalog_root, instrument_id_str)
+    if not force:
+        if marker_path.exists():
+            stored_hash = marker_path.read_text().strip()
+            if stored_hash == source_hash:
+                existing_bars = catalog.bars(instrument_ids=[instrument_id_str])
+                if existing_bars:
+                    log.info(
+                        "nautilus_catalog_already_populated",
+                        instrument_id=instrument_id_str,
+                        bar_count=len(existing_bars),
+                        source_hash=source_hash,
+                    )
+                    return instrument_id_str
+            else:
+                log.info(
+                    "nautilus_catalog_stale_rebuilding",
+                    instrument_id=instrument_id_str,
+                    stored_hash=stored_hash,
+                    current_hash=source_hash,
+                    raw_file_count=len(raw_files),
+                )
+                # Rebuild semantics: drop the cached bar directory for
+                # THIS instrument + bar spec so the new bars don't
+                # interleave with the stale ones. Other instruments
+                # AND other bar specs for the same instrument are
+                # untouched, and the shared instrument definition
+                # under data/equity/ is left in place (Codex review
+                # P2: deleting it strands sibling bar specs).
+                _purge_catalog_for_instrument(catalog_root, instrument_id_str, bar_spec=_BAR_SPEC)
+        else:
+            # Markerless legacy catalog (Codex review P1). Pre-patch
+            # builds didn't write a marker, so existing bars are
+            # functionally untraceable to a source state. If the
+            # catalog has bars for this instrument, treat them as
+            # stale and purge — appending on top of a partially-
+            # filled partition either silently no-ops or errors on
+            # overlapping intervals, leaving a wrong catalog with a
+            # fresh marker that locks in the staleness on the next
+            # call.
+            existing_bars = catalog.bars(instrument_ids=[instrument_id_str])
+            if existing_bars:
+                log.info(
+                    "nautilus_catalog_legacy_unmarked_rebuilding",
+                    instrument_id=instrument_id_str,
+                    legacy_bar_count=len(existing_bars),
+                    note=(
+                        "no source-hash marker present; treating existing "
+                        "bars as stale and purging before rebuild"
+                    ),
+                )
+                _purge_catalog_for_instrument(catalog_root, instrument_id_str, bar_spec=_BAR_SPEC)
 
     # Phase 2 task 2.7: streaming read via ``pyarrow.parquet.iter_batches``
     # instead of slurping every partition into memory as a pandas
@@ -163,6 +213,11 @@ def build_catalog_for_symbol(
             catalog.write_data(bars)
             total_bars += len(bars)
 
+    # Persist the source hash AFTER the bars are written so a crash
+    # mid-write leaves the marker absent and the next call rebuilds.
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(source_hash)
+
     log.info(
         "nautilus_catalog_built",
         instrument_id=instrument_id_str,
@@ -170,8 +225,87 @@ def build_catalog_for_symbol(
         partitions=len(raw_files),
         batch_size=_BATCH_SIZE,
         catalog_root=str(catalog_root),
+        source_hash=source_hash,
     )
     return instrument_id_str
+
+
+def _compute_raw_source_hash(raw_files: list[Path], *, raw_root: Path) -> str:
+    """Hash the (relative path, size, mtime_ns, header bytes) of every
+    raw parquet file. The relative path keeps year/month partitions
+    distinct (``2024/01.parquet`` vs ``2025/01.parquet`` would
+    otherwise collide on basename — Codex review P2). The first
+    parquet bytes are sampled so an in-place rewrite that lands on
+    the same byte size and same second-resolution mtime still
+    invalidates the hash on filesystems whose mtime granularity is
+    coarse."""
+    parts: list[str] = []
+    for path in sorted(raw_files):
+        stat = path.stat()
+        try:
+            relpath = path.relative_to(raw_root).as_posix()
+        except ValueError:
+            relpath = path.as_posix()
+        # Sample BOTH the parquet header (file magic + writer
+        # fingerprint) AND the footer (Codex review P2 — schema
+        # metadata + row-group offsets live in the footer; an
+        # in-place rewrite that preserves size + mtime can leave the
+        # prefix identical while later row groups or the footer
+        # change). 4 KiB at each end keeps the cost bounded for
+        # large parquets (one seek + two short reads) while catching
+        # both same-prefix-different-footer and the legacy
+        # different-prefix cases.
+        header = b""
+        footer = b""
+        sample_bytes = 4096
+        try:
+            with path.open("rb") as handle:
+                header = handle.read(sample_bytes)
+                if stat.st_size > sample_bytes:
+                    handle.seek(max(0, stat.st_size - sample_bytes))
+                    footer = handle.read(sample_bytes)
+        except OSError:
+            pass
+        edge_hash = sha256(header + footer).hexdigest()[:16]
+        parts.append(f"{relpath}:{stat.st_size}:{stat.st_mtime_ns}:{edge_hash}")
+    return sha256("|".join(parts).encode()).hexdigest()
+
+
+def _source_marker_path(catalog_root: Path, instrument_id_str: str) -> Path:
+    """Where the source-hash marker for an instrument lives.
+
+    Co-located with the catalog (not the raw tree) so the same raw
+    tree can back multiple catalogs without their markers stomping
+    on each other.
+    """
+    return catalog_root / ".msai_source_hashes" / f"{instrument_id_str}.hash"
+
+
+def _purge_catalog_for_instrument(
+    catalog_root: Path,
+    instrument_id_str: str,
+    *,
+    bar_spec: str,
+) -> None:
+    """Remove the bar files for one ``(instrument, bar_spec)`` from
+    the catalog so a stale-detected rebuild can write a fresh copy.
+
+    Only the matching ``data/bar/<instrument>-<bar_spec>`` directory
+    is touched. Codex review P2: the shared
+    ``data/equity/<instrument>`` definition is left in place because
+    a single catalog can hold multiple bar specs for the same
+    instrument (1-MINUTE-LAST, 5-MINUTE-LAST, ...) and they all
+    point at the same instrument entry. Removing it would orphan
+    the sibling specs and a crash before the rebuild's
+    ``catalog.write_data([instrument])`` call would strand them
+    permanently. ``write_data([instrument])`` later in the rebuild
+    is idempotent — re-writing the same instrument is safe.
+    """
+    bar_dir = catalog_root / "data" / "bar" / f"{instrument_id_str}-{bar_spec}"
+    if bar_dir.exists():
+        for child in bar_dir.iterdir():
+            child.unlink()
+        bar_dir.rmdir()
 
 
 def ensure_catalog_data(
@@ -274,9 +408,7 @@ def describe_catalog(
             hash_parts.append(f"{f.name}:{stat.st_size}:{stat.st_mtime}")
 
     catalog_hash = (
-        sha256("|".join(sorted(hash_parts)).encode()).hexdigest()[:16]
-        if hash_parts
-        else "empty"
+        sha256("|".join(sorted(hash_parts)).encode()).hexdigest()[:16] if hash_parts else "empty"
     )
 
     return {
