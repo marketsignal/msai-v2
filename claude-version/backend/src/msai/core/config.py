@@ -10,7 +10,7 @@ from __future__ import annotations
 from os import cpu_count
 from pathlib import Path
 
-from pydantic import field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # In local dev: .../claude-version/backend/src/msai/core/config.py → parents[4] = claude-version/
@@ -54,8 +54,29 @@ class Settings(BaseSettings):
     # validates this via ``_validate_port_account_consistency`` —
     # a mismatch crashes the subprocess at ``build_live_trading_node_config``
     # time rather than silently sending orders to the wrong venue.
-    ib_host: str = "127.0.0.1"
-    ib_port: int = 4002
+    # Accept both the legacy names (``IB_HOST`` / ``IB_PORT`` — used
+    # by unit tests and local-dev setups) and the Docker-compose
+    # names (``IB_GATEWAY_HOST`` / ``IB_GATEWAY_PORT_PAPER`` — set on
+    # every service container). Before this alias, a backend running
+    # under ``docker compose`` saw only ``IB_GATEWAY_HOST`` and fell
+    # through to the 127.0.0.1:4002 defaults, so ``/account/health``
+    # probed localhost of its own container instead of the gateway
+    # container and always reported unreachable. Drill 2026-04-15.
+    #
+    # The legacy name is listed first so an operator-set ``IB_HOST``
+    # overrides the compose-wide default without editing compose
+    # files — useful when pointing a dev backend at a remote gateway.
+    # Live-port deployments set ``IB_PORT=4003`` explicitly because
+    # this alias only picks up the PAPER variant by design (the
+    # supervisor's paper/live mismatch guard refuses to cross-wire).
+    ib_host: str = Field(
+        default="127.0.0.1",
+        validation_alias=AliasChoices("IB_HOST", "IB_GATEWAY_HOST"),
+    )
+    ib_port: int = Field(
+        default=4002,
+        validation_alias=AliasChoices("IB_PORT", "IB_GATEWAY_PORT_PAPER"),
+    )
 
     # IB market data type: REALTIME (default, requires subscription),
     # DELAYED (15-min delayed, free for most instruments),
