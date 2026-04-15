@@ -177,8 +177,22 @@ async def client(
     async def _override_current_user() -> dict[str, Any]:
         return {"sub": test_user.entra_id, "email": test_user.email}
 
+    # Register a fake ``live-supervisor`` consumer so
+    # ``_supervisor_is_alive`` (drill 2026-04-15 P0-A) sees an
+    # active consumer and doesn't short-circuit /start with 503.
+    # Real integration with a supervisor consumer loop is out of
+    # scope for these endpoint tests — we stub it at the Redis
+    # layer the same way the fake supervisor task stubs the DB
+    # side.
+    shared_bus = LiveCommandBus(redis=redis_text)
+    await shared_bus.ensure_group()
+    with contextlib.suppress(Exception):
+        await redis_text.xgroup_createconsumer(
+            LIVE_COMMAND_STREAM, "live-supervisor", "fake-supervisor-1"
+        )
+
     async def _override_command_bus() -> LiveCommandBus:
-        return LiveCommandBus(redis=redis_text)
+        return shared_bus
 
     async def _override_idempotency_store() -> IdempotencyStore:
         return IdempotencyStore(redis=redis_binary)
@@ -593,7 +607,11 @@ async def test_start_returns_200_already_active_when_row_is_running(
     first_id = r1.json()["id"]
 
     # Clear the stream so the second-call assertion is clean.
-    await redis_text.delete(LIVE_COMMAND_STREAM)
+    # Trim instead of delete so the fake-supervisor consumer
+    # registration from the ``client`` fixture (drill 2026-04-15
+    # P0-A — /start now returns 503 if no consumer is active)
+    # survives. DELETE would drop the entire stream + group.
+    await redis_text.xtrim(LIVE_COMMAND_STREAM, maxlen=0)
 
     # Second start — active process row still present from the fake
     # supervisor, so we expect 200 already_active without republishing.
@@ -651,7 +669,11 @@ async def test_stop_returns_200_immediately_when_no_active_row(
         session.add(dep)
         dep_id = dep.id
 
-    await redis_text.delete(LIVE_COMMAND_STREAM)
+    # Trim instead of delete so the fake-supervisor consumer
+    # registration from the ``client`` fixture (drill 2026-04-15
+    # P0-A — /start now returns 503 if no consumer is active)
+    # survives. DELETE would drop the entire stream + group.
+    await redis_text.xtrim(LIVE_COMMAND_STREAM, maxlen=0)
 
     response = await client.post("/api/v1/live/stop", json={"deployment_id": str(dep_id)})
     assert response.status_code == 200

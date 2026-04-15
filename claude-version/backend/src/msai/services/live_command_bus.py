@@ -259,6 +259,16 @@ class LiveCommandBus:
         payload: dict[str, Any],
         idempotency_key: str | None,
     ) -> str:
+        # Ensure the consumer group exists BEFORE xadd. Without this,
+        # a command published to a fresh Redis (or a Redis where the
+        # supervisor has never started) is lost: the first supervisor
+        # to come up runs XGROUP CREATE ... id="$" which positions
+        # last-delivered-id at the stream's current tail — past the
+        # waiting command — so XREADGROUP > never sees it. Idempotent
+        # (BUSYGROUP swallowed) so the per-publish cost is one Redis
+        # round-trip on steady-state. Drill 2026-04-15 root cause.
+        await self.ensure_group()
+
         fields: dict[str, str] = {
             "command_type": command_type.value,
             "deployment_id": str(deployment_id),
