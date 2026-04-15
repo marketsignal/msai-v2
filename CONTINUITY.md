@@ -6,49 +6,33 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field     | Value                                      |
-| --------- | ------------------------------------------ |
-| Command   | /fix-bug quantstats-intraday-normalization |
-| Phase     | 6 — Finish                                 |
-| Next step | Commit + push + PR                         |
-
-### Checklist
-
-- [x] Worktree created
-- [x] Project state read
-- [x] Plugins verified (Codex CLI available)
-- [x] Searched existing solutions (none for QuantStats intraday)
-- [x] Researched Codex's fix (`_normalize_report_returns` groupby day + compound)
-- [x] Systematic debugging complete (failing test written — import error reproduced bug)
-- [x] TDD fix execution complete (18 tests green, ported helper verbatim from Codex)
-- [x] Code review loop (1 iteration) — PASS. Codex xhigh + PR toolkit both clean on P0/P1/P2. PR toolkit's single P2 was self-labeled "not worth changing, user impact nil"; 3 of 4 P3 test-coverage nits addressed
-- [x] Simplified (helper ported verbatim from Codex; no accidental complexity added)
-- [x] Verified (tests: 972 pass, ruff clean on new code, mypy +1 env-only error — pandas.api.types stubs, same class as existing pandas stub error)
-- [x] E2E — N/A (internal metric normalization, output changes only)
-- [x] Learning documented (`docs/solutions/backtesting/quantstats-intraday-sharpe-inflation.md`)
-- [x] State files updated (CONTINUITY + CHANGELOG)
-- [ ] Committed and pushed
-- [ ] PR created
-- [ ] PR reviews addressed
-- [ ] Branch finished
+| Field   | Value |
+| ------- | ----- |
+| Command | none  |
 
 ## Done
 
-- Phase 1 #1 portfolio orchestration (PR #6 OPEN, 10-iter Codex-reviewed)
-- Phase 1 #2 Playwright e2e harness (PR #7 OPEN, 16 specs green)
-- Phase 1 #3 CLI sub-apps (PR #8 OPEN, 27 commands, Codex + e2e reviewed)
 - Hybrid merge PR#3 merged (2026-04-13): 18 tasks, 99 files, ~15K lines
 - Docker Compose parity PR#4 merged (2026-04-13): 12 gaps fixed, all 10 containers running
-- Codex ingestion + backtest IPC PR#5 merged (2026-04-14)
+- IB Gateway connected: 6 paper sub-accounts verified (DFP733210 + DUP733211-215, ~$1M each)
+- Databento API key configured
+- Phase 2 parity backlog cleared 2026-04-15: PR #6 portfolio, #7 playwright e2e, #8 CLI sub-apps, #9 QuantStats intraday, #10 alerting API, #11 daily scheduler tz — all merged after local merge-main-into-branch conflict resolution (1147 tests on final branch)
+- Phase 2 #4 council (5 advisors + chairman): rejected verbatim Option A (867 LOC) and framed Option B (300 LOC); mandated paper-IB kill-all drill as go/no-go gate
+- Phase 2 #4 drill executed (2026-04-15 04:00 UTC): exposed 3 P0 live-stack bugs blocking any `/live/start` (profile-gate, supervisor silent-fail, IB host/port drift)
+- Phase 2 #4 — live trade persistence merged (PR #15): broker_trade_id column + partial unique dedup + ON CONFLICT DO NOTHING path from OrderFilled → trades; audit row mismatch now visible (Codex review P1+P2 both addressed)
+- Live-stack kill-all drill PASSED 2026-04-15 05:37: EUR/USD.IDEALPRO paper BUY filled → /kill-all → SELL reduce_only filled → PositionClosed in 187 ms. Layer 3 (SIGTERM + manage_stop=True) verified.
+- Live-stack sprint complete 2026-04-15 06:00 UTC — all 3 P0s fixed in separate branches ready for PR+merge:
+  - P0-B `fix/live-supervisor-silent-spawn-fail` (f324f0c): LiveCommandBus.\_publish now calls ensure_group before xadd so commands don't vanish when consumer group is positioned at `$`; supervisor **main**.py configures stdlib logging.basicConfig so its logs are visible in docker logs
+  - P0-C `fix/ib-gateway-env-var-drift` (6f02767): settings.ib_host/ib_port accept AliasChoices on IB_GATEWAY_HOST + IB_GATEWAY_PORT_PAPER env names
+  - P0-A `fix/live-supervisor-default-profile` (08b34a9): /live/start returns 503 fast when no supervisor consumer is registered (vs silent 504 timeout)
 
 ## Now
 
-**Phase 2 #1 in progress**: QuantStats intraday normalization. Helper `_normalize_report_returns` ported verbatim from Codex. 18 new tests covering compound, pass-through, tz-aware/naive, empty, non-numeric, midnight-cross. PR toolkit review PASS. Codex xhigh review running.
+All open PRs closed (Phase 2 #1-#4 + portfolio/playwright/CLI ports). Main has everything. Moving to the stated goal: first real backtest with real AAPL/SPY data via Databento.
 
 ## Next
 
-1. Finish Phase 2 #1 QuantStats intraday (this branch) → PR → merge
-2. Phase 2 #2 Alerting API + history (file-backed log + GET /api/v1/alerts/ router)
-3. Phase 2 #3 Daily scheduler timezone-aware (configurable tz/hour/minute + state file)
-4. Phase 2 #4 LiveStateController + snapshot builders (5s Redis snapshots)
-5. Phase 2 #5 Strategy registry + continuous futures (DB-backed InstrumentDefinition, `.Z.` regex)
+1. **First real backtest** — ingest AAPL + SPY minute bars (Databento, 2024-01-01 → 2025-01-01), run EMA Cross, verify UI + QuantStats report. End-to-end validation.
+2. Apply migration `k9e0f1g2h3i4_add_broker_trade_id_to_trades` to dev Postgres.
+3. Phase 2 #5 Strategy registry + continuous futures (DB-backed InstrumentDefinition, `.Z.` regex).
+4. Follow-ups (not blocking): `READ_ONLY_API=no` compose default; `/account/health` probe never-started bug; `/live/positions` gap; deployment row status stays `starting`; audit lifecycle race auto-heal.
