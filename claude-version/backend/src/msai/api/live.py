@@ -58,6 +58,8 @@ from msai.services.live.idempotency import (
     Reserved,
 )
 from msai.services.live_command_bus import (
+    LIVE_COMMAND_GROUP,
+    LIVE_COMMAND_STREAM,
     LiveCommandBus,  # noqa: TC001 — FastAPI Depends resolves at runtime
 )
 from msai.services.nautilus.trading_node import TradingNodeManager
@@ -110,6 +112,42 @@ async def _halt_is_active(bus: LiveCommandBus) -> bool:
     is exercised without the global ``get_command_bus`` dependency.
     """
     return bool(await bus._redis.exists(_HALT_KEY))  # noqa: SLF001 — intentional
+
+
+# Idle window for the supervisor-alive check. The supervisor's
+# ``XREADGROUP`` uses ``BLOCK 5000ms`` (see
+# ``live_command_bus.consume``) so a live consumer's ``idle`` never
+# exceeds a few seconds. 15 s is 3× that — a consumer idle for
+# longer than this is almost certainly a crashed/stopped supervisor
+# whose group entry hasn't been cleaned up yet.
+_SUPERVISOR_MAX_IDLE_MS = 15_000
+
+
+async def _supervisor_is_alive(bus: LiveCommandBus) -> bool:
+    """Return True when at least one ``live-supervisor`` consumer has
+    been active within ``_SUPERVISOR_MAX_IDLE_MS``.
+
+    Drill 2026-04-15 P0-A: the ``live-supervisor`` service is gated
+    behind the ``broker`` compose profile and therefore absent from
+    the default ``docker compose up`` stack. When the supervisor is
+    down, ``/api/v1/live/start`` used to publish a command, poll the
+    (never-created) ``live_node_processes`` row until its 60 s
+    deadline, and return 504 — a silent hang with no actionable
+    error. Checking the consumer group's liveness here lets the
+    endpoint return 503 with a clear remediation message the moment
+    an operator forgets to activate the profile or the supervisor
+    has crashed.
+    """
+    try:
+        consumers = await bus._redis.xinfo_consumers(  # noqa: SLF001
+            LIVE_COMMAND_STREAM, LIVE_COMMAND_GROUP
+        )
+    except Exception:  # noqa: BLE001 — any Redis error means "can't tell, assume dead"
+        return False
+    if not consumers:
+        return False
+    max_idle = _SUPERVISOR_MAX_IDLE_MS
+    return any(int(c.get("idle", max_idle + 1)) < max_idle for c in consumers)
 
 
 async def _poll_for_terminal(
@@ -299,6 +337,40 @@ async def live_start(  # noqa: PLR0912, PLR0915 — multi-branch dispatch by des
             if reservation is not None:
                 await idem.release(reservation.redis_key)
             return _apply_outcome(outcome)
+
+        # -------------------------------------------------------------
+        # Supervisor liveness
+        # -------------------------------------------------------------
+        # The live-supervisor container consumes START/STOP commands
+        # from Redis Streams and spawns the Nautilus trading
+        # subprocess. If no supervisor is actively consuming (the
+        # ``broker`` compose profile wasn't activated, the container
+        # crashed, etc.), publishing a command here would land it in
+        # a stream with no reader and the 60 s poll below would time
+        # out with a generic 504 — unhelpful during a deploy or
+        # incident. Fail fast with a 503 + remediation instead.
+        if not await _supervisor_is_alive(bus):
+            log.error(
+                "live_start_rejected_no_supervisor",
+                extra={
+                    "stream": LIVE_COMMAND_STREAM,
+                    "group": LIVE_COMMAND_GROUP,
+                    "note": (
+                        "no live-supervisor consumer active — start the broker "
+                        "profile or restart the live-supervisor container"
+                    ),
+                },
+            )
+            if reservation is not None:
+                await idem.release(reservation.redis_key)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "live-supervisor is not running. Start it with "
+                    "`docker compose -f docker-compose.dev.yml --profile broker "
+                    "up -d live-supervisor ib-gateway` and retry."
+                ),
+            )
 
         # -------------------------------------------------------------
         # Strategy lookup
@@ -684,6 +756,7 @@ async def live_kill_all(
     publish loop is also blocked.
     """
     from msai.services.observability.trading_metrics import KILL_SWITCH_ACTIVATED
+
     KILL_SWITCH_ACTIVATED.inc()
 
     halt_set_at = datetime.now(UTC)
@@ -942,12 +1015,14 @@ async def live_positions(
     reader = get_position_reader()
 
     active_rows = (
-        await db.execute(
-            select(LiveDeployment).where(
-                LiveDeployment.status.in_(("running", "ready"))
+        (
+            await db.execute(
+                select(LiveDeployment).where(LiveDeployment.status.in_(("running", "ready")))
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     all_positions: list[dict[str, Any]] = []
     for dep in active_rows:
@@ -976,9 +1051,13 @@ async def live_trades(
     """
     from msai.models.order_attempt_audit import OrderAttemptAudit
 
-    count_q = select(func.count()).select_from(OrderAttemptAudit).where(
-        OrderAttemptAudit.is_live.is_(True),
-        OrderAttemptAudit.status.in_(("filled", "partially_filled")),
+    count_q = (
+        select(func.count())
+        .select_from(OrderAttemptAudit)
+        .where(
+            OrderAttemptAudit.is_live.is_(True),
+            OrderAttemptAudit.status.in_(("filled", "partially_filled")),
+        )
     )
     total = (await db.execute(count_q)).scalar_one()
 
@@ -1026,13 +1105,17 @@ async def live_audits(
     from msai.models.order_attempt_audit import OrderAttemptAudit
 
     rows = (
-        await db.execute(
-            select(OrderAttemptAudit)
-            .where(OrderAttemptAudit.deployment_id == deployment_id)
-            .order_by(OrderAttemptAudit.ts_attempted.desc())
-            .limit(50)
+        (
+            await db.execute(
+                select(OrderAttemptAudit)
+                .where(OrderAttemptAudit.deployment_id == deployment_id)
+                .order_by(OrderAttemptAudit.ts_attempted.desc())
+                .limit(50)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     return {
         "audits": [

@@ -45,6 +45,18 @@ class Trade(Base):
         Index("ix_trades_strategy_id", "strategy_id"),
         Index("ix_trades_executed_at", "executed_at"),
         Index("ix_trades_instrument", "instrument"),
+        # Partial unique index on (deployment_id, broker_trade_id) so a
+        # reconciliation-time fill replay (nautilus.md gotcha 19 — IB
+        # reports historical fills on engine restart) can't create a
+        # duplicate Trade row. Partial because backtest rows have no
+        # broker-side id and would otherwise collide on NULL.
+        Index(
+            "ix_trades_broker_trade_id_deployment",
+            "deployment_id",
+            "broker_trade_id",
+            unique=True,
+            postgresql_where="broker_trade_id IS NOT NULL",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
@@ -63,6 +75,7 @@ class Trade(Base):
     quantity: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False)
     price: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False)
     commission: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
+    broker_trade_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     pnl: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
     is_live: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     executed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

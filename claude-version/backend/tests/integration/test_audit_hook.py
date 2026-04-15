@@ -22,6 +22,7 @@ from msai.models import Backtest, Base, LiveDeployment, Strategy, User
 from msai.services.nautilus.audit_hook import (
     OrderAuditWriter,
     OrderSubmittedFacts,
+    TradeFillFacts,
     lookup_by_client_order_id,
 )
 
@@ -431,3 +432,189 @@ class TestEdgeCases:
         self, session_factory: async_sessionmaker[AsyncSession]
     ) -> None:
         assert await lookup_by_client_order_id(session_factory, "nope") is None
+
+
+# ---------------------------------------------------------------------------
+# write_trade_fill — Phase 2 #4 port (drill 2026-04-15)
+# ---------------------------------------------------------------------------
+
+
+def _fill(
+    *,
+    broker_trade_id: str,
+    client_order_id: str,
+    deployment_id,
+    strategy_id,
+) -> TradeFillFacts:
+    return TradeFillFacts(
+        broker_trade_id=broker_trade_id,
+        client_order_id=client_order_id,
+        deployment_id=deployment_id,
+        strategy_id=strategy_id,
+        strategy_code_hash="deadbeef" * 8,
+        instrument="EUR/USD.IDEALPRO",
+        side="BUY",
+        quantity=Decimal("1.00"),
+        price=Decimal("1.17905"),
+        commission=Decimal("2.00"),
+        executed_at=datetime.now(UTC),
+    )
+
+
+class TestWriteTradeFill:
+    @pytest.mark.asyncio
+    async def test_inserts_trade_row(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        fixtures: dict[str, object],
+    ) -> None:
+        """A single OrderFilled event produces one Trade row with
+        ``is_live=True`` and ``deployment_id`` set."""
+        from sqlalchemy import select
+
+        from msai.models import Trade
+
+        writer = OrderAuditWriter(db=session_factory)
+        strategy = fixtures["strategy"]
+        deployment = fixtures["deployment"]
+
+        ok = await writer.write_trade_fill(
+            _fill(
+                broker_trade_id="0000e215.69debe81.01.01",
+                client_order_id="cli-001",
+                deployment_id=deployment.id,  # type: ignore[union-attr]
+                strategy_id=strategy.id,  # type: ignore[union-attr]
+            )
+        )
+        assert ok is True
+
+        async with session_factory() as session:
+            result = await session.execute(
+                select(Trade).where(Trade.broker_trade_id == "0000e215.69debe81.01.01")
+            )
+            row = result.scalar_one()
+            assert row.deployment_id == deployment.id  # type: ignore[union-attr]
+            assert row.is_live is True
+            assert row.side == "BUY"
+            assert row.quantity == Decimal("1.00")
+            assert row.price == Decimal("1.17905")
+            assert row.commission == Decimal("2.00")
+            assert row.broker_trade_id == "0000e215.69debe81.01.01"
+
+    @pytest.mark.asyncio
+    async def test_replayed_fill_is_deduped(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        fixtures: dict[str, object],
+    ) -> None:
+        """IB's reconciliation-time fill replay (nautilus.md gotcha
+        19) sends historical OrderFilled events again. The partial
+        unique index on (deployment_id, broker_trade_id) + ``ON
+        CONFLICT DO NOTHING`` must suppress the duplicate. Second
+        call returns ``False`` and the Trade count stays at 1."""
+        from sqlalchemy import func, select
+
+        from msai.models import Trade
+
+        writer = OrderAuditWriter(db=session_factory)
+        strategy = fixtures["strategy"]
+        deployment = fixtures["deployment"]
+
+        facts = _fill(
+            broker_trade_id="replay-target-01",
+            client_order_id="cli-replay",
+            deployment_id=deployment.id,  # type: ignore[union-attr]
+            strategy_id=strategy.id,  # type: ignore[union-attr]
+        )
+
+        first = await writer.write_trade_fill(facts)
+        second = await writer.write_trade_fill(facts)
+
+        assert first is True
+        assert second is False
+
+        async with session_factory() as session:
+            count = (
+                await session.execute(
+                    select(func.count()).select_from(Trade).where(
+                        Trade.broker_trade_id == "replay-target-01"
+                    )
+                )
+            ).scalar_one()
+            assert count == 1
+
+    @pytest.mark.asyncio
+    async def test_same_broker_id_different_deployment_both_persist(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        fixtures: dict[str, object],
+    ) -> None:
+        """Broker trade ids are only unique within a single IB
+        session. A second deployment on a different IB client id can
+        legitimately produce the same trade_id string for an
+        unrelated fill — the (deployment_id, broker_trade_id)
+        composite key keeps them distinct."""
+        from sqlalchemy import func, select
+
+        from msai.models import LiveDeployment, Trade
+
+        strategy = fixtures["strategy"]
+        first_deployment = fixtures["deployment"]
+
+        # Create a second deployment under the same strategy.
+        async with session_factory() as session:
+            slug2 = uuid4().hex[:16]
+            second_deployment = LiveDeployment(
+                id=uuid4(),
+                strategy_id=strategy.id,  # type: ignore[union-attr]
+                strategy_code_hash="cafef00d" * 8,
+                config={},
+                instruments=["EUR/USD.IDEALPRO"],
+                status="running",
+                paper_trading=True,
+                started_by=first_deployment.started_by,  # type: ignore[union-attr]
+                deployment_slug=slug2,
+                identity_signature="e" * 64,
+                trader_id=f"MSAI-{slug2}",
+                strategy_id_full=f"SmokeMarketOrderStrategy-{slug2}",
+                account_id="DU1234568",
+                message_bus_stream=f"trader-MSAI-{slug2}-stream",
+                config_hash="beefcafe" * 8,
+                instruments_signature="EUR/USD.IDEALPRO",
+            )
+            session.add(second_deployment)
+            await session.commit()
+            second_id = second_deployment.id
+
+        writer = OrderAuditWriter(db=session_factory)
+        shared_trade_id = "ambiguous-trade-42"
+
+        ok1 = await writer.write_trade_fill(
+            _fill(
+                broker_trade_id=shared_trade_id,
+                client_order_id="dep1-cli",
+                deployment_id=first_deployment.id,  # type: ignore[union-attr]
+                strategy_id=strategy.id,  # type: ignore[union-attr]
+            )
+        )
+        ok2 = await writer.write_trade_fill(
+            _fill(
+                broker_trade_id=shared_trade_id,
+                client_order_id="dep2-cli",
+                deployment_id=second_id,
+                strategy_id=strategy.id,  # type: ignore[union-attr]
+            )
+        )
+
+        assert ok1 is True
+        assert ok2 is True
+
+        async with session_factory() as session:
+            count = (
+                await session.execute(
+                    select(func.count()).select_from(Trade).where(
+                        Trade.broker_trade_id == shared_trade_id
+                    )
+                )
+            ).scalar_one()
+            assert count == 2

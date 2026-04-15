@@ -2,28 +2,31 @@
 
 ## Goal
 
-Reach Codex parity (Phase 2 — 5 P1 items).
+First real backtest — ingest market data and run EMA Cross strategy on real AAPL/SPY data.
 
 ## Workflow
 
-| Field     | Value                                        |
-| --------- | -------------------------------------------- |
-| Command   | /fix-bug daily-scheduler-timezone            |
-| Phase     | 5.1 — Code review loop                       |
-| Next step | Await Codex iter 4; commit + PR autonomously |
+| Field     | Value                                      |
+| --------- | ------------------------------------------ |
+| Command   | /fix-bug quantstats-intraday-normalization |
+| Phase     | 6 — Finish                                 |
+| Next step | Commit + push + PR                         |
 
 ### Checklist
 
 - [x] Worktree created
 - [x] Project state read
-- [x] Researched Codex's `daily_scheduler.py` design
-- [x] TDD execution complete (24 new tests)
-- [x] Code review loop (5 iters) — PASS. Iter 1 P2 broad except + Codex P1 target_date + P2 long-ingest re-fire. Iter 2 Codex 2×P2 (config validation, atomic state). Iter 3 Codex P1 Databento window semantics. Iter 4 PR toolkit docstring + Codex P2 overnight schedules (session_offset_days). Iter 5 Codex 2×P2 (Polygon end-inclusive + multi-exchange) — documented as out-of-scope/pre-existing follow-ups (parquet dedup mitigates Polygon, multi-exchange needs per-asset schedules). PR toolkit iter 5: "Terminal. Ship it." 45 tests, 987 backend total.
-- [x] Verified (987 unit tests pass, ruff + mypy clean)
-- [x] Simplified (helper extraction _valid_alerts, consolidated loop handling)
-- [x] E2E — N/A: internal scheduler, no user-facing changes
-- [x] Learning documented (`docs/solutions/scheduling/daily-ingest-timezone-awareness.md`)
-- [x] State files updated
+- [x] Plugins verified (Codex CLI available)
+- [x] Searched existing solutions (none for QuantStats intraday)
+- [x] Researched Codex's fix (`_normalize_report_returns` groupby day + compound)
+- [x] Systematic debugging complete (failing test written — import error reproduced bug)
+- [x] TDD fix execution complete (18 tests green, ported helper verbatim from Codex)
+- [x] Code review loop (1 iteration) — PASS. Codex xhigh + PR toolkit both clean on P0/P1/P2. PR toolkit's single P2 was self-labeled "not worth changing, user impact nil"; 3 of 4 P3 test-coverage nits addressed
+- [x] Simplified (helper ported verbatim from Codex; no accidental complexity added)
+- [x] Verified (tests: 972 pass, ruff clean on new code, mypy +1 env-only error — pandas.api.types stubs, same class as existing pandas stub error)
+- [x] E2E — N/A (internal metric normalization, output changes only)
+- [x] Learning documented (`docs/solutions/backtesting/quantstats-intraday-sharpe-inflation.md`)
+- [x] State files updated (CONTINUITY + CHANGELOG)
 - [ ] Committed and pushed
 - [ ] PR created
 - [ ] PR reviews addressed
@@ -31,16 +34,21 @@ Reach Codex parity (Phase 2 — 5 P1 items).
 
 ## Done
 
-- Phase 2 #1 QuantStats intraday → PR #9 (open)
-- Phase 2 #2 Alerting API + history → PR #10 (open, 9-iter Codex review, 52 tests)
-- Phase 1 #1/#2/#3 portfolio + Playwright + CLI → PRs #6/#7/#8 (open)
+- Phase 1 #1 portfolio orchestration (PR #6 OPEN, 10-iter Codex-reviewed)
+- Phase 1 #2 Playwright e2e harness (PR #7 OPEN, 16 specs green)
+- Phase 1 #3 CLI sub-apps (PR #8 OPEN, 27 commands, Codex + e2e reviewed)
+- Hybrid merge PR#3 merged (2026-04-13): 18 tasks, 99 files, ~15K lines
+- Docker Compose parity PR#4 merged (2026-04-13): 12 gaps fixed, all 10 containers running
+- Codex ingestion + backtest IPC PR#5 merged (2026-04-14)
 
 ## Now
 
-**Phase 2 #3 in progress**: Daily ingest scheduler tz-aware. Replaced hardcoded `06:00 UTC` arq cron with `run_nightly_ingest_if_due` wrapper that consults tz/hour/minute/enable settings + atomic JSON state file. Preserves Claude's DB-backed asset universe + fallback. 40 tests including London/Tokyo parametrize, atomic-write-on-fsync-failure, hour/minute range validation, Databento end-exclusive window semantics, eager-claim idempotency across restarts. 4 review iterations — each Codex finding was real and narrowing. PR toolkit iter 4 "not terminal" on stale docstring → fixed.
+**Phase 2 #1 in progress**: QuantStats intraday normalization. Helper `_normalize_report_returns` ported verbatim from Codex. 18 new tests covering compound, pass-through, tz-aware/naive, empty, non-numeric, midnight-cross. PR toolkit review PASS. Codex xhigh review running.
 
 ## Next
 
-1. Finish Phase 2 #3 → PR → next item
-2. Phase 2 #4 LiveStateController + snapshot builders (5s Redis snapshots)
-3. Phase 2 #5 Strategy registry + continuous futures (DB-backed InstrumentDefinition, `.Z.` regex)
+1. Finish Phase 2 #1 QuantStats intraday (this branch) → PR → merge
+2. Phase 2 #2 Alerting API + history (file-backed log + GET /api/v1/alerts/ router)
+3. Phase 2 #3 Daily scheduler timezone-aware (configurable tz/hour/minute + state file)
+4. Phase 2 #4 LiveStateController + snapshot builders (5s Redis snapshots)
+5. Phase 2 #5 Strategy registry + continuous futures (DB-backed InstrumentDefinition, `.Z.` regex)
