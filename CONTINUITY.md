@@ -17,6 +17,8 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 - IB Gateway connected: 6 paper sub-accounts verified (DFP733210 + DUP733211-215, ~$1M each)
 - Databento API key configured
 - Phase 2 parity backlog cleared 2026-04-15: PR #6 portfolio, #7 playwright e2e, #8 CLI sub-apps, #9 QuantStats intraday, #10 alerting API, #11 daily scheduler tz — all merged after local merge-main-into-branch conflict resolution (1147 tests on final branch)
+- First real backtest 2026-04-15 14:01 UTC: AAPL.NASDAQ + SPY.ARCA Databento 2024 full year, 258k bars, 4,448 trades, QuantStats HTML report via `/api/v1/backtests/{id}/report`. Core goal from Project Overview met.
+- Alembic migration collision fixed: PR #6 + PR #15 both authored revision `k9e0f1g2h3i4`; portfolio rechained to `l0f1g2h3i4j5` (commit 3139d75).
 - Phase 2 #4 council (5 advisors + chairman): rejected verbatim Option A (867 LOC) and framed Option B (300 LOC); mandated paper-IB kill-all drill as go/no-go gate
 - Phase 2 #4 drill executed (2026-04-15 04:00 UTC): exposed 3 P0 live-stack bugs blocking any `/live/start` (profile-gate, supervisor silent-fail, IB host/port drift)
 - Phase 2 #4 — live trade persistence merged (PR #15): broker_trade_id column + partial unique dedup + ON CONFLICT DO NOTHING path from OrderFilled → trades; audit row mismatch now visible (Codex review P1+P2 both addressed)
@@ -28,11 +30,16 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Now
 
-All open PRs closed (Phase 2 #1-#4 + portfolio/playwright/CLI ports). Main has everything. Moving to the stated goal: first real backtest with real AAPL/SPY data via Databento.
+**First real backtest achieved** (2026-04-15). Full year AAPL + SPY 2024 Databento data ingested (258,150 bars in 12 s), EMA Cross backtest ran in 11 s producing **4,448 trades**, QuantStats HTML report (365 KB) generated and fetchable via `/api/v1/backtests/{id}/report`. Core goal from Project Overview is met.
+
+**During the session, two pre-existing bugs surfaced and were worked around, not yet fixed:**
+
+1. **Stale catalog bug** — `ensure_catalog_data` returns `already_populated` when ANY bar parquet exists for the instrument, even if the on-disk raw data now covers a wider range than the catalog. Worked around by `rm -rf /app/data/nautilus/data/{bar,equity}` before the run. Fix: detect date-range delta and rebuild the subset, or make the check time-bucketed.
+2. **Stale subprocess signature** — long-running worker containers cache the `_run_in_subprocess` import in memory. After PR #5 changed its signature from 2 args to 1, containers that predated the merge kept invoking the 2-arg form and every backtest failed with "takes 1 positional argument but 2 were given". Fixed by restarting `job-watchdog`. Fix: the docker-compose dev image should bust on source change, or entrypoints should force a `compileall` at start.
 
 ## Next
 
-1. **First real backtest** — ingest AAPL + SPY minute bars (Databento, 2024-01-01 → 2025-01-01), run EMA Cross, verify UI + QuantStats report. End-to-end validation.
-2. Apply migration `k9e0f1g2h3i4_add_broker_trade_id_to_trades` to dev Postgres.
-3. Phase 2 #5 Strategy registry + continuous futures (DB-backed InstrumentDefinition, `.Z.` regex).
-4. Follow-ups (not blocking): `READ_ONLY_API=no` compose default; `/account/health` probe never-started bug; `/live/positions` gap; deployment row status stays `starting`; audit lifecycle race auto-heal.
+1. Apply migration (done — already at head `l0f1g2h3i4j5`).
+2. Phase 2 #5 Strategy registry + continuous futures (DB-backed InstrumentDefinition, `.Z.` regex).
+3. File follow-ups for (a) stale catalog detection, (b) worker-container stale-import hygiene, (c) EMA backtest PnL / win-rate / sharpe all zero (trade extraction ran, PnL scoring didn't).
+4. Other known follow-ups: `READ_ONLY_API=no` compose default; `/account/health` probe never-started bug; `/live/positions` gap; deployment row status stays `starting`; audit lifecycle race auto-heal.
