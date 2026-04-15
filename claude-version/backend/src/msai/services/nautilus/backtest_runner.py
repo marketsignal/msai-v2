@@ -28,15 +28,12 @@ import tempfile
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any, cast
 
 import pandas as pd
 
 from msai.services.analytics_math import compute_series_metrics
 from msai.services.nautilus.strategy_loader import resolve_importable_strategy_paths
-
-if TYPE_CHECKING:
-    pass
 
 # NautilusTrader is heavy (pulls in Rust extensions).  We import eagerly
 # because this module is only imported inside the backtest worker, which
@@ -50,7 +47,7 @@ try:
         BacktestVenueConfig,
     )
     from nautilus_trader.backtest.node import BacktestNode
-    from nautilus_trader.model.identifiers import InstrumentId, Venue
+    from nautilus_trader.model.identifiers import Venue
     from nautilus_trader.trading.config import ImportableStrategyConfig
 
     _NAUTILUS_IMPORT_ERROR: Exception | None = None
@@ -213,7 +210,9 @@ class BacktestRunner:
 
         # Create a tempfile for the subprocess to write its result into.
         with tempfile.NamedTemporaryFile(
-            prefix="msai-backtest-", suffix=".pkl", delete=False,
+            prefix="msai-backtest-",
+            suffix=".pkl",
+            delete=False,
         ) as tmp:
             result_path = Path(tmp.name)
         payload.result_path = str(result_path)
@@ -323,14 +322,9 @@ def _run_in_subprocess(payload: _RunPayload) -> None:
             positions_df = engine.trader.generate_positions_report()
             venue_names = _extract_venues_from_instrument_ids(payload.instrument_ids)
             account_frames = [
-                engine.trader.generate_account_report(venue=Venue(v))
-                for v in venue_names
+                engine.trader.generate_account_report(venue=Venue(v)) for v in venue_names
             ]
-            account_df = (
-                pd.concat(account_frames)
-                if account_frames
-                else pd.DataFrame()
-            )
+            account_df = pd.concat(account_frames) if account_frames else pd.DataFrame()
             account_payload = _compact_account_report(account_df)
 
             _write_subprocess_result(
@@ -340,7 +334,7 @@ def _run_in_subprocess(payload: _RunPayload) -> None:
                     "orders": orders_df.to_dict(orient="records"),
                     "positions": positions_df.to_dict(orient="records"),
                     "account": account_payload.to_dict(orient="records"),
-                    "metrics": _extract_metrics(primary, orders_df, account_payload),
+                    "metrics": _extract_metrics(primary, orders_df, account_payload, positions_df),
                 },
             )
         finally:
@@ -463,10 +457,9 @@ def _compact_account_report(account_df: pd.DataFrame) -> pd.DataFrame:
             return pd.DataFrame(columns=["timestamp", "returns", "equity"])
         account_id_col = _first_present(frame.columns, ("account_id",))
         if account_id_col is not None:
-            deduped = (
-                frame.groupby([timestamp_col, account_id_col], as_index=False)[equity_col]
-                .last()
-            )
+            deduped = frame.groupby([timestamp_col, account_id_col], as_index=False)[
+                equity_col
+            ].last()
             intraday_equity = (
                 deduped.groupby(timestamp_col, as_index=True)[equity_col].sum().sort_index()
             )
@@ -487,7 +480,11 @@ def _compact_account_report(account_df: pd.DataFrame) -> pd.DataFrame:
     if returns_col is not None:
         grouped_returns = (
             frame.groupby(frame[timestamp_col].dt.normalize(), as_index=True)[returns_col]
-            .apply(lambda values: (1.0 + pd.to_numeric(values, errors="coerce").fillna(0.0)).prod() - 1.0)
+            .apply(
+                lambda values: (
+                    (1.0 + pd.to_numeric(values, errors="coerce").fillna(0.0)).prod() - 1.0
+                )
+            )
             .sort_index()
         )
         return pd.DataFrame(
@@ -519,6 +516,7 @@ def _extract_metrics(
     primary_result: object,
     orders_df: pd.DataFrame,
     account_df: pd.DataFrame | None = None,
+    positions_df: pd.DataFrame | None = None,
 ) -> dict[str, float | int]:
     """Pull a normalised metrics dict out of the Nautilus result object.
 
@@ -533,9 +531,20 @@ def _extract_metrics(
     minor version changes ("Sharpe Ratio (252 days)" vs "Sharpe Ratio")
     don't silently zero-out the dashboard.
 
-    When Nautilus's built-in stats produce zeros (e.g. for short backtests),
-    we fall back to deriving metrics from the compacted account report
-    using ``compute_series_metrics``.
+    Three-tier fallback for win_rate / total_return / max_drawdown:
+
+    1. Nautilus ``stats_pnls`` / ``stats_returns`` (preferred — Nautilus
+       computes them with full position context).
+    2. Per-position ``realized_pnl`` from ``positions_df`` (covers cases
+       where ``stats_pnls`` is empty or NaN — happens on short windows
+       and certain strategy configs where the engine couldn't aggregate).
+    3. Returns series in ``account_df`` (last resort — account snapshot).
+
+    Without the positions tier, every backtest whose Nautilus stats came
+    back NaN reported ``win_rate=0`` and ``total_return=0`` even when
+    thousands of positions had been closed with real PnL. Surfaced by the
+    first-real-backtest milestone 2026-04-15 (4 448 trades, all metrics
+    zero in the API response).
     """
     stats_returns = getattr(primary_result, "stats_returns", None) or {}
     stats_pnls = getattr(primary_result, "stats_pnls", None) or {}
@@ -555,14 +564,36 @@ def _extract_metrics(
     total_return = _find_float(currency_stats, ["pnl% (total)", "pnl%", "return"])
     win_rate = _find_float(currency_stats, ["win rate"])
 
-    # Fall back to account-derived metrics when Nautilus stats are zero.
+    # Account tier — preferred for total_return + max_drawdown when
+    # available. The account snapshot is the EXACT portfolio equity
+    # path so it captures capital recycling and open-position drag
+    # that the positions-derived realized-PnL approximation misses.
+    # Codex review P1: positions tier was wrongly running before
+    # account tier and shadowing the more accurate values.
+    account_derived: dict[str, float] | None = None
     if account_df is not None:
-        derived = _derive_metrics_from_account(account_df)
-        if derived is not None:
-            if abs(max_drawdown) <= 1e-12:
-                max_drawdown = derived["max_drawdown"]
-            if abs(total_return) <= 1e-12:
-                total_return = derived["total_return"]
+        account_derived = _derive_metrics_from_account(account_df)
+    if account_derived is not None:
+        if _is_missing(max_drawdown):
+            max_drawdown = account_derived["max_drawdown"]
+        if _is_missing(total_return):
+            total_return = account_derived["total_return"]
+
+    # Positions tier — only source for win_rate (account/stats don't
+    # carry per-trade win/loss). For total_return/max_drawdown it
+    # acts as the LAST resort, behind both Nautilus stats and the
+    # account snapshot. The drill 2026-04-15 hit win_rate=0 because
+    # this tier didn't exist; account tier alone has no win_rate.
+    positions_derived: dict[str, float] | None = None
+    if positions_df is not None and not positions_df.empty:
+        positions_derived = _derive_metrics_from_positions(positions_df)
+    if positions_derived is not None:
+        if _is_missing(win_rate):
+            win_rate = positions_derived["win_rate"]
+        if _is_missing(total_return):
+            total_return = positions_derived["total_return"]
+        if _is_missing(max_drawdown):
+            max_drawdown = positions_derived["max_drawdown"]
 
     return {
         "sharpe_ratio": _nan_safe(sharpe),
@@ -572,6 +603,154 @@ def _extract_metrics(
         "win_rate": _nan_safe(win_rate),
         "num_trades": int(len(orders_df)),
     }
+
+
+def _derive_metrics_from_positions(positions_df: pd.DataFrame) -> dict[str, float] | None:
+    """Compute win_rate / total_return / max_drawdown from Nautilus's
+    ``generate_positions_report`` DataFrame.
+
+    The report has one row per position with ``realized_pnl`` (a Money
+    value rendered as ``"0.11 USD"``) and ``side`` (``"FLAT"`` for
+    closed positions, ``"LONG"``/``"SHORT"`` for still-open). Open
+    positions are ignored because their PnL is unrealized.
+
+    ``total_return`` is rendered as a unit-less ratio against the
+    cumulative absolute opening notional so the value is comparable
+    across strategies and instruments. ``max_drawdown`` is computed
+    from the equity curve formed by cumulative realized PnL, then
+    normalised against the same notional.
+
+    Returns ``None`` if no closed positions are present so the caller
+    can chain to other fallbacks.
+    """
+    if "realized_pnl" not in positions_df.columns or positions_df.empty:
+        return None
+
+    closed = positions_df
+    if "side" in positions_df.columns:
+        closed = positions_df[positions_df["side"].astype(str) == "FLAT"]
+    if closed.empty:
+        return None
+
+    # Codex review P2: extract (amount, currency) pairs and only
+    # aggregate the dominant currency. A multi-currency portfolio
+    # would otherwise add EUR + USD numerics as if they were the
+    # same unit, producing nonsense totals that can override a valid
+    # account-derived metric.
+    pairs = [_money_to_float_with_currency(v) for v in closed["realized_pnl"].tolist()]
+    pairs = [p for p in pairs if p is not None]
+    if not pairs:
+        return None
+
+    by_currency: dict[str, list[float]] = {}
+    by_currency_indices: dict[str, list[int]] = {}
+    for idx, (amount, currency) in enumerate(pairs):
+        by_currency.setdefault(currency, []).append(amount)
+        by_currency_indices.setdefault(currency, []).append(idx)
+
+    # Pick the dominant currency by row count; ties broken by the
+    # currency that sums to the largest absolute amount.
+    dominant = max(
+        by_currency.keys(),
+        key=lambda c: (len(by_currency[c]), abs(sum(by_currency[c]))),
+    )
+    pnl_values = by_currency[dominant]
+    dominant_indices = by_currency_indices[dominant]
+
+    pnl_series = pd.Series(pnl_values, dtype=float)
+    wins = int((pnl_series > 0).sum())
+    win_rate = float(wins / len(pnl_series)) if len(pnl_series) else 0.0
+    total_pnl = float(pnl_series.sum())
+
+    # Notional for the return denominator: prefer ``avg_px_open *
+    # peak_qty`` over the SAME rows that contributed to pnl_series
+    # so multi-currency scenarios stay aligned. Otherwise fall back
+    # to ``len(pnl_series)`` which keeps total_return per-trade.
+    notional = 0.0
+    closed_dominant = closed.iloc[dominant_indices] if dominant_indices else closed
+    if {"avg_px_open", "peak_qty"}.issubset(closed_dominant.columns):
+        avg_open = pd.to_numeric(closed_dominant["avg_px_open"], errors="coerce").fillna(0.0)
+        qty = pd.to_numeric(closed_dominant["peak_qty"], errors="coerce").fillna(0.0)
+        notional = float((avg_open.abs() * qty.abs()).sum())
+    total_return = total_pnl / notional if notional > 0 else total_pnl / len(pnl_series)
+
+    # Codex review P2: seed the cumulative path with 0 so an
+    # immediately-losing strategy registers a real drawdown from
+    # trade one. Without the seed, ``cummax()`` adopts the first
+    # (negative) value as the peak and reports max_drawdown=0.
+    cumulative_with_seed = pd.concat([pd.Series([0.0]), pnl_series.cumsum()], ignore_index=True)
+    running_max = cumulative_with_seed.cummax()
+    drawdown = cumulative_with_seed - running_max
+    max_drawdown = float(drawdown.min()) if not drawdown.empty else 0.0
+    if notional > 0:
+        max_drawdown = max_drawdown / notional
+
+    return {
+        "win_rate": win_rate,
+        "total_return": total_return,
+        "max_drawdown": max_drawdown,
+    }
+
+
+def _is_missing(value: float) -> bool:
+    """A metric counts as "missing" when it's NaN or within 1e-12 of
+    zero. The NaN branch is load-bearing — Nautilus's stats_returns
+    yields NaN on short-window backtests, and ``abs(nan) <= 1e-12``
+    is False because every comparison against NaN is False, which
+    silently skipped the positions fallback before this fix.
+    """
+    import math
+
+    if value is None:
+        return True
+    try:
+        if math.isnan(value):
+            return True
+    except (TypeError, ValueError):
+        return True
+    return abs(value) <= 1e-12
+
+
+def _money_to_float(value: object) -> float | None:
+    """Coerce a Nautilus money-shaped value to a Python float.
+
+    Nautilus's positions report renders ``Money`` as the string
+    ``"0.11 USD"``. ``str(value).split()[0]`` strips the currency
+    suffix; the same path also handles plain ints/floats and Decimal
+    via ``float()``. Returns ``None`` for empty/unparseable values so
+    the caller can drop them from aggregations rather than poisoning
+    the sum with a 0.0 that masquerades as a real fill.
+    """
+    pair = _money_to_float_with_currency(value)
+    return pair[0] if pair is not None else None
+
+
+def _money_to_float_with_currency(value: object) -> tuple[float, str] | None:
+    """Like :func:`_money_to_float` but returns ``(amount, currency)``.
+
+    The currency is needed by :func:`_derive_metrics_from_positions`
+    so it can split a multi-currency positions report by currency
+    and only aggregate one bucket at a time (Codex review P2 — adding
+    USD and EUR as if they were the same unit silently corrupts
+    total_return/max_drawdown).
+
+    Plain numerics (int, float, Decimal-without-currency-suffix)
+    return currency ``""``. Empty/unparseable inputs return ``None``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return (float(value), "")
+    text = str(value).strip()
+    if not text:
+        return None
+    parts = text.split()
+    head = parts[0]
+    currency = parts[1] if len(parts) > 1 else ""
+    try:
+        return (float(head), currency)
+    except (TypeError, ValueError):
+        return None
 
 
 def _derive_metrics_from_account(account_df: pd.DataFrame) -> dict[str, float] | None:
