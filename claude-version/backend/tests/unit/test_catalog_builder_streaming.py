@@ -204,6 +204,197 @@ def test_streaming_builder_multi_partition(tmp_path: Path) -> None:
     assert len(bars) == 5_000
 
 
+def test_idempotency_skip_when_raw_unchanged(tmp_path: Path) -> None:
+    """Calling the builder twice with identical raw parquet files
+    should be a no-op on the second call (existing behaviour we
+    don't want to regress)."""
+    raw_root = tmp_path / "raw"
+    catalog_root = tmp_path / "catalog"
+
+    _write_synthetic_parquet(
+        raw_root,
+        rows=1_000,
+        start_ts=datetime(2026, 1, 1, tzinfo=UTC),
+        symbol="MSFT",
+    )
+
+    first_id = build_catalog_for_symbol(
+        symbol="MSFT",
+        raw_parquet_root=raw_root,
+        catalog_root=catalog_root,
+    )
+    second_id = build_catalog_for_symbol(
+        symbol="MSFT",
+        raw_parquet_root=raw_root,
+        catalog_root=catalog_root,
+    )
+    assert first_id == second_id
+
+    from nautilus_trader.persistence.catalog import ParquetDataCatalog
+
+    catalog = ParquetDataCatalog(str(catalog_root))
+    # Still 1 000 bars — second call did NOT double-write.
+    assert len(catalog.bars(instrument_ids=[first_id])) == 1_000
+
+
+def test_rebuild_when_raw_data_extends(tmp_path: Path) -> None:
+    """Stale-catalog regression (drill 2026-04-15): if the raw
+    parquet tree gains new partitions after the first catalog
+    build, the next ``build_catalog_for_symbol`` MUST detect the
+    delta and rebuild — otherwise every backtest after a fresh
+    ingest silently runs against the old (truncated) catalog and
+    produces wrong (or zero-trade) results.
+
+    The drill on 2026-04-15 hit exactly this: 1 month of AAPL
+    data was ingested early, then a full year was ingested later;
+    the second backtest read 2 653 bars from the stale catalog
+    instead of 123 072 from the new parquet tree.
+    """
+    raw_root = tmp_path / "raw"
+    catalog_root = tmp_path / "catalog"
+
+    # Initial ingest — 1 month, ~28 trading days × 1 440 minutes
+    # is overkill for a unit test, so use 1 000 rows.
+    _write_synthetic_parquet(
+        raw_root,
+        rows=1_000,
+        start_ts=datetime(2026, 1, 1, tzinfo=UTC),
+        symbol="GOOG",
+    )
+    instrument_id = build_catalog_for_symbol(
+        symbol="GOOG",
+        raw_parquet_root=raw_root,
+        catalog_root=catalog_root,
+    )
+
+    # Operator adds another month of raw data via a follow-up ingest.
+    _write_synthetic_parquet(
+        raw_root,
+        rows=2_000,
+        start_ts=datetime(2026, 2, 1, tzinfo=UTC),
+        symbol="GOOG",
+    )
+
+    # Second build call — must rebuild to include the new partition.
+    build_catalog_for_symbol(
+        symbol="GOOG",
+        raw_parquet_root=raw_root,
+        catalog_root=catalog_root,
+    )
+
+    from nautilus_trader.persistence.catalog import ParquetDataCatalog
+
+    catalog = ParquetDataCatalog(str(catalog_root))
+    assert len(catalog.bars(instrument_ids=[instrument_id])) == 3_000
+
+
+def test_legacy_catalog_without_marker_is_rebuilt(tmp_path: Path) -> None:
+    """Codex review P1: pre-patch catalogs have no source-hash
+    marker. The first call after the upgrade MUST treat existing
+    bars as stale and purge them — appending on top of legacy bars
+    can either silently no-op (same partition filename) or error
+    (overlapping intervals), and the post-rebuild marker would
+    lock in the staleness on subsequent calls."""
+    raw_root = tmp_path / "raw"
+    catalog_root = tmp_path / "catalog"
+
+    _write_synthetic_parquet(
+        raw_root,
+        rows=500,
+        start_ts=datetime(2026, 1, 1, tzinfo=UTC),
+        symbol="AMZN",
+    )
+    instrument_id = build_catalog_for_symbol(
+        symbol="AMZN",
+        raw_parquet_root=raw_root,
+        catalog_root=catalog_root,
+    )
+    # Simulate "legacy" by removing the marker and growing the raw
+    # tree. Without the legacy guard, the next call would skip
+    # straight to the appender path.
+    marker = catalog_root / ".msai_source_hashes" / f"{instrument_id}.hash"
+    marker.unlink()
+    _write_synthetic_parquet(
+        raw_root,
+        rows=700,
+        start_ts=datetime(2026, 2, 1, tzinfo=UTC),
+        symbol="AMZN",
+    )
+
+    build_catalog_for_symbol(
+        symbol="AMZN",
+        raw_parquet_root=raw_root,
+        catalog_root=catalog_root,
+    )
+
+    from nautilus_trader.persistence.catalog import ParquetDataCatalog
+
+    catalog = ParquetDataCatalog(str(catalog_root))
+    assert len(catalog.bars(instrument_ids=[instrument_id])) == 1_200
+
+
+def test_source_hash_distinguishes_same_basename_in_different_partitions(
+    tmp_path: Path,
+) -> None:
+    """Codex review P2: ingest writes every monthly partition as
+    ``MM.parquet``, so ``2024/01.parquet`` and ``2025/01.parquet``
+    share a basename. The source hash must include the relative
+    path so a same-size identically-named file in a different year
+    doesn't masquerade as the original."""
+    from msai.services.nautilus.catalog_builder import _compute_raw_source_hash
+
+    raw_root = tmp_path / "raw"
+    _write_synthetic_parquet(
+        raw_root,
+        rows=100,
+        start_ts=datetime(2024, 1, 1, tzinfo=UTC),
+        symbol="META",
+    )
+    files_before = sorted((raw_root / "stocks" / "META").rglob("*.parquet"))
+    hash_before = _compute_raw_source_hash(files_before, raw_root=raw_root)
+
+    _write_synthetic_parquet(
+        raw_root,
+        rows=100,
+        start_ts=datetime(2025, 1, 1, tzinfo=UTC),
+        symbol="META",
+    )
+    files_after = sorted((raw_root / "stocks" / "META").rglob("*.parquet"))
+    hash_after = _compute_raw_source_hash(files_after, raw_root=raw_root)
+
+    assert hash_before != hash_after, (
+        "adding a 2025/01.parquet alongside 2024/01.parquet must change the hash; "
+        "if it doesn't, basename-only fingerprinting silently masked the new file"
+    )
+
+
+def test_purge_preserves_sibling_bar_specs(tmp_path: Path) -> None:
+    """Codex review P2: ``_purge_catalog_for_instrument`` must NOT
+    delete the shared ``data/equity/<instrument>`` directory because
+    other bar specs for the same instrument depend on it. Only the
+    matching ``data/bar/<instrument>-<bar_spec>`` directory should
+    be removed."""
+    from msai.services.nautilus.catalog_builder import _purge_catalog_for_instrument
+
+    catalog_root = tmp_path / "catalog"
+    bar_dir = catalog_root / "data" / "bar" / "TSLA.NASDAQ-1-MINUTE-LAST-EXTERNAL"
+    sibling_bar_dir = catalog_root / "data" / "bar" / "TSLA.NASDAQ-5-MINUTE-LAST-EXTERNAL"
+    equity_dir = catalog_root / "data" / "equity" / "TSLA.NASDAQ"
+    for d in (bar_dir, sibling_bar_dir, equity_dir):
+        d.mkdir(parents=True)
+        (d / "placeholder.parquet").write_bytes(b"x")
+
+    _purge_catalog_for_instrument(
+        catalog_root,
+        "TSLA.NASDAQ",
+        bar_spec="1-MINUTE-LAST-EXTERNAL",
+    )
+
+    assert not bar_dir.exists(), "target bar dir must be removed"
+    assert sibling_bar_dir.exists(), "sibling bar spec must survive purge"
+    assert equity_dir.exists(), "shared instrument definition must survive purge"
+
+
 def test_streaming_builder_raises_when_no_raw_data(tmp_path: Path) -> None:
     """Fail-loud contract: missing raw data raises
     ``FileNotFoundError`` with a descriptive message so the backtest
