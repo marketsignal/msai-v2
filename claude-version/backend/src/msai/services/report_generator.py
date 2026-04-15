@@ -10,10 +10,56 @@ import tempfile
 from pathlib import Path
 
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
 
 from msai.core.logging import get_logger
 
 log = get_logger(__name__)
+
+
+def _normalize_report_returns(series: pd.Series | None) -> pd.Series:
+    """Normalise a returns series for QuantStats.
+
+    QuantStats treats every row as one trading period and annualises with
+    ``sqrt(252)``, so minute-bar input inflates Sharpe/Sortino/vol by
+    ``sqrt(390)`` (~20x).  We group by UTC calendar date and compound each
+    day's returns back to a single daily observation.  Already-daily input
+    round-trips unchanged because ``(1 + r).prod()`` over a one-element
+    group equals ``1 + r``.
+
+    Ported from codex-version/backend/src/msai/services/report_generator.py.
+    """
+    if series is None:
+        return pd.Series(dtype=float)
+
+    normalized = pd.Series(series).copy()
+    if normalized.empty:
+        return pd.Series(dtype=float)
+
+    normalized = pd.to_numeric(normalized, errors="coerce").dropna()
+    if normalized.empty:
+        return pd.Series(dtype=float)
+
+    index = normalized.index
+    if isinstance(index, pd.DatetimeIndex):
+        timestamp_index: pd.DatetimeIndex | None = index
+    elif is_numeric_dtype(index):
+        timestamp_index = None
+    else:
+        parsed = pd.to_datetime(index, utc=True, errors="coerce")
+        timestamp_index = parsed if isinstance(parsed, pd.DatetimeIndex) else None
+
+    if isinstance(timestamp_index, pd.DatetimeIndex) and not timestamp_index.isna().all():
+        normalized.index = timestamp_index
+        normalized = normalized[~normalized.index.isna()]
+        if normalized.empty:
+            return pd.Series(dtype=float)
+        normalized = ((1.0 + normalized).groupby(normalized.index.normalize()).prod() - 1.0).astype(
+            float
+        )
+
+    return normalized.sort_index()
+
 
 # Try to import quantstats; gracefully degrade if unavailable.
 try:
@@ -51,28 +97,30 @@ class ReportGenerator:
         Raises:
             RuntimeError: If QuantStats is not installed.
         """
+        # Compound intraday bars into daily returns — QuantStats assumes
+        # one row per trading period, so minute-bar input produces a
+        # ~sqrt(390) Sharpe inflation without this step. Already-daily
+        # series round-trip unchanged.
+        returns = _normalize_report_returns(returns)
+        normalized_benchmark = (
+            _normalize_report_returns(benchmark) if benchmark is not None else None
+        )
+
         if not _HAS_QUANTSTATS:
             return self._generate_fallback_report(returns, title)
 
         if returns.empty:
             return self._generate_empty_report(title)
 
-        # Ensure returns has a DatetimeIndex for QuantStats compatibility
-        if not isinstance(returns.index, pd.DatetimeIndex):
-            returns = returns.copy()
-            returns.index = pd.to_datetime(returns.index)
-
         try:
             # QuantStats writes HTML to a file and returns None.
             # We write to a temp file and read the content back.
-            with tempfile.NamedTemporaryFile(
-                suffix=".html", delete=False, mode="w"
-            ) as tmp:
+            with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w") as tmp:
                 tmp_path = tmp.name
 
             qs.reports.html(
                 returns,
-                benchmark=benchmark,
+                benchmark=normalized_benchmark,
                 title=title,
                 output=tmp_path,
                 download_filename=tmp_path,

@@ -1119,7 +1119,11 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
             from datetime import UTC, datetime
             from decimal import Decimal
 
-            from msai.services.nautilus.audit_hook import OrderAuditWriter, OrderSubmittedFacts
+            from msai.services.nautilus.audit_hook import (
+                OrderAuditWriter,
+                OrderSubmittedFacts,
+                TradeFillFacts,
+            )
 
             writer = OrderAuditWriter(db=sf)  # keyword-only init (Codex fix)
             _cache = node.kernel.cache  # for fetching full order details
@@ -1144,7 +1148,9 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
                             _qty = Decimal(str(order.quantity)) if order else Decimal("0")
                             _price = None
                             _order_type = str(order.order_type) if order else "UNKNOWN"
-                            _instrument = str(order.instrument_id) if order else str(event.instrument_id)
+                            _instrument = (
+                                str(order.instrument_id) if order else str(event.instrument_id)
+                            )
 
                             await writer.write_submitted(
                                 OrderSubmittedFacts(
@@ -1162,10 +1168,100 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
                                 )
                             )
                         elif event_type == "OrderFilled":
-                            await writer.update_filled(str(event.client_order_id))
+                            # Phase 2 #4 port + Codex review P1/P2:
+                            # 1. write_trade_fill first — idempotent via
+                            #    (deployment_id, broker_trade_id) partial
+                            #    unique index. If the fill is a replay
+                            #    (reconciliation — nautilus.md gotcha 19
+                            #    — or a redelivered msgbus event), this
+                            #    returns False so downstream metric +
+                            #    audit work is suppressed.
+                            # 2. Only flip the audit row AND increment
+                            #    ORDERS_FILLED when a genuinely new fill
+                            #    was persisted. Reviewer objection P2:
+                            #    keeping ORDERS_FILLED inside
+                            #    update_filled inflated the counter on
+                            #    every warm-restart reconciliation pass.
+                            # 3. If the audit row is missing at
+                            #    update_filled time, an OrderSubmitted
+                            #    task is still in flight (asyncio race —
+                            #    create_task doesn't guarantee ordering)
+                            #    OR we never saw the submit for this
+                            #    fill (cold-reconciliation path). Log a
+                            #    WARN with enough context to find the
+                            #    orphaned audit row later; the Trade row
+                            #    itself is the authoritative record of
+                            #    the broker-side execution.
+                            _trade_persisted = False
+                            if p.deployment_id is not None:
+                                _last_px = getattr(event, "last_px", None)
+                                _last_qty = getattr(event, "last_qty", None)
+                                _commission = getattr(event, "commission", None)
+                                _ts_event_ns = getattr(event, "ts_event", None)
+                                _executed_at = (
+                                    datetime.fromtimestamp(_ts_event_ns / 1_000_000_000, UTC)
+                                    if _ts_event_ns
+                                    else datetime.now(UTC)
+                                )
+                                _order_side = str(getattr(event, "order_side", "UNKNOWN"))
+                                # Nautilus enums like ``OrderSide.BUY`` stringify
+                                # as ``"BUY"``; strip the enum prefix defensively
+                                # in case internal reprs change.
+                                if "." in _order_side:
+                                    _order_side = _order_side.rsplit(".", 1)[-1]
+                                _trade_persisted = await writer.write_trade_fill(
+                                    TradeFillFacts(
+                                        broker_trade_id=str(event.trade_id),
+                                        client_order_id=str(event.client_order_id),
+                                        deployment_id=p.deployment_id,
+                                        strategy_id=p.strategy_id or p.deployment_id,
+                                        strategy_code_hash=p.strategy_code_hash or "engine-audit",
+                                        instrument=str(event.instrument_id),
+                                        side=_order_side,
+                                        quantity=(
+                                            Decimal(str(_last_qty))
+                                            if _last_qty is not None
+                                            else Decimal("0")
+                                        ),
+                                        price=(
+                                            Decimal(str(_last_px))
+                                            if _last_px is not None
+                                            else Decimal("0")
+                                        ),
+                                        commission=(
+                                            Decimal(str(_commission).split()[0])
+                                            if _commission is not None
+                                            else None
+                                        ),
+                                        executed_at=_executed_at,
+                                    )
+                                )
+                            if _trade_persisted:
+                                _audit_updated = await writer.update_filled(
+                                    str(event.client_order_id)
+                                )
+                                if not _audit_updated:
+                                    print(  # noqa: T201 — structlog not wired in subprocess
+                                        f"[MSAI] OrderFilled for {event.client_order_id!s} "
+                                        "had no matching audit row; Trade persisted but "
+                                        "order_attempt_audits is stuck at pre-fill status "
+                                        "(asyncio race or cold-reconciliation replay).",
+                                        flush=True,
+                                    )
+                                from msai.services.observability.trading_metrics import (
+                                    ORDERS_FILLED,
+                                )
+
+                                ORDERS_FILLED.inc()
                         elif event_type == "OrderAccepted":
-                            broker_id = str(event.venue_order_id) if hasattr(event, "venue_order_id") else None
-                            await writer.update_accepted(str(event.client_order_id), broker_order_id=broker_id)
+                            broker_id = (
+                                str(event.venue_order_id)
+                                if hasattr(event, "venue_order_id")
+                                else None
+                            )
+                            await writer.update_accepted(
+                                str(event.client_order_id), broker_order_id=broker_id
+                            )
                         elif event_type == "OrderCanceled":
                             await writer.update_cancelled(str(event.client_order_id), reason=None)
                         elif event_type == "OrderRejected":

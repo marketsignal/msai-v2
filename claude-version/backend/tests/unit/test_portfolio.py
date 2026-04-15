@@ -36,9 +36,10 @@ def _make_portfolio_row(
     row.id = portfolio_id or _PORTFOLIO_ID
     row.name = name
     row.description = "A test portfolio"
-    row.objective = "max_sharpe"
+    row.objective = "maximize_sharpe"
     row.base_capital = 100000.0
     row.requested_leverage = 1.0
+    row.downside_target = None
     row.benchmark_symbol = "SPY"
     row.account_id = None
     row.created_by = None
@@ -75,11 +76,17 @@ def _make_run_row(
     row.portfolio_id = portfolio_id or _PORTFOLIO_ID
     row.status = status
     row.metrics = None
+    row.series = None
+    row.allocations = None
     row.report_path = None
     row.start_date = date(2025, 1, 1)
     row.end_date = date(2025, 12, 31)
+    row.max_parallelism = None
+    row.error_message = None
+    row.heartbeat_at = None
     row.created_by = None
     row.created_at = datetime.now(UTC)
+    row.updated_at = datetime.now(UTC)
     row.completed_at = None
     return row
 
@@ -163,7 +170,7 @@ class TestCreatePortfolio:
 
         data = PortfolioCreate(
             name="Test Portfolio",
-            objective="max_sharpe",
+            objective="maximize_sharpe",
             base_capital=100000.0,
             allocations=[
                 {"candidate_id": str(_CANDIDATE_ID), "weight": 0.6},
@@ -176,7 +183,7 @@ class TestCreatePortfolio:
 
         # Assert: 1 portfolio + 2 allocations = 3 add() calls
         assert result.name == "Test Portfolio"
-        assert result.objective == "max_sharpe"
+        assert result.objective == "maximize_sharpe"
         assert mock_db.add.call_count == 3
 
     async def test_create_portfolio_with_user_id(

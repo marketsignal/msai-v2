@@ -302,6 +302,19 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asynci
 
 
 async def _async_main() -> int:
+    # ``setup_logging`` configures structlog. The supervisor modules
+    # (__main__.py, main.py, process_manager.py, heartbeat_monitor.py)
+    # and ``live_command_bus`` all use stdlib ``logging.getLogger`` —
+    # without an explicit basicConfig those INFO records are dropped
+    # by stdlib's lastResort (WARNING+ only), which is exactly why
+    # the 2026-04-15 drill saw zero log output from the running
+    # supervisor. Configure stdlib alongside structlog so every
+    # module's logs reach stderr (and therefore ``docker logs``).
+    logging.basicConfig(
+        level=logging.DEBUG if settings.environment.lower() == "development" else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        force=True,
+    )
     setup_logging(settings.environment)
     logger = logging.getLogger(__name__)
     logger.info("live_supervisor_starting")

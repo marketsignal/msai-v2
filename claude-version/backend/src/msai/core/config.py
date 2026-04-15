@@ -10,7 +10,7 @@ from __future__ import annotations
 from os import cpu_count
 from pathlib import Path
 
-from pydantic import field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # In local dev: .../claude-version/backend/src/msai/core/config.py → parents[4] = claude-version/
@@ -54,8 +54,29 @@ class Settings(BaseSettings):
     # validates this via ``_validate_port_account_consistency`` —
     # a mismatch crashes the subprocess at ``build_live_trading_node_config``
     # time rather than silently sending orders to the wrong venue.
-    ib_host: str = "127.0.0.1"
-    ib_port: int = 4002
+    # Accept both the legacy names (``IB_HOST`` / ``IB_PORT`` — used
+    # by unit tests and local-dev setups) and the Docker-compose
+    # names (``IB_GATEWAY_HOST`` / ``IB_GATEWAY_PORT_PAPER`` — set on
+    # every service container). Before this alias, a backend running
+    # under ``docker compose`` saw only ``IB_GATEWAY_HOST`` and fell
+    # through to the 127.0.0.1:4002 defaults, so ``/account/health``
+    # probed localhost of its own container instead of the gateway
+    # container and always reported unreachable. Drill 2026-04-15.
+    #
+    # The legacy name is listed first so an operator-set ``IB_HOST``
+    # overrides the compose-wide default without editing compose
+    # files — useful when pointing a dev backend at a remote gateway.
+    # Live-port deployments set ``IB_PORT=4003`` explicitly because
+    # this alias only picks up the PAPER variant by design (the
+    # supervisor's paper/live mismatch guard refuses to cross-wire).
+    ib_host: str = Field(
+        default="127.0.0.1",
+        validation_alias=AliasChoices("IB_HOST", "IB_GATEWAY_HOST"),
+    )
+    ib_port: int = Field(
+        default=4002,
+        validation_alias=AliasChoices("IB_PORT", "IB_GATEWAY_PORT_PAPER"),
+    )
 
     # IB market data type: REALTIME (default, requires subscription),
     # DELAYED (15-min delayed, free for most instruments),
@@ -79,6 +100,21 @@ class Settings(BaseSettings):
     # Backtest execution tuning
     backtest_timeout_seconds: int = 30 * 60
 
+    # Portfolio job wall-clock budget.  Portfolio runs launch N candidate
+    # backtests, each bounded by ``backtest_timeout_seconds``; the arq
+    # ``job_timeout`` has to cover the *sequential* worst case —
+    # ``ceil(N / parallelism) × backtest_timeout`` with headroom — or
+    # otherwise valid portfolios get killed before any child actually
+    # times out.  Sizing:
+    #
+    #     portfolio_job_timeout_seconds ≈ ceil(max_N / compute_slot_limit)
+    #                                     × backtest_timeout_seconds × 1.1
+    #
+    # Defaults to ~8 sequential 30-min batches (4 h).  Operators who raise
+    # ``backtest_timeout_seconds`` or expect portfolios with >8 allocations
+    # AND low ``max_parallelism`` must bump this in lockstep.
+    portfolio_job_timeout_seconds: int = 8 * 30 * 60  # 4 hours
+
     # Job watchdog thresholds
     job_stale_seconds: int = 600  # 10 min without heartbeat = stale
     job_pending_grace_seconds: int = 600  # 10 min pending without starting = stuck
@@ -97,6 +133,28 @@ class Settings(BaseSettings):
     compute_slot_wait_seconds: int = 900  # max time to wait for a slot
     compute_slot_lease_seconds: int = 120  # TTL per lease
     compute_slot_poll_seconds: int = 2  # polling interval while waiting
+
+    # Daily ingest scheduling (Phase 2 #3 — Codex parity port).
+    # The arq cron triggers `run_nightly_ingest_if_due` every minute;
+    # the wrapper checks these settings + a JSON state file to decide
+    # whether to actually run today. Operators in non-US markets can set
+    # the timezone (LSE 16:30 London, TSE 15:00 Tokyo) without a code
+    # change; setting `daily_ingest_enabled=false` disables the cron
+    # without removing the job from the worker.
+    daily_ingest_enabled: bool = True
+    daily_ingest_timezone: str = "America/New_York"  # default: post-US-close ingest
+    # Range-validated so an out-of-range env var (e.g. HOUR=25) fails fast
+    # at config load with a clear pydantic ValidationError rather than
+    # crashing every cron tick inside `_is_due` at datetime.replace.
+    daily_ingest_hour: int = Field(default=18, ge=0, le=23)
+    daily_ingest_minute: int = Field(default=0, ge=0, le=59)
+    # Session-date offset for the target ingest. Default 0 assumes a
+    # post-close same-day schedule: 18:00 ET on April 14 ingests
+    # April 14's session. If operators move to an overnight schedule
+    # (e.g. 02:00 local-tz the morning after), set this to -1 so the
+    # wrapper ingests yesterday's session instead of today's. Must be
+    # non-positive — ingesting future sessions is never correct.
+    daily_ingest_session_offset_days: int = Field(default=0, ge=-7, le=0)
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
@@ -134,6 +192,17 @@ class Settings(BaseSettings):
         return self.research_root / "optuna"
 
     @property
+    def scheduler_state_path(self) -> Path:
+        """JSON state file for the daily ingest scheduler.
+
+        Records ``last_enqueued_date`` so the cron wrapper is idempotent
+        across worker restarts and concurrent fires — only one ingest
+        per scheduled-tz calendar day. Stored under ``data_root`` so it
+        survives container rebuilds via the bind-mounted volume.
+        """
+        return self.data_root / "scheduler" / "daily_ingest_state.json"
+
+    @property
     def nautilus_catalog_root(self) -> Path:
         """Root directory for the NautilusTrader ``ParquetDataCatalog``
         (``{data_root}/nautilus``).
@@ -144,6 +213,16 @@ class Settings(BaseSettings):
         by ``BacktestNode`` during backtest execution.
         """
         return self.data_root / "nautilus"
+
+    @property
+    def alerts_path(self) -> Path:
+        """File-backed operational alert history (``{data_root}/alerts/alerts.json``).
+
+        Written by :class:`msai.services.alerting.AlertingService` and read
+        by the ``/api/v1/alerts/`` router for the dashboard audit trail.
+        Capped at 200 records (newest first).
+        """
+        return self.data_root / "alerts" / "alerts.json"
 
 
 settings: Settings = Settings()

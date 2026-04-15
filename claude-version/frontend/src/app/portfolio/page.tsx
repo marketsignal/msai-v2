@@ -125,7 +125,13 @@ function CreatePortfolioDialog({
   }, []);
 
   const addAllocation = (): void => {
-    setAllocations((prev) => [...prev, { candidate_id: "", weight: "0.5" }]);
+    // Seed weight as empty string — the backend treats a missing weight
+    // as a request for heuristic derivation (Sharpe-/Sortino-/profit-
+    // weighted per the objective).  A fixed ``0.5`` default defeated
+    // that path for every objective except ``manual``.  For ``manual``
+    // objective, a backend ``model_validator`` rejects omitted weights
+    // with a clear error, so the form still fails loudly when required.
+    setAllocations((prev) => [...prev, { candidate_id: "", weight: "" }]);
   };
 
   const removeAllocation = (idx: number): void => {
@@ -158,12 +164,24 @@ function CreatePortfolioDialog({
       return;
     }
 
+    // Serialize an empty or unparseable weight as ``null`` so the
+    // backend applies its heuristic-by-objective derivation.  The
+    // previous ``|| 0`` fallback was silently rejected by the tightened
+    // ``gt=0.0`` Pydantic validator and, before that, silently
+    // equal-weighted every allocation regardless of objective.
     const parsedAllocations = allocations
       .filter((a) => a.candidate_id.trim())
-      .map((a) => ({
-        candidate_id: a.candidate_id.trim(),
-        weight: parseFloat(a.weight) || 0,
-      }));
+      .map((a) => {
+        const trimmed = a.weight.trim();
+        const parsed = trimmed === "" ? null : parseFloat(trimmed);
+        return {
+          candidate_id: a.candidate_id.trim(),
+          weight:
+            parsed !== null && Number.isFinite(parsed) && parsed > 0
+              ? parsed
+              : null,
+        };
+      });
 
     setSubmitting(true);
     setFormError(null);
@@ -317,8 +335,9 @@ function CreatePortfolioDialog({
             </div>
             {allocations.length === 0 ? (
               <p className="text-xs text-muted-foreground">
-                No allocations added. You can create the portfolio first and add
-                allocations later via the API.
+                At least one allocation is required. Weight is optional — leave
+                blank to let the portfolio objective derive it from candidate
+                metrics.
               </p>
             ) : (
               <div className="space-y-2">

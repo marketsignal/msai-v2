@@ -285,3 +285,97 @@ class TestLiveTrades:
         assert "total" in body
         assert isinstance(body["trades"], list)
         assert body["total"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Supervisor-liveness guard (drill 2026-04-15 P0-A)
+# ---------------------------------------------------------------------------
+
+
+class TestLiveStartSupervisorGuard:
+    """/live/start must fail fast with 503 when the live-supervisor
+    is not actively consuming from the command bus. Before this
+    guard, operators hit a silent 60 s poll timeout (504) when the
+    broker compose profile was not active or the supervisor
+    container had crashed."""
+
+    async def test_live_start_returns_503_when_no_consumer(
+        self,
+        mock_db: AsyncMock,
+        mock_command_bus: MagicMock,
+    ) -> None:
+        """``XINFO CONSUMERS`` returning an empty list means no
+        supervisor has ever registered with the group. Endpoint
+        must reject the request with a 503 + actionable error."""
+        mock_command_bus._redis.xinfo_consumers = AsyncMock(return_value=[])  # noqa: SLF001
+
+        async def _override_get_db() -> AsyncGenerator[AsyncMock, None]:
+            yield mock_db
+
+        async def _override_get_bus() -> LiveCommandBus:
+            return mock_command_bus
+
+        app.dependency_overrides[get_db] = _override_get_db
+        app.dependency_overrides[get_command_bus] = _override_get_bus
+
+        transport = httpx.ASGITransport(app=app)
+        try:
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                response = await client.post(
+                    "/api/v1/live/start",
+                    json={
+                        "strategy_id": "00000000-0000-0000-0000-000000000001",
+                        "config": {},
+                        "instruments": ["AAPL"],
+                        "paper_trading": True,
+                    },
+                )
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+            app.dependency_overrides.pop(get_command_bus, None)
+
+        assert response.status_code == 503
+        assert "live-supervisor" in response.json()["detail"]
+
+    async def test_live_start_returns_503_when_consumer_is_stale(
+        self,
+        mock_db: AsyncMock,
+        mock_command_bus: MagicMock,
+    ) -> None:
+        """A consumer whose idle time exceeds the threshold
+        (supervisor crashed, container stopped, etc.) is treated
+        as absent. 60 s idle >> the 15 s threshold."""
+        mock_command_bus._redis.xinfo_consumers = AsyncMock(  # noqa: SLF001
+            return_value=[{"name": "zombie", "idle": 60_000, "pending": 0}]
+        )
+
+        async def _override_get_db() -> AsyncGenerator[AsyncMock, None]:
+            yield mock_db
+
+        async def _override_get_bus() -> LiveCommandBus:
+            return mock_command_bus
+
+        app.dependency_overrides[get_db] = _override_get_db
+        app.dependency_overrides[get_command_bus] = _override_get_bus
+
+        transport = httpx.ASGITransport(app=app)
+        try:
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                response = await client.post(
+                    "/api/v1/live/start",
+                    json={
+                        "strategy_id": "00000000-0000-0000-0000-000000000001",
+                        "config": {},
+                        "instruments": ["AAPL"],
+                        "paper_trading": True,
+                    },
+                )
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+            app.dependency_overrides.pop(get_command_bus, None)
+
+        assert response.status_code == 503
