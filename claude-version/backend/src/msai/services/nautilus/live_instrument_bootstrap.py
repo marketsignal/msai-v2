@@ -67,6 +67,24 @@ PHASE_1_PAPER_SYMBOLS: dict[str, IBContract] = {
         exchange="IDEALPRO",
         currency="USD",
     ),
+    # ETF — S&P 500 SPDR. Routes via SMART, primary listing is ARCA.
+    "SPY": IBContract(
+        secType="STK",
+        symbol="SPY",
+        exchange="SMART",
+        primaryExchange="ARCA",
+        currency="USD",
+    ),
+    # E-mini S&P 500 futures — KNOWN-BROKEN contract spec. Tried
+    # ``exchange="CME"`` on 2026-04-15; IB rejected with
+    # ``Unable to resolve contract details``. Needs ``exchange=
+    # "GLOBEX"`` AND a ``lastTradeDateOrContractMonth`` for the
+    # front-month resolution (or a continuous-future resolver). Left
+    # commented so the next operator sees both the attempt and the
+    # gap.
+    # "ES": IBContract(secType="FUT", symbol="ES", exchange="GLOBEX",
+    #                  lastTradeDateOrContractMonth="<YYYYMM>",
+    #                  currency="USD"),
 }
 
 
