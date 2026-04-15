@@ -46,6 +46,7 @@ from msai.schemas.research import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _now() -> datetime:
     return datetime(2026, 4, 12, 10, 0, 0)
 
@@ -57,6 +58,7 @@ def _uuid() -> UUID:
 # ---------------------------------------------------------------------------
 # AssetUniverse schemas
 # ---------------------------------------------------------------------------
+
 
 class TestAssetUniverseCreate:
     def test_valid_create(self) -> None:
@@ -137,6 +139,7 @@ class TestAssetUniverseListResponse:
 # ---------------------------------------------------------------------------
 # Research schemas
 # ---------------------------------------------------------------------------
+
 
 class TestResearchSweepRequest:
     def test_valid_sweep(self) -> None:
@@ -291,6 +294,7 @@ class TestResearchPromotionResponse:
 # Graduation schemas
 # ---------------------------------------------------------------------------
 
+
 class TestGraduationCandidateCreate:
     def test_valid_create(self) -> None:
         schema = GraduationCandidateCreate(
@@ -379,6 +383,7 @@ class TestGraduationTransitionListResponse:
 # Portfolio schemas
 # ---------------------------------------------------------------------------
 
+
 class TestPortfolioAllocationInput:
     def test_valid_allocation(self) -> None:
         schema = PortfolioAllocationInput(candidate_id=_uuid(), weight=0.5)
@@ -392,13 +397,21 @@ class TestPortfolioAllocationInput:
         with pytest.raises(ValidationError):
             PortfolioAllocationInput(candidate_id=_uuid(), weight=1.1)
 
-    def test_weight_zero_valid(self) -> None:
-        schema = PortfolioAllocationInput(candidate_id=_uuid(), weight=0.0)
-        assert schema.weight == 0.0
+    def test_weight_zero_rejected(self) -> None:
+        # Weight 0.0 no longer a valid "exclude" signal — omit the
+        # allocation entirely instead.  ``gt=0.0`` disambiguates from the
+        # "no explicit weight, derive heuristically" path (weight=None).
+        with pytest.raises(ValidationError):
+            PortfolioAllocationInput(candidate_id=_uuid(), weight=0.0)
 
     def test_weight_one_valid(self) -> None:
         schema = PortfolioAllocationInput(candidate_id=_uuid(), weight=1.0)
         assert schema.weight == 1.0
+
+    def test_weight_none_valid(self) -> None:
+        # None = "derive heuristic weight from candidate metrics".
+        schema = PortfolioAllocationInput(candidate_id=_uuid())
+        assert schema.weight is None
 
 
 class TestPortfolioCreate:
@@ -429,8 +442,60 @@ class TestPortfolioCreate:
             PortfolioCreate(
                 name="Test",
                 base_capital=50000.0,
-                allocations=[],
+                allocations=[PortfolioAllocationInput(candidate_id=_uuid(), weight=1.0)],
             )  # type: ignore[call-arg]
+
+    def test_empty_allocations_rejected(self) -> None:
+        # Orchestration deterministically fails on empty portfolios;
+        # reject at the API boundary so the operator learns immediately
+        # rather than discovering it on every /runs call.
+        with pytest.raises(ValidationError):
+            PortfolioCreate(
+                name="Empty",
+                objective="equal_weight",
+                base_capital=1000.0,
+                allocations=[],
+            )
+
+    def test_manual_objective_requires_all_weights(self) -> None:
+        # ``manual`` promises operator-set weights; silently falling
+        # through to heuristic equal-weight would not match intent.
+        with pytest.raises(ValidationError, match="manual requires an explicit weight"):
+            PortfolioCreate(
+                name="Manual with gap",
+                objective="manual",
+                base_capital=10000.0,
+                allocations=[
+                    PortfolioAllocationInput(candidate_id=_uuid(), weight=0.5),
+                    PortfolioAllocationInput(candidate_id=_uuid()),  # weight=None
+                ],
+            )
+
+    def test_manual_objective_accepts_full_weights(self) -> None:
+        schema = PortfolioCreate(
+            name="Manual OK",
+            objective="manual",
+            base_capital=10000.0,
+            allocations=[
+                PortfolioAllocationInput(candidate_id=_uuid(), weight=0.6),
+                PortfolioAllocationInput(candidate_id=_uuid(), weight=0.4),
+            ],
+        )
+        assert len(schema.allocations) == 2
+
+    def test_sharpe_objective_allows_omitted_weights(self) -> None:
+        # Heuristic-driven objectives welcome omitted weights — they're
+        # derived at orchestration time from candidate metrics.
+        schema = PortfolioCreate(
+            name="Heuristic",
+            objective="maximize_sharpe",
+            base_capital=10000.0,
+            allocations=[
+                PortfolioAllocationInput(candidate_id=_uuid()),
+                PortfolioAllocationInput(candidate_id=_uuid()),
+            ],
+        )
+        assert all(alloc.weight is None for alloc in schema.allocations)
 
 
 class TestPortfolioResponse:
@@ -444,6 +509,7 @@ class TestPortfolioResponse:
             "objective": "maximize_sharpe",
             "base_capital": 100000.0,
             "requested_leverage": 1.0,
+            "downside_target": None,
             "benchmark_symbol": "SPY",
             "account_id": None,
             "created_at": now,
@@ -452,6 +518,25 @@ class TestPortfolioResponse:
         resp = PortfolioResponse.model_validate(data)
         assert resp.name == "My Portfolio"
         assert resp.benchmark_symbol == "SPY"
+
+    def test_legacy_max_sharpe_accepted(self) -> None:
+        # Pre-rename rows stored `max_sharpe`; the response schema must
+        # translate on read so GET /portfolios keeps working on legacy data.
+        data = {
+            "id": _uuid(),
+            "name": "Legacy",
+            "description": None,
+            "objective": "max_sharpe",
+            "base_capital": 100.0,
+            "requested_leverage": 1.0,
+            "downside_target": None,
+            "benchmark_symbol": None,
+            "account_id": None,
+            "created_at": _now(),
+            "updated_at": _now(),
+        }
+        resp = PortfolioResponse.model_validate(data)
+        assert resp.objective.value == "maximize_sharpe"
 
 
 class TestPortfolioListResponse:
@@ -484,10 +569,16 @@ class TestPortfolioRunResponse:
             "portfolio_id": pid,
             "status": "completed",
             "metrics": {"sharpe": 1.8, "max_dd": -0.12},
+            "series": None,
+            "allocations": None,
             "report_path": "/data/reports/run_123.html",
             "start_date": date(2024, 1, 1),
             "end_date": date(2025, 1, 1),
+            "max_parallelism": None,
+            "error_message": None,
+            "heartbeat_at": None,
             "created_at": now,
+            "updated_at": now,
             "completed_at": now,
         }
         resp = PortfolioRunResponse.model_validate(data)
