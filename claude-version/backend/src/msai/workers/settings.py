@@ -130,15 +130,19 @@ class WorkerSettings:
     # Cron jobs — scheduled background work.
     # PnL: 21:30 UTC = safe for both EST (4:30 PM) and EDT (5:30 PM),
     # always after US equity close (4:00 PM ET).
-    # Ingest: 06:00 UTC = safe for both EST (1:00 AM) and EDT (2:00 AM).
+    # Ingest: tz-aware via wrapper. arq fires `run_nightly_ingest_if_due`
+    #   every minute; the wrapper consults DAILY_INGEST_TIMEZONE / HOUR
+    #   / MINUTE / ENABLED + a JSON state file (Phase 2 #3 — Codex
+    #   parity) so non-US markets can schedule by local close and the
+    #   ingest is at-most-once per scheduled-tz calendar day.
     # Watchdog: every 60 seconds (minute=None, second=0 → fires at :00 each minute).
     from arq.cron import cron as _cron
 
-    from msai.workers.nightly_ingest import run_nightly_ingest as _nightly
+    from msai.workers.nightly_ingest import run_nightly_ingest_if_due as _nightly_if_due
     from msai.workers.pnl_aggregation import aggregate_daily_pnl as _pnl
 
     cron_jobs = [
         _cron(_pnl, hour=21, minute=30),
-        _cron(_nightly, hour=6, minute=0),
-        _cron(_watchdog, minute=None, second=0),  # every minute at :00
+        _cron(_nightly_if_due, minute=None, second=0),
+        _cron(_watchdog, minute=None, second=0),
     ]

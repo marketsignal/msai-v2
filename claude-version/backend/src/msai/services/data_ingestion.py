@@ -170,11 +170,39 @@ class DataIngestionService:
         provider: str = "auto",
         dataset: str | None = None,
         schema: str | None = None,
+        target_date: date | None = None,
     ) -> dict:
-        """Incremental daily update -- fetches yesterday's data.
+        """Fetch a single trading session's data.
 
-        Convenience method that delegates to :meth:`ingest_historical` with
-        ``start`` and ``end`` set to yesterday and today.
+        ``target_date`` is the session date to fetch (caller's calendar,
+        typically the scheduled-tz date post-close). This method asks
+        the provider for ``[target_date, target_date + 1)`` so Databento's
+        end-exclusive window yields just that session's bars — Codex iter
+        3 P1.
+
+        ``target_date`` defaults to ``yesterday`` in the process tz so
+        existing CLI / manual-trigger callers preserve the "yesterday's
+        session" semantics the method previously had.
+
+        **Provider window semantics** (Codex iter 5 P2 — follow-up): the
+        ``[target_date, target_date + 1)`` window is exclusive on the
+        ``end`` boundary. Databento honours that. Polygon's ``/v2/aggs``
+        range endpoint is end-*inclusive*, so a Polygon-routed
+        ``ingest_daily(target_date=X)`` call fetches both ``X`` and
+        ``X + 1``. The duplicate ``X + 1`` rows are dropped by
+        ``ParquetStore`` (timestamp-keyed dedup on write), so no data
+        corruption — only wasted download bandwidth. Normalising the
+        per-provider semantics is tracked as a separate improvement; the
+        prior codepath (``end = date.today()``) had the same Polygon
+        2-day overlap, so this isn't a Phase 2 #3 regression.
+
+        **Mixed-exchange limitation** (Codex iter 5 P2 — follow-up): a
+        single ``target_date`` is applied to every asset regardless of
+        exchange. Operators running mixed LSE + NYSE universes should
+        either schedule separate daily ingests per exchange (requires
+        multiple worker configurations) or pick a schedule after the
+        latest market close. Per-exchange scheduling is out of scope
+        for this port.
 
         Args:
             asset_class: Asset class name.
@@ -182,13 +210,17 @@ class DataIngestionService:
             provider: Data provider override.
             dataset: Databento dataset override.
             schema: Databento schema override.
+            target_date: Session date to ingest. Default: yesterday
+                (process tz). The tz-aware scheduler wrapper passes
+                ``current.date()`` in the scheduled tz so a 18:00 ET ingest
+                on a UTC host fetches the just-closed US session.
 
         Returns:
             Detailed payload with per-symbol ingestion results.
         """
-        yesterday = date.today() - timedelta(days=1)
-        start = yesterday.isoformat()
-        end = date.today().isoformat()
+        session_date = target_date if target_date is not None else date.today() - timedelta(days=1)
+        start = session_date.isoformat()
+        end = (session_date + timedelta(days=1)).isoformat()
         return await self.ingest_historical(
             asset_class,
             symbols,
@@ -241,9 +273,7 @@ class DataIngestionService:
         """
         resolved_provider = provider
         if resolved_provider == "auto":
-            resolved_provider = (
-                "databento" if asset_class in {"equities", "futures"} else "polygon"
-            )
+            resolved_provider = "databento" if asset_class in {"equities", "futures"} else "polygon"
 
         resolved_schema = schema or settings.databento_default_schema
         if resolved_provider == "databento":

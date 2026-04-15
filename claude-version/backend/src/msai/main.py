@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
 from msai.api.account import router as account_router
+from msai.api.alerts import router as alerts_router
 from msai.api.asset_universe import router as universe_router
 from msai.api.auth import router as auth_router
 from msai.api.backtests import router as backtests_router
@@ -144,12 +145,16 @@ async def _start_projection_tasks() -> None:
 
         async with async_session_factory() as session:
             active_deps = (
-                await session.execute(
-                    select(LiveDeployment).where(
-                        LiveDeployment.status.in_(("running", "ready", "starting", "building"))
+                (
+                    await session.execute(
+                        select(LiveDeployment).where(
+                            LiveDeployment.status.in_(("running", "ready", "starting", "building"))
+                        )
                     )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             for dep in active_deps:
                 if dep.message_bus_stream:
                     registry.register(
@@ -234,6 +239,7 @@ app.include_router(research_router)
 app.include_router(graduation_router)
 app.include_router(portfolio_router)
 app.include_router(strategy_templates_router)
+app.include_router(alerts_router)
 
 
 # ---------------------------------------------------------------------------
