@@ -302,3 +302,46 @@ async def test_plan_constants_are_stable() -> None:
     assert LIVE_COMMAND_STREAM == "msai:live:commands"
     assert LIVE_COMMAND_GROUP == "live-supervisor"
     assert LIVE_COMMAND_DLQ_STREAM == "msai:live:commands:dlq"
+
+
+# ---------------------------------------------------------------------------
+# Publish-before-consumer-group regression (drill 2026-04-15)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_publish_before_consumer_group_is_still_delivered(
+    redis_client: AsyncRedis,
+) -> None:
+    """A command published before the supervisor has ever started MUST
+    still reach the supervisor when it eventually comes up.
+
+    The drill on 2026-04-15 hit exactly this: FastAPI enqueued
+    ``/live/start`` while ``live-supervisor`` was down (broker
+    profile not active). When the supervisor finally started it
+    called ``XGROUP CREATE ... id="$"``, which positioned
+    ``last-delivered-id`` at the stream's current tail — i.e. PAST
+    the waiting command. ``XREADGROUP > `` then saw zero new
+    messages and the command sat in the stream forever, unreachable.
+
+    The publish path MUST ``ensure_group()`` before ``xadd`` so the
+    consumer group exists BEFORE any command is written — otherwise
+    the first publish to a fresh Redis (or after a ``FLUSHDB``) is
+    silently lost.
+    """
+    from msai.services.live_command_bus import LiveCommandBus
+
+    # Fresh bus; NO explicit ensure_group call. Reproduces the
+    # production path where FastAPI calls publish_start without the
+    # supervisor having ever been up.
+    bus = LiveCommandBus(redis=redis_client, min_idle_ms=0, recovery_interval_s=60)
+    dep_id = uuid4()
+    await bus.publish_start(dep_id, {"paper_trading": True})
+
+    # Now the "supervisor" starts: consume and expect the earlier
+    # command. Without the fix, this times out because the group is
+    # created at "$" = stream tail and the pending entry is skipped.
+    commands = await _consume_n(bus, consumer_id="supervisor-late-start", n=1, timeout_s=3.0)
+    assert len(commands) == 1
+    assert commands[0].command_type is LiveCommandType.START
+    assert commands[0].deployment_id == dep_id
