@@ -244,11 +244,25 @@ class PositionReader:
         trader_id: str,
         account_id: str,
     ) -> AccountStateUpdate | None:
+        # Nautilus ``AccountId`` requires the canonical
+        # ``"VENUE-ACCOUNT"`` form (e.g., ``"INTERACTIVE_BROKERS-DUP733213"``)
+        # — passing the bare broker account string (``"DUP733213"``) raises
+        # ``ValueError: value was malformed: did not contain a hyphen '-'``
+        # and takes down the whole WS snapshot before any downstream field
+        # is emitted. Surfaced end-to-end 2026-04-16 during Phase 2 #4
+        # reconnect-snapshot verification: a fresh backend with an empty
+        # ``ProjectionState`` fell to this cold path on every connect and
+        # every client got a 1011 close. Qualify with the IB venue prefix
+        # here so the format always matches what Nautilus's own
+        # ``AccountState`` events emit.
+        qualified_account = (
+            account_id if "-" in account_id else f"INTERACTIVE_BROKERS-{account_id}"
+        )
         adapter = self._build_adapter(trader_id)
         try:
             cache = Cache(database=adapter)
             cache.cache_all()
-            account = cache.account(AccountId(account_id))
+            account = cache.account(AccountId(qualified_account))
             if account is None:
                 return None
             return self._to_account_update(account, deployment_id)

@@ -38,7 +38,9 @@ from msai.api.websocket import (
 )
 from msai.services.nautilus.projection.events import (
     AccountStateUpdate,
+    DeploymentStatusEvent,
     PositionSnapshot,
+    RiskHaltEvent,
 )
 
 
@@ -140,15 +142,41 @@ async def test_authenticate_disconnect_returns_none() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_send_initial_snapshot_with_positions_and_account() -> None:
-    ws = _fake_websocket()
-    deployment_id = uuid4()
+def _make_deployment(deployment_id: Any) -> Any:
+    """Shared deployment MagicMock used by the snapshot tests."""
     deployment = MagicMock()
     deployment.id = deployment_id
     deployment.trader_id = "MSAI-test"
     deployment.strategy_id_full = "EMACross-test"
     deployment.account_id = "DU12345"
+    return deployment
+
+
+def _make_reader(positions: list[Any], account: Any) -> Any:
+    reader = MagicMock()
+    reader.get_open_positions = AsyncMock(return_value=positions)
+    reader.get_account = AsyncMock(return_value=account)
+    return reader
+
+
+def _make_state(
+    *,
+    status: Any = None,
+    halt: Any = None,
+    halted: bool = False,
+) -> Any:
+    state = MagicMock()
+    state.get_status = MagicMock(return_value=status)
+    state.get_halt = MagicMock(return_value=halt)
+    state.is_halted = MagicMock(return_value=halted)
+    return state
+
+
+@pytest.mark.asyncio
+async def test_send_initial_snapshot_with_positions_and_account(monkeypatch: Any) -> None:
+    ws = _fake_websocket()
+    deployment_id = uuid4()
+    deployment = _make_deployment(deployment_id)
 
     pos = PositionSnapshot(
         deployment_id=deployment_id,
@@ -168,11 +196,24 @@ async def test_send_initial_snapshot_with_positions_and_account() -> None:
         ts=datetime.now(UTC),
     )
 
-    reader = MagicMock()
-    reader.get_open_positions = AsyncMock(return_value=[pos])
-    reader.get_account = AsyncMock(return_value=acct)
+    # Stub the DB-backed reconnect readers — this test is about the
+    # positions/account path specifically.
+    monkeypatch.setattr(
+        "msai.api.websocket.load_open_orders_for_deployment",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        "msai.api.websocket.load_recent_trades_for_deployment",
+        AsyncMock(return_value=[]),
+    )
 
-    await _send_initial_snapshot(ws, deployment=deployment, position_reader=reader)
+    await _send_initial_snapshot(
+        ws,
+        deployment=deployment,
+        position_reader=_make_reader([pos], acct),
+        projection_state=_make_state(),
+        db=MagicMock(),
+    )
 
     ws.send_json.assert_awaited_once()
     payload = ws.send_json.call_args.args[0]
@@ -185,24 +226,144 @@ async def test_send_initial_snapshot_with_positions_and_account() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_initial_snapshot_with_no_account() -> None:
+async def test_send_initial_snapshot_with_no_account(monkeypatch: Any) -> None:
     ws = _fake_websocket()
     deployment_id = uuid4()
-    deployment = MagicMock()
-    deployment.id = deployment_id
-    deployment.trader_id = "MSAI-test"
-    deployment.strategy_id_full = "EMACross-test"
-    deployment.account_id = "DU12345"
+    deployment = _make_deployment(deployment_id)
 
-    reader = MagicMock()
-    reader.get_open_positions = AsyncMock(return_value=[])
-    reader.get_account = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        "msai.api.websocket.load_open_orders_for_deployment",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        "msai.api.websocket.load_recent_trades_for_deployment",
+        AsyncMock(return_value=[]),
+    )
 
-    await _send_initial_snapshot(ws, deployment=deployment, position_reader=reader)
+    await _send_initial_snapshot(
+        ws,
+        deployment=deployment,
+        position_reader=_make_reader([], None),
+        projection_state=_make_state(),
+        db=MagicMock(),
+    )
 
     payload = ws.send_json.call_args.args[0]
     assert payload["positions"] == []
     assert payload["account"] is None
+
+
+@pytest.mark.asyncio
+async def test_send_initial_snapshot_includes_orders_trades_status_and_halt(
+    monkeypatch: Any,
+) -> None:
+    """Council-mandated reconnect invariant (Phase 2 #4, Option B):
+    a reconnecting client MUST receive orders, trades, status, and
+    risk_halt alongside positions + account. Four sources each
+    flow into distinct payload keys so a UI regression in any one
+    is test-visible.
+    """
+    ws = _fake_websocket()
+    deployment_id = uuid4()
+    deployment = _make_deployment(deployment_id)
+
+    order_row = {
+        "id": str(uuid4()),
+        "client_order_id": "O-1",
+        "instrument_id": "AAPL.NASDAQ",
+        "side": "BUY",
+        "quantity": "10",
+        "price": "150.00",
+        "order_type": "MARKET",
+        "status": "submitted",
+        "reason": None,
+        "broker_order_id": None,
+        "ts_attempted": datetime.now(UTC).isoformat(),
+    }
+    trade_row = {
+        "id": str(uuid4()),
+        "deployment_id": str(deployment_id),
+        "instrument": "AAPL.NASDAQ",
+        "side": "BUY",
+        "quantity": "10",
+        "price": "150.00",
+        "commission": "0.05",
+        "broker_trade_id": "T-1",
+        "client_order_id": "O-0",
+        "pnl": None,
+        "is_live": True,
+        "executed_at": datetime.now(UTC).isoformat(),
+    }
+    status_evt = DeploymentStatusEvent(
+        deployment_id=deployment_id,
+        status="running",
+        ts=datetime.now(UTC),
+    )
+    halt_evt = RiskHaltEvent(
+        deployment_id=deployment_id,
+        reason="manual_kill_all",
+        set_at=datetime.now(UTC),
+    )
+
+    monkeypatch.setattr(
+        "msai.api.websocket.load_open_orders_for_deployment",
+        AsyncMock(return_value=[order_row]),
+    )
+    monkeypatch.setattr(
+        "msai.api.websocket.load_recent_trades_for_deployment",
+        AsyncMock(return_value=[trade_row]),
+    )
+
+    await _send_initial_snapshot(
+        ws,
+        deployment=deployment,
+        position_reader=_make_reader([], None),
+        projection_state=_make_state(status=status_evt, halt=halt_evt, halted=True),
+        db=MagicMock(),
+    )
+
+    payload = ws.send_json.call_args.args[0]
+    assert payload["orders"] == [order_row]
+    assert payload["trades"] == [trade_row]
+    assert payload["status"] is not None
+    assert payload["status"]["status"] == "running"
+    assert payload["risk_halt"]["halted"] is True
+    assert payload["risk_halt"]["event"]["reason"] == "manual_kill_all"
+
+
+@pytest.mark.asyncio
+async def test_send_initial_snapshot_with_no_orders_or_trades_returns_empty_lists(
+    monkeypatch: Any,
+) -> None:
+    """Fresh deployment with no audit rows: orders and trades are
+    empty lists (not ``None`` / missing keys) so the UI doesn't
+    have to distinguish 'never fetched' from 'fetched and empty'."""
+    ws = _fake_websocket()
+    deployment_id = uuid4()
+    deployment = _make_deployment(deployment_id)
+
+    monkeypatch.setattr(
+        "msai.api.websocket.load_open_orders_for_deployment",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        "msai.api.websocket.load_recent_trades_for_deployment",
+        AsyncMock(return_value=[]),
+    )
+
+    await _send_initial_snapshot(
+        ws,
+        deployment=deployment,
+        position_reader=_make_reader([], None),
+        projection_state=_make_state(status=None, halt=None, halted=False),
+        db=MagicMock(),
+    )
+
+    payload = ws.send_json.call_args.args[0]
+    assert payload["orders"] == []
+    assert payload["trades"] == []
+    assert payload["status"] is None
+    assert payload["risk_halt"] == {"halted": False, "event": None}
 
 
 # ---------------------------------------------------------------------------
