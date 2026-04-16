@@ -16,7 +16,6 @@ Immutable row → no ``updated_at`` column; ``created_at`` only.
 
 from __future__ import annotations
 
-from datetime import datetime  # noqa: TC003
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
@@ -26,11 +25,10 @@ from sqlalchemy import (
     Integer,
     String,
     UniqueConstraint,
-    func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from msai.models.base import Base
+from msai.models.base import Base, CreatedAtMixin
 
 if TYPE_CHECKING:
     from msai.models.live_portfolio_revision_strategy import (
@@ -38,7 +36,7 @@ if TYPE_CHECKING:
     )
 
 
-class LivePortfolioRevision(Base):
+class LivePortfolioRevision(CreatedAtMixin, Base):
     """Immutable snapshot of a portfolio's composition."""
 
     __tablename__ = "live_portfolio_revisions"
@@ -65,9 +63,6 @@ class LivePortfolioRevision(Base):
     composition_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     is_frozen: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="false"
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        server_default=func.now(), nullable=False
     )
 
     strategies: Mapped[list[LivePortfolioRevisionStrategy]] = relationship(

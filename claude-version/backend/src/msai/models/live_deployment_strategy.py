@@ -8,14 +8,13 @@ Immutable on create.
 
 from __future__ import annotations
 
-from datetime import datetime  # noqa: TC003
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
-from sqlalchemy import ForeignKey, String, UniqueConstraint, func
+from sqlalchemy import ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from msai.models.base import Base
+from msai.models.base import Base, CreatedAtMixin
 
 if TYPE_CHECKING:
     from msai.models.live_portfolio_revision_strategy import (
@@ -23,7 +22,7 @@ if TYPE_CHECKING:
     )
 
 
-class LiveDeploymentStrategy(Base):
+class LiveDeploymentStrategy(CreatedAtMixin, Base):
     """One strategy instance inside a live deployment."""
 
     __tablename__ = "live_deployment_strategies"
@@ -49,9 +48,6 @@ class LiveDeploymentStrategy(Base):
         index=True,
     )
     strategy_id_full: Mapped[str] = mapped_column(String(280), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        server_default=func.now(), nullable=False
-    )
 
     revision_strategy: Mapped[LivePortfolioRevisionStrategy] = relationship(
         lazy="selectin"

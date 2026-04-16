@@ -153,11 +153,9 @@ class PortfolioService:
 
         The partial unique index ``uq_one_draft_per_portfolio``
         guarantees at most one draft per portfolio; a concurrent caller
-        losing the race will catch an ``IntegrityError`` on flush and
-        the retry will find the winner's draft via
-        :meth:`get_current_draft`. For PR #1 the service is not
-        intended to be called concurrently on the same portfolio —
-        the DB index is defense in depth.
+        losing the race catches an ``IntegrityError`` on flush and
+        the retry finds the winner's draft via
+        :meth:`get_current_draft`.
         """
         existing = await self.get_current_draft(portfolio_id)
         if existing is not None:
