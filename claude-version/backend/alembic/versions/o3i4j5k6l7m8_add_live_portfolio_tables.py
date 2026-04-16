@@ -4,8 +4,8 @@ Revision ID: o3i4j5k6l7m8
 Revises: n2h3i4j5k6l7
 Create Date: 2026-04-16 17:00:00.000000
 
-PR #1 of the portfolio-per-account-live feature (design doc
-docs/plans/2026-04-16-portfolio-per-account-live-design.md).
+Portfolio-per-account-live feature — schema foundation (design doc
+``docs/plans/2026-04-16-portfolio-per-account-live-design.md``).
 
 Adds the live-composition layer. No FK cycle — the "latest revision"
 of a portfolio is computed on the fly via

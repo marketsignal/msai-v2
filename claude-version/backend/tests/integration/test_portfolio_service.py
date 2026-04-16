@@ -174,3 +174,80 @@ async def test_add_same_strategy_twice_raises(session: AsyncSession) -> None:
 
     with pytest.raises(ValueError, match="already a member"):
         await svc.add_strategy(portfolio.id, s1.id, {}, ["AAPL.NASDAQ"], Decimal("0.5"))
+
+
+@pytest.mark.asyncio
+async def test_partial_index_rejects_second_draft(session: AsyncSession) -> None:
+    """The ``uq_one_draft_per_portfolio`` partial unique index must
+    enforce "at most one unfrozen revision per portfolio" at the DB
+    level. Declared inline on ``LivePortfolioRevision.__table_args__``
+    so ``Base.metadata.create_all`` produces the same schema as the
+    migration."""
+    from sqlalchemy.exc import IntegrityError
+
+    from msai.models import LivePortfolio, LivePortfolioRevision
+
+    user = await _seed_user(session)
+    portfolio = LivePortfolio(
+        id=uuid4(),
+        name=f"PartialIdx-{uuid4().hex[:8]}",
+        description=None,
+        created_by=user.id,
+    )
+    session.add(portfolio)
+    await session.flush()
+
+    session.add(
+        LivePortfolioRevision(
+            id=uuid4(),
+            portfolio_id=portfolio.id,
+            revision_number=1,
+            composition_hash="0" * 64,
+            is_frozen=False,
+        )
+    )
+    await session.flush()
+
+    session.add(
+        LivePortfolioRevision(
+            id=uuid4(),
+            portfolio_id=portfolio.id,
+            revision_number=2,
+            composition_hash="1" * 64,
+            is_frozen=False,
+        )
+    )
+    with pytest.raises(IntegrityError, match="uq_one_draft_per_portfolio"):
+        await session.flush()
+    await session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_partial_index_allows_two_frozen_revisions(session: AsyncSession) -> None:
+    """The partial index only constrains ``is_frozen = false`` rows.
+    Two frozen revisions on the same portfolio must coexist (audit
+    history across rebalances)."""
+    from msai.models import LivePortfolio, LivePortfolioRevision
+
+    user = await _seed_user(session)
+    portfolio = LivePortfolio(
+        id=uuid4(),
+        name=f"TwoFrozen-{uuid4().hex[:8]}",
+        description=None,
+        created_by=user.id,
+    )
+    session.add(portfolio)
+    await session.flush()
+
+    for n, h in ((1, "a" * 64), (2, "b" * 64)):
+        session.add(
+            LivePortfolioRevision(
+                id=uuid4(),
+                portfolio_id=portfolio.id,
+                revision_number=n,
+                composition_hash=h,
+                is_frozen=True,
+            )
+        )
+    await session.flush()
+    await session.commit()

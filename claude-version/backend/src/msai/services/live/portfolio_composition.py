@@ -9,10 +9,16 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import TYPE_CHECKING, Any
+from decimal import Decimal
+from typing import Any
 
-if TYPE_CHECKING:
-    from decimal import Decimal
+# Scale of the ``weight`` column on ``live_portfolio_revision_strategies``
+# (``Numeric(8, 6)``). Hashing must quantize to this scale so that a
+# caller-supplied ``Decimal("0.3333333")`` hashes identically to the
+# rounded value Postgres will persist (``0.333333``). Without this, a
+# revision snapshotted pre-flush and one re-read from the DB compute
+# different hashes for the same row (Codex review, 2026-04-16).
+_WEIGHT_SCALE = Decimal("0.000001")
 
 
 def compute_composition_hash(members: list[dict[str, Any]]) -> str:
@@ -26,23 +32,24 @@ def compute_composition_hash(members: list[dict[str, Any]]) -> str:
     - sort by ``order_index`` so caller order is irrelevant
     - ``strategy_id`` → 32-char UUID hex
     - ``instruments`` → sorted, de-duped
-    - ``weight`` → normalized via ``Decimal.normalize()``, then ``format(..., "f")``
-      so ``0.5`` and ``0.50`` hash identically
+    - ``weight`` → quantized to the DB column's scale (6 decimal
+      places), then ``Decimal.normalize()``, then ``format(..., "f")``
+      so ``0.5``, ``0.50``, and ``0.500000`` all hash identically AND
+      match the value Postgres will persist under ``Numeric(8, 6)``
     - ``config`` → ``sort_keys=True`` at every level
     """
-    canonical = [
-        _canonicalize_member(m) for m in sorted(members, key=lambda m: m["order_index"])
-    ]
+    canonical = [_canonicalize_member(m) for m in sorted(members, key=lambda m: m["order_index"])]
     payload = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 
 def _canonicalize_member(member: dict[str, Any]) -> dict[str, Any]:
     weight: Decimal = member["weight"]
+    quantized = weight.quantize(_WEIGHT_SCALE)
     return {
         "strategy_id": member["strategy_id"].hex,
         "order_index": int(member["order_index"]),
         "config": member["config"],
         "instruments": sorted(set(member["instruments"])),
-        "weight": format(weight.normalize(), "f"),
+        "weight": format(quantized.normalize(), "f"),
     }

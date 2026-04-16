@@ -26,8 +26,29 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
-class RevisionImmutableError(Exception):
+class PortfolioDomainError(Exception):
+    """Base for all portfolio-domain errors raised by PortfolioService
+    / RevisionService. API layers catch this family to map to HTTP 409
+    / 422 without parsing string messages."""
+
+
+class RevisionImmutableError(PortfolioDomainError):
     """Raised when a caller attempts to mutate a frozen revision."""
+
+
+class NoDraftToSnapshotError(PortfolioDomainError):
+    """Raised when ``snapshot()`` is called on a portfolio with no
+    unfrozen draft. Either the portfolio never had one, or a concurrent
+    snapshot already froze it. Caller should query
+    :meth:`RevisionService.get_active_revision` to retrieve the winner's
+    frozen revision."""
+
+
+class EmptyCompositionError(PortfolioDomainError):
+    """Raised when ``snapshot()`` is called on a draft that has zero
+    member strategies. A revision with no members has no operational
+    use — the supervisor would refuse to start it — so we fail fast
+    at snapshot time with a clear message."""
 
 
 class RevisionService:
@@ -66,11 +87,9 @@ class RevisionService:
         draft = await self._lock_draft_revision(portfolio_id)
         if draft is None:
             # No unfrozen row — either the portfolio never had a draft
-            # OR a concurrent snapshot already froze it. Surface a
-            # clean error so the caller retries via
-            # ``get_active_revision`` rather than silently treating
-            # "nothing to snapshot" as success.
-            raise ValueError(
+            # OR a concurrent snapshot already froze it. Caller recovers
+            # via ``get_active_revision``.
+            raise NoDraftToSnapshotError(
                 f"Portfolio {portfolio_id} has no draft revision to snapshot"
             )
 
@@ -85,6 +104,12 @@ class RevisionService:
             .scalars()
             .all()
         )
+
+        if not members:
+            raise EmptyCompositionError(
+                f"Draft revision {draft.id} has no member strategies — "
+                "add at least one before snapshotting."
+            )
 
         computed_hash = compute_composition_hash(
             [

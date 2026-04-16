@@ -22,9 +22,11 @@ from uuid import UUID, uuid4
 from sqlalchemy import (
     Boolean,
     ForeignKey,
+    Index,
     Integer,
     String,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -51,6 +53,18 @@ class LivePortfolioRevision(CreatedAtMixin, Base):
             "composition_hash",
             name="uq_live_portfolio_revisions_hash",
         ),
+        # Partial unique index — matches the Alembic migration
+        # ``o3i4j5k6l7m8_add_live_portfolio_tables.py``. Declared inline
+        # on the model so ``Base.metadata.create_all`` (used by the
+        # testcontainer fixtures in the portfolio integration tests)
+        # produces a schema that matches production. Mirrors the pattern
+        # from ``LiveNodeProcess.uq_live_node_processes_active_deployment``.
+        Index(
+            "uq_one_draft_per_portfolio",
+            "portfolio_id",
+            unique=True,
+            postgresql_where=text("is_frozen = false"),
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
@@ -61,9 +75,7 @@ class LivePortfolioRevision(CreatedAtMixin, Base):
     )
     revision_number: Mapped[int] = mapped_column(Integer, nullable=False)
     composition_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    is_frozen: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default="false"
-    )
+    is_frozen: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
 
     strategies: Mapped[list[LivePortfolioRevisionStrategy]] = relationship(
         back_populates="revision",

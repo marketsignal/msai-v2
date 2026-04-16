@@ -22,6 +22,10 @@ from msai.models import (
     LivePortfolioRevision,
     LivePortfolioRevisionStrategy,
 )
+from msai.services.live.revision_service import (
+    PortfolioDomainError,
+    RevisionImmutableError,
+)
 
 if TYPE_CHECKING:
     from decimal import Decimal
@@ -30,7 +34,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
-class StrategyNotGraduatedError(Exception):
+class StrategyNotGraduatedError(PortfolioDomainError):
     """Raised when adding a strategy that has no promoted
     :class:`GraduationCandidate`."""
 
@@ -50,9 +54,7 @@ class PortfolioService:
     ) -> LivePortfolio:
         """Create an empty portfolio — no draft revision yet (lazily
         created by :meth:`add_strategy`)."""
-        portfolio = LivePortfolio(
-            name=name, description=description, created_by=created_by
-        )
+        portfolio = LivePortfolio(name=name, description=description, created_by=created_by)
         self._session.add(portfolio)
         await self._session.flush()
         return portfolio
@@ -78,6 +80,30 @@ class PortfolioService:
 
         draft = await self._get_or_create_draft_revision(portfolio_id)
 
+        # Re-acquire the draft under ``SELECT … FOR UPDATE`` so a
+        # concurrent ``RevisionService.snapshot`` on the same portfolio
+        # blocks until this ``add_strategy`` commits. Without the lock,
+        # snapshot could freeze the draft + compute ``composition_hash``
+        # from the pre-insert member set, then this insert would append
+        # a member to a now-frozen revision whose hash no longer matches
+        # its rows (Codex review, 2026-04-16). The FOR UPDATE also
+        # guarantees that if snapshot has already taken the lock and
+        # flipped ``is_frozen=True``, this caller sees the updated row
+        # (``is_frozen=True``) after the wait and raises instead of
+        # silently corrupting it.
+        locked = (
+            await self._session.execute(
+                select(LivePortfolioRevision)
+                .where(LivePortfolioRevision.id == draft.id)
+                .with_for_update()
+            )
+        ).scalar_one()
+        if locked.is_frozen:
+            raise RevisionImmutableError(
+                f"Draft revision {draft.id} was frozen by a concurrent snapshot; "
+                "re-invoke ``add_strategy`` to create a fresh draft."
+            )
+
         existing = await self._session.execute(
             select(LivePortfolioRevisionStrategy.id).where(
                 LivePortfolioRevisionStrategy.revision_id == draft.id,
@@ -101,9 +127,7 @@ class PortfolioService:
         await self._session.flush()
         return member
 
-    async def list_draft_members(
-        self, portfolio_id: UUID
-    ) -> list[LivePortfolioRevisionStrategy]:
+    async def list_draft_members(self, portfolio_id: UUID) -> list[LivePortfolioRevisionStrategy]:
         """Return the draft-revision members in insertion order.
         Empty list if no draft yet."""
         draft = await self.get_current_draft(portfolio_id)
@@ -116,9 +140,7 @@ class PortfolioService:
         )
         return list(result.scalars().all())
 
-    async def get_current_draft(
-        self, portfolio_id: UUID
-    ) -> LivePortfolioRevision | None:
+    async def get_current_draft(self, portfolio_id: UUID) -> LivePortfolioRevision | None:
         """Public accessor — returns the portfolio's unfrozen revision,
         or ``None`` if no draft yet.
 
@@ -146,16 +168,15 @@ class PortfolioService:
         )
         return result.first() is not None
 
-    async def _get_or_create_draft_revision(
-        self, portfolio_id: UUID
-    ) -> LivePortfolioRevision:
+    async def _get_or_create_draft_revision(self, portfolio_id: UUID) -> LivePortfolioRevision:
         """Return the existing draft, or create a new one.
 
-        The partial unique index ``uq_one_draft_per_portfolio``
-        guarantees at most one draft per portfolio; a concurrent caller
-        losing the race catches an ``IntegrityError`` on flush and
-        the retry finds the winner's draft via
-        :meth:`get_current_draft`.
+        Under concurrent callers on the same portfolio, the partial
+        unique index ``uq_one_draft_per_portfolio`` guarantees at most
+        one draft row: the loser's flush raises ``IntegrityError``,
+        which propagates up so the caller can choose to retry by
+        re-invoking ``add_strategy`` (which re-enters here and finds
+        the winner's draft via :meth:`get_current_draft`).
         """
         existing = await self.get_current_draft(portfolio_id)
         if existing is not None:
@@ -163,8 +184,9 @@ class PortfolioService:
 
         max_number = (
             await self._session.execute(
-                select(func.coalesce(func.max(LivePortfolioRevision.revision_number), 0))
-                .where(LivePortfolioRevision.portfolio_id == portfolio_id)
+                select(func.coalesce(func.max(LivePortfolioRevision.revision_number), 0)).where(
+                    LivePortfolioRevision.portfolio_id == portfolio_id
+                )
             )
         ).scalar_one()
 
@@ -187,7 +209,8 @@ class PortfolioService:
 
     async def _next_order_index(self, revision_id: UUID) -> int:
         result = await self._session.execute(
-            select(func.coalesce(func.max(LivePortfolioRevisionStrategy.order_index), -1))
-            .where(LivePortfolioRevisionStrategy.revision_id == revision_id)
+            select(func.coalesce(func.max(LivePortfolioRevisionStrategy.order_index), -1)).where(
+                LivePortfolioRevisionStrategy.revision_id == revision_id
+            )
         )
         return int(result.scalar_one()) + 1

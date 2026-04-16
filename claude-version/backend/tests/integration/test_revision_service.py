@@ -13,6 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from msai.models import Base, GraduationCandidate, Strategy, User
 from msai.services.live.portfolio_service import PortfolioService
 from msai.services.live.revision_service import (
+    EmptyCompositionError,
+    NoDraftToSnapshotError,
     RevisionImmutableError,
     RevisionService,
 )
@@ -78,9 +80,7 @@ async def _seed_portfolio_with_one_graduated_strategy(
     portfolio = await psvc.create_portfolio(
         name=f"P-{uuid4().hex[:8]}", description=None, created_by=user.id
     )
-    await psvc.add_strategy(
-        portfolio.id, strategy.id, {"fast": 10}, ["AAPL.NASDAQ"], Decimal("1")
-    )
+    await psvc.add_strategy(portfolio.id, strategy.id, {"fast": 10}, ["AAPL.NASDAQ"], Decimal("1"))
     return portfolio, strategy, user
 
 
@@ -115,9 +115,7 @@ async def test_snapshot_same_composition_returns_existing_revision(
     first = await rsvc.snapshot(portfolio.id)
     await session.commit()
 
-    await psvc.add_strategy(
-        portfolio.id, strategy.id, {"fast": 10}, ["AAPL.NASDAQ"], Decimal("1")
-    )
+    await psvc.add_strategy(portfolio.id, strategy.id, {"fast": 10}, ["AAPL.NASDAQ"], Decimal("1"))
     await session.commit()
 
     second = await rsvc.snapshot(portfolio.id)
@@ -179,12 +177,48 @@ async def test_snapshot_raises_when_no_draft(session: AsyncSession) -> None:
     await session.flush()
     from msai.models import LivePortfolio
 
-    portfolio = LivePortfolio(
-        id=uuid4(), name="Empty", description=None, created_by=user.id
-    )
+    portfolio = LivePortfolio(id=uuid4(), name="Empty", description=None, created_by=user.id)
     session.add(portfolio)
     await session.commit()
 
     rsvc = RevisionService(session)
-    with pytest.raises(ValueError, match="no draft"):
+    with pytest.raises(NoDraftToSnapshotError, match="no draft"):
+        await rsvc.snapshot(portfolio.id)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_empty_draft_raises_empty_composition_error(
+    session: AsyncSession,
+) -> None:
+    """A draft with zero member strategies is a semantic error — the
+    supervisor cannot run an empty portfolio, so snapshot fails fast."""
+    from msai.models import LivePortfolio, LivePortfolioRevision
+
+    user = User(
+        id=uuid4(),
+        entra_id=f"empty-{uuid4().hex}",
+        email=f"empty-{uuid4().hex}@example.com",
+        role="operator",
+    )
+    session.add(user)
+    await session.flush()
+
+    portfolio = LivePortfolio(
+        id=uuid4(), name=f"Empty-{uuid4().hex[:8]}", description=None, created_by=user.id
+    )
+    session.add(portfolio)
+    await session.flush()
+
+    draft = LivePortfolioRevision(
+        id=uuid4(),
+        portfolio_id=portfolio.id,
+        revision_number=1,
+        composition_hash="0" * 64,
+        is_frozen=False,
+    )
+    session.add(draft)
+    await session.commit()
+
+    rsvc = RevisionService(session)
+    with pytest.raises(EmptyCompositionError, match="no member strategies"):
         await rsvc.snapshot(portfolio.id)
