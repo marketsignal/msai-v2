@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    CheckConstraint,
     ForeignKey,
     Integer,
     Numeric,
@@ -37,6 +38,10 @@ class LivePortfolioRevisionStrategy(CreatedAtMixin, Base):
     __table_args__ = (
         UniqueConstraint("revision_id", "order_index", name="uq_lprs_revision_order"),
         UniqueConstraint("revision_id", "strategy_id", name="uq_lprs_revision_strategy"),
+        # Weight is an allocation fraction ∈ (0, 1]. DB-level CHECK so
+        # the invariant survives any future caller that skips the
+        # service-level validation (PR#1 code-review, 2026-04-16).
+        CheckConstraint("weight > 0 AND weight <= 1", name="ck_lprs_weight_range"),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)

@@ -251,3 +251,82 @@ async def test_partial_index_allows_two_frozen_revisions(session: AsyncSession) 
         )
     await session.flush()
     await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_weight_check_rejects_zero(session: AsyncSession) -> None:
+    """``ck_lprs_weight_range`` enforces weight ∈ (0, 1] at the DB
+    level. Weight == 0 violates ``weight > 0``."""
+    from sqlalchemy.exc import IntegrityError
+
+    from msai.models import LivePortfolio, LivePortfolioRevision, LivePortfolioRevisionStrategy
+
+    user = await _seed_user(session)
+    strategy = await _seed_strategy(session, user, graduated=True)
+    portfolio = LivePortfolio(
+        id=uuid4(), name=f"WZero-{uuid4().hex[:8]}", description=None, created_by=user.id
+    )
+    session.add(portfolio)
+    await session.flush()
+    rev = LivePortfolioRevision(
+        id=uuid4(),
+        portfolio_id=portfolio.id,
+        revision_number=1,
+        composition_hash="0" * 64,
+        is_frozen=False,
+    )
+    session.add(rev)
+    await session.flush()
+    session.add(
+        LivePortfolioRevisionStrategy(
+            id=uuid4(),
+            revision_id=rev.id,
+            strategy_id=strategy.id,
+            config={},
+            instruments=["AAPL.NASDAQ"],
+            weight=Decimal("0"),
+            order_index=0,
+        )
+    )
+    with pytest.raises(IntegrityError, match="ck_lprs_weight_range"):
+        await session.flush()
+    await session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_weight_check_rejects_over_one(session: AsyncSession) -> None:
+    """Weight > 1 violates ``weight <= 1``."""
+    from sqlalchemy.exc import IntegrityError
+
+    from msai.models import LivePortfolio, LivePortfolioRevision, LivePortfolioRevisionStrategy
+
+    user = await _seed_user(session)
+    strategy = await _seed_strategy(session, user, graduated=True)
+    portfolio = LivePortfolio(
+        id=uuid4(), name=f"WOver-{uuid4().hex[:8]}", description=None, created_by=user.id
+    )
+    session.add(portfolio)
+    await session.flush()
+    rev = LivePortfolioRevision(
+        id=uuid4(),
+        portfolio_id=portfolio.id,
+        revision_number=1,
+        composition_hash="0" * 64,
+        is_frozen=False,
+    )
+    session.add(rev)
+    await session.flush()
+    session.add(
+        LivePortfolioRevisionStrategy(
+            id=uuid4(),
+            revision_id=rev.id,
+            strategy_id=strategy.id,
+            config={},
+            instruments=["AAPL.NASDAQ"],
+            weight=Decimal("1.5"),
+            order_index=0,
+        )
+    )
+    with pytest.raises(IntegrityError, match="ck_lprs_weight_range"):
+        await session.flush()
+    await session.rollback()
