@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime  # noqa: TC003
 from decimal import Decimal  # noqa: TC003
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
@@ -25,6 +26,10 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from msai.models.base import Base
+
+if TYPE_CHECKING:
+    from msai.models.live_portfolio_revision import LivePortfolioRevision
+    from msai.models.strategy import Strategy
 
 
 class LivePortfolioRevisionStrategy(Base):
@@ -49,7 +54,7 @@ class LivePortfolioRevisionStrategy(Base):
         nullable=False,
         index=True,
     )
-    config: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     instruments: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False)
     weight: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
     order_index: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -57,7 +62,7 @@ class LivePortfolioRevisionStrategy(Base):
         server_default=func.now(), nullable=False
     )
 
-    revision: Mapped["LivePortfolioRevision"] = relationship(  # noqa: F821
+    revision: Mapped[LivePortfolioRevision] = relationship(
         back_populates="strategies", lazy="selectin"
     )
-    strategy: Mapped["Strategy"] = relationship(lazy="selectin")  # noqa: F821
+    strategy: Mapped[Strategy] = relationship(lazy="selectin")

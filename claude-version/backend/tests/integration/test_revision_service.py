@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterator
 from decimal import Decimal
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import pytest
@@ -16,6 +16,9 @@ from msai.services.live.revision_service import (
     RevisionImmutableError,
     RevisionService,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Iterator
 
 
 @pytest.fixture(scope="module")

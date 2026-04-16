@@ -15,12 +15,16 @@ See ``docs/plans/2026-04-16-portfolio-per-account-live-design.md``.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from sqlalchemy import ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from msai.models.base import Base, TimestampMixin
+
+if TYPE_CHECKING:
+    from msai.models.user import User
 
 
 class LivePortfolio(TimestampMixin, Base):
@@ -37,4 +41,4 @@ class LivePortfolio(TimestampMixin, Base):
         index=True,
     )
 
-    creator: Mapped["User"] = relationship(lazy="selectin")  # noqa: F821
+    creator: Mapped[User] = relationship(lazy="selectin")

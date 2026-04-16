@@ -25,8 +25,9 @@ All ID columns use ``sa.Uuid()`` to match the convention from
 from __future__ import annotations
 
 import sqlalchemy as sa
-from alembic import op
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+
+from alembic import op
 
 revision: str = "o3i4j5k6l7m8"
 down_revision: str = "n2h3i4j5k6l7"

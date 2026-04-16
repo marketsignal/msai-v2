@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from decimal import Decimal
 
 
 def compute_composition_hash(members: list[dict[str, Any]]) -> str:

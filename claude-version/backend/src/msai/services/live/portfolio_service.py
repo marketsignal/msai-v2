@@ -12,9 +12,7 @@ Invariants enforced:
 
 from __future__ import annotations
 
-from decimal import Decimal
-from typing import TYPE_CHECKING
-from uuid import UUID
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import func, select
 
@@ -26,6 +24,9 @@ from msai.models import (
 )
 
 if TYPE_CHECKING:
+    from decimal import Decimal
+    from uuid import UUID
+
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -60,7 +61,7 @@ class PortfolioService:
         self,
         portfolio_id: UUID,
         strategy_id: UUID,
-        config: dict,
+        config: dict[str, Any],
         instruments: list[str],
         weight: Decimal,
     ) -> LivePortfolioRevisionStrategy:

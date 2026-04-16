@@ -9,12 +9,18 @@ Immutable on create.
 from __future__ import annotations
 
 from datetime import datetime  # noqa: TC003
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from sqlalchemy import ForeignKey, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from msai.models.base import Base
+
+if TYPE_CHECKING:
+    from msai.models.live_portfolio_revision_strategy import (
+        LivePortfolioRevisionStrategy,
+    )
 
 
 class LiveDeploymentStrategy(Base):
@@ -47,6 +53,6 @@ class LiveDeploymentStrategy(Base):
         server_default=func.now(), nullable=False
     )
 
-    revision_strategy: Mapped["LivePortfolioRevisionStrategy"] = relationship(  # noqa: F821
+    revision_strategy: Mapped[LivePortfolioRevisionStrategy] = relationship(
         lazy="selectin"
     )

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterator
 from decimal import Decimal
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import pytest
@@ -13,7 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from msai.models import (
     Base,
     GraduationCandidate,
-    LivePortfolio,
     Strategy,
     User,
 )
@@ -21,6 +20,9 @@ from msai.services.live.portfolio_service import (
     PortfolioService,
     StrategyNotGraduatedError,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Iterator
 
 
 @pytest.fixture(scope="module")

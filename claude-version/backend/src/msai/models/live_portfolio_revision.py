@@ -17,6 +17,7 @@ Immutable row → no ``updated_at`` column; ``created_at`` only.
 from __future__ import annotations
 
 from datetime import datetime  # noqa: TC003
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
@@ -30,6 +31,11 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from msai.models.base import Base
+
+if TYPE_CHECKING:
+    from msai.models.live_portfolio_revision_strategy import (
+        LivePortfolioRevisionStrategy,
+    )
 
 
 class LivePortfolioRevision(Base):
@@ -64,7 +70,7 @@ class LivePortfolioRevision(Base):
         server_default=func.now(), nullable=False
     )
 
-    strategies: Mapped[list["LivePortfolioRevisionStrategy"]] = relationship(  # noqa: F821
+    strategies: Mapped[list[LivePortfolioRevisionStrategy]] = relationship(
         back_populates="revision",
         cascade="all, delete-orphan",
         order_by="LivePortfolioRevisionStrategy.order_index",

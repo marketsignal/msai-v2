@@ -14,7 +14,6 @@ level ensures at most one unfrozen row per portfolio.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from uuid import UUID
 
 from sqlalchemy import select
 
@@ -22,6 +21,8 @@ from msai.models import LivePortfolioRevision, LivePortfolioRevisionStrategy
 from msai.services.live.portfolio_composition import compute_composition_hash
 
 if TYPE_CHECKING:
+    from uuid import UUID
+
     from sqlalchemy.ext.asyncio import AsyncSession
 
 

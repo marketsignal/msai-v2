@@ -10,7 +10,6 @@ from __future__ import annotations
 from decimal import Decimal
 from uuid import UUID
 
-
 _S1 = UUID("11111111-1111-1111-1111-111111111111")
 _S2 = UUID("22222222-2222-2222-2222-222222222222")
 
