@@ -132,15 +132,19 @@ def canonical_instrument_id(
 
     For stocks/ETFs/FX, the user-facing id is already canonical
     (``AAPL.NASDAQ``, ``EUR/USD.IDEALPRO``). For futures, the user writes
-    ``ES.XCME`` (stable across quarterly rolls) but Nautilus registers
+    ``ES.CME`` (stable across quarterly rolls) but Nautilus registers
     the instrument under the concrete month derived from IB's
-    ``localSymbol`` (``ESM6.XCME`` this quarter). Without this mapping
-    the strategy subscribes to ``ES.XCME`` while only ``ESM6.XCME``
+    ``localSymbol`` (``ESM6.CME`` this quarter). Without this mapping
+    the strategy subscribes to ``ES.CME`` while only ``ESM6.CME``
     exists — zero bar events fire.
 
+    The venue suffix for futures is ``CME`` (IB's native name) —
+    ``IB_SIMPLIFIED`` symbology uses IB's exchange strings verbatim, not
+    the ISO MIC (``XCME``). Live-verified 2026-04-16: Nautilus
+    registered our ``FUT ES CME`` contract as ``ESM6.CME``.
+
     Accepts either a bare symbol (``"ES"``) or a full instrument_id
-    (``"ES.XCME"``); the venue is always recomputed from the contract
-    definition (``XCME`` for CME futures).
+    (``"ES.CME"`` or ``"ES.XCME"`` — legacy MIC accepted for input only).
 
     Args:
         user_instrument_id: Operator-facing symbol or id.
@@ -161,7 +165,7 @@ def canonical_instrument_id(
         return "EUR/USD.IDEALPRO"
     if root == "ES":
         resolved_today = today if today is not None else exchange_local_today()
-        return f"{_es_front_month_local_symbol(resolved_today)}.XCME"
+        return f"{_es_front_month_local_symbol(resolved_today)}.CME"
     raise ValueError(
         f"Unknown instrument root '{root}' — Phase 1 paper symbols: AAPL, MSFT, SPY, EUR/USD, ES"
     )

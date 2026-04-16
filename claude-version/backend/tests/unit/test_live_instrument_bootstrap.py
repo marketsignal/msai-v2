@@ -204,18 +204,25 @@ class TestCanonicalInstrumentId:
     def test_es_deterministic_with_today_param(self) -> None:
         """Passing an explicit ``today`` makes ES canonicalization
         deterministic — no wall-clock dependency. April 15, 2026 →
-        June 2026 contract ``ESM6.XCME``."""
-        assert canonical_instrument_id("ES.XCME", today=date(2026, 4, 15)) == "ESM6.XCME"
+        June 2026 contract ``ESM6.CME`` (IB_SIMPLIFIED uses ``CME``
+        verbatim, not the ISO MIC ``XCME``)."""
+        assert canonical_instrument_id("ES.CME", today=date(2026, 4, 15)) == "ESM6.CME"
 
     def test_es_rolls_to_september_after_june_expiry(self) -> None:
         """June 20, 2026 (day after 3rd Friday) rolls to September."""
-        assert canonical_instrument_id("ES", today=date(2026, 6, 20)) == "ESU6.XCME"
+        assert canonical_instrument_id("ES", today=date(2026, 6, 20)) == "ESU6.CME"
 
     def test_es_december_maps_to_z_code(self) -> None:
-        assert canonical_instrument_id("ES.XCME", today=date(2026, 10, 1)) == "ESZ6.XCME"
+        assert canonical_instrument_id("ES.CME", today=date(2026, 10, 1)) == "ESZ6.CME"
 
     def test_es_march_maps_to_h_code_next_year(self) -> None:
-        assert canonical_instrument_id("ES", today=date(2027, 1, 15)) == "ESH7.XCME"
+        assert canonical_instrument_id("ES", today=date(2027, 1, 15)) == "ESH7.CME"
+
+    def test_es_legacy_xcme_input_still_accepted(self) -> None:
+        """Legacy MIC-style input (``ES.XCME``) still accepted — the
+        root extraction splits on ``.`` so the venue is ignored. Output
+        is always ``.CME`` (IB_SIMPLIFIED venue)."""
+        assert canonical_instrument_id("ES.XCME", today=date(2026, 4, 15)) == "ESM6.CME"
 
     def test_aapl_round_trips_identity(self) -> None:
         assert canonical_instrument_id("AAPL") == "AAPL.NASDAQ"
@@ -233,25 +240,26 @@ class TestCanonicalInstrumentId:
         assert canonical_instrument_id("EUR/USD") == "EUR/USD.IDEALPRO"
         assert canonical_instrument_id("EUR/USD.IDEALPRO") == "EUR/USD.IDEALPRO"
 
-    def test_es_maps_to_front_month_with_xcme_venue(self) -> None:
-        """ES is the interesting case — user writes ``ES.XCME`` but
-        Nautilus registers the concrete month (``ESM6.XCME`` this
-        quarter) because the IB adapter parses ``localSymbol``."""
-        result = canonical_instrument_id("ES.XCME")
-        # Format: ES{MonthCode}{YearLastDigit}.XCME
-        assert result.endswith(".XCME")
+    def test_es_maps_to_front_month_with_cme_venue(self) -> None:
+        """ES is the interesting case — user writes ``ES.CME`` but
+        Nautilus registers the concrete month (``ESM6.CME`` this
+        quarter) because the IB adapter parses ``localSymbol``.
+        Venue stays ``CME`` (IB_SIMPLIFIED, verified live 2026-04-16)."""
+        result = canonical_instrument_id("ES.CME")
+        # Format: ES{MonthCode}{YearLastDigit}.CME
+        assert result.endswith(".CME")
         assert result.startswith("ES")
         # Month code is H/M/U/Z (quarterly); year digit is 0-9
-        assert len(result) == len("ESM6.XCME")
+        assert len(result) == len("ESM6.CME")
         month_code = result[2]
         assert month_code in {"H", "M", "U", "Z"}
         year_digit = result[3]
         assert year_digit.isdigit()
 
     def test_es_from_bare_symbol_matches_full_id(self) -> None:
-        """Accepts either bare root (``"ES"``) or full id (``"ES.XCME"``)
+        """Accepts either bare root (``"ES"``) or full id (``"ES.CME"``)
         — operator input may arrive either way."""
-        assert canonical_instrument_id("ES") == canonical_instrument_id("ES.XCME")
+        assert canonical_instrument_id("ES") == canonical_instrument_id("ES.CME")
 
     def test_unknown_symbol_raises(self) -> None:
         with pytest.raises(ValueError, match="Unknown instrument root"):
@@ -293,10 +301,10 @@ class TestPhaseOneSymbolsFreshPerCall:
         reference the SAME quarterly contract. This is what prevents
         the supervisor/subprocess midnight-on-roll-day race."""
         shared_today = date(2026, 6, 20)  # day after June expiry
-        canonical = canonical_instrument_id("ES.XCME", today=shared_today)
+        canonical = canonical_instrument_id("ES.CME", today=shared_today)
         config = build_ib_instrument_provider_config(["ES"], today=shared_today)
         es_contract = next(iter(config.load_contracts))
-        # canonical should be ESU6.XCME (September)
-        assert canonical == "ESU6.XCME"
+        # canonical should be ESU6.CME (September)
+        assert canonical == "ESU6.CME"
         # Contract expiry should also be 202609
         assert es_contract.lastTradeDateOrContractMonth == "202609"
