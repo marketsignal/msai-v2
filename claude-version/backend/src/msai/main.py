@@ -30,8 +30,8 @@ from msai.api.auth import router as auth_router
 from msai.api.backtests import router as backtests_router
 from msai.api.graduation import router as graduation_router
 from msai.api.live import router as live_router
-from msai.api.portfolio import router as portfolio_router
 from msai.api.market_data import router as market_data_router
+from msai.api.portfolio import router as portfolio_router
 from msai.api.research import router as research_router
 from msai.api.strategies import router as strategies_router
 from msai.api.strategy_templates import router as strategy_templates_router
@@ -120,7 +120,6 @@ async def _start_projection_tasks() -> None:
     from msai.api.live_deps import get_projection_state
     from msai.services.nautilus.projection.consumer import ProjectionConsumer
     from msai.services.nautilus.projection.fanout import DualPublisher
-    from msai.services.nautilus.projection.registry import StreamRegistry
     from msai.services.nautilus.projection.state_applier import StateApplier
 
     state = get_projection_state()
@@ -199,9 +198,17 @@ async def _stop_projection_tasks() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Startup/shutdown lifecycle."""
+    from msai.api.account import start_ib_probe_task, stop_ib_probe_task
+
     await _ensure_api_key_user()  # best-effort, retried on /ready
     await _start_projection_tasks()
+    # IB probe periodic task — without this the /api/v1/account/health
+    # endpoint always reports ``gateway_connected=false`` because the
+    # probe's ``check_health`` is never called. Drill 2026-04-15
+    # misled me three times before this was fixed.
+    await start_ib_probe_task()
     yield
+    await stop_ib_probe_task()
     await _stop_projection_tasks()
 
 
