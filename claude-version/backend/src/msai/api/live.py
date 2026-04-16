@@ -509,6 +509,34 @@ async def live_start(  # noqa: PLR0912, PLR0915 — multi-branch dispatch by des
             idempotency_key=idempotency_key,
         )
 
+        # Auto-link graduation candidate (if one exists in
+        # ``live_running`` for this strategy) so the audit trail
+        # connects the graduated strategy to its actual deployment.
+        try:
+            from msai.models.graduation_candidate import GraduationCandidate
+
+            candidate = (
+                await db.execute(
+                    select(GraduationCandidate).where(
+                        GraduationCandidate.strategy_id == request.strategy_id,
+                        GraduationCandidate.stage == "live_running",
+                        GraduationCandidate.deployment_id.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            if candidate is not None:
+                candidate.deployment_id = deployment.id
+                await db.commit()
+                log.info(
+                    "graduation_candidate_linked",
+                    extra={
+                        "candidate_id": str(candidate.id),
+                        "deployment_id": str(deployment.id),
+                    },
+                )
+        except Exception:  # noqa: BLE001
+            log.warning("graduation_candidate_link_failed", exc_info=True)
+
         # Register the new deployment with the projection consumer so
         # it discovers the Nautilus message bus stream without a restart.
         try:
