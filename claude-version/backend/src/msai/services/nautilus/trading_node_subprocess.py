@@ -1274,8 +1274,40 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
 
             # Subscribe to ALL order events via wildcard pattern
             node.kernel.msgbus.subscribe(topic="events.order.*", handler=_on_order_event_sync)
+
+            # Position events — PositionClosed carries realized_pnl
+            # that we need to write back to the closing Trade row so
+            # the ``pnl`` column in the DB is populated.
+            def _on_position_event_sync(event: Any) -> None:
+                event_type = type(event).__name__
+                if event_type != "PositionClosed":
+                    return
+
+                async def _write_pnl() -> None:
+                    try:
+                        closing_id = str(event.closing_order_id)
+                        rpnl = getattr(event, "realized_pnl", None)
+                        if rpnl is not None and p.deployment_id is not None:
+                            pnl_str = str(rpnl).split()[0]
+                            await writer.update_trade_pnl(
+                                closing_order_id=closing_id,
+                                deployment_id=p.deployment_id,
+                                realized_pnl=Decimal(pnl_str),
+                            )
+                    except Exception as _pnl_exc:  # noqa: BLE001
+                        print(  # noqa: T201
+                            f"[MSAI] PositionClosed PnL write FAILED: {_pnl_exc!r}",
+                            flush=True,
+                        )
+
+                _loop.create_task(_write_pnl())
+
+            node.kernel.msgbus.subscribe(topic="events.position.*", handler=_on_position_event_sync)
             # Use print() because structlog isn't initialized in the subprocess
-            print("[MSAI] Engine-level audit hook wired via events.order.*", flush=True)  # noqa: T201
+            print(  # noqa: T201
+                "[MSAI] Engine-level audit hook wired via events.order.* + events.position.*",
+                flush=True,
+            )
         except Exception as _audit_exc:  # noqa: BLE001
             print(f"[MSAI] Engine audit hook wiring FAILED: {_audit_exc!r}", flush=True)  # noqa: T201
 

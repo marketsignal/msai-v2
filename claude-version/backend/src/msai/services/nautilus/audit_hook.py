@@ -259,6 +259,7 @@ class OrderAuditWriter:
                 price=facts.price,
                 commission=facts.commission,
                 broker_trade_id=facts.broker_trade_id,
+                client_order_id=facts.client_order_id,
                 is_live=True,
                 executed_at=facts.executed_at,
             )
@@ -299,6 +300,57 @@ class OrderAuditWriter:
                 "side": facts.side,
                 "quantity": str(facts.quantity),
                 "price": str(facts.price),
+            },
+        )
+        return True
+
+    async def update_trade_pnl(
+        self,
+        *,
+        closing_order_id: str,
+        deployment_id: UUID,
+        realized_pnl: Decimal,
+    ) -> bool:
+        """Set ``pnl`` on the Trade row that closed a position.
+
+        Called from the ``PositionClosed`` handler — that event
+        carries ``closing_order_id`` (= ``client_order_id`` on the
+        fill) and ``realized_pnl`` for the entire position. We match
+        on ``(deployment_id, client_order_id)`` and UPDATE the most
+        recent fill for that order. Returns ``True`` when a row was
+        updated, ``False`` when no match was found.
+        """
+        from sqlalchemy import update
+
+        async with self._db() as session, session.begin():
+            result = await session.execute(
+                update(Trade)
+                .where(
+                    Trade.deployment_id == deployment_id,
+                    Trade.client_order_id == closing_order_id,
+                )
+                .values(pnl=realized_pnl)
+                .returning(Trade.id)
+            )
+            row_id = result.scalar_one_or_none()
+
+        if row_id is None:
+            log.warning(
+                "trade_pnl_update_no_match",
+                extra={
+                    "closing_order_id": closing_order_id,
+                    "deployment_id": str(deployment_id),
+                    "realized_pnl": str(realized_pnl),
+                },
+            )
+            return False
+
+        log.info(
+            "trade_pnl_updated",
+            extra={
+                "trade_id": str(row_id),
+                "closing_order_id": closing_order_id,
+                "realized_pnl": str(realized_pnl),
             },
         )
         return True
