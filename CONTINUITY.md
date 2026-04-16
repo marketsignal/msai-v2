@@ -33,6 +33,7 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Done (cont'd)
 
+- ES futures canonicalization merged 2026-04-16 04:35 UTC (PR #23): fixes the drill's zero-bars failure mode at the MSAI layer. `canonical_instrument_id()` maps `ES.CME` → `ESM6.CME` so the strategy's bar subscription matches the concrete instrument Nautilus registers from `FUT ES 202606`. Spawn-scoped `today` threaded through supervisor + subprocess (via `TradingNodePayload.spawn_today_iso`) closes the midnight-on-roll-day race. Live-verified: subscription succeeds without `instrument not found`. Caught a `.XCME` vs `.CME` venue bug in live testing that unit tests missed. 28 new bootstrap tests (39 total). Codex addressed 4 rounds of findings + a 5th surfaced only by the live deploy. DUP733213's missing real-time CME data subscription confirmed as the remaining upstream blocker (IB error 354) — operator action at broker.ibkr.com, not code.
 - 7-bug post-drill sprint complete 2026-04-16 02:31 UTC — every offline-fixable bug from the 2026-04-15 multi-asset drill aftermath shipped to main, no bugs left behind:
   - **Bug #1** PR #17 — backtest metrics now derive from positions when Nautilus stats return NaN (3-tier fallback: stats → account snapshot → positions). Verified: win_rate=0.17, sharpe=-45.7 on AAPL/SPY 2024.
   - **Bug #2** PR #18 — `/account/health` IB probe now starts as a FastAPI lifespan background task (30s interval). Verified: `gateway_connected=true` after first probe tick.
@@ -44,11 +45,16 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Now
 
-Sprint clean. All 7 post-drill bugs shipped. Pre-market prep window before 2026-04-16 09:30 ET open — last chance to land prep items so the multi-asset drill can rerun against a clean stack at the open.
+PR #23 merged. Stack restarted on main-branch code. All code-side work for ES is complete. The remaining blocker to actual fills at market open is the IB market-data entitlement gap on `DUP733213` (confirmed via IB error 354) — operator action at `broker.ibkr.com → Market Data Subscription Manager`, no code involved.
 
 ## Next
 
-1. **Pre-open prep (before 2026-04-16 09:30 ET)**: verify paper account `DUP733213` market-data entitlements (IB account → Settings → Market Data Subscriptions); fix ES futures contract spec in `live_instrument_bootstrap.py` (`exchange="GLOBEX"` + `lastTradeDateOrContractMonth` for front-month); add options-chain bootstrap path for one ticker.
-2. **At market open**: run the full graduation pipeline as the user-facing flow (backtest a fast EMA → `POST /api/v1/graduation/...` → graduated strategy goes live across all 5 asset classes → watch fills). Verify all 7 bug fixes hold under live load.
-3. Phase 2 #5 Strategy registry + continuous futures (DB-backed InstrumentDefinition, `.Z.` regex).
-4. Remaining follow-ups not in the 7-bug sprint: `/live/positions` empty with open Nautilus position; deployment row status stays `starting`; audit lifecycle race auto-heal.
+1. **Enable IB real-time market data on `DUP733213`** (operator UI action at broker.ibkr.com):
+   - `CME Real-Time (NP, L1)` — for ES/NQ/YM/RTY futures
+   - `NASDAQ TotalView` or `NASDAQ Level I` — for AAPL/MSFT
+   - `NYSE Real-Time` or the `US Securities Snapshot and Futures Value Bundle` (free) — for SPY
+2. **Fix ES futures contract spec** — DONE via PR #23.
+3. **Add options-chain bootstrap path** for one ticker (still pending, separate PR).
+4. **At market open (2026-04-16 09:30 ET)**: rerun the graduation pipeline with entitlements in place. Verify bars flow on AAPL/MSFT/SPY/ES, the 7 earlier bug fixes hold, and paper orders fill end-to-end.
+5. Phase 2 #5 Strategy registry + continuous futures (DB-backed InstrumentDefinition, `.Z.` regex).
+6. Remaining follow-ups: `/live/positions` empty with open Nautilus position; deployment row status stays `starting`; audit lifecycle race auto-heal.
