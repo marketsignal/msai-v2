@@ -118,6 +118,15 @@ class TradingNodePayload:
     """Original canonical instrument IDs (e.g. ``AAPL.NASDAQ``) from the
     deployment row. Used by MarketHoursService to prime trading hours
     from the instrument_cache table (which keys on canonical_id)."""
+    spawn_today_iso: str = ""
+    """Exchange-local ``YYYY-MM-DD`` date computed by the supervisor at
+    spawn time. Threaded through to the IB provider config builder so
+    the subprocess uses the SAME front-month futures contract the
+    supervisor used when canonicalizing the strategy's instrument_id.
+    Without this, a spawn that crosses the midnight quarterly-roll
+    boundary would preload the wrong month and the strategy would
+    subscribe to a bar stream that doesn't exist. Empty string means
+    "compute in the subprocess" (back-compat for older callers)."""
     ib_host: str = "127.0.0.1"
     ib_port: int = 4002
     ib_account_id: str = "DU0000000"
@@ -1430,6 +1439,19 @@ def _build_real_node(payload: TradingNodePayload) -> Any:
         account_id=payload.ib_account_id,
     )
 
+    # Decode ``spawn_today_iso`` into a ``date`` so the provider config
+    # builder uses the exact same front-month the supervisor used when
+    # canonicalizing the strategy's ``instrument_id``. Empty/invalid
+    # strings fall back to the subprocess's own clock (back-compat).
+    from datetime import date as _date
+
+    spawn_today: _date | None = None
+    if payload.spawn_today_iso:
+        try:
+            spawn_today = _date.fromisoformat(payload.spawn_today_iso)
+        except ValueError:
+            spawn_today = None
+
     config = build_live_trading_node_config(
         deployment_slug=payload.deployment_slug,
         strategy_path=payload.strategy_path,
@@ -1437,6 +1459,7 @@ def _build_real_node(payload: TradingNodePayload) -> Any:
         strategy_config=payload.strategy_config,
         paper_symbols=payload.paper_symbols,
         ib_settings=ib_settings,
+        spawn_today=spawn_today,
     )
 
     node = TradingNode(config=config)

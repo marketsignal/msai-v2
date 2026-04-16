@@ -32,8 +32,11 @@ Two Nautilus gotchas drive the IB client wiring:
 from __future__ import annotations
 
 import hashlib
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
+
+if TYPE_CHECKING:
+    from datetime import date
 
 from nautilus_trader.adapters.interactive_brokers.common import IB_VENUE
 from nautilus_trader.adapters.interactive_brokers.config import (
@@ -221,6 +224,7 @@ def build_live_trading_node_config(
     max_notional_per_order: dict[str, int] | None = None,
     max_order_submit_rate: str = "100/00:00:01",
     max_order_modify_rate: str = "100/00:00:01",
+    spawn_today: date | None = None,
 ) -> TradingNodeConfig:
     """Build the ``TradingNodeConfig`` for the live trading subprocess.
 
@@ -301,7 +305,10 @@ def build_live_trading_node_config(
     normalized_account_id = ib_settings.account_id.strip()
     _validate_port_account_consistency(ib_settings.port, normalized_account_id)
 
-    instrument_provider_config = build_ib_instrument_provider_config(paper_symbols)
+    instrument_provider_config = build_ib_instrument_provider_config(
+        paper_symbols,
+        today=spawn_today,
+    )
     data_client_id = _derive_data_client_id(deployment_slug)
     exec_client_id = _derive_exec_client_id(deployment_slug)
 
