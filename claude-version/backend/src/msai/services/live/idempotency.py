@@ -234,6 +234,7 @@ _PERMANENT_FAILURE_KINDS: frozenset[FailureKind] = frozenset(
         FailureKind.SPAWN_FAILED_PERMANENT,
         FailureKind.RECONCILIATION_FAILED,
         FailureKind.BUILD_TIMEOUT,
+        FailureKind.HEARTBEAT_TIMEOUT,
         FailureKind.UNKNOWN,
     }
 )

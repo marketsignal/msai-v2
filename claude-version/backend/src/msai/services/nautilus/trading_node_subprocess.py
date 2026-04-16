@@ -226,15 +226,49 @@ async def _mark_terminal(
     error_message: str | None,
     exit_code: int,
 ) -> None:
-    await _update_row(
-        session_factory,
-        row_id,
-        status=status,
-        failure_kind=failure_kind.value,
-        error_message=error_message,
-        exit_code=exit_code,
-        last_heartbeat_at=datetime.now(UTC),
-    )
+    """Write the subprocess's terminal row state AND sync the parent
+    ``live_deployments.status`` so the logical deployment view doesn't
+    linger at ``running`` / ``starting`` after the process has exited.
+
+    Without the deployment-row sync, ``/api/v1/live/status`` shows
+    ``deployment.status='running'`` indefinitely after ``/live/stop``
+    or ``/kill-all`` — the process row flips to ``stopped``/``failed``
+    but the logical row is untouched. This extends the Bug X3 fix
+    (which only covered the spawn-failure path in ``_mark_failed``)
+    to also cover the normal-stop path that terminates through this
+    function.
+    """
+    # LiveNodeProcess terminal write (always runs first so the process
+    # row state is authoritative even if the deployment sync below
+    # fails for some reason).
+
+    from msai.models.live_deployment import LiveDeployment
+
+    async with session_factory() as session, session.begin():
+        process_row = await session.get(LiveNodeProcess, row_id)
+        if process_row is None:
+            return
+        process_row.status = status
+        process_row.failure_kind = failure_kind.value
+        process_row.error_message = error_message
+        process_row.exit_code = exit_code
+        process_row.last_heartbeat_at = datetime.now(UTC)
+
+        # Map the subprocess's terminal status onto the deployment row.
+        # "stopped" → "stopped" (clean shutdown, can be restarted).
+        # Everything else (failed, stale, unmanaged, ...) → "failed".
+        # The non-terminal guard lets a concurrent ``/live/stop`` that
+        # already set ``stopped`` take precedence over a subsequent
+        # ``failed``-path terminal write (e.g., if SIGTERM arrived but
+        # the subprocess then crashed during teardown).
+        deployment = await session.get(LiveDeployment, process_row.deployment_id)
+        if deployment is not None and deployment.status in (
+            "starting",
+            "building",
+            "ready",
+            "running",
+        ):
+            deployment.status = "stopped" if status == "stopped" else "failed"
 
 
 # ---------------------------------------------------------------------------

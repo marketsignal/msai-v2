@@ -627,6 +627,7 @@ async def live_start(  # noqa: PLR0912, PLR0915 — multi-branch dispatch by des
             FailureKind.SPAWN_FAILED_PERMANENT,
             FailureKind.RECONCILIATION_FAILED,
             FailureKind.BUILD_TIMEOUT,
+            FailureKind.HEARTBEAT_TIMEOUT,
             FailureKind.UNKNOWN,
         }
         if kind not in permanent_kinds:

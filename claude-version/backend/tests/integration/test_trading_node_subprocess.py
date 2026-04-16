@@ -427,6 +427,14 @@ async def test_clean_exit_marks_row_stopped_with_failure_kind_none(
     assert row.error_message is None
     assert row.pid == os.getpid()
 
+    # Fix A (2026-04-15): _mark_terminal must also sync the parent
+    # LiveDeployment.status so the logical deployment view doesn't
+    # linger at "starting"/"running" after the process exits cleanly.
+    async with session_factory() as session:
+        dep = await session.get(LiveDeployment, row.deployment_id)
+        assert dep is not None
+        assert dep.status == "stopped"
+
 
 # ---------------------------------------------------------------------------
 # Failure paths
@@ -468,6 +476,14 @@ async def test_startup_health_check_failure_marks_reconciliation_failed(
     assert "trader.is_running=False" in row.error_message
     # Dispose must have been called (gotcha #20)
     assert node.dispose_call.ts is not None
+
+    # Fix A (2026-04-15): _mark_terminal also syncs the parent
+    # LiveDeployment.status so /live/status shows "failed" instead of
+    # lingering at "starting" after reconciliation fails.
+    async with session_factory() as session:
+        dep = await session.get(LiveDeployment, row.deployment_id)
+        assert dep is not None
+        assert dep.status == "failed"
 
     # build() and run_async() were called (run_async is the SINGLE
     # async entry point in the real Nautilus API). The

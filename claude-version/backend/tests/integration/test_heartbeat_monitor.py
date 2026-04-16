@@ -4,7 +4,8 @@ Verifies the ownership split from plan v7 (Codex v6 P0):
 
 - Post-startup rows (``ready``/``running``/``stopping``) with stale
   heartbeats are flipped to ``failed`` with
-  :attr:`FailureKind.UNKNOWN`.
+  :attr:`FailureKind.HEARTBEAT_TIMEOUT`, and the parent
+  ``live_deployments.status`` is synced to ``failed``.
 - Startup rows (``starting``/``building``) are NEVER touched — the
   watchdog owns them.
 - Fresh heartbeats in any status are left alone.
@@ -136,7 +137,9 @@ async def test_stale_post_startup_row_marked_failed(
     status: str,
 ) -> None:
     """All three post-startup statuses with a stale heartbeat must be
-    flipped to ``failed`` with ``FailureKind.UNKNOWN``."""
+    flipped to ``failed`` with ``FailureKind.HEARTBEAT_TIMEOUT``, and
+    the parent ``LiveDeployment`` row must have its ``status`` synced
+    to ``failed`` so the HTTP layer and UI observe the terminal state."""
     async with session_factory() as session:
         row = await _seed_row(
             session,
@@ -155,8 +158,12 @@ async def test_stale_post_startup_row_marked_failed(
         fresh = await session.get(LiveNodeProcess, row.id)
         assert fresh is not None
         assert fresh.status == "failed"
-        assert fresh.failure_kind == FailureKind.UNKNOWN.value
+        assert fresh.failure_kind == FailureKind.HEARTBEAT_TIMEOUT.value
         assert fresh.error_message == "heartbeat timeout"
+
+        fresh_dep = await session.get(LiveDeployment, deployment.id)
+        assert fresh_dep is not None
+        assert fresh_dep.status == "failed"
 
 
 # ---------------------------------------------------------------------------
