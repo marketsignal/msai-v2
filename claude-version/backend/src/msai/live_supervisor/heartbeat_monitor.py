@@ -4,7 +4,9 @@ Cross-restart recovery for deployments that were running but lost
 their parent supervisor. The HeartbeatMonitor walks
 ``live_node_processes`` once every ``sleep_interval_s`` seconds and
 flips any row whose last heartbeat is older than ``stale_seconds`` to
-``status='failed'`` with :attr:`FailureKind.UNKNOWN`.
+``status='failed'`` with :attr:`FailureKind.HEARTBEAT_TIMEOUT`, and
+syncs the parent ``LiveDeployment.status`` to ``failed`` so the HTTP
+layer and UI observe the terminal state (X3 pattern, 2026-04-15).
 
 Ownership split (plan v7, Codex v6 P0)
 --------------------------------------
@@ -42,10 +44,12 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import update
 
-from msai.models import LiveNodeProcess
+from msai.models import LiveDeployment, LiveNodeProcess
 from msai.services.live.failure_kind import FailureKind
 
 if TYPE_CHECKING:
+    from uuid import UUID
+
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
@@ -101,6 +105,7 @@ class HeartbeatMonitor:
         ``deployment_id`` hex strings the sweep flipped, so tests can
         assert on the batch."""
         flipped: list[str] = []
+        flipped_uuids: list[UUID] = []
         cutoff = datetime.now(UTC) - timedelta(seconds=self._stale_seconds)
         async with self._db() as session, session.begin():
             result = await session.execute(
@@ -113,7 +118,7 @@ class HeartbeatMonitor:
                 .values(
                     status="failed",
                     error_message="heartbeat timeout",
-                    failure_kind=FailureKind.UNKNOWN.value,
+                    failure_kind=FailureKind.HEARTBEAT_TIMEOUT.value,
                 )
                 .returning(LiveNodeProcess.deployment_id)
             )
@@ -126,4 +131,20 @@ class HeartbeatMonitor:
                     },
                 )
                 flipped.append(str(deployment_id))
+                flipped_uuids.append(deployment_id)
+
+            # Sync parent deployment row so the HTTP layer and UI see
+            # the terminal state. Same pattern as ProcessManager._mark_failed
+            # (X3 fix, 2026-04-15 live drill).
+            if flipped_uuids:
+                await session.execute(
+                    update(LiveDeployment)
+                    .where(
+                        LiveDeployment.id.in_(flipped_uuids),
+                        LiveDeployment.status.in_(
+                            ("starting", "building", "ready", "running", "stopping")
+                        ),
+                    )
+                    .values(status="failed")
+                )
         return flipped

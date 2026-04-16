@@ -16,6 +16,7 @@ class TestFailureKindValues:
             "spawn_failed_transient",
             "build_timeout",
             "reconciliation_failed",
+            "heartbeat_timeout",
             "in_flight",
             "body_mismatch",
             "api_poll_timeout",

@@ -83,13 +83,26 @@ class FailureKind(StrEnum):
     ``error_message``). Written by ``_trading_node_subprocess`` in
     its ``finally`` block on catching ``StartupHealthCheckFailed``."""
 
+    HEARTBEAT_TIMEOUT = "heartbeat_timeout"
+    """The post-startup heartbeat sweep observed a row whose
+    ``last_heartbeat_at`` is older than the stale threshold. Written
+    by ``HeartbeatMonitor._mark_stale_as_failed`` when the subprocess
+    silently died or got wedged (SIGSTOP'd, deadlocked, OS-killed)
+    without writing its own terminal row. Previously used
+    :attr:`UNKNOWN` which was indistinguishable on the HTTP layer
+    from truly unclassified failures — operators couldn't tell a
+    heartbeat-stuck subprocess from a garbage-column row. This kind
+    is permanent from the endpoint's perspective: retries won't fix
+    it automatically, the operator must restart the supervisor or
+    the deployment."""
+
     UNKNOWN = "unknown"
     """Fallback for rows whose ``failure_kind`` column is NULL or
-    carries a value not in this enum. Used by
-    ``HeartbeatMonitor._mark_stale_as_failed`` for post-startup stale
-    sweeps where the subprocess died without reporting why, AND by
-    :meth:`parse_or_unknown` when reading unrecognized historical
-    values back."""
+    carries a value not in this enum. Used by :meth:`parse_or_unknown`
+    when reading unrecognized historical values back. Writers MUST
+    use a specific kind (``HEARTBEAT_TIMEOUT``, ``BUILD_TIMEOUT``,
+    etc.) rather than ``UNKNOWN`` — a new path that can only surface
+    as UNKNOWN is a writing bug to fix, not an acceptable state."""
 
     # ------------------------------------------------------------------
     # Endpoint-layer values (Task 1.14)
