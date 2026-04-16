@@ -37,7 +37,7 @@ The existing research `Portfolio` + `PortfolioAllocation` tables are tied to `Gr
 
 New tables:
 
-- `live_portfolios` — mutable identity (name, objective, description, created_by, `latest_revision_id` pointer)
+- `live_portfolios` — mutable identity (name, description, created_by). The "active" revision is computed on demand via a query, not stored as a FK pointer — avoids an FK cycle against `live_portfolio_revisions.portfolio_id`.
 - `live_portfolio_revisions` — immutable snapshot; one revision per rebalance; `composition_hash` (sha256 of sorted member tuples)
 - `live_portfolio_revision_strategies` — M:N membership: `(revision_id, strategy_id, config_hash, instruments_signature, weight, order_index)`
 - `live_deployment_strategies` — per-deployment member rows so read path (WebSocket snapshot, `/live/positions`, audit) can attribute events to the right strategy via `strategy_id_full`
@@ -114,7 +114,7 @@ Any change to the revision's composition (strategies, weights, configs, instrume
 - SQLAlchemy models + relationships.
 - `PortfolioService` (create, add member, list members, active revision).
 - `RevisionService` (snapshot + composition_hash + freeze).
-- Unit tests: hash determinism, M:N mapping, revision immutability (cannot mutate after first deployment references it).
+- Unit tests: hash determinism, M:N mapping, revision immutability (cannot mutate after freeze via `is_frozen=true`).
 
 ~600 LOC. Nothing in the live path uses the new tables yet. Ship + merge.
 

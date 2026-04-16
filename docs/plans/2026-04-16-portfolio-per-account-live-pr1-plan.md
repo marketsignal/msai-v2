@@ -21,7 +21,8 @@ Plan-review loop iteration 1 findings addressed here:
 - **P0 (FK cycle risk)**: dropped the `live_portfolios.latest_revision_id` FK entirely. Active-revision lookup becomes a simple query in `RevisionService.get_active_revision`. Eliminates the cycle, eliminates the cascade-delete workaround, keeps existing `drop_all/create_all` fixtures safe.
 - **P1 (GraduationCandidate fixture fields)**: tests now supply `config={}` and `metrics={}` on `GraduationCandidate` (both are NOT NULL per `src/msai/models/graduation_candidate.py:33-34`).
 - **P1 (immutability overclaim)**: dropped the "immutable once referenced by LiveDeployment" language — that's PR #2 scope. `is_frozen` is the single boundary in PR #1.
-- **P1 (draft race)**: added partial unique index `uq_one_draft_per_portfolio` so the DB enforces "at most one unfrozen revision per portfolio". `PortfolioService._get_or_create_draft_revision` uses `INSERT … ON CONFLICT DO NOTHING` + re-select to handle concurrent callers safely.
+- **P1 (draft race)**: added partial unique index `uq_one_draft_per_portfolio` so the DB enforces "at most one unfrozen revision per portfolio". `PortfolioService._get_or_create_draft_revision` uses a read-then-insert pattern guarded by the partial unique index — if a concurrent caller wins the race, the second caller's flush raises `IntegrityError`, which propagates up (callers are expected to retry the whole operation). Defense-in-depth; service is not intended to be hammered concurrently on the same portfolio in PR #1.
+- **P0 (snapshot race — iter 3 fix)**: `RevisionService.snapshot` now fetches the draft with `SELECT … FOR UPDATE` to serialize concurrent snapshot callers on the same portfolio. Without this, two callers could both see the draft unfrozen, the second could load the FIRST caller's just-frozen revision as "existing with matching hash", and delete it via `session.delete(draft)` — because it's the same row.
 - **P1 (migration test below standard)**: added Task 11 — migration test in `tests/integration/test_alembic_migrations.py` following the existing file's pattern.
 - **P1 (TimestampMixin convention)**: `LivePortfolio` uses `TimestampMixin` (matches `Portfolio`, `GraduationCandidate`). Revision/member/deployment-strategy rows are immutable-on-create, so they have `created_at` only (no `updated_at` — updates never happen).
 - **P2 (UUID idiom)**: migration uses `sa.Uuid()` everywhere to match recent migrations (`h6b7c8d9e0f1`, `n2h3i4j5k6l7`).
@@ -179,11 +180,15 @@ def upgrade() -> None:
     )
     # Partial unique index: at most one unfrozen (draft) revision per
     # portfolio. Prevents two concurrent add_strategy callers from
-    # racing into two parallel drafts.
-    op.execute(
-        "CREATE UNIQUE INDEX uq_one_draft_per_portfolio "
-        "ON live_portfolio_revisions(portfolio_id) "
-        "WHERE is_frozen = false"
+    # racing into two parallel drafts. Uses the Alembic-native
+    # ``postgresql_where`` kwarg (idiomatic for partial indexes)
+    # rather than raw SQL so autogenerate diffs stay clean.
+    op.create_index(
+        "uq_one_draft_per_portfolio",
+        "live_portfolio_revisions",
+        ["portfolio_id"],
+        unique=True,
+        postgresql_where=sa.text("is_frozen = false"),
     )
 
     op.create_table(
@@ -290,7 +295,10 @@ def downgrade() -> None:
 
     op.drop_table("live_deployment_strategies")
     op.drop_table("live_portfolio_revision_strategies")
-    op.execute("DROP INDEX IF EXISTS uq_one_draft_per_portfolio")
+    op.drop_index(
+        "uq_one_draft_per_portfolio",
+        table_name="live_portfolio_revisions",
+    )
     op.drop_table("live_portfolio_revisions")
     op.drop_table("live_portfolios")
 ```
@@ -1149,7 +1157,9 @@ from msai.services.live.portfolio_service import (
 
 
 @pytest.fixture(scope="module")
-def pg_url() -> Iterator[str]:
+def isolated_postgres_url() -> Iterator[str]:
+    """Dedicated Postgres testcontainer per module — matches the repo
+    convention (`test_live_node_process_model.py`, `test_heartbeat_thread.py`)."""
     from testcontainers.postgres import PostgresContainer
 
     with PostgresContainer("postgres:16-alpine") as pg:
@@ -1157,8 +1167,8 @@ def pg_url() -> Iterator[str]:
 
 
 @pytest_asyncio.fixture
-async def session(pg_url: str) -> AsyncIterator[AsyncSession]:
-    engine = create_async_engine(pg_url)
+async def session(isolated_postgres_url: str) -> AsyncIterator[AsyncSession]:
+    engine = create_async_engine(isolated_postgres_url)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
@@ -1562,7 +1572,9 @@ from msai.services.live.revision_service import (
 
 
 @pytest.fixture(scope="module")
-def pg_url() -> Iterator[str]:
+def isolated_postgres_url() -> Iterator[str]:
+    """Dedicated Postgres testcontainer per module — matches the repo
+    convention (`test_live_node_process_model.py`, `test_heartbeat_thread.py`)."""
     from testcontainers.postgres import PostgresContainer
 
     with PostgresContainer("postgres:16-alpine") as pg:
@@ -1570,8 +1582,8 @@ def pg_url() -> Iterator[str]:
 
 
 @pytest_asyncio.fixture
-async def session(pg_url: str) -> AsyncIterator[AsyncSession]:
-    engine = create_async_engine(pg_url)
+async def session(isolated_postgres_url: str) -> AsyncIterator[AsyncSession]:
+    engine = create_async_engine(isolated_postgres_url)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
@@ -1780,9 +1792,24 @@ class RevisionService:
         revision is returned (identical compositions collapse).
 
         Raises ``ValueError`` if there is no draft to snapshot.
+
+        Concurrency: uses ``SELECT … FOR UPDATE`` on the draft row so
+        two concurrent ``snapshot`` callers on the same portfolio
+        serialize. Without this, caller B could load the draft while
+        caller A is mid-flush, observe A's just-frozen row as
+        "existing with matching hash", and delete it via
+        ``session.delete(draft)`` — because it's the SAME row that's
+        already been frozen. The row lock forces B to wait until A
+        commits, after which B re-reads, sees the frozen row, and
+        short-circuits.
         """
-        draft = await self._get_draft_revision(portfolio_id)
+        draft = await self._lock_draft_revision(portfolio_id)
         if draft is None:
+            # No unfrozen row — either the portfolio never had a draft
+            # OR a concurrent snapshot already froze it. Surface a
+            # clean error so the caller retries via
+            # ``get_active_revision`` rather than silently treating
+            # "nothing to snapshot" as success.
             raise ValueError(
                 f"Portfolio {portfolio_id} has no draft revision to snapshot"
             )
@@ -1863,14 +1890,22 @@ class RevisionService:
 
     # ------------------------------------------------------------------
 
-    async def _get_draft_revision(
+    async def _lock_draft_revision(
         self, portfolio_id: UUID
     ) -> LivePortfolioRevision | None:
+        """``SELECT … FOR UPDATE`` on the portfolio's draft row.
+
+        Blocks concurrent snapshot callers on the same portfolio
+        until the current transaction commits. ``.with_for_update()``
+        takes a row-level lock that's released on commit/rollback.
+        """
         result = await self._session.execute(
-            select(LivePortfolioRevision).where(
+            select(LivePortfolioRevision)
+            .where(
                 LivePortfolioRevision.portfolio_id == portfolio_id,
                 LivePortfolioRevision.is_frozen.is_(False),
             )
+            .with_for_update()
         )
         return result.scalar_one_or_none()
 ```
@@ -1933,7 +1968,9 @@ from msai.services.live.revision_service import RevisionService
 
 
 @pytest.fixture(scope="module")
-def pg_url() -> Iterator[str]:
+def isolated_postgres_url() -> Iterator[str]:
+    """Dedicated Postgres testcontainer per module — matches the repo
+    convention (`test_live_node_process_model.py`, `test_heartbeat_thread.py`)."""
     from testcontainers.postgres import PostgresContainer
 
     with PostgresContainer("postgres:16-alpine") as pg:
@@ -1941,8 +1978,8 @@ def pg_url() -> Iterator[str]:
 
 
 @pytest_asyncio.fixture
-async def session(pg_url: str) -> AsyncIterator[AsyncSession]:
-    engine = create_async_engine(pg_url)
+async def session(isolated_postgres_url: str) -> AsyncIterator[AsyncSession]:
+    engine = create_async_engine(isolated_postgres_url)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
@@ -2137,72 +2174,83 @@ git commit -m "test(integration): full-lifecycle test for PR#1 portfolio layer"
 
 - Modify: `tests/integration/test_alembic_migrations.py`
 
-**Step 1: Read the existing file for the pattern**
+**Step 1: Read the existing harness**
 
 ```bash
-sed -n '1,60p' tests/integration/test_alembic_migrations.py
+sed -n '1,100p' tests/integration/test_alembic_migrations.py
 ```
 
-Follow its existing subprocess-based pattern for upgrade/downgrade tests. The repo already runs migrations against an isolated Postgres container in that file — reuse that harness.
+Repo convention (iter-2 review finding):
 
-**Step 2: Add a test**
+- Fixture: module-scoped `isolated_postgres_url` with its own `PostgresContainer`.
+- Runner: `_run_alembic(database_url, "upgrade", "head")` — **subprocess**, not in-process `command.upgrade()`. `alembic/env.py` calls `asyncio.run(...)` which clashes with `pytest-asyncio` if invoked in-process.
+- Inspection: `create_async_engine(url)` + `async with engine.connect() as conn` + `await conn.run_sync(sa.inspect)` — not a sync inspect on a raw connection.
 
-Append (or insert after the last test in that file) a test that:
+**Step 2: Append the test**
 
-- Brings the schema to revision `o3i4j5k6l7m8` via `upgrade`.
-- Verifies every new table exists + the partial unique index `uq_one_draft_per_portfolio` exists + the two new columns are present.
-- Runs `downgrade` back to `n2h3i4j5k6l7` and verifies the tables are gone.
-- Runs `upgrade` again.
+Append the following at the end of `tests/integration/test_alembic_migrations.py`:
 
 ```python
-def test_o3_live_portfolio_tables_roundtrip(
-    alembic_config,  # reuse whatever fixture the file already defines
-    migration_connection,  # ditto
-) -> None:
-    """PR #1 schema: new tables create on upgrade, drop on downgrade,
-    round-trip cleanly. Validates the partial unique draft index too."""
-    from alembic import command
+@pytest.mark.asyncio
+async def test_o3_portfolio_schema_roundtrip(isolated_postgres_url: str) -> None:
+    """PR #1 schema: new tables + new columns + partial unique index land
+    on upgrade; downgrade removes them cleanly; re-upgrade works."""
+    _run_alembic(isolated_postgres_url, "upgrade", "head")
 
-    command.upgrade(alembic_config, "o3i4j5k6l7m8")
+    engine = create_async_engine(isolated_postgres_url)
+    try:
+        async with engine.connect() as conn:
+            def _collect(sync_conn: sa.Connection) -> dict:
+                insp = sa.inspect(sync_conn)
+                return {
+                    "tables": set(insp.get_table_names()),
+                    "dep_cols": {c["name"] for c in insp.get_columns("live_deployments")},
+                    "proc_cols": {c["name"] for c in insp.get_columns("live_node_processes")},
+                    "rev_indexes": {
+                        idx["name"]
+                        for idx in insp.get_indexes("live_portfolio_revisions")
+                    },
+                }
+            state = await conn.run_sync(_collect)
+        assert "live_portfolios" in state["tables"]
+        assert "live_portfolio_revisions" in state["tables"]
+        assert "live_portfolio_revision_strategies" in state["tables"]
+        assert "live_deployment_strategies" in state["tables"]
+        assert "ib_login_key" in state["dep_cols"]
+        assert "gateway_session_key" in state["proc_cols"]
+        assert "uq_one_draft_per_portfolio" in state["rev_indexes"]
+    finally:
+        await engine.dispose()
 
-    inspector = sa.inspect(migration_connection)
-    assert "live_portfolios" in inspector.get_table_names()
-    assert "live_portfolio_revisions" in inspector.get_table_names()
-    assert "live_portfolio_revision_strategies" in inspector.get_table_names()
-    assert "live_deployment_strategies" in inspector.get_table_names()
+    _run_alembic(isolated_postgres_url, "downgrade", "n2h3i4j5k6l7")
 
-    # New columns on existing tables.
-    dep_cols = {c["name"] for c in inspector.get_columns("live_deployments")}
-    assert "ib_login_key" in dep_cols
-    proc_cols = {c["name"] for c in inspector.get_columns("live_node_processes")}
-    assert "gateway_session_key" in proc_cols
+    engine = create_async_engine(isolated_postgres_url)
+    try:
+        async with engine.connect() as conn:
+            tables_after_down = await conn.run_sync(
+                lambda sc: set(sa.inspect(sc).get_table_names())
+            )
+        assert "live_portfolios" not in tables_after_down
+        assert "live_portfolio_revisions" not in tables_after_down
+        assert "live_portfolio_revision_strategies" not in tables_after_down
+        assert "live_deployment_strategies" not in tables_after_down
+    finally:
+        await engine.dispose()
 
-    # Partial unique index for drafts.
-    indexes = inspector.get_indexes("live_portfolio_revisions")
-    assert any(
-        idx["name"] == "uq_one_draft_per_portfolio" for idx in indexes
-    )
-
-    command.downgrade(alembic_config, "n2h3i4j5k6l7")
-    inspector = sa.inspect(migration_connection)
-    assert "live_portfolios" not in inspector.get_table_names()
-
-    command.upgrade(alembic_config, "head")
+    _run_alembic(isolated_postgres_url, "upgrade", "head")
 ```
-
-**Important:** if `test_alembic_migrations.py` uses a different fixture name or test style, adapt to match. Read the file first; don't paste this blindly.
 
 **Step 3: Run — must pass**
 
 ```bash
-uv run pytest tests/integration/test_alembic_migrations.py::test_o3_live_portfolio_tables_roundtrip -v
+uv run pytest tests/integration/test_alembic_migrations.py::test_o3_portfolio_schema_roundtrip -v
 ```
 
 **Step 4: Commit**
 
 ```bash
 git add tests/integration/test_alembic_migrations.py
-git commit -m "test(migration): add o3 portfolio-schema round-trip test"
+git commit -m "test(migration): add o3 portfolio-schema round-trip test (subprocess harness)"
 ```
 
 ---
