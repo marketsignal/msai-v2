@@ -6,9 +6,43 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field   | Value |
-| ------- | ----- |
-| Command | none  |
+| Field     | Value                                   |
+| --------- | --------------------------------------- |
+| Command   | /new-feature portfolio-per-account-live |
+| Phase     | Pre-Flight                              |
+| Next step | Verify plugins                          |
+
+### Checklist
+
+- [x] Worktree created (`feat/portfolio-per-account-live`)
+- [x] Project state read
+- [ ] Plugins verified
+- [ ] PRD created
+- [ ] Research done
+- [ ] Brainstorming complete
+- [ ] Approach comparison filled (council already ran — use as input)
+- [ ] Contrarian gate passed — **council already ran (standalone mode), verdict below**
+- [x] Council verdict: **new immutable live-composition model** (LivePortfolio + LivePortfolioRevision + LivePortfolioRevisionStrategy + LiveDeploymentStrategy + gateway_session_key); per-account IB Gateway Compose services; per-gateway-session spawn guard; full-portfolio cold restart on any member change.
+- [ ] Plan written
+- [ ] Plan review loop (0 iterations) — iterate until no P0/P1/P2
+- [ ] TDD execution complete
+- [ ] Code review loop (0 iterations) — iterate until no P0/P1/P2
+- [ ] Simplified
+- [ ] Verified (tests/lint/types)
+- [ ] E2E use cases designed (Phase 3.2b)
+- [ ] E2E verified via verify-e2e agent (Phase 5.4)
+- [ ] E2E regression passed (Phase 5.4b)
+- [ ] E2E use cases graduated to tests/e2e/use-cases/ (Phase 6.2b)
+- [ ] Learnings documented (if any)
+- [ ] State files updated
+- [ ] Committed and pushed
+- [ ] PR created
+- [ ] PR reviews addressed
+- [ ] Branch finished
+
+### Feature scope
+
+Evolve `LiveDeployment` from `(strategy_id, account_id)` to `(portfolio_revision_id, account_id)`. Introduce `LivePortfolio` (mutable, rebalanced over time by portfolio-manager), `LivePortfolioRevision` (immutable snapshot, the warm-restart identity boundary), `LivePortfolioRevisionStrategy` (M:N: one graduated strategy can appear in many portfolios), and `LiveDeploymentStrategy` (member strategy-instance rows for attribution/recovery). Enable same portfolio deployed to N different IB accounts in parallel — each deployment = isolated subprocess + per-account IB Gateway session. Static per-account Gateway services in Compose. Concurrent-spawn guard scoped to gateway session, not global. Deterministic IB `client_id` allocation rule. Full-portfolio cold restart on any member change (no per-strategy hot-swap in v1). Only graduated strategies may be added to a portfolio.
 
 ## Done
 
