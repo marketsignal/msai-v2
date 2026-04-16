@@ -139,12 +139,8 @@ def upgrade() -> None:
             server_default=sa.func.now(),
             nullable=False,
         ),
-        sa.UniqueConstraint(
-            "revision_id", "order_index", name="uq_lprs_revision_order"
-        ),
-        sa.UniqueConstraint(
-            "revision_id", "strategy_id", name="uq_lprs_revision_strategy"
-        ),
+        sa.UniqueConstraint("revision_id", "order_index", name="uq_lprs_revision_order"),
+        sa.UniqueConstraint("revision_id", "strategy_id", name="uq_lprs_revision_strategy"),
     )
 
     op.create_table(
@@ -160,9 +156,7 @@ def upgrade() -> None:
         sa.Column(
             "revision_strategy_id",
             sa.Uuid(),
-            sa.ForeignKey(
-                "live_portfolio_revision_strategies.id", ondelete="RESTRICT"
-            ),
+            sa.ForeignKey("live_portfolio_revision_strategies.id", ondelete="RESTRICT"),
             nullable=False,
             index=True,
         ),

@@ -86,22 +86,32 @@ class PortfolioService:
         # snapshot could freeze the draft + compute ``composition_hash``
         # from the pre-insert member set, then this insert would append
         # a member to a now-frozen revision whose hash no longer matches
-        # its rows (Codex review, 2026-04-16). The FOR UPDATE also
-        # guarantees that if snapshot has already taken the lock and
-        # flipped ``is_frozen=True``, this caller sees the updated row
-        # (``is_frozen=True``) after the wait and raises instead of
-        # silently corrupting it.
+        # its rows.
+        #
+        # Three post-wait outcomes are possible:
+        #   1. Row still present and ``is_frozen=false`` → safe to insert.
+        #   2. Row still present but ``is_frozen=true`` → snapshot
+        #      froze it in place; raise ``RevisionImmutableError`` so
+        #      caller retries by re-invoking ``add_strategy``.
+        #   3. Row no longer exists → snapshot collapsed the draft onto
+        #      an existing frozen revision with matching hash (which
+        #      ``session.delete(draft)``s the original row). Raise
+        #      ``RevisionImmutableError`` with the same retry advice;
+        #      ``scalar_one_or_none`` + explicit None-check avoids the
+        #      raw ``NoResultFound`` the original ``scalar_one`` would
+        #      surface. (Codex iter-2 review.)
         locked = (
             await self._session.execute(
                 select(LivePortfolioRevision)
                 .where(LivePortfolioRevision.id == draft.id)
                 .with_for_update()
             )
-        ).scalar_one()
-        if locked.is_frozen:
+        ).scalar_one_or_none()
+        if locked is None or locked.is_frozen:
             raise RevisionImmutableError(
-                f"Draft revision {draft.id} was frozen by a concurrent snapshot; "
-                "re-invoke ``add_strategy`` to create a fresh draft."
+                f"Draft revision {draft.id} was frozen or collapsed by a "
+                "concurrent snapshot; re-invoke ``add_strategy`` to create "
+                "a fresh draft."
             )
 
         existing = await self._session.execute(
