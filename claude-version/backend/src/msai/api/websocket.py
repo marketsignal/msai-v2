@@ -48,17 +48,26 @@ from uuid import UUID  # noqa: TC003 — FastAPI resolves the type at runtime fo
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from msai.api.live_deps import get_live_redis_binary, get_position_reader
+from msai.api.live_deps import (
+    get_live_redis_binary,
+    get_position_reader,
+    get_projection_state,
+)
 from msai.core.auth import validate_token_or_api_key
 from msai.core.database import get_db
 from msai.core.logging import get_logger
 from msai.models.live_deployment import LiveDeployment
 from msai.services.nautilus.projection.fanout import events_channel_for
+from msai.services.nautilus.projection.reconnect_reader import (
+    load_open_orders_for_deployment,
+    load_recent_trades_for_deployment,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from msai.services.nautilus.projection.position_reader import PositionReader
+    from msai.services.nautilus.projection.projection_state import ProjectionState
 
 
 log = get_logger(__name__)
@@ -111,12 +120,36 @@ async def _send_initial_snapshot(
     *,
     deployment: LiveDeployment,
     position_reader: PositionReader,
+    projection_state: ProjectionState,
+    db: AsyncSession,
 ) -> None:
-    """Pull the current positions + account from
-    :class:`PositionReader` and send a single ``snapshot``
-    message to the client. The reader's fast path serves this
-    in-memory if the worker has already seen events for this
-    deployment; otherwise the cold path rebuilds from Redis."""
+    """Send a full state-replay snapshot to a freshly-connected client.
+
+    Four data sources, each pulled from its authoritative store so a
+    reconnecting UI can paint the full live view without waiting for
+    the next event on the pub/sub channel:
+
+    - ``positions`` / ``account`` — :class:`PositionReader` (fast path
+      in-memory ``ProjectionState``; cold path rebuilds from Redis).
+    - ``orders`` — still-open :class:`OrderAttemptAudit` rows for this
+      deployment, newest-first. Terminal orders are excluded so the
+      ribbon only shows in-flight work.
+    - ``trades`` — most recent :class:`Trade` rows for this deployment,
+      newest-first, bounded at 50 to keep the payload compact.
+    - ``status`` / ``risk_halt`` — :class:`ProjectionState` lookups
+      (these arrive as events on the pub/sub channel and are already
+      cached in memory if the worker has seen any events).
+
+    Reconnect semantics:
+
+    - Connected clients never miss events (per-deployment pub/sub
+      fan-out is reliable). These snapshot fields are strictly the
+      reconnect-replay path.
+    - The snapshot is a point-in-time read. Subsequent events on the
+      pub/sub channel carry deltas that the UI merges into the
+      snapshot by ``client_order_id`` / ``instrument_id`` /
+      ``deployment_id`` as appropriate.
+    """
     deployment_id = deployment.id
     positions = await position_reader.get_open_positions(
         deployment_id=deployment_id,
@@ -128,14 +161,41 @@ async def _send_initial_snapshot(
         trader_id=deployment.trader_id,
         account_id=deployment.account_id,
     )
-    await websocket.send_json(
-        {
-            "type": "snapshot",
-            "deployment_id": str(deployment_id),
-            "positions": [p.model_dump(mode="json") for p in positions],
-            "account": account.model_dump(mode="json") if account is not None else None,
-        }
+    orders = await load_open_orders_for_deployment(db, deployment_id)
+    trades = await load_recent_trades_for_deployment(db, deployment_id)
+    status_event = projection_state.get_status(deployment_id)
+    halt_event = projection_state.get_halt(deployment_id)
+    halted = projection_state.is_halted(deployment_id)
+
+    payload = {
+        "type": "snapshot",
+        "deployment_id": str(deployment_id),
+        "positions": [p.model_dump(mode="json") for p in positions],
+        "account": account.model_dump(mode="json") if account is not None else None,
+        "orders": orders,
+        "trades": trades,
+        "status": status_event.model_dump(mode="json") if status_event is not None else None,
+        "risk_halt": {
+            "halted": halted,
+            "event": halt_event.model_dump(mode="json") if halt_event is not None else None,
+        },
+    }
+
+    # Structured log so regressions (zero orders when the DB has them,
+    # status missing, etc.) show up in observability dashboards instead
+    # of a silent empty panel in the UI. Council Scalability-Hawk P1.
+    log.info(
+        "ws_snapshot_emitted",
+        deployment_id=str(deployment_id),
+        positions=len(positions),
+        orders=len(orders),
+        trades=len(trades),
+        has_account=account is not None,
+        has_status=status_event is not None,
+        halted=halted,
     )
+
+    await websocket.send_json(payload)
 
 
 async def _heartbeat_loop(websocket: WebSocket) -> None:
@@ -290,17 +350,30 @@ async def live_stream(
         return
 
     position_reader = get_position_reader()
+    projection_state = get_projection_state()
 
+    # Open a short-lived DB session just for the reconnect readers
+    # (orders + trades come from audit tables, not the Nautilus cache).
+    # Same pattern as ``_load_deployment`` — do NOT pin a pool
+    # connection for the lifetime of the WebSocket, which can be hours.
+    snapshot_session_gen = get_db()
+    snapshot_session: AsyncSession = await anext(snapshot_session_gen)
     try:
-        await _send_initial_snapshot(
-            websocket,
-            deployment=deployment,
-            position_reader=position_reader,
-        )
-    except Exception:  # noqa: BLE001
-        log.exception("ws_snapshot_failed", deployment_id=str(deployment_id))
-        await websocket.close(code=1011, reason="Snapshot failed")
-        return
+        try:
+            await _send_initial_snapshot(
+                websocket,
+                deployment=deployment,
+                position_reader=position_reader,
+                projection_state=projection_state,
+                db=snapshot_session,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("ws_snapshot_failed", deployment_id=str(deployment_id))
+            await websocket.close(code=1011, reason="Snapshot failed")
+            return
+    finally:
+        with contextlib.suppress(StopAsyncIteration):
+            await anext(snapshot_session_gen)
 
     redis = await get_live_redis_binary()
     pubsub = redis.pubsub()
