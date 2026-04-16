@@ -108,9 +108,16 @@ Evolve `LiveDeployment` from `(strategy_id, account_id)` to `(portfolio_revision
 
 ## Now
 
-Code-review iter-2 running (Codex background task `b99wie10n`) to verify the iter-1 fixes are correct and no new P0/P1/P2 exist. Exit criteria: both Codex and a PR-toolkit spot-check return NO FINDINGS on iter-2. If clean, workflow moves to Push + PR creation (requires user confirmation per CLAUDE.md workflow rules).
+**Code-review iter-2 returned 3 P2s** (Codex `b99wie10n`). Fixes landed in `c5d94d4`:
+
+- **P2 applied** — `compute_composition_hash` pins `ROUND_HALF_EVEN` explicitly so the hash can't drift if any earlier code changed Python's decimal context. Matches Postgres Numeric default rounding.
+- **P2 applied** — `add_strategy`'s `SELECT FOR UPDATE` uses `scalar_one_or_none()` and treats a draft-deleted-by-concurrent-snapshot race the same as a frozen draft — both raise `RevisionImmutableError` with the retry hint (was raising raw `NoResultFound`).
+- **P2 rejected (false alarm)** — Codex claimed `index=True` inside `op.create_table` doesn't emit a standalone `CREATE INDEX`. Adding explicit `op.create_index` calls produced `DuplicateTableError`, confirming the implicit creation fires. Reverted.
+
+**Iter-3 running** (Codex `b2v8jr95f`) to verify no new P0/P1/P2. If clean, exit code-review loop → push + PR creation (requires user confirmation per CLAUDE.md).
 
 **Deferred to PR#2 or follow-up (noted, not blocking merge):**
+
 - `_lock_draft_revision` has no statement-timeout / NOWAIT — defensive improvement, but snapshot callers serialize cleanly in the current test topology. Track as P2 follow-up when contention becomes real.
 - `compute_composition_hash` still takes `list[dict[str, Any]]`. Could be a frozen `CompositionMember` dataclass for compile-time safety. Upgrade when PR#2 lands a typed service-boundary DTO.
 
