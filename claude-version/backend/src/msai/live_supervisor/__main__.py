@@ -47,6 +47,10 @@ from msai.live_supervisor.main import run_forever
 from msai.live_supervisor.process_manager import ProcessManager
 from msai.models import LiveDeployment, Strategy
 from msai.services.live_command_bus import LiveCommandBus
+from msai.services.nautilus.live_instrument_bootstrap import (
+    canonical_instrument_id,
+    exchange_local_today,
+)
 from msai.services.nautilus.strategy_loader import resolve_importable_strategy_paths
 from msai.services.nautilus.trading_node_subprocess import (
     TradingNodePayload,
@@ -126,6 +130,27 @@ def _build_production_payload_factory(
             # provider expects bare symbols that it then resolves
             # to IB contracts via the security master.
             paper_symbols = [instrument.split(".")[0] for instrument in deployment.instruments]
+
+            # Compute the exchange-local date ONCE per spawn and thread
+            # it through every futures-rollover-sensitive call site.
+            # Without this, the supervisor's canonicalization and the
+            # subprocess's provider config can resolve to different
+            # front-months if the spawn crosses midnight on a quarterly
+            # roll day — which would cause the strategy to subscribe to
+            # a bar stream that doesn't exist in the loaded cache.
+            spawn_today = exchange_local_today()
+
+            # Canonicalize each user-facing instrument_id to the
+            # concrete Nautilus instrument_id that will exist in the
+            # cache after the provider preloads the matching IBContract.
+            # Identity mapping for stocks/ETF/FX; for futures, maps the
+            # stable root (``ES.XCME``) to the current front-month
+            # (``ESM6.XCME``) so the strategy's bar subscription matches
+            # what Nautilus actually registers.
+            canonical_instrument_ids = [
+                canonical_instrument_id(instrument, today=spawn_today)
+                for instrument in deployment.instruments
+            ]
 
             # Codex iter3 P1: real-money safety gap.
             #
@@ -224,10 +249,14 @@ def _build_production_payload_factory(
             # ``bar_type`` in the request config, we do NOT
             # override.
             merged_strategy_config = dict(deployment.config or {})
-            if deployment.instruments:
-                first_instrument = deployment.instruments[0]
-                merged_strategy_config.setdefault("instrument_id", first_instrument)
-                # Default bar type: LAST for equities, MID for FX.
+            if canonical_instrument_ids:
+                # Use the CANONICAL id (e.g., ``ESM6.XCME``) not the
+                # user-facing id (``ES.XCME``). The strategy subscribes
+                # to bars for this id, and Nautilus only has the
+                # canonical id registered in its cache.
+                first_instrument = canonical_instrument_ids[0]
+                first_user_instrument = deployment.instruments[0]
+                # Default bar type: LAST for equities/futures, MID for FX.
                 # IB returns error 162 for FX LAST bars — FX only
                 # supports BID, ASK, or MID. Codex verified this.
                 _is_fx = any(
@@ -235,10 +264,47 @@ def _build_production_payload_factory(
                     for x in ("IDEALPRO", "CASH", "EUR", "GBP", "JPY", "AUD", "CHF")
                 )
                 _price_type = "MID" if _is_fx else "LAST"
-                merged_strategy_config.setdefault(
-                    "bar_type",
-                    f"{first_instrument}-1-MINUTE-{_price_type}-EXTERNAL",
-                )
+
+                # Futures rollover detection: canonicalization changes
+                # the ROOT symbol (``ES`` → ``ESM6``) — not just the
+                # venue suffix. For stocks we add the venue suffix
+                # (``AAPL`` → ``AAPL.NASDAQ``) but the root stays
+                # ``AAPL``, so an explicit config with a valid bar_type
+                # like ``AAPL.NASDAQ-5-MINUTE-...`` must be preserved.
+                user_root = first_user_instrument.split(".")[0]
+                canonical_root = first_instrument.split(".")[0]
+                root_changed = user_root != canonical_root
+
+                if root_changed:
+                    # Futures rolled: override so the strategy subscribes
+                    # to the concrete month that's actually loaded in
+                    # Nautilus. A config pinning the user-facing id
+                    # (``ES.XCME``) would otherwise get zero bars.
+                    merged_strategy_config["instrument_id"] = first_instrument
+                    existing_bt = merged_strategy_config.get("bar_type", "")
+                    if not existing_bt:
+                        merged_strategy_config["bar_type"] = (
+                            f"{first_instrument}-1-MINUTE-{_price_type}-EXTERNAL"
+                        )
+                    elif existing_bt.startswith(first_user_instrument + "-"):
+                        # Operator pinned the user-facing id — swap just
+                        # the prefix and preserve their aggregation tail.
+                        merged_strategy_config["bar_type"] = (
+                            first_instrument + existing_bt[len(first_user_instrument) :]
+                        )
+                    # else: operator pinned an unrelated id (e.g., a
+                    # fully-qualified future month). Respect their
+                    # choice — they took responsibility for keeping
+                    # bar_type consistent with instrument_id.
+                else:
+                    # Stocks / ETF / FX — canonical == user-facing apart
+                    # from a venue suffix, so setdefault preserves an
+                    # operator's custom values.
+                    merged_strategy_config.setdefault("instrument_id", first_instrument)
+                    merged_strategy_config.setdefault(
+                        "bar_type",
+                        f"{first_instrument}-1-MINUTE-{_price_type}-EXTERNAL",
+                    )
 
             nautilus_payload = TradingNodePayload(
                 row_id=row_id,
@@ -250,7 +316,8 @@ def _build_production_payload_factory(
                 strategy_config_path=paths.config_path,
                 strategy_config=merged_strategy_config,
                 paper_symbols=paper_symbols,
-                canonical_instruments=list(deployment.instruments),
+                canonical_instruments=canonical_instrument_ids,
+                spawn_today_iso=spawn_today.isoformat(),
                 ib_host=settings.ib_host,
                 ib_port=settings.ib_port,
                 # Codex iter3 P1: use the deployment row's
