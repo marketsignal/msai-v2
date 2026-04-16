@@ -14,6 +14,8 @@ from msai.models.instrument_cache import InstrumentCache
 from msai.models.live_deployment import LiveDeployment
 from msai.models.live_node_process import LiveNodeProcess
 from msai.models.live_portfolio import LivePortfolio
+from msai.models.live_portfolio_revision import LivePortfolioRevision
+from msai.models.live_portfolio_revision_strategy import LivePortfolioRevisionStrategy
 from msai.models.order_attempt_audit import OrderAttemptAudit
 from msai.models.portfolio import Portfolio
 from msai.models.portfolio_allocation import PortfolioAllocation
@@ -36,6 +38,8 @@ __all__ = [
     "LiveDeployment",
     "LiveNodeProcess",
     "LivePortfolio",
+    "LivePortfolioRevision",
+    "LivePortfolioRevisionStrategy",
     "OrderAttemptAudit",
     "Portfolio",
     "PortfolioAllocation",
