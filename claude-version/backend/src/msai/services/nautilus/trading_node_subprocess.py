@@ -360,6 +360,7 @@ async def run_subprocess_async(
     skip_dispose: bool = False,
     on_node_constructed: Any = None,
     on_post_build: Any = None,
+    async_cleanup: Any = None,
 ) -> int:
     """Execute one trading subprocess lifecycle end-to-end.
 
@@ -913,6 +914,24 @@ async def run_subprocess_async(
         except Exception:  # noqa: BLE001
             log.exception("terminal_mark_failed")
 
+        # Bug X2 fix: run cleanup callbacks (e.g. AsyncEngine.dispose)
+        # INSIDE this event loop, after all other teardown completes.
+        # The caller used to do ``asyncio.run(engine.dispose())`` from
+        # the sync ``finally`` block after this coroutine returned,
+        # which crashed with ``RuntimeError: ... attached to a
+        # different loop`` + ``Event loop is closed`` because the
+        # engine's connection pool was bound to THIS loop at create
+        # time but a FRESH loop tried to dispose it. Doing the
+        # dispose inside the original loop keeps binding + teardown
+        # on the same event loop and avoids the cross-loop crash.
+        if async_cleanup is not None:
+            try:
+                result = async_cleanup()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:  # noqa: BLE001
+                log.exception("async_cleanup_failed")
+
 
 # ---------------------------------------------------------------------------
 # Context manager: swallow dispose errors so the terminal write path runs
@@ -1334,23 +1353,29 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
         except Exception as _audit_exc:  # noqa: BLE001
             print(f"[MSAI] Engine audit hook wiring FAILED: {_audit_exc!r}", flush=True)  # noqa: T201
 
-    try:
-        exit_code = asyncio.run(
-            run_subprocess_async(
-                payload,
-                session_factory=session_factory,
-                node_factory=_build_real_node,
-                heartbeat_factory=_real_heartbeat_factory,
-                disconnect_handler_factory=_real_disconnect_handler_factory,
-                install_signal_handlers=True,
-                skip_dispose=True,
-                on_node_constructed=_capture_node,
-                on_post_build=_wire_market_hours,
-            )
+    # Bug X2 fix: dispose the AsyncEngine INSIDE the same event loop
+    # that created its connection pool. Previously the dispose ran
+    # via a second ``asyncio.run(engine.dispose())`` call after the
+    # first ``asyncio.run`` loop had torn down — that created a
+    # fresh loop whose tasks couldn't safely close pool connections
+    # bound to the original loop, resulting in
+    # ``RuntimeError: ... attached to a different loop`` +
+    # ``Event loop is closed`` on every clean shutdown. Handing the
+    # dispose in via ``async_cleanup`` keeps everything on one loop.
+    exit_code = asyncio.run(
+        run_subprocess_async(
+            payload,
+            session_factory=session_factory,
+            node_factory=_build_real_node,
+            heartbeat_factory=_real_heartbeat_factory,
+            disconnect_handler_factory=_real_disconnect_handler_factory,
+            install_signal_handlers=True,
+            skip_dispose=True,
+            on_node_constructed=_capture_node,
+            on_post_build=_wire_market_hours,
+            async_cleanup=engine.dispose,
         )
-    finally:
-        # engine.dispose() must run inside an event loop; use a fresh one.
-        asyncio.run(engine.dispose())
+    )
 
     # Dispose the Nautilus node from sync context — its kernel loop
     # is no longer running (asyncio.run already exited) so dispose

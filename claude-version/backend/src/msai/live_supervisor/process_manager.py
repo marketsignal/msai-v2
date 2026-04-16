@@ -204,6 +204,15 @@ class ProcessManager:
             return False
         if row_id is _PhaseAOutcome.NO_DEPLOYMENT:
             return False
+        if row_id is _PhaseAOutcome.CONCURRENT_STARTUP:
+            # Bug X1: another deployment is still initializing. We
+            # return False so the command reclaim path retries after
+            # the first one reaches ``running`` (or times out / fails).
+            # Ack-ing here would drop the command silently; leaving
+            # it unacked lets the supervisor consumer group pick it
+            # up on the next tick via ``XAUTOCLAIM`` once the first
+            # deployment is stable.
+            return False
 
         # row_id is a real UUID from here on.
         assert isinstance(row_id, UUID)
@@ -481,6 +490,39 @@ class ProcessManager:
                 )
                 return _PhaseAOutcome.ALREADY_ACTIVE
 
+            # Bug X1 fix: IB Gateway's connection semantics don't
+            # survive two concurrent subprocess startups. When a second
+            # Nautilus ``TradingNode`` connects its data + exec clients
+            # while another deployment is still reconciling (``starting``
+            # / ``building`` / ``ready``), IB Gateway disconnects the
+            # first subprocess's clients mid-startup and both fall into
+            # ``startup_health_check_failed``. Serialize spawns at the
+            # supervisor: if any OTHER deployment is still initializing,
+            # reject fast with ``CONCURRENT_STARTUP`` so the operator
+            # retries once the first is ``running``. Rows already in
+            # ``running`` state don't block — once a subprocess has
+            # completed reconciliation its connections are stable.
+            other_starting = (
+                await session.execute(
+                    select(LiveNodeProcess).where(
+                        LiveNodeProcess.deployment_id != deployment_id,
+                        LiveNodeProcess.status.in_(
+                            ("starting", "building", "ready"),
+                        ),
+                    )
+                )
+            ).scalar_one_or_none()
+            if other_starting is not None:
+                log.warning(
+                    "spawn_blocked_concurrent_startup",
+                    extra={
+                        "deployment_id": str(deployment_id),
+                        "other_deployment_id": str(other_starting.deployment_id),
+                        "other_status": other_starting.status,
+                    },
+                )
+                return _PhaseAOutcome.CONCURRENT_STARTUP
+
             row = LiveNodeProcess(
                 deployment_id=deployment_id,
                 pid=None,
@@ -528,6 +570,16 @@ class ProcessManager:
         except Exception:  # noqa: BLE001
             pass
 
+        # Bug X3 fix: when a spawn fails permanently the parent
+        # ``live_deployments.status`` must also flip to ``failed``. The
+        # previous code only updated the ``live_node_processes`` row,
+        # leaving the deployment row stuck at ``starting`` forever —
+        # visible in the UI, the CLI, and the API as a zombie deployment
+        # that never cleans up. Transition the deployment row in the
+        # same transaction so /live/status reflects reality on the
+        # next read.
+        from msai.models.live_deployment import LiveDeployment
+
         async with self._db() as session, session.begin():
             row = await session.get(LiveNodeProcess, row_id)
             if row is None:
@@ -536,6 +588,18 @@ class ProcessManager:
             row.failure_kind = failure_kind.value
             row.error_message = reason
             row.exit_code = None
+
+            # Flip parent deployment to ``failed`` only if it's still in
+            # a non-terminal state — don't stomp ``stopped`` rows that a
+            # concurrent /live/stop may have already written.
+            deployment = await session.get(LiveDeployment, row.deployment_id)
+            if deployment is not None and deployment.status in (
+                "starting",
+                "building",
+                "ready",
+                "running",
+            ):
+                deployment.status = "failed"
 
     # ------------------------------------------------------------------
     # Reap loop (decision #15)
@@ -884,6 +948,7 @@ class _PhaseAOutcome:
     NO_DEPLOYMENT: _PhaseAOutcome
     BUSY_STOPPING: _PhaseAOutcome
     ALREADY_ACTIVE: _PhaseAOutcome
+    CONCURRENT_STARTUP: _PhaseAOutcome
 
     def __init__(self, name: str) -> None:
         self._name = name
@@ -895,3 +960,4 @@ class _PhaseAOutcome:
 _PhaseAOutcome.NO_DEPLOYMENT = _PhaseAOutcome("NO_DEPLOYMENT")
 _PhaseAOutcome.BUSY_STOPPING = _PhaseAOutcome("BUSY_STOPPING")
 _PhaseAOutcome.ALREADY_ACTIVE = _PhaseAOutcome("ALREADY_ACTIVE")
+_PhaseAOutcome.CONCURRENT_STARTUP = _PhaseAOutcome("CONCURRENT_STARTUP")
