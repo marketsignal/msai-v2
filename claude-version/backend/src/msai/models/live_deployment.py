@@ -20,7 +20,7 @@ Phase 1 task 1.1b adds the following columns to the v0 schema:
 - ``trader_id``            — denormalized ``MSAI-{slug}`` for log queries
 - ``strategy_id_full``     — denormalized ``{ClassName}-{slug}``
 - ``account_id``           — IB account id (part of identity tuple)
-- ``message_bus_stream``   — denormalized ``trader-MSAI-{slug}-stream``
+- ``message_bus_stream``   — denormalized ``trader-MSAI-{slug}:stream``
 - ``config_hash``          — sha256 of canonical-json strategy config
 - ``instruments_signature`` — sorted, comma-joined canonical IDs
 - ``last_started_at`` / ``last_stopped_at`` — most-recent-run timestamps

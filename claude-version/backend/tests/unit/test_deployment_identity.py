@@ -8,7 +8,7 @@ Verifies the canonical-JSON sha256 identity model from decision #7:
 - compute_config_hash on a Pydantic model normalizes via model_dump(mode="json")
   so semantically-identical configs hash the same (Codex v5 P3 fix)
 - derive_* helpers produce the right MSAI-{slug}, EMACrossStrategy-{slug},
-  trader-MSAI-{slug}-stream values
+  trader-MSAI-{slug}:stream values
 - generate_deployment_slug returns 16-hex-char strings (64 bits)
 - Same identity tuple → same identity_signature (warm restart)
 - ANY field change (code_hash / config_hash / account_id / paper_trading /
@@ -118,8 +118,10 @@ class TestDeriveHelpers:
         )
 
     def test_derive_message_bus_stream(self) -> None:
+        # Colon separator matches Nautilus's Rust MessageBus output —
+        # see Bug B fix 2026-04-16 in ``derive_message_bus_stream``.
         assert (
-            derive_message_bus_stream("a1b2c3d4e5f60718") == "trader-MSAI-a1b2c3d4e5f60718-stream"
+            derive_message_bus_stream("a1b2c3d4e5f60718") == "trader-MSAI-a1b2c3d4e5f60718:stream"
         )
 
 
