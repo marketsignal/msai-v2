@@ -225,7 +225,13 @@ services:
       TWS_USERID: ${TWS_USERID:-}
       TWS_PASSWORD: ${TWS_PASSWORD:-}
       TRADING_MODE: ${TRADING_MODE:-paper}
-      READ_ONLY_API: ${READ_ONLY_API:-yes}
+      # Default to ``no`` so paper-trading orders can be submitted
+      # without a per-session env override. ``yes`` blocks every order
+      # with IB error 321 ("API interface is currently in Read-Only
+      # mode") — bit us twice during the 2026-04-15 drill. Operators
+      # running with real-money accounts should override via
+      # ``READ_ONLY_API=yes`` in ``.env`` until they're ready to trade.
+      READ_ONLY_API: ${READ_ONLY_API:-no}
       TWS_SETTINGS_PATH: /home/ibgateway/tws_settings
       AUTO_RESTART_TIME: ${IB_AUTO_RESTART_TIME:-11:45 PM}
       RELOGIN_AFTER_TWOFA_TIMEOUT: ${IB_RELOGIN_AFTER_TWOFA_TIMEOUT:-yes}
