@@ -13,6 +13,7 @@ from msai.models.graduation_stage_transition import GraduationStageTransition
 from msai.models.instrument_cache import InstrumentCache
 from msai.models.live_deployment import LiveDeployment
 from msai.models.live_node_process import LiveNodeProcess
+from msai.models.live_portfolio import LivePortfolio
 from msai.models.order_attempt_audit import OrderAttemptAudit
 from msai.models.portfolio import Portfolio
 from msai.models.portfolio_allocation import PortfolioAllocation
@@ -34,6 +35,7 @@ __all__ = [
     "InstrumentCache",
     "LiveDeployment",
     "LiveNodeProcess",
+    "LivePortfolio",
     "OrderAttemptAudit",
     "Portfolio",
     "PortfolioAllocation",
