@@ -76,6 +76,7 @@ class Trade(Base):
     price: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False)
     commission: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
     broker_trade_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    client_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     pnl: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
     is_live: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     executed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
