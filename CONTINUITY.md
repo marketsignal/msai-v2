@@ -24,7 +24,7 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 - [ ] Contrarian gate passed — **council already ran (standalone mode), verdict below**
 - [x] Council verdict: **new immutable live-composition model** (LivePortfolio + LivePortfolioRevision + LivePortfolioRevisionStrategy + LiveDeploymentStrategy + gateway_session_key); per-account IB Gateway Compose services; per-gateway-session spawn guard; full-portfolio cold restart on any member change.
 - [ ] Plan written
-- [ ] Plan review loop (0 iterations) — iterate until no P0/P1/P2
+- [ ] Plan review loop (1 iterations) — iterate until no P0/P1/P2
 - [ ] TDD execution complete
 - [ ] Code review loop (0 iterations) — iterate until no P0/P1/P2
 - [ ] Simplified
