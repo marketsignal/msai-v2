@@ -31,19 +31,24 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
   - P0-C `fix/ib-gateway-env-var-drift` (6f02767): settings.ib_host/ib_port accept AliasChoices on IB_GATEWAY_HOST + IB_GATEWAY_PORT_PAPER env names
   - P0-A `fix/live-supervisor-default-profile` (08b34a9): /live/start returns 503 fast when no supervisor consumer is registered (vs silent 504 timeout)
 
+## Done (cont'd)
+
+- 7-bug post-drill sprint complete 2026-04-16 02:31 UTC — every offline-fixable bug from the 2026-04-15 multi-asset drill aftermath shipped to main, no bugs left behind:
+  - **Bug #1** PR #17 — backtest metrics now derive from positions when Nautilus stats return NaN (3-tier fallback: stats → account snapshot → positions). Verified: win_rate=0.17, sharpe=-45.7 on AAPL/SPY 2024.
+  - **Bug #2** PR #18 — `/account/health` IB probe now starts as a FastAPI lifespan background task (30s interval). Verified: `gateway_connected=true` after first probe tick.
+  - **Bug #3** commit 2084423 — `READ_ONLY_API` compose default flipped to `no` so paper-trading orders submit without per-session env override (was triggering IB error 321 in 2026-04-15 drill).
+  - **Bug #4** PR #19 — `PositionClosed.realized_pnl` now propagates to `trades.pnl` via new `client_order_id` linkage; subscribed to `events.position.*` in subprocess.
+  - **Bug #5** PR #20 — `graduation_candidates.deployment_id` auto-links on `/live/start` so the graduation → live audit chain stays connected.
+  - **Bug #6** PR #21 — `trades.side` now persists as `BUY`/`SELL` strings via `OrderSide.name` (was leaking enum int 1/2 into the DB).
+  - **Bug #7** PR #22 — `claude-version/scripts/restart-workers.sh` ships ~10s worker container restart for stale-import hygiene; documented in `claude-version/CLAUDE.md`.
+
 ## Now
 
-Multi-asset live drill ATTEMPTED 2026-04-15 19:36-19:45 UTC, **failed to produce a single live fill** outside the EUR/USD path that already works. Bugs surfaced (none yet fixed):
-
-1. **AAPL/MSFT/SPY** — deployments reach RUNNING state and subscribe to bars, but no `on_bar` events fire. Set `IB_MARKET_DATA_TYPE=DELAYED` to dodge IB error 162 from earlier; DELAYED on US equities apparently doesn't push bar events to the strategy. Strategy is alive, EMAs never update, no signals. The dev account `DUP733213` may not have any market data subscription for US equities — needs check.
-2. **ES futures** — `Unable to resolve contract details for IBContract(secType='FUT', exchange='CME', symbol='ES', currency='USD')`. Wrong contract spec; ES needs `exchange='GLOBEX'` + a `lastTradeDateOrContractMonth` for the front-month resolution. Bootstrap whitelist entry I added is wrong.
-3. **Options** — never attempted; needs separate IB options-chain bootstrap path.
-4. **Graduation flow** — never invoked the `/api/v1/graduation/...` API. The right user-facing path is backtest → graduate → live deploy, not hand-tuned EMA config straight to /live/start. This was the user's explicit "no cheating" requirement.
-5. **Heartbeat-stale** flips on multi-deployment supervisor → `failed`. Symptomatic of the bar-feed gap.
+Sprint clean. All 7 post-drill bugs shipped. Pre-market prep window before 2026-04-16 09:30 ET open — last chance to land prep items so the multi-asset drill can rerun against a clean stack at the open.
 
 ## Next
 
-1. **Tomorrow at market open**: do this properly. Pre-open prep — verify paper account `DUP733213` market-data entitlements (IB account → Settings → Market Data Subscriptions); fix ES futures contract spec (`GLOBEX` + front-month); add SPY-style entry for an index ETF if needed; add options-chain bootstrap for one ticker. After open: run the full graduation pipeline as the user-facing flow (backtest a fast EMA → `POST /api/v1/graduation/...` → graduated strategy goes live across all 5 asset classes → watch fills).
-2. Bug B (worker stale-import hygiene) — lightweight ops fix.
+1. **Pre-open prep (before 2026-04-16 09:30 ET)**: verify paper account `DUP733213` market-data entitlements (IB account → Settings → Market Data Subscriptions); fix ES futures contract spec in `live_instrument_bootstrap.py` (`exchange="GLOBEX"` + `lastTradeDateOrContractMonth` for front-month); add options-chain bootstrap path for one ticker.
+2. **At market open**: run the full graduation pipeline as the user-facing flow (backtest a fast EMA → `POST /api/v1/graduation/...` → graduated strategy goes live across all 5 asset classes → watch fills). Verify all 7 bug fixes hold under live load.
 3. Phase 2 #5 Strategy registry + continuous futures (DB-backed InstrumentDefinition, `.Z.` regex).
-4. Follow-ups: EMA backtest zero PnL/win-rate/sharpe (extraction gap); `trades.side` persists as Nautilus enum int (1/2) instead of "BUY"/"SELL"; PositionClosed `realized_pnl` not propagated; `READ_ONLY_API=no` compose default; `/account/health` probe never-started; `/live/positions` empty with open Nautilus position; deployment row status stays `starting`; audit lifecycle race auto-heal.
+4. Remaining follow-ups not in the 7-bug sprint: `/live/positions` empty with open Nautilus position; deployment row status stays `starting`; audit lifecycle race auto-heal.
