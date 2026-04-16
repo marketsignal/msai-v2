@@ -826,3 +826,52 @@ async def test_alembic_upgrade_head_creates_order_attempt_audits(
     actual_indexes = set(shape["indexes"])
     missing_indexes = expected_indexes - actual_indexes
     assert not missing_indexes, f"missing indexes: {missing_indexes}"
+
+
+@pytest.mark.asyncio
+async def test_o3_portfolio_schema_roundtrip(isolated_postgres_url: str) -> None:
+    """PR #1 schema: new tables + new columns + partial unique index land
+    on upgrade; downgrade removes them cleanly; re-upgrade works."""
+    _run_alembic(isolated_postgres_url, "upgrade", "head")
+
+    engine = create_async_engine(isolated_postgres_url)
+    try:
+        async with engine.connect() as conn:
+            def _collect(sync_conn: sa.Connection) -> dict:
+                insp = sa.inspect(sync_conn)
+                return {
+                    "tables": set(insp.get_table_names()),
+                    "dep_cols": {c["name"] for c in insp.get_columns("live_deployments")},
+                    "proc_cols": {c["name"] for c in insp.get_columns("live_node_processes")},
+                    "rev_indexes": {
+                        idx["name"]
+                        for idx in insp.get_indexes("live_portfolio_revisions")
+                    },
+                }
+            state = await conn.run_sync(_collect)
+        assert "live_portfolios" in state["tables"]
+        assert "live_portfolio_revisions" in state["tables"]
+        assert "live_portfolio_revision_strategies" in state["tables"]
+        assert "live_deployment_strategies" in state["tables"]
+        assert "ib_login_key" in state["dep_cols"]
+        assert "gateway_session_key" in state["proc_cols"]
+        assert "uq_one_draft_per_portfolio" in state["rev_indexes"]
+    finally:
+        await engine.dispose()
+
+    _run_alembic(isolated_postgres_url, "downgrade", "n2h3i4j5k6l7")
+
+    engine = create_async_engine(isolated_postgres_url)
+    try:
+        async with engine.connect() as conn:
+            tables_after_down = await conn.run_sync(
+                lambda sc: set(sa.inspect(sc).get_table_names())
+            )
+        assert "live_portfolios" not in tables_after_down
+        assert "live_portfolio_revisions" not in tables_after_down
+        assert "live_portfolio_revision_strategies" not in tables_after_down
+        assert "live_deployment_strategies" not in tables_after_down
+    finally:
+        await engine.dispose()
+
+    _run_alembic(isolated_postgres_url, "upgrade", "head")
