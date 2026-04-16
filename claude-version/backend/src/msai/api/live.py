@@ -17,7 +17,6 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import case, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import IntegrityError
 
 from msai.api.live_deps import get_command_bus, get_idempotency_store
 from msai.core.audit import log_audit
@@ -28,7 +27,6 @@ from msai.core.logging import get_logger
 from msai.models.live_deployment import LiveDeployment
 from msai.models.live_node_process import LiveNodeProcess
 from msai.models.strategy import Strategy
-from msai.models.user import User
 from msai.schemas.live import (
     LiveDeploymentInfo,
     LiveDeploymentStatusResponse,
@@ -481,6 +479,18 @@ async def live_start(  # noqa: PLR0912, PLR0915 — multi-branch dispatch by des
             )
         ).scalar_one_or_none()
         if active_process is not None:
+            # UP-direction sync — mirror of PR #26 Fix A/B. When an
+            # idempotent retry or warm restart hits an already-running
+            # process, the deployment row can be stuck at 'starting'
+            # (the upsert CASE above preserves any active status, so a
+            # deployment whose original /live/start never completed the
+            # poll-and-update step keeps its initial 'starting'). That
+            # stale value makes /live/positions, /live/status, and the
+            # UI filter out the deployment even though its process is
+            # operational. Sync here so observers see operational truth.
+            if active_process.status in ("ready", "running") and deployment.status != "running":
+                deployment.status = "running"
+                await db.commit()
             outcome = EndpointOutcome.already_active(
                 {
                     "id": str(deployment.id),
@@ -1043,10 +1053,41 @@ async def live_positions(
 
     reader = get_position_reader()
 
+    # Filter by the authoritative process-row state rather than
+    # deployment.status. A deployment can lag at ``starting`` even
+    # though its subprocess is fully ``ready``/``running`` — the UP
+    # sync in ``already_active`` (Bug A, 2026-04-16) closes most of
+    # the gap, but the /live/start poll-timeout race can still land
+    # a permanent_failure response while a fresh subprocess comes
+    # up in parallel. Going via the process row decouples the
+    # /live/positions visibility from any deployment-row sync
+    # latency. Includes BOTH running/ready so a newly-spawned
+    # deployment's positions appear as soon as the subprocess
+    # reports ready, and a truly-stopped deployment's positions
+    # drop out immediately.
+    active_process_statuses = ("ready", "running")
+    latest_process_per_dep = (
+        select(
+            LiveNodeProcess.deployment_id,
+            func.max(LiveNodeProcess.started_at).label("started_at"),
+        )
+        .group_by(LiveNodeProcess.deployment_id)
+        .subquery()
+    )
     active_rows = (
         (
             await db.execute(
-                select(LiveDeployment).where(LiveDeployment.status.in_(("running", "ready")))
+                select(LiveDeployment)
+                .join(
+                    latest_process_per_dep,
+                    latest_process_per_dep.c.deployment_id == LiveDeployment.id,
+                )
+                .join(
+                    LiveNodeProcess,
+                    (LiveNodeProcess.deployment_id == LiveDeployment.id)
+                    & (LiveNodeProcess.started_at == latest_process_per_dep.c.started_at),
+                )
+                .where(LiveNodeProcess.status.in_(active_process_statuses))
             )
         )
         .scalars()

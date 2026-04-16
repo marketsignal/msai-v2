@@ -169,15 +169,28 @@ def derive_strategy_id_full(strategy_class_name: str, slug: str) -> str:
 
 
 def derive_message_bus_stream(slug: str) -> str:
-    """``trader-MSAI-{slug}-stream`` — the deterministic Redis Stream name
+    """``trader-MSAI-{slug}:stream`` — the deterministic Redis Stream name
     where Nautilus publishes message-bus events for this trader (Phase 3
     task 3.2 with ``stream_per_topic=False``).
 
     Persisted on the row at deployment-creation time so the projection
     consumer (3.4) knows what stream to ``XREADGROUP`` from without
     polling Redis for stream names.
+
+    The separator before ``stream`` is a **colon**, matching what
+    Nautilus's Rust MessageBus actually writes: with ``use_trader_prefix=True``,
+    ``use_trader_id=True``, and ``streams_prefix='stream'`` (see
+    ``live_node_config.py``), Nautilus constructs the name as
+    ``"{prefix}-{trader_id}:{streams_prefix}"``. Bug B, 2026-04-16:
+    this helper previously returned ``-stream`` (hyphen). Every
+    PositionOpened / OrderFilled / AccountState event since MSAI
+    wired the projection consumer was being silently dropped
+    because the consumer was XREADGROUP'ing an empty
+    ``...-stream`` key while Nautilus was writing to
+    ``...:stream``. Confirmed on 5 deployments: hyphen-keys
+    had 0 entries, colon-keys 64–2582.
     """
-    return f"trader-{derive_trader_id(slug)}-stream"
+    return f"trader-{derive_trader_id(slug)}:stream"
 
 
 def canonicalize_user_id(user_id: UUID | None, *, fallback_sub: str | None = None) -> str:

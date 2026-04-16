@@ -59,7 +59,6 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import msgspec
-from nautilus_trader.cache.cache import Cache  # type: ignore[import-not-found]
 from nautilus_trader.cache.config import CacheConfig
 from nautilus_trader.cache.database import (  # type: ignore[import-not-found]
     CacheDatabaseAdapter,
@@ -67,7 +66,6 @@ from nautilus_trader.cache.database import (  # type: ignore[import-not-found]
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.identifiers import (  # type: ignore[import-not-found]
     AccountId,
-    StrategyId,
     TraderId,
 )
 from nautilus_trader.serialization.serializer import (  # type: ignore[import-not-found]
@@ -85,6 +83,20 @@ if TYPE_CHECKING:
     from uuid import UUID
 
     from msai.services.nautilus.projection.projection_state import ProjectionState
+
+
+def _money_to_decimal(money: Any) -> Decimal:
+    """``Money.__str__`` returns ``"0.00 USD"`` which ``Decimal``
+    rejects. Extract the numeric portion via the canonical
+    ``Money.as_decimal()`` when available, or strip the currency
+    suffix as a fallback. Returns 0 for None input."""
+    if money is None:
+        return Decimal(0)
+    as_decimal = getattr(money, "as_decimal", None)
+    if callable(as_decimal):
+        return Decimal(as_decimal())
+    text = str(money).split(" ", 1)[0]
+    return Decimal(text) if text else Decimal(0)
 
 
 log = logging.getLogger(__name__)
@@ -227,13 +239,33 @@ class PositionReader:
         trader_id: str,
         strategy_id_full: str,
     ) -> list[PositionSnapshot]:
-        """Build a fresh Cache, ``cache_all()``, read, dispose.
-        Per-request — never reused."""
+        """Read open positions for a strategy directly from the
+        ``CacheDatabaseAdapter``. Per-request — the adapter is
+        disposed at the end.
+
+        Why the adapter directly and not ``Cache.cache_all() +
+        cache.positions_open(...)``: the ``Cache`` wrapper's
+        ``cache_positions``/``cache_orders`` paths silently load
+        zero rows in our Nautilus version even when the adapter's
+        ``load_orders()``/``load_positions()`` return the rows
+        correctly. Surfaced end-to-end 2026-04-16 during Bug B
+        investigation: ``redis-cli MONITOR`` showed the adapter
+        issuing the right SCAN + LRANGE commands against
+        ``trader-{trader}:positions:*`` and ``:orders:*``, and
+        deserializing the events successfully, but the Cache's
+        internal position map stayed empty. Going direct to the
+        adapter bypasses the wrapper entirely — there's no state
+        we need from ``Cache`` beyond the loaded ``Position``
+        objects themselves.
+        """
         adapter = self._build_adapter(trader_id)
         try:
-            cache = Cache(database=adapter)
-            cache.cache_all()
-            raw = cache.positions_open(strategy_id=StrategyId(strategy_id_full))
+            positions_by_id = adapter.load_positions()
+            raw = [
+                position
+                for position in positions_by_id.values()
+                if str(position.strategy_id) == strategy_id_full and position.is_open
+            ]
             return [self._to_snapshot(p, deployment_id) for p in raw]
         finally:
             adapter.close()
@@ -255,14 +287,13 @@ class PositionReader:
         # every client got a 1011 close. Qualify with the IB venue prefix
         # here so the format always matches what Nautilus's own
         # ``AccountState`` events emit.
-        qualified_account = (
-            account_id if "-" in account_id else f"INTERACTIVE_BROKERS-{account_id}"
-        )
+        qualified_account = account_id if "-" in account_id else f"INTERACTIVE_BROKERS-{account_id}"
         adapter = self._build_adapter(trader_id)
         try:
-            cache = Cache(database=adapter)
-            cache.cache_all()
-            account = cache.account(AccountId(qualified_account))
+            # Go direct to the adapter — see the docstring on
+            # ``_read_via_ephemeral_cache_positions`` for why the
+            # ``Cache`` wrapper is bypassed (Bug B, 2026-04-16).
+            account = adapter.load_account(AccountId(qualified_account))
             if account is None:
                 return None
             return self._to_account_update(account, deployment_id)
@@ -278,15 +309,27 @@ class PositionReader:
         """Convert a Nautilus ``Position`` cached object to our
         internal ``PositionSnapshot``. Done as a staticmethod
         so the test surface stays narrow — no DB / Redis
-        dependencies."""
+        dependencies.
+
+        Nautilus ``Position`` returns ``Money`` for ``realized_pnl``
+        (str form is ``"0.00 USD"``, which ``Decimal`` cannot parse).
+        ``unrealized_pnl`` is a *method* that takes a last-quote
+        argument — we don't have the live quote in this read path,
+        so we surface 0 (the dashboard can compute it client-side
+        from the position + a separate quote feed if needed). Bug B
+        surfaced this when switching the reader from the broken
+        ``Cache`` wrapper to the working adapter path — the wrapper
+        never returned any Position, so this ``Money.__str__``
+        mismatch had gone undetected.
+        """
         ts = PositionReader._coerce_ts(getattr(position, "ts_last", None))
         return PositionSnapshot(
             deployment_id=deployment_id,
             instrument_id=str(position.instrument_id),
             qty=Decimal(str(getattr(position, "quantity", "0"))),
             avg_price=Decimal(str(getattr(position, "avg_px_open", "0"))),
-            unrealized_pnl=Decimal(str(getattr(position, "unrealized_pnl", "0"))),
-            realized_pnl=Decimal(str(getattr(position, "realized_pnl", "0"))),
+            unrealized_pnl=Decimal(0),
+            realized_pnl=_money_to_decimal(getattr(position, "realized_pnl", None)),
             ts=ts,
         )
 
@@ -301,9 +344,17 @@ class PositionReader:
             balances = account.balances() if callable(account.balances) else account.balances
             if balances:
                 first = next(iter(balances.values())) if isinstance(balances, dict) else balances[0]
-                balance = Decimal(str(getattr(first, "total", "0")))
-                margin_used = Decimal(str(getattr(first, "locked", "0")))
-                margin_available = Decimal(str(getattr(first, "free", "0")))
+                # Nautilus ``AccountBalance`` fields are ``Money`` —
+                # same "0.00 USD" parsing issue as ``realized_pnl``
+                # in ``_to_snapshot``. Use the shared helper so
+                # ``Money.as_decimal()`` is called when available,
+                # otherwise the currency suffix is stripped.
+                total = getattr(first, "total", None)
+                balance = _money_to_decimal(total() if callable(total) else total)
+                locked = getattr(first, "locked", None)
+                margin_used = _money_to_decimal(locked() if callable(locked) else locked)
+                free = getattr(first, "free", None)
+                margin_available = _money_to_decimal(free() if callable(free) else free)
         except Exception:  # noqa: BLE001
             log.exception(
                 "position_reader_account_balance_extract_failed",
