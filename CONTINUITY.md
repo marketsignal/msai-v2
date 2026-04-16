@@ -10,7 +10,7 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 | --------- | ----------------------------------------------------- |
 | Command   | /new-feature portfolio-per-account-live               |
 | Phase     | 5 — Quality Gates                                     |
-| Next step | Final code review pass before PR create (user choice) |
+| Next step | Await iter-3 Codex review verdict → exit loop if clean |
 
 ### Checklist
 
