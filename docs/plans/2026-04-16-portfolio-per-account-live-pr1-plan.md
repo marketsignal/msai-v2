@@ -1799,9 +1799,17 @@ class RevisionService:
         caller A is mid-flush, observe A's just-frozen row as
         "existing with matching hash", and delete it via
         ``session.delete(draft)`` — because it's the SAME row that's
-        already been frozen. The row lock forces B to wait until A
-        commits, after which B re-reads, sees the frozen row, and
-        short-circuits.
+        already been frozen.
+
+        After the lock releases (A commits with ``is_frozen=True``),
+        B's ``_lock_draft_revision`` query — which filters
+        ``is_frozen = false`` — no longer matches the now-frozen row
+        and returns ``None``. ``snapshot`` then raises ``ValueError``.
+        The caller is expected to recover by calling
+        :meth:`get_active_revision` to retrieve A's frozen revision;
+        we deliberately do NOT silently return it here because a
+        ``snapshot`` call that finds no draft to freeze is a semantic
+        error, not a no-op.
         """
         draft = await self._lock_draft_revision(portfolio_id)
         if draft is None:

@@ -39,7 +39,7 @@ New tables:
 
 - `live_portfolios` — mutable identity (name, description, created_by). The "active" revision is computed on demand via a query, not stored as a FK pointer — avoids an FK cycle against `live_portfolio_revisions.portfolio_id`.
 - `live_portfolio_revisions` — immutable snapshot; one revision per rebalance; `composition_hash` (sha256 of sorted member tuples)
-- `live_portfolio_revision_strategies` — M:N membership: `(revision_id, strategy_id, config_hash, instruments_signature, weight, order_index)`
+- `live_portfolio_revision_strategies` — M:N membership: `(revision_id, strategy_id, config, instruments, weight, order_index)`. The revision's `composition_hash` is computed over the full normalized tuples of all member rows (config + instruments + weight + order + strategy_id), so there's no need to denormalize per-member hashes.
 - `live_deployment_strategies` — per-deployment member rows so read path (WebSocket snapshot, `/live/positions`, audit) can attribute events to the right strategy via `strategy_id_full`
 
 New columns:
