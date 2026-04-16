@@ -112,6 +112,15 @@ class LiveDeployment(Base):
     Also part of the identity tuple — switching accounts produces a new
     deployment row, not a warm restart on the existing one."""
 
+    ib_login_key: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    """IB username (TWS userid) used by this deployment. The supervisor
+    multiplexes logical deployments that share an ``ib_login_key`` onto
+    a single Nautilus subprocess via Nautilus's multi-account
+    ``exec_clients`` feature (PR #3194, 1.225+). Nullable in PR #1 —
+    populated by PR #2 at deploy time, enforced NOT NULL in PR #3."""
+
     message_bus_stream: Mapped[str] = mapped_column(String(96), nullable=False)
     """``f"trader-MSAI-{deployment_slug}-stream"`` — the deterministic
     Redis Stream name where Nautilus publishes events for this trader
