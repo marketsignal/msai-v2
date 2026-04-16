@@ -99,6 +99,10 @@ cd backend && uv run msai live-kill-all
 # Database migrations
 cd backend && uv run alembic upgrade head           # Apply migrations
 cd backend && uv run alembic revision --autogenerate -m "description"  # New migration
+
+# Worker stale-import refresh (run after merges touching src/msai/services|workers|live_supervisor)
+./scripts/restart-workers.sh                       # Restart workers without rebuilding images
+./scripts/restart-workers.sh --with-broker         # Also restart live-supervisor + ib-gateway
 ```
 
 ### API Endpoints
