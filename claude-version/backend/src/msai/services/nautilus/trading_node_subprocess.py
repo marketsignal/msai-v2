@@ -1203,12 +1203,26 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
                                     if _ts_event_ns
                                     else datetime.now(UTC)
                                 )
-                                _order_side = str(getattr(event, "order_side", "UNKNOWN"))
-                                # Nautilus enums like ``OrderSide.BUY`` stringify
-                                # as ``"BUY"``; strip the enum prefix defensively
-                                # in case internal reprs change.
-                                if "." in _order_side:
-                                    _order_side = _order_side.rsplit(".", 1)[-1]
+                                # Nautilus's OrderSide enum stringifies as its
+                                # int value (``"1"`` / ``"2"``) on this version,
+                                # NOT as ``"BUY"`` / ``"SELL"``. Drill 2026-04-15
+                                # surfaced trades with ``side="1"`` in the DB.
+                                # Map by name when available, fall back to the
+                                # int→string mapping, then to the raw stringify
+                                # so future enum changes still produce something.
+                                _raw_side = getattr(event, "order_side", None)
+                                _name = getattr(_raw_side, "name", None)
+                                if _name:
+                                    _order_side = _name
+                                else:
+                                    _side_str = (
+                                        str(_raw_side) if _raw_side is not None else "UNKNOWN"
+                                    )
+                                    _int_to_name = {"1": "BUY", "2": "SELL"}
+                                    _order_side = _int_to_name.get(_side_str, _side_str)
+                                    # Strip ``OrderSide.BUY`` -> ``BUY`` for older reprs.
+                                    if "." in _order_side:
+                                        _order_side = _order_side.rsplit(".", 1)[-1]
                                 _trade_persisted = await writer.write_trade_fill(
                                     TradeFillFacts(
                                         broker_trade_id=str(event.trade_id),
