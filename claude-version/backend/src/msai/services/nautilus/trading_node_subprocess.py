@@ -1539,6 +1539,7 @@ def _build_real_node(payload: TradingNodePayload) -> Any:
     from msai.services.nautilus.live_node_config import (
         IBSettings,
         build_live_trading_node_config,
+        build_portfolio_trading_node_config,
     )
 
     ib_settings = IBSettings(
@@ -1560,15 +1561,26 @@ def _build_real_node(payload: TradingNodePayload) -> Any:
         except ValueError:
             spawn_today = None
 
-    config = build_live_trading_node_config(
-        deployment_slug=payload.deployment_slug,
-        strategy_path=payload.strategy_path,
-        strategy_config_path=payload.strategy_config_path,
-        strategy_config=payload.strategy_config,
-        paper_symbols=payload.paper_symbols,
-        ib_settings=ib_settings,
-        spawn_today=spawn_today,
-    )
+    # Multi-strategy path: when strategy_members is populated, build a
+    # portfolio config with N strategies sharing a single exec client.
+    # Otherwise fall through to the legacy single-strategy path.
+    if payload.strategy_members:
+        config = build_portfolio_trading_node_config(
+            deployment_slug=payload.deployment_slug,
+            strategy_members=payload.strategy_members,
+            ib_settings=ib_settings,
+            spawn_today=spawn_today,
+        )
+    else:
+        config = build_live_trading_node_config(
+            deployment_slug=payload.deployment_slug,
+            strategy_path=payload.strategy_path,
+            strategy_config_path=payload.strategy_config_path,
+            strategy_config=payload.strategy_config,
+            paper_symbols=payload.paper_symbols,
+            ib_settings=ib_settings,
+            spawn_today=spawn_today,
+        )
 
     node = TradingNode(config=config)
     # ``IB`` is the module-level constant ``"INTERACTIVE_BROKERS"``

@@ -41,6 +41,7 @@ def _make_payload(
     ib_host: str = "127.0.0.1",
     ib_port: int = 4002,
     ib_account_id: str = "DU1234567",
+    strategy_members: list[StrategyMemberPayload] | None = None,
 ) -> TradingNodePayload:
     return TradingNodePayload(
         row_id=uuid4(),
@@ -55,6 +56,7 @@ def _make_payload(
         ib_account_id=ib_account_id,
         database_url="postgresql+asyncpg://ignored/ignored",
         redis_url="redis://ignored",
+        strategy_members=strategy_members if strategy_members is not None else [],
     )
 
 
@@ -626,3 +628,120 @@ def test_build_portfolio_config_single_exec_client() -> None:
 
     assert len(config.exec_clients) == 1
     assert "INTERACTIVE_BROKERS" in config.exec_clients
+
+
+# ---------------------------------------------------------------------------
+# _build_real_node multi-strategy wiring (Task 18)
+# ---------------------------------------------------------------------------
+
+
+def test_build_real_node_uses_portfolio_config_when_strategy_members_present(
+    _patched_node: type[_FakeTradingNode],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``payload.strategy_members`` is non-empty, ``_build_real_node``
+    calls ``build_portfolio_trading_node_config`` instead of the legacy
+    single-strategy builder."""
+    captured_portfolio: dict[str, Any] = {}
+    captured_single: dict[str, Any] = {}
+
+    class _Sentinel:
+        pass
+
+    def _portfolio_stub(**kwargs: Any) -> _Sentinel:
+        captured_portfolio.update(kwargs)
+        return _Sentinel()
+
+    def _single_stub(**kwargs: Any) -> _Sentinel:
+        captured_single.update(kwargs)
+        return _Sentinel()
+
+    import msai.services.nautilus.live_node_config as lnc
+
+    monkeypatch.setattr(lnc, "build_portfolio_trading_node_config", _portfolio_stub)
+    monkeypatch.setattr(lnc, "build_live_trading_node_config", _single_stub)
+
+    m1 = _make_member(instruments=["AAPL"], strategy_id_full="s1@slug")
+    m2 = _make_member(instruments=["MSFT"], strategy_id_full="s2@slug")
+
+    payload = _make_payload(strategy_members=[m1, m2])
+    _build_real_node(payload)
+
+    # Portfolio builder was called
+    assert "strategy_members" in captured_portfolio
+    assert len(captured_portfolio["strategy_members"]) == 2
+    assert captured_portfolio["deployment_slug"] == payload.deployment_slug
+
+    # Single-strategy builder was NOT called
+    assert captured_single == {}
+
+
+def test_build_real_node_uses_legacy_config_when_no_strategy_members(
+    _patched_node: type[_FakeTradingNode],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``payload.strategy_members`` is empty (legacy path),
+    ``_build_real_node`` calls ``build_live_trading_node_config``."""
+    captured_portfolio: dict[str, Any] = {}
+    captured_single: dict[str, Any] = {}
+
+    class _Sentinel:
+        pass
+
+    def _portfolio_stub(**kwargs: Any) -> _Sentinel:
+        captured_portfolio.update(kwargs)
+        return _Sentinel()
+
+    def _single_stub(**kwargs: Any) -> _Sentinel:
+        captured_single.update(kwargs)
+        return _Sentinel()
+
+    import msai.services.nautilus.live_node_config as lnc
+
+    monkeypatch.setattr(lnc, "build_portfolio_trading_node_config", _portfolio_stub)
+    monkeypatch.setattr(lnc, "build_live_trading_node_config", _single_stub)
+
+    payload = _make_payload()  # No strategy_members
+    _build_real_node(payload)
+
+    # Single-strategy builder was called
+    assert "strategy_path" in captured_single
+    assert captured_single["deployment_slug"] == payload.deployment_slug
+
+    # Portfolio builder was NOT called
+    assert captured_portfolio == {}
+
+
+def test_build_real_node_threads_ib_settings_to_portfolio_config(
+    _patched_node: type[_FakeTradingNode],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_build_real_node`` constructs ``IBSettings`` from payload fields
+    and passes them to the portfolio builder when strategy_members is
+    non-empty."""
+    captured: dict[str, Any] = {}
+
+    class _Sentinel:
+        pass
+
+    def _portfolio_stub(**kwargs: Any) -> _Sentinel:
+        captured.update(kwargs)
+        return _Sentinel()
+
+    import msai.services.nautilus.live_node_config as lnc
+
+    monkeypatch.setattr(lnc, "build_portfolio_trading_node_config", _portfolio_stub)
+    monkeypatch.setattr(lnc, "build_live_trading_node_config", lambda **kw: _Sentinel())
+
+    m1 = _make_member(instruments=["AAPL"])
+    payload = _make_payload(
+        ib_host="10.0.0.5",
+        ib_port=4001,
+        ib_account_id="U7654321",
+        strategy_members=[m1],
+    )
+    _build_real_node(payload)
+
+    assert captured["ib_settings"].host == "10.0.0.5"
+    assert captured["ib_settings"].port == 4001
+    assert captured["ib_settings"].account_id == "U7654321"
