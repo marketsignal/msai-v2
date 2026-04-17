@@ -811,17 +811,14 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
         first_strategy = strategies_by_id[members[0].strategy_id]
         strategy_code_hash = _resolve_strategy_code_hash(first_strategy)
 
-        # Aggregate instruments from all members
-        all_instruments: list[str] = []
-        for m in members:
-            all_instruments.extend(m.instruments)
-        all_instruments = sorted(set(all_instruments))
-
-        # Aggregate config from all members for the deployment row
+        # Aggregate instruments + config from all members in single pass
+        instrument_set: set[str] = set()
         combined_config: dict[str, Any] = {}
         for m in members:
+            instrument_set.update(m.instruments)
             strat = strategies_by_id[m.strategy_id]
             combined_config[f"{strat.strategy_class}_{m.order_index}"] = m.config
+        all_instruments = sorted(instrument_set)
 
         # -------------------------------------------------------------
         # Layer 3: Identity-based warm-restart upsert
