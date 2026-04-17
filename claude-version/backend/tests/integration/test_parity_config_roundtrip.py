@@ -107,7 +107,7 @@ def test_live_config_with_injected_manage_stop_field_parses() -> None:
         "slow_ema_period": 30,
         "trade_size": "1",
         "manage_stop": True,
-        "order_id_tag": "abcd1234abcd1234",
+        "order_id_tag": "0-abcd1234abcd1234",
     }
 
     encoded = msgspec.json.encode(live_config_with_injected)
@@ -136,7 +136,7 @@ def test_smoke_config_accepts_full_live_injection() -> None:
         "instrument_id": "AAPL.NASDAQ",
         "bar_type": "AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL",
         "manage_stop": True,
-        "order_id_tag": "abcd1234abcd1234",
+        "order_id_tag": "0-abcd1234abcd1234",
     }
     decoded = config_cls.parse(msgspec.json.encode(live_config))
     assert decoded.manage_stop is True

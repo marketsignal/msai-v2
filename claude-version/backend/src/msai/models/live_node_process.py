@@ -90,6 +90,14 @@ class LiveNodeProcess(Base, TimestampMixin):
     # unrecognized values safely.
     failure_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
+    gateway_session_key: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, index=True
+    )
+    """Stable identifier for the (IB Gateway host, port, TWS login)
+    tuple this subprocess is bound to. Per-gateway-session spawn guard
+    (PR #3) filters on this key. Nullable in PR #1; populated by PR #2
+    and enforced NOT NULL in PR #3."""
+
     __table_args__ = (
         # Idempotency layer (decision #13): a deployment can have at most
         # ONE active row at any time. Two concurrent spawns racing on the

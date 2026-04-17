@@ -18,6 +18,20 @@ class LiveStartRequest(BaseModel):
     paper_trading: bool = True
 
 
+class PortfolioStartRequest(BaseModel):
+    """Request schema for starting a portfolio-based live deployment.
+
+    Instead of deploying a single strategy (like :class:`LiveStartRequest`),
+    this deploys an entire frozen portfolio revision — a set of strategies
+    with weights, configs, and instruments — to a specific IB account.
+    """
+
+    portfolio_revision_id: UUID
+    account_id: str
+    paper_trading: bool = True
+    ib_login_key: str | None = None
+
+
 class LiveStopRequest(BaseModel):
     """Request schema for stopping a running deployment."""
 
@@ -28,10 +42,10 @@ class LiveDeploymentInfo(BaseModel):
     """Summary of a single live deployment."""
 
     id: UUID
-    strategy_id: UUID
+    strategy_id: UUID | None = None
     status: str
     paper_trading: bool
-    instruments: list[str]
+    instruments: list[str] = []
     started_at: datetime | None = None
     stopped_at: datetime | None = None
 
@@ -63,11 +77,11 @@ class LiveDeploymentStatusResponse(BaseModel):
 
     # Logical deployment fields
     id: UUID
-    strategy_id: UUID
+    strategy_id: UUID | None = None
     deployment_slug: str
     status: str
     paper_trading: bool
-    instruments: list[str]
+    instruments: list[str] = []
     last_started_at: datetime | None = None
     last_stopped_at: datetime | None = None
 
@@ -109,6 +123,31 @@ class LiveResumeResponse(BaseModel):
     persistent halt flag set by ``/kill-all``."""
 
     resumed: bool
+
+
+class StrategyMemberInfo(BaseModel):
+    """Per-strategy member detail within a portfolio deployment."""
+
+    strategy_id: UUID
+    strategy_id_full: str
+    instruments: list[str]
+    weight: str
+
+    model_config = {"from_attributes": True}
+
+
+class PortfolioDeploymentInfo(BaseModel):
+    """Summary of a portfolio-based deployment with per-member detail."""
+
+    id: UUID
+    portfolio_revision_id: UUID | None = None
+    account_id: str
+    status: str
+    paper_trading: bool
+    deployment_slug: str
+    members: list[StrategyMemberInfo] = []
+
+    model_config = {"from_attributes": True}
 
 
 class LivePositionsResponse(BaseModel):

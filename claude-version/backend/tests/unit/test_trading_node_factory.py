@@ -25,6 +25,7 @@ from uuid import uuid4
 import pytest
 
 from msai.services.nautilus.trading_node_subprocess import (
+    StrategyMemberPayload,
     TradingNodePayload,
     _build_real_node,
 )
@@ -40,6 +41,7 @@ def _make_payload(
     ib_host: str = "127.0.0.1",
     ib_port: int = 4002,
     ib_account_id: str = "DU1234567",
+    strategy_members: list[StrategyMemberPayload] | None = None,
 ) -> TradingNodePayload:
     return TradingNodePayload(
         row_id=uuid4(),
@@ -54,6 +56,7 @@ def _make_payload(
         ib_account_id=ib_account_id,
         database_url="postgresql+asyncpg://ignored/ignored",
         redis_url="redis://ignored",
+        strategy_members=strategy_members if strategy_members is not None else [],
     )
 
 
@@ -476,3 +479,272 @@ def test_closure_body_matches_production_factory_source() -> None:
         "production _is_connected must AND both engine probes — "
         "a drift here would let exec-only outages slip through"
     )
+
+
+# ---------------------------------------------------------------------------
+# build_portfolio_trading_node_config — multi-strategy TradingNodeConfig
+# ---------------------------------------------------------------------------
+
+
+def _make_member(
+    *,
+    instruments: list[str] | None = None,
+    strategy_path: str = "strategies.example.ema_cross:EMACrossStrategy",
+    strategy_config_path: str = "strategies.example.config:EMACrossConfig",
+    strategy_config: dict[str, Any] | None = None,
+    strategy_id_full: str = "",
+) -> StrategyMemberPayload:
+    return StrategyMemberPayload(
+        strategy_id=uuid4(),
+        strategy_path=strategy_path,
+        strategy_config_path=strategy_config_path,
+        strategy_config=strategy_config if strategy_config is not None else {},
+        strategy_id_full=strategy_id_full,
+        instruments=instruments if instruments is not None else ["AAPL"],
+    )
+
+
+def test_build_config_with_multiple_strategies() -> None:
+    """``build_portfolio_trading_node_config`` produces N strategy configs."""
+    from msai.services.nautilus.live_node_config import (
+        IBSettings,
+        build_portfolio_trading_node_config,
+    )
+
+    slug = "abcd1234abcd1234"
+    m1 = _make_member(instruments=["AAPL"], strategy_id_full=f"EMACross-0-{slug}")
+    m2 = _make_member(instruments=["MSFT"], strategy_id_full=f"EMACross-1-{slug}")
+
+    config = build_portfolio_trading_node_config(
+        deployment_slug=slug,
+        strategy_members=[m1, m2],
+        ib_settings=IBSettings(host="127.0.0.1", port=4002, account_id="DU1234567"),
+    )
+
+    assert len(config.strategies) == 2
+    # order_id_tag is the suffix of strategy_id_full (without the class
+    # name prefix) so Nautilus constructs the correct StrategyId:
+    # ``f"{class_name}-{order_id_tag}"`` == strategy_id_full
+    assert config.strategies[0].config["order_id_tag"] == f"0-{slug}"
+    assert config.strategies[1].config["order_id_tag"] == f"1-{slug}"
+
+
+def test_build_config_aggregates_instruments_for_provider() -> None:
+    """All members' instruments are included in the instrument provider."""
+    from msai.services.nautilus.live_node_config import (
+        IBSettings,
+        build_portfolio_trading_node_config,
+    )
+
+    m1 = _make_member(instruments=["AAPL", "SPY"])
+    m2 = _make_member(instruments=["MSFT", "AAPL"])  # AAPL overlaps
+
+    config = build_portfolio_trading_node_config(
+        deployment_slug="abcd1234abcd1234",
+        strategy_members=[m1, m2],
+        ib_settings=IBSettings(host="127.0.0.1", port=4002, account_id="DU1234567"),
+    )
+
+    # The data client's instrument provider should cover all symbols.
+    # Verify by inspecting the data client config — the provider config
+    # has a ``load_contracts`` dict keyed by IBContract.
+    data_client_config = config.data_clients["INTERACTIVE_BROKERS"]
+    provider = data_client_config.instrument_provider
+    # load_contracts is a frozenset of IBContract objects, one per symbol
+    contract_symbols = {c.symbol for c in provider.load_contracts}
+    assert "AAPL" in contract_symbols
+    assert "MSFT" in contract_symbols
+    assert "SPY" in contract_symbols
+
+
+def test_build_config_preserves_load_state_save_state_true() -> None:
+    """Multi-strategy config must have load_state=True and save_state=True.
+
+    This is critical for warm restart of portfolio deployments — without
+    it, a restarted subprocess quietly resets every strategy's internal
+    state to first-bar defaults.
+    """
+    from msai.services.nautilus.live_node_config import (
+        IBSettings,
+        build_portfolio_trading_node_config,
+    )
+
+    m1 = _make_member(instruments=["AAPL"])
+
+    config = build_portfolio_trading_node_config(
+        deployment_slug="abcd1234abcd1234",
+        strategy_members=[m1],
+        ib_settings=IBSettings(host="127.0.0.1", port=4002, account_id="DU1234567"),
+    )
+
+    assert config.load_state is True
+    assert config.save_state is True
+
+
+def test_build_portfolio_config_rejects_empty_members() -> None:
+    """Empty strategy_members list is rejected."""
+    from msai.services.nautilus.live_node_config import (
+        IBSettings,
+        build_portfolio_trading_node_config,
+    )
+
+    with pytest.raises(ValueError, match="at least one member"):
+        build_portfolio_trading_node_config(
+            deployment_slug="abcd1234abcd1234",
+            strategy_members=[],
+            ib_settings=IBSettings(host="127.0.0.1", port=4002, account_id="DU1234567"),
+        )
+
+
+def test_build_portfolio_config_rejects_no_instruments() -> None:
+    """Members with no instruments across all of them is rejected."""
+    from msai.services.nautilus.live_node_config import (
+        IBSettings,
+        build_portfolio_trading_node_config,
+    )
+
+    m1 = _make_member(instruments=[])
+
+    with pytest.raises(ValueError, match="No instruments found"):
+        build_portfolio_trading_node_config(
+            deployment_slug="abcd1234abcd1234",
+            strategy_members=[m1],
+            ib_settings=IBSettings(host="127.0.0.1", port=4002, account_id="DU1234567"),
+        )
+
+
+def test_build_portfolio_config_single_exec_client() -> None:
+    """Multi-strategy deployment uses a SINGLE exec client (one account)."""
+    from msai.services.nautilus.live_node_config import (
+        IBSettings,
+        build_portfolio_trading_node_config,
+    )
+
+    m1 = _make_member(instruments=["AAPL"])
+    m2 = _make_member(instruments=["MSFT"])
+
+    config = build_portfolio_trading_node_config(
+        deployment_slug="abcd1234abcd1234",
+        strategy_members=[m1, m2],
+        ib_settings=IBSettings(host="127.0.0.1", port=4002, account_id="DU1234567"),
+    )
+
+    assert len(config.exec_clients) == 1
+    assert "INTERACTIVE_BROKERS" in config.exec_clients
+
+
+# ---------------------------------------------------------------------------
+# _build_real_node multi-strategy wiring (Task 18)
+# ---------------------------------------------------------------------------
+
+
+def test_build_real_node_uses_portfolio_config_when_strategy_members_present(
+    _patched_node: type[_FakeTradingNode],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``payload.strategy_members`` is non-empty, ``_build_real_node``
+    calls ``build_portfolio_trading_node_config`` instead of the legacy
+    single-strategy builder."""
+    captured_portfolio: dict[str, Any] = {}
+    captured_single: dict[str, Any] = {}
+
+    class _Sentinel:
+        pass
+
+    def _portfolio_stub(**kwargs: Any) -> _Sentinel:
+        captured_portfolio.update(kwargs)
+        return _Sentinel()
+
+    def _single_stub(**kwargs: Any) -> _Sentinel:
+        captured_single.update(kwargs)
+        return _Sentinel()
+
+    import msai.services.nautilus.live_node_config as lnc
+
+    monkeypatch.setattr(lnc, "build_portfolio_trading_node_config", _portfolio_stub)
+    monkeypatch.setattr(lnc, "build_live_trading_node_config", _single_stub)
+
+    m1 = _make_member(instruments=["AAPL"], strategy_id_full="s1@slug")
+    m2 = _make_member(instruments=["MSFT"], strategy_id_full="s2@slug")
+
+    payload = _make_payload(strategy_members=[m1, m2])
+    _build_real_node(payload)
+
+    # Portfolio builder was called
+    assert "strategy_members" in captured_portfolio
+    assert len(captured_portfolio["strategy_members"]) == 2
+    assert captured_portfolio["deployment_slug"] == payload.deployment_slug
+
+    # Single-strategy builder was NOT called
+    assert captured_single == {}
+
+
+def test_build_real_node_uses_legacy_config_when_no_strategy_members(
+    _patched_node: type[_FakeTradingNode],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``payload.strategy_members`` is empty (legacy path),
+    ``_build_real_node`` calls ``build_live_trading_node_config``."""
+    captured_portfolio: dict[str, Any] = {}
+    captured_single: dict[str, Any] = {}
+
+    class _Sentinel:
+        pass
+
+    def _portfolio_stub(**kwargs: Any) -> _Sentinel:
+        captured_portfolio.update(kwargs)
+        return _Sentinel()
+
+    def _single_stub(**kwargs: Any) -> _Sentinel:
+        captured_single.update(kwargs)
+        return _Sentinel()
+
+    import msai.services.nautilus.live_node_config as lnc
+
+    monkeypatch.setattr(lnc, "build_portfolio_trading_node_config", _portfolio_stub)
+    monkeypatch.setattr(lnc, "build_live_trading_node_config", _single_stub)
+
+    payload = _make_payload()  # No strategy_members
+    _build_real_node(payload)
+
+    # Single-strategy builder was called
+    assert "strategy_path" in captured_single
+    assert captured_single["deployment_slug"] == payload.deployment_slug
+
+    # Portfolio builder was NOT called
+    assert captured_portfolio == {}
+
+
+def test_build_real_node_threads_ib_settings_to_portfolio_config(
+    _patched_node: type[_FakeTradingNode],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_build_real_node`` constructs ``IBSettings`` from payload fields
+    and passes them to the portfolio builder when strategy_members is
+    non-empty."""
+    captured: dict[str, Any] = {}
+
+    class _Sentinel:
+        pass
+
+    def _portfolio_stub(**kwargs: Any) -> _Sentinel:
+        captured.update(kwargs)
+        return _Sentinel()
+
+    import msai.services.nautilus.live_node_config as lnc
+
+    monkeypatch.setattr(lnc, "build_portfolio_trading_node_config", _portfolio_stub)
+    monkeypatch.setattr(lnc, "build_live_trading_node_config", lambda **kw: _Sentinel())
+
+    m1 = _make_member(instruments=["AAPL"])
+    payload = _make_payload(
+        ib_host="10.0.0.5",
+        ib_port=4001,
+        ib_account_id="U7654321",
+        strategy_members=[m1],
+    )
+    _build_real_node(payload)
+
+    assert captured["ib_settings"].host == "10.0.0.5"
+    assert captured["ib_settings"].port == 4001
+    assert captured["ib_settings"].account_id == "U7654321"

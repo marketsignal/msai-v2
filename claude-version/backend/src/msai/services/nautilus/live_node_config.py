@@ -38,6 +38,8 @@ from urllib.parse import urlparse
 if TYPE_CHECKING:
     from datetime import date
 
+    from msai.services.nautilus.trading_node_subprocess import StrategyMemberPayload
+
 from nautilus_trader.adapters.interactive_brokers.common import IB_VENUE
 from nautilus_trader.adapters.interactive_brokers.config import (
     InteractiveBrokersDataClientConfig,
@@ -452,8 +454,177 @@ def build_live_trading_node_config(
                 config={
                     **strategy_config,
                     "manage_stop": True,
-                    "order_id_tag": deployment_slug,
+                    # Include order_index=0 so Nautilus emits
+                    # ``{class}-0-{slug}`` which matches the format
+                    # ``derive_strategy_id_full(class, slug, 0)``
+                    # produces. Without the ``0-`` prefix the
+                    # StrategyId and strategy_id_full would diverge.
+                    "order_id_tag": f"0-{deployment_slug}",
                 },
             ),
         ],
+    )
+
+
+def build_portfolio_trading_node_config(
+    *,
+    deployment_slug: str,
+    strategy_members: list[StrategyMemberPayload],
+    ib_settings: IBSettings,
+    max_notional_per_order: dict[str, int] | None = None,
+    max_order_submit_rate: str = "100/00:00:01",
+    max_order_modify_rate: str = "100/00:00:01",
+    spawn_today: date | None = None,
+) -> TradingNodeConfig:
+    """Build a ``TradingNodeConfig`` for a multi-strategy portfolio deployment.
+
+    Like :func:`build_live_trading_node_config` but accepts N strategy
+    members instead of one, building N ``ImportableStrategyConfig`` objects
+    that share a SINGLE IB exec/data client and a single instrument
+    provider covering ALL members' instruments.
+
+    Key differences from the single-strategy builder:
+
+    - ``strategies`` is a list of length N (one per member)
+    - ``load_state=True, save_state=True`` always — critical for warm
+      restart of the portfolio
+    - Instruments are aggregated across ALL members for the provider config
+    - Each strategy's ``order_id_tag`` uses ``strategy_id_full`` (not the
+      deployment_slug) so orders are attributable to individual strategies
+
+    Args:
+        deployment_slug: 16-char hex slug. Drives trader_id and IB client ids.
+        strategy_members: One or more strategy payloads. Must be non-empty.
+        ib_settings: IB Gateway connection + account settings.
+        max_notional_per_order: Per-instrument cap on order notional value.
+        max_order_submit_rate: Nautilus rate limit for order submissions.
+        max_order_modify_rate: Nautilus rate limit for order modifications.
+        spawn_today: Exchange-local date for front-month futures resolution.
+
+    Returns:
+        A fully populated ``TradingNodeConfig`` ready for ``TradingNode``.
+
+    Raises:
+        ValueError: For empty ``strategy_members``, no instruments across
+            all members, unknown port, or port/account mismatch.
+    """
+    if not strategy_members:
+        raise ValueError(
+            "strategy_members must contain at least one member — a portfolio "
+            "deployment with no strategies cannot make progress."
+        )
+
+    # Aggregate instruments across all members (de-duped).
+    all_instruments: set[str] = set()
+    for member in strategy_members:
+        all_instruments.update(member.instruments)
+    if not all_instruments:
+        raise ValueError(
+            "No instruments found across all strategy_members — a TradingNode "
+            "with no subscribed instruments cannot make progress."
+        )
+    sorted_instruments = sorted(all_instruments)
+
+    normalized_account_id = ib_settings.account_id.strip()
+    _validate_port_account_consistency(ib_settings.port, normalized_account_id)
+
+    instrument_provider_config = build_ib_instrument_provider_config(
+        sorted_instruments,
+        today=spawn_today,
+    )
+    data_client_id = _derive_data_client_id(deployment_slug)
+    exec_client_id = _derive_exec_client_id(deployment_slug)
+
+    # Map the string config value to the Nautilus enum.
+    from nautilus_trader.adapters.interactive_brokers.config import IBMarketDataTypeEnum
+
+    _mdt_map = {
+        "REALTIME": IBMarketDataTypeEnum.REALTIME,
+        "DELAYED": IBMarketDataTypeEnum.DELAYED,
+        "DELAYED_FROZEN": IBMarketDataTypeEnum.DELAYED_FROZEN,
+    }
+    _mdt_str = settings.ib_market_data_type.upper()
+    _market_data_type = _mdt_map.get(_mdt_str, IBMarketDataTypeEnum.REALTIME)
+    _use_rth = settings.ib_use_regular_trading_hours
+
+    data_client = InteractiveBrokersDataClientConfig(
+        ibg_host=ib_settings.host,
+        ibg_port=ib_settings.port,
+        ibg_client_id=data_client_id,
+        instrument_provider=instrument_provider_config,
+        market_data_type=_market_data_type,
+        use_regular_trading_hours=_use_rth,
+    )
+    exec_client = InteractiveBrokersExecClientConfig(
+        ibg_host=ib_settings.host,
+        ibg_port=ib_settings.port,
+        ibg_client_id=exec_client_id,
+        account_id=normalized_account_id,
+        instrument_provider=instrument_provider_config,
+    )
+
+    redis_database = build_redis_database_config()
+    cache_config = CacheConfig(
+        database=redis_database,
+        encoding="msgpack",
+        buffer_interval_ms=None,
+        persist_account_events=True,
+    )
+    message_bus_config = MessageBusConfig(
+        database=redis_database,
+        encoding="msgpack",
+        stream_per_topic=False,
+        use_trader_prefix=True,
+        use_trader_id=True,
+        streams_prefix="stream",
+        buffer_interval_ms=None,
+    )
+
+    # Build N ImportableStrategyConfigs — one per member.
+    # Each strategy's order_id_tag is the SUFFIX of strategy_id_full
+    # (without the class name). Nautilus constructs StrategyId as
+    # ``f"{class_name}-{order_id_tag}"``, so if strategy_id_full is
+    # ``"EMACross-0-slug"`` the tag must be ``"0-slug"`` — otherwise
+    # Nautilus would produce ``"EMACross-EMACross-0-slug"`` (double
+    # prefix).
+    strategy_configs: list[ImportableStrategyConfig] = []
+    for member in strategy_members:
+        # Parse "{class}-{order_index}-{slug}" → "{order_index}-{slug}"
+        _parts = member.strategy_id_full.split("-", 1)
+        order_id_tag = _parts[1] if len(_parts) >= 2 else deployment_slug
+        strategy_configs.append(
+            ImportableStrategyConfig(
+                strategy_path=member.strategy_path,
+                config_path=member.strategy_config_path,
+                config={
+                    **member.strategy_config,
+                    "manage_stop": True,
+                    "order_id_tag": order_id_tag,
+                },
+            ),
+        )
+
+    return TradingNodeConfig(
+        trader_id=_derive_trader_id(deployment_slug),
+        load_state=True,
+        save_state=True,
+        data_engine=LiveDataEngineConfig(),
+        exec_engine=LiveExecEngineConfig(
+            reconciliation=True,
+            reconciliation_lookback_mins=1440,
+            inflight_check_interval_ms=2000,
+            inflight_check_threshold_ms=5000,
+            position_check_interval_secs=60,
+        ),
+        risk_engine=LiveRiskEngineConfig(
+            bypass=False,
+            max_order_submit_rate=max_order_submit_rate,
+            max_order_modify_rate=max_order_modify_rate,
+            max_notional_per_order=max_notional_per_order or {},
+        ),
+        cache=cache_config,
+        message_bus=message_bus_config,
+        data_clients={IB_VENUE.value: data_client},
+        exec_clients={IB_VENUE.value: exec_client},
+        strategies=strategy_configs,
     )

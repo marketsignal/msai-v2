@@ -13,33 +13,27 @@ not here. The ``last_started_at`` / ``last_stopped_at`` columns are denormalized
 "most recent run" timestamps for fast UI queries; the source of truth for any
 specific run is the corresponding ``live_node_processes`` row.
 
-Phase 1 task 1.1b adds the following columns to the v0 schema:
-
-- ``deployment_slug``      — 16 hex chars, used to derive ``trader_id``
-- ``identity_signature``   — sha256 of the identity tuple, UNIQUE
-- ``trader_id``            — denormalized ``MSAI-{slug}`` for log queries
-- ``strategy_id_full``     — denormalized ``{ClassName}-{slug}``
-- ``account_id``           — IB account id (part of identity tuple)
-- ``message_bus_stream``   — denormalized ``trader-MSAI-{slug}:stream``
-- ``config_hash``          — sha256 of canonical-json strategy config
-- ``instruments_signature`` — sorted, comma-joined canonical IDs
-- ``last_started_at`` / ``last_stopped_at`` — most-recent-run timestamps
-- ``startup_hard_timeout_s`` — per-deployment override for the watchdog ceiling
-
-The OLD ``started_at`` / ``stopped_at`` columns are dropped — they tracked
-only the FIRST start, but a deployment can be (re-)started many times.
+Phase 1 task 1.1b adds stable identity columns. PR#2 task 11 drops
+legacy per-strategy columns (``config_hash``, ``instruments``,
+``instruments_signature``, ``strategy_code_hash``, ``config``) whose
+data now lives on ``live_portfolio_revision_strategies``.
+``strategy_id`` is nullable (kept for FK audit trail).
+``portfolio_revision_id`` is NOT NULL (backfill guarantees).
 """
 
 from __future__ import annotations
 
 from datetime import datetime  # noqa: TC003 — required at runtime for SQLAlchemy Mapped[]
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from msai.models.base import Base
+
+if TYPE_CHECKING:
+    from msai.models.live_portfolio_revision import LivePortfolioRevision
 
 
 class LiveDeployment(Base):
@@ -54,18 +48,22 @@ class LiveDeployment(Base):
     """
 
     __tablename__ = "live_deployments"
+    __table_args__ = (
+        UniqueConstraint(
+            "portfolio_revision_id",
+            "account_id",
+            name="uq_live_deployments_revision_account",
+        ),
+    )
 
     # ------------------------------------------------------------------
     # Pre-existing columns (from the v0 schema, unchanged in 1.1b)
     # ------------------------------------------------------------------
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
-    strategy_id: Mapped[UUID] = mapped_column(
-        ForeignKey("strategies.id"), index=True, nullable=False
+    strategy_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("strategies.id"), index=True, nullable=True
     )
-    strategy_code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     strategy_git_sha: Mapped[str | None] = mapped_column(String(40), nullable=True)
-    config: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    instruments: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False)
     status: Mapped[str] = mapped_column(String(50), nullable=False, server_default="stopped")
     paper_trading: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
     started_by: Mapped[UUID | None] = mapped_column(
@@ -88,11 +86,10 @@ class LiveDeployment(Base):
     identity_signature: Mapped[str] = mapped_column(
         String(64), nullable=False, unique=True, index=True
     )
-    """sha256 hex of the canonical-JSON identity tuple. Includes
-    ``started_by``, ``strategy_id``, ``strategy_code_hash``, ``config_hash``,
-    ``account_id``, ``paper_trading``, ``instruments_signature``. The UNIQUE
-    constraint enforces "warm restart on exact match, cold start on any
-    change.\""""
+    """sha256 hex of the canonical-JSON identity tuple. Post-PR#2 this is
+    computed from ``PortfolioDeploymentIdentity`` (portfolio_revision_id +
+    account_id + paper_trading). The UNIQUE constraint enforces "warm
+    restart on exact match, cold start on any change.\""""
 
     trader_id: Mapped[str] = mapped_column(String(32), nullable=False)
     """``f"MSAI-{deployment_slug}"`` — convenience denormalization for
@@ -112,26 +109,25 @@ class LiveDeployment(Base):
     Also part of the identity tuple — switching accounts produces a new
     deployment row, not a warm restart on the existing one."""
 
+    ib_login_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    """IB username (TWS userid) used by this deployment. The supervisor
+    multiplexes logical deployments that share an ``ib_login_key`` onto
+    a single Nautilus subprocess via Nautilus's multi-account
+    ``exec_clients`` feature (PR #3194, 1.225+). Nullable in PR #1 —
+    populated by PR #2 at deploy time, enforced NOT NULL in PR #3."""
+
+    portfolio_revision_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("live_portfolio_revisions.id"), index=True, nullable=True
+    )
+    """FK to the frozen portfolio revision that triggered this deployment.
+    Nullable because legacy /start (single-strategy) doesn't supply it.
+    Will be enforced NOT NULL when /start is formally deprecated."""
+
     message_bus_stream: Mapped[str] = mapped_column(String(96), nullable=False)
     """``f"trader-MSAI-{deployment_slug}-stream"`` — the deterministic
     Redis Stream name where Nautilus publishes events for this trader
     (Phase 3 task 3.2 with ``stream_per_topic=False``). Persisted here so
     the projection consumer (3.4) knows what stream to subscribe to."""
-
-    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    """sha256 hex of the canonical JSON of the strategy config. Persisted
-    for diagnostics — the source of truth is the identity tuple, but
-    having the hash on the row makes log triage trivial."""
-
-    instruments_signature: Mapped[str] = mapped_column(Text, nullable=False)
-    """Sorted, comma-joined canonical instrument IDs. Same format as the
-    identity tuple field, persisted for diagnostics.
-
-    Stored as ``TEXT`` rather than ``VARCHAR(N)`` because a large options
-    universe (30 underlyings × 4 expiries × 25 strikes ≈ 3000 IDs at
-    ~20 chars each = ~60 KB) blows past any realistic fixed cap. The
-    identity hash takes over uniqueness — this column is purely for
-    human debugging (Codex Task 1.1b iteration 2, P2 fix)."""
 
     last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     """Most recent ``/api/v1/live/start`` timestamp. Replaces the v0
@@ -155,8 +151,9 @@ class LiveDeployment(Base):
     # ------------------------------------------------------------------
     # Relationships
     # ------------------------------------------------------------------
-    strategy: Mapped[Strategy] = relationship(lazy="selectin")  # noqa: F821
+    strategy: Mapped[Strategy | None] = relationship(lazy="selectin")  # noqa: F821
     starter: Mapped[User] = relationship(lazy="selectin")  # noqa: F821
+    portfolio_revision: Mapped[LivePortfolioRevision | None] = relationship(lazy="selectin")
 
-    # NOTE: no separate composite unique index — UNIQUE(identity_signature)
-    # is the single source of identity truth. Decision #7.
+    # UNIQUE(identity_signature) remains for upsert target.
+    # UNIQUE(portfolio_revision_id, account_id) added by Task 11.

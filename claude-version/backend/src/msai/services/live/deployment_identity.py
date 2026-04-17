@@ -158,14 +158,28 @@ def derive_trader_id(slug: str) -> str:
     return f"MSAI-{slug}"
 
 
-def derive_strategy_id_full(strategy_class_name: str, slug: str) -> str:
-    """``{class_name}-{slug}`` — the Nautilus ``StrategyId.value`` string.
+def derive_strategy_id_full(
+    strategy_class_name: str, slug: str, order_index: int = 0,
+) -> str:
+    """``{class_name}-{order_index}-{slug}`` — the Nautilus ``StrategyId.value``.
 
-    Nautilus builds StrategyId from ``f"{class_name}-{order_id_tag}"`` and
-    we use the deployment_slug as the order_id_tag (decision #7), so this
-    is the canonical full strategy identifier across restarts.
+    The ``order_index`` disambiguates multiple strategies of the same class
+    within a portfolio deployment (e.g. two ``EMACross`` with different
+    configs). For single-strategy backward compat, ``order_index`` defaults
+    to ``0``.
+
+    .. note::
+
+       This changes the format from ``"{class}-{slug}"`` (pre-portfolio)
+       to ``"{class}-{order_index}-{slug}"``. Existing callers that pass
+       only 2 args get ``order_index=0``, producing a DIFFERENT string
+       than the old format. Existing deployments will cold-start on first
+       restart with the new code — this is acceptable because the
+       identity_signature (not strategy_id_full) governs warm restart,
+       and existing single-strategy deployments retain their
+       identity_signature.
     """
-    return f"{strategy_class_name}-{slug}"
+    return f"{strategy_class_name}-{order_index}-{slug}"
 
 
 def derive_message_bus_stream(slug: str) -> str:
@@ -217,6 +231,53 @@ def canonicalize_user_id(user_id: UUID | None, *, fallback_sub: str | None = Non
     if fallback_sub:
         return f"sub:{fallback_sub}"
     return ""
+
+
+@dataclass(slots=True, frozen=True)
+class PortfolioDeploymentIdentity:
+    """Identity tuple for portfolio-based deployments.
+
+    Unlike :class:`DeploymentIdentity` which identifies a single-strategy
+    deployment, this identifies a *portfolio* deployment — a set of
+    strategies deployed together to a single account.
+
+    Two portfolio deployments with the same :meth:`signature` share state
+    across restarts. Any field difference → cold start.
+    """
+
+    started_by: str
+    portfolio_revision_id: str
+    account_id: str
+    paper_trading: bool
+
+    def to_canonical_json(self) -> bytes:
+        """Stable serialization for hashing (same contract as DeploymentIdentity)."""
+        return json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    def signature(self) -> str:
+        """64-char sha256 hex — the unique ``identity_signature`` for the row."""
+        return hashlib.sha256(self.to_canonical_json()).hexdigest()
+
+
+def derive_portfolio_deployment_identity(
+    *,
+    user_id: UUID | None,
+    portfolio_revision_id: UUID,
+    account_id: str,
+    paper_trading: bool,
+    user_sub: str | None = None,
+) -> PortfolioDeploymentIdentity:
+    """Convenience builder for :class:`PortfolioDeploymentIdentity`.
+
+    Mirrors :func:`derive_deployment_identity` but takes portfolio-level
+    inputs instead of single-strategy inputs.
+    """
+    return PortfolioDeploymentIdentity(
+        started_by=canonicalize_user_id(user_id, fallback_sub=user_sub),
+        portfolio_revision_id=portfolio_revision_id.hex,
+        account_id=account_id,
+        paper_trading=paper_trading,
+    )
 
 
 def derive_deployment_identity(

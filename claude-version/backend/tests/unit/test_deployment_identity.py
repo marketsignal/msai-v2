@@ -114,7 +114,7 @@ class TestDeriveHelpers:
     def test_derive_strategy_id_full(self) -> None:
         assert (
             derive_strategy_id_full("EMACrossStrategy", "a1b2c3d4e5f60718")
-            == "EMACrossStrategy-a1b2c3d4e5f60718"
+            == "EMACrossStrategy-0-a1b2c3d4e5f60718"
         )
 
     def test_derive_message_bus_stream(self) -> None:

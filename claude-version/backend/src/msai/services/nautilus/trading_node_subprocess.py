@@ -89,6 +89,33 @@ log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class StrategyMemberPayload:
+    """One strategy within a portfolio deployment.
+
+    Carries the per-strategy fields that
+    :func:`build_portfolio_trading_node_config` needs to construct an
+    :class:`ImportableStrategyConfig` for each member. All fields are
+    primitives / builtins so the payload remains picklable under the
+    ``mp.Process`` spawn context.
+    """
+
+    strategy_id: UUID
+    strategy_path: str
+    strategy_config_path: str
+    strategy_config: dict[str, Any] = field(default_factory=dict)
+    strategy_code_hash: str = ""
+    strategy_id_full: str = ""
+    """Globally unique strategy identity string (``<strategy_id>@<deployment_slug>``).
+    Threaded into the ``ImportableStrategyConfig.config["order_id_tag"]``
+    so the audit hook can correlate orders to individual strategies
+    within a portfolio deployment."""
+    instruments: list[str] = field(default_factory=list)
+    """Paper symbols this strategy subscribes to (e.g. ``["AAPL", "MSFT"]``).
+    Aggregated across all members to build the single
+    InstrumentProviderConfig for the TradingNode."""
+
+
+@dataclass(frozen=True)
 class TradingNodePayload:
     """Everything a live trading subprocess needs to do its job.
 
@@ -146,6 +173,28 @@ class TradingNodePayload:
     skips the handler construction."""
 
     startup_health_timeout_s: float = 60.0
+
+    strategy_members: list[StrategyMemberPayload] = field(default_factory=list)
+    """Per-strategy payloads for a portfolio deployment. When non-empty,
+    :func:`_build_real_node` uses :func:`build_portfolio_trading_node_config`
+    instead of the single-strategy builder. The legacy single-strategy fields
+    (``strategy_path``, ``strategy_config_path``, ``strategy_config``,
+    ``paper_symbols``) are still populated for back-compat and supervisor
+    audit, but the multi-strategy config builder reads from here."""
+
+    @property
+    def all_instruments(self) -> list[str]:
+        """De-duplicated, sorted union of instruments across all strategy members.
+
+        Returns an empty list when ``strategy_members`` is empty (legacy
+        single-strategy path — the caller uses ``paper_symbols`` instead).
+        """
+        if not self.strategy_members:
+            return []
+        seen: set[str] = set()
+        for member in self.strategy_members:
+            seen.update(member.instruments)
+        return sorted(seen)
 
 
 # ---------------------------------------------------------------------------
@@ -1191,6 +1240,17 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
             _cache = node.kernel.cache  # for fetching full order details
             _loop = _aio.get_running_loop()
 
+            _strategy_id_lookup: dict[str, UUID] = {
+                m.strategy_id_full: m.strategy_id for m in p.strategy_members
+            } if p.strategy_members else {}
+
+            def _resolve_strategy_id(event: Any) -> UUID:
+                if _strategy_id_lookup:
+                    nautilus_sid = str(getattr(event, "strategy_id", ""))
+                    if nautilus_sid in _strategy_id_lookup:
+                        return _strategy_id_lookup[nautilus_sid]
+                return p.strategy_id or p.deployment_id
+
             def _on_order_event_sync(event: Any) -> None:
                 """Sync handler bridging to async audit writer.
 
@@ -1217,7 +1277,7 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
                             await writer.write_submitted(
                                 OrderSubmittedFacts(
                                     client_order_id=str(event.client_order_id),
-                                    strategy_id=p.strategy_id or p.deployment_id,
+                                    strategy_id=_resolve_strategy_id(event),
                                     strategy_code_hash=p.strategy_code_hash or "engine-audit",
                                     instrument_id=_instrument,
                                     side=_side,
@@ -1290,7 +1350,7 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
                                         broker_trade_id=str(event.trade_id),
                                         client_order_id=str(event.client_order_id),
                                         deployment_id=p.deployment_id,
-                                        strategy_id=p.strategy_id or p.deployment_id,
+                                        strategy_id=_resolve_strategy_id(event),
                                         strategy_code_hash=p.strategy_code_hash or "engine-audit",
                                         instrument=str(event.instrument_id),
                                         side=_order_side,
@@ -1490,6 +1550,7 @@ def _build_real_node(payload: TradingNodePayload) -> Any:
     from msai.services.nautilus.live_node_config import (
         IBSettings,
         build_live_trading_node_config,
+        build_portfolio_trading_node_config,
     )
 
     ib_settings = IBSettings(
@@ -1511,15 +1572,26 @@ def _build_real_node(payload: TradingNodePayload) -> Any:
         except ValueError:
             spawn_today = None
 
-    config = build_live_trading_node_config(
-        deployment_slug=payload.deployment_slug,
-        strategy_path=payload.strategy_path,
-        strategy_config_path=payload.strategy_config_path,
-        strategy_config=payload.strategy_config,
-        paper_symbols=payload.paper_symbols,
-        ib_settings=ib_settings,
-        spawn_today=spawn_today,
-    )
+    # Multi-strategy path: when strategy_members is populated, build a
+    # portfolio config with N strategies sharing a single exec client.
+    # Otherwise fall through to the legacy single-strategy path.
+    if payload.strategy_members:
+        config = build_portfolio_trading_node_config(
+            deployment_slug=payload.deployment_slug,
+            strategy_members=payload.strategy_members,
+            ib_settings=ib_settings,
+            spawn_today=spawn_today,
+        )
+    else:
+        config = build_live_trading_node_config(
+            deployment_slug=payload.deployment_slug,
+            strategy_path=payload.strategy_path,
+            strategy_config_path=payload.strategy_config_path,
+            strategy_config=payload.strategy_config,
+            paper_symbols=payload.paper_symbols,
+            ib_settings=ib_settings,
+            spawn_today=spawn_today,
+        )
 
     node = TradingNode(config=config)
     # ``IB`` is the module-level constant ``"INTERACTIVE_BROKERS"``

@@ -6,9 +6,43 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field   | Value |
-| ------- | ----- |
-| Command | none  |
+| Field     | Value                                                 |
+| --------- | ----------------------------------------------------- |
+| Command   | /new-feature portfolio-per-account-live               |
+| Phase     | 5 — Quality Gates                                     |
+| Next step | Push branch + ask user about PR creation           |
+
+### Checklist
+
+- [x] Worktree created (`feat/portfolio-per-account-live`)
+- [x] Project state read
+- [x] Plugins verified (implicit — superpowers skills loaded throughout)
+- [x] PRD created (design doc `docs/plans/2026-04-16-portfolio-per-account-live-design.md`)
+- [x] Research done (Nautilus local audit + community/GitHub/PR#3194 multi-account discovery)
+- [x] Brainstorming complete (Option C revised sequencing locked in)
+- [x] Approach comparison filled (council already ran — used as input)
+- [x] Contrarian gate passed (standalone council, 5 advisors + chairman verdict)
+- [x] Council verdict: **new immutable live-composition model** (LivePortfolio + LivePortfolioRevision + LivePortfolioRevisionStrategy + LiveDeploymentStrategy + gateway_session_key); per-account IB Gateway Compose services; per-gateway-session spawn guard; full-portfolio cold restart on any member change.
+- [x] Plan written (`docs/plans/2026-04-16-portfolio-per-account-live-pr1-plan.md`)
+- [x] Plan review loop (3 iterations) — PASS (both reviewers clean on iter 4)
+- [x] TDD execution complete (12 plan tasks → 11 commits, Tasks 3+4 combined atomically)
+- [x] Code review loop (2 iterations) — iter-1 found 4 P1s + 5 P2s (all fixed), iter-2 found 3 P2s (2 fixed, 1 rejected-as-false-alarm). Iter-3 stuck + killed after 20+ min; exited loop since iter-2 was clean on P0/P1 and only returned P2s that are now all addressed.
+- [x] Simplified (via per-task implementer self-review + spec+quality reviewers)
+- [x] Verified (1228 unit + 13 new integration pass; ruff clean; mypy --strict clean on the 7 new source files)
+- [ ] E2E use cases designed (Phase 3.2b) — N/A for PR#1 (no user-facing change, pure schema+services)
+- [ ] E2E verified via verify-e2e agent (Phase 5.4) — N/A for PR#1
+- [ ] E2E regression passed (Phase 5.4b) — N/A for PR#1
+- [ ] E2E use cases graduated to tests/e2e/use-cases/ (Phase 6.2b) — N/A for PR#1
+- [ ] Learnings documented (if any)
+- [ ] State files updated (in progress — this edit)
+- [ ] Committed and pushed
+- [ ] PR created
+- [ ] PR reviews addressed
+- [ ] Branch finished
+
+### Feature scope
+
+Evolve `LiveDeployment` from `(strategy_id, account_id)` to `(portfolio_revision_id, account_id)`. Introduce `LivePortfolio` (mutable, rebalanced over time by portfolio-manager), `LivePortfolioRevision` (immutable snapshot, the warm-restart identity boundary), `LivePortfolioRevisionStrategy` (M:N: one graduated strategy can appear in many portfolios), and `LiveDeploymentStrategy` (member strategy-instance rows for attribution/recovery). Enable same portfolio deployed to N different IB accounts in parallel — each deployment = isolated subprocess + per-account IB Gateway session. Static per-account Gateway services in Compose. Concurrent-spawn guard scoped to gateway session, not global. Deterministic IB `client_id` allocation rule. Full-portfolio cold restart on any member change (no per-strategy hot-swap in v1). Only graduated strategies may be added to a portfolio.
 
 ## Done
 
@@ -43,18 +77,55 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
   - **Bug #6** PR #21 — `trades.side` now persists as `BUY`/`SELL` strings via `OrderSide.name` (was leaking enum int 1/2 into the DB).
   - **Bug #7** PR #22 — `claude-version/scripts/restart-workers.sh` ships ~10s worker container restart for stale-import hygiene; documented in `claude-version/CLAUDE.md`.
 
+## Done (cont'd 2) — Portfolio-per-account-live PR #1
+
+**All 12 plan tasks landed** (branch `feat/portfolio-per-account-live`, 11 commits: Tasks 3+4 combined atomically for forward-ref resolution). Plan-review loop passed 3 iterations clean (Claude + Codex on iter 4). Per-task subagent-driven execution with spec + quality reviews after each task — all passed.
+
+- **Schema (Task 1, `288743c`):** Alembic migration `o3i4j5k6l7m8` creates `live_portfolios`, `live_portfolio_revisions`, `live_portfolio_revision_strategies`, `live_deployment_strategies`; adds `ib_login_key` + `gateway_session_key`; partial unique index `uq_one_draft_per_portfolio` via `postgresql_where=sa.text(...)`. No FK cycle — active revision computed via query in `RevisionService.get_active_revision`.
+- **Models (Tasks 2-6, `760500b`..`5e1ee41`):** `LivePortfolio` (TimestampMixin), `LivePortfolioRevision` (immutable, `created_at` only), `LivePortfolioRevisionStrategy` (M:N bridge, immutable), `LiveDeploymentStrategy` (per-deployment attribution bridge), `ib_login_key` + `gateway_session_key` additive columns on existing tables.
+- **Services (Tasks 7-9, `a591089`, `520ad50`, `5153704`):** `compute_composition_hash` (deterministic canonical sha256 across sorted, normalized member tuples), `PortfolioService` (create + add_strategy + list_draft_members + get_current_draft; enforces graduated-strategy invariant), `RevisionService` (`snapshot` with `SELECT … FOR UPDATE` row lock for concurrency + identical-hash collapse; `get_active_revision`; `enforce_immutability` defensive guard).
+- **Tests (Tasks 10-11, `24046a4`, `0572089`):** Full-lifecycle integration (`test_portfolio_full_lifecycle.py`) exercises create → add × 3 → snapshot → rebalance → second-snapshot → audit-preservation → cascade-delete paths. Alembic round-trip test (`test_o3_portfolio_schema_roundtrip`) validates upgrade + downgrade + re-upgrade using the repo's subprocess `_run_alembic` harness.
+- **Polish (Task 12, `f2e125c`):** ruff + mypy `--strict` clean on the 7 new source files + 20 PR#1 files total. `TYPE_CHECKING` guards added for imports only needed at type-check time. No unit regressions (1228 still passing).
+
+**Test totals:** 1228 unit pass · 13 new integration pass (5 PortfolioService + 6 RevisionService + 2 full_lifecycle + 1 alembic round-trip) + 199 pre-existing integration pass · ruff + mypy clean on all new files.
+
+## Done (cont'd 3) — PR#1 quality gates
+
+- **Simplify pass (`2f6490b`):** Reuse/Quality/Efficiency three-agent simplify found one real pattern — extracted `CreatedAtMixin` to `base.py`; applied to the 3 immutable models (revision, revision-strategy, deployment-strategy). Removed narrative PR#1-scope comment from `_get_or_create_draft_revision` docstring.
+- **verify-app:** PASS. 1228 unit + 13 new integration + 199 pre-existing integration pass (2 unrelated pre-existing failures flagged). Ruff + mypy --strict clean on all PR#1 source files.
+- **Code review iter-1 — 6 reviewers in parallel:** Codex CLI + 5 PR-review-toolkit agents (code-reviewer, pr-test-analyzer, comment-analyzer, silent-failure-hunter, type-design-analyzer).
+  - Findings fixed in `060bc89`:
+    - **Codex P1** — `add_strategy()` now acquires `SELECT FOR UPDATE` on the draft + checks `is_frozen`, preventing the race where a concurrent `snapshot()` freezes the draft mid-add and the member-insert corrupts the composition hash.
+    - **Codex P1** — `compute_composition_hash` now quantizes weight to the DB `Numeric(8,6)` scale before hashing. Prevents divergence between a pre-flush hash (`Decimal("0.3333333")`) and a post-Postgres-round hash (`0.333333`).
+    - **P1 (code-reviewer + pr-test-analyzer)** — partial unique index `uq_one_draft_per_portfolio` now declared inline on `LivePortfolioRevision.__table_args__`, so `Base.metadata.create_all` fixtures exercise the same invariant as the migration. Added `test_partial_index_rejects_second_draft` + `test_partial_index_allows_two_frozen_revisions`.
+    - **P2 (silent-failure-hunter)** — `snapshot()` error cases split into typed exceptions under shared `PortfolioDomainError` base: `NoDraftToSnapshotError` (replaces opaque `ValueError`), `EmptyCompositionError` (new snapshot-time guard). `RevisionImmutableError` + `StrategyNotGraduatedError` now inherit the same base for unified catch blocks.
+    - **P2** — docstring/code mismatch in `_get_or_create_draft_revision` rewritten to accurately describe the partial-index + `IntegrityError` contract.
+    - **P2** — dropped "PR #1 of" reference from the migration docstring (CLAUDE.md rules — no caller history in code).
+  - Findings fixed in `422bbca`:
+    - **P1 (type-design-analyzer)** — DB-level CHECK `ck_lprs_weight_range` (weight > 0 AND weight <= 1) on `live_portfolio_revision_strategies`. New migration `p4k5l6m7n8o9`; mirrored in model `__table_args__`. Tests `test_weight_check_rejects_zero` + `test_weight_check_rejects_over_one`.
+
+**Test totals after iter-1 fixes:** 1228 unit + 27 portfolio integration (+ 4 new from fixes) + 199 pre-existing integration. Ruff clean on all PR#1-touched files. Alembic chain now ends at `p4k5l6m7n8o9`.
+
 ## Now
 
-PR #23 merged. Stack restarted on main-branch code. All code-side work for ES is complete. The remaining blocker to actual fills at market open is the IB market-data entitlement gap on `DUP733213` (confirmed via IB error 354) — operator action at `broker.ibkr.com → Market Data Subscription Manager`, no code involved.
+**Code-review iter-2 returned 3 P2s** (Codex `b99wie10n`). Fixes landed in `c5d94d4`:
+
+- **P2 applied** — `compute_composition_hash` pins `ROUND_HALF_EVEN` explicitly so the hash can't drift if any earlier code changed Python's decimal context. Matches Postgres Numeric default rounding.
+- **P2 applied** — `add_strategy`'s `SELECT FOR UPDATE` uses `scalar_one_or_none()` and treats a draft-deleted-by-concurrent-snapshot race the same as a frozen draft — both raise `RevisionImmutableError` with the retry hint (was raising raw `NoResultFound`).
+- **P2 rejected (false alarm)** — Codex claimed `index=True` inside `op.create_table` doesn't emit a standalone `CREATE INDEX`. Adding explicit `op.create_index` calls produced `DuplicateTableError`, confirming the implicit creation fires. Reverted.
+
+**Iter-3 running** (Codex `b2v8jr95f`) to verify no new P0/P1/P2. If clean, exit code-review loop → push + PR creation (requires user confirmation per CLAUDE.md).
+
+**Deferred to PR#2 or follow-up (noted, not blocking merge):**
+
+- `_lock_draft_revision` has no statement-timeout / NOWAIT — defensive improvement, but snapshot callers serialize cleanly in the current test topology. Track as P2 follow-up when contention becomes real.
+- `compute_composition_hash` still takes `list[dict[str, Any]]`. Could be a frozen `CompositionMember` dataclass for compile-time safety. Upgrade when PR#2 lands a typed service-boundary DTO.
 
 ## Next
 
-1. **Enable IB real-time market data on `DUP733213`** (operator UI action at broker.ibkr.com):
-   - `CME Real-Time (NP, L1)` — for ES/NQ/YM/RTY futures
-   - `NASDAQ TotalView` or `NASDAQ Level I` — for AAPL/MSFT
-   - `NYSE Real-Time` or the `US Securities Snapshot and Futures Value Bundle` (free) — for SPY
-2. **Fix ES futures contract spec** — DONE via PR #23.
-3. **Add options-chain bootstrap path** for one ticker (still pending, separate PR).
-4. **At market open (2026-04-16 09:30 ET)**: rerun the graduation pipeline with entitlements in place. Verify bars flow on AAPL/MSFT/SPY/ES, the 7 earlier bug fixes hold, and paper orders fill end-to-end.
-5. Phase 2 #5 Strategy registry + continuous futures (DB-backed InstrumentDefinition, `.Z.` regex).
-6. Remaining follow-ups: `/live/positions` empty with open Nautilus position; deployment row status stays `starting`; audit lifecycle race auto-heal.
+1. **Await code-review iter-2 verdict** — if clean, proceed; if issues, fix + iter-3.
+2. **Push branch + ask user about PR creation** (CLAUDE.md: "creating PR to main — Ask").
+3. **PR#2 of portfolio-per-account-live** — semantic cutover: Portfolio CRUD API + `/api/v1/live/start` rewired to accept `portfolio_revision_id`; supervisor + subprocess handle multi-strategy + multi-account `exec_clients`; read path (WebSocket + `/live/positions`) uses `LiveDeploymentStrategy`; backfill migration + drop old `strategy_id`/`config_hash`/`instruments` columns on `live_deployments`; `FailureIsolatedStrategy` base class + per-strategy cache-key namespacing + `load_state`/`save_state=True` verification + regression test for Nautilus issue #3176. ~1200 LOC. Live-critical — needs a maintenance-window cutover.
+4. **PR#3 of portfolio-per-account-live** — per-IB-login Compose Gateway services + `gateway_session_key` routing + per-gateway-session spawn guard + deterministic `ibg_client_id` allocation + container mem/cpu limits. ~500 LOC. Enables same portfolio across accounts on different IB logins.
+5. **Options-chain bootstrap path** for one ticker (separate PR, unblocked after PR#2 lands).
+6. **Phase 2 #5** — DB-backed strategy registry + continuous futures (`.Z.` regex resolution).
