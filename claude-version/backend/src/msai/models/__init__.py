@@ -10,7 +10,9 @@ from msai.models.backtest import Backtest
 from msai.models.base import Base
 from msai.models.graduation_candidate import GraduationCandidate
 from msai.models.graduation_stage_transition import GraduationStageTransition
+from msai.models.instrument_alias import InstrumentAlias
 from msai.models.instrument_cache import InstrumentCache
+from msai.models.instrument_definition import InstrumentDefinition
 from msai.models.live_deployment import LiveDeployment
 from msai.models.live_deployment_strategy import LiveDeploymentStrategy
 from msai.models.live_node_process import LiveNodeProcess
@@ -35,7 +37,9 @@ __all__ = [
     "Base",
     "GraduationCandidate",
     "GraduationStageTransition",
+    "InstrumentAlias",
     "InstrumentCache",
+    "InstrumentDefinition",
     "LiveDeployment",
     "LiveDeploymentStrategy",
     "LiveNodeProcess",
