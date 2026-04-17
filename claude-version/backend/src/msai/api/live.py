@@ -25,6 +25,7 @@ from msai.core.config import settings
 from msai.core.database import get_db
 from msai.core.logging import get_logger
 from msai.models.live_deployment import LiveDeployment
+from msai.models.live_deployment_strategy import LiveDeploymentStrategy
 from msai.models.live_node_process import LiveNodeProcess
 from msai.models.strategy import Strategy
 from msai.models.live_portfolio_revision import LivePortfolioRevision
@@ -886,6 +887,33 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Deployment row vanished between upsert and reload",
             )
+
+        # -------------------------------------------------------------
+        # Populate LiveDeploymentStrategy rows (idempotent on restart)
+        # -------------------------------------------------------------
+        # DELETE existing rows for this deployment so restarts don't
+        # accumulate stale entries. Then INSERT one row per revision
+        # member with the derived strategy_id_full.
+        await db.execute(
+            LiveDeploymentStrategy.__table__.delete().where(
+                LiveDeploymentStrategy.deployment_id == deployment_id
+            )
+        )
+        for member in members:
+            strat = strategies_by_id[member.strategy_id]
+            strategy_id_full = derive_strategy_id_full(
+                strat.strategy_class,
+                deployment.deployment_slug,
+                member.order_index,
+            )
+            db.add(
+                LiveDeploymentStrategy(
+                    deployment_id=deployment_id,
+                    revision_strategy_id=member.id,
+                    strategy_id_full=strategy_id_full,
+                )
+            )
+        await db.commit()
 
         # -------------------------------------------------------------
         # Active-process de-duplication
