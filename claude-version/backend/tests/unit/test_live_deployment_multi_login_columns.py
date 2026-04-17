@@ -1,4 +1,4 @@
-"""Unit tests for the new multi-login routing columns (PR#1)."""
+"""Unit tests for the multi-login routing columns (PR#1 added, PR#3 enforced NOT NULL)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ def test_live_deployment_has_ib_login_key_column() -> None:
 
     cols = {c.name: c for c in LiveDeployment.__table__.columns}
     assert "ib_login_key" in cols
-    assert cols["ib_login_key"].nullable is True
+    assert cols["ib_login_key"].nullable is False
 
 
 def test_live_node_process_has_gateway_session_key_column() -> None:
@@ -16,4 +16,4 @@ def test_live_node_process_has_gateway_session_key_column() -> None:
 
     cols = {c.name: c for c in LiveNodeProcess.__table__.columns}
     assert "gateway_session_key" in cols
-    assert cols["gateway_session_key"].nullable is True
+    assert cols["gateway_session_key"].nullable is False
