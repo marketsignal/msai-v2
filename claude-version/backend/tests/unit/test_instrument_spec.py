@@ -46,8 +46,8 @@ class TestCanonicalIdFuture:
         """A futures spec with ``expiry=None`` resolves to the
         continuous contract (CONTFUT) — Nautilus encodes that as
         just the root on the venue."""
-        spec = InstrumentSpec(asset_class="future", symbol="ES", venue="XCME")
-        assert spec.canonical_id() == "ES.XCME"
+        spec = InstrumentSpec(asset_class="future", symbol="ES", venue="CME")
+        assert spec.canonical_id() == "ES.CME"
 
     def test_fixed_month_future_encodes_month_and_year_digit(self) -> None:
         """Fixed-month future: ``{root}{month_code}{year_digit}.{venue}``.
@@ -57,10 +57,10 @@ class TestCanonicalIdFuture:
         spec = InstrumentSpec(
             asset_class="future",
             symbol="ES",
-            venue="XCME",
+            venue="CME",
             expiry=date(2025, 6, 20),
         )
-        assert spec.canonical_id() == "ESM5.XCME"
+        assert spec.canonical_id() == "ESM5.CME"
 
     def test_every_month_code_roundtrips(self) -> None:
         """Regression guard: verify all twelve futures month codes

@@ -98,8 +98,8 @@ class TestExtractVenuesFromInstrumentIds:
         """A mixed backtest (equity + futures) produces both venues
         in first-seen order — deterministic so tests can assert on
         the resulting config list."""
-        result = _extract_venues_from_instrument_ids(["AAPL.NASDAQ", "ESM5.XCME", "MSFT.NASDAQ"])
-        assert result == ["NASDAQ", "XCME"]
+        result = _extract_venues_from_instrument_ids(["AAPL.NASDAQ", "ESM5.CME", "MSFT.NASDAQ"])
+        assert result == ["NASDAQ", "CME"]
 
     def test_option_venue_is_last_dot_component(self) -> None:
         """Option ids have internal spaces + multiple dots
@@ -121,7 +121,7 @@ class TestExtractVenuesFromInstrumentIds:
 
 class TestMultiVenueBuildConfig:
     def test_multi_venue_produces_one_config_per_venue(self) -> None:
-        """A backtest spanning ``["AAPL.NASDAQ", "ESM5.XCME"]`` gets
+        """A backtest spanning ``["AAPL.NASDAQ", "ESM5.CME"]`` gets
         TWO ``BacktestVenueConfig`` entries — one per unique
         venue — so Nautilus's engine can route orders to the
         correct simulated venue."""
@@ -131,7 +131,7 @@ class TestMultiVenueBuildConfig:
                 "instrument_id": "AAPL.NASDAQ",
                 "bar_type": "AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL",
             },
-            instrument_ids=["AAPL.NASDAQ", "ESM5.XCME"],
+            instrument_ids=["AAPL.NASDAQ", "ESM5.CME"],
             start_date="2024-01-01",
             end_date="2024-01-02",
             catalog_path="./data/nautilus",
@@ -139,7 +139,7 @@ class TestMultiVenueBuildConfig:
         run_config = _build_backtest_run_config(payload)
 
         venue_names = sorted(v.name for v in run_config.venues)
-        assert venue_names == ["NASDAQ", "XCME"]
+        assert venue_names == ["CME", "NASDAQ"]
 
 
 class TestZeroMetrics:

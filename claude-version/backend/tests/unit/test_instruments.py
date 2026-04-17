@@ -30,8 +30,8 @@ class TestResolveInstrument:
         regardless of the ``venue`` kwarg — the SecurityMaster
         round-trip contract keys on the canonical ID string and
         must not silently rewrite venues."""
-        inst = resolve_instrument("ESM5.XCME", venue="NASDAQ")
-        assert str(inst.id) == "ESM5.XCME"
+        inst = resolve_instrument("ESM5.CME", venue="NASDAQ")
+        assert str(inst.id) == "ESM5.CME"
 
     def test_default_equity_venue_is_nasdaq(self) -> None:
         assert DEFAULT_EQUITY_VENUE == "NASDAQ"

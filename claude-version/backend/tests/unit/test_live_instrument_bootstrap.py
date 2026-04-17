@@ -222,7 +222,7 @@ class TestCanonicalInstrumentId:
         """Legacy MIC-style input (``ES.XCME``) still accepted — the
         root extraction splits on ``.`` so the venue is ignored. Output
         is always ``.CME`` (IB_SIMPLIFIED venue)."""
-        assert canonical_instrument_id("ES.XCME", today=date(2026, 4, 15)) == "ESM6.CME"
+        assert canonical_instrument_id("ES.XCME", today=date(2026, 4, 15)) == "ESM6.CME"  # legacy accept
 
     def test_aapl_round_trips_identity(self) -> None:
         assert canonical_instrument_id("AAPL") == "AAPL.NASDAQ"
