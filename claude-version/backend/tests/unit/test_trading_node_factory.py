@@ -511,19 +511,22 @@ def test_build_config_with_multiple_strategies() -> None:
         build_portfolio_trading_node_config,
     )
 
-    m1 = _make_member(instruments=["AAPL"], strategy_id_full="s1@slug")
-    m2 = _make_member(instruments=["MSFT"], strategy_id_full="s2@slug")
+    slug = "abcd1234abcd1234"
+    m1 = _make_member(instruments=["AAPL"], strategy_id_full=f"EMACross-0-{slug}")
+    m2 = _make_member(instruments=["MSFT"], strategy_id_full=f"EMACross-1-{slug}")
 
     config = build_portfolio_trading_node_config(
-        deployment_slug="abcd1234abcd1234",
+        deployment_slug=slug,
         strategy_members=[m1, m2],
         ib_settings=IBSettings(host="127.0.0.1", port=4002, account_id="DU1234567"),
     )
 
     assert len(config.strategies) == 2
-    # Each strategy config should have its own order_id_tag
-    assert config.strategies[0].config["order_id_tag"] == "s1@slug"
-    assert config.strategies[1].config["order_id_tag"] == "s2@slug"
+    # order_id_tag is the suffix of strategy_id_full (without the class
+    # name prefix) so Nautilus constructs the correct StrategyId:
+    # ``f"{class_name}-{order_id_tag}"`` == strategy_id_full
+    assert config.strategies[0].config["order_id_tag"] == f"0-{slug}"
+    assert config.strategies[1].config["order_id_tag"] == f"1-{slug}"
 
 
 def test_build_config_aggregates_instruments_for_provider() -> None:

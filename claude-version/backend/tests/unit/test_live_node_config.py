@@ -125,12 +125,12 @@ class TestHappyPath:
         assert strat.config["manage_stop"] is True
 
     def test_order_id_tag_injected_from_slug(self) -> None:
-        """Task 1.10: ``order_id_tag`` must be the deployment_slug so
-        every ``client_order_id`` Nautilus mints is prefixed with the
-        stable identifier Task 1.11's audit hook correlates on."""
+        """Task 1.10: ``order_id_tag`` must be ``0-{deployment_slug}``
+        so Nautilus emits ``{class}-0-{slug}`` which matches
+        ``derive_strategy_id_full(class, slug, 0)``."""
         config = _build()
         strat = config.strategies[0]
-        assert strat.config["order_id_tag"] == _SLUG_A
+        assert strat.config["order_id_tag"] == f"0-{_SLUG_A}"
 
     def test_caller_config_keys_preserved(self) -> None:
         """The injected ``manage_stop`` and ``order_id_tag`` MUST be
@@ -145,7 +145,7 @@ class TestHappyPath:
         assert strat.config["fast_ema_period"] == 42
         assert strat.config["slow_ema_period"] == 100
         assert strat.config["manage_stop"] is True
-        assert strat.config["order_id_tag"] == _SLUG_A
+        assert strat.config["order_id_tag"] == f"0-{_SLUG_A}"
 
     def test_caller_cannot_override_manage_stop_false(self) -> None:
         """Defensive: the caller's config is spread BEFORE the

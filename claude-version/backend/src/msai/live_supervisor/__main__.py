@@ -194,15 +194,19 @@ def _build_production_payload_factory(
             if deployment.portfolio_revision_id is not None:
                 # Portfolio-based deployment — load all revision members
                 members: list[LivePortfolioRevisionStrategy] = (
-                    await session.execute(
-                        select(LivePortfolioRevisionStrategy)
-                        .where(
-                            LivePortfolioRevisionStrategy.revision_id
-                            == deployment.portfolio_revision_id
+                    (
+                        await session.execute(
+                            select(LivePortfolioRevisionStrategy)
+                            .where(
+                                LivePortfolioRevisionStrategy.revision_id
+                                == deployment.portfolio_revision_id
+                            )
+                            .order_by(LivePortfolioRevisionStrategy.order_index)
                         )
-                        .order_by(LivePortfolioRevisionStrategy.order_index)
                     )
-                ).scalars().all()
+                    .scalars()
+                    .all()
+                )
                 if not members:
                     raise ValueError(
                         f"deployment {deployment_id} references portfolio "
@@ -214,10 +218,14 @@ def _build_production_payload_factory(
                 member_strategy_ids = [m.strategy_id for m in members]
                 strategies_by_id: dict[UUID, Strategy] = {}
                 for strat_row in (
-                    await session.execute(
-                        select(Strategy).where(Strategy.id.in_(member_strategy_ids))
+                    (
+                        await session.execute(
+                            select(Strategy).where(Strategy.id.in_(member_strategy_ids))
+                        )
                     )
-                ).scalars().all():
+                    .scalars()
+                    .all()
+                ):
                     strategies_by_id[strat_row.id] = strat_row
 
                 missing = [sid for sid in member_strategy_ids if sid not in strategies_by_id]
@@ -266,9 +274,7 @@ def _build_production_payload_factory(
                     )
 
                     # Per-member instruments: canonicalize for futures rollover
-                    member_paper_symbols = [
-                        inst.split(".")[0] for inst in member.instruments
-                    ]
+                    member_paper_symbols = [inst.split(".")[0] for inst in member.instruments]
                     member_canonical = [
                         canonical_instrument_id(inst, today=spawn_today)
                         for inst in member.instruments
@@ -296,7 +302,7 @@ def _build_production_payload_factory(
                                 )
                             elif existing_bt.startswith(first_user_inst + "-"):
                                 member_config["bar_type"] = (
-                                    first_inst + existing_bt[len(first_user_inst):]
+                                    first_inst + existing_bt[len(first_user_inst) :]
                                 )
                         else:
                             member_config.setdefault("instrument_id", first_inst)
@@ -330,7 +336,11 @@ def _build_production_payload_factory(
                     deployment_id=deployment_id,
                     deployment_slug=deployment_slug,
                     strategy_id=deployment.strategy_id,
-                    strategy_code_hash=deployment.strategy_code_hash or "",
+                    # ``strategy_code_hash`` column was dropped in Task 11
+                    # — derive from the first member's per-strategy hash.
+                    strategy_code_hash=strategy_members[0].strategy_code_hash
+                    if strategy_members
+                    else "",
                     strategy_path=first_member.strategy_path,
                     strategy_config_path=first_member.strategy_config_path,
                     strategy_config=first_member.strategy_config,
@@ -361,122 +371,11 @@ def _build_production_payload_factory(
                 )
 
             else:
-                # Legacy single-strategy path (unchanged)
-                strategy = (
-                    await session.execute(
-                        select(Strategy).where(Strategy.id == deployment.strategy_id)
-                    )
-                ).scalar_one_or_none()
-                if strategy is None:
-                    raise ValueError(
-                        f"deployment {deployment_id} references strategy "
-                        f"{deployment.strategy_id} which does not exist"
-                    )
-
-                # Resolve ``strategies/example/ema_cross.py`` → Nautilus
-                # importable strings. The same helper powers the backtest
-                # runner (services/nautilus/backtest_runner.py:341) so
-                # live and backtest always agree on how a strategy file
-                # turns into an ``ImportableStrategyConfig``.
-                paths = resolve_importable_strategy_paths(
-                    strategy_file=strategy.file_path,
-                    strategy_class_name=strategy.strategy_class,
-                )
-
-                # ``deployment.instruments`` is the stored instrument
-                # list (e.g. ``["AAPL.NASDAQ", "MSFT.NASDAQ"]``). Pass
-                # through the symbol portion (before the venue suffix)
-                # as ``paper_symbols`` — the Nautilus instrument
-                # provider expects bare symbols that it then resolves
-                # to IB contracts via the security master.
-                paper_symbols = [
-                    instrument.split(".")[0] for instrument in deployment.instruments
-                ]
-
-                # Canonicalize each user-facing instrument_id to the
-                # concrete Nautilus instrument_id that will exist in the
-                # cache after the provider preloads the matching IBContract.
-                # Identity mapping for stocks/ETF/FX; for futures, maps the
-                # stable root (``ES.XCME``) to the current front-month
-                # (``ESM6.XCME``) so the strategy's bar subscription matches
-                # what Nautilus actually registers.
-                canonical_instrument_ids = [
-                    canonical_instrument_id(instrument, today=spawn_today)
-                    for instrument in deployment.instruments
-                ]
-
-                # Codex iter6 P1: derive ``instrument_id`` + ``bar_type``
-                # into the strategy config if the caller didn't set them.
-                merged_strategy_config = dict(deployment.config or {})
-                if canonical_instrument_ids:
-                    first_instrument = canonical_instrument_ids[0]
-                    first_user_instrument = deployment.instruments[0]
-                    _is_fx = any(
-                        x in first_instrument.upper()
-                        for x in ("IDEALPRO", "CASH", "EUR", "GBP", "JPY", "AUD", "CHF")
-                    )
-                    _price_type = "MID" if _is_fx else "LAST"
-
-                    user_root = first_user_instrument.split(".")[0]
-                    canonical_root = first_instrument.split(".")[0]
-                    root_changed = user_root != canonical_root
-
-                    if root_changed:
-                        merged_strategy_config["instrument_id"] = first_instrument
-                        existing_bt = merged_strategy_config.get("bar_type", "")
-                        if not existing_bt:
-                            merged_strategy_config["bar_type"] = (
-                                f"{first_instrument}-1-MINUTE-{_price_type}-EXTERNAL"
-                            )
-                        elif existing_bt.startswith(first_user_instrument + "-"):
-                            merged_strategy_config["bar_type"] = (
-                                first_instrument
-                                + existing_bt[len(first_user_instrument):]
-                            )
-                    else:
-                        merged_strategy_config.setdefault("instrument_id", first_instrument)
-                        merged_strategy_config.setdefault(
-                            "bar_type",
-                            f"{first_instrument}-1-MINUTE-{_price_type}-EXTERNAL",
-                        )
-
-                nautilus_payload = TradingNodePayload(
-                    row_id=row_id,
-                    deployment_id=deployment_id,
-                    deployment_slug=deployment_slug,
-                    strategy_id=deployment.strategy_id,
-                    strategy_code_hash=deployment.strategy_code_hash or "",
-                    strategy_path=paths.strategy_path,
-                    strategy_config_path=paths.config_path,
-                    strategy_config=merged_strategy_config,
-                    paper_symbols=paper_symbols,
-                    canonical_instruments=canonical_instrument_ids,
-                    spawn_today_iso=spawn_today.isoformat(),
-                    ib_host=settings.ib_host,
-                    ib_port=settings.ib_port,
-                    # Codex iter3 P1: use the deployment row's
-                    # account_id, not the process-wide settings default.
-                    # Different deployments on the same supervisor can
-                    # target different IB accounts (e.g., two paper
-                    # accounts used for A/B testing) as long as all of
-                    # them match the supervisor's paper/live port.
-                    ib_account_id=deployment_account,
-                    database_url=settings.database_url,
-                    redis_url=settings.redis_url,
-                    startup_health_timeout_s=settings.startup_health_timeout_s,
-                )
-                log.info(
-                    "trading_node_payload_built",
-                    extra={
-                        "deployment_id": str(deployment_id),
-                        "deployment_slug": deployment_slug,
-                        "strategy_path": paths.strategy_path,
-                        "paper_symbols": paper_symbols,
-                        "ib_host": settings.ib_host,
-                        "ib_port": settings.ib_port,
-                        "account_id": deployment_account,
-                        "paper_trading": deployment.paper_trading,
-                    },
+                # Dead path post-Task 11: portfolio_revision_id is NOT NULL,
+                # so the ``if`` branch above always runs. Guard defensively.
+                raise ValueError(
+                    f"deployment {deployment_id} has no portfolio_revision_id "
+                    f"— this should be impossible after the Task 10 backfill"
                 )
 
             return (nautilus_payload,)

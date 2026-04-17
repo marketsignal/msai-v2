@@ -42,10 +42,10 @@ class LiveDeploymentInfo(BaseModel):
     """Summary of a single live deployment."""
 
     id: UUID
-    strategy_id: UUID
+    strategy_id: UUID | None = None
     status: str
     paper_trading: bool
-    instruments: list[str]
+    instruments: list[str] = []
     started_at: datetime | None = None
     stopped_at: datetime | None = None
 
@@ -77,11 +77,11 @@ class LiveDeploymentStatusResponse(BaseModel):
 
     # Logical deployment fields
     id: UUID
-    strategy_id: UUID
+    strategy_id: UUID | None = None
     deployment_slug: str
     status: str
     paper_trading: bool
-    instruments: list[str]
+    instruments: list[str] = []
     last_started_at: datetime | None = None
     last_stopped_at: datetime | None = None
 

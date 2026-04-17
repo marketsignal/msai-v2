@@ -454,7 +454,12 @@ def build_live_trading_node_config(
                 config={
                     **strategy_config,
                     "manage_stop": True,
-                    "order_id_tag": deployment_slug,
+                    # Include order_index=0 so Nautilus emits
+                    # ``{class}-0-{slug}`` which matches the format
+                    # ``derive_strategy_id_full(class, slug, 0)``
+                    # produces. Without the ``0-`` prefix the
+                    # StrategyId and strategy_id_full would diverge.
+                    "order_id_tag": f"0-{deployment_slug}",
                 },
             ),
         ],
@@ -576,12 +581,17 @@ def build_portfolio_trading_node_config(
     )
 
     # Build N ImportableStrategyConfigs — one per member.
-    # Each strategy's order_id_tag uses strategy_id_full so orders
-    # within the portfolio are attributable to individual strategies
-    # (falls back to deployment_slug if strategy_id_full is empty).
+    # Each strategy's order_id_tag is the SUFFIX of strategy_id_full
+    # (without the class name). Nautilus constructs StrategyId as
+    # ``f"{class_name}-{order_id_tag}"``, so if strategy_id_full is
+    # ``"EMACross-0-slug"`` the tag must be ``"0-slug"`` — otherwise
+    # Nautilus would produce ``"EMACross-EMACross-0-slug"`` (double
+    # prefix).
     strategy_configs: list[ImportableStrategyConfig] = []
     for member in strategy_members:
-        order_id_tag = member.strategy_id_full or deployment_slug
+        # Parse "{class}-{order_index}-{slug}" → "{order_index}-{slug}"
+        _parts = member.strategy_id_full.split("-", 1)
+        order_id_tag = _parts[1] if len(_parts) >= 2 else deployment_slug
         strategy_configs.append(
             ImportableStrategyConfig(
                 strategy_path=member.strategy_path,

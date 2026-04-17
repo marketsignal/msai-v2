@@ -411,9 +411,6 @@ async def live_start(  # noqa: PLR0912, PLR0915 — multi-branch dispatch by des
 
         stmt = pg_insert(deployment_table).values(
             strategy_id=request.strategy_id,
-            strategy_code_hash=strategy_code_hash,
-            config=request.config,
-            instruments=request.instruments,
             status="starting",
             paper_trading=request.paper_trading,
             last_started_at=now,
@@ -425,8 +422,6 @@ async def live_start(  # noqa: PLR0912, PLR0915 — multi-branch dispatch by des
             strategy_id_full=derive_strategy_id_full(strategy.strategy_class, slug),
             account_id=account_id,
             message_bus_stream=derive_message_bus_stream(slug),
-            config_hash=identity.config_hash,
-            instruments_signature=identity.instruments_signature,
         )
         # PR#1 Codex P1 regression: preserve the existing status when
         # the row is already in an active state. Before this fix, the
@@ -771,14 +766,16 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
             )
 
         members: list[LivePortfolioRevisionStrategy] = (
-            await db.execute(
-                select(LivePortfolioRevisionStrategy)
-                .where(
-                    LivePortfolioRevisionStrategy.revision_id == revision.id
+            (
+                await db.execute(
+                    select(LivePortfolioRevisionStrategy)
+                    .where(LivePortfolioRevisionStrategy.revision_id == revision.id)
+                    .order_by(LivePortfolioRevisionStrategy.order_index)
                 )
-                .order_by(LivePortfolioRevisionStrategy.order_index)
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         if not members:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -794,10 +791,10 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
         strategy_ids = [m.strategy_id for m in members]
         strategies_by_id: dict[UUID, Strategy] = {}
         for strat_row in (
-            await db.execute(
-                select(Strategy).where(Strategy.id.in_(strategy_ids))
-            )
-        ).scalars().all():
+            (await db.execute(select(Strategy).where(Strategy.id.in_(strategy_ids))))
+            .scalars()
+            .all()
+        ):
             strategies_by_id[strat_row.id] = strat_row
 
         missing = [sid for sid in strategy_ids if sid not in strategies_by_id]
@@ -838,9 +835,6 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
 
         stmt = pg_insert(deployment_table).values(
             strategy_id=first_strategy.id,
-            strategy_code_hash=strategy_code_hash,
-            config=combined_config,
-            instruments=all_instruments,
             status="starting",
             paper_trading=request.paper_trading,
             last_started_at=now,
@@ -849,14 +843,10 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
             deployment_slug=slug,
             identity_signature=identity_signature,
             trader_id=derive_trader_id(slug),
-            strategy_id_full=derive_strategy_id_full(
-                first_strategy.strategy_class, slug
-            ),
+            strategy_id_full=derive_strategy_id_full(first_strategy.strategy_class, slug),
             account_id=request.account_id,
             ib_login_key=request.ib_login_key,
             message_bus_stream=derive_message_bus_stream(slug),
-            config_hash=compute_config_hash(combined_config),
-            instruments_signature=",".join(all_instruments),
             portfolio_revision_id=request.portfolio_revision_id,
         )
         _active_statuses = ("starting", "building", "ready", "running")
@@ -1390,7 +1380,10 @@ async def live_status(
             strategy_id=d.strategy_id,
             status=d.status,
             paper_trading=d.paper_trading,
-            instruments=d.instruments,
+            # ``instruments`` column was dropped in Task 11 — data now
+            # lives on ``live_portfolio_revision_strategies``. Default
+            # to empty list for backward-compatible API response.
+            instruments=[],
             # Map the new most-recent-run timestamps onto the existing
             # response field names for backward compatibility. The
             # underlying columns were renamed in v9 task 1.1b but the
@@ -1454,7 +1447,8 @@ async def get_live_deployment_status(
         deployment_slug=deployment.deployment_slug,
         status=deployment.status,
         paper_trading=deployment.paper_trading,
-        instruments=list(deployment.instruments or []),
+        # ``instruments`` column dropped in Task 11 — default to empty list.
+        instruments=[],
         last_started_at=deployment.last_started_at,
         last_stopped_at=deployment.last_stopped_at,
         process_id=process.id if process else None,
