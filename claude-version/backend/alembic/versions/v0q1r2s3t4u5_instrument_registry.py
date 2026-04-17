@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import sqlalchemy as sa
 from alembic import op
-from sqlalchemy.dialects import postgresql
 
 revision: str = "v0q1r2s3t4u5"
 down_revision: str = "u9p0q1r2s3t4"
@@ -22,7 +21,7 @@ def upgrade() -> None:
         "instrument_definitions",
         sa.Column(
             "instrument_uid",
-            postgresql.UUID(as_uuid=True),
+            sa.Uuid(),
             primary_key=True,
             server_default=sa.text("gen_random_uuid()"),
         ),
@@ -97,13 +96,13 @@ def upgrade() -> None:
         "instrument_aliases",
         sa.Column(
             "id",
-            postgresql.UUID(as_uuid=True),
+            sa.Uuid(),
             primary_key=True,
             server_default=sa.text("gen_random_uuid()"),
         ),
         sa.Column(
             "instrument_uid",
-            postgresql.UUID(as_uuid=True),
+            sa.Uuid(),
             sa.ForeignKey(
                 "instrument_definitions.instrument_uid", ondelete="CASCADE"
             ),
