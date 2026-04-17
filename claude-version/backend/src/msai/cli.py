@@ -421,23 +421,26 @@ def research_cancel(
 
 @live_app.command("start")
 def live_start(
-    strategy_id: str = typer.Argument(..., help="Strategy UUID"),
-    instruments: str = typer.Argument(..., help="Comma-separated instrument IDs"),
+    portfolio_revision_id: str = typer.Argument(..., help="Portfolio revision UUID"),
+    account_id: str = typer.Argument(..., help="IB account id (e.g. DU1234567)"),
     paper: bool = typer.Option(True, help="Paper trading mode (default: True)"),
+    ib_login_key: str = typer.Option(
+        "", help="IB login username (optional, server derives if empty)"
+    ),
 ) -> None:
-    """Start live/paper trading for a strategy."""
-    instrument_list = [s.strip() for s in instruments.split(",") if s.strip()]
-    if not instrument_list:
-        _fail("no instruments provided")
-    payload = {
-        "strategy_id": strategy_id,
-        "config": {},
-        "instruments": instrument_list,
+    """Deploy a portfolio revision to live/paper trading."""
+    payload: dict[str, object] = {
+        "portfolio_revision_id": portfolio_revision_id,
+        "account_id": account_id,
         "paper_trading": paper,
     }
-    response = _api_call("POST", "/api/v1/live/start", json_body=payload)
+    if ib_login_key:
+        payload["ib_login_key"] = ib_login_key
+    response = _api_call("POST", "/api/v1/live/start-portfolio", json_body=payload)
     data = response.json()
-    typer.echo(f"Deployment started: {data['id']} (status: {data['status']})")
+    dep_id = data.get("id", "unknown")
+    dep_status = data.get("status", "unknown")
+    typer.echo(f"Deployment started: {dep_id} (status: {dep_status})")
 
 
 @live_app.command("stop")

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING, Any
 from uuid import UUID  # noqa: TC003 — FastAPI resolves the type at runtime for path params
@@ -21,7 +20,6 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from msai.api.live_deps import get_command_bus, get_idempotency_store
 from msai.core.audit import log_audit
 from msai.core.auth import get_current_user, resolve_user_id
-from msai.core.config import settings
 from msai.core.database import get_db
 from msai.core.logging import get_logger
 from msai.models.live_deployment import LiveDeployment
@@ -43,14 +41,11 @@ from msai.schemas.live import (
     PortfolioStartRequest,
 )
 from msai.services.live.deployment_identity import (
-    compute_config_hash,
-    derive_deployment_identity,
     derive_message_bus_stream,
     derive_portfolio_deployment_identity,
     derive_strategy_id_full,
     derive_trader_id,
     generate_deployment_slug,
-    normalize_request_config,
 )
 from msai.services.live.failure_kind import FailureKind
 from msai.services.live.idempotency import (
@@ -68,7 +63,6 @@ from msai.services.live_command_bus import (
 )
 from msai.services.nautilus.trading_node import TradingNodeManager
 from msai.services.risk_engine import RiskEngine
-from msai.services.strategy_registry import compute_file_hash
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -223,439 +217,27 @@ async def _resolve_user_id(db: AsyncSession, claims: dict[str, Any]) -> UUID | N
     return await resolve_user_id(db, claims)
 
 
-def _resolve_strategy_code_hash(strategy: Strategy) -> str:
-    """Compute the SHA256 hash of the strategy source file.
-
-    The hash is part of the stable-identity tuple (decision #7): editing
-    a strategy file must produce a new ``identity_signature`` so the
-    edited deployment starts cold with isolated state instead of
-    silently warm-restarting on top of incompatible persisted state
-    (Codex Task 1.1b P1 fix).
-
-    ``Strategy.file_path`` is stored as a project-relative path (e.g.
-    ``strategies/example/ema_cross.py``); resolve it against the
-    configured ``strategies_root`` to get an absolute path on disk.
-    """
-    rel = Path(strategy.file_path)
-    if rel.is_absolute():
-        abs_path = rel
-    elif rel.parts and rel.parts[0] == "strategies":
-        # File path already includes the ``strategies/`` prefix;
-        # drop it because strategies_root IS the strategies dir.
-        abs_path = settings.strategies_root.joinpath(*rel.parts[1:])
-    else:
-        abs_path = settings.strategies_root / rel
-
-    if not abs_path.is_file():
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                f"Strategy file not found on disk: {abs_path}. "
-                "Re-register the strategy or restore the source file."
-            ),
-        )
-    return compute_file_hash(abs_path)
-
-
-@router.post("/start")
-async def live_start(  # noqa: PLR0912, PLR0915 — multi-branch dispatch by design
+@router.post("/start", deprecated=True)
+async def live_start(
     request: LiveStartRequest,
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-    claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
-    db: AsyncSession = Depends(get_db),  # noqa: B008
-    bus: LiveCommandBus = Depends(get_command_bus),  # noqa: B008
-    idem: IdempotencyStore = Depends(get_idempotency_store),  # noqa: B008
 ) -> JSONResponse:
-    """Deploy a strategy to paper or live trading (Task 1.14).
+    """Deprecated single-strategy deploy endpoint.
 
-    Three idempotency layers (decision #13):
-
-    1. **HTTP Idempotency-Key** — atomic SETNX reservation in Redis.
-       Concurrent retries with the same key get HTTP 425 In-Flight;
-       retries after completion get the cached response within the
-       24 h TTL. Keys are user-scoped (Codex v4 P2) so an attacker
-       cannot observe another user's cached response.
-
-    2. **Halt flag** — if ``msai:risk:halt`` is set, return 503 with
-       ``failure_kind=halt_active`` (non-cacheable so a ``/resume``
-       followed by a retry can re-attempt).
-
-    3. **Identity-based warm restart** — the ``identity_signature``
-       is computed from ``(user_id, strategy_id, strategy_code_hash,
-       config_hash, account_id, paper_trading, instruments)``. An
-       existing row with the same signature is reused (warm restart);
-       otherwise a fresh row is inserted (cold start). An existing
-       row whose latest process is in an active status is a short-
-       circuit ``already_active`` (200, cacheable).
-
-    The endpoint publishes a START command to the live supervisor via
-    :class:`LiveCommandBus` and polls ``live_node_processes`` for
-    ``status in (ready, running, failed)`` with a 60 s wall-clock
-    timeout. Terminal outcomes are classified via
-    :meth:`FailureKind.parse_or_unknown` and converted into
-    :class:`EndpointOutcome` values; the idempotency store's
-    ``commit()`` / ``release()`` is driven by ``outcome.cacheable``.
+    Use ``POST /api/v1/live/start-portfolio`` instead, which deploys
+    an entire frozen portfolio revision to a specific IB account.
     """
-    # ------------------------------------------------------------------
-    # Layer 1: HTTP Idempotency-Key reservation
-    # ------------------------------------------------------------------
-    user_id = await _resolve_user_id(db, claims)
-    body_for_hash: dict[str, Any] = {
-        "strategy_id": str(request.strategy_id),
-        "config": request.config,
-        "instruments": sorted(request.instruments),
-        "paper_trading": request.paper_trading,
-    }
-    body_hash = IdempotencyStore.body_hash(body_for_hash)
-
-    reservation: Reserved | None = None
-    if idempotency_key is not None:
-        if user_id is None:
-            # Idempotency is user-scoped; an unresolved user has no
-            # scope to anchor the reservation to. Fail fast rather
-            # than silently falling back to a non-scoped key.
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Idempotency-Key requires an authenticated user.",
-            )
-        result = await idem.reserve(user_id=user_id, key=idempotency_key, body_hash=body_hash)
-        if isinstance(result, InFlight):
-            return _apply_outcome(EndpointOutcome.in_flight())
-        if isinstance(result, CachedOutcome):
-            return _apply_outcome(result.outcome)
-        if isinstance(result, BodyMismatchReservation):
-            return _apply_outcome(EndpointOutcome.body_mismatch())
-        # Only the Reserved branch owns the store (Codex v8 / v7 P0).
-        # The caller MUST eventually call commit() or release().
-        reservation = result
-
-    # ``do_release_on_error`` wraps the rest of the handler; any
-    # exception raised below triggers release() so the next retry
-    # with the same key can re-attempt.
-    try:
-        # -------------------------------------------------------------
-        # Layer 2: Halt flag
-        # -------------------------------------------------------------
-        if await _halt_is_active(bus):
-            outcome = EndpointOutcome.halt_active()
-            if reservation is not None:
-                await idem.release(reservation.redis_key)
-            return _apply_outcome(outcome)
-
-        # -------------------------------------------------------------
-        # Supervisor liveness
-        # -------------------------------------------------------------
-        # The live-supervisor container consumes START/STOP commands
-        # from Redis Streams and spawns the Nautilus trading
-        # subprocess. If no supervisor is actively consuming (the
-        # ``broker`` compose profile wasn't activated, the container
-        # crashed, etc.), publishing a command here would land it in
-        # a stream with no reader and the 60 s poll below would time
-        # out with a generic 504 — unhelpful during a deploy or
-        # incident. Fail fast with a 503 + remediation instead.
-        if not await _supervisor_is_alive(bus):
-            log.error(
-                "live_start_rejected_no_supervisor",
-                extra={
-                    "stream": LIVE_COMMAND_STREAM,
-                    "group": LIVE_COMMAND_GROUP,
-                    "note": (
-                        "no live-supervisor consumer active — start the broker "
-                        "profile or restart the live-supervisor container"
-                    ),
-                },
-            )
-            if reservation is not None:
-                await idem.release(reservation.redis_key)
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=(
-                    "live-supervisor is not running. Start it with "
-                    "`docker compose -f docker-compose.dev.yml --profile broker "
-                    "up -d live-supervisor ib-gateway` and retry."
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "error": {
+                "code": "ENDPOINT_DEPRECATED",
+                "message": (
+                    "POST /api/v1/live/start is deprecated. "
+                    "Use POST /api/v1/live/start-portfolio instead."
                 ),
-            )
-
-        # -------------------------------------------------------------
-        # Strategy lookup
-        # -------------------------------------------------------------
-        strategy: Strategy | None = (
-            await db.execute(select(Strategy).where(Strategy.id == request.strategy_id))
-        ).scalar_one_or_none()
-        if strategy is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Strategy {request.strategy_id} not found",
-            )
-
-        # -------------------------------------------------------------
-        # Layer 3: Identity-based warm-restart upsert
-        # -------------------------------------------------------------
-        strategy_code_hash = _resolve_strategy_code_hash(strategy)
-        account_id = (settings.ib_account_id or "").strip() or "DU0000000"
-        normalized_config = normalize_request_config(request.config, strategy.default_config)
-        identity = derive_deployment_identity(
-            user_id=user_id,
-            strategy_id=request.strategy_id,
-            strategy_code_hash=strategy_code_hash,
-            config=normalized_config,
-            account_id=account_id,
-            paper_trading=request.paper_trading,
-            instruments=request.instruments,
-        )
-        identity_signature = identity.signature()
-
-        slug = generate_deployment_slug()
-        now = datetime.now(UTC)
-        deployment_table = LiveDeployment.__table__
-
-        stmt = pg_insert(deployment_table).values(
-            strategy_id=request.strategy_id,
-            status="starting",
-            paper_trading=request.paper_trading,
-            last_started_at=now,
-            last_stopped_at=None,
-            started_by=user_id,
-            deployment_slug=slug,
-            identity_signature=identity_signature,
-            trader_id=derive_trader_id(slug),
-            strategy_id_full=derive_strategy_id_full(strategy.strategy_class, slug),
-            account_id=account_id,
-            message_bus_stream=derive_message_bus_stream(slug),
-        )
-        # PR#1 Codex P1 regression: preserve the existing status when
-        # the row is already in an active state. Before this fix, the
-        # set_ clause unconditionally stomped ``status`` to
-        # ``"starting"``, so a retry against a RUNNING deployment
-        # would flip the deployment row from ``running`` back to
-        # ``starting`` even though the downstream active_process
-        # check returns already_active. That made
-        # ``/api/v1/live/status`` report the wrong state for a live
-        # deployment.
-        #
-        # The SQL CASE below keeps the existing status if it's in
-        # {starting, building, ready, running} (the active set) and
-        # otherwise resets it to ``starting`` for the cold-start /
-        # warm-restart paths. Atomic, no race.
-        _active_statuses = ("starting", "building", "ready", "running")
-        upsert_stmt = stmt.on_conflict_do_update(
-            index_elements=[deployment_table.c.identity_signature],
-            set_={
-                "status": case(
-                    (
-                        deployment_table.c.status.in_(_active_statuses),
-                        deployment_table.c.status,
-                    ),
-                    else_="starting",
-                ),
-                "last_started_at": now,
-            },
-        ).returning(deployment_table.c.id, deployment_table.c.deployment_slug)
-        upsert_row = (await db.execute(upsert_stmt)).one()
-        deployment_id = upsert_row.id
-        is_warm_restart = upsert_row.deployment_slug != slug
-        await db.commit()
-
-        deployment = await db.get(LiveDeployment, deployment_id)
-        if deployment is None:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Deployment row vanished between upsert and reload",
-            )
-
-        # -------------------------------------------------------------
-        # Active-process de-duplication — if a live_node_processes row
-        # is already in an active state, return already_active (200,
-        # cacheable) without publishing a new command.
-        # -------------------------------------------------------------
-        active_process = (
-            await db.execute(
-                select(LiveNodeProcess)
-                .where(
-                    LiveNodeProcess.deployment_id == deployment.id,
-                    LiveNodeProcess.status.in_(("starting", "building", "ready", "running")),
-                )
-                .order_by(LiveNodeProcess.started_at.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if active_process is not None:
-            # UP-direction sync — mirror of PR #26 Fix A/B. When an
-            # idempotent retry or warm restart hits an already-running
-            # process, the deployment row can be stuck at 'starting'
-            # (the upsert CASE above preserves any active status, so a
-            # deployment whose original /live/start never completed the
-            # poll-and-update step keeps its initial 'starting'). That
-            # stale value makes /live/positions, /live/status, and the
-            # UI filter out the deployment even though its process is
-            # operational. Sync here so observers see operational truth.
-            if active_process.status in ("ready", "running") and deployment.status != "running":
-                deployment.status = "running"
-                await db.commit()
-            outcome = EndpointOutcome.already_active(
-                {
-                    "id": str(deployment.id),
-                    "deployment_slug": deployment.deployment_slug,
-                    "status": active_process.status,
-                    "paper_trading": deployment.paper_trading,
-                    "warm_restart": is_warm_restart,
-                }
-            )
-            if reservation is not None:
-                await idem.commit(reservation.redis_key, body_hash, outcome)
-            return _apply_outcome(outcome)
-
-        # -------------------------------------------------------------
-        # Publish START command on the command bus
-        # -------------------------------------------------------------
-        await bus.publish_start(
-            deployment_id=deployment.id,
-            payload={
-                "deployment_slug": deployment.deployment_slug,
-                "strategy_id": str(request.strategy_id),
-                "strategy_path": strategy.file_path,
-                "config": request.config,
-                "instruments": request.instruments,
-            },
-            idempotency_key=idempotency_key,
-        )
-
-        # Auto-link graduation candidate (if one exists in
-        # ``live_running`` for this strategy) so the audit trail
-        # connects the graduated strategy to its actual deployment.
-        try:
-            from msai.models.graduation_candidate import GraduationCandidate
-
-            candidate = (
-                await db.execute(
-                    select(GraduationCandidate).where(
-                        GraduationCandidate.strategy_id == request.strategy_id,
-                        GraduationCandidate.stage == "live_running",
-                        GraduationCandidate.deployment_id.is_(None),
-                    )
-                )
-            ).scalar_one_or_none()
-            if candidate is not None:
-                candidate.deployment_id = deployment.id
-                await db.commit()
-                log.info(
-                    "graduation_candidate_linked",
-                    extra={
-                        "candidate_id": str(candidate.id),
-                        "deployment_id": str(deployment.id),
-                    },
-                )
-        except Exception:  # noqa: BLE001
-            log.warning("graduation_candidate_link_failed", exc_info=True)
-
-        # Register the new deployment with the projection consumer so
-        # it discovers the Nautilus message bus stream without a restart.
-        try:
-            from msai.main import get_stream_registry
-
-            get_stream_registry().register(
-                deployment_id=deployment.id,
-                deployment_slug=deployment.deployment_slug,
-                stream_name=deployment.message_bus_stream,
-            )
-        except Exception:  # noqa: BLE001
-            log.debug("stream_registry_register_failed")
-
-        # -------------------------------------------------------------
-        # Poll live_node_processes for ready / failed / running
-        # -------------------------------------------------------------
-        row = await _poll_for_terminal(
-            db,
-            deployment.id,
-            ready_statuses=frozenset({"ready", "running"}),
-            terminal_statuses=frozenset({"failed", "stopped"}),
-            timeout_s=START_POLL_TIMEOUT_S,
-            interval_s=START_POLL_INTERVAL_S,
-        )
-
-        if row is None:
-            outcome = EndpointOutcome.api_poll_timeout()
-            if reservation is not None:
-                await idem.release(reservation.redis_key)
-            return _apply_outcome(outcome)
-
-        if row.status in {"ready", "running"}:
-            deployment.status = "running"
-            deployment.last_stopped_at = None
-            await db.commit()
-            await log_audit(
-                db,
-                user_id=user_id,
-                action="live_start",
-                resource_type="live_deployment",
-                resource_id=deployment.id,
-                details={
-                    "instruments": request.instruments,
-                    "paper": request.paper_trading,
-                    "warm_restart": is_warm_restart,
-                },
-            )
-            outcome = EndpointOutcome.ready(
-                {
-                    "id": str(deployment.id),
-                    "deployment_slug": deployment.deployment_slug,
-                    "status": row.status,
-                    "paper_trading": deployment.paper_trading,
-                    "warm_restart": is_warm_restart,
-                }
-            )
-            if reservation is not None:
-                await idem.commit(reservation.redis_key, body_hash, outcome)
-            return _apply_outcome(outcome)
-
-        # Terminal failure branch — classify via FailureKind.
-        kind = FailureKind.parse_or_unknown(row.failure_kind)
-        if kind is FailureKind.HALT_ACTIVE:
-            outcome = EndpointOutcome.halt_active()
-            if reservation is not None:
-                await idem.release(reservation.redis_key)
-            return _apply_outcome(outcome)
-
-        # Codex iter6 P2: SPAWN_FAILED_TRANSIENT means the
-        # supervisor's payload factory raised a transient error
-        # (Postgres briefly down, network timeout). The command is
-        # still in the Redis PEL for XAUTOCLAIM redelivery, so the
-        # endpoint must NOT cache a permanent-looking response. A
-        # subsequent retry with the same Idempotency-Key should be
-        # allowed to re-attempt once the dependency recovers.
-        if kind is FailureKind.SPAWN_FAILED_TRANSIENT:
-            outcome = EndpointOutcome.spawn_failed_transient(
-                row.error_message or "transient supervisor failure"
-            )
-            if reservation is not None:
-                await idem.release(reservation.redis_key)
-            return _apply_outcome(outcome)
-
-        # Map unexpected kinds (NONE on a failed row, or endpoint-only
-        # values the subprocess wouldn't write) to UNKNOWN so the
-        # endpoint doesn't crash.
-        permanent_kinds = {
-            FailureKind.SPAWN_FAILED_PERMANENT,
-            FailureKind.RECONCILIATION_FAILED,
-            FailureKind.BUILD_TIMEOUT,
-            FailureKind.HEARTBEAT_TIMEOUT,
-            FailureKind.UNKNOWN,
-        }
-        if kind not in permanent_kinds:
-            kind = FailureKind.UNKNOWN
-        outcome = EndpointOutcome.permanent_failure(kind, row.error_message or "unknown failure")
-        if reservation is not None:
-            await idem.commit(reservation.redis_key, body_hash, outcome)
-        return _apply_outcome(outcome)
-
-    except Exception:
-        # Hard failure (raised exception) — release the reservation
-        # so the next retry can re-attempt. Re-raise so FastAPI
-        # produces the usual 500 (or the HTTPException the caller
-        # raised, e.g. strategy 404).
-        if reservation is not None:
-            await idem.release(reservation.redis_key)
-        raise
+            }
+        },
+    )
 
 
 @router.post("/start-portfolio")
@@ -804,9 +386,8 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
                 detail=f"Strategies not found: {[str(s) for s in missing]}",
             )
 
-        # Compute code hash for the first member (for the deployment row)
+        # Pick the first member's strategy for the deployment row's strategy_id.
         first_strategy = strategies_by_id[members[0].strategy_id]
-        strategy_code_hash = _resolve_strategy_code_hash(first_strategy)
 
         # Aggregate instruments + config from all members in single pass
         instrument_set: set[str] = set()
