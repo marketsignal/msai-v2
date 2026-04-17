@@ -62,8 +62,11 @@ import httpx
 import typer
 
 from msai.core.config import settings
+from msai.core.database import async_session_factory
 from msai.core.logging import get_logger, setup_logging
 from msai.services.data_ingestion import DataIngestionService
+from msai.services.data_sources.databento_client import DatabentoClient
+from msai.services.nautilus.security_master.service import SecurityMaster
 from msai.services.parquet_store import ParquetStore
 
 setup_logging(settings.environment)
@@ -681,6 +684,111 @@ def system_health() -> None:
         except httpx.RequestError as exc:
             parts[label] = {"error": f"{type(exc).__name__}: {exc}"}
     _emit_json(parts)
+
+
+# ======================================================================
+# instruments sub-app
+# ======================================================================
+
+
+@instruments_app.command("refresh")
+def instruments_refresh(
+    symbols: str = typer.Option(
+        ...,
+        "--symbols",
+        help="Comma-separated symbols (e.g. ``AAPL,ES.Z.5``)",
+    ),
+    provider: str = typer.Option(
+        "databento",
+        "--provider",
+        help=(
+            "Provider to pre-warm: ``databento`` (supported) or "
+            "``interactive_brokers`` (deferred to follow-up PR)."
+        ),
+    ),
+    start: str = typer.Option(
+        "2024-01-01",
+        "--start",
+        help="Definition window start (``YYYY-MM-DD``) — used for ``.Z.N`` fetch",
+    ),
+    end: str = typer.Option(
+        "",
+        "--end",
+        help="Definition window end (``YYYY-MM-DD``) — defaults to today UTC",
+    ),
+    dataset: str = typer.Option(
+        "GLBX.MDP3",
+        "--dataset",
+        help="Databento dataset for ``.Z.N`` cold-miss synthesis",
+    ),
+) -> None:
+    """Pre-warm the instrument registry so later deployments never hit a
+    cold-miss at bar-event time.
+
+    This is the PRD §47-48 pre-warm tool.  Operators run it before
+    deploying a new strategy so:
+
+    * Backtest resolve (:meth:`SecurityMaster.resolve_for_backtest`)
+      succeeds on the ``.Z.N`` continuous-futures path by downloading the
+      Databento ``definition`` payload and upserting the registry row.
+    * Live resolve (:meth:`SecurityMaster.resolve_for_live`) — for
+      ``--provider interactive_brokers`` — is **deferred to a follow-up
+      PR** because the claude-version :class:`Settings` model does not
+      yet expose the fields required to build a short-lived
+      :class:`IBQualifier` (``ib_request_timeout_seconds``,
+      ``ib_instrument_client_id``, dual paper/live port).  Adding those
+      is out-of-scope for the registry PR; the Databento path is the
+      shipping surface.
+    """
+    symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
+    if not symbol_list:
+        _fail("no symbols provided")
+
+    if provider == "interactive_brokers":
+        _fail(
+            "The `--provider interactive_brokers` path is deferred to a "
+            "follow-up PR — IBQualifier construction requires IB settings "
+            "that are not yet on the Settings model (see CLI docstring for "
+            "details).  For now, pre-warm the Databento registry with "
+            "`--provider databento` and run the live deployment — "
+            "SecurityMaster.resolve_for_live will cold-resolve via the "
+            "existing live_instrument_bootstrap path on first start.",
+        )
+
+    if provider != "databento":
+        raise typer.BadParameter(
+            f"unsupported provider {provider!r} — use 'databento' "
+            "(or 'interactive_brokers' once the follow-up PR lands)."
+        )
+
+    # Databento path.
+    api_key = os.environ.get("DATABENTO_API_KEY") or settings.databento_api_key
+    if not api_key:
+        raise typer.BadParameter(
+            "DATABENTO_API_KEY is not set — export the env var (or add it to "
+            "the backend's settings) before running `msai instruments refresh "
+            "--provider databento`.  The command cannot fetch a `.Z.N` "
+            "continuous-futures definition without the API key.",
+        )
+
+    async def _run() -> list[str]:
+        async with async_session_factory() as session:
+            databento_client = DatabentoClient(api_key)
+            security_master = SecurityMaster(
+                qualifier=None,
+                db=session,
+                databento_client=databento_client,
+            )
+            return await security_master.resolve_for_backtest(
+                symbol_list,
+                start=start,
+                end=end or None,
+                dataset=dataset,
+            )
+
+    typer.echo(f"Pre-warming registry for {symbol_list} via Databento...")
+    resolved = asyncio.run(_run())
+    _emit_json({"provider": provider, "resolved": resolved})
 
 
 if __name__ == "__main__":
