@@ -32,7 +32,8 @@ from msai.schemas.backtest import (
     BacktestRunRequest,
     BacktestStatusResponse,
 )
-from msai.services.nautilus.instruments import canonical_instrument_id
+from msai.services.data_sources.databento_client import DatabentoClient
+from msai.services.nautilus.security_master.service import SecurityMaster
 
 log = get_logger(__name__)
 
@@ -78,16 +79,32 @@ async def run_backtest(
     # caller's dict is not mutated downstream.
     worker_config = dict(body.config)
 
-    # Phase 2 task 2.9: normalize every instrument the caller supplied
-    # to its canonical form BEFORE storing the backtest row. Callers
-    # can pass shorthand (``"AAPL"`` → ``"AAPL.NASDAQ"``) or
-    # already-canonical IDs (``"ESM5.XCME"`` stays as-is because the
-    # ``.`` is already present). Doing the conversion here means
-    # ``backtests.instruments`` is ALWAYS canonical, the worker reads
-    # canonical-only, and the backtest_runner's
-    # ``_extract_venues_from_instrument_ids`` helper sees consistent
-    # venue suffixes for its BacktestVenueConfig list.
-    canonical_instruments = [canonical_instrument_id(s) for s in body.instruments]
+    # v3.0 (Task 11) — resolve every instrument the caller supplied
+    # through the DB-backed registry BEFORE storing the backtest row.
+    # ``SecurityMaster.resolve_for_backtest`` is fail-loud on a warm-
+    # path miss (``DatabentoDefinitionMissing`` — operator must run
+    # ``msai instruments refresh`` first) with a single exception: the
+    # ``<root>.Z.<N>`` continuous-futures synthesis path calls Databento
+    # on cold-miss. The qualifier is ``None`` because backtest
+    # resolution never needs an IB round-trip. The Databento client
+    # follows the existing pattern used at
+    # ``workers/nightly_ingest.py`` and ``services/data_ingestion.py``
+    # (None when the API key is unset — the resolver will raise a
+    # ``ValueError`` with a clear message on the ``.Z.N`` cold-miss
+    # path, which is what we want).
+    databento_client = (
+        DatabentoClient(settings.databento_api_key) if settings.databento_api_key else None
+    )
+    security_master = SecurityMaster(
+        qualifier=None,
+        db=db,
+        databento_client=databento_client,
+    )
+    canonical_instruments = await security_master.resolve_for_backtest(
+        body.instruments,
+        start=body.start_date.isoformat(),
+        end=body.end_date.isoformat(),
+    )
 
     # Create the backtest record
     backtest = Backtest(
