@@ -27,9 +27,9 @@ from msai.core.logging import get_logger
 from msai.models.live_deployment import LiveDeployment
 from msai.models.live_deployment_strategy import LiveDeploymentStrategy
 from msai.models.live_node_process import LiveNodeProcess
-from msai.models.strategy import Strategy
 from msai.models.live_portfolio_revision import LivePortfolioRevision
 from msai.models.live_portfolio_revision_strategy import LivePortfolioRevisionStrategy
+from msai.models.strategy import Strategy
 from msai.schemas.live import (
     LiveDeploymentInfo,
     LiveDeploymentStatusResponse,

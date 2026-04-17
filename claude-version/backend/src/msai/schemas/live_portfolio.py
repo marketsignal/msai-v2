@@ -8,10 +8,10 @@ Separate from ``schemas/portfolio.py`` which serves the backtest-portfolio
 
 from __future__ import annotations
 
-from datetime import datetime
-from decimal import Decimal
+from datetime import datetime  # noqa: TC003 — Pydantic resolves at runtime
+from decimal import Decimal  # noqa: TC003 — Pydantic resolves at runtime
 from typing import Any
-from uuid import UUID
+from uuid import UUID  # noqa: TC003 — Pydantic resolves at runtime
 
 from pydantic import BaseModel, ConfigDict, Field
 
