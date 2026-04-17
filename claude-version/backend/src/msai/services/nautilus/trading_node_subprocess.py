@@ -89,6 +89,33 @@ log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class StrategyMemberPayload:
+    """One strategy within a portfolio deployment.
+
+    Carries the per-strategy fields that
+    :func:`build_portfolio_trading_node_config` needs to construct an
+    :class:`ImportableStrategyConfig` for each member. All fields are
+    primitives / builtins so the payload remains picklable under the
+    ``mp.Process`` spawn context.
+    """
+
+    strategy_id: UUID
+    strategy_path: str
+    strategy_config_path: str
+    strategy_config: dict[str, Any] = field(default_factory=dict)
+    strategy_code_hash: str = ""
+    strategy_id_full: str = ""
+    """Globally unique strategy identity string (``<strategy_id>@<deployment_slug>``).
+    Threaded into the ``ImportableStrategyConfig.config["order_id_tag"]``
+    so the audit hook can correlate orders to individual strategies
+    within a portfolio deployment."""
+    instruments: list[str] = field(default_factory=list)
+    """Paper symbols this strategy subscribes to (e.g. ``["AAPL", "MSFT"]``).
+    Aggregated across all members to build the single
+    InstrumentProviderConfig for the TradingNode."""
+
+
+@dataclass(frozen=True)
 class TradingNodePayload:
     """Everything a live trading subprocess needs to do its job.
 
@@ -146,6 +173,28 @@ class TradingNodePayload:
     skips the handler construction."""
 
     startup_health_timeout_s: float = 60.0
+
+    strategy_members: list[StrategyMemberPayload] = field(default_factory=list)
+    """Per-strategy payloads for a portfolio deployment. When non-empty,
+    :func:`_build_real_node` uses :func:`build_portfolio_trading_node_config`
+    instead of the single-strategy builder. The legacy single-strategy fields
+    (``strategy_path``, ``strategy_config_path``, ``strategy_config``,
+    ``paper_symbols``) are still populated for back-compat and supervisor
+    audit, but the multi-strategy config builder reads from here."""
+
+    @property
+    def all_instruments(self) -> list[str]:
+        """De-duplicated, sorted union of instruments across all strategy members.
+
+        Returns an empty list when ``strategy_members`` is empty (legacy
+        single-strategy path — the caller uses ``paper_symbols`` instead).
+        """
+        if not self.strategy_members:
+            return []
+        seen: set[str] = set()
+        for member in self.strategy_members:
+            seen.update(member.instruments)
+        return sorted(seen)
 
 
 # ---------------------------------------------------------------------------
