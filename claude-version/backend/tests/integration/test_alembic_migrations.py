@@ -875,3 +875,477 @@ async def test_o3_portfolio_schema_roundtrip(isolated_postgres_url: str) -> None
         await engine.dispose()
 
     _run_alembic(isolated_postgres_url, "upgrade", "head")
+
+
+# ---------------------------------------------------------------------------
+# PR#2 Task 10 — backfill legacy deployments as single-strategy portfolios
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def isolated_postgres_url_backfill_portfolios() -> Iterator[str]:
+    """Dedicated container for the portfolio backfill migration test."""
+    from testcontainers.postgres import PostgresContainer
+
+    with PostgresContainer("postgres:16-alpine") as pg:
+        yield pg.get_connection_url().replace("psycopg2", "asyncpg")
+
+
+@pytest.mark.asyncio
+async def test_backfill_creates_portfolio_for_legacy_deployment(
+    isolated_postgres_url_backfill_portfolios: str,
+) -> None:
+    """PR#2 Task 10: ``alembic upgrade head`` wraps each legacy deployment
+    (``portfolio_revision_id IS NULL``) into a synthetic single-strategy
+    portfolio with a frozen revision, a member row, and a deployment-strategy
+    bridge row.
+
+    Strategy:
+    1. Upgrade to q5l6m7n8o9p0 (schema has portfolio tables + nullable FK).
+    2. Insert a user, strategy, and deployment with no portfolio_revision_id.
+    3. Upgrade to head (runs r6m7n8o9p0q1 backfill).
+    4. Verify: portfolio, revision, member, deployment_strategy all created;
+       deployment.portfolio_revision_id is set.
+    """
+    from uuid import uuid4
+
+    # Step 1: upgrade to the revision just before the backfill
+    _run_alembic_upgrade(
+        isolated_postgres_url_backfill_portfolios,
+        target="q5l6m7n8o9p0",
+    )
+
+    # Step 2: insert pre-existing data
+    engine = create_async_engine(isolated_postgres_url_backfill_portfolios)
+    user_id = uuid4()
+    strategy_id = uuid4()
+    deployment_id = uuid4()
+    slug = "abcdef0123456789"
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO users (id, entra_id, email, role, created_at, updated_at) "
+                    "VALUES (:id, :entra, :email, 'operator', NOW(), NOW())"
+                ),
+                {
+                    "id": user_id,
+                    "entra": f"bf-{user_id.hex}",
+                    "email": f"bf-{user_id.hex}@example.com",
+                },
+            )
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO strategies ("
+                    "  id, name, file_path, strategy_class, created_by,"
+                    "  created_at, updated_at"
+                    ") VALUES ("
+                    "  :id, :name, :fp, :cls, :uid, NOW(), NOW()"
+                    ")"
+                ),
+                {
+                    "id": strategy_id,
+                    "name": "backfill-portfolio-test",
+                    "fp": "strategies/bf.py",
+                    "cls": "BfStrategy",
+                    "uid": user_id,
+                },
+            )
+            # Insert deployment with all identity columns but NO portfolio_revision_id
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO live_deployments ("
+                    "  id, strategy_id, strategy_code_hash, config, instruments,"
+                    "  status, paper_trading, started_by, created_at,"
+                    "  deployment_slug, identity_signature, trader_id,"
+                    "  strategy_id_full, account_id, message_bus_stream,"
+                    "  config_hash, instruments_signature"
+                    ") VALUES ("
+                    "  :id, :sid, :hash, CAST(:cfg AS JSONB),"
+                    "  CAST(:instr AS VARCHAR[]),"
+                    "  'stopped', true, :uid, NOW(),"
+                    "  :slug, :sig, :tid,"
+                    "  :sidf, :acct, :mbs,"
+                    "  :cfgh, :isig"
+                    ")"
+                ),
+                {
+                    "id": deployment_id,
+                    "sid": strategy_id,
+                    "hash": "deadbeef" * 8,
+                    "cfg": '{"fast": 10, "slow": 20}',
+                    "instr": ["AAPL.NASDAQ", "MSFT.NASDAQ"],
+                    "slug": slug,
+                    "sig": "a" * 64,
+                    "tid": f"MSAI-{slug}",
+                    "sidf": f"BfStrategy-{slug}",
+                    "acct": "DU0000000",
+                    "mbs": f"trader-MSAI-{slug}-stream",
+                    "cfgh": "b" * 64,
+                    "isig": "AAPL.NASDAQ,MSFT.NASDAQ",
+                    "uid": user_id,
+                },
+            )
+    finally:
+        await engine.dispose()
+
+    # Step 3: upgrade to head — runs the backfill migration
+    _run_alembic_upgrade(isolated_postgres_url_backfill_portfolios)
+
+    # Step 4: verify the backfill created all expected rows
+    engine = create_async_engine(isolated_postgres_url_backfill_portfolios)
+    try:
+        async with engine.connect() as conn:
+            # Check deployment now has portfolio_revision_id set
+            dep_row = (
+                await conn.execute(
+                    sa.text(
+                        "SELECT portfolio_revision_id "
+                        "FROM live_deployments WHERE id = :id"
+                    ),
+                    {"id": deployment_id},
+                )
+            ).one()
+            assert dep_row.portfolio_revision_id is not None
+
+            revision_id = dep_row.portfolio_revision_id
+
+            # Check the portfolio was created
+            portfolio_row = (
+                await conn.execute(
+                    sa.text(
+                        "SELECT lp.id, lp.name FROM live_portfolios lp "
+                        "JOIN live_portfolio_revisions lpr ON lpr.portfolio_id = lp.id "
+                        "WHERE lpr.id = :rid"
+                    ),
+                    {"rid": revision_id},
+                )
+            ).one()
+            assert portfolio_row.name == f"Legacy-{slug}"
+
+            # Check the revision
+            rev_row = (
+                await conn.execute(
+                    sa.text(
+                        "SELECT revision_number, is_frozen, composition_hash "
+                        "FROM live_portfolio_revisions WHERE id = :rid"
+                    ),
+                    {"rid": revision_id},
+                )
+            ).one()
+            assert rev_row.revision_number == 1
+            assert rev_row.is_frozen is True
+            assert rev_row.composition_hash is not None
+            assert len(rev_row.composition_hash) == 64
+
+            # Check the revision strategy member
+            member_row = (
+                await conn.execute(
+                    sa.text(
+                        "SELECT strategy_id, config, instruments, weight, order_index "
+                        "FROM live_portfolio_revision_strategies WHERE revision_id = :rid"
+                    ),
+                    {"rid": revision_id},
+                )
+            ).one()
+            assert member_row.strategy_id == strategy_id
+            assert member_row.config == {"fast": 10, "slow": 20}
+            assert sorted(member_row.instruments) == ["AAPL.NASDAQ", "MSFT.NASDAQ"]
+            assert float(member_row.weight) == 1.0
+            assert member_row.order_index == 0
+
+            # Check the deployment strategy bridge row
+            ds_row = (
+                await conn.execute(
+                    sa.text(
+                        "SELECT deployment_id, strategy_id_full "
+                        "FROM live_deployment_strategies "
+                        "WHERE deployment_id = :did"
+                    ),
+                    {"did": deployment_id},
+                )
+            ).one()
+            assert ds_row.strategy_id_full == f"BfStrategy-{slug}"
+    finally:
+        await engine.dispose()
+
+
+@pytest.fixture(scope="module")
+def isolated_postgres_url_backfill_idempotent() -> Iterator[str]:
+    """Dedicated container for the backfill idempotency test."""
+    from testcontainers.postgres import PostgresContainer
+
+    with PostgresContainer("postgres:16-alpine") as pg:
+        yield pg.get_connection_url().replace("psycopg2", "asyncpg")
+
+
+@pytest.mark.asyncio
+async def test_backfill_is_idempotent_skips_already_set(
+    isolated_postgres_url_backfill_idempotent: str,
+) -> None:
+    """The backfill skips deployments that already have portfolio_revision_id
+    set (e.g. deployments created via the new /live/start-portfolio endpoint
+    after the portfolio tables were added but before the backfill ran).
+    An empty live_deployments table is also a no-op.
+    """
+    # Upgrade all the way — the backfill runs on an empty table (no-op)
+    _run_alembic_upgrade(isolated_postgres_url_backfill_idempotent)
+
+    engine = create_async_engine(isolated_postgres_url_backfill_idempotent)
+    try:
+        async with engine.connect() as conn:
+            # No Legacy-* portfolios should have been created
+            count = (
+                await conn.execute(
+                    sa.text(
+                        "SELECT COUNT(*) FROM live_portfolios WHERE name LIKE 'Legacy-%'"
+                    )
+                )
+            ).scalar_one()
+            assert count == 0
+    finally:
+        await engine.dispose()
+
+
+@pytest.fixture(scope="module")
+def isolated_postgres_url_backfill_downgrade() -> Iterator[str]:
+    """Dedicated container for the backfill downgrade test."""
+    from testcontainers.postgres import PostgresContainer
+
+    with PostgresContainer("postgres:16-alpine") as pg:
+        yield pg.get_connection_url().replace("psycopg2", "asyncpg")
+
+
+@pytest.mark.asyncio
+async def test_backfill_downgrade_removes_legacy_portfolios(
+    isolated_postgres_url_backfill_downgrade: str,
+) -> None:
+    """Downgrading the backfill migration removes the synthetic Legacy-*
+    portfolios and nulls out portfolio_revision_id on deployments.
+    """
+    from uuid import uuid4
+
+    # Step 1: upgrade to just before the backfill
+    _run_alembic_upgrade(
+        isolated_postgres_url_backfill_downgrade,
+        target="q5l6m7n8o9p0",
+    )
+
+    # Step 2: insert a legacy deployment
+    engine = create_async_engine(isolated_postgres_url_backfill_downgrade)
+    user_id = uuid4()
+    strategy_id = uuid4()
+    deployment_id = uuid4()
+    slug = "fedcba9876543210"
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO users (id, entra_id, email, role, created_at, updated_at) "
+                    "VALUES (:id, :entra, :email, 'operator', NOW(), NOW())"
+                ),
+                {
+                    "id": user_id,
+                    "entra": f"dg-{user_id.hex}",
+                    "email": f"dg-{user_id.hex}@example.com",
+                },
+            )
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO strategies ("
+                    "  id, name, file_path, strategy_class, created_by,"
+                    "  created_at, updated_at"
+                    ") VALUES ("
+                    "  :id, :name, :fp, :cls, :uid, NOW(), NOW()"
+                    ")"
+                ),
+                {
+                    "id": strategy_id,
+                    "name": "downgrade-test",
+                    "fp": "strategies/dg.py",
+                    "cls": "DgStrategy",
+                    "uid": user_id,
+                },
+            )
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO live_deployments ("
+                    "  id, strategy_id, strategy_code_hash, config, instruments,"
+                    "  status, paper_trading, started_by, created_at,"
+                    "  deployment_slug, identity_signature, trader_id,"
+                    "  strategy_id_full, account_id, message_bus_stream,"
+                    "  config_hash, instruments_signature"
+                    ") VALUES ("
+                    "  :id, :sid, :hash, CAST(:cfg AS JSONB),"
+                    "  CAST(:instr AS VARCHAR[]),"
+                    "  'stopped', true, :uid, NOW(),"
+                    "  :slug, :sig, :tid,"
+                    "  :sidf, :acct, :mbs,"
+                    "  :cfgh, :isig"
+                    ")"
+                ),
+                {
+                    "id": deployment_id,
+                    "sid": strategy_id,
+                    "hash": "deadbeef" * 8,
+                    "cfg": '{"x": 1}',
+                    "instr": ["SPY.ARCA"],
+                    "slug": slug,
+                    "sig": "c" * 64,
+                    "tid": f"MSAI-{slug}",
+                    "sidf": f"DgStrategy-{slug}",
+                    "acct": "DU1111111",
+                    "mbs": f"trader-MSAI-{slug}-stream",
+                    "cfgh": "d" * 64,
+                    "isig": "SPY.ARCA",
+                    "uid": user_id,
+                },
+            )
+    finally:
+        await engine.dispose()
+
+    # Step 3: upgrade to head (backfill runs)
+    _run_alembic_upgrade(isolated_postgres_url_backfill_downgrade)
+
+    # Verify backfill happened
+    engine = create_async_engine(isolated_postgres_url_backfill_downgrade)
+    try:
+        async with engine.connect() as conn:
+            count = (
+                await conn.execute(
+                    sa.text("SELECT COUNT(*) FROM live_portfolios WHERE name LIKE 'Legacy-%'")
+                )
+            ).scalar_one()
+            assert count == 1
+    finally:
+        await engine.dispose()
+
+    # Step 4: downgrade back to q5l6m7n8o9p0 (removes the backfill)
+    _run_alembic(
+        isolated_postgres_url_backfill_downgrade,
+        "downgrade",
+        "q5l6m7n8o9p0",
+    )
+
+    # Step 5: verify the downgrade cleaned up
+    engine = create_async_engine(isolated_postgres_url_backfill_downgrade)
+    try:
+        async with engine.connect() as conn:
+            # No Legacy-* portfolios
+            count = (
+                await conn.execute(
+                    sa.text("SELECT COUNT(*) FROM live_portfolios WHERE name LIKE 'Legacy-%'")
+                )
+            ).scalar_one()
+            assert count == 0
+
+            # Deployment's portfolio_revision_id is NULL again
+            dep_row = (
+                await conn.execute(
+                    sa.text(
+                        "SELECT portfolio_revision_id FROM live_deployments WHERE id = :id"
+                    ),
+                    {"id": deployment_id},
+                )
+            ).one()
+            assert dep_row.portfolio_revision_id is None
+
+            # No deployment_strategies for this deployment
+            ds_count = (
+                await conn.execute(
+                    sa.text(
+                        "SELECT COUNT(*) FROM live_deployment_strategies "
+                        "WHERE deployment_id = :did"
+                    ),
+                    {"did": deployment_id},
+                )
+            ).scalar_one()
+            assert ds_count == 0
+    finally:
+        await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# PR#2 Task 11 — drop legacy columns, enforce portfolio_revision_id NOT NULL
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def isolated_postgres_url_drop_legacy() -> Iterator[str]:
+    """Dedicated container for the Task 11 drop-legacy-columns test."""
+    from testcontainers.postgres import PostgresContainer
+
+    with PostgresContainer("postgres:16-alpine") as pg:
+        yield pg.get_connection_url().replace("psycopg2", "asyncpg")
+
+
+@pytest.mark.asyncio
+async def test_migration_drops_legacy_columns_keeps_identity(
+    isolated_postgres_url_drop_legacy: str,
+) -> None:
+    """PR#2 Task 11: after ``alembic upgrade head`` (which includes the
+    s7n8o9p0q1r2 migration), the 5 legacy per-strategy columns are gone,
+    ``identity_signature`` is kept (P0-2 fix), ``portfolio_revision_id``
+    is NOT NULL, ``strategy_id`` is nullable, and the new composite
+    unique constraint ``uq_live_deployments_revision_account`` exists.
+    """
+    _run_alembic_upgrade(isolated_postgres_url_drop_legacy)
+
+    engine = create_async_engine(isolated_postgres_url_drop_legacy)
+    try:
+        async with engine.connect() as conn:
+
+            def _inspect(sync_conn: object) -> dict:
+                insp = inspect(sync_conn)
+                columns = {c["name"]: c for c in insp.get_columns("live_deployments")}
+                indexes = {idx["name"]: idx for idx in insp.get_indexes("live_deployments")}
+                unique_constraints = {
+                    uc["name"]: uc
+                    for uc in insp.get_unique_constraints("live_deployments")
+                }
+                return {
+                    "columns": columns,
+                    "indexes": indexes,
+                    "unique_constraints": unique_constraints,
+                }
+
+            shape = await conn.run_sync(_inspect)
+    finally:
+        await engine.dispose()
+
+    columns = shape["columns"]
+    col_names = set(columns)
+
+    # P0-2: identity_signature MUST be kept
+    assert "identity_signature" in col_names, (
+        "identity_signature was dropped but must be kept — upsert target depends on it"
+    )
+
+    # Dropped columns must be gone
+    assert "config_hash" not in col_names, "config_hash should have been dropped"
+    assert "instruments" not in col_names, "instruments should have been dropped"
+    assert "instruments_signature" not in col_names, (
+        "instruments_signature should have been dropped"
+    )
+    assert "strategy_code_hash" not in col_names, (
+        "strategy_code_hash should have been dropped"
+    )
+    assert "config" not in col_names, "config should have been dropped"
+
+    # portfolio_revision_id must be NOT NULL
+    assert columns["portfolio_revision_id"]["nullable"] is False, (
+        "portfolio_revision_id should be NOT NULL after Task 11 migration"
+    )
+
+    # strategy_id must be nullable
+    assert columns["strategy_id"]["nullable"] is True, (
+        "strategy_id should be nullable after Task 11 migration"
+    )
+
+    # The composite unique constraint must exist
+    unique_constraints = shape["unique_constraints"]
+    assert "uq_live_deployments_revision_account" in unique_constraints, (
+        f"missing uq_live_deployments_revision_account; got {sorted(unique_constraints)}"
+    )
+    uc = unique_constraints["uq_live_deployments_revision_account"]
+    assert set(uc["column_names"]) == {"portfolio_revision_id", "account_id"}
