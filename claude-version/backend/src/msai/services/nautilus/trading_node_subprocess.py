@@ -1240,6 +1240,17 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
             _cache = node.kernel.cache  # for fetching full order details
             _loop = _aio.get_running_loop()
 
+            _strategy_id_lookup: dict[str, UUID] = {
+                m.strategy_id_full: m.strategy_id for m in p.strategy_members
+            } if p.strategy_members else {}
+
+            def _resolve_strategy_id(event: Any) -> UUID:
+                if _strategy_id_lookup:
+                    nautilus_sid = str(getattr(event, "strategy_id", ""))
+                    if nautilus_sid in _strategy_id_lookup:
+                        return _strategy_id_lookup[nautilus_sid]
+                return p.strategy_id or p.deployment_id
+
             def _on_order_event_sync(event: Any) -> None:
                 """Sync handler bridging to async audit writer.
 
@@ -1266,7 +1277,7 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
                             await writer.write_submitted(
                                 OrderSubmittedFacts(
                                     client_order_id=str(event.client_order_id),
-                                    strategy_id=p.strategy_id or p.deployment_id,
+                                    strategy_id=_resolve_strategy_id(event),
                                     strategy_code_hash=p.strategy_code_hash or "engine-audit",
                                     instrument_id=_instrument,
                                     side=_side,
@@ -1339,7 +1350,7 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
                                         broker_trade_id=str(event.trade_id),
                                         client_order_id=str(event.client_order_id),
                                         deployment_id=p.deployment_id,
-                                        strategy_id=p.strategy_id or p.deployment_id,
+                                        strategy_id=_resolve_strategy_id(event),
                                         strategy_code_hash=p.strategy_code_hash or "engine-audit",
                                         instrument=str(event.instrument_id),
                                         side=_order_side,

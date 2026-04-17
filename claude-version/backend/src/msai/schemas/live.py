@@ -125,6 +125,31 @@ class LiveResumeResponse(BaseModel):
     resumed: bool
 
 
+class StrategyMemberInfo(BaseModel):
+    """Per-strategy member detail within a portfolio deployment."""
+
+    strategy_id: UUID
+    strategy_id_full: str
+    instruments: list[str]
+    weight: str
+
+    model_config = {"from_attributes": True}
+
+
+class PortfolioDeploymentInfo(BaseModel):
+    """Summary of a portfolio-based deployment with per-member detail."""
+
+    id: UUID
+    portfolio_revision_id: UUID | None = None
+    account_id: str
+    status: str
+    paper_trading: bool
+    deployment_slug: str
+    members: list[StrategyMemberInfo] = []
+
+    model_config = {"from_attributes": True}
+
+
 class LivePositionsResponse(BaseModel):
     """Response schema for current open positions."""
 
