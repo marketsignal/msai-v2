@@ -178,8 +178,17 @@ class ProcessManager:
         deployment_slug: str,
         payload: dict[str, Any],
         idempotency_key: str,  # noqa: ARG002 — reserved for Task 1.14 dedupe path
+        gateway_session_key: str | None = None,
     ) -> bool:
         """Spawn a new trading subprocess.
+
+        Args:
+            gateway_session_key: When provided, the concurrent-startup
+                guard in phase A only blocks spawns targeting the SAME
+                gateway session (same IB login). Deployments on different
+                gateways can start concurrently. When ``None`` (legacy),
+                the guard is global — any other starting deployment
+                blocks this one (backward compatible).
 
         Returns:
             ``True`` on success or idempotent no-op — caller ACKs the
@@ -189,6 +198,7 @@ class ProcessManager:
         row_id = await self._phase_a_reserve_slot(
             deployment_id=deployment_id,
             deployment_slug=deployment_slug,
+            gateway_session_key=gateway_session_key,
         )
         if row_id is None:
             # Phase A returned None → either hard failure (no
@@ -309,8 +319,7 @@ class ProcessManager:
                         "deployment_slug": deployment_slug,
                         "exception_type": type(exc).__name__,
                         "note": (
-                            "treating as transient — command stays in PEL "
-                            "for XAUTOCLAIM retry"
+                            "treating as transient — command stays in PEL for XAUTOCLAIM retry"
                         ),
                     },
                 )
@@ -416,6 +425,7 @@ class ProcessManager:
 
         self.handles[deployment_id] = process
         from msai.services.observability.trading_metrics import DEPLOYMENTS_STARTED
+
         DEPLOYMENTS_STARTED.inc()
 
         # Phase C: record the real pid on the row.
@@ -443,9 +453,18 @@ class ProcessManager:
         *,
         deployment_id: UUID,
         deployment_slug: str,
+        gateway_session_key: str | None = None,
     ) -> UUID | _PhaseAOutcome:
         """Run phase A in a single transaction. Return the new row id,
-        or one of the :class:`_PhaseAOutcome` sentinels."""
+        or one of the :class:`_PhaseAOutcome` sentinels.
+
+        Args:
+            gateway_session_key: When provided, the concurrent-startup
+                guard only blocks spawns on the SAME gateway session.
+                When ``None``, the guard is global (backward compat).
+                Also persisted on the ``LiveNodeProcess`` row so the
+                guard can query it on subsequent spawns.
+        """
         async with self._db() as session, session.begin():
             deployment = (
                 await session.execute(
@@ -460,6 +479,13 @@ class ProcessManager:
                     extra={"deployment_slug": deployment_slug},
                 )
                 return _PhaseAOutcome.NO_DEPLOYMENT
+
+            # Compute effective gateway_session_key: caller override
+            # takes precedence, then fall back to the deployment's
+            # ib_login_key, then "default" (single-gateway legacy).
+            effective_gw_key = (
+                gateway_session_key or getattr(deployment, "ib_login_key", None) or "default"
+            )
 
             existing = (
                 await session.execute(
@@ -497,20 +523,30 @@ class ProcessManager:
             # / ``building`` / ``ready``), IB Gateway disconnects the
             # first subprocess's clients mid-startup and both fall into
             # ``startup_health_check_failed``. Serialize spawns at the
-            # supervisor: if any OTHER deployment is still initializing,
-            # reject fast with ``CONCURRENT_STARTUP`` so the operator
-            # retries once the first is ``running``. Rows already in
-            # ``running`` state don't block — once a subprocess has
-            # completed reconciliation its connections are stable.
-            other_starting = (
-                await session.execute(
-                    select(LiveNodeProcess).where(
-                        LiveNodeProcess.deployment_id != deployment_id,
-                        LiveNodeProcess.status.in_(
-                            ("starting", "building", "ready"),
-                        ),
-                    )
+            # supervisor: if any OTHER deployment is still initializing
+            # ON THE SAME GATEWAY, reject fast with
+            # ``CONCURRENT_STARTUP`` so the operator retries once the
+            # first is ``running``. Rows already in ``running`` state
+            # don't block — once a subprocess has completed
+            # reconciliation its connections are stable.
+            #
+            # PR#3 enhancement: when ``gateway_session_key`` is provided,
+            # only block spawns targeting the SAME gateway session. Two
+            # deployments on DIFFERENT gateways (different IB logins)
+            # can now start concurrently — this is the core enabler for
+            # multi-login topologies.
+            startup_filters = [
+                LiveNodeProcess.deployment_id != deployment_id,
+                LiveNodeProcess.status.in_(
+                    ("starting", "building", "ready"),
+                ),
+            ]
+            if gateway_session_key is not None:
+                startup_filters.append(
+                    LiveNodeProcess.gateway_session_key == gateway_session_key,
                 )
+            other_starting = (
+                await session.execute(select(LiveNodeProcess).where(*startup_filters))
             ).scalar_one_or_none()
             if other_starting is not None:
                 log.warning(
@@ -519,17 +555,20 @@ class ProcessManager:
                         "deployment_id": str(deployment_id),
                         "other_deployment_id": str(other_starting.deployment_id),
                         "other_status": other_starting.status,
+                        "gateway_session_key": gateway_session_key,
                     },
                 )
                 return _PhaseAOutcome.CONCURRENT_STARTUP
 
+            now = datetime.now(UTC)
             row = LiveNodeProcess(
                 deployment_id=deployment_id,
                 pid=None,
                 host=socket.gethostname(),
-                started_at=datetime.now(UTC),
-                last_heartbeat_at=datetime.now(UTC),
+                started_at=now,
+                last_heartbeat_at=now,
                 status="starting",
+                gateway_session_key=effective_gw_key,
             )
             session.add(row)
             try:
@@ -559,14 +598,14 @@ class ProcessManager:
         outcomes.
         """
         from msai.services.observability.trading_metrics import DEPLOYMENTS_FAILED
+
         DEPLOYMENTS_FAILED.inc()
 
         # Best-effort email alert for spawn failures.
         try:
             from msai.services.alerting import AlertService
-            await AlertService().alert_strategy_error(
-                strategy_name=str(row_id), error=reason
-            )
+
+            await AlertService().alert_strategy_error(strategy_name=str(row_id), error=reason)
         except Exception:  # noqa: BLE001
             pass
 
@@ -936,6 +975,7 @@ class ProcessManager:
             os.kill(pid, signal.SIGTERM)
 
         from msai.services.observability.trading_metrics import DEPLOYMENTS_STOPPED
+
         DEPLOYMENTS_STOPPED.inc()
 
         return True

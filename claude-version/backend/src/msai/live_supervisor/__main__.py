@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 from typing import Any
@@ -47,6 +48,7 @@ from msai.live_supervisor.main import run_forever
 from msai.live_supervisor.process_manager import ProcessManager
 from msai.models import LiveDeployment, LivePortfolioRevisionStrategy, Strategy
 from msai.services.live.deployment_identity import derive_strategy_id_full
+from msai.services.live.gateway_router import GatewayRouter
 from msai.services.live_command_bus import LiveCommandBus
 from msai.services.nautilus.live_instrument_bootstrap import (
     canonical_instrument_id,
@@ -65,6 +67,7 @@ log = logging.getLogger(__name__)
 
 def _build_production_payload_factory(
     session_factory: async_sessionmaker[AsyncSession],
+    gateway_router: GatewayRouter | None = None,
 ) -> Any:
     """Closure factory so the returned callable captures the
     session factory without needing a class wrapper. The returned
@@ -84,6 +87,12 @@ def _build_production_payload_factory(
     to ``127.0.0.1`` and ``ib_port`` to ``4002`` (paper) — the
     operator overrides these via env vars if running against a
     non-default IB Gateway.
+
+    When a :class:`GatewayRouter` is provided and the deployment has
+    an ``ib_login_key``, the factory resolves the IB host/port from
+    the router instead of using the process-wide settings. This
+    enables multi-login topologies where each IB login connects to a
+    dedicated gateway container.
 
     Raises are propagated so :meth:`ProcessManager.spawn` can mark
     the row as ``SPAWN_FAILED_PERMANENT``.
@@ -187,6 +196,18 @@ def _build_production_payload_factory(
                     f"account_id='{deployment_account}' starts with a paper prefix. "
                     f"Live deployments require non-paper account IDs."
                 )
+
+            # ---------------------------------------------------------
+            # Resolve IB host/port: multi-login GatewayRouter or
+            # fall back to process-wide settings.
+            # ---------------------------------------------------------
+            if deployment.ib_login_key and gateway_router and gateway_router.is_multi_login:
+                endpoint = gateway_router.resolve(deployment.ib_login_key)
+                ib_host = endpoint.host
+                ib_port = endpoint.port
+            else:
+                ib_host = settings.ib_host
+                ib_port = settings.ib_port
 
             # ---------------------------------------------------------
             # Branch: portfolio-based vs single-strategy deployment
@@ -347,8 +368,8 @@ def _build_production_payload_factory(
                     paper_symbols=paper_symbols,
                     canonical_instruments=canonical_instrument_ids,
                     spawn_today_iso=spawn_today.isoformat(),
-                    ib_host=settings.ib_host,
-                    ib_port=settings.ib_port,
+                    ib_host=ib_host,
+                    ib_port=ib_port,
                     ib_account_id=deployment_account,
                     database_url=settings.database_url,
                     redis_url=settings.redis_url,
@@ -363,10 +384,11 @@ def _build_production_payload_factory(
                         "portfolio_revision_id": str(deployment.portfolio_revision_id),
                         "member_count": len(strategy_members),
                         "paper_symbols": paper_symbols,
-                        "ib_host": settings.ib_host,
-                        "ib_port": settings.ib_port,
+                        "ib_host": ib_host,
+                        "ib_port": ib_port,
                         "account_id": deployment_account,
                         "paper_trading": deployment.paper_trading,
+                        "ib_login_key": deployment.ib_login_key,
                     },
                 )
 
@@ -426,12 +448,25 @@ async def _async_main() -> int:
         settings.redis_url, decode_responses=True
     )
 
+    gateway_config = os.environ.get("GATEWAY_CONFIG")
+    gateway_router = GatewayRouter(gateway_config) if gateway_config else None
+    if gateway_router and gateway_router.is_multi_login:
+        logger.info(
+            "gateway_router_initialized",
+            extra={
+                "login_keys": gateway_router.login_keys,
+                "config": gateway_config,
+            },
+        )
+
     bus = LiveCommandBus(redis=redis_client)
     process_manager = ProcessManager(
         db=session_factory,
         redis=redis_client,
         spawn_target=_trading_node_subprocess,
-        payload_factory=_build_production_payload_factory(session_factory),
+        payload_factory=_build_production_payload_factory(
+            session_factory, gateway_router=gateway_router
+        ),
     )
     heartbeat_monitor = HeartbeatMonitor(db=session_factory)
 

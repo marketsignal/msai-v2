@@ -68,6 +68,11 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
 
   redis:
     image: redis:7-alpine
@@ -79,6 +84,11 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
 
   # ---------------------------------------------------------------------------
   # Backend API
@@ -115,6 +125,11 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
 
   # ---------------------------------------------------------------------------
   # Workers (arq job queues)
@@ -202,11 +217,17 @@ services:
       IB_MARKET_DATA_TYPE: ${IB_MARKET_DATA_TYPE:-REALTIME}
       TWS_USERID: ${TWS_USERID:?Set TWS_USERID in .env}
       TWS_PASSWORD: ${TWS_PASSWORD:?Set TWS_PASSWORD in .env}
+      GATEWAY_CONFIG: ${GATEWAY_CONFIG:-}
     depends_on:
       <<: *worker-depends
       ib-gateway:
         condition: service_healthy
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
 
   ib-gateway:
     profiles: ["broker"]
@@ -246,6 +267,11 @@ services:
       - "127.0.0.1:5900:5900"
     volumes:
       - ./data/ib-gateway:/home/ibgateway/tws_settings
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
     healthcheck:
       test: ["CMD-SHELL", "timeout 2 bash -lc ': >/dev/tcp/127.0.0.1/4002' || timeout 2 bash -lc ': >/dev/tcp/127.0.0.1/4001'"]
       interval: 30s
