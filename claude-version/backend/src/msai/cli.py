@@ -83,6 +83,11 @@ graduation_app = typer.Typer(help="Graduation pipeline commands")
 portfolio_app = typer.Typer(help="Portfolio management + combined backtest commands")
 account_app = typer.Typer(help="IB account commands")
 system_app = typer.Typer(help="Platform health + diagnostics")
+instruments_app = typer.Typer(
+    name="instruments",
+    help="Instrument registry operations",
+    rich_markup_mode="rich",
+)
 
 app.add_typer(strategy_app, name="strategy")
 app.add_typer(backtest_app, name="backtest")
@@ -92,6 +97,7 @@ app.add_typer(graduation_app, name="graduation")
 app.add_typer(portfolio_app, name="portfolio")
 app.add_typer(account_app, name="account")
 app.add_typer(system_app, name="system")
+app.add_typer(instruments_app, name="instruments")
 
 
 # ----------------------------------------------------------------------
