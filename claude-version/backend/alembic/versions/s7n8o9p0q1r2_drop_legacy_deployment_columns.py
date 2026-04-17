@@ -41,10 +41,11 @@ depends_on: str | None = None
 
 
 def upgrade() -> None:
-    # 1. Enforce NOT NULL on portfolio_revision_id (backfill guarantees all rows have it)
-    op.alter_column("live_deployments", "portfolio_revision_id", nullable=False)
+    # NOTE: portfolio_revision_id stays nullable — legacy /start endpoint
+    # doesn't supply it. NOT NULL enforcement deferred to a future PR
+    # when /start is formally deprecated.
 
-    # 2. Make strategy_id nullable (kept for FK audit trail)
+    # 1. Make strategy_id nullable (kept for FK audit trail)
     op.alter_column("live_deployments", "strategy_id", nullable=True)
 
     # 3. Drop columns whose data now lives on live_portfolio_revision_strategies
@@ -75,8 +76,5 @@ def downgrade() -> None:
     op.add_column("live_deployments", sa.Column("instruments", ARRAY(sa.String()), nullable=True))
     op.add_column("live_deployments", sa.Column("config_hash", sa.String(64), nullable=True))
 
-    # 2. Make strategy_id NOT NULL again
+    # 1. Make strategy_id NOT NULL again
     op.alter_column("live_deployments", "strategy_id", nullable=False)
-
-    # 1. Make portfolio_revision_id nullable again
-    op.alter_column("live_deployments", "portfolio_revision_id", nullable=True)

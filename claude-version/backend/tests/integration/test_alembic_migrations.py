@@ -837,6 +837,7 @@ async def test_o3_portfolio_schema_roundtrip(isolated_postgres_url: str) -> None
     engine = create_async_engine(isolated_postgres_url)
     try:
         async with engine.connect() as conn:
+
             def _collect(sync_conn: sa.Connection) -> dict:
                 insp = sa.inspect(sync_conn)
                 return {
@@ -844,10 +845,10 @@ async def test_o3_portfolio_schema_roundtrip(isolated_postgres_url: str) -> None
                     "dep_cols": {c["name"] for c in insp.get_columns("live_deployments")},
                     "proc_cols": {c["name"] for c in insp.get_columns("live_node_processes")},
                     "rev_indexes": {
-                        idx["name"]
-                        for idx in insp.get_indexes("live_portfolio_revisions")
+                        idx["name"] for idx in insp.get_indexes("live_portfolio_revisions")
                     },
                 }
+
             state = await conn.run_sync(_collect)
         assert "live_portfolios" in state["tables"]
         assert "live_portfolio_revisions" in state["tables"]
@@ -999,10 +1000,7 @@ async def test_backfill_creates_portfolio_for_legacy_deployment(
             # Check deployment now has portfolio_revision_id set
             dep_row = (
                 await conn.execute(
-                    sa.text(
-                        "SELECT portfolio_revision_id "
-                        "FROM live_deployments WHERE id = :id"
-                    ),
+                    sa.text("SELECT portfolio_revision_id FROM live_deployments WHERE id = :id"),
                     {"id": deployment_id},
                 )
             ).one()
@@ -1097,9 +1095,7 @@ async def test_backfill_is_idempotent_skips_already_set(
             # No Legacy-* portfolios should have been created
             count = (
                 await conn.execute(
-                    sa.text(
-                        "SELECT COUNT(*) FROM live_portfolios WHERE name LIKE 'Legacy-%'"
-                    )
+                    sa.text("SELECT COUNT(*) FROM live_portfolios WHERE name LIKE 'Legacy-%'")
                 )
             ).scalar_one()
             assert count == 0
@@ -1242,9 +1238,7 @@ async def test_backfill_downgrade_removes_legacy_portfolios(
             # Deployment's portfolio_revision_id is NULL again
             dep_row = (
                 await conn.execute(
-                    sa.text(
-                        "SELECT portfolio_revision_id FROM live_deployments WHERE id = :id"
-                    ),
+                    sa.text("SELECT portfolio_revision_id FROM live_deployments WHERE id = :id"),
                     {"id": deployment_id},
                 )
             ).one()
@@ -1254,8 +1248,7 @@ async def test_backfill_downgrade_removes_legacy_portfolios(
             ds_count = (
                 await conn.execute(
                     sa.text(
-                        "SELECT COUNT(*) FROM live_deployment_strategies "
-                        "WHERE deployment_id = :did"
+                        "SELECT COUNT(*) FROM live_deployment_strategies WHERE deployment_id = :did"
                     ),
                     {"did": deployment_id},
                 )
@@ -1300,8 +1293,7 @@ async def test_migration_drops_legacy_columns_keeps_identity(
                 columns = {c["name"]: c for c in insp.get_columns("live_deployments")}
                 indexes = {idx["name"]: idx for idx in insp.get_indexes("live_deployments")}
                 unique_constraints = {
-                    uc["name"]: uc
-                    for uc in insp.get_unique_constraints("live_deployments")
+                    uc["name"]: uc for uc in insp.get_unique_constraints("live_deployments")
                 }
                 return {
                     "columns": columns,
@@ -1327,14 +1319,13 @@ async def test_migration_drops_legacy_columns_keeps_identity(
     assert "instruments_signature" not in col_names, (
         "instruments_signature should have been dropped"
     )
-    assert "strategy_code_hash" not in col_names, (
-        "strategy_code_hash should have been dropped"
-    )
+    assert "strategy_code_hash" not in col_names, "strategy_code_hash should have been dropped"
     assert "config" not in col_names, "config should have been dropped"
 
-    # portfolio_revision_id must be NOT NULL
-    assert columns["portfolio_revision_id"]["nullable"] is False, (
-        "portfolio_revision_id should be NOT NULL after Task 11 migration"
+    # portfolio_revision_id stays nullable (legacy /start doesn't supply it;
+    # NOT NULL enforcement deferred to a future PR)
+    assert columns["portfolio_revision_id"]["nullable"] is True, (
+        "portfolio_revision_id should remain nullable until /start is deprecated"
     )
 
     # strategy_id must be nullable

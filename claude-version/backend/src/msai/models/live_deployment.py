@@ -116,12 +116,12 @@ class LiveDeployment(Base):
     ``exec_clients`` feature (PR #3194, 1.225+). Nullable in PR #1 —
     populated by PR #2 at deploy time, enforced NOT NULL in PR #3."""
 
-    portfolio_revision_id: Mapped[UUID] = mapped_column(
-        ForeignKey("live_portfolio_revisions.id"), index=True, nullable=False
+    portfolio_revision_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("live_portfolio_revisions.id"), index=True, nullable=True
     )
     """FK to the frozen portfolio revision that triggered this deployment.
-    Made NOT NULL by Task 11 migration (s7n8o9p0q1r2) after Task 10
-    backfill populated all existing rows."""
+    Nullable because legacy /start (single-strategy) doesn't supply it.
+    Will be enforced NOT NULL when /start is formally deprecated."""
 
     message_bus_stream: Mapped[str] = mapped_column(String(96), nullable=False)
     """``f"trader-MSAI-{deployment_slug}-stream"`` — the deterministic
@@ -153,7 +153,7 @@ class LiveDeployment(Base):
     # ------------------------------------------------------------------
     strategy: Mapped[Strategy | None] = relationship(lazy="selectin")  # noqa: F821
     starter: Mapped[User] = relationship(lazy="selectin")  # noqa: F821
-    portfolio_revision: Mapped[LivePortfolioRevision] = relationship(lazy="selectin")
+    portfolio_revision: Mapped[LivePortfolioRevision | None] = relationship(lazy="selectin")
 
     # UNIQUE(identity_signature) remains for upsert target.
     # UNIQUE(portfolio_revision_id, account_id) added by Task 11.
