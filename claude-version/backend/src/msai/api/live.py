@@ -27,6 +27,8 @@ from msai.core.logging import get_logger
 from msai.models.live_deployment import LiveDeployment
 from msai.models.live_node_process import LiveNodeProcess
 from msai.models.strategy import Strategy
+from msai.models.live_portfolio_revision import LivePortfolioRevision
+from msai.models.live_portfolio_revision_strategy import LivePortfolioRevisionStrategy
 from msai.schemas.live import (
     LiveDeploymentInfo,
     LiveDeploymentStatusResponse,
@@ -37,10 +39,13 @@ from msai.schemas.live import (
     LiveStatusResponse,
     LiveStopRequest,
     LiveTradesResponse,
+    PortfolioStartRequest,
 )
 from msai.services.live.deployment_identity import (
+    compute_config_hash,
     derive_deployment_identity,
     derive_message_bus_stream,
+    derive_portfolio_deployment_identity,
     derive_strategy_id_full,
     derive_trader_id,
     generate_deployment_slug,
@@ -652,6 +657,407 @@ async def live_start(  # noqa: PLR0912, PLR0915 — multi-branch dispatch by des
         # so the next retry can re-attempt. Re-raise so FastAPI
         # produces the usual 500 (or the HTTPException the caller
         # raised, e.g. strategy 404).
+        if reservation is not None:
+            await idem.release(reservation.redis_key)
+        raise
+
+
+@router.post("/start-portfolio")
+async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispatch by design
+    request: PortfolioStartRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+    bus: LiveCommandBus = Depends(get_command_bus),  # noqa: B008
+    idem: IdempotencyStore = Depends(get_idempotency_store),  # noqa: B008
+) -> JSONResponse:
+    """Deploy a frozen portfolio revision to paper or live trading.
+
+    This is the portfolio-based counterpart to :func:`live_start`.
+    Instead of deploying a single strategy, it deploys an entire
+    portfolio revision (a set of strategies with weights, configs,
+    and instruments) to a specific IB account.
+
+    The three-layer idempotency model is identical to ``/start``:
+
+    1. **HTTP Idempotency-Key** — atomic SETNX reservation in Redis.
+    2. **Halt flag** — if ``msai:risk:halt`` is set, return 503.
+    3. **Identity-based warm restart** — the ``identity_signature``
+       is computed from ``(user_id, portfolio_revision_id, account_id,
+       paper_trading)`` via :class:`PortfolioDeploymentIdentity`.
+    """
+    # ------------------------------------------------------------------
+    # Layer 1: HTTP Idempotency-Key reservation
+    # ------------------------------------------------------------------
+    user_id = await _resolve_user_id(db, claims)
+    body_for_hash: dict[str, Any] = {
+        "portfolio_revision_id": str(request.portfolio_revision_id),
+        "account_id": request.account_id,
+        "paper_trading": request.paper_trading,
+    }
+    body_hash = IdempotencyStore.body_hash(body_for_hash)
+
+    reservation: Reserved | None = None
+    if idempotency_key is not None:
+        if user_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Idempotency-Key requires an authenticated user.",
+            )
+        result = await idem.reserve(user_id=user_id, key=idempotency_key, body_hash=body_hash)
+        if isinstance(result, InFlight):
+            return _apply_outcome(EndpointOutcome.in_flight())
+        if isinstance(result, CachedOutcome):
+            return _apply_outcome(result.outcome)
+        if isinstance(result, BodyMismatchReservation):
+            return _apply_outcome(EndpointOutcome.body_mismatch())
+        reservation = result
+
+    try:
+        # -------------------------------------------------------------
+        # Layer 2: Halt flag
+        # -------------------------------------------------------------
+        if await _halt_is_active(bus):
+            outcome = EndpointOutcome.halt_active()
+            if reservation is not None:
+                await idem.release(reservation.redis_key)
+            return _apply_outcome(outcome)
+
+        # -------------------------------------------------------------
+        # Supervisor liveness
+        # -------------------------------------------------------------
+        if not await _supervisor_is_alive(bus):
+            log.error(
+                "portfolio_start_rejected_no_supervisor",
+                extra={
+                    "stream": LIVE_COMMAND_STREAM,
+                    "group": LIVE_COMMAND_GROUP,
+                },
+            )
+            if reservation is not None:
+                await idem.release(reservation.redis_key)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "live-supervisor is not running. Start it with "
+                    "`docker compose -f docker-compose.dev.yml --profile broker "
+                    "up -d live-supervisor ib-gateway` and retry."
+                ),
+            )
+
+        # -------------------------------------------------------------
+        # Load frozen revision + members (SELECT FOR UPDATE)
+        # -------------------------------------------------------------
+        revision: LivePortfolioRevision | None = (
+            await db.execute(
+                select(LivePortfolioRevision)
+                .where(LivePortfolioRevision.id == request.portfolio_revision_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if revision is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Portfolio revision {request.portfolio_revision_id} not found",
+            )
+        if not revision.is_frozen:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Portfolio revision {request.portfolio_revision_id} is not frozen. "
+                    "Freeze it before deploying."
+                ),
+            )
+
+        members: list[LivePortfolioRevisionStrategy] = (
+            await db.execute(
+                select(LivePortfolioRevisionStrategy)
+                .where(
+                    LivePortfolioRevisionStrategy.revision_id == revision.id
+                )
+                .order_by(LivePortfolioRevisionStrategy.order_index)
+            )
+        ).scalars().all()
+        if not members:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Portfolio revision {request.portfolio_revision_id} has no strategies. "
+                    "Add at least one strategy before deploying."
+                ),
+            )
+
+        # -------------------------------------------------------------
+        # Load Strategy models and compute code hashes
+        # -------------------------------------------------------------
+        strategy_ids = [m.strategy_id for m in members]
+        strategies_by_id: dict[UUID, Strategy] = {}
+        for strat_row in (
+            await db.execute(
+                select(Strategy).where(Strategy.id.in_(strategy_ids))
+            )
+        ).scalars().all():
+            strategies_by_id[strat_row.id] = strat_row
+
+        missing = [sid for sid in strategy_ids if sid not in strategies_by_id]
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Strategies not found: {[str(s) for s in missing]}",
+            )
+
+        # Compute code hash for the first member (for the deployment row)
+        first_strategy = strategies_by_id[members[0].strategy_id]
+        strategy_code_hash = _resolve_strategy_code_hash(first_strategy)
+
+        # Aggregate instruments from all members
+        all_instruments: list[str] = []
+        for m in members:
+            all_instruments.extend(m.instruments)
+        all_instruments = sorted(set(all_instruments))
+
+        # Aggregate config from all members for the deployment row
+        combined_config: dict[str, Any] = {}
+        for m in members:
+            strat = strategies_by_id[m.strategy_id]
+            combined_config[f"{strat.strategy_class}_{m.order_index}"] = m.config
+
+        # -------------------------------------------------------------
+        # Layer 3: Identity-based warm-restart upsert
+        # -------------------------------------------------------------
+        identity = derive_portfolio_deployment_identity(
+            user_id=user_id,
+            portfolio_revision_id=request.portfolio_revision_id,
+            account_id=request.account_id,
+            paper_trading=request.paper_trading,
+            user_sub=claims.get("sub"),
+        )
+        identity_signature = identity.signature()
+
+        slug = generate_deployment_slug()
+        now = datetime.now(UTC)
+        deployment_table = LiveDeployment.__table__
+
+        stmt = pg_insert(deployment_table).values(
+            strategy_id=first_strategy.id,
+            strategy_code_hash=strategy_code_hash,
+            config=combined_config,
+            instruments=all_instruments,
+            status="starting",
+            paper_trading=request.paper_trading,
+            last_started_at=now,
+            last_stopped_at=None,
+            started_by=user_id,
+            deployment_slug=slug,
+            identity_signature=identity_signature,
+            trader_id=derive_trader_id(slug),
+            strategy_id_full=derive_strategy_id_full(
+                first_strategy.strategy_class, slug
+            ),
+            account_id=request.account_id,
+            ib_login_key=request.ib_login_key,
+            message_bus_stream=derive_message_bus_stream(slug),
+            config_hash=compute_config_hash(combined_config),
+            instruments_signature=",".join(all_instruments),
+            portfolio_revision_id=request.portfolio_revision_id,
+        )
+        _active_statuses = ("starting", "building", "ready", "running")
+        upsert_stmt = stmt.on_conflict_do_update(
+            index_elements=[deployment_table.c.identity_signature],
+            set_={
+                "status": case(
+                    (
+                        deployment_table.c.status.in_(_active_statuses),
+                        deployment_table.c.status,
+                    ),
+                    else_="starting",
+                ),
+                "last_started_at": now,
+            },
+        ).returning(deployment_table.c.id, deployment_table.c.deployment_slug)
+        upsert_row = (await db.execute(upsert_stmt)).one()
+        deployment_id = upsert_row.id
+        is_warm_restart = upsert_row.deployment_slug != slug
+        await db.commit()
+
+        deployment = await db.get(LiveDeployment, deployment_id)
+        if deployment is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Deployment row vanished between upsert and reload",
+            )
+
+        # -------------------------------------------------------------
+        # Active-process de-duplication
+        # -------------------------------------------------------------
+        active_process = (
+            await db.execute(
+                select(LiveNodeProcess)
+                .where(
+                    LiveNodeProcess.deployment_id == deployment.id,
+                    LiveNodeProcess.status.in_(("starting", "building", "ready", "running")),
+                )
+                .order_by(LiveNodeProcess.started_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if active_process is not None:
+            if active_process.status in ("ready", "running") and deployment.status != "running":
+                deployment.status = "running"
+                await db.commit()
+            outcome = EndpointOutcome.already_active(
+                {
+                    "id": str(deployment.id),
+                    "deployment_slug": deployment.deployment_slug,
+                    "status": active_process.status,
+                    "paper_trading": deployment.paper_trading,
+                    "warm_restart": is_warm_restart,
+                }
+            )
+            if reservation is not None:
+                await idem.commit(reservation.redis_key, body_hash, outcome)
+            return _apply_outcome(outcome)
+
+        # -------------------------------------------------------------
+        # Publish START command on the command bus
+        # -------------------------------------------------------------
+        await bus.publish_start(
+            deployment_id=deployment.id,
+            payload={
+                "deployment_slug": deployment.deployment_slug,
+                "strategy_id": str(first_strategy.id),
+                "strategy_path": first_strategy.file_path,
+                "config": combined_config,
+                "instruments": all_instruments,
+            },
+            idempotency_key=idempotency_key,
+        )
+
+        # -------------------------------------------------------------
+        # Graduation linking — link all member strategies
+        # -------------------------------------------------------------
+        try:
+            from msai.models.graduation_candidate import GraduationCandidate
+
+            for member in members:
+                candidate = (
+                    await db.execute(
+                        select(GraduationCandidate).where(
+                            GraduationCandidate.strategy_id == member.strategy_id,
+                            GraduationCandidate.stage == "live_running",
+                            GraduationCandidate.deployment_id.is_(None),
+                        )
+                    )
+                ).scalar_one_or_none()
+                if candidate is not None:
+                    candidate.deployment_id = deployment.id
+                    log.info(
+                        "graduation_candidate_linked",
+                        extra={
+                            "candidate_id": str(candidate.id),
+                            "deployment_id": str(deployment.id),
+                            "strategy_id": str(member.strategy_id),
+                        },
+                    )
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            log.warning("graduation_candidate_link_failed", exc_info=True)
+
+        # -------------------------------------------------------------
+        # Register message_bus_stream with projection consumer
+        # -------------------------------------------------------------
+        try:
+            from msai.main import get_stream_registry
+
+            get_stream_registry().register(
+                deployment_id=deployment.id,
+                deployment_slug=deployment.deployment_slug,
+                stream_name=deployment.message_bus_stream,
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("stream_registry_register_failed")
+
+        # -------------------------------------------------------------
+        # Poll live_node_processes for ready / failed / running
+        # -------------------------------------------------------------
+        row = await _poll_for_terminal(
+            db,
+            deployment.id,
+            ready_statuses=frozenset({"ready", "running"}),
+            terminal_statuses=frozenset({"failed", "stopped"}),
+            timeout_s=START_POLL_TIMEOUT_S,
+            interval_s=START_POLL_INTERVAL_S,
+        )
+
+        if row is None:
+            outcome = EndpointOutcome.api_poll_timeout()
+            if reservation is not None:
+                await idem.release(reservation.redis_key)
+            return _apply_outcome(outcome)
+
+        if row.status in {"ready", "running"}:
+            deployment.status = "running"
+            deployment.last_stopped_at = None
+            await db.commit()
+            await log_audit(
+                db,
+                user_id=user_id,
+                action="portfolio_start",
+                resource_type="live_deployment",
+                resource_id=deployment.id,
+                details={
+                    "portfolio_revision_id": str(request.portfolio_revision_id),
+                    "account_id": request.account_id,
+                    "member_count": len(members),
+                    "instruments": all_instruments,
+                    "paper": request.paper_trading,
+                    "warm_restart": is_warm_restart,
+                },
+            )
+            outcome = EndpointOutcome.ready(
+                {
+                    "id": str(deployment.id),
+                    "deployment_slug": deployment.deployment_slug,
+                    "status": row.status,
+                    "paper_trading": deployment.paper_trading,
+                    "warm_restart": is_warm_restart,
+                }
+            )
+            if reservation is not None:
+                await idem.commit(reservation.redis_key, body_hash, outcome)
+            return _apply_outcome(outcome)
+
+        # Terminal failure branch
+        kind = FailureKind.parse_or_unknown(row.failure_kind)
+        if kind is FailureKind.HALT_ACTIVE:
+            outcome = EndpointOutcome.halt_active()
+            if reservation is not None:
+                await idem.release(reservation.redis_key)
+            return _apply_outcome(outcome)
+
+        if kind is FailureKind.SPAWN_FAILED_TRANSIENT:
+            outcome = EndpointOutcome.spawn_failed_transient(
+                row.error_message or "transient supervisor failure"
+            )
+            if reservation is not None:
+                await idem.release(reservation.redis_key)
+            return _apply_outcome(outcome)
+
+        permanent_kinds = {
+            FailureKind.SPAWN_FAILED_PERMANENT,
+            FailureKind.RECONCILIATION_FAILED,
+            FailureKind.BUILD_TIMEOUT,
+            FailureKind.HEARTBEAT_TIMEOUT,
+            FailureKind.UNKNOWN,
+        }
+        if kind not in permanent_kinds:
+            kind = FailureKind.UNKNOWN
+        outcome = EndpointOutcome.permanent_failure(kind, row.error_message or "unknown failure")
+        if reservation is not None:
+            await idem.commit(reservation.redis_key, body_hash, outcome)
+        return _apply_outcome(outcome)
+
+    except Exception:
         if reservation is not None:
             await idem.release(reservation.redis_key)
         raise

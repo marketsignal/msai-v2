@@ -18,6 +18,20 @@ class LiveStartRequest(BaseModel):
     paper_trading: bool = True
 
 
+class PortfolioStartRequest(BaseModel):
+    """Request schema for starting a portfolio-based live deployment.
+
+    Instead of deploying a single strategy (like :class:`LiveStartRequest`),
+    this deploys an entire frozen portfolio revision — a set of strategies
+    with weights, configs, and instruments — to a specific IB account.
+    """
+
+    portfolio_revision_id: UUID
+    account_id: str
+    paper_trading: bool = True
+    ib_login_key: str | None = None
+
+
 class LiveStopRequest(BaseModel):
     """Request schema for stopping a running deployment."""
 
