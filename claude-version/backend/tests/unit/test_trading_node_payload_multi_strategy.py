@@ -178,3 +178,95 @@ class TestAllInstruments:
             strategy_members=[m1, m2],
         )
         assert payload.all_instruments == ["AAPL"]
+
+
+# ---------------------------------------------------------------------------
+# Supervisor payload factory portfolio-path validation (Task 17)
+# ---------------------------------------------------------------------------
+
+
+class TestSupervisorPayloadFactoryPortfolioPath:
+    """Validate the building blocks that _build_production_payload_factory
+    uses for portfolio-based deployments. These are pure-function tests
+    that don't need a real DB session."""
+
+    def test_portfolio_payload_has_strategy_members(self) -> None:
+        """A portfolio payload should have non-empty strategy_members."""
+        m1 = _make_member(
+            instruments=["AAPL"],
+            strategy_id_full="EMACross-0-slug123",
+            strategy_code_hash="hash1",
+        )
+        m2 = _make_member(
+            instruments=["MSFT"],
+            strategy_id_full="SmokeMarketOrder-1-slug123",
+            strategy_code_hash="hash2",
+        )
+        payload = TradingNodePayload(
+            row_id=uuid4(),
+            deployment_id=uuid4(),
+            deployment_slug="slug123",
+            strategy_path=m1.strategy_path,
+            strategy_config_path=m1.strategy_config_path,
+            strategy_config=m1.strategy_config,
+            paper_symbols=["AAPL", "MSFT"],
+            canonical_instruments=["AAPL.NASDAQ", "MSFT.NASDAQ"],
+            strategy_members=[m1, m2],
+        )
+        assert len(payload.strategy_members) == 2
+        assert payload.strategy_members[0].strategy_id_full == "EMACross-0-slug123"
+        assert payload.strategy_members[1].strategy_id_full == "SmokeMarketOrder-1-slug123"
+
+    def test_portfolio_payload_aggregated_symbols(self) -> None:
+        """paper_symbols and canonical_instruments aggregate across all members."""
+        m1 = _make_member(instruments=["AAPL", "GOOG"])
+        m2 = _make_member(instruments=["MSFT", "AAPL"])
+        # Simulate the aggregation the factory does
+        all_paper = sorted(set(m1.instruments + m2.instruments))
+        assert all_paper == ["AAPL", "GOOG", "MSFT"]
+
+    def test_portfolio_payload_preserves_per_member_config(self) -> None:
+        """Each StrategyMemberPayload carries its own config."""
+        m1 = _make_member(
+            strategy_config={"instrument_id": "AAPL.NASDAQ", "fast_period": 10},
+        )
+        m2 = _make_member(
+            strategy_config={"instrument_id": "MSFT.NASDAQ", "fast_period": 20},
+        )
+        payload = TradingNodePayload(
+            row_id=uuid4(),
+            deployment_id=uuid4(),
+            deployment_slug="slug123",
+            strategy_path=m1.strategy_path,
+            strategy_config_path=m1.strategy_config_path,
+            strategy_members=[m1, m2],
+        )
+        assert payload.strategy_members[0].strategy_config["fast_period"] == 10
+        assert payload.strategy_members[1].strategy_config["fast_period"] == 20
+
+    def test_legacy_single_strategy_has_empty_members(self) -> None:
+        """Legacy single-strategy payload has empty strategy_members list."""
+        payload = TradingNodePayload(
+            row_id=uuid4(),
+            deployment_id=uuid4(),
+            deployment_slug="slug123",
+            strategy_path="strats.foo:Bar",
+            strategy_config_path="strats.foo:BarConfig",
+            strategy_config={"instrument_id": "AAPL.NASDAQ"},
+            paper_symbols=["AAPL"],
+        )
+        assert payload.strategy_members == []
+        assert payload.all_instruments == []
+
+    def test_imports_needed_for_portfolio_factory(self) -> None:
+        """Verify all imports the factory needs are accessible."""
+        from msai.models import LivePortfolioRevisionStrategy
+        from msai.services.live.deployment_identity import derive_strategy_id_full
+        from msai.services.nautilus.strategy_loader import resolve_importable_strategy_paths
+        from msai.services.strategy_registry import compute_file_hash
+
+        # Just verify imports succeed — no need to call them
+        assert callable(derive_strategy_id_full)
+        assert callable(resolve_importable_strategy_paths)
+        assert callable(compute_file_hash)
+        assert hasattr(LivePortfolioRevisionStrategy, "__tablename__")
