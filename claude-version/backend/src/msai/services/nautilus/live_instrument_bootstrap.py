@@ -79,7 +79,7 @@ def _current_quarterly_expiry(today: date) -> str:
 
     Operators who need the expiring contract on Friday morning should
     start deployments before midnight CT Thursday, or pin the explicit
-    fully-qualified month id (e.g., ``ESM6.XCME``) in deployment config.
+    fully-qualified month id (e.g., ``ESM6.CME``) in deployment config.
 
     IB rejects FUT contracts without an explicit
     ``lastTradeDateOrContractMonth`` as ambiguous ("Unable to resolve

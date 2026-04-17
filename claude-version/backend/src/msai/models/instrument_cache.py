@@ -1,7 +1,7 @@
 """InstrumentCache model — cached IB qualification results (Phase 2 task 2.2).
 
 One row per fully-resolved instrument. The primary key is the Nautilus
-canonical instrument ID (``AAPL.NASDAQ``, ``ESM5.XCME``, ...) so two
+canonical instrument ID (``AAPL.NASDAQ``, ``ESM5.CME``, ...) so two
 callers that resolve the same logical instrument share a cache entry
 and Phase 2's SecurityMaster service can do a cache-first lookup.
 

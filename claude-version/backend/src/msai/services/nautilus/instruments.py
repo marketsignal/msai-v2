@@ -4,7 +4,7 @@
 Pre-v9, this module used ``TestInstrumentProvider.equity(venue="SIM")``
 and rebound every instrument to the synthetic ``SIM`` venue. Phase 2
 replaces that with a real security-master resolver keyed on
-canonical IB venues (``NASDAQ`` for equities on Nasdaq, ``XCME`` for
+canonical IB venues (``NASDAQ`` for equities on Nasdaq, ``CME`` for
 CME futures, ``IDEALPRO`` for forex, ...) so backtest and live
 trading both see the SAME instrument objects.
 
@@ -60,7 +60,7 @@ def resolve_instrument(
 
     Args:
         symbol_or_id: Ticker symbol (``"AAPL"``) or Nautilus ID
-            (``"AAPL.NASDAQ"``, ``"ESM5.XCME"``). A dotted
+            (``"AAPL.NASDAQ"``, ``"ESM5.CME"``). A dotted
             identifier's suffix wins over ``venue``.
         venue: Venue to bind a bare symbol to. Defaults to
             :data:`DEFAULT_EQUITY_VENUE` (``NASDAQ``).
