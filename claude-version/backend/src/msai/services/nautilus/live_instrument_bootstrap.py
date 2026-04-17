@@ -20,6 +20,15 @@ Phase 1 hardcodes a closed AAPL/MSFT universe so the live-supervisor
 smoke test can run end-to-end against IB Gateway paper. Phase 2
 replaces this with the full SecurityMaster lookup driven by the
 ``Strategy.instruments`` JSONB column.
+
+.. deprecated::
+    The front-month rollover helpers here remain load-bearing for the
+    live-supervisor payload factory (the only current caller). New code
+    should go through
+    :class:`msai.services.nautilus.security_master.service.SecurityMaster`
+    which delegates to these helpers for the closed-universe cold-miss
+    path. Will be removed in the follow-up live-wiring PR once the
+    supervisor reads resolved canonicals from the DB directly.
 """
 
 from __future__ import annotations
