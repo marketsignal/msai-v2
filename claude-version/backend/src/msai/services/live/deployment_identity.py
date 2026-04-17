@@ -219,6 +219,53 @@ def canonicalize_user_id(user_id: UUID | None, *, fallback_sub: str | None = Non
     return ""
 
 
+@dataclass(slots=True, frozen=True)
+class PortfolioDeploymentIdentity:
+    """Identity tuple for portfolio-based deployments.
+
+    Unlike :class:`DeploymentIdentity` which identifies a single-strategy
+    deployment, this identifies a *portfolio* deployment — a set of
+    strategies deployed together to a single account.
+
+    Two portfolio deployments with the same :meth:`signature` share state
+    across restarts. Any field difference → cold start.
+    """
+
+    started_by: str
+    portfolio_revision_id: str
+    account_id: str
+    paper_trading: bool
+
+    def to_canonical_json(self) -> bytes:
+        """Stable serialization for hashing (same contract as DeploymentIdentity)."""
+        return json.dumps(asdict(self), sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    def signature(self) -> str:
+        """64-char sha256 hex — the unique ``identity_signature`` for the row."""
+        return hashlib.sha256(self.to_canonical_json()).hexdigest()
+
+
+def derive_portfolio_deployment_identity(
+    *,
+    user_id: UUID | None,
+    portfolio_revision_id: UUID,
+    account_id: str,
+    paper_trading: bool,
+    user_sub: str | None = None,
+) -> PortfolioDeploymentIdentity:
+    """Convenience builder for :class:`PortfolioDeploymentIdentity`.
+
+    Mirrors :func:`derive_deployment_identity` but takes portfolio-level
+    inputs instead of single-strategy inputs.
+    """
+    return PortfolioDeploymentIdentity(
+        started_by=canonicalize_user_id(user_id, fallback_sub=user_sub),
+        portfolio_revision_id=portfolio_revision_id.hex,
+        account_id=account_id,
+        paper_trading=paper_trading,
+    )
+
+
 def derive_deployment_identity(
     *,
     user_id: UUID | None,
