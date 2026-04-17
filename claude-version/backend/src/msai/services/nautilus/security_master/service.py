@@ -45,7 +45,13 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from msai.core.config import settings
 from msai.models.instrument_cache import InstrumentCache
+from msai.services.nautilus.security_master.continuous_futures import (
+    is_databento_continuous_pattern,
+    raw_symbol_from_request,
+    resolved_databento_definition,
+)
 from msai.services.nautilus.security_master.parser import (
     extract_trading_hours,
     nautilus_instrument_to_cache_json,
@@ -63,6 +69,16 @@ if TYPE_CHECKING:
 DEFAULT_CACHE_VALIDITY_DAYS = 30
 """Rows older than this are considered stale — the next resolve
 returns the cached value AND schedules a background refresh."""
+
+
+class DatabentoDefinitionMissing(Exception):  # noqa: N818 — spec-mandated name (codex parity)
+    """Raised by :meth:`SecurityMaster.resolve_for_backtest` when a requested
+    symbol has no active registry row under the ``databento`` provider and
+    the operator has not pre-warmed the registry.
+
+    Backtests are fail-loud on cold-miss — the error carries the original
+    symbol and an operator hint pointing to ``msai instruments refresh``.
+    """
 
 
 class SecurityMaster:
@@ -287,6 +303,197 @@ class SecurityMaster:
             )
             out.append(alias_str)
         return out
+
+    # ------------------------------------------------------------------
+    # Backtest resolve entrypoint (registry-backed, Task 9)
+    # ------------------------------------------------------------------
+
+    async def resolve_for_backtest(
+        self,
+        symbols: list[str],
+        *,
+        start: str | None = None,
+        end: str | None = None,
+        dataset: str = "GLBX.MDP3",
+    ) -> list[str]:
+        """Return canonical Nautilus ``InstrumentId`` strings for ``symbols``.
+
+        Four paths:
+
+        1. ``<root>.Z.<N>`` continuous pattern → delegate to
+           :meth:`_resolve_databento_continuous` which warm-hits
+           by ``raw_symbol`` and falls through to the Databento
+           definition fetch + synthesis on miss.
+        2. Any other dotted input (e.g. ``"ESH4.CME"``) → warm-hit
+           via :meth:`InstrumentRegistry.find_by_alias` under
+           ``provider="databento"``. Returned alias IS the input string.
+        3. Bare ticker (e.g. ``"AAPL"``) → warm-hit via
+           :meth:`InstrumentRegistry.find_by_raw_symbol` under
+           ``provider="databento"``, return its active alias string.
+        4. Miss on the warm paths → raise :class:`DatabentoDefinitionMissing`
+           with an actionable operator hint.
+
+        Backtests are fail-loud on cold-miss: the operator must run
+        ``msai instruments refresh`` first. The one exception is the
+        ``.Z.N`` continuous path, which *does* synthesize on miss because
+        the front-month roll is a known-good Databento-side operation
+        with no IB round-trip.
+
+        Args:
+            symbols: Requested symbols. Accepts any of the three input
+                shapes (continuous pattern / dotted alias / bare ticker).
+            start: Definition window lower bound (``YYYY-MM-DD``). Only
+                used on the ``.Z.N`` cold-miss path. Defaults to
+                ``"2024-01-01"``.
+            end: Definition window upper bound (``YYYY-MM-DD``). Defaults
+                to today UTC.
+            dataset: Databento dataset for the ``.Z.N`` cold-miss path.
+                Defaults to ``"GLBX.MDP3"`` (CME futures).
+
+        Raises:
+            DatabentoDefinitionMissing: A warm-path miss for a non-``.Z.N``
+                symbol — operator has not pre-warmed the registry.
+            ValueError: A ``.Z.N`` cold-miss but ``self._databento`` is
+                ``None`` — cannot synthesize without the Databento client.
+        """
+        from msai.services.nautilus.security_master.registry import (
+            InstrumentRegistry,
+        )
+
+        registry = InstrumentRegistry(self._db)
+        out: list[str] = []
+        for sym in symbols:
+            # Path 1 — Databento continuous pattern.
+            if is_databento_continuous_pattern(sym):
+                out.append(
+                    await self._resolve_databento_continuous(
+                        sym, start=start, end=end, dataset=dataset
+                    )
+                )
+                continue
+
+            # Path 2 — dotted alias already in registry.
+            if "." in sym:
+                idef = await registry.find_by_alias(sym, provider="databento")
+                if idef is not None:
+                    out.append(sym)
+                    continue
+                raise DatabentoDefinitionMissing(
+                    f"No registry row for alias {sym!r} under provider "
+                    "'databento' — run `msai instruments refresh --symbols "
+                    f"{sym}` to pre-warm the registry before the backtest."
+                )
+
+            # Path 3 — bare ticker, warm-hit by raw_symbol.
+            idef = await registry.find_by_raw_symbol(sym, provider="databento")
+            if idef is not None:
+                active_alias = next(
+                    (a for a in idef.aliases if a.effective_to is None), None
+                )
+                if active_alias is not None:
+                    out.append(active_alias.alias_string)
+                    continue
+
+            # Path 4 — cold-miss, fail loud.
+            raise DatabentoDefinitionMissing(
+                f"No registry row for raw_symbol {sym!r} under provider "
+                "'databento' — run `msai instruments refresh --symbols "
+                f"{sym}` to pre-warm the registry before the backtest."
+            )
+        return out
+
+    async def _resolve_databento_continuous(
+        self,
+        sym: str,
+        *,
+        start: str | None,
+        end: str | None,
+        dataset: str,
+    ) -> str:
+        """Resolve a ``<root>.Z.<N>`` continuous pattern for backtest.
+
+        Step 1 — Warm path: :meth:`InstrumentRegistry.find_by_raw_symbol`
+        under ``provider="databento"``. If an active alias exists for the
+        raw continuous symbol, return it without touching Databento.
+
+        Step 2 — Cold path: download the Databento ``definition``
+        payload for the window ``[start, end)`` via
+        :meth:`DatabentoClient.fetch_definition_instruments`, synthesize
+        a :class:`ResolvedInstrumentDefinition` via
+        :func:`resolved_databento_definition`, and upsert the registry
+        through the shared idempotent helper
+        :meth:`_upsert_definition_and_alias` (with
+        ``provider="databento"`` + ``venue_format="databento_continuous"``
+        — matches the CHECK constraints on both tables).
+
+        Idempotency: the ``_upsert_definition_and_alias`` helper is scoped
+        on ``(raw_symbol, provider, asset_class)`` for the definition
+        and ``(alias_string, provider)`` for the active alias, so a
+        second call with the same window refreshes timestamps without
+        raising :class:`IntegrityError`.
+
+        Raises:
+            ValueError: ``self._databento`` is ``None`` on cold-miss —
+                cannot fetch the definition payload.
+        """
+        from msai.services.nautilus.security_master.registry import (
+            InstrumentRegistry,
+        )
+
+        raw = raw_symbol_from_request(sym)
+        registry = InstrumentRegistry(self._db)
+
+        # Step 1 — warm path.
+        idef = await registry.find_by_raw_symbol(raw, provider="databento")
+        if idef is not None:
+            active_alias = next(
+                (a for a in idef.aliases if a.effective_to is None), None
+            )
+            if active_alias is not None:
+                return active_alias.alias_string
+
+        # Step 2 — cold path. Databento client is required.
+        if self._databento is None:
+            raise ValueError(
+                f"DatabentoClient required to synthesize continuous {sym!r} "
+                "on cold-miss — construct SecurityMaster with "
+                "databento_client=... or pre-warm the registry via "
+                "`msai instruments refresh`."
+            )
+
+        resolved_start = start or "2024-01-01"
+        resolved_end = end or datetime.now(UTC).date().isoformat()
+        definition_path = (
+            settings.databento_definition_root
+            / dataset
+            / raw
+            / f"{resolved_start}_{resolved_end}.definition.dbn.zst"
+        )
+        instruments = await self._databento.fetch_definition_instruments(
+            raw,
+            resolved_start,
+            resolved_end,
+            dataset=dataset,
+            target_path=definition_path,
+        )
+        resolved = resolved_databento_definition(
+            raw_symbol=raw,
+            instruments=instruments,
+            dataset=dataset,
+            start=resolved_start,
+            end=resolved_end,
+            definition_path=definition_path,
+        )
+        await self._upsert_definition_and_alias(
+            raw_symbol=resolved.raw_symbol,
+            listing_venue=resolved.listing_venue,
+            routing_venue=resolved.routing_venue,
+            asset_class=resolved.asset_class,
+            alias_string=resolved.instrument_id,
+            provider="databento",
+            venue_format="databento_continuous",
+        )
+        return resolved.instrument_id
 
     @staticmethod
     def _asset_class_for_instrument(instrument: Any) -> str:

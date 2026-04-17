@@ -58,7 +58,11 @@ class InstrumentAlias(Base):
         index=True,
     )
     alias_string: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
-    venue_format: Mapped[str] = mapped_column(String(16), nullable=False)
+    # String(32): must accommodate the longest literal allowed by the
+    # ``ck_instrument_aliases_venue_format`` CHECK constraint — currently
+    # ``'databento_continuous'`` (20 chars). Leaving headroom for future
+    # venue formats (e.g. ``'mic_code_with_segment'``).
+    venue_format: Mapped[str] = mapped_column(String(32), nullable=False)
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
     effective_from: Mapped[date] = mapped_column(Date, nullable=False)
     effective_to: Mapped[date | None] = mapped_column(Date, nullable=True)

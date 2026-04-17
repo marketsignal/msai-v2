@@ -177,3 +177,23 @@ def continuous_needs_refresh_for_window(
     if cached_start is None or cached_end is None:
         return True
     return requested_start < cached_start or requested_end > cached_end
+
+
+def raw_continuous_suffix(symbol: str) -> str | None:
+    """Return the ``.<letter>.<N>`` suffix of a Databento continuous pattern.
+
+    Example: ``"ES.Z.5" → ".Z.5"``. Returns ``None`` if ``symbol`` is not a
+    Databento continuous pattern (lets callers pattern-match without a
+    second regex hit).
+
+    Reserved helper — not used by v3.0's ``resolve_for_backtest`` path but
+    stored here for a planned follow-up that records the continuous
+    suffix on :class:`InstrumentDefinition.continuous_pattern`. The
+    shape matches the ``ck_instrument_definitions_continuous_pattern_shape``
+    CHECK constraint regex ``^\\.[A-Za-z]\\.[0-9]+$`` on the model.
+    """
+    if not is_databento_continuous_pattern(symbol):
+        return None
+    # Pattern matched, so exactly two dots split root/letter/number.
+    _, letter, number = symbol.rsplit(".", 2)
+    return f".{letter}.{number}"

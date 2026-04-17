@@ -109,7 +109,7 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("alias_string", sa.String(100), nullable=False),
-        sa.Column("venue_format", sa.String(16), nullable=False),
+        sa.Column("venue_format", sa.String(32), nullable=False),
         sa.Column("provider", sa.String(32), nullable=False),
         sa.Column("effective_from", sa.Date, nullable=False),
         sa.Column("effective_to", sa.Date, nullable=True),
