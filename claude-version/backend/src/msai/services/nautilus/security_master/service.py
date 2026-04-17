@@ -40,7 +40,7 @@ Bulk resolve semantics:
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -50,13 +50,14 @@ from msai.services.nautilus.security_master.parser import (
     extract_trading_hours,
     nautilus_instrument_to_cache_json,
 )
+from msai.services.nautilus.security_master.specs import InstrumentSpec
 
 if TYPE_CHECKING:
     from nautilus_trader.model.instruments import Instrument
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from msai.services.data_sources.databento_client import DatabentoClient
     from msai.services.nautilus.security_master.ib_qualifier import IBQualifier
-    from msai.services.nautilus.security_master.specs import InstrumentSpec
 
 
 DEFAULT_CACHE_VALIDITY_DAYS = 30
@@ -84,13 +85,19 @@ class SecurityMaster:
     def __init__(
         self,
         *,
-        qualifier: IBQualifier,
+        qualifier: IBQualifier | None = None,
         db: AsyncSession,
         cache_validity_days: int = DEFAULT_CACHE_VALIDITY_DAYS,
+        databento_client: DatabentoClient | None = None,
     ) -> None:
         self._qualifier = qualifier
         self._db = db
         self._cache_validity = timedelta(days=cache_validity_days)
+        # Stored for Task 9's continuous-futures path
+        # (``_resolve_databento_continuous``). ``None`` is permitted for
+        # live-only callers — cold-miss on a Databento continuous symbol
+        # with ``self._databento is None`` raises in Task 9.
+        self._databento = databento_client
 
     async def resolve(self, spec: InstrumentSpec) -> Instrument:
         """Resolve a single spec, consulting the cache first.
@@ -105,6 +112,12 @@ class SecurityMaster:
             return _instrument_from_cache_row(cached)
 
         # Cache miss — qualify, extract trading hours, write, return.
+        if self._qualifier is None:
+            raise ValueError(
+                f"Cache miss for spec {spec!r} requires an IBQualifier — "
+                "construct SecurityMaster with qualifier=... or pre-warm "
+                "the cache via resolve_for_backtest / resolve_for_live."
+            )
         instrument = await self._qualifier.qualify(spec)
         trading_hours_json = self._trading_hours_for(
             canonical_id=canonical_id,
@@ -169,6 +182,256 @@ class SecurityMaster:
             "contract details; the background-refresh scheduler lands "
             "in Phase 4. Callers should use resolve() for now."
         )
+
+    # ------------------------------------------------------------------
+    # Live-trading resolve entrypoint (registry-backed, Task 8)
+    # ------------------------------------------------------------------
+
+    async def resolve_for_live(self, symbols: list[str]) -> list[str]:
+        """Return canonical Nautilus ``InstrumentId`` strings for ``symbols``.
+
+        Warm path: registry hit by alias OR raw_symbol → return the active
+        alias. Cold path: delegate to the Phase-1 closed-universe
+        :func:`canonical_instrument_id` helper, resolve the built
+        :class:`InstrumentSpec` through the existing cache-first
+        :meth:`resolve`, then upsert
+        ``instrument_definitions`` + ``instrument_aliases`` so the next
+        call goes down the warm path.
+
+        Non-hot-path; uses ``self._db`` + optional IB qualify round-trips.
+        Callers must pre-warm before ``TradingNode.run()`` (gotchas #9,
+        #11 — dynamic instrument loading on the trading critical path
+        fails at the first bar event, not at startup).
+
+        Cold-miss scope (v2.2 — explicit):
+            The cold-miss path currently delegates to the Phase-1
+            closed-universe :func:`canonical_instrument_id` helper at
+            ``live_instrument_bootstrap.py:123-170``. Symbols outside
+            ``{AAPL, MSFT, SPY, EUR/USD, ES}`` will raise ``ValueError``
+            from that helper. To add a new symbol:
+
+            1. Extend :func:`canonical_instrument_id`'s if-chain at
+               ``live_instrument_bootstrap.py:123-170``.
+            2. Extend :meth:`_spec_from_canonical` (below) with the new
+               venue case.
+            3. Pre-warm the registry via ``msai instruments refresh
+               --symbols <NEW>`` so future hits go down the warm path
+               instead of the cold path.
+
+        Raises:
+            ValueError: A cold-miss path was required but ``self._qualifier``
+                is ``None`` — construct the :class:`SecurityMaster` with
+                ``qualifier=...`` for any live-trading entrypoint.
+        """
+        from msai.services.nautilus.live_instrument_bootstrap import (
+            canonical_instrument_id,
+        )
+        from msai.services.nautilus.security_master.registry import (
+            InstrumentRegistry,
+        )
+
+        registry = InstrumentRegistry(self._db)
+        today = datetime.now(UTC).date()
+        out: list[str] = []
+        for sym in symbols:
+            # Warm path A — caller passed an already-qualified dotted alias
+            if "." in sym:
+                idef = await registry.find_by_alias(
+                    sym, provider="interactive_brokers"
+                )
+                if idef is not None:
+                    out.append(sym)
+                    continue
+            # Warm path B — caller passed a bare ticker, resolve to active alias
+            idef = await registry.find_by_raw_symbol(
+                sym, provider="interactive_brokers"
+            )
+            if idef is not None:
+                active_alias = next(
+                    (a for a in idef.aliases if a.effective_to is None), None
+                )
+                if active_alias is not None:
+                    out.append(active_alias.alias_string)
+                    continue
+            # Cold path — delegate to existing live_instrument_bootstrap
+            # front-month rollover + existing SecurityMaster.resolve(spec).
+            # Reason: live_instrument_bootstrap.canonical_instrument_id(...)
+            # holds the closed-universe roll logic (ES → ESM6.CME at spawn
+            # today); we reuse it rather than reinventing. The returned
+            # canonical alias string is then used to build an InstrumentSpec
+            # via _spec_from_canonical() and the spec is resolved through
+            # the existing cache-first path (which triggers an IB qualify
+            # round-trip on cache miss).
+            if self._qualifier is None:
+                raise ValueError(
+                    f"Cold-miss resolve for {sym!r} requires an IBQualifier — "
+                    "construct SecurityMaster with qualifier=... for live use."
+                )
+            canonical = canonical_instrument_id(sym, today=today)
+            spec = self._spec_from_canonical(canonical)
+            instrument = await self.resolve(spec)  # cache-first
+            alias_str = str(instrument.id)
+            routing_venue = instrument.id.venue.value
+            listing_venue = routing_venue
+            details = self._qualifier._provider.contract_details.get(instrument.id)
+            if details is not None and getattr(details, "contract", None) is not None:
+                primary = getattr(details.contract, "primaryExchange", None) or None
+                if primary:
+                    listing_venue = primary
+            await self._upsert_definition_and_alias(
+                raw_symbol=instrument.raw_symbol.value,
+                listing_venue=listing_venue,
+                routing_venue=routing_venue,
+                asset_class=self._asset_class_for_instrument(instrument),
+                alias_string=alias_str,
+            )
+            out.append(alias_str)
+        return out
+
+    @staticmethod
+    def _asset_class_for_instrument(instrument: Any) -> str:
+        """Derive the registry's ``asset_class`` column value from a Nautilus
+        :class:`Instrument` via its runtime class name.
+
+        Mirrors the mapping in
+        :func:`security_master.continuous_futures._asset_class_for_instrument_type`
+        (Task 6). Return values MUST match the
+        ``ck_instrument_definitions_asset_class`` CHECK constraint:
+        ``'equity','futures','fx','option','crypto'``.
+
+        Note that this differs from :class:`InstrumentSpec.asset_class`
+        which uses ``'future'`` (singular) as its literal — the spec
+        enum is a separate taxonomy for *input*, not the registry's
+        storage enum.
+        """
+        cls_name = instrument.__class__.__name__
+        if cls_name in {"FuturesContract", "FuturesSpread"}:
+            return "futures"
+        if cls_name in {"OptionContract", "OptionSpread"}:
+            return "option"
+        if cls_name == "CurrencyPair":
+            return "fx"
+        if cls_name in {"CryptoFuture", "CryptoPerpetual", "CryptoOption"}:
+            return "crypto"
+        return "equity"
+
+    def _spec_from_canonical(self, canonical: str) -> InstrumentSpec:
+        """Parse an already-resolved canonical alias string into an
+        :class:`InstrumentSpec` for downstream :meth:`resolve`.
+
+        Reuses the venue mapping established by
+        :func:`live_instrument_bootstrap.canonical_instrument_id`. Closed
+        universe:
+
+        - ``AAPL.NASDAQ`` / ``MSFT.NASDAQ`` → equity / NASDAQ
+        - ``SPY.ARCA`` → equity / ARCA
+        - ``EUR/USD.IDEALPRO`` → forex / IDEALPRO
+        - ``ESM6.CME`` (or similar) → future / CME
+
+        Raises:
+            ValueError: On an unknown venue suffix — callers should
+                widen the closed universe by adding a case here first.
+        """
+        symbol, _, venue = canonical.rpartition(".")
+        if not venue:
+            raise ValueError(
+                f"Canonical alias {canonical!r} has no venue suffix"
+            )
+        if venue == "NASDAQ":
+            return InstrumentSpec(
+                asset_class="equity", symbol=symbol, venue="NASDAQ"
+            )
+        if venue == "ARCA":
+            return InstrumentSpec(
+                asset_class="equity", symbol=symbol, venue="ARCA"
+            )
+        if venue == "IDEALPRO":
+            # symbol here is "EUR/USD"; base = "EUR", quote = "USD"
+            base, _, quote = symbol.partition("/")
+            return InstrumentSpec(
+                asset_class="forex",
+                symbol=base,
+                venue="IDEALPRO",
+                currency=quote or "USD",
+            )
+        if venue == "CME":
+            return InstrumentSpec(
+                asset_class="future", symbol=symbol, venue="CME"
+            )
+        raise ValueError(
+            f"Unknown venue {venue!r} in canonical {canonical!r} — extend "
+            "SecurityMaster._spec_from_canonical for new venues."
+        )
+
+    async def _upsert_definition_and_alias(
+        self,
+        *,
+        raw_symbol: str,
+        listing_venue: str,
+        routing_venue: str,
+        asset_class: str,
+        alias_string: str,
+        provider: str = "interactive_brokers",
+        venue_format: str = "exchange_name",
+    ) -> None:
+        """Idempotent upsert: one :class:`InstrumentDefinition` row +
+        one active :class:`InstrumentAlias` row.
+
+        Called from both :meth:`resolve_for_live` (provider defaults to
+        ``interactive_brokers``, venue_format ``exchange_name``) and
+        Task 9's ``_resolve_databento_continuous`` (provider
+        ``databento``, venue_format ``databento_continuous``).
+
+        Idempotency: scoped to ``(raw_symbol, provider, asset_class)`` —
+        matches the ``uq_instrument_definitions_symbol_provider_asset``
+        unique constraint created by the Task 1 migration. A second
+        call with the same tuple updates ``refreshed_at`` and skips the
+        alias insert if an active (``effective_to IS NULL``) alias
+        already exists for the same ``(alias_string, provider)``.
+        """
+        from msai.models.instrument_alias import InstrumentAlias
+        from msai.models.instrument_definition import InstrumentDefinition
+
+        stmt = select(InstrumentDefinition).where(
+            InstrumentDefinition.raw_symbol == raw_symbol,
+            InstrumentDefinition.provider == provider,
+            InstrumentDefinition.asset_class == asset_class,
+        )
+        idef = (await self._db.execute(stmt)).scalar_one_or_none()
+        if idef is None:
+            idef = InstrumentDefinition(
+                raw_symbol=raw_symbol,
+                listing_venue=listing_venue,
+                routing_venue=routing_venue,
+                asset_class=asset_class,
+                provider=provider,
+                lifecycle_state="active",
+            )
+            self._db.add(idef)
+            await self._db.flush()
+        # Only insert the alias row if an active one doesn't already
+        # exist — scoped to (alias_string, provider) like the
+        # uq_instrument_aliases_string_provider_from unique constraint.
+        alias_stmt = select(InstrumentAlias).where(
+            InstrumentAlias.alias_string == alias_string,
+            InstrumentAlias.provider == provider,
+            InstrumentAlias.effective_to.is_(None),
+        )
+        existing_alias = (
+            await self._db.execute(alias_stmt)
+        ).scalar_one_or_none()
+        if existing_alias is None:
+            self._db.add(
+                InstrumentAlias(
+                    instrument_uid=idef.instrument_uid,
+                    alias_string=alias_string,
+                    venue_format=venue_format,
+                    provider=provider,
+                    effective_from=datetime.now(UTC).date(),
+                )
+            )
+        idef.refreshed_at = datetime.now(UTC)
+        await self._db.flush()
 
     # ------------------------------------------------------------------
     # Cache IO
