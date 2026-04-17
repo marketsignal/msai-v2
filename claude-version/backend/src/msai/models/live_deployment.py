@@ -33,6 +33,7 @@ only the FIRST start, but a deployment can be (re-)started many times.
 from __future__ import annotations
 
 from datetime import datetime  # noqa: TC003 — required at runtime for SQLAlchemy Mapped[]
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
@@ -40,6 +41,9 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from msai.models.base import Base
+
+if TYPE_CHECKING:
+    from msai.models.live_portfolio_revision import LivePortfolioRevision
 
 
 class LiveDeployment(Base):
@@ -112,14 +116,20 @@ class LiveDeployment(Base):
     Also part of the identity tuple — switching accounts produces a new
     deployment row, not a warm restart on the existing one."""
 
-    ib_login_key: Mapped[str | None] = mapped_column(
-        String(64), nullable=True, index=True
-    )
+    ib_login_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     """IB username (TWS userid) used by this deployment. The supervisor
     multiplexes logical deployments that share an ``ib_login_key`` onto
     a single Nautilus subprocess via Nautilus's multi-account
     ``exec_clients`` feature (PR #3194, 1.225+). Nullable in PR #1 —
     populated by PR #2 at deploy time, enforced NOT NULL in PR #3."""
+
+    portfolio_revision_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("live_portfolio_revisions.id"), index=True, nullable=True
+    )
+    """FK to the frozen portfolio revision that triggered this deployment.
+    Nullable for backward compatibility — existing rows pre-date portfolio-
+    based deployments. Task 10 backfills this column, Task 11 makes it
+    NOT NULL once all rows have a value."""
 
     message_bus_stream: Mapped[str] = mapped_column(String(96), nullable=False)
     """``f"trader-MSAI-{deployment_slug}-stream"`` — the deterministic
@@ -166,6 +176,7 @@ class LiveDeployment(Base):
     # ------------------------------------------------------------------
     strategy: Mapped[Strategy] = relationship(lazy="selectin")  # noqa: F821
     starter: Mapped[User] = relationship(lazy="selectin")  # noqa: F821
+    portfolio_revision: Mapped[LivePortfolioRevision | None] = relationship(lazy="selectin")
 
     # NOTE: no separate composite unique index — UNIQUE(identity_signature)
     # is the single source of identity truth. Decision #7.
