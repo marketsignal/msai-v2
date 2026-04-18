@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from msai.models import Base
@@ -168,3 +169,84 @@ async def test_resolve_for_live_cold_miss_calls_ib_and_upserts(
         ).scalar_one()
         assert alias_row.venue_format == "exchange_name"
         assert alias_row.effective_to is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_live_cold_miss_outside_closed_universe_raises(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Phase-1 closed universe: AAPL/MSFT/SPY/EUR/USD/ES only.
+
+    ``resolve_for_live`` for any other symbol must raise ``ValueError``
+    from :func:`canonical_instrument_id`'s closed-universe guard — and
+    must never reach the IB qualifier (``mock_qualifier.qualify`` stays
+    uncalled).
+    """
+    async with session_factory() as session:
+        mock_qualifier = MagicMock()
+        mock_qualifier.qualify = AsyncMock()
+        sm = SecurityMaster(qualifier=mock_qualifier, db=session)
+        with pytest.raises(ValueError, match="GOOG|closed universe|Unknown"):
+            await sm.resolve_for_live(["GOOG"])
+        mock_qualifier.qualify.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_live_concurrent_cold_miss_is_race_safe(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Two concurrent ``resolve_for_live("MSFT")`` calls from fresh
+    sessions with an empty registry — both should succeed and exactly
+    ONE :class:`InstrumentDefinition` row should exist afterwards.
+
+    Covers the race closed by F2's ``INSERT ... ON CONFLICT DO UPDATE``
+    rewrite of ``_upsert_definition_and_alias`` — the old
+    SELECT-then-INSERT path would intermittently raise ``IntegrityError``
+    on the ``uq_instrument_definitions_symbol_provider_asset`` constraint.
+
+    We use a real Nautilus ``Equity`` instrument as the qualifier's
+    return value so either concurrent path can cache-HIT the other's
+    write and deserialize the JSONB row back into a valid Nautilus
+    instrument via ``_instrument_from_cache_row``.
+    """
+    import asyncio
+
+    from nautilus_trader.test_kit.providers import TestInstrumentProvider
+
+    real_instrument = TestInstrumentProvider.equity(symbol="MSFT", venue="NASDAQ")
+
+    async def _resolve_in_session() -> list[str]:
+        async with session_factory() as session:
+            mock_qualifier = MagicMock()
+            mock_qualifier.qualify = AsyncMock(return_value=real_instrument)
+            mock_provider = MagicMock()
+            mock_provider.contract_details = {}
+            mock_qualifier._provider = mock_provider
+            sm = SecurityMaster(qualifier=mock_qualifier, db=session)
+            result = await sm.resolve_for_live(["MSFT"])
+            # resolve_for_live flushes but does not commit — commit here so
+            # the second concurrent session (and the final count query) can
+            # observe the upsert.
+            await session.commit()
+            return result
+
+    # Two concurrent cold-miss resolves — both should succeed under
+    # ON CONFLICT DO UPDATE semantics.
+    results = await asyncio.gather(_resolve_in_session(), _resolve_in_session())
+    assert results == [["MSFT.NASDAQ"], ["MSFT.NASDAQ"]]
+
+    # Verify exactly ONE InstrumentDefinition row exists — the second
+    # upsert collapsed onto the first via the unique constraint.
+    async with session_factory() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(InstrumentDefinition).where(
+                        InstrumentDefinition.raw_symbol == "MSFT"
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1, f"Expected 1 row, got {len(rows)}"
