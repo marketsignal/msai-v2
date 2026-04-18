@@ -14,7 +14,7 @@ fixture pattern from ``test_instrument_registry.py`` /
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
@@ -250,3 +250,96 @@ async def test_resolve_for_live_concurrent_cold_miss_is_race_safe(
             .all()
         )
         assert len(rows) == 1, f"Expected 1 row, got {len(rows)}"
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_live_closes_prior_active_alias_on_new_insert(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Upserting a new alias for an existing ``(raw_symbol, provider)``
+    must close any prior active alias (``effective_to IS NULL``) so the
+    ``[effective_from, effective_to)`` windows stay non-overlapping.
+
+    Scenario: ``AAPL`` exists under provider=interactive_brokers with an
+    active alias ``AAPL.NASDAQ``. A refresh / venue change causes the
+    qualifier to return a new canonical ``AAPL.ARCA``. After the upsert,
+    the old alias MUST have ``effective_to=today`` and the new one MUST
+    be active — exactly one active alias per ``(instrument_uid, provider)``
+    at any point.
+    """
+    async with session_factory() as session:
+        # Arrange — seed AAPL + active AAPL.NASDAQ alias.
+        idef = InstrumentDefinition(
+            raw_symbol="AAPL",
+            listing_venue="NASDAQ",
+            routing_venue="NASDAQ",
+            asset_class="equity",
+            provider="interactive_brokers",
+            lifecycle_state="active",
+        )
+        session.add(idef)
+        await session.flush()
+        session.add(
+            InstrumentAlias(
+                instrument_uid=idef.instrument_uid,
+                alias_string="AAPL.NASDAQ",
+                venue_format="exchange_name",
+                provider="interactive_brokers",
+                effective_from=date(2026, 1, 1),
+            )
+        )
+        await session.commit()
+
+        sm = SecurityMaster(qualifier=MagicMock(), db=session)
+
+        # Act — directly invoke the upsert helper with a new alias.
+        # (The helper is the subject of the fix; exercising it directly
+        # avoids the warm-path short-circuit in ``resolve_for_live``.)
+        await sm._upsert_definition_and_alias(
+            raw_symbol="AAPL",
+            listing_venue="ARCA",
+            routing_venue="ARCA",
+            asset_class="equity",
+            alias_string="AAPL.ARCA",
+        )
+        await session.commit()
+
+        # Assert — old alias closed today, new alias active.
+        today = datetime.now(UTC).date()
+        old_alias = (
+            await session.execute(
+                select(InstrumentAlias).where(
+                    InstrumentAlias.alias_string == "AAPL.NASDAQ",
+                    InstrumentAlias.provider == "interactive_brokers",
+                )
+            )
+        ).scalar_one()
+        assert old_alias.effective_to == today
+
+        new_alias = (
+            await session.execute(
+                select(InstrumentAlias).where(
+                    InstrumentAlias.alias_string == "AAPL.ARCA",
+                    InstrumentAlias.provider == "interactive_brokers",
+                )
+            )
+        ).scalar_one()
+        assert new_alias.effective_to is None
+        assert new_alias.effective_from == today
+
+        # Invariant — exactly one active alias for this (instrument_uid,
+        # provider) pair.
+        active_count = len(
+            (
+                await session.execute(
+                    select(InstrumentAlias).where(
+                        InstrumentAlias.instrument_uid == idef.instrument_uid,
+                        InstrumentAlias.provider == "interactive_brokers",
+                        InstrumentAlias.effective_to.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert active_count == 1

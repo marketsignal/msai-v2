@@ -42,7 +42,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from msai.core.config import settings
@@ -621,9 +621,34 @@ class SecurityMaster:
         result = await self._db.execute(def_stmt)
         instrument_uid = result.scalar_one()
 
+        today = now.date()
+
+        # Close any previous active aliases for this
+        # ``(instrument_uid, provider)`` so the new alias becomes the single
+        # active one per the half-open ``[effective_from, effective_to)``
+        # window invariant. Callers pick the active alias via
+        # ``next((a for a in idef.aliases if a.effective_to is None))`` —
+        # without this, a futures roll or repeated refreshes on different
+        # days leave multiple aliases active simultaneously and the caller
+        # picks arbitrarily.
+        close_stmt = (
+            update(InstrumentAlias)
+            .where(
+                InstrumentAlias.instrument_uid == instrument_uid,
+                InstrumentAlias.provider == provider,
+                InstrumentAlias.effective_to.is_(None),
+                # Don't close an alias that's about to be re-inserted today
+                # (idempotent same-day refresh path — the insert below is
+                # ON CONFLICT DO NOTHING on
+                # ``(alias_string, provider, effective_from)``).
+                InstrumentAlias.alias_string != alias_string,
+            )
+            .values(effective_to=today)
+        )
+        await self._db.execute(close_stmt)
+
         # Alias upsert — ON CONFLICT DO NOTHING since the uniqueness key
         # includes ``effective_from`` so a same-day re-upsert is a no-op.
-        today = now.date()
         alias_stmt = (
             pg_insert(InstrumentAlias.__table__)
             .values(
