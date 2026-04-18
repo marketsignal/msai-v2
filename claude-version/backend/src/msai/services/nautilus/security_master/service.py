@@ -39,7 +39,7 @@ Bulk resolve semantics:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select, update
@@ -251,20 +251,14 @@ class SecurityMaster:
         for sym in symbols:
             # Warm path A — caller passed an already-qualified dotted alias
             if "." in sym:
-                idef = await registry.find_by_alias(
-                    sym, provider="interactive_brokers"
-                )
+                idef = await registry.find_by_alias(sym, provider="interactive_brokers")
                 if idef is not None:
                     out.append(sym)
                     continue
             # Warm path B — caller passed a bare ticker, resolve to active alias
-            idef = await registry.find_by_raw_symbol(
-                sym, provider="interactive_brokers"
-            )
+            idef = await registry.find_by_raw_symbol(sym, provider="interactive_brokers")
             if idef is not None:
-                active_alias = next(
-                    (a for a in idef.aliases if a.effective_to is None), None
-                )
+                active_alias = next((a for a in idef.aliases if a.effective_to is None), None)
                 if active_alias is not None:
                     out.append(active_alias.alias_string)
                     continue
@@ -360,6 +354,11 @@ class SecurityMaster:
         )
 
         registry = InstrumentRegistry(self._db)
+        # Window alias lookups by ``start`` so historical backtests get the
+        # alias that was active *during* the backtest window, not today's
+        # front-month / current listing venue. Falls back to today when the
+        # caller doesn't scope a window (live-like resolve).
+        as_of = date.fromisoformat(start) if start else datetime.now(UTC).date()
         out: list[str] = []
         for sym in symbols:
             # Path 1 — Databento continuous pattern.
@@ -373,7 +372,7 @@ class SecurityMaster:
 
             # Path 2 — dotted alias already in registry.
             if "." in sym:
-                idef = await registry.find_by_alias(sym, provider="databento")
+                idef = await registry.find_by_alias(sym, provider="databento", as_of_date=as_of)
                 if idef is not None:
                     out.append(sym)
                     continue
@@ -387,7 +386,13 @@ class SecurityMaster:
             idef = await registry.find_by_raw_symbol(sym, provider="databento")
             if idef is not None:
                 active_alias = next(
-                    (a for a in idef.aliases if a.effective_to is None), None
+                    (
+                        a
+                        for a in idef.aliases
+                        if a.effective_from <= as_of
+                        and (a.effective_to is None or a.effective_to > as_of)
+                    ),
+                    None,
                 )
                 if active_alias is not None:
                     out.append(active_alias.alias_string)
@@ -445,9 +450,7 @@ class SecurityMaster:
         # Step 1 — warm path.
         idef = await registry.find_by_raw_symbol(raw, provider="databento")
         if idef is not None:
-            active_alias = next(
-                (a for a in idef.aliases if a.effective_to is None), None
-            )
+            active_alias = next((a for a in idef.aliases if a.effective_to is None), None)
             if active_alias is not None:
                 return active_alias.alias_string
 
@@ -535,17 +538,11 @@ class SecurityMaster:
         """
         symbol, _, venue = canonical.rpartition(".")
         if not venue:
-            raise ValueError(
-                f"Canonical alias {canonical!r} has no venue suffix"
-            )
+            raise ValueError(f"Canonical alias {canonical!r} has no venue suffix")
         if venue == "NASDAQ":
-            return InstrumentSpec(
-                asset_class="equity", symbol=symbol, venue="NASDAQ"
-            )
+            return InstrumentSpec(asset_class="equity", symbol=symbol, venue="NASDAQ")
         if venue == "ARCA":
-            return InstrumentSpec(
-                asset_class="equity", symbol=symbol, venue="ARCA"
-            )
+            return InstrumentSpec(asset_class="equity", symbol=symbol, venue="ARCA")
         if venue == "IDEALPRO":
             # symbol here is "EUR/USD"; base = "EUR", quote = "USD"
             base, _, quote = symbol.partition("/")
@@ -556,9 +553,7 @@ class SecurityMaster:
                 currency=quote or "USD",
             )
         if venue == "CME":
-            return InstrumentSpec(
-                asset_class="future", symbol=symbol, venue="CME"
-            )
+            return InstrumentSpec(asset_class="future", symbol=symbol, venue="CME")
         raise ValueError(
             f"Unknown venue {venue!r} in canonical {canonical!r} — extend "
             "SecurityMaster._spec_from_canonical for new venues."

@@ -203,3 +203,119 @@ async def test_resolve_for_backtest_continuous_happy_path(
         ).scalar_one()
         assert alias_row.venue_format == "databento_continuous"
         assert alias_row.effective_to is None
+
+
+async def _seed_aapl_with_venue_swap(
+    session: AsyncSession,
+) -> InstrumentDefinition:
+    """Seed AAPL under two consecutive venue aliases.
+
+    - ``AAPL.NASDAQ`` active 2020-01-01 → 2023-01-01 (closed window).
+    - ``AAPL.ARCA`` active 2023-01-01 → NULL (open window, currently live).
+
+    Used by the start-date windowing tests below.
+    """
+    from datetime import date
+
+    idef = InstrumentDefinition(
+        raw_symbol="AAPL",
+        listing_venue="NASDAQ",
+        routing_venue="NASDAQ",
+        asset_class="equity",
+        provider="databento",
+        roll_policy="none",
+        lifecycle_state="active",
+    )
+    session.add(idef)
+    await session.flush()
+
+    session.add_all(
+        [
+            InstrumentAlias(
+                instrument_uid=idef.instrument_uid,
+                alias_string="AAPL.NASDAQ",
+                venue_format="exchange_name",
+                provider="databento",
+                effective_from=date(2020, 1, 1),
+                effective_to=date(2023, 1, 1),
+            ),
+            InstrumentAlias(
+                instrument_uid=idef.instrument_uid,
+                alias_string="AAPL.ARCA",
+                venue_format="exchange_name",
+                provider="databento",
+                effective_from=date(2023, 1, 1),
+                effective_to=None,
+            ),
+        ]
+    )
+    await session.commit()
+    return idef
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_backtest_dotted_alias_honors_start_date(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Path 2 (dotted alias) must window ``find_by_alias`` by ``start``.
+
+    Historical backtest with ``start="2022-06-01"`` requests
+    ``AAPL.NASDAQ`` — the alias active in 2022 (closed 2023). With today
+    > 2023 the default (today) windowing in ``find_by_alias`` returns
+    ``None`` and the resolver raises ``DatabentoDefinitionMissing``.
+    After the fix, threading ``start`` into ``find_by_alias`` hits the
+    closed-window row and returns the original ``AAPL.NASDAQ`` string.
+    """
+    async with session_factory() as session:
+        await _seed_aapl_with_venue_swap(session)
+        sm = SecurityMaster(db=session, databento_client=None)
+
+        ids = await sm.resolve_for_backtest(
+            ["AAPL.NASDAQ"], start="2022-06-01", end="2022-12-31"
+        )
+
+        assert ids == ["AAPL.NASDAQ"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_backtest_bare_ticker_honors_start_date(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Path 3 (bare ticker) must pick the alias active on ``start``.
+
+    With two aliases on the same definition (NASDAQ closed 2023, ARCA
+    open), a historical backtest with ``start="2022-06-01"`` must
+    resolve ``AAPL`` → ``AAPL.NASDAQ`` (the venue the symbol was
+    actually listed on during the window). The current code picks the
+    one with ``effective_to IS NULL`` → ``AAPL.ARCA``, which would
+    mis-partition parquet reads / silently return wrong data.
+    """
+    async with session_factory() as session:
+        await _seed_aapl_with_venue_swap(session)
+        sm = SecurityMaster(db=session, databento_client=None)
+
+        ids = await sm.resolve_for_backtest(
+            ["AAPL"], start="2022-06-01", end="2022-12-31"
+        )
+
+        assert ids == ["AAPL.NASDAQ"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_backtest_bare_ticker_no_start_uses_today(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Regression guard: ``start=None`` must still resolve to today's
+    active alias.
+
+    Same seed as the windowing tests, but no ``start`` passed → today's
+    window is in [2023-01-01, NULL), so the bare-ticker path must return
+    ``AAPL.ARCA``. Prevents the fix from over-correcting.
+    """
+    async with session_factory() as session:
+        await _seed_aapl_with_venue_swap(session)
+        sm = SecurityMaster(db=session, databento_client=None)
+
+        ids = await sm.resolve_for_backtest(["AAPL"])
+
+        assert ids == ["AAPL.ARCA"]

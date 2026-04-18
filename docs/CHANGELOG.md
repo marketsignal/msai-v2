@@ -63,6 +63,21 @@ All notable changes to msai-v2 will be documented in this file.
 
 **PR shipped as:** squash commit `a52046f` on main (2026-04-17).
 
+### 2026-04-18 — Fix: `resolve_for_backtest` honors `start` for alias windowing
+
+Closes known-limitation #2 from the PR #32 CHANGELOG entry. `SecurityMaster.resolve_for_backtest` was defaulting alias lookups to today UTC, so post-roll historical backtests silently received today's front-month / current listing venue instead of the contract active during the backtest window. Two warm paths were affected:
+
+- **Path 2 (dotted alias)** — `registry.find_by_alias(sym, provider="databento")` missed `as_of_date=`, so `find_by_alias` defaulted to today. A closed-window alias (e.g. `AAPL.NASDAQ`, effective 2020–2023) returned `None` under today's date and raised a misleading `DatabentoDefinitionMissing`.
+- **Path 3 (bare ticker)** — selected the alias with `effective_to IS NULL` (currently-open), not the alias active on `start_date`.
+
+Fix parses the existing `start: str | None` kwarg once (`date.fromisoformat(start) if start else datetime.now(UTC).date()`) and threads the resulting `date` through both paths. `find_by_alias` already accepted `as_of_date: date | None`, so no signature change was needed at the registry layer. Path 3 now filters aliases by the full half-open window predicate `effective_from <= as_of AND (effective_to IS NULL OR effective_to > as_of)`, matching `find_by_alias`'s SQL semantics.
+
+3 new integration tests (`test_resolve_for_backtest_dotted_alias_honors_start_date`, `test_resolve_for_backtest_bare_ticker_honors_start_date`, `test_resolve_for_backtest_bare_ticker_no_start_uses_today`) seed AAPL with two consecutive venue aliases (`AAPL.NASDAQ` 2020–2023, `AAPL.ARCA` 2023–∞) and pin the three regressions: historical dotted, historical bare-ticker, and today-default. All 6 tests in `test_security_master_resolve_backtest.py` pass; 122 tests in the security_master/backtest scope pass; ruff + mypy clean on the changed lines.
+
+Solution doc: `docs/solutions/backtesting/alias-windowing-by-start-date.md`.
+
+Incidental: ruff-format normalized ~10 multi-line-to-single-line call sites in adjacent methods (`resolve_for_live`, `_resolve_databento_continuous`, `_spec_from_canonical`) when the formatter ran on save. These are whitespace-only, aligned with project style (python-style.md line-length 100), and would flip on any future edit to the file regardless.
+
 ### Changed
 
 - 2026-04-16: Live-supervisor now canonicalizes user-facing instrument ids before passing to strategy config — e.g., `ES.CME` → `ESM6.CME` for futures, identity for stocks/ETF/FX. Overwrites stale explicit `instrument_id` / `bar_type` only when the root symbol changes (futures rollover), preserving operator aggregation choices on stocks/FX.
