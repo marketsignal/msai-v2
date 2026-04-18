@@ -33,7 +33,10 @@ from msai.schemas.backtest import (
     BacktestStatusResponse,
 )
 from msai.services.data_sources.databento_client import DatabentoClient
-from msai.services.nautilus.security_master.service import SecurityMaster
+from msai.services.nautilus.security_master.service import (
+    DatabentoDefinitionMissing,
+    SecurityMaster,
+)
 
 log = get_logger(__name__)
 
@@ -100,11 +103,32 @@ async def run_backtest(
         db=db,
         databento_client=databento_client,
     )
-    canonical_instruments = await security_master.resolve_for_backtest(
-        body.instruments,
-        start=body.start_date.isoformat(),
-        end=body.end_date.isoformat(),
-    )
+    try:
+        canonical_instruments = await security_master.resolve_for_backtest(
+            body.instruments,
+            start=body.start_date.isoformat(),
+            end=body.end_date.isoformat(),
+        )
+    except DatabentoDefinitionMissing as exc:
+        log.warning(
+            "backtest_instrument_unresolved",
+            symbols=body.instruments,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        log.warning(
+            "backtest_instrument_value_error",
+            symbols=body.instruments,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
 
     # Create the backtest record
     backtest = Backtest(

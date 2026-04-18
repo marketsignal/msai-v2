@@ -219,18 +219,16 @@ async def test_run_backtest_raises_when_registry_is_empty(
 
     When the registry has no row under ``provider="databento"`` for a
     bare ticker, :meth:`SecurityMaster.resolve_for_backtest` raises
-    :class:`DatabentoDefinitionMissing`. The endpoint has no try/except
-    around the resolver call, so the exception propagates through the
-    ASGI pipeline.
-
-    We build a dedicated httpx client with ``raise_app_exceptions=False``
-    so the exception surfaces as a 500 at the HTTP layer instead of
-    re-raising into the test body — this mirrors production behavior
-    (uvicorn → FastAPI error middleware → 500 Internal Server Error).
+    :class:`DatabentoDefinitionMissing`. The endpoint catches it and
+    surfaces a 422 ``UNPROCESSABLE_ENTITY`` response whose ``detail``
+    carries the operator hint pointing at
+    ``msai instruments refresh --symbols <X> --provider databento``.
 
     This test anchors the semantic change: the old closed-universe
     ``canonical_instrument_id`` helper would have silently produced
-    ``"MSFT.NASDAQ"``; the new registry path refuses to guess.
+    ``"MSFT.NASDAQ"``; the new registry path refuses to guess and the
+    API returns a well-formed 422 instead of leaking a 500 with a
+    traceback.
     """
 
     async def _override_get_db() -> AsyncIterator[AsyncSession]:
@@ -257,7 +255,7 @@ async def test_run_backtest_raises_when_registry_is_empty(
     }
 
     try:
-        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
             with patch(
                 "msai.api.backtests.get_redis_pool",
@@ -268,9 +266,13 @@ async def test_run_backtest_raises_when_registry_is_empty(
         app.dependency_overrides.pop(get_db, None)
         app.dependency_overrides.pop(get_current_user, None)
 
-    # 500 is the default for an unhandled exception — we deliberately
-    # don't wrap the resolver's DatabentoDefinitionMissing in an HTTP
-    # exception because the operator-facing failure path is the CLI
-    # (``msai instruments refresh``) not the API. Any 2xx here would
-    # indicate silent fallback to the deprecated canonical_instrument_id.
-    assert response.status_code == 500
+    # 422 is the operator-facing failure — the resolver raised
+    # DatabentoDefinitionMissing because the registry has no active row
+    # under provider='databento' for 'MSFT', and the endpoint surfaces
+    # that as a well-formed HTTP response whose ``detail`` contains the
+    # ``msai instruments refresh`` hint. Any 2xx here would indicate
+    # silent fallback to the deprecated canonical_instrument_id helper.
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "MSFT" in detail
+    assert "msai instruments refresh" in detail
