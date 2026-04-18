@@ -33,10 +33,22 @@ if TYPE_CHECKING:
 
 
 def _make_mock_databento_module() -> ModuleType:
-    """Create a fake ``databento`` module whose ``Historical`` records calls."""
+    """Create a fake ``databento`` module whose ``Historical`` records calls.
+
+    ``get_range(..., path=...)`` writes a placeholder byte to ``path`` so
+    the subsequent atomic ``tmp_path.replace(target_path)`` succeeds. The
+    real Databento SDK writes the ``.dbn.zst`` payload here.
+    """
+
+    def _write_stub(*_args: object, **kwargs: object) -> None:
+        from pathlib import Path
+
+        path = kwargs.get("path")
+        if path is not None:
+            Path(str(path)).write_bytes(b"")
+
     mock_historical_instance = MagicMock()
-    # ``get_range`` with ``path=`` writes to disk and returns None
-    mock_historical_instance.timeseries.get_range.return_value = None
+    mock_historical_instance.timeseries.get_range.side_effect = _write_stub
 
     mock_module = ModuleType("databento")
     mock_module.Historical = MagicMock(return_value=mock_historical_instance)  # type: ignore[attr-defined]
@@ -140,12 +152,17 @@ class TestFetchDefinitionInstruments:
         # Assert
         assert missing_dir.exists()
 
-    async def test_removes_existing_target_before_download(
+    async def test_overwrites_existing_target_atomically(
         self,
         tmp_path: Path,
     ) -> None:
-        """When ``target_path`` already exists, it is unlinked before download
-        so the Databento SDK can write a fresh payload.
+        """When ``target_path`` already exists and the download succeeds, the
+        stale file is atomically replaced with the fresh download.
+
+        The SDK writes to a sibling ``.tmp`` path first; a successful
+        download ends with ``tmp_path.replace(target_path)``. This preserves
+        the prior good file if the SDK raises (covered by the SDK-error
+        test below).
         """
         # Arrange
         mock_loader = MagicMock()
@@ -174,11 +191,49 @@ class TestFetchDefinitionInstruments:
         finally:
             _restore_databento(original)
 
-        # Assert — the stale file was removed (the mock's get_range does not
-        # re-create it), and get_range was still called exactly once.
+        # Assert — the target file exists (replaced by the rename) and the
+        # sibling ``.tmp`` path has been consumed by the rename.
         historical_instance = mock_module.Historical.return_value  # type: ignore[attr-defined]
         historical_instance.timeseries.get_range.assert_called_once()
-        assert not target.exists()
+        assert target.exists()
+        assert not (tmp_path / "ES.definition.dbn.zst.tmp").exists()
+
+    async def test_preserves_prior_file_when_sdk_fails(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Atomic-rename semantics: if the SDK raises, the prior good file
+        is preserved (no ``unlink`` before the download) and the ``.tmp``
+        sibling is cleaned up.
+        """
+        # Arrange
+        client = DatabentoClient(api_key="test_key")
+        target = tmp_path / "ES.definition.dbn.zst"
+        target.write_bytes(b"prior-good")
+
+        mock_module = ModuleType("databento")
+        mock_historical_instance = MagicMock()
+        mock_historical_instance.timeseries.get_range.side_effect = RuntimeError("boom")
+        mock_module.Historical = MagicMock(return_value=mock_historical_instance)  # type: ignore[attr-defined]
+
+        original = sys.modules.get("databento")
+        sys.modules["databento"] = mock_module
+        try:
+            # Act / Assert
+            with pytest.raises(RuntimeError, match="Databento definition request failed"):
+                await client.fetch_definition_instruments(
+                    "ES.c.0",
+                    "2024-01-01",
+                    "2024-12-31",
+                    dataset="GLBX.MDP3",
+                    target_path=target,
+                )
+        finally:
+            _restore_databento(original)
+
+        # Prior good file is untouched; tmp path was cleaned up.
+        assert target.read_bytes() == b"prior-good"
+        assert not (tmp_path / "ES.definition.dbn.zst.tmp").exists()
 
     async def test_returns_list_of_instruments(
         self,
@@ -247,7 +302,9 @@ class TestFetchDefinitionInstruments:
         finally:
             _restore_databento(original)
 
-        # Assert
+        # Assert — the SDK receives the sibling ``.tmp`` path (atomic download),
+        # NOT the final ``target`` path. A successful rename promotes .tmp to
+        # ``target``; a failing SDK leaves the prior good target in place.
         historical_instance = mock_module.Historical.return_value  # type: ignore[attr-defined]
         call = historical_instance.timeseries.get_range.call_args
         assert call.kwargs["dataset"] == "GLBX.MDP3"
@@ -257,7 +314,7 @@ class TestFetchDefinitionInstruments:
         assert call.kwargs["end"] == "2024-12-31"
         assert call.kwargs["stype_in"] == "continuous"
         assert call.kwargs["stype_out"] == "instrument_id"
-        assert call.kwargs["path"] == target
+        assert call.kwargs["path"] == str(target) + ".tmp"
 
     async def test_raises_without_api_key(self, tmp_path: Path) -> None:
         """When no API key is configured, raise ``RuntimeError`` before any I/O."""

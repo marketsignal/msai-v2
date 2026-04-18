@@ -136,8 +136,9 @@ class DatabentoClient:
         import databento as db
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        if target_path.exists():
-            target_path.unlink()
+        # Atomic rename preserves prior good definition file if SDK fails —
+        # download to a sibling ``.tmp`` first and rename on success.
+        tmp_path = target_path.with_suffix(target_path.suffix + ".tmp")
         client = db.Historical(key=self.api_key)
         try:
             client.timeseries.get_range(
@@ -148,13 +149,15 @@ class DatabentoClient:
                 end=end,
                 stype_in=_databento_stype_in(symbol),
                 stype_out="instrument_id",
-                path=target_path,
+                path=str(tmp_path),
             )
         except Exception as exc:
+            tmp_path.unlink(missing_ok=True)
             raise RuntimeError(
                 f"Databento definition request failed for {symbol} "
                 f"(dataset={dataset}): {exc}"
             ) from exc
+        tmp_path.replace(target_path)
 
         # `use_exchange_as_venue=True` is a per-call kwarg of `from_dbn_file`
         # (see nautilus_trader/adapters/databento/loaders.py:119-128,154-156);
