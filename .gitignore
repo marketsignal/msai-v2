@@ -3,9 +3,6 @@
 .mcp.json
 .playwright-mcp/
 
-# Session state
-CONTINUITY.md
-
 # Python
 __pycache__/
 *.py[cod]
