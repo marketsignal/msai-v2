@@ -159,9 +159,10 @@ class DatabentoClient:
             ) from exc
         tmp_path.replace(target_path)
 
-        # `use_exchange_as_venue=True` is a per-call kwarg of `from_dbn_file`
-        # (see nautilus_trader/adapters/databento/loaders.py:119-128,154-156);
-        # it is NOT a constructor kwarg of `DatabentoDataLoader`.
+        # `use_exchange_as_venue=True` is a per-call kwarg of
+        # `DatabentoDataLoader.from_dbn_file` (see
+        # `nautilus_trader/adapters/databento/loaders.py`); it is NOT a
+        # constructor kwarg of `DatabentoDataLoader`.
         # Setting it ensures CME futures emit venue='CME' not 'GLBX' — keeps
         # registry canonical alias in exchange-name form.
         loader = DatabentoDataLoader()

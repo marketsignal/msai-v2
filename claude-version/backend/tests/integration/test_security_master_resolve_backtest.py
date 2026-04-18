@@ -1,4 +1,4 @@
-"""Integration tests for :meth:`SecurityMaster.resolve_for_backtest` (Task 9).
+"""Integration tests for :meth:`SecurityMaster.resolve_for_backtest`.
 
 Exercises the four paths of the registry-backed backtest resolve:
 

@@ -23,7 +23,7 @@ All notable changes to msai-v2 will be documented in this file.
 - `DatabentoClient.fetch_definition_instruments(...)` — download + decode `.definition.dbn.zst` with `use_exchange_as_venue=True` on `from_dbn_file()` call site.
 - `msai instruments refresh --symbols ... --provider [interactive_brokers|databento]` CLI — pre-warm the registry before deploying strategies. (Databento path works; IB path deferred — see Deferred section.)
 - `SecurityMaster.__init__` relaxed: `qualifier` and `databento_client` both optional (same class now serves backtest + live callers).
-- Continuous-futures helpers: `is_databento_continuous_pattern`, `raw_symbol_from_request`, `ResolvedInstrumentDefinition`, `resolved_databento_definition`, `definition_window_bounds_from_details`, `continuous_needs_refresh_for_window`, `raw_continuous_suffix` (reserved).
+- Continuous-futures helpers: `is_databento_continuous_pattern`, `raw_symbol_from_request`, `ResolvedInstrumentDefinition`, `resolved_databento_definition`, `definition_window_bounds_from_details`, `continuous_needs_refresh_for_window`.
 - Backtest API wired: `POST /api/v1/backtests/run` now resolves via registry (`api/backtests.py:90`).
 - Split-brain normalization: `.XCME` → `.CME` across source docstrings + 26 test fixtures.
 - `.. deprecated::` notices added to `instruments.py` + `live_instrument_bootstrap.py` (modules remain load-bearing for closed-universe live path + live-supervisor payload factory).

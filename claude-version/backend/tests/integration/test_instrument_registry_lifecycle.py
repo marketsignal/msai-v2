@@ -1,4 +1,4 @@
-"""Full-lifecycle integration test for :class:`InstrumentRegistry` (Task 17).
+"""Full-lifecycle integration test for :class:`InstrumentRegistry`.
 
 Walks a single ES futures definition through the complete lifecycle a live
 trading deployment exercises end-to-end:

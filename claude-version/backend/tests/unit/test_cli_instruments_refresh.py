@@ -1,4 +1,4 @@
-"""Unit tests for ``msai instruments refresh`` (Phase 7 / Task 13).
+"""Unit tests for ``msai instruments refresh``.
 
 The refresh command is the PRD §47-48 pre-warm tool for the instrument
 registry.  It has two provider paths:

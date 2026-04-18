@@ -96,7 +96,7 @@ def build_catalog_for_symbol(
             Parquet under ``{asset_class}/ES/``, not ``{asset_class}/ESM6/``,
             so callers that pass a canonical ID MUST also pass the original
             root ticker (``"ES"``) via this kwarg for the path lookup to
-            succeed.  See Codex Phase 5 F9.
+            succeed.
 
             **Worker wiring is a follow-up PR:** today the backtest worker
             (:mod:`msai.workers.backtest_job`) does not yet have access to
@@ -362,8 +362,7 @@ def ensure_catalog_data(
             Required whenever ``symbols`` contains registry-derived
             canonical IDs whose local-part does not match the root ticker
             the ingestion pipeline writes under (e.g. ``ESM6.CME`` ingests
-            under ``futures/ES/``, not ``futures/ESM6/``).  See Codex
-            Phase 5 F9.
+            under ``futures/ES/``, not ``futures/ESM6/``).
 
     Returns:
         The list of canonical Nautilus instrument IDs in the same order as

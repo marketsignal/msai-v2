@@ -82,19 +82,16 @@ async def run_backtest(
     # caller's dict is not mutated downstream.
     worker_config = dict(body.config)
 
-    # v3.0 (Task 11) — resolve every instrument the caller supplied
-    # through the DB-backed registry BEFORE storing the backtest row.
-    # ``SecurityMaster.resolve_for_backtest`` is fail-loud on a warm-
-    # path miss (``DatabentoDefinitionMissing`` — operator must run
-    # ``msai instruments refresh`` first) with a single exception: the
-    # ``<root>.Z.<N>`` continuous-futures synthesis path calls Databento
-    # on cold-miss. The qualifier is ``None`` because backtest
-    # resolution never needs an IB round-trip. The Databento client
-    # follows the existing pattern used at
-    # ``workers/nightly_ingest.py`` and ``services/data_ingestion.py``
-    # (None when the API key is unset — the resolver will raise a
+    # Resolve every instrument the caller supplied through the DB-backed
+    # registry BEFORE storing the backtest row. ``resolve_for_backtest``
+    # is fail-loud on a warm-path miss (``DatabentoDefinitionMissing`` —
+    # operator must run ``msai instruments refresh`` first) with one
+    # exception: the ``<root>.Z.<N>`` continuous-futures synthesis path
+    # calls Databento on cold-miss. Backtest resolution never needs an
+    # IB round-trip, so ``qualifier=None``. ``databento_client`` is
+    # ``None`` when the API key is unset — the resolver will raise a
     # ``ValueError`` with a clear message on the ``.Z.N`` cold-miss
-    # path, which is what we want).
+    # path, which is the desired behaviour.
     databento_client = (
         DatabentoClient(settings.databento_api_key) if settings.databento_api_key else None
     )

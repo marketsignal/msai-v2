@@ -1,19 +1,19 @@
-"""Backtest <-> live parity integration test (Task 18, PRD US-001).
+"""Backtest <-> live parity integration test (PRD US-001).
 
 Pins ``datetime.now()`` via freezegun so both resolve paths observe the same
 ``as_of_date`` and therefore hit the same active aliases, verifying the
 invariant that a strategy referencing ``["AAPL", "ES"]`` sees the identical
 canonical Nautilus ``InstrumentId`` strings in backtest and live execution.
 
-v3.0 scope: AAPL + ES are warm-path resolves — the test only exercises the
-registry lookup path, not the ``.Z.N`` Databento continuous synthesis. The
-continuous-synthesis parity is covered separately by Task 19.
+Scope: AAPL + ES are warm-path resolves — the test only exercises the
+registry lookup path, not the ``.Z.N`` Databento continuous synthesis (that
+parity is covered by the end-to-end continuous-futures backtest test).
 
 Follows the per-module ``session_factory`` fixture pattern shared across the
-Task 3 / 4 / 8 / 9 integration tests. ``mock_qualifier`` is constructed
-inline inside the test body (not a shared fixture) — it is never invoked on
-this warm-hit path, but both resolve entrypoints require a non-``None``
-``SecurityMaster`` to be constructed successfully.
+registry integration tests. ``mock_qualifier`` is constructed inline inside
+the test body (not a shared fixture) — it is never invoked on this warm-hit
+path, but both resolve entrypoints require a non-``None`` ``SecurityMaster``
+to be constructed successfully.
 """
 
 from __future__ import annotations
@@ -69,8 +69,8 @@ async def test_resolve_live_and_backtest_return_identical_ids(
     backtest and live paths. Both resolve ["AAPL", "ES"] to
     ["AAPL.NASDAQ", "ESM6.CME"].
 
-    v3.0: AAPL + ES warm-path resolves hit registry only; no Databento
-    continuous synthesis path exercised here (ES is not .Z.N)."""
+    AAPL + ES warm-path resolves hit the registry only; no Databento
+    continuous synthesis path is exercised here (ES is not ``.Z.N``)."""
     async with session_factory() as session:
         for provider in ("interactive_brokers", "databento"):
             session.add(

@@ -109,10 +109,10 @@ class SecurityMaster:
         self._qualifier = qualifier
         self._db = db
         self._cache_validity = timedelta(days=cache_validity_days)
-        # Stored for Task 9's continuous-futures path
+        # Used by the continuous-futures backtest path
         # (``_resolve_databento_continuous``). ``None`` is permitted for
-        # live-only callers — cold-miss on a Databento continuous symbol
-        # with ``self._databento is None`` raises in Task 9.
+        # live-only callers — a cold-miss on a Databento continuous symbol
+        # with ``self._databento is None`` will raise.
         self._databento = databento_client
 
     async def resolve(self, spec: InstrumentSpec) -> Instrument:
@@ -200,7 +200,7 @@ class SecurityMaster:
         )
 
     # ------------------------------------------------------------------
-    # Live-trading resolve entrypoint (registry-backed, Task 8)
+    # Live-trading resolve entrypoint (registry-backed)
     # ------------------------------------------------------------------
 
     async def resolve_for_live(self, symbols: list[str]) -> list[str]:
@@ -219,15 +219,14 @@ class SecurityMaster:
         #11 — dynamic instrument loading on the trading critical path
         fails at the first bar event, not at startup).
 
-        Cold-miss scope (v2.2 — explicit):
-            The cold-miss path currently delegates to the Phase-1
-            closed-universe :func:`canonical_instrument_id` helper at
-            ``live_instrument_bootstrap.py:123-170``. Symbols outside
-            ``{AAPL, MSFT, SPY, EUR/USD, ES}`` will raise ``ValueError``
-            from that helper. To add a new symbol:
+        Cold-miss scope:
+            The cold-miss path currently delegates to the closed-universe
+            :func:`live_instrument_bootstrap.canonical_instrument_id`
+            helper. Symbols outside ``{AAPL, MSFT, SPY, EUR/USD, ES}``
+            will raise ``ValueError`` from that helper. To add a new
+            symbol:
 
-            1. Extend :func:`canonical_instrument_id`'s if-chain at
-               ``live_instrument_bootstrap.py:123-170``.
+            1. Extend :func:`canonical_instrument_id`'s if-chain.
             2. Extend :meth:`_spec_from_canonical` (below) with the new
                venue case.
             3. Pre-warm the registry via ``msai instruments refresh
@@ -305,7 +304,7 @@ class SecurityMaster:
         return out
 
     # ------------------------------------------------------------------
-    # Backtest resolve entrypoint (registry-backed, Task 9)
+    # Backtest resolve entrypoint (registry-backed)
     # ------------------------------------------------------------------
 
     async def resolve_for_backtest(
@@ -500,27 +499,22 @@ class SecurityMaster:
         """Derive the registry's ``asset_class`` column value from a Nautilus
         :class:`Instrument` via its runtime class name.
 
-        Mirrors the mapping in
-        :func:`security_master.continuous_futures._asset_class_for_instrument_type`
-        (Task 6). Return values MUST match the
-        ``ck_instrument_definitions_asset_class`` CHECK constraint:
-        ``'equity','futures','fx','option','crypto'``.
+        Delegates to
+        :func:`security_master.continuous_futures.asset_class_for_instrument_type`
+        so both the live-resolve path (this method, takes Instrument) and
+        the Databento backtest-resolve path (takes a string type name from
+        the serialized payload) share one mapping and cannot drift.
 
         Note that this differs from :class:`InstrumentSpec.asset_class`
         which uses ``'future'`` (singular) as its literal — the spec
         enum is a separate taxonomy for *input*, not the registry's
         storage enum.
         """
-        cls_name = instrument.__class__.__name__
-        if cls_name in {"FuturesContract", "FuturesSpread"}:
-            return "futures"
-        if cls_name in {"OptionContract", "OptionSpread"}:
-            return "option"
-        if cls_name == "CurrencyPair":
-            return "fx"
-        if cls_name in {"CryptoFuture", "CryptoPerpetual", "CryptoOption"}:
-            return "crypto"
-        return "equity"
+        from msai.services.nautilus.security_master.continuous_futures import (
+            asset_class_for_instrument_type,
+        )
+
+        return asset_class_for_instrument_type(instrument.__class__.__name__)
 
     def _spec_from_canonical(self, canonical: str) -> InstrumentSpec:
         """Parse an already-resolved canonical alias string into an
@@ -586,12 +580,12 @@ class SecurityMaster:
 
         Called from both :meth:`resolve_for_live` (provider defaults to
         ``interactive_brokers``, venue_format ``exchange_name``) and
-        Task 9's ``_resolve_databento_continuous`` (provider
-        ``databento``, venue_format ``databento_continuous``).
+        :meth:`_resolve_databento_continuous` (provider ``databento``,
+        venue_format ``databento_continuous``).
 
         Idempotency: scoped to ``(raw_symbol, provider, asset_class)`` —
         matches the ``uq_instrument_definitions_symbol_provider_asset``
-        unique constraint created by the Task 1 migration. A second call
+        unique constraint created by the registry migration. A second call
         with the same tuple refreshes ``refreshed_at`` and is a no-op on
         the alias side (same-day ``(alias_string, provider,
         effective_from)`` matches the

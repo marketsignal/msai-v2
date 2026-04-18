@@ -169,9 +169,9 @@ New tables `instrument_definitions` + `instrument_aliases` hold control-plane me
 
 **Deferred to follow-up PRs (not yet scheduled):**
 
-- Live-path wiring — `/api/v1/live/start` + supervisor still use closed-universe `canonical_instrument_id()`. Follow-up plan: `docs/plans/2026-04-XX-live-wiring-instrument-registry.md` (skeleton in the main plan file at the end).
-- `instrument_cache` table coexists with the new registry and is not migrated yet. Follow-up: `docs/plans/2026-04-XX-instrument-cache-migration.md`.
-- Strategy config-schema extraction for UI form generation. Follow-up: `docs/plans/2026-04-XX-strategy-config-schema-api.md`.
+- Live-path wiring — `/api/v1/live/start` + supervisor still use closed-universe `canonical_instrument_id()`. Deferred to a follow-up PR — see the skeleton at the end of `docs/plans/2026-04-17-db-backed-strategy-registry.md` §"Split-off PR Skeleton".
+- `instrument_cache` table coexists with the new registry and is not migrated yet. Deferred to a follow-up PR — see the skeleton at the end of `docs/plans/2026-04-17-db-backed-strategy-registry.md` §"Split-off PR Skeleton".
+- Strategy config-schema extraction for UI form generation. Deferred to a follow-up PR — see the skeleton at the end of `docs/plans/2026-04-17-db-backed-strategy-registry.md` §"Split-off PR Skeleton".
 
 The `msai instruments refresh --provider interactive_brokers` path is currently deferred — follow-up PR will add the required `Settings` fields (`ib_request_timeout_seconds`, `ib_instrument_client_id`, etc.) plus the full IBQualifier factory.
 

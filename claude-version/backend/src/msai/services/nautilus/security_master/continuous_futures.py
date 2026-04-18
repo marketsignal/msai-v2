@@ -1,9 +1,9 @@
 """Databento continuous-futures symbology helpers.
 
-Adapted from codex-version ``instrument_service.py:440-451`` (pattern +
-raw-symbol derivation) and ``instrument_service.py:466-605`` (synthesis
-+ window helpers). The Databento Python adapter in Nautilus 1.223.0 has
-no native continuous-symbol normalization (verified: zero grep hits for
+Adapted from the codex-version ``instrument_service`` module (pattern +
+raw-symbol derivation, synthesis, window helpers). The Databento Python
+adapter in Nautilus 1.223.0 has no native continuous-symbol
+normalization (verified: zero grep hits for
 ``continuous|\\.c\\.0|\\.Z\\.`` in ``nautilus_trader/adapters/databento/``),
 so MSAI fills the gap.
 
@@ -21,9 +21,9 @@ from nautilus_trader.model.identifiers import (  # type: ignore[import-not-found
     InstrumentId,
 )
 
-# ``instrument_to_payload`` is the existing parser helper at
-# ``security_master/parser.py:171`` (``nautilus_instrument_to_cache_json``),
-# re-exported here under the shorter name used by the synthesis logic.
+# ``instrument_to_payload`` is the existing parser helper
+# ``nautilus_instrument_to_cache_json``, re-exported here under the
+# shorter name used by the synthesis logic.
 from msai.services.nautilus.security_master.parser import (
     nautilus_instrument_to_cache_json as instrument_to_payload,
 )
@@ -83,8 +83,9 @@ def resolved_databento_definition(
     """Build a synthetic continuous-futures ``ResolvedInstrumentDefinition``
     from a Databento-loaded set of concrete-month instruments.
 
-    Adapted from codex ``instrument_service.py:466-539``. Picks the
-    instrument with the latest ``ts_init``/``ts_event`` as the representative.
+    Adapted from the codex-version ``instrument_service`` module. Picks
+    the instrument with the latest ``ts_init`` / ``ts_event`` as the
+    representative.
     """
     matching = [
         inst for inst in instruments if inst.raw_symbol.value == raw_symbol
@@ -97,14 +98,11 @@ def resolved_databento_definition(
             "into a Nautilus instrument"
         )
 
-    selected = max(
-        matching,
-        key=lambda inst: str(
-            instrument_to_payload(inst).get("ts_init")
-            or instrument_to_payload(inst).get("ts_event")
-            or ""
-        ),
-    )
+    def _ts_sort_key(inst: Instrument) -> str:
+        p = instrument_to_payload(inst)
+        return str(p.get("ts_init") or p.get("ts_event") or "")
+
+    selected = max(matching, key=_ts_sort_key)
     payload = instrument_to_payload(selected)
     venue = selected.id.venue.value
 
@@ -123,7 +121,7 @@ def resolved_databento_definition(
         raw_symbol=raw_symbol,
         listing_venue=venue,
         routing_venue=venue,
-        asset_class=_asset_class_for_instrument_type(instrument_type),
+        asset_class=asset_class_for_instrument_type(instrument_type),
         provider="databento",
         contract_details={
             "dataset": dataset,
@@ -138,7 +136,18 @@ def resolved_databento_definition(
     )
 
 
-def _asset_class_for_instrument_type(instrument_type: str) -> str:
+def asset_class_for_instrument_type(instrument_type: str) -> str:
+    """Map a Nautilus instrument-type name (the runtime ``__class__.__name__``)
+    to the registry's ``asset_class`` column value.
+
+    Single source of truth for the mapping — both
+    :func:`resolved_databento_definition` (string-typed payloads from
+    Databento) and :meth:`SecurityMaster._asset_class_for_instrument`
+    (live ``Instrument`` objects) delegate here so they cannot drift.
+
+    Return values MUST match the ``ck_instrument_definitions_asset_class``
+    CHECK constraint: ``'equity','futures','fx','option','crypto'``.
+    """
     if instrument_type in {"FuturesContract", "FuturesSpread"}:
         return "futures"
     if instrument_type in {"OptionContract", "OptionSpread"}:
@@ -179,21 +188,3 @@ def continuous_needs_refresh_for_window(
     return requested_start < cached_start or requested_end > cached_end
 
 
-def raw_continuous_suffix(symbol: str) -> str | None:
-    """Return the ``.<letter>.<N>`` suffix of a Databento continuous pattern.
-
-    Example: ``"ES.Z.5" → ".Z.5"``. Returns ``None`` if ``symbol`` is not a
-    Databento continuous pattern (lets callers pattern-match without a
-    second regex hit).
-
-    Reserved helper — not used by v3.0's ``resolve_for_backtest`` path but
-    stored here for a planned follow-up that records the continuous
-    suffix on :class:`InstrumentDefinition.continuous_pattern`. The
-    shape matches the ``ck_instrument_definitions_continuous_pattern_shape``
-    CHECK constraint regex ``^\\.[A-Za-z]\\.[0-9]+$`` on the model.
-    """
-    if not is_databento_continuous_pattern(symbol):
-        return None
-    # Pattern matched, so exactly two dots split root/letter/number.
-    _, letter, number = symbol.rsplit(".", 2)
-    return f".{letter}.{number}"

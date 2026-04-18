@@ -1,12 +1,12 @@
 """Integration test — ``POST /api/v1/backtests/run`` resolves instruments
-via :meth:`SecurityMaster.resolve_for_backtest` (Task 11).
+via :meth:`SecurityMaster.resolve_for_backtest`.
 
-The production path change on ``api/backtests.py:90`` replaces the
-closed-universe :func:`canonical_instrument_id` helper with a registry
-lookup. Pre-seeded rows under ``provider="databento"`` MUST win; the
-persisted ``Backtest.instruments`` column MUST contain the canonical
-alias strings returned by the registry (``"AAPL.NASDAQ"``), not the bare
-input (``"AAPL"``).
+The production path replaces the closed-universe
+:func:`canonical_instrument_id` helper with a registry lookup in
+``api/backtests.run_backtest``. Pre-seeded rows under
+``provider="databento"`` MUST win; the persisted ``Backtest.instruments``
+column MUST contain the canonical alias strings returned by the registry
+(``"AAPL.NASDAQ"``), not the bare input (``"AAPL"``).
 
 Follows the per-module ``session_factory`` + ``isolated_postgres_url``
 fixture pattern from ``test_security_master_resolve_backtest.py``. Redis
@@ -100,8 +100,8 @@ async def seeded_aapl_registry(
 ) -> None:
     """Seed ``AAPL`` → ``AAPL.NASDAQ`` under ``provider="databento"``.
 
-    This mirrors the shape ``msai instruments refresh`` will produce in
-    Task 13 — an ``InstrumentDefinition`` row keyed on
+    This mirrors the shape ``msai instruments refresh`` produces — an
+    ``InstrumentDefinition`` row keyed on
     ``(raw_symbol, provider, asset_class)`` plus an active
     :class:`InstrumentAlias` row with ``effective_to=None``.
     """

@@ -794,7 +794,7 @@ def instruments_refresh(
             # SecurityMaster._upsert_definition_and_alias only flushes —
             # without an explicit commit the async session rolls back on
             # context exit and the registry is unchanged despite a
-            # success-looking CLI output.  (Codex Phase 5 F8.)
+            # success-looking CLI output.
             await session.commit()
             return resolved
 

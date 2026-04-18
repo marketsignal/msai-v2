@@ -1,4 +1,4 @@
-"""Integration tests for :meth:`SecurityMaster.resolve_for_live` (Task 8).
+"""Integration tests for :meth:`SecurityMaster.resolve_for_live`.
 
 Exercises the warm / cold paths of the live-trading resolve entrypoint:
 

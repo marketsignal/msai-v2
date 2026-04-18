@@ -219,8 +219,8 @@ class Settings(BaseSettings):
         """Root directory for cached Databento ``.definition.dbn.zst`` payloads
         (``{data_root}/databento_definitions``).
 
-        Used by :meth:`SecurityMaster._resolve_databento_continuous` (Task 9)
-        as the destination for on-demand ``fetch_definition_instruments``
+        Used by :meth:`SecurityMaster._resolve_databento_continuous` as the
+        destination for on-demand ``fetch_definition_instruments``
         downloads. Layout: ``{root}/{dataset}/{raw_symbol}/{start}_{end}.definition.dbn.zst``.
         Persisted under ``data_root`` so the files survive container rebuilds
         via the bind-mounted volume and subsequent backtests of the same

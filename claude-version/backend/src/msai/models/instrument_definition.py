@@ -9,10 +9,12 @@ See ``docs/prds/db-backed-strategy-registry.md`` §6 for the full
 schema rationale.
 
 **Coexistence note (2026-04-17):** the existing ``InstrumentCache``
-model / table (``instrument_cache``) is NOT migrated in this PR. Follow-up
-PR ``docs/plans/2026-04-XX-instrument-cache-migration.md`` handles that
-once Nautilus-native cache durability (``CacheConfig(database=redis)``)
-has proven out through a restart cycle in production.
+model / table (``instrument_cache``) is NOT migrated in this PR. The
+migration is deferred to a follow-up PR — see the split-off skeletons
+at the end of ``docs/plans/2026-04-17-db-backed-strategy-registry.md``.
+The coexistence lasts until Nautilus-native cache durability
+(``CacheConfig(database=redis)``) has proven out through a restart
+cycle in production.
 """
 
 from __future__ import annotations

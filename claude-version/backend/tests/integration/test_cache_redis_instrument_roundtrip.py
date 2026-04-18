@@ -30,7 +30,7 @@ The setup differs from the plan's sketch:
   even if Redis persistence were broken. The right pattern is
   ``Cache(database=CacheDatabaseAdapter(...), config=...)``, which is
   the same pattern :mod:`msai.services.nautilus.projection.position_reader`
-  uses in production (``position_reader.py:196-230``).
+  uses in production.
 
 - The plan used ``cache_a.flush_db()`` as a "flush buffered writes"
   call. That's wrong — ``flush_db`` is a ``FLUSHDB`` in the Redis
@@ -117,10 +117,9 @@ def _build_cache(
     caller can close the adapter explicitly at the end of each
     "process" — mimicking what a TradingNode does on ``dispose()``.
 
-    The ``MsgSpecSerializer`` is constructed the same way
-    ``nautilus_trader/system/kernel.py:313-317`` constructs it in the
-    live path, so the on-wire format is identical to what a live
-    TradingNode would produce.
+    The ``MsgSpecSerializer`` is constructed the same way Nautilus's
+    ``system.kernel`` builds it in the live path, so the on-wire format
+    is identical to what a live TradingNode would produce.
     """
     db_cfg = DatabaseConfig(type="redis", host=redis_host, port=redis_port)
     cache_cfg = CacheConfig(database=db_cfg, encoding="msgpack")

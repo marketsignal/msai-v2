@@ -6,9 +6,9 @@ verify the three contract guarantees:
 
 1. The method exists and returns a ``list`` of Nautilus Instruments.
 2. ``from_dbn_file`` is invoked with ``use_exchange_as_venue=True`` so
-   CME futures emit ``venue='CME'`` (not ``GLBX``) — see the per-call
-   kwarg documented in
-   ``nautilus_trader/adapters/databento/loaders.py:119-128,154-156``.
+   CME futures emit ``venue='CME'`` (not ``GLBX``) — the per-call
+   kwarg is on ``DatabentoDataLoader.from_dbn_file`` in
+   ``nautilus_trader/adapters/databento/loaders.py``.
 3. The destination parent directory is created idempotently and a
    pre-existing download is overwritten.
 """
@@ -83,8 +83,9 @@ class TestFetchDefinitionInstruments:
         self,
         tmp_path: Path,
     ) -> None:
-        """``use_exchange_as_venue=True`` is the per-call kwarg per Nautilus
-        ``adapters/databento/loaders.py:119-128,154-156``.
+        """``use_exchange_as_venue=True`` is the per-call kwarg on
+        ``DatabentoDataLoader.from_dbn_file`` (see
+        ``nautilus_trader/adapters/databento/loaders.py``).
         """
         # Arrange
         mock_loader = MagicMock()

@@ -1,4 +1,4 @@
-"""End-to-end continuous-futures backtest resolve test (Task 19).
+"""End-to-end continuous-futures backtest resolve test.
 
 Placeholder for the ``.Z.N`` cold-miss path:
 
