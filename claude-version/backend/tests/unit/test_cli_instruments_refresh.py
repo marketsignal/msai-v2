@@ -72,6 +72,8 @@ class TestRefreshDatabento:
         fake_sm.resolve_for_backtest = AsyncMock(return_value=["ES.Z.5.GLBX"])
 
         fake_session = MagicMock()
+        fake_session.commit = AsyncMock()
+        fake_session.rollback = AsyncMock()
         fake_session_cm = MagicMock()
         fake_session_cm.__aenter__ = AsyncMock(return_value=fake_session)
         fake_session_cm.__aexit__ = AsyncMock(return_value=None)
@@ -98,6 +100,44 @@ class TestRefreshDatabento:
         fake_sm.resolve_for_backtest.assert_awaited_once()
         call = fake_sm.resolve_for_backtest.await_args
         assert call.args[0] == ["ES.Z.5"]
+        # F8 regression: the CLI must commit the registry writes before the
+        # async session context exits.  Without the explicit commit the
+        # flushed rows from _upsert_definition_and_alias roll back silently.
+        fake_session.commit.assert_awaited_once()
+        fake_session.rollback.assert_not_awaited()
+
+    def test_refresh_databento_rolls_back_on_failure(
+        self,
+        runner: CliRunner,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When resolve_for_backtest raises, the CLI must roll back the
+        session (never commit partial flushed rows)."""
+        monkeypatch.setenv("DATABENTO_API_KEY", "test-key-123")
+
+        fake_sm = MagicMock()
+        fake_sm.resolve_for_backtest = AsyncMock(side_effect=RuntimeError("boom"))
+
+        fake_session = MagicMock()
+        fake_session.commit = AsyncMock()
+        fake_session.rollback = AsyncMock()
+        fake_session_cm = MagicMock()
+        fake_session_cm.__aenter__ = AsyncMock(return_value=fake_session)
+        fake_session_cm.__aexit__ = AsyncMock(return_value=None)
+
+        with (
+            patch("msai.cli.async_session_factory", return_value=fake_session_cm),
+            patch("msai.cli.DatabentoClient"),
+            patch("msai.cli.SecurityMaster", return_value=fake_sm),
+        ):
+            result = runner.invoke(
+                app,
+                ["instruments", "refresh", "--symbols", "ES.Z.5", "--provider", "databento"],
+            )
+
+        assert result.exit_code != 0
+        fake_session.rollback.assert_awaited_once()
+        fake_session.commit.assert_not_awaited()
 
     def test_refresh_databento_raises_without_api_key(
         self,

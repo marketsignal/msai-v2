@@ -779,12 +779,24 @@ def instruments_refresh(
                 db=session,
                 databento_client=databento_client,
             )
-            return await security_master.resolve_for_backtest(
-                symbol_list,
-                start=start,
-                end=end or None,
-                dataset=dataset,
-            )
+            try:
+                resolved = await security_master.resolve_for_backtest(
+                    symbol_list,
+                    start=start,
+                    end=end or None,
+                    dataset=dataset,
+                )
+            except Exception:
+                # Roll back any partial writes before the context exits so
+                # we never leave half-upserted rows behind on failure.
+                await session.rollback()
+                raise
+            # SecurityMaster._upsert_definition_and_alias only flushes —
+            # without an explicit commit the async session rolls back on
+            # context exit and the registry is unchanged despite a
+            # success-looking CLI output.  (Codex Phase 5 F8.)
+            await session.commit()
+            return resolved
 
     typer.echo(f"Pre-warming registry for {symbol_list} via Databento...")
     resolved = asyncio.run(_run())
