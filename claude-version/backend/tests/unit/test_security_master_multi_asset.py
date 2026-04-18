@@ -41,32 +41,32 @@ from msai.services.nautilus.security_master.specs import InstrumentSpec
 class TestFuturesEndToEnd:
     def test_es_june_2025_fixed_month(self) -> None:
         """Standard fixed-month future: ESM5 on CME. The full
-        pipeline produces the canonical id `ESM5.XCME` and the
+        pipeline produces the canonical id `ESM5.CME` and the
         IB contract has secType=FUT + the right
         lastTradeDateOrContractMonth."""
         spec = InstrumentSpec(
             asset_class="future",
             symbol="ES",
-            venue="XCME",
+            venue="CME",
             expiry=date(2025, 6, 20),
         )
-        assert spec.canonical_id() == "ESM5.XCME"
+        assert spec.canonical_id() == "ESM5.CME"
 
         contract = spec_to_ib_contract(spec)
         assert contract.secType == "FUT"
         assert contract.symbol == "ES"
-        assert contract.exchange == "XCME"
+        assert contract.exchange == "CME"
         assert contract.lastTradeDateOrContractMonth == "20250620"
 
     def test_continuous_es_no_expiry(self) -> None:
         """CONTFUT secType for the continuous-front-month ES — the
-        canonical id is just `ES.XCME` (no month/year suffix)."""
+        canonical id is just `ES.CME` (no month/year suffix)."""
         spec = InstrumentSpec(
             asset_class="future",
             symbol="ES",
-            venue="XCME",
+            venue="CME",
         )
-        assert spec.canonical_id() == "ES.XCME"
+        assert spec.canonical_id() == "ES.CME"
 
         contract = spec_to_ib_contract(spec)
         assert contract.secType == "CONTFUT"

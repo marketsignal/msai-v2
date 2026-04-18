@@ -1,7 +1,7 @@
 """InstrumentCache model — cached IB qualification results (Phase 2 task 2.2).
 
 One row per fully-resolved instrument. The primary key is the Nautilus
-canonical instrument ID (``AAPL.NASDAQ``, ``ESM5.XCME``, ...) so two
+canonical instrument ID (``AAPL.NASDAQ``, ``ESM5.CME``, ...) so two
 callers that resolve the same logical instrument share a cache entry
 and Phase 2's SecurityMaster service can do a cache-first lookup.
 
@@ -13,7 +13,7 @@ Columns:
 - ``asset_class`` — one of ``equity``/``future``/``option``/``forex``/``index``
   (indexed for Phase 2's bulk-resolve paths that filter by class).
 - ``venue`` — IB venue acronym, indexed for per-venue queries
-  (e.g. "all XCME futures").
+  (e.g. "all CME futures").
 - ``ib_contract_json`` — full IB ``Contract`` fields as JSONB. Lets the
   SecurityMaster refresh the Nautilus ``Instrument`` without re-hitting
   IB, which matters because IB rate-limits ``reqContractDetails`` to
@@ -85,7 +85,7 @@ class InstrumentCache(Base, TimestampMixin):
         nullable=False,
         index=True,
     )
-    """IB venue acronym (``NASDAQ``, ``XCME``, ``IDEALPRO``, ``SMART``)."""
+    """IB venue acronym (``NASDAQ``, ``CME``, ``IDEALPRO``, ``SMART``)."""
 
     ib_contract_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
     """Full IB ``Contract`` fields as JSONB. Used by SecurityMaster to

@@ -95,10 +95,10 @@ def test_aapl_at_5am_eastern_is_in_eth() -> None:
 
 def test_es_futures_overnight_is_in_eth() -> None:
     service = MarketHoursService()
-    service._cache["ESM5.XCME"] = _futures_hours()  # noqa: SLF001
+    service._cache["ESM5.CME"] = _futures_hours()  # noqa: SLF001
     # 03:00 Chicago time Tuesday = 08:00 UTC
     ts = datetime(2026, 4, 7, 8, 0, tzinfo=UTC)
-    assert service.is_in_eth("ESM5.XCME", ts) is True
+    assert service.is_in_eth("ESM5.CME", ts) is True
 
 
 def test_cross_midnight_window_today_match() -> None:
@@ -106,7 +106,7 @@ def test_cross_midnight_window_today_match() -> None:
     at 18:00 today and closes at 01:00 tomorrow must match
     a 19:00-today timestamp via the today-side branch."""
     service = MarketHoursService()
-    service._cache["ESM5.XCME"] = {  # noqa: SLF001
+    service._cache["ESM5.CME"] = {  # noqa: SLF001
         "timezone": "America/Chicago",
         "rth": [],
         "eth": [
@@ -116,7 +116,7 @@ def test_cross_midnight_window_today_match() -> None:
     }
     # Sunday 19:00 Chicago = Monday 01:00 UTC
     ts = datetime(2026, 4, 13, 0, 0, tzinfo=UTC)  # Sunday 19:00 Chicago
-    assert service.is_in_eth("ESM5.XCME", ts) is True
+    assert service.is_in_eth("ESM5.CME", ts) is True
 
 
 def test_cross_midnight_window_post_midnight_match() -> None:
@@ -124,7 +124,7 @@ def test_cross_midnight_window_post_midnight_match() -> None:
     match: at 00:30 on Monday, we're still inside Sunday's
     18:00 → 01:00 window via the yesterday-side branch."""
     service = MarketHoursService()
-    service._cache["ESM5.XCME"] = {  # noqa: SLF001
+    service._cache["ESM5.CME"] = {  # noqa: SLF001
         "timezone": "America/Chicago",
         "rth": [],
         "eth": [
@@ -133,7 +133,7 @@ def test_cross_midnight_window_post_midnight_match() -> None:
     }
     # Monday 00:30 Chicago = Monday 05:30 UTC (CDT in April)
     ts = datetime(2026, 4, 13, 5, 30, tzinfo=UTC)
-    assert service.is_in_eth("ESM5.XCME", ts) is True
+    assert service.is_in_eth("ESM5.CME", ts) is True
 
 
 def test_cross_midnight_window_outside_match() -> None:
@@ -141,7 +141,7 @@ def test_cross_midnight_window_outside_match() -> None:
     PAST the close=01:00 boundary, so the window must NOT
     match."""
     service = MarketHoursService()
-    service._cache["ESM5.XCME"] = {  # noqa: SLF001
+    service._cache["ESM5.CME"] = {  # noqa: SLF001
         "timezone": "America/Chicago",
         "rth": [],
         "eth": [
@@ -150,7 +150,7 @@ def test_cross_midnight_window_outside_match() -> None:
     }
     # Monday 02:00 Chicago = Monday 07:00 UTC (CDT in April)
     ts = datetime(2026, 4, 13, 7, 0, tzinfo=UTC)
-    assert service.is_in_eth("ESM5.XCME", ts) is False
+    assert service.is_in_eth("ESM5.CME", ts) is False
 
 
 # ----------------------------------------------------------------------

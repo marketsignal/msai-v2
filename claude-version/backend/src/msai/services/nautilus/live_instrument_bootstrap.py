@@ -20,6 +20,15 @@ Phase 1 hardcodes a closed AAPL/MSFT universe so the live-supervisor
 smoke test can run end-to-end against IB Gateway paper. Phase 2
 replaces this with the full SecurityMaster lookup driven by the
 ``Strategy.instruments`` JSONB column.
+
+.. deprecated::
+    The front-month rollover + provider-config helpers here remain
+    load-bearing for:
+    (1) the live-supervisor payload factory,
+    (2) ``live_node_config.build_ib_instrument_provider_config``,
+    (3) ``SecurityMaster.resolve_for_live``'s cold-miss fallback.
+    All three migrate to registry-driven resolution in the follow-up
+    live-wiring PR.
 """
 
 from __future__ import annotations
@@ -79,7 +88,7 @@ def _current_quarterly_expiry(today: date) -> str:
 
     Operators who need the expiring contract on Friday morning should
     start deployments before midnight CT Thursday, or pin the explicit
-    fully-qualified month id (e.g., ``ESM6.XCME``) in deployment config.
+    fully-qualified month id (e.g., ``ESM6.CME``) in deployment config.
 
     IB rejects FUT contracts without an explicit
     ``lastTradeDateOrContractMonth`` as ambiguous ("Unable to resolve

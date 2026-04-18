@@ -72,7 +72,7 @@ def _extract_venues_from_instrument_ids(instrument_ids: list[str]) -> list[str]:
     venue suffix is everything after the FINAL ``.`` (Nautilus's
     simplified symbology puts the venue last --
     ``"C AAPL 20260515 150.SMART"``). A single backtest spanning
-    multiple venues (e.g. ``["AAPL.NASDAQ", "ESM5.XCME"]``) returns
+    multiple venues (e.g. ``["AAPL.NASDAQ", "ESM5.CME"]``) returns
     both names so the runner can build one ``BacktestVenueConfig``
     per unique venue.
 

@@ -162,7 +162,7 @@ async def test_query_by_asset_class_and_venue_uses_composite_index(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """The ``ix_instrument_cache_class_venue`` composite index backs
-    Phase 2's bulk-resolve filter ("give me all XCME futures"). We
+    Phase 2's bulk-resolve filter ("give me all CME futures"). We
     can't directly assert PostgreSQL uses the index, but we can
     verify the query returns the expected row set and the index
     exists in the schema."""
@@ -171,18 +171,18 @@ async def test_query_by_asset_class_and_venue_uses_composite_index(
         session.add_all(
             [
                 InstrumentCache(
-                    canonical_id="ESM5.XCME",
+                    canonical_id="ESM5.CME",
                     asset_class="future",
-                    venue="XCME",
+                    venue="CME",
                     ib_contract_json={"secType": "FUT"},
                     nautilus_instrument_json={"type": "FuturesContract"},
                     trading_hours=None,
                     last_refreshed_at=now,
                 ),
                 InstrumentCache(
-                    canonical_id="NQM5.XCME",
+                    canonical_id="NQM5.CME",
                     asset_class="future",
-                    venue="XCME",
+                    venue="CME",
                     ib_contract_json={"secType": "FUT"},
                     nautilus_instrument_json={"type": "FuturesContract"},
                     trading_hours=None,
@@ -207,7 +207,7 @@ async def test_query_by_asset_class_and_venue_uses_composite_index(
                     select(InstrumentCache)
                     .where(
                         InstrumentCache.asset_class == "future",
-                        InstrumentCache.venue == "XCME",
+                        InstrumentCache.venue == "CME",
                     )
                     .order_by(InstrumentCache.canonical_id)
                 )
@@ -216,7 +216,7 @@ async def test_query_by_asset_class_and_venue_uses_composite_index(
             .all()
         )
         assert len(rows) == 2
-        assert {r.canonical_id for r in rows} == {"ESM5.XCME", "NQM5.XCME"}
+        assert {r.canonical_id for r in rows} == {"ESM5.CME", "NQM5.CME"}
 
 
 @pytest.mark.asyncio

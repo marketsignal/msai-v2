@@ -40,28 +40,45 @@ Bulk resolve semantics:
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from msai.core.config import settings
 from msai.models.instrument_cache import InstrumentCache
+from msai.services.nautilus.security_master.continuous_futures import (
+    is_databento_continuous_pattern,
+    raw_symbol_from_request,
+    resolved_databento_definition,
+)
 from msai.services.nautilus.security_master.parser import (
     extract_trading_hours,
     nautilus_instrument_to_cache_json,
 )
+from msai.services.nautilus.security_master.specs import InstrumentSpec
 
 if TYPE_CHECKING:
     from nautilus_trader.model.instruments import Instrument
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from msai.services.data_sources.databento_client import DatabentoClient
     from msai.services.nautilus.security_master.ib_qualifier import IBQualifier
-    from msai.services.nautilus.security_master.specs import InstrumentSpec
 
 
 DEFAULT_CACHE_VALIDITY_DAYS = 30
 """Rows older than this are considered stale — the next resolve
 returns the cached value AND schedules a background refresh."""
+
+
+class DatabentoDefinitionMissing(Exception):  # noqa: N818 — spec-mandated name (codex parity)
+    """Raised by :meth:`SecurityMaster.resolve_for_backtest` when a requested
+    symbol has no active registry row under the ``databento`` provider and
+    the operator has not pre-warmed the registry.
+
+    Backtests are fail-loud on cold-miss — the error carries the original
+    symbol and an operator hint pointing to ``msai instruments refresh``.
+    """
 
 
 class SecurityMaster:
@@ -84,13 +101,19 @@ class SecurityMaster:
     def __init__(
         self,
         *,
-        qualifier: IBQualifier,
+        qualifier: IBQualifier | None = None,
         db: AsyncSession,
         cache_validity_days: int = DEFAULT_CACHE_VALIDITY_DAYS,
+        databento_client: DatabentoClient | None = None,
     ) -> None:
         self._qualifier = qualifier
         self._db = db
         self._cache_validity = timedelta(days=cache_validity_days)
+        # Used by the continuous-futures backtest path
+        # (``_resolve_databento_continuous``). ``None`` is permitted for
+        # live-only callers — a cold-miss on a Databento continuous symbol
+        # with ``self._databento is None`` will raise.
+        self._databento = databento_client
 
     async def resolve(self, spec: InstrumentSpec) -> Instrument:
         """Resolve a single spec, consulting the cache first.
@@ -105,6 +128,12 @@ class SecurityMaster:
             return _instrument_from_cache_row(cached)
 
         # Cache miss — qualify, extract trading hours, write, return.
+        if self._qualifier is None:
+            raise ValueError(
+                f"Cache miss for spec {spec!r} requires an IBQualifier — "
+                "construct SecurityMaster with qualifier=... or pre-warm "
+                "the cache via resolve_for_backtest / resolve_for_live."
+            )
         instrument = await self._qualifier.qualify(spec)
         trading_hours_json = self._trading_hours_for(
             canonical_id=canonical_id,
@@ -169,6 +198,472 @@ class SecurityMaster:
             "contract details; the background-refresh scheduler lands "
             "in Phase 4. Callers should use resolve() for now."
         )
+
+    # ------------------------------------------------------------------
+    # Live-trading resolve entrypoint (registry-backed)
+    # ------------------------------------------------------------------
+
+    async def resolve_for_live(self, symbols: list[str]) -> list[str]:
+        """Return canonical Nautilus ``InstrumentId`` strings for ``symbols``.
+
+        Warm path: registry hit by alias OR raw_symbol → return the active
+        alias. Cold path: delegate to the Phase-1 closed-universe
+        :func:`canonical_instrument_id` helper, resolve the built
+        :class:`InstrumentSpec` through the existing cache-first
+        :meth:`resolve`, then upsert
+        ``instrument_definitions`` + ``instrument_aliases`` so the next
+        call goes down the warm path.
+
+        Non-hot-path; uses ``self._db`` + optional IB qualify round-trips.
+        Callers must pre-warm before ``TradingNode.run()`` (gotchas #9,
+        #11 — dynamic instrument loading on the trading critical path
+        fails at the first bar event, not at startup).
+
+        Cold-miss scope:
+            The cold-miss path currently delegates to the closed-universe
+            :func:`live_instrument_bootstrap.canonical_instrument_id`
+            helper. Symbols outside ``{AAPL, MSFT, SPY, EUR/USD, ES}``
+            will raise ``ValueError`` from that helper. To add a new
+            symbol:
+
+            1. Extend :func:`canonical_instrument_id`'s if-chain.
+            2. Extend :meth:`_spec_from_canonical` (below) with the new
+               venue case.
+            3. Pre-warm the registry via ``msai instruments refresh
+               --symbols <NEW>`` so future hits go down the warm path
+               instead of the cold path.
+
+        Raises:
+            ValueError: A cold-miss path was required but ``self._qualifier``
+                is ``None`` — construct the :class:`SecurityMaster` with
+                ``qualifier=...`` for any live-trading entrypoint.
+        """
+        from msai.services.nautilus.live_instrument_bootstrap import (
+            canonical_instrument_id,
+        )
+        from msai.services.nautilus.security_master.registry import (
+            InstrumentRegistry,
+        )
+
+        registry = InstrumentRegistry(self._db)
+        today = datetime.now(UTC).date()
+        out: list[str] = []
+        for sym in symbols:
+            # Warm path A — caller passed an already-qualified dotted alias
+            if "." in sym:
+                idef = await registry.find_by_alias(
+                    sym, provider="interactive_brokers"
+                )
+                if idef is not None:
+                    out.append(sym)
+                    continue
+            # Warm path B — caller passed a bare ticker, resolve to active alias
+            idef = await registry.find_by_raw_symbol(
+                sym, provider="interactive_brokers"
+            )
+            if idef is not None:
+                active_alias = next(
+                    (a for a in idef.aliases if a.effective_to is None), None
+                )
+                if active_alias is not None:
+                    out.append(active_alias.alias_string)
+                    continue
+            # Cold path — delegate to existing live_instrument_bootstrap
+            # front-month rollover + existing SecurityMaster.resolve(spec).
+            # Reason: live_instrument_bootstrap.canonical_instrument_id(...)
+            # holds the closed-universe roll logic (ES → ESM6.CME at spawn
+            # today); we reuse it rather than reinventing. The returned
+            # canonical alias string is then used to build an InstrumentSpec
+            # via _spec_from_canonical() and the spec is resolved through
+            # the existing cache-first path (which triggers an IB qualify
+            # round-trip on cache miss).
+            if self._qualifier is None:
+                raise ValueError(
+                    f"Cold-miss resolve for {sym!r} requires an IBQualifier — "
+                    "construct SecurityMaster with qualifier=... for live use."
+                )
+            canonical = canonical_instrument_id(sym, today=today)
+            spec = self._spec_from_canonical(canonical)
+            instrument = await self.resolve(spec)  # cache-first
+            alias_str = str(instrument.id)
+            routing_venue = instrument.id.venue.value
+            listing_venue = routing_venue
+            details = self._qualifier._provider.contract_details.get(instrument.id)
+            if details is not None and getattr(details, "contract", None) is not None:
+                primary = getattr(details.contract, "primaryExchange", None) or None
+                if primary:
+                    listing_venue = primary
+            await self._upsert_definition_and_alias(
+                raw_symbol=instrument.raw_symbol.value,
+                listing_venue=listing_venue,
+                routing_venue=routing_venue,
+                asset_class=self._asset_class_for_instrument(instrument),
+                alias_string=alias_str,
+            )
+            out.append(alias_str)
+        return out
+
+    # ------------------------------------------------------------------
+    # Backtest resolve entrypoint (registry-backed)
+    # ------------------------------------------------------------------
+
+    async def resolve_for_backtest(
+        self,
+        symbols: list[str],
+        *,
+        start: str | None = None,
+        end: str | None = None,
+        dataset: str = "GLBX.MDP3",
+    ) -> list[str]:
+        """Return canonical Nautilus ``InstrumentId`` strings for ``symbols``.
+
+        Four paths:
+
+        1. ``<root>.Z.<N>`` continuous pattern → delegate to
+           :meth:`_resolve_databento_continuous` which warm-hits
+           by ``raw_symbol`` and falls through to the Databento
+           definition fetch + synthesis on miss.
+        2. Any other dotted input (e.g. ``"ESH4.CME"``) → warm-hit
+           via :meth:`InstrumentRegistry.find_by_alias` under
+           ``provider="databento"``. Returned alias IS the input string.
+        3. Bare ticker (e.g. ``"AAPL"``) → warm-hit via
+           :meth:`InstrumentRegistry.find_by_raw_symbol` under
+           ``provider="databento"``, return its active alias string.
+        4. Miss on the warm paths → raise :class:`DatabentoDefinitionMissing`
+           with an actionable operator hint.
+
+        Backtests are fail-loud on cold-miss: the operator must run
+        ``msai instruments refresh`` first. The one exception is the
+        ``.Z.N`` continuous path, which *does* synthesize on miss because
+        the front-month roll is a known-good Databento-side operation
+        with no IB round-trip.
+
+        Args:
+            symbols: Requested symbols. Accepts any of the three input
+                shapes (continuous pattern / dotted alias / bare ticker).
+            start: Definition window lower bound (``YYYY-MM-DD``). Only
+                used on the ``.Z.N`` cold-miss path. Defaults to
+                ``"2024-01-01"``.
+            end: Definition window upper bound (``YYYY-MM-DD``). Defaults
+                to today UTC.
+            dataset: Databento dataset for the ``.Z.N`` cold-miss path.
+                Defaults to ``"GLBX.MDP3"`` (CME futures).
+
+        Raises:
+            DatabentoDefinitionMissing: A warm-path miss for a non-``.Z.N``
+                symbol — operator has not pre-warmed the registry.
+            ValueError: A ``.Z.N`` cold-miss but ``self._databento`` is
+                ``None`` — cannot synthesize without the Databento client.
+        """
+        from msai.services.nautilus.security_master.registry import (
+            InstrumentRegistry,
+        )
+
+        registry = InstrumentRegistry(self._db)
+        out: list[str] = []
+        for sym in symbols:
+            # Path 1 — Databento continuous pattern.
+            if is_databento_continuous_pattern(sym):
+                out.append(
+                    await self._resolve_databento_continuous(
+                        sym, start=start, end=end, dataset=dataset
+                    )
+                )
+                continue
+
+            # Path 2 — dotted alias already in registry.
+            if "." in sym:
+                idef = await registry.find_by_alias(sym, provider="databento")
+                if idef is not None:
+                    out.append(sym)
+                    continue
+                raise DatabentoDefinitionMissing(
+                    f"No registry row for alias {sym!r} under provider "
+                    "'databento' — run `msai instruments refresh --symbols "
+                    f"{sym}` to pre-warm the registry before the backtest."
+                )
+
+            # Path 3 — bare ticker, warm-hit by raw_symbol.
+            idef = await registry.find_by_raw_symbol(sym, provider="databento")
+            if idef is not None:
+                active_alias = next(
+                    (a for a in idef.aliases if a.effective_to is None), None
+                )
+                if active_alias is not None:
+                    out.append(active_alias.alias_string)
+                    continue
+
+            # Path 4 — cold-miss, fail loud.
+            raise DatabentoDefinitionMissing(
+                f"No registry row for raw_symbol {sym!r} under provider "
+                "'databento' — run `msai instruments refresh --symbols "
+                f"{sym}` to pre-warm the registry before the backtest."
+            )
+        return out
+
+    async def _resolve_databento_continuous(
+        self,
+        sym: str,
+        *,
+        start: str | None,
+        end: str | None,
+        dataset: str,
+    ) -> str:
+        """Resolve a ``<root>.Z.<N>`` continuous pattern for backtest.
+
+        Step 1 — Warm path: :meth:`InstrumentRegistry.find_by_raw_symbol`
+        under ``provider="databento"``. If an active alias exists for the
+        raw continuous symbol, return it without touching Databento.
+
+        Step 2 — Cold path: download the Databento ``definition``
+        payload for the window ``[start, end)`` via
+        :meth:`DatabentoClient.fetch_definition_instruments`, synthesize
+        a :class:`ResolvedInstrumentDefinition` via
+        :func:`resolved_databento_definition`, and upsert the registry
+        through the shared idempotent helper
+        :meth:`_upsert_definition_and_alias` (with
+        ``provider="databento"`` + ``venue_format="databento_continuous"``
+        — matches the CHECK constraints on both tables).
+
+        Idempotency: the ``_upsert_definition_and_alias`` helper is scoped
+        on ``(raw_symbol, provider, asset_class)`` for the definition
+        and ``(alias_string, provider)`` for the active alias, so a
+        second call with the same window refreshes timestamps without
+        raising :class:`IntegrityError`.
+
+        Raises:
+            ValueError: ``self._databento`` is ``None`` on cold-miss —
+                cannot fetch the definition payload.
+        """
+        from msai.services.nautilus.security_master.registry import (
+            InstrumentRegistry,
+        )
+
+        raw = raw_symbol_from_request(sym)
+        registry = InstrumentRegistry(self._db)
+
+        # Step 1 — warm path.
+        idef = await registry.find_by_raw_symbol(raw, provider="databento")
+        if idef is not None:
+            active_alias = next(
+                (a for a in idef.aliases if a.effective_to is None), None
+            )
+            if active_alias is not None:
+                return active_alias.alias_string
+
+        # Step 2 — cold path. Databento client is required.
+        if self._databento is None:
+            raise ValueError(
+                f"DatabentoClient required to synthesize continuous {sym!r} "
+                "on cold-miss — construct SecurityMaster with "
+                "databento_client=... or pre-warm the registry via "
+                "`msai instruments refresh`."
+            )
+
+        resolved_start = start or "2024-01-01"
+        resolved_end = end or datetime.now(UTC).date().isoformat()
+        definition_path = (
+            settings.databento_definition_root
+            / dataset
+            / raw
+            / f"{resolved_start}_{resolved_end}.definition.dbn.zst"
+        )
+        instruments = await self._databento.fetch_definition_instruments(
+            raw,
+            resolved_start,
+            resolved_end,
+            dataset=dataset,
+            target_path=definition_path,
+        )
+        resolved = resolved_databento_definition(
+            raw_symbol=raw,
+            instruments=instruments,
+            dataset=dataset,
+            start=resolved_start,
+            end=resolved_end,
+            definition_path=definition_path,
+        )
+        await self._upsert_definition_and_alias(
+            raw_symbol=resolved.raw_symbol,
+            listing_venue=resolved.listing_venue,
+            routing_venue=resolved.routing_venue,
+            asset_class=resolved.asset_class,
+            alias_string=resolved.instrument_id,
+            provider="databento",
+            venue_format="databento_continuous",
+        )
+        return resolved.instrument_id
+
+    @staticmethod
+    def _asset_class_for_instrument(instrument: Any) -> str:
+        """Derive the registry's ``asset_class`` column value from a Nautilus
+        :class:`Instrument` via its runtime class name.
+
+        Delegates to
+        :func:`security_master.continuous_futures.asset_class_for_instrument_type`
+        so both the live-resolve path (this method, takes Instrument) and
+        the Databento backtest-resolve path (takes a string type name from
+        the serialized payload) share one mapping and cannot drift.
+
+        Note that this differs from :class:`InstrumentSpec.asset_class`
+        which uses ``'future'`` (singular) as its literal — the spec
+        enum is a separate taxonomy for *input*, not the registry's
+        storage enum.
+        """
+        from msai.services.nautilus.security_master.continuous_futures import (
+            asset_class_for_instrument_type,
+        )
+
+        return asset_class_for_instrument_type(instrument.__class__.__name__)
+
+    def _spec_from_canonical(self, canonical: str) -> InstrumentSpec:
+        """Parse an already-resolved canonical alias string into an
+        :class:`InstrumentSpec` for downstream :meth:`resolve`.
+
+        Reuses the venue mapping established by
+        :func:`live_instrument_bootstrap.canonical_instrument_id`. Closed
+        universe:
+
+        - ``AAPL.NASDAQ`` / ``MSFT.NASDAQ`` → equity / NASDAQ
+        - ``SPY.ARCA`` → equity / ARCA
+        - ``EUR/USD.IDEALPRO`` → forex / IDEALPRO
+        - ``ESM6.CME`` (or similar) → future / CME
+
+        Raises:
+            ValueError: On an unknown venue suffix — callers should
+                widen the closed universe by adding a case here first.
+        """
+        symbol, _, venue = canonical.rpartition(".")
+        if not venue:
+            raise ValueError(
+                f"Canonical alias {canonical!r} has no venue suffix"
+            )
+        if venue == "NASDAQ":
+            return InstrumentSpec(
+                asset_class="equity", symbol=symbol, venue="NASDAQ"
+            )
+        if venue == "ARCA":
+            return InstrumentSpec(
+                asset_class="equity", symbol=symbol, venue="ARCA"
+            )
+        if venue == "IDEALPRO":
+            # symbol here is "EUR/USD"; base = "EUR", quote = "USD"
+            base, _, quote = symbol.partition("/")
+            return InstrumentSpec(
+                asset_class="forex",
+                symbol=base,
+                venue="IDEALPRO",
+                currency=quote or "USD",
+            )
+        if venue == "CME":
+            return InstrumentSpec(
+                asset_class="future", symbol=symbol, venue="CME"
+            )
+        raise ValueError(
+            f"Unknown venue {venue!r} in canonical {canonical!r} — extend "
+            "SecurityMaster._spec_from_canonical for new venues."
+        )
+
+    async def _upsert_definition_and_alias(
+        self,
+        *,
+        raw_symbol: str,
+        listing_venue: str,
+        routing_venue: str,
+        asset_class: str,
+        alias_string: str,
+        provider: str = "interactive_brokers",
+        venue_format: str = "exchange_name",
+    ) -> None:
+        """Idempotent upsert: one :class:`InstrumentDefinition` row +
+        one active :class:`InstrumentAlias` row.
+
+        Called from both :meth:`resolve_for_live` (provider defaults to
+        ``interactive_brokers``, venue_format ``exchange_name``) and
+        :meth:`_resolve_databento_continuous` (provider ``databento``,
+        venue_format ``databento_continuous``).
+
+        Idempotency: scoped to ``(raw_symbol, provider, asset_class)`` —
+        matches the ``uq_instrument_definitions_symbol_provider_asset``
+        unique constraint created by the registry migration. A second call
+        with the same tuple refreshes ``refreshed_at`` and is a no-op on
+        the alias side (same-day ``(alias_string, provider,
+        effective_from)`` matches the
+        ``uq_instrument_aliases_string_provider_from`` unique constraint,
+        which ``ON CONFLICT DO NOTHING`` quietly handles).
+
+        Race-safety: both statements use PostgreSQL ``INSERT ... ON
+        CONFLICT`` so concurrent resolvers for the same symbol can't
+        collide on the unique constraints. Mirrors the pattern in
+        :meth:`_write_cache`.
+        """
+        from msai.models.instrument_alias import InstrumentAlias
+        from msai.models.instrument_definition import InstrumentDefinition
+
+        now = datetime.now(UTC)
+        def_stmt = (
+            pg_insert(InstrumentDefinition.__table__)
+            .values(
+                raw_symbol=raw_symbol,
+                listing_venue=listing_venue,
+                routing_venue=routing_venue,
+                asset_class=asset_class,
+                provider=provider,
+                lifecycle_state="active",
+                refreshed_at=now,
+            )
+            .on_conflict_do_update(
+                constraint="uq_instrument_definitions_symbol_provider_asset",
+                set_={"refreshed_at": now},
+            )
+            .returning(InstrumentDefinition.__table__.c.instrument_uid)
+        )
+        result = await self._db.execute(def_stmt)
+        instrument_uid = result.scalar_one()
+
+        today = now.date()
+
+        # Close any previous active aliases for this
+        # ``(instrument_uid, provider)`` so the new alias becomes the single
+        # active one per the half-open ``[effective_from, effective_to)``
+        # window invariant. Callers pick the active alias via
+        # ``next((a for a in idef.aliases if a.effective_to is None))`` —
+        # without this, a futures roll or repeated refreshes on different
+        # days leave multiple aliases active simultaneously and the caller
+        # picks arbitrarily.
+        close_stmt = (
+            update(InstrumentAlias)
+            .where(
+                InstrumentAlias.instrument_uid == instrument_uid,
+                InstrumentAlias.provider == provider,
+                InstrumentAlias.effective_to.is_(None),
+                # Don't close an alias that's about to be re-inserted today
+                # (idempotent same-day refresh path — the insert below is
+                # ON CONFLICT DO NOTHING on
+                # ``(alias_string, provider, effective_from)``).
+                InstrumentAlias.alias_string != alias_string,
+            )
+            .values(effective_to=today)
+        )
+        await self._db.execute(close_stmt)
+
+        # Alias upsert — ON CONFLICT DO NOTHING since the uniqueness key
+        # includes ``effective_from`` so a same-day re-upsert is a no-op.
+        alias_stmt = (
+            pg_insert(InstrumentAlias.__table__)
+            .values(
+                instrument_uid=instrument_uid,
+                alias_string=alias_string,
+                venue_format=venue_format,
+                provider=provider,
+                effective_from=today,
+            )
+            .on_conflict_do_nothing(
+                constraint="uq_instrument_aliases_string_provider_from",
+            )
+        )
+        await self._db.execute(alias_stmt)
+        await self._db.flush()
 
     # ------------------------------------------------------------------
     # Cache IO

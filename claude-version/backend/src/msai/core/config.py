@@ -215,6 +215,20 @@ class Settings(BaseSettings):
         return self.data_root / "nautilus"
 
     @property
+    def databento_definition_root(self) -> Path:
+        """Root directory for cached Databento ``.definition.dbn.zst`` payloads
+        (``{data_root}/databento_definitions``).
+
+        Used by :meth:`SecurityMaster._resolve_databento_continuous` as the
+        destination for on-demand ``fetch_definition_instruments``
+        downloads. Layout: ``{root}/{dataset}/{raw_symbol}/{start}_{end}.definition.dbn.zst``.
+        Persisted under ``data_root`` so the files survive container rebuilds
+        via the bind-mounted volume and subsequent backtests of the same
+        continuous symbol can reuse the cached definition.
+        """
+        return self.data_root / "databento_definitions"
+
+    @property
     def alerts_path(self) -> Path:
         """File-backed operational alert history (``{data_root}/alerts/alerts.json``).
 

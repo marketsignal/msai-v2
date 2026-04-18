@@ -18,8 +18,8 @@ each security type:
 
 - **STK**: ``AAPL.NASDAQ`` — plain symbol on the venue
 - **IND**: ``^SPX.CBOE`` — caret prefix for cash indexes
-- **FUT** (fixed month): ``ESM5.XCME`` — ``{root}{month_code}{year_digit}``
-- **CONTFUT** (continuous): ``ES.XCME`` — just the root
+- **FUT** (fixed month): ``ESM5.CME`` — ``{root}{month_code}{year_digit}``
+- **CONTFUT** (continuous): ``ES.CME`` — just the root
 - **OPT**: ``C AAPL 20260515 150.XSMART`` —
   ``{right} {tradingClass} {yyyyMMdd} {strike:g}`` on the venue
 - **CASH**/**CRYPTO**: ``EUR/USD.IDEALPRO`` — slash-separated pair
@@ -82,7 +82,7 @@ class InstrumentSpec:
         symbol: Root ticker / underlying (e.g. ``AAPL``, ``ES``, ``SPX``,
             ``EUR``). For forex, the base currency.
         venue: IB exchange acronym used as the Nautilus ``Venue``
-            (e.g. ``NASDAQ``, ``XCME``, ``SMART``, ``IDEALPRO``). MUST
+            (e.g. ``NASDAQ``, ``CME``, ``SMART``, ``IDEALPRO``). MUST
             match the ``Venue`` Nautilus derives from the resolved
             contract — see gotcha #4.
         currency: Quote currency. Defaults to USD. For forex this is

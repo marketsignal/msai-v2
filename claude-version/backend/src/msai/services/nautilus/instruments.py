@@ -4,7 +4,7 @@
 Pre-v9, this module used ``TestInstrumentProvider.equity(venue="SIM")``
 and rebound every instrument to the synthetic ``SIM`` venue. Phase 2
 replaces that with a real security-master resolver keyed on
-canonical IB venues (``NASDAQ`` for equities on Nasdaq, ``XCME`` for
+canonical IB venues (``NASDAQ`` for equities on Nasdaq, ``CME`` for
 CME futures, ``IDEALPRO`` for forex, ...) so backtest and live
 trading both see the SAME instrument objects.
 
@@ -26,6 +26,14 @@ Task 2.10 removed the transitional ``legacy_resolve_sim`` shim —
 every test fixture that depended on the ``*.SIM`` venue binding
 has been migrated to pass a real canonical venue via the
 ``venue`` kwarg or a dotted instrument ID.
+
+.. deprecated::
+    This Phase-1 closed-universe resolver has been superseded by
+    :class:`msai.services.nautilus.security_master.service.SecurityMaster`.
+    The module remains load-bearing for ``services/nautilus/catalog_builder.py``
+    (which uses ``resolve_instrument`` when writing Parquet data to the
+    backtest catalog). Remove this shim after catalog-builder migrates
+    to the registry.
 """
 
 from __future__ import annotations
@@ -60,7 +68,7 @@ def resolve_instrument(
 
     Args:
         symbol_or_id: Ticker symbol (``"AAPL"``) or Nautilus ID
-            (``"AAPL.NASDAQ"``, ``"ESM5.XCME"``). A dotted
+            (``"AAPL.NASDAQ"``, ``"ESM5.CME"``). A dotted
             identifier's suffix wins over ``venue``.
         venue: Venue to bind a bare symbol to. Defaults to
             :data:`DEFAULT_EQUITY_VENUE` (``NASDAQ``).

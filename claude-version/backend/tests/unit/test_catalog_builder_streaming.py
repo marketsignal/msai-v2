@@ -411,3 +411,102 @@ def test_streaming_builder_raises_when_no_raw_data(tmp_path: Path) -> None:
             raw_parquet_root=raw_root,
             catalog_root=catalog_root,
         )
+
+
+# ----------------------------------------------------------------------
+# F9 — raw_symbol_override for registry-derived canonical IDs
+# ----------------------------------------------------------------------
+
+
+def test_build_catalog_uses_raw_symbol_override_for_futures_canonical(
+    tmp_path: Path,
+) -> None:
+    """When the caller passes a canonical ID whose local-part doesn't match
+    the ingest-tree directory (e.g. ``ESM6.CME`` ingests under ``futures/ES/``),
+    :func:`build_catalog_for_symbol` must honour ``raw_symbol_override`` for
+    the path lookup.
+
+    Without the override this call would raise ``FileNotFoundError`` because
+    the resolver would derive ``raw_symbol='ESM6'`` from ``Instrument.raw_symbol``
+    and look under ``futures/ESM6/``, which doesn't exist.  With the
+    override (``raw_symbol_override='ES'``) the path lookup hits
+    ``futures/ES/`` where the ingest pipeline actually wrote the data.
+    """
+    raw_root = tmp_path / "raw"
+    catalog_root = tmp_path / "catalog"
+
+    # Ingest pipeline writes under ``futures/ES/`` — NOT ``futures/ESM6/``.
+    # We reuse the stocks-layout helper but point it at the ``futures``
+    # asset-class subdirectory by writing the file manually.
+    rng = np.random.default_rng(7)
+    rows = 500
+    timestamps = pd.date_range(
+        start=datetime(2026, 3, 1, tzinfo=UTC),
+        periods=rows,
+        freq="1min",
+        tz="UTC",
+    )
+    closes = 5000.0 + rng.standard_normal(rows).cumsum() * 0.5
+    opens = closes + rng.standard_normal(rows) * 0.1
+    highs = np.maximum(opens, closes) + np.abs(rng.standard_normal(rows)) * 0.2
+    lows = np.minimum(opens, closes) - np.abs(rng.standard_normal(rows)) * 0.2
+    volumes = rng.integers(1, 100, rows).astype(np.int64)
+    df = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": volumes,
+        }
+    )
+    out_dir = raw_root / "futures" / "ES" / "2026"
+    out_dir.mkdir(parents=True)
+    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), out_dir / "03.parquet")
+
+    # WITHOUT the override: FileNotFoundError (looks under futures/ESM6/).
+    import pytest
+
+    with pytest.raises(FileNotFoundError):
+        build_catalog_for_symbol(
+            symbol="ESM6.CME",
+            raw_parquet_root=raw_root,
+            catalog_root=catalog_root,
+            asset_class="futures",
+        )
+
+    # WITH the override: resolves successfully.
+    instrument_id = build_catalog_for_symbol(
+        symbol="ESM6.CME",
+        raw_parquet_root=raw_root,
+        catalog_root=catalog_root,
+        asset_class="futures",
+        raw_symbol_override="ES",
+    )
+    assert instrument_id.endswith(".CME")
+
+
+def test_ensure_catalog_data_raw_symbols_length_mismatch_raises() -> None:
+    """``ensure_catalog_data`` zips ``symbols`` and ``raw_symbols``
+    positionally — a length mismatch is a caller bug and must raise
+    ``ValueError`` rather than silently drop or mis-pair entries."""
+    import pytest
+
+    from msai.services.nautilus.catalog_builder import ensure_catalog_data
+
+    with pytest.raises(ValueError, match="raw_symbols length mismatch"):
+        ensure_catalog_data(
+            symbols=["AAPL.NASDAQ", "ESM6.CME"],
+            raw_parquet_root=tmp_path_stub(),
+            catalog_root=tmp_path_stub(),
+            raw_symbols=["AAPL"],  # wrong length
+        )
+
+
+def tmp_path_stub() -> Path:
+    """Return a harmless ``Path`` — the length-mismatch check fires
+    before any filesystem access."""
+    from pathlib import Path as _Path
+
+    return _Path("/tmp/msai-f9-stub")

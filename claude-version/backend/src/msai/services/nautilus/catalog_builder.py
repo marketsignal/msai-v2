@@ -64,6 +64,7 @@ def build_catalog_for_symbol(
     *,
     asset_class: str = "stocks",
     force: bool = False,
+    raw_symbol_override: str | None = None,
 ) -> str:
     """Convert raw OHLCV files for a single symbol into Nautilus catalog format.
 
@@ -86,6 +87,26 @@ def build_catalog_for_symbol(
             ``raw_parquet_root``.  Defaults to ``"stocks"``.
         force: When ``True``, rebuild the catalog entries for this symbol
             even if bars already exist.  Used to refresh stale data.
+        raw_symbol_override: Optional raw-symbol for the ingest-tree path
+            lookup.  When ``None`` (default), the raw symbol is derived from
+            the resolved Nautilus ``Instrument.raw_symbol`` — which works
+            for equities (``AAPL.NASDAQ`` → ``AAPL``) but *not* for the
+            registry-derived canonical IDs the backtest API now emits.  For
+            futures canonicals like ``ESM6.CME`` the ingest pipeline writes
+            Parquet under ``{asset_class}/ES/``, not ``{asset_class}/ESM6/``,
+            so callers that pass a canonical ID MUST also pass the original
+            root ticker (``"ES"``) via this kwarg for the path lookup to
+            succeed.
+
+            **Worker wiring is a follow-up PR:** today the backtest worker
+            (:mod:`msai.workers.backtest_job`) does not yet have access to
+            the user's original input symbols (they aren't persisted on
+            :class:`~msai.models.backtest.Backtest`), so it still passes
+            the canonical ID alone.  That wiring + the
+            ``Backtest.input_symbols`` column will land with the live-path
+            wiring follow-up.  This signature is the minimal public-API
+            widening so the follow-up is a narrow change instead of a
+            rewrite.
 
     Returns:
         The canonical Nautilus instrument ID string
@@ -94,11 +115,18 @@ def build_catalog_for_symbol(
 
     Raises:
         FileNotFoundError: No raw Parquet files exist for the requested
-            symbol under ``{raw_parquet_root}/{asset_class}/{symbol}``.
+            symbol under ``{raw_parquet_root}/{asset_class}/{raw_symbol}``.
     """
     instrument = resolve_instrument(symbol)
     instrument_id_str = str(instrument.id)
-    raw_symbol = instrument.raw_symbol.value
+    # F9: prefer the caller-supplied raw symbol for the ingest-tree
+    # path lookup — needed whenever ``symbol`` is a registry-derived
+    # canonical ID (e.g. ``ESM6.CME``) whose local-part does NOT match
+    # the root ticker the ingestion pipeline writes under
+    # (``ES/``). Equities happen to round-trip through
+    # ``Instrument.raw_symbol`` because their canonical local-part IS
+    # the ticker (``AAPL.NASDAQ`` → ``AAPL``).
+    raw_symbol = raw_symbol_override or instrument.raw_symbol.value
 
     catalog_root.mkdir(parents=True, exist_ok=True)
     catalog = ParquetDataCatalog(str(catalog_root))
@@ -314,6 +342,7 @@ def ensure_catalog_data(
     catalog_root: Path,
     *,
     asset_class: str = "stocks",
+    raw_symbols: list[str] | None = None,
 ) -> list[str]:
     """Ensure the Nautilus catalog contains data for every requested symbol.
 
@@ -326,6 +355,14 @@ def ensure_catalog_data(
         raw_parquet_root: Root of raw OHLCV Parquet files.
         catalog_root: Root of the Nautilus catalog.
         asset_class: Asset-class sub-directory name. Defaults to ``"stocks"``.
+        raw_symbols: Optional parallel list of root tickers for the
+            ingest-tree path lookup, one per entry in ``symbols``.  When
+            provided, each entry is passed through as
+            ``raw_symbol_override`` to :func:`build_catalog_for_symbol`.
+            Required whenever ``symbols`` contains registry-derived
+            canonical IDs whose local-part does not match the root ticker
+            the ingestion pipeline writes under (e.g. ``ESM6.CME`` ingests
+            under ``futures/ES/``, not ``futures/ESM6/``).
 
     Returns:
         The list of canonical Nautilus instrument IDs in the same order as
@@ -335,15 +372,25 @@ def ensure_catalog_data(
     Raises:
         FileNotFoundError: Propagated from :func:`build_catalog_for_symbol`
             if any symbol is missing raw data.
+        ValueError: When ``raw_symbols`` is provided but its length does
+            not match ``symbols`` — the two lists are zipped positionally
+            so a mismatch is a caller bug.
     """
+    if raw_symbols is not None and len(raw_symbols) != len(symbols):
+        raise ValueError(
+            "raw_symbols length mismatch: "
+            f"got {len(raw_symbols)} raw_symbols for {len(symbols)} symbols"
+        )
     instrument_ids: list[str] = []
-    for symbol in symbols:
+    for index, symbol in enumerate(symbols):
+        raw_override = raw_symbols[index] if raw_symbols is not None else None
         instrument_ids.append(
             build_catalog_for_symbol(
                 symbol=symbol,
                 raw_parquet_root=raw_parquet_root,
                 catalog_root=catalog_root,
                 asset_class=asset_class,
+                raw_symbol_override=raw_override,
             )
         )
     return instrument_ids

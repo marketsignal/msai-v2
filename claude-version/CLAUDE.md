@@ -95,6 +95,8 @@ cd backend && uv run msai ingest-daily --asset stocks --symbols all
 cd backend && uv run msai data-status
 cd backend && uv run msai live-status
 cd backend && uv run msai live-kill-all
+cd backend && uv run msai instruments refresh --symbols AAPL,ES --provider interactive_brokers
+cd backend && uv run msai instruments refresh --symbols ES.Z.5 --provider databento
 
 # Database migrations
 cd backend && uv run alembic upgrade head           # Apply migrations
@@ -160,6 +162,18 @@ All endpoints except /health and /ready require Azure Entra ID JWT authenticatio
 - PyJWT for backend JWT validation (NOT MSAL — MSAL is frontend only)
 - Risk engine validates before every live deployment start
 - WebSocket auth: first message must be JWT token within 5 seconds
+
+### Instrument Registry (2026-04-17)
+
+New tables `instrument_definitions` + `instrument_aliases` hold control-plane metadata for instrument resolution. UUID-keyed, with effective-date windowing on aliases for futures rolls. Schema + `SecurityMaster.resolve_for_backtest` extensions + `msai instruments refresh` CLI ship in this PR.
+
+**Deferred to follow-up PRs (not yet scheduled):**
+
+- Live-path wiring — `/api/v1/live/start` + supervisor still use closed-universe `canonical_instrument_id()`. Deferred to a follow-up PR — see the skeleton at the end of `docs/plans/2026-04-17-db-backed-strategy-registry.md` §"Split-off PR Skeleton".
+- `instrument_cache` table coexists with the new registry and is not migrated yet. Deferred to a follow-up PR — see the skeleton at the end of `docs/plans/2026-04-17-db-backed-strategy-registry.md` §"Split-off PR Skeleton".
+- Strategy config-schema extraction for UI form generation. Deferred to a follow-up PR — see the skeleton at the end of `docs/plans/2026-04-17-db-backed-strategy-registry.md` §"Split-off PR Skeleton".
+
+The `msai instruments refresh --provider interactive_brokers` path is currently deferred — follow-up PR will add the required `Settings` fields (`ib_request_timeout_seconds`, `ib_instrument_client_id`, etc.) plus the full IBQualifier factory.
 
 ### Environment Variables
 

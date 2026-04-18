@@ -5,7 +5,7 @@ to spin up real IB infrastructure. When the env var is set,
 this test exercises the full Phase 2 stack against a paper
 IB Gateway:
 
-1. Resolve ``AAPL.NASDAQ``, ``ESM5.XCME``, ``EUR/USD.IDEALPRO``
+1. Resolve ``AAPL.NASDAQ``, ``ESM5.CME``, ``EUR/USD.IDEALPRO``
    via :class:`SecurityMaster` (warm + cold paths)
 2. Verify each resolved instrument has the right Nautilus type
    (``Equity`` / ``FuturesContract`` / ``CurrencyPair``)
@@ -108,7 +108,7 @@ def _build_security_master():  # type: ignore[no-untyped-def]
 async def test_phase2_full_security_master_lifecycle() -> None:
     """End-to-end Phase 2 harness:
 
-    1. Resolve AAPL.NASDAQ, ESM5.XCME, EUR/USD.IDEALPRO via
+    1. Resolve AAPL.NASDAQ, ESM5.CME, EUR/USD.IDEALPRO via
        SecurityMaster against a real paper IB Gateway.
     2. Verify each resolved instrument has the right Nautilus
        type and the cache row landed in instrument_cache.
@@ -136,7 +136,7 @@ async def test_phase2_full_security_master_lifecycle() -> None:
         InstrumentSpec(
             asset_class="future",
             symbol="ES",
-            venue="XCME",
+            venue="CME",
             expiry=date(2025, 6, 20),
         ),
         InstrumentSpec(

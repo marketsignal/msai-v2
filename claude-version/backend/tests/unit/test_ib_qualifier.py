@@ -62,18 +62,18 @@ class TestSpecToContractFuture:
         spec = InstrumentSpec(
             asset_class="future",
             symbol="ES",
-            venue="XCME",
+            venue="CME",
             expiry=date(2025, 6, 20),
         )
         contract = spec_to_ib_contract(spec)
         assert contract.secType == "FUT"
         assert contract.symbol == "ES"
-        assert contract.exchange == "XCME"
+        assert contract.exchange == "CME"
         assert contract.lastTradeDateOrContractMonth == "20250620"
 
     def test_continuous_future(self) -> None:
         """``expiry=None`` → CONTFUT secType with no expiry field."""
-        spec = InstrumentSpec(asset_class="future", symbol="ES", venue="XCME")
+        spec = InstrumentSpec(asset_class="future", symbol="ES", venue="CME")
         contract = spec_to_ib_contract(spec)
         assert contract.secType == "CONTFUT"
         assert contract.symbol == "ES"
