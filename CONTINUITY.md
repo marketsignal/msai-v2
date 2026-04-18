@@ -31,8 +31,8 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 - [x] E2E use cases graduated — N/A (nothing to graduate)
 - [x] Learning documented — captured in CHANGELOG entry (2026-04-18 stale test cleanup)
 - [x] State files updated — CONTINUITY.md (this file), docs/CHANGELOG.md
-- [x] Committed and pushed (`1 commit on origin/fix/stale-post-pr29-tests`)
-- [ ] PR created
+- [x] Committed and pushed (2 commits on `origin/fix/stale-post-pr29-tests`)
+- [x] PR created — #34 (https://github.com/marketsignal/msai-v2/pull/34)
 - [ ] PR reviews addressed
 - [ ] Branch finished
 
@@ -192,14 +192,16 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 ## Now
 
 - **Branch** `fix/stale-post-pr29-tests` in worktree. Ready for code review + simplify + verify + push + PR.
-- **All 9 originally-failing integration files pass** (verified file-by-file). Full-suite re-verification running.
+- **PR #34 open** at https://github.com/marketsignal/msai-v2/pull/34 (3 commits on branch; main + continuity + Codex-review-fix).
+- **Full suite: 1601/0/0** (passed/failed/errors). Zero regressions from main's 1513 passed.
+- **Codex PR review:** 1 P2 found + fixed + replied. Canonical identity helpers (`derive_strategy_id_full`, `derive_message_bus_stream`, `derive_trader_id`, `generate_deployment_slug`) now used in the factory so tests exercise production-shape strings (commit `65a068e`).
 - **Deferred from PR #32** — 2 of the original 3 items still open:
   1. `msai instruments refresh` for plain symbols (Databento path works; IB path skipped).
   2. Live path wiring onto registry (`/api/v1/live/start-portfolio` still uses closed-universe `canonical_instrument_id()`).
 
 ## Next
 
-1. **Await full-suite completion + confirm zero failures.**
-2. **Code review + simplify + verify-app** (Phase 5 quality gates).
-3. **Commit + push + PR creation** (with user confirmation per critical-rules).
+1. **Wait for Codex bot re-scan** of `65a068e` (or user can invoke `/finish-branch` to merge without a second pass).
+2. **Any further review comments** → `/review-pr-comments` again.
+3. **When approved** → `/finish-branch` to merge + clean up.
 4. **After PR merges** — pick up the remaining deferred PR #32 items: live-path wiring (highest strategic value, needs design pass), then IB-path registry insert.
