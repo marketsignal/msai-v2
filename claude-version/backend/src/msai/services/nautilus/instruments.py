@@ -29,14 +29,11 @@ has been migrated to pass a real canonical venue via the
 
 .. deprecated::
     This Phase-1 closed-universe resolver has been superseded by
-    :class:`msai.services.nautilus.security_master.service.SecurityMaster`
-    (see `docs/plans/2026-04-17-db-backed-strategy-registry.md`). New
-    call sites should use ``SecurityMaster.resolve_for_live`` or
-    ``.resolve_for_backtest`` which consult the registry first and
-    delegate to this helper only on cold misses within the closed
-    universe. The module remains load-bearing for live_instrument_bootstrap
-    and will be deprecated in full once the follow-up live-wiring PR
-    completes.
+    :class:`msai.services.nautilus.security_master.service.SecurityMaster`.
+    The module remains load-bearing for ``services/nautilus/catalog_builder.py``
+    (which uses ``resolve_instrument`` when writing Parquet data to the
+    backtest catalog). Remove this shim after catalog-builder migrates
+    to the registry.
 """
 
 from __future__ import annotations
