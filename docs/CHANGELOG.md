@@ -45,6 +45,14 @@ All notable changes to msai-v2 will be documented in this file.
 - **Pydantic config-schema extraction on `StrategyRegistry`.** Orthogonal to registry; deferred.
 - **IB provider factory in `msai instruments refresh`.** Needs `Settings` expansion (ib_request_timeout_seconds, etc.) — ships with the live-wiring follow-up.
 
+**Known limitations discovered post-Task 20 (Codex Phase 5 review):**
+
+- **`msai instruments refresh --symbols <plain>` works only for `.Z.N` continuous-futures.** For plain symbols (`AAPL`, `ES`), the CLI delegates to `SecurityMaster.resolve_for_backtest`, which raises `DatabentoDefinitionMissing` because no fetch-and-synthesize path exists for non-continuous symbols. **Workaround:** operators seed plain-symbol registry rows via direct SQL until the follow-up PR adds a proper Databento plain-symbol fetch. Example: `INSERT INTO instrument_definitions (raw_symbol, listing_venue, routing_venue, asset_class, provider, lifecycle_state) VALUES ('AAPL', 'NASDAQ', 'NASDAQ', 'equity', 'databento', 'active')` + matching alias row.
+
+- **`resolve_for_backtest` uses today's date for alias windowing**, not the backtest's `start_date`. After a futures front-month roll, a historical backtest (e.g. `start_date=2025-12-01, end_date=2026-01-31`) will receive the **current** front-month alias rather than the contract active during the backtest window. **Workaround:** operators passing continuous-futures `.Z.N` patterns avoid this issue. For concrete futures with historical windows, operators must manually specify the correct contract (e.g. `ESZ5.CME` for Dec-2025 backtests). Follow-up: thread `start_date` into `InstrumentRegistry.find_by_alias` within `resolve_for_backtest`.
+
+- **Worker parquet lookup assumes raw-symbol == canonical prefix.** `workers/backtest_job.ensure_catalog_data` passes `Backtest.instruments` (canonical IDs like `ESM6.CME`) to `catalog_builder.build_catalog_for_symbol`, which then calls `resolve_instrument()` and splits on `.` to derive the raw_symbol. For equities this happens to work (`AAPL.NASDAQ` → raw `AAPL`, parquet root is `AAPL/`), but for futures it fails (`ESM6.CME` → raw `ESM6`, parquet root is `ES/`). Fix 9 adds an optional `raw_symbol_override` kwarg to `build_catalog_for_symbol`/`ensure_catalog_data` so the worker can pass the user's original input; **wiring the worker + `Backtest.input_symbols` column is a follow-up** (see plan doc).
+
 **Commits (22 total):** 21b9ec1, 3b2cc35, 7ea6fb1, 75a3cf1, 9282824, 15b2d22, 2fb64b1, 38edeb9, 2829585, 3c26ad3, a2b9b01, 32f0e57, c87751f, c17aef6, b39d318, 71c904b, bfe90e8, c84e697, 7383319, dce4f82, 7324e0b, plus this commit.
 
 ### Changed
