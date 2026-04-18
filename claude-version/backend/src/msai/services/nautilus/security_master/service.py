@@ -591,53 +591,59 @@ class SecurityMaster:
 
         Idempotency: scoped to ``(raw_symbol, provider, asset_class)`` —
         matches the ``uq_instrument_definitions_symbol_provider_asset``
-        unique constraint created by the Task 1 migration. A second
-        call with the same tuple updates ``refreshed_at`` and skips the
-        alias insert if an active (``effective_to IS NULL``) alias
-        already exists for the same ``(alias_string, provider)``.
+        unique constraint created by the Task 1 migration. A second call
+        with the same tuple refreshes ``refreshed_at`` and is a no-op on
+        the alias side (same-day ``(alias_string, provider,
+        effective_from)`` matches the
+        ``uq_instrument_aliases_string_provider_from`` unique constraint,
+        which ``ON CONFLICT DO NOTHING`` quietly handles).
+
+        Race-safety: both statements use PostgreSQL ``INSERT ... ON
+        CONFLICT`` so concurrent resolvers for the same symbol can't
+        collide on the unique constraints. Mirrors the pattern in
+        :meth:`_write_cache`.
         """
         from msai.models.instrument_alias import InstrumentAlias
         from msai.models.instrument_definition import InstrumentDefinition
 
-        stmt = select(InstrumentDefinition).where(
-            InstrumentDefinition.raw_symbol == raw_symbol,
-            InstrumentDefinition.provider == provider,
-            InstrumentDefinition.asset_class == asset_class,
-        )
-        idef = (await self._db.execute(stmt)).scalar_one_or_none()
-        if idef is None:
-            idef = InstrumentDefinition(
+        now = datetime.now(UTC)
+        def_stmt = (
+            pg_insert(InstrumentDefinition.__table__)
+            .values(
                 raw_symbol=raw_symbol,
                 listing_venue=listing_venue,
                 routing_venue=routing_venue,
                 asset_class=asset_class,
                 provider=provider,
                 lifecycle_state="active",
+                refreshed_at=now,
             )
-            self._db.add(idef)
-            await self._db.flush()
-        # Only insert the alias row if an active one doesn't already
-        # exist — scoped to (alias_string, provider) like the
-        # uq_instrument_aliases_string_provider_from unique constraint.
-        alias_stmt = select(InstrumentAlias).where(
-            InstrumentAlias.alias_string == alias_string,
-            InstrumentAlias.provider == provider,
-            InstrumentAlias.effective_to.is_(None),
+            .on_conflict_do_update(
+                constraint="uq_instrument_definitions_symbol_provider_asset",
+                set_={"refreshed_at": now},
+            )
+            .returning(InstrumentDefinition.__table__.c.instrument_uid)
         )
-        existing_alias = (
-            await self._db.execute(alias_stmt)
-        ).scalar_one_or_none()
-        if existing_alias is None:
-            self._db.add(
-                InstrumentAlias(
-                    instrument_uid=idef.instrument_uid,
-                    alias_string=alias_string,
-                    venue_format=venue_format,
-                    provider=provider,
-                    effective_from=datetime.now(UTC).date(),
-                )
+        result = await self._db.execute(def_stmt)
+        instrument_uid = result.scalar_one()
+
+        # Alias upsert — ON CONFLICT DO NOTHING since the uniqueness key
+        # includes ``effective_from`` so a same-day re-upsert is a no-op.
+        today = now.date()
+        alias_stmt = (
+            pg_insert(InstrumentAlias.__table__)
+            .values(
+                instrument_uid=instrument_uid,
+                alias_string=alias_string,
+                venue_format=venue_format,
+                provider=provider,
+                effective_from=today,
             )
-        idef.refreshed_at = datetime.now(UTC)
+            .on_conflict_do_nothing(
+                constraint="uq_instrument_aliases_string_provider_from",
+            )
+        )
+        await self._db.execute(alias_stmt)
         await self._db.flush()
 
     # ------------------------------------------------------------------
