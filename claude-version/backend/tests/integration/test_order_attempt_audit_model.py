@@ -30,6 +30,7 @@ from msai.models import (
     Strategy,
     User,
 )
+from tests.integration._deployment_factory import make_live_deployment
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -93,26 +94,7 @@ async def deployment(
     user_strategy: tuple[User, Strategy],
 ) -> LiveDeployment:
     user, strategy = user_strategy
-    slug = "abcd1234abcd1234"
-    dep = LiveDeployment(
-        id=uuid4(),
-        strategy_id=strategy.id,
-        strategy_code_hash="deadbeef" * 8,
-        config={"fast": 10, "slow": 20},
-        instruments=["AAPL.NASDAQ"],
-        status="running",
-        paper_trading=True,
-        started_by=user.id,
-        deployment_slug=slug,
-        identity_signature="f" * 64,
-        trader_id=f"MSAI-{slug}",
-        strategy_id_full=f"EMACrossStrategy-{slug}",
-        account_id="DU1234567",
-        message_bus_stream=f"trader-MSAI-{slug}-stream",
-        config_hash="cafebabe" * 8,
-        instruments_signature="AAPL.NASDAQ",
-    )
-    session.add(dep)
+    dep = await make_live_deployment(session, user=user, strategy=strategy)
     await session.commit()
     return dep
 

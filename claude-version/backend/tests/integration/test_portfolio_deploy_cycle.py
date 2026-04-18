@@ -178,9 +178,12 @@ async def test_full_portfolio_deploy_cycle(session: AsyncSession) -> None:
         identity_signature=identity.signature(),
         trader_id=derive_trader_id(slug),
         strategy_id_full=derive_strategy_id_full(
-            strategies[0].strategy_class, slug, order_index=0,
+            strategies[0].strategy_class,
+            slug,
+            order_index=0,
         ),
         account_id="DU1234567",
+        ib_login_key="msai-paper-primary",
         portfolio_revision_id=revision.id,
         message_bus_stream=derive_message_bus_stream(slug),
     )
@@ -192,7 +195,9 @@ async def test_full_portfolio_deploy_cycle(session: AsyncSession) -> None:
     # -----------------------------------------------------------------
     for i, rev_strat in enumerate(rev_strategies):
         sid_full = derive_strategy_id_full(
-            strategies[i].strategy_class, slug, order_index=i,
+            strategies[i].strategy_class,
+            slug,
+            order_index=i,
         )
         lds = LiveDeploymentStrategy(
             id=uuid4(),
@@ -288,9 +293,7 @@ async def test_deployment_cascade_deletes_deployment_strategies(
         description=None,
         created_by=user.id,
     )
-    await psvc.add_strategy(
-        portfolio.id, strat.id, {}, ["AAPL.NASDAQ"], Decimal("1")
-    )
+    await psvc.add_strategy(portfolio.id, strat.id, {}, ["AAPL.NASDAQ"], Decimal("1"))
     revision = await rsvc.snapshot(portfolio.id)
     await session.commit()
 
@@ -324,6 +327,7 @@ async def test_deployment_cascade_deletes_deployment_strategies(
         trader_id=derive_trader_id(slug),
         strategy_id_full=derive_strategy_id_full(strat.strategy_class, slug),
         account_id="DU9999999",
+        ib_login_key="msai-paper-primary",
         portfolio_revision_id=revision.id,
         message_bus_stream=derive_message_bus_stream(slug),
     )

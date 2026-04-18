@@ -63,6 +63,22 @@ All notable changes to msai-v2 will be documented in this file.
 
 **PR shipped as:** squash commit `a52046f` on main (2026-04-17).
 
+### 2026-04-18 — Fix: stale test cleanup after PR #29/PR #30/PR #31 schema moves
+
+The portfolio-per-account-live PR series (#29/#30/#31) dropped 5 columns from `live_deployments`, added `NOT NULL` on `ib_login_key` (PR #30), added `NOT NULL` on `gateway_session_key` to `live_node_processes` (PR #30), enforced `portfolio_revision_id NOT NULL` (PR #31), and deprecated the legacy `/api/v1/live/start` endpoint in favor of `/start-portfolio` (PR #31). The test suite was not fully updated; 30 tests failed + 78 errored on main against the current schema.
+
+**Shipped:**
+
+- `tests/integration/_deployment_factory.py` — new `make_live_deployment()` helper that seeds a `LivePortfolio` → `LivePortfolioRevision` → `LiveDeployment` chain matching the post-PR#29 NOT NULL set. Accepts either ORM instances (`user=`, `strategy=`) or IDs (`user_id=`, `strategy_id=`) for maximum flexibility. Generates unique slugs + identity signatures per call so module-scoped fixtures don't collide.
+- `test_audit_hook.py`, `test_heartbeat_monitor.py`, `test_heartbeat_thread.py`, `test_live_node_process_model.py`, `test_live_start_endpoints.py`, `test_live_status_by_id.py`, `test_order_attempt_audit_model.py`, `test_process_manager.py`, `test_trading_node_subprocess.py`, `test_portfolio_deploy_cycle.py` — all migrated to the factory (or patched with the current NOT NULL kwargs). `gateway_session_key` added to every `LiveNodeProcess(...)` construction.
+- `test_alembic_migrations.py` — deleted 4 obsolete "Phase 1 task 1.1b" tests that asserted columns dropped in PR #29 (`config_hash`, `instruments_signature`, etc.). Updated assertions in `test_backfill_creates_portfolio_for_legacy_deployment` (backfill migration intentionally writes empty config + empty instruments per `r6m7n8o9p0q1` line 92) and `test_migration_drops_legacy_columns_keeps_identity` (`portfolio_revision_id` is now NOT NULL after `u9p0q1r2s3t4`). Kept the duplicate-identity-collision test — it still targets valid intermediate migration semantics.
+- `test_live_deployment_stable_identity.py` — deleted entirely. 6 tests of the intermediate v9 identity design that PR #29 replaced with `PortfolioDeploymentIdentity`; new behavior is covered by `test_portfolio_deploy_cycle.py` + portfolio service tests.
+- `test_live_start_endpoints.py` — deleted 9 tests targeting the deprecated `/api/v1/live/start` endpoint (now returns 410 Gone per PR #31). Kept the 2 `/stop` tests which remain valid.
+- `test_parity_determinism.py` — fixed the synthetic OHLC generator. The `_write_synthetic_bars` helper computed `open`, `high`, `low` from independent random draws, producing bars where `high < open` and tripping Nautilus's `Bar.__init__` invariant check. Now derives `high = max(open, close) + |r|*0.1` and `low = min(open, close) - |r|*0.1`, guaranteeing the invariant holds.
+- `test_parity_config_roundtrip.py::test_smoke_config_accepts_full_live_injection` — updated the stale `order_id_tag == "abcd1234abcd1234"` assertion. Since PR #29 the order-index prefix is carried verbatim to match `derive_strategy_id_full`'s `{class}-{order_index}-{slug}` format, so the decoded value is `"0-abcd1234abcd1234"`.
+
+**Scope note:** Test-only cleanup. No production code modified. No public API contract changes. No user-facing behavior changes.
+
 ### 2026-04-18 — Fix: `resolve_for_backtest` honors `start` for alias windowing
 
 Closes known-limitation #2 from the PR #32 CHANGELOG entry. `SecurityMaster.resolve_for_backtest` was defaulting alias lookups to today UTC, so post-roll historical backtests silently received today's front-month / current listing venue instead of the contract active during the backtest window. Two warm paths were affected:

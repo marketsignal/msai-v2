@@ -32,6 +32,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from msai.models import Base, LiveDeployment, LiveNodeProcess, Strategy, User
+from tests.integration._deployment_factory import make_live_deployment
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -84,14 +85,6 @@ async def deployment(session: AsyncSession) -> LiveDeployment:
     deployment with a unique slug + signature so the unique indexes don't
     collide across module-scoped tests.
     """
-    from msai.services.live.deployment_identity import (
-        derive_deployment_identity,
-        derive_message_bus_stream,
-        derive_strategy_id_full,
-        derive_trader_id,
-        generate_deployment_slug,
-    )
-
     user = User(
         id=uuid4(),
         entra_id=f"test-{uuid4().hex}",
@@ -111,42 +104,7 @@ async def deployment(session: AsyncSession) -> LiveDeployment:
     session.add(strategy)
     await session.flush()
 
-    config = {"x": 1}
-    instruments = ["AAPL.NASDAQ"]
-    account_id = "DU1234567"
-    paper_trading = True
-    strategy_code_hash = "deadbeef" * 8
-
-    identity = derive_deployment_identity(
-        user_id=user.id,
-        strategy_id=strategy.id,
-        strategy_code_hash=strategy_code_hash,
-        config=config,
-        account_id=account_id,
-        paper_trading=paper_trading,
-        instruments=instruments,
-    )
-    slug = generate_deployment_slug()
-
-    deployment = LiveDeployment(
-        id=uuid4(),
-        strategy_id=strategy.id,
-        strategy_code_hash=strategy_code_hash,
-        config=config,
-        instruments=instruments,
-        status="stopped",
-        paper_trading=paper_trading,
-        started_by=user.id,
-        deployment_slug=slug,
-        identity_signature=identity.signature(),
-        trader_id=derive_trader_id(slug),
-        strategy_id_full=derive_strategy_id_full(strategy.strategy_class, slug),
-        account_id=account_id,
-        message_bus_stream=derive_message_bus_stream(slug),
-        config_hash=identity.config_hash,
-        instruments_signature=identity.instruments_signature,
-    )
-    session.add(deployment)
+    deployment = await make_live_deployment(session, user=user, strategy=strategy, status="stopped")
     await session.commit()
     return deployment
 
@@ -156,6 +114,7 @@ async def test_insert_and_query(session: AsyncSession, deployment: LiveDeploymen
     """Baseline: create a row, read it back with the expected values."""
     row = LiveNodeProcess(
         deployment_id=deployment.id,
+        gateway_session_key="msai-paper-primary:localhost:4002",
         pid=12345,
         host="test-host",
         started_at=_utcnow(),
@@ -184,6 +143,7 @@ async def test_pid_nullable(session: AsyncSession, deployment: LiveDeployment) -
     """
     row = LiveNodeProcess(
         deployment_id=deployment.id,
+        gateway_session_key="msai-paper-primary:localhost:4002",
         pid=None,
         host="test-host",
         started_at=_utcnow(),
@@ -202,6 +162,7 @@ async def test_building_status_accepted(session: AsyncSession, deployment: LiveD
     """
     row = LiveNodeProcess(
         deployment_id=deployment.id,
+        gateway_session_key="msai-paper-primary:localhost:4002",
         pid=12345,
         host="test-host",
         started_at=_utcnow(),
@@ -234,6 +195,7 @@ async def test_failure_kind_accepts_all_enum_values(
     for kind in all_kinds:
         row = LiveNodeProcess(
             deployment_id=deployment.id,
+            gateway_session_key="msai-paper-primary:localhost:4002",
             pid=None,
             host="test-host",
             started_at=_utcnow(),
@@ -254,6 +216,7 @@ async def test_failure_kind_nullable(session: AsyncSession, deployment: LiveDepl
     """failure_kind is nullable for happy-path rows that haven't failed yet."""
     row = LiveNodeProcess(
         deployment_id=deployment.id,
+        gateway_session_key="msai-paper-primary:localhost:4002",
         pid=12345,
         host="test-host",
         started_at=_utcnow(),
@@ -276,6 +239,7 @@ async def test_partial_unique_index_blocks_duplicate_active(
     """
     row1 = LiveNodeProcess(
         deployment_id=deployment.id,
+        gateway_session_key="msai-paper-primary:localhost:4002",
         pid=111,
         host="test-host",
         started_at=_utcnow(),
@@ -288,6 +252,7 @@ async def test_partial_unique_index_blocks_duplicate_active(
     # Second active row for the same deployment — should fail.
     row2 = LiveNodeProcess(
         deployment_id=deployment.id,
+        gateway_session_key="msai-paper-primary:localhost:4002",
         pid=222,
         host="test-host",
         started_at=_utcnow(),
@@ -313,6 +278,7 @@ async def test_partial_unique_index_allows_terminal_plus_active(
     # First run ended in 'stopped'
     old = LiveNodeProcess(
         deployment_id=deployment.id,
+        gateway_session_key="msai-paper-primary:localhost:4002",
         pid=111,
         host="test-host",
         started_at=_utcnow() - timedelta(hours=1),
@@ -326,6 +292,7 @@ async def test_partial_unique_index_allows_terminal_plus_active(
     # New run starting
     new = LiveNodeProcess(
         deployment_id=deployment.id,
+        gateway_session_key="msai-paper-primary:localhost:4002",
         pid=None,
         host="test-host",
         started_at=_utcnow(),
@@ -346,6 +313,7 @@ async def test_partial_unique_index_allows_failed_plus_active(
     """Same as above but the prior run failed."""
     old = LiveNodeProcess(
         deployment_id=deployment.id,
+        gateway_session_key="msai-paper-primary:localhost:4002",
         pid=111,
         host="test-host",
         started_at=_utcnow() - timedelta(hours=1),
@@ -360,6 +328,7 @@ async def test_partial_unique_index_allows_failed_plus_active(
 
     new = LiveNodeProcess(
         deployment_id=deployment.id,
+        gateway_session_key="msai-paper-primary:localhost:4002",
         pid=None,
         host="test-host",
         started_at=_utcnow(),
@@ -384,6 +353,7 @@ async def test_stopping_status_counts_as_active(
     """
     stopping = LiveNodeProcess(
         deployment_id=deployment.id,
+        gateway_session_key="msai-paper-primary:localhost:4002",
         pid=111,
         host="test-host",
         started_at=_utcnow(),
@@ -395,6 +365,7 @@ async def test_stopping_status_counts_as_active(
 
     racing = LiveNodeProcess(
         deployment_id=deployment.id,
+        gateway_session_key="msai-paper-primary:localhost:4002",
         pid=None,
         host="test-host",
         started_at=_utcnow(),

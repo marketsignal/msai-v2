@@ -22,6 +22,7 @@ from msai.core.database import get_db
 from msai.main import app
 from msai.models import Base, LiveDeployment, LiveNodeProcess, Strategy, User
 from msai.services.live.failure_kind import FailureKind
+from tests.integration._deployment_factory import make_live_deployment
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -108,27 +109,14 @@ async def _seed_deployment_with_process(
         session.add(strategy)
         await session.flush()
 
-        slug = uuid4().hex[:16]
-        dep = LiveDeployment(
-            id=uuid4(),
-            strategy_id=strategy.id,
-            strategy_code_hash="deadbeef" * 8,
-            config={},
-            instruments=["AAPL", "MSFT"],
+        dep = await make_live_deployment(
+            session,
+            user=user,
+            strategy=strategy,
             status="running" if with_process else "created",
-            paper_trading=True,
-            started_by=user.id,
-            deployment_slug=slug,
-            identity_signature="f" * 64,
-            trader_id=f"MSAI-{slug}",
-            strategy_id_full=f"EMACrossStrategy-{slug}",
-            account_id="DU1234567",
-            message_bus_stream=f"trader-MSAI-{slug}-stream",
-            config_hash="cafebabe" * 8,
-            instruments_signature="AAPL,MSFT",
-            last_started_at=datetime.now(UTC) if with_process else None,
         )
-        session.add(dep)
+        if with_process:
+            dep.last_started_at = datetime.now(UTC)
         await session.flush()
 
         proc: LiveNodeProcess | None = None
@@ -136,6 +124,7 @@ async def _seed_deployment_with_process(
             proc = LiveNodeProcess(
                 id=uuid4(),
                 deployment_id=dep.id,
+                gateway_session_key="msai-paper-primary:localhost:4002",
                 pid=12345,
                 host="test-host-1",
                 started_at=datetime.now(UTC),
@@ -188,7 +177,12 @@ async def test_status_by_id_returns_running_deployment_with_process_fields(
     assert body["deployment_slug"] == dep.deployment_slug
     assert body["status"] == "running"
     assert body["paper_trading"] is True
-    assert body["instruments"] == ["AAPL", "MSFT"]
+    # ``instruments`` column was dropped from live_deployments in PR #29
+    # Task 11; the endpoint now returns an empty list as a backward-
+    # compatible shim. Real instrument lists live on
+    # ``live_portfolio_revision_strategies`` and are surfaced via the
+    # portfolio-scoped endpoints.
+    assert body["instruments"] == []
     # Per-run process fields
     assert body["process_id"] == str(proc.id)
     assert body["pid"] == 12345
@@ -270,6 +264,7 @@ async def test_status_by_id_returns_most_recent_process_row(
         new_proc = LiveNodeProcess(
             id=uuid4(),
             deployment_id=dep.id,
+            gateway_session_key="msai-paper-primary:localhost:4002",
             pid=99999,
             host="test-host-2",
             started_at=datetime.now(UTC),
