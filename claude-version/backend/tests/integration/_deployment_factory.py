@@ -28,6 +28,12 @@ from uuid import UUID, uuid4
 from msai.models.live_deployment import LiveDeployment
 from msai.models.live_portfolio import LivePortfolio
 from msai.models.live_portfolio_revision import LivePortfolioRevision
+from msai.services.live.deployment_identity import (
+    derive_message_bus_stream,
+    derive_strategy_id_full,
+    derive_trader_id,
+    generate_deployment_slug,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -76,7 +82,7 @@ async def make_live_deployment(
             "make_live_deployment requires either (user, strategy) or (user_id, strategy_id)"
         )
 
-    slug = slug or uuid4().hex[:16]
+    slug = slug or generate_deployment_slug()
 
     portfolio = LivePortfolio(
         id=uuid4(),
@@ -105,12 +111,12 @@ async def make_live_deployment(
         started_by=user_id,
         deployment_slug=slug,
         identity_signature=uuid4().hex + uuid4().hex,
-        trader_id=f"MSAI-{slug}",
-        strategy_id_full=f"{strategy_class}-{slug}",
+        trader_id=derive_trader_id(slug),
+        strategy_id_full=derive_strategy_id_full(strategy_class, slug),
         account_id=account_id,
         ib_login_key=ib_login_key,
         portfolio_revision_id=revision.id,
-        message_bus_stream=f"trader-MSAI-{slug}-stream",
+        message_bus_stream=derive_message_bus_stream(slug),
     )
     session.add(deployment)
     await session.flush()
