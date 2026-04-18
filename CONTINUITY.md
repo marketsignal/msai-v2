@@ -6,9 +6,35 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field   | Value |
-| ------- | ----- |
-| Command | none  |
+| Field     | Value                                                          |
+| --------- | -------------------------------------------------------------- |
+| Command   | /fix-bug backtest-start-date-windowing                         |
+| Phase     | 6 — Finish (quality gates passed; ready to commit + push + PR) |
+| Next step | Commit + push, then ask user about PR creation                 |
+
+**Bug summary:** `SecurityMaster.resolve_for_backtest` uses today's date for `InstrumentRegistry.find_by_alias`, not the backtest's `start_date`. Post-roll historical backtests silently get today's front-month alias. Flagged in PR #32 CHANGELOG under "Known limitations discovered post-Task 20 (limitation #2)". Target: claude-version. Scope: backtest-only.
+
+### Checklist
+
+- [x] Worktree created (`.worktrees/backtest-start-date-windowing`, branch `fix/backtest-start-date-windowing`)
+- [x] Project state read
+- [x] Plugins verified (superpowers + pr-review-toolkit listed in skill inventory)
+- [x] Searched existing solutions (docs/solutions/backtesting/ — nothing prior matched)
+- [x] Systematic debugging complete — root cause identified: 2 warm paths in `resolve_for_backtest` ignoring `start` kwarg
+- [x] Plan written — N/A (simple fix per workflow, Phase 3 skipped; 1 file + 1 test file, not high-impact surface)
+- [x] TDD fix execution complete — red → green (3 new tests added, 1 file edited)
+- [x] Code review loop (1 iteration) — PASS (pr-review-toolkit:code-reviewer CLEAN, only P3 nits; codex CLI stalled after retry, workflow permits single-reviewer when the other is unavailable)
+- [x] Simplified — 3 parallel review agents (reuse/quality/efficiency) all CLEAN (P3-only); formatter-churn in adjacent methods kept (aligned with ruff-format project standard)
+- [x] Verified — 122/122 in-scope tests pass; ruff clean on changed files; mypy clean on changed lines (53 unrelated pre-existing errors in other lines of the same file). Full-suite failures (30/78) confirmed pre-existing on main, untouched by this fix
+- [x] E2E verified — N/A: fix is internally observable only. Reproducing via public API requires seeding the registry with multiple alias windows for a single symbol, which can't be done through sanctioned ARRANGE channels (`msai instruments refresh` has no effective_from/effective_to param; direct DB inserts forbidden). Integration tests with seeded sessions are the test of record.
+- [x] E2E regression — N/A: tests/e2e/use-cases/ is empty (no accumulated UCs)
+- [x] E2E use cases graduated — N/A (nothing to graduate)
+- [x] Learning documented — `docs/solutions/backtesting/alias-windowing-by-start-date.md`
+- [x] State files updated — CONTINUITY.md (this file), docs/CHANGELOG.md
+- [ ] Committed and pushed
+- [ ] PR created
+- [ ] PR reviews addressed
+- [ ] Branch finished
 
 ### Feature scope (post-council, post-research)
 
@@ -136,18 +162,35 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 - **Pre-existing main dirty tree preserved**: CLAUDE.md (E2E Config), `claude-version/docker-compose.dev.yml` (new IB_PORT + TRADING_MODE env vars), 38 codex-version in-progress files (portfolio-per-account port), tests/e2e fixtures, IB-Gateway runtime data all restored. Stale `CONTINUITY.md` + `docs/CHANGELOG.md` discarded in favor of origin/main versions. Safety branch: `backup/pre-pr32-cleanup-20260417`.
 - **Workers restarted** (`./scripts/restart-workers.sh`) to pick up new security_master modules; `GET /health` on :8800 returns 200.
 
+## Done (cont'd 7) — resolve_for_backtest honors start_date (2026-04-18)
+
+- **Fix scope:** `SecurityMaster.resolve_for_backtest` (service.py) — threaded existing `start: str | None` kwarg through both warm paths so historical backtests get the alias active during the backtest window, not today.
+  - Path 2 (dotted alias): `registry.find_by_alias(..., as_of_date=as_of)`
+  - Path 3 (bare ticker): replaced `effective_to IS NULL` filter with full window predicate `effective_from <= as_of AND (effective_to IS NULL OR effective_to > as_of)`
+- **3 new integration tests** — `test_security_master_resolve_backtest.py`: dotted-alias-historical, bare-ticker-historical, bare-ticker-today-default regression guard. All 6 tests in file pass; 122 security_master/backtest-scope tests pass total.
+- **Quality gates:**
+  - Code review (pr-review-toolkit): CLEAN (P3-only nits)
+  - Codex CLI: stalled on both attempts, killed; workflow permits single-reviewer
+  - Simplify (3 parallel agents — reuse/quality/efficiency): all CLEAN (P3-only)
+  - Verify: ruff + mypy clean on my changed lines; in-scope tests pass; pre-existing full-suite failures (30/78) confirmed present on main, untouched by this fix
+  - E2E: N/A — fix is only observable via state that can't be arranged through sanctioned public-interface channels (alias windows have no public CRUD)
+- **Solution doc:** `docs/solutions/backtesting/alias-windowing-by-start-date.md`.
+- **Closes** PR #32 CHANGELOG "Known limitations discovered post-Task 20, limitation #2".
+
 ## Now
 
-- **Main branch** at `a52046f` (PR #32 merged). `backup/pre-pr32-cleanup-20260417` holds the pre-cleanup snapshot for recovery; delete when confident.
-- **Dirty tree on main** (pre-existing, preserved from before this session): 20 modified + 21 untracked files — CLAUDE.md E2E config, `claude-version/docker-compose.dev.yml` IB_PORT/TRADING_MODE, codex-version portfolio-per-account port work, tests/e2e fixtures. Not part of this session's work; needs owner decision on what to commit vs discard.
-- **Claude stack** healthy on :8800 (workers restarted post-merge). Codex stack not running.
-- **Three explicitly-deferred follow-ups from PR #32** (captured in CHANGELOG + PR body):
-  1. `msai instruments refresh` for plain symbols does not insert rows (Databento path works; IB path skipped). Seed via SQL until the follow-up PR lands.
-  2. `resolve_for_backtest` windows aliases by today's date, not `start_date` — post-roll historical backtests will silently get today's front-month.
-  3. Live path unchanged — `/api/v1/live/start` still uses closed-universe `canonical_instrument_id()`; follow-up PR wires live onto the registry.
+- **Branch** `fix/backtest-start-date-windowing` in worktree, ready to commit + push. Not yet pushed.
+- **Deferred from PR #32** — 2 of the original 3 items still open after this fix merges:
+  1. `msai instruments refresh` for plain symbols (Databento path works; IB path skipped).
+  2. Live path wiring onto registry (`/api/v1/live/start` still uses closed-universe `canonical_instrument_id()`).
+- **Pre-existing main dirty-tree failures** (found during this session's verify-app run, confirmed on main too) — separate problem, not in scope here:
+  - Alembic migration tests expect `LiveDeployment.config_hash` + `instruments_signature` columns that don't exist in the model
+  - `LiveDeployment.__init__` rejects `strategy_code_hash` kwarg
+  - `test_ema_cross_backtest_is_deterministic` raises `ValueError: high was < open` in BarDataWrangler
+  - Worth tracking as its own follow-up (likely stale scaffolding from portfolio-per-account-live PRs).
 
 ## Next
 
-1. **Resolve the pre-existing dirty tree on main.** Inspect `codex-version/**` uncommitted work — decide whether to commit it (new feature branch for codex portfolio-per-account port) or discard it. Same call for CLAUDE.md + docker-compose tweaks.
-2. **Start a follow-up PR** for one of the three deferred items above when ready. Highest-value first: (a) live-path wiring (parity with backtest), then (b) IB-path registry insert, then (c) `start_date`-correct alias windowing.
-3. **Decide fate of `backup/pre-pr32-cleanup-20260417`** — keep for a few days as safety net, then `git branch -D`.
+1. **Commit + push** this fix branch; ask user about PR creation (per critical-rules).
+2. **After PR merges** — the remaining deferred PR #32 items in priority order: live-path wiring (highest strategic value, needs design pass), then IB-path registry insert for plain symbols.
+3. **Triage the pre-existing full-suite failures** — separate branch. Decide whether they're stale scaffolding to delete or real schema gaps to close.
