@@ -165,17 +165,17 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 
 ## Now
 
-- **Branch** `fix/stale-post-pr29-tests` in worktree. Ready for code review + simplify + verify + push + PR.
-- **PR #34 open** at https://github.com/marketsignal/msai-v2/pull/34 (3 commits on branch; main + continuity + Codex-review-fix).
-- **Full suite: 1601/0/0** (passed/failed/errors). Zero regressions from main's 1513 passed.
-- **Codex PR review:** 1 P2 found + fixed + replied. Canonical identity helpers (`derive_strategy_id_full`, `derive_message_bus_stream`, `derive_trader_id`, `generate_deployment_slug`) now used in the factory so tests exercise production-shape strings (commit `65a068e`).
-- **Deferred from PR #32** — 2 of the original 3 items still open:
-  1. `msai instruments refresh` for plain symbols (Databento path works; IB path skipped).
-  2. Live path wiring onto registry (`/api/v1/live/start-portfolio` still uses closed-universe `canonical_instrument_id()`).
+- **On `main` (clean history, no active workflow).** PR #34 merged at `a992453`; continuity-clear at `1c681a0`.
+- **Dirty working tree diagnosis (2026-04-18 15:29):** `claude-codex-forge/setup.sh --with-playwright -f` was run, picking up forge PR #482 ("Playwright security + caller/agent protocol fixes"). Produced 4 dirty files:
+  - ✅ `playwright.config.ts` (new, intended — forge template)
+  - ✅ `docs/ci-templates/{e2e.yml,README.md}` (new, intended — reference CI, not auto-activated)
+  - ✅ `tests/e2e/fixtures/auth.ts` (upgraded, intended — removes `TEST_API_KEY`/localStorage bearer-token path; cookie-session only now; adds SECURITY WARNING)
+  - ❌ `docs/CHANGELOG.md` — template-stomped (96 lines of msai-v2 PR history wiped via `setup.sh -f` → `FORCE=true` branch at line 591). **Restored from HEAD this session.**
+- **Remaining dirty state:** the 3 legitimate forge PR #482 adoption changes, ready for review + commit.
 
 ## Next
 
-1. **Wait for Codex bot re-scan** of `65a068e` (or user can invoke `/finish-branch` to merge without a second pass).
-2. **Any further review comments** → `/review-pr-comments` again.
-3. **When approved** → `/finish-branch` to merge + clean up.
-4. **After PR merges** — pick up the remaining deferred PR #32 items: live-path wiring (highest strategic value, needs design pass), then IB-path registry insert.
+1. **Review + commit Playwright security bundle** (user task) — suggested: `chore(e2e): adopt claude-codex-forge PR #482 Playwright security fixes`.
+2. **Deferred PR #32 items** (pick up after commit):
+   - **Live path wiring onto registry** — `/api/v1/live/start-portfolio` still uses closed-universe `canonical_instrument_id()`. Highest strategic value; needs design pass (→ `/new-feature`).
+   - **`msai instruments refresh` for plain symbols** — Databento path works; IB path skipped.
