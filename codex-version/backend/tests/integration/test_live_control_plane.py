@@ -250,6 +250,172 @@ def test_live_status_and_positions_use_runtime_snapshots(monkeypatch: pytest.Mon
         ]
 
 
+def test_live_status_and_positions_surface_portfolio_members(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "msai_api_key", "msai-test-key")
+
+    status_rows = [
+        {
+            "id": "dep-portfolio",
+            "strategy_id": None,
+            "portfolio_revision_id": "revision-1",
+            "account_id": "DU123456",
+            "status": "running",
+            "started_at": "2026-04-16T12:00:00Z",
+            "process_alive": True,
+            "control_mode": "remote",
+            "runtime_fresh": True,
+            "paper_trading": True,
+            "broker_connected": True,
+            "broker_mock_mode": False,
+            "broker_updated_at": "2026-04-16T12:00:00Z",
+            "broker_open_positions": 0,
+            "broker_open_orders": 0,
+            "broker_exposure_detected": False,
+            "members": [],
+        }
+    ]
+
+    class _FakeSession:
+        async def execute(self, *_: object, **__: object) -> _RowResult:
+            return _RowResult([])
+
+    async def _override_db() -> AsyncGenerator[_FakeSession, None]:
+        yield _FakeSession()
+
+    async def _fake_status() -> list[dict[str, Any]]:
+        return status_rows
+
+    async def _fake_snapshots(name: str) -> list[dict[str, Any]]:
+        if name == "status":
+            return [
+                {
+                    "scope": "dep-portfolio",
+                    "generated_at": "2026-04-16T12:05:00Z",
+                    "data": {
+                        "status": "running",
+                        "daily_pnl": 5.5,
+                        "open_positions": 2,
+                        "open_orders": 1,
+                        "updated_at": "2026-04-16T12:05:00Z",
+                        "portfolio_revision_id": "revision-1",
+                        "account_id": "DU123456",
+                        "members": [
+                            {
+                                "strategy_id": "strategy-1",
+                                "strategy_name": "example.mean_reversion",
+                                "strategy_id_full": "MeanReversionZScoreStrategy-0-live123",
+                                "order_index": 0,
+                                "instrument_ids": ["SPY.XNAS"],
+                            },
+                            {
+                                "strategy_id": "strategy-2",
+                                "strategy_name": "example.mean_reversion.alt",
+                                "strategy_id_full": "MeanReversionZScoreStrategy-1-live123",
+                                "order_index": 1,
+                                "instrument_ids": ["QQQ.XNAS"],
+                            },
+                        ],
+                    },
+                }
+            ]
+        if name == "positions":
+            return [
+                {
+                    "scope": "dep-portfolio",
+                    "generated_at": "2026-04-16T12:05:00Z",
+                    "data": [
+                        {
+                            "deployment_id": "dep-portfolio",
+                            "strategy_id": "strategy-1",
+                            "strategy_id_full": "MeanReversionZScoreStrategy-0-live123",
+                            "instrument": "SPY.XNAS",
+                            "quantity": 1,
+                            "paper_trading": True,
+                        },
+                        {
+                            "deployment_id": "dep-portfolio",
+                            "strategy_id": "strategy-2",
+                            "strategy_id_full": "MeanReversionZScoreStrategy-1-live123",
+                            "instrument": "QQQ.XNAS",
+                            "quantity": 2,
+                            "paper_trading": True,
+                        },
+                    ],
+                }
+            ]
+        return []
+
+    app.dependency_overrides[get_db] = _override_db
+    monkeypatch.setattr(live_api.live_runtime_client, "status", _fake_status)
+    monkeypatch.setattr(live_api, "load_live_snapshots", _fake_snapshots)
+
+    with TestClient(app) as client:
+        status_response = client.get("/api/v1/live/status", headers={"X-API-Key": "msai-test-key"})
+        positions_response = client.get("/api/v1/live/positions", headers={"X-API-Key": "msai-test-key"})
+
+        assert status_response.status_code == 200
+        assert status_response.json() == [
+            {
+                "id": "dep-portfolio",
+                "strategy": "Portfolio (2 strategies)",
+                "status": "running",
+                "started_at": "2026-04-16T12:00:00Z",
+                "daily_pnl": 5.5,
+                "process_alive": True,
+                "control_mode": "remote",
+                "runtime_fresh": True,
+                "paper_trading": True,
+                "open_positions": 2,
+                "open_orders": 1,
+                "updated_at": "2026-04-16T12:05:00Z",
+                "reason": None,
+                "broker_connected": True,
+                "broker_mock_mode": False,
+                "broker_updated_at": "2026-04-16T12:00:00Z",
+                "broker_open_positions": 0,
+                "broker_open_orders": 0,
+                "broker_exposure_detected": False,
+                "portfolio_revision_id": "revision-1",
+                "account_id": "DU123456",
+                "members": [
+                    {
+                        "strategy_id": "strategy-1",
+                        "strategy_name": "example.mean_reversion",
+                        "strategy_id_full": "MeanReversionZScoreStrategy-0-live123",
+                        "order_index": 0,
+                        "instrument_ids": ["SPY.XNAS"],
+                    },
+                    {
+                        "strategy_id": "strategy-2",
+                        "strategy_name": "example.mean_reversion.alt",
+                        "strategy_id_full": "MeanReversionZScoreStrategy-1-live123",
+                        "order_index": 1,
+                        "instrument_ids": ["QQQ.XNAS"],
+                    },
+                ],
+            }
+        ]
+        assert positions_response.status_code == 200
+        assert positions_response.json() == [
+            {
+                "deployment_id": "dep-portfolio",
+                "strategy_id": "strategy-2",
+                "strategy_id_full": "MeanReversionZScoreStrategy-1-live123",
+                "instrument": "QQQ.XNAS",
+                "quantity": 2,
+                "paper_trading": True,
+            },
+            {
+                "deployment_id": "dep-portfolio",
+                "strategy_id": "strategy-1",
+                "strategy_id_full": "MeanReversionZScoreStrategy-0-live123",
+                "instrument": "SPY.XNAS",
+                "quantity": 1,
+                "paper_trading": True,
+            },
+        ]
+
+
 def test_live_stream_replays_snapshot_and_streams_updates(
     monkeypatch: pytest.MonkeyPatch,
     redis_url: str,

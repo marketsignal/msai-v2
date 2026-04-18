@@ -13,6 +13,7 @@ from msai.api import (
     backtests_router,
     graduation_router,
     live_router,
+    live_portfolios_router,
     market_data_router,
     portfolio_router,
     research_router,
@@ -100,6 +101,7 @@ api_router.include_router(market_data_router)
 api_router.include_router(alerts_router)
 api_router.include_router(account_router)
 api_router.include_router(live_router)
+api_router.include_router(live_portfolios_router)
 api_router.include_router(portfolio_router)
 api_router.include_router(research_router)
 api_router.include_router(websocket_router)

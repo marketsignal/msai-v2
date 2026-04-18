@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import multiprocessing as mp
 import queue
 import signal
@@ -15,19 +16,30 @@ from typing import Any
 from urllib.parse import urlparse
 
 import msgspec
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from msai.core.config import settings
 from msai.core.database import async_session_factory
 from msai.core.logging import get_logger
-from msai.models import InstrumentDefinition, LiveDeployment
+from msai.models import (
+    InstrumentDefinition,
+    LiveDeployment,
+    LiveDeploymentStrategy,
+    LivePortfolioRevisionStrategy,
+    Strategy,
+)
 from msai.services.ib_account import BrokerSnapshot, ib_account_service
+from msai.services.live import (
+    derive_strategy_id_full,
+    generate_deployment_slug,
+)
 from msai.services.live_updates import (
     clear_live_scope,
     load_live_snapshot,
     load_live_snapshots,
     publish_live_update,
 )
+from msai.services.nautilus.failure_isolated_strategy import activate_runtime_strategy_safety
 from msai.services.nautilus.strategy_loader import resolve_importable_strategy_paths
 
 logger = get_logger("trading_node")
@@ -75,14 +87,31 @@ except Exception as exc:  # pragma: no cover - environment-dependent import
 
 
 @dataclass(slots=True)
-class _TradingNodePayload:
-    deployment_id: str
+class _StrategyMemberPayload:
+    revision_strategy_id: str
     strategy_id: str
     strategy_name: str
     strategy_code_hash: str
     strategy_path: str
     config_path: str
     config: dict[str, Any]
+    order_id_tag: str
+    strategy_id_full: str
+    instrument_ids: tuple[str, ...]
+
+
+@dataclass(slots=True)
+class _TradingNodePayload:
+    deployment_id: str
+    deployment_slug: str
+    strategy_id: str
+    strategy_name: str
+    strategy_code_hash: str
+    strategy_path: str
+    config_path: str
+    config: dict[str, Any]
+    order_id_tag: str | None
+    strategy_id_full: str | None
     ibg_host: str
     ibg_port: int
     data_client_id: int
@@ -91,6 +120,8 @@ class _TradingNodePayload:
     trader_id: str
     paper_trading: bool
     instrument_ids: tuple[str, ...]
+    portfolio_revision_id: str | None = None
+    strategy_members: tuple[_StrategyMemberPayload, ...] = ()
 
 
 @dataclass(slots=True)
@@ -133,44 +164,135 @@ class TradingNodeManager:
 
     async def start(
         self,
-        strategy_id: str,
-        strategy_name: str,
-        strategy_file: str,
-        config: dict[str, Any],
-        instruments: list[str],
-        strategy_code_hash: str,
-        strategy_git_sha: str | None,
-        paper_trading: bool,
-        started_by: str | None,
+        strategy_id: str | None = None,
+        strategy_name: str | None = None,
+        strategy_file: str | None = None,
+        config: dict[str, Any] | None = None,
+        instruments: list[str] | None = None,
+        strategy_code_hash: str | None = None,
+        strategy_git_sha: str | None = None,
+        paper_trading: bool = True,
+        started_by: str | None = None,
+        portfolio_revision_id: str | None = None,
+        strategy_members: list[dict[str, Any]] | None = None,
+        identity_signature: str | None = None,
+        account_id: str | None = None,
     ) -> str:
         if _NAUTILUS_IMPORT_ERROR is not None:
             raise RuntimeError(f"Nautilus live imports unavailable: {_NAUTILUS_IMPORT_ERROR}")
 
+        instrument_ids = list(instruments or [])
+        member_inputs = [dict(member) for member in (strategy_members or [])]
+        account_id = account_id or settings.ib_account_id
+        is_portfolio_start = portfolio_revision_id is not None
+        if is_portfolio_start and not member_inputs:
+            raise LiveStartFailedError("Portfolio deployments require at least one strategy member")
+        if not is_portfolio_start and (
+            not strategy_id or not strategy_name or not strategy_file or config is None or not instrument_ids or not strategy_code_hash
+        ):
+            raise LiveStartFailedError("Legacy live starts require strategy, config, and instrument inputs")
+
         await self._assert_no_live_overlap(
-            instruments=instruments,
+            instruments=instrument_ids,
             paper_trading=paper_trading,
         )
 
         async with async_session_factory() as session:
+            existing = None
+            if identity_signature:
+                existing = (
+                    await session.execute(
+                        select(LiveDeployment).where(LiveDeployment.identity_signature == identity_signature)
+                    )
+                ).scalar_one_or_none()
+                if existing is not None and str(existing.status) not in {"blocked", "error", "stopped", "unmanaged"}:
+                    raise LiveStartBlockedError(
+                        f"Deployment {existing.id} is already active for this identity"
+                    )
+
             data_client_id, exec_client_id = await self._allocate_ib_client_ids(
                 session,
                 paper_trading=paper_trading,
             )
-            deployment = LiveDeployment(
-                strategy_id=strategy_id,
-                strategy_code_hash=strategy_code_hash,
-                strategy_git_sha=strategy_git_sha,
-                config=config,
-                instruments=instruments,
-                status="starting",
-                paper_trading=paper_trading,
-                ib_data_client_id=data_client_id,
-                ib_exec_client_id=exec_client_id,
-                process_pid=None,
-                started_at=datetime.now(UTC),
-                started_by=started_by,
-            )
-            session.add(deployment)
+
+            if existing is None:
+                deployment = LiveDeployment(
+                    strategy_id=strategy_id if not is_portfolio_start else None,
+                    portfolio_revision_id=portfolio_revision_id,
+                    strategy_code_hash=_aggregate_strategy_code_hashes(member_inputs)
+                    if is_portfolio_start
+                    else str(strategy_code_hash),
+                    strategy_git_sha=strategy_git_sha,
+                    config=_deployment_config_payload(
+                        config=config,
+                        portfolio_revision_id=portfolio_revision_id,
+                        member_inputs=member_inputs,
+                    ),
+                    instruments=instrument_ids,
+                    identity_signature=identity_signature,
+                    deployment_slug=generate_deployment_slug(),
+                    strategy_id_full=None,
+                    account_id=account_id,
+                    status="starting",
+                    paper_trading=paper_trading,
+                    ib_data_client_id=data_client_id,
+                    ib_exec_client_id=exec_client_id,
+                    process_pid=None,
+                    started_at=datetime.now(UTC),
+                    stopped_at=None,
+                    started_by=started_by,
+                )
+                session.add(deployment)
+                await session.flush()
+            else:
+                deployment = existing
+                deployment.strategy_id = strategy_id if not is_portfolio_start else None
+                deployment.portfolio_revision_id = portfolio_revision_id
+                deployment.strategy_code_hash = (
+                    _aggregate_strategy_code_hashes(member_inputs) if is_portfolio_start else str(strategy_code_hash)
+                )
+                deployment.strategy_git_sha = strategy_git_sha
+                deployment.config = _deployment_config_payload(
+                    config=config,
+                    portfolio_revision_id=portfolio_revision_id,
+                    member_inputs=member_inputs,
+                )
+                deployment.instruments = instrument_ids
+                deployment.identity_signature = identity_signature
+                deployment.account_id = account_id
+                deployment.status = "starting"
+                deployment.paper_trading = paper_trading
+                deployment.ib_data_client_id = data_client_id
+                deployment.ib_exec_client_id = exec_client_id
+                deployment.process_pid = None
+                deployment.started_at = datetime.now(UTC)
+                deployment.stopped_at = None
+                deployment.started_by = started_by
+
+            deployment_slug = str(deployment.deployment_slug or generate_deployment_slug())
+            deployment.deployment_slug = deployment_slug
+
+            if is_portfolio_start:
+                await session.execute(
+                    delete(LiveDeploymentStrategy).where(LiveDeploymentStrategy.deployment_id == deployment.id)
+                )
+                member_payloads = _build_strategy_member_payloads(member_inputs, deployment_slug)
+                for member_payload in member_payloads:
+                    session.add(
+                        LiveDeploymentStrategy(
+                            deployment_id=deployment.id,
+                            revision_strategy_id=member_payload.revision_strategy_id,
+                            strategy_id_full=member_payload.strategy_id_full,
+                        )
+                    )
+                if member_payloads:
+                    deployment.strategy_id_full = member_payloads[0].strategy_id_full
+            else:
+                deployment.strategy_id_full = _legacy_strategy_id_full(
+                    strategy_file=str(strategy_file),
+                    deployment_slug=deployment_slug,
+                )
+
             await session.commit()
             await session.refresh(deployment)
 
@@ -178,23 +300,51 @@ class TradingNodeManager:
         if not isinstance(deployment_id, str):
             raise RuntimeError("Unexpected deployment ID type")
 
-        import_paths = resolve_importable_strategy_paths(strategy_file)
+        strategy_member_payloads: list[_StrategyMemberPayload] = []
+        if is_portfolio_start:
+            strategy_member_payloads = _build_strategy_member_payloads(member_inputs, str(deployment.deployment_slug))
+            primary_member = strategy_member_payloads[0]
+            import_paths = None
+            primary_config = dict(primary_member.config)
+            primary_strategy_path = primary_member.strategy_path
+            primary_config_path = primary_member.config_path
+            primary_strategy_id = primary_member.strategy_id
+            primary_strategy_name = primary_member.strategy_name
+            primary_strategy_code_hash = primary_member.strategy_code_hash
+            primary_order_id_tag = primary_member.order_id_tag
+            primary_strategy_id_full = primary_member.strategy_id_full
+        else:
+            import_paths = resolve_importable_strategy_paths(str(strategy_file))
+            primary_config = dict(config or {})
+            primary_strategy_path = import_paths.strategy_path
+            primary_config_path = import_paths.config_path
+            primary_strategy_id = str(strategy_id)
+            primary_strategy_name = str(strategy_name)
+            primary_strategy_code_hash = str(strategy_code_hash)
+            primary_order_id_tag = _order_id_tag_for_member(0, str(deployment.deployment_slug))
+            primary_strategy_id_full = deployment.strategy_id_full
+
         payload = _TradingNodePayload(
             deployment_id=deployment_id,
-            strategy_id=strategy_id,
-            strategy_name=strategy_name,
-            strategy_code_hash=strategy_code_hash,
-            strategy_path=import_paths.strategy_path,
-            config_path=import_paths.config_path,
-            config=config,
+            deployment_slug=str(deployment.deployment_slug),
+            strategy_id=primary_strategy_id,
+            strategy_name=primary_strategy_name,
+            strategy_code_hash=primary_strategy_code_hash,
+            strategy_path=primary_strategy_path,
+            config_path=primary_config_path,
+            config=primary_config,
+            order_id_tag=primary_order_id_tag,
+            strategy_id_full=primary_strategy_id_full,
             ibg_host=settings.ib_gateway_host,
             ibg_port=settings.ib_gateway_port_paper if paper_trading else settings.ib_gateway_port_live,
             data_client_id=data_client_id,
             exec_client_id=exec_client_id,
-            account_id=settings.ib_account_id,
+            account_id=account_id or settings.ib_account_id,
             trader_id=_deployment_trader_id(deployment_id),
             paper_trading=paper_trading,
-            instrument_ids=tuple(instruments),
+            instrument_ids=tuple(instrument_ids),
+            portfolio_revision_id=portfolio_revision_id,
+            strategy_members=tuple(strategy_member_payloads) if is_portfolio_start else (),
         )
 
         process_ctx = mp.get_context("spawn")
@@ -242,12 +392,15 @@ class TradingNodeManager:
             "deployment.started",
             {
                 "deployment_id": deployment_id,
-                "strategy_id": strategy_id,
+                "strategy_id": primary_strategy_id,
+                "strategy_id_full": primary_strategy_id_full,
+                "portfolio_revision_id": portfolio_revision_id,
                 "paper_trading": paper_trading,
                 "process_pid": process.pid,
                 "ib_data_client_id": data_client_id,
                 "ib_exec_client_id": exec_client_id,
-                "instruments": instruments,
+                "account_id": account_id,
+                "instruments": instrument_ids,
             },
         )
         return deployment_id
@@ -512,6 +665,7 @@ class TradingNodeManager:
         runtime_by_id = await _load_status_snapshots_by_scope()
         now = datetime.now(UTC)
         broker_views = await self._load_broker_views(rows, runtime_by_id, now)
+        deployment_members = await _load_deployment_members(rows)
 
         status_rows: list[dict[str, Any]] = []
         for row in rows:
@@ -566,6 +720,7 @@ class TradingNodeManager:
                     "broker_exposure_detected": (
                         broker_view.exposure_detected if broker_view is not None else False
                     ),
+                    "members": deployment_members.get(deployment_id, []),
                 }
             )
         return status_rows
@@ -730,6 +885,7 @@ def _run_trading_node_process(payload: _TradingNodePayload, startup_queue: Any) 
 
     node: TradingNode | None = None
     try:
+        _activate_payload_strategy_safety(payload)
         node_cfg = build_trading_node_config(payload)
         node = TradingNode(config=node_cfg)
         node.kernel.msgbus.add_streaming_type(ShutdownSystem)
@@ -770,11 +926,43 @@ def build_trading_node_config(payload: _TradingNodePayload) -> TradingNodeConfig
         raise RuntimeError(f"Nautilus live imports unavailable: {_NAUTILUS_IMPORT_ERROR}")
 
     instrument_provider = _build_instrument_provider_config(payload.instrument_ids)
-    strategy_cfg = ImportableStrategyConfig(
-        strategy_path=payload.strategy_path,
-        config_path=payload.config_path,
-        config=payload.config,
-    )
+    if payload.strategy_members:
+        strategy_cfgs = [
+            ImportableStrategyConfig(
+                strategy_path=member.strategy_path,
+                config_path=member.config_path,
+                config=_strategy_config_with_order_tag(member.config, member.order_id_tag),
+            )
+            for member in payload.strategy_members
+        ]
+        startup_instrument_id = str(payload.strategy_members[0].config["instrument_id"])
+        startup_quantity = sum(
+            _member_startup_quantity(member.config)
+            for member in payload.strategy_members
+        )
+        controller_members = [
+            {
+                "strategy_id": member.strategy_id,
+                "strategy_name": member.strategy_name,
+                "strategy_code_hash": member.strategy_code_hash,
+                "strategy_id_full": member.strategy_id_full,
+                "order_id_tag": member.order_id_tag,
+                "instrument_ids": list(member.instrument_ids),
+            }
+            for member in payload.strategy_members
+        ]
+    else:
+        strategy_cfgs = [
+            ImportableStrategyConfig(
+                strategy_path=payload.strategy_path,
+                config_path=payload.config_path,
+                config=_strategy_config_with_order_tag(payload.config, payload.order_id_tag),
+            )
+        ]
+        startup_instrument_id = str(payload.config["instrument_id"])
+        startup_quantity = _member_startup_quantity(payload.config)
+        controller_members = []
+
     data_cfg = InteractiveBrokersDataClientConfig(
         instrument_provider=instrument_provider,
         ibg_host=payload.ibg_host,
@@ -813,9 +1001,12 @@ def build_trading_node_config(payload: _TradingNodePayload) -> TradingNodeConfig
                 "strategy_db_id": payload.strategy_id,
                 "strategy_name": payload.strategy_name,
                 "strategy_code_hash": payload.strategy_code_hash,
+                "strategy_id_full": payload.strategy_id_full,
+                "portfolio_revision_id": payload.portfolio_revision_id,
+                "strategy_members": controller_members,
                 "instrument_ids": list(payload.instrument_ids),
-                "startup_instrument_id": str(payload.config["instrument_id"]),
-                "startup_quantity": float(payload.config.get("trade_size", 1.0)),
+                "startup_instrument_id": startup_instrument_id,
+                "startup_quantity": startup_quantity,
                 "account_id": payload.account_id,
                 "paper_trading": payload.paper_trading,
                 "snapshot_interval_secs": settings.live_state_snapshot_interval_seconds,
@@ -829,13 +1020,27 @@ def build_trading_node_config(payload: _TradingNodePayload) -> TradingNodeConfig
             reconciliation=True,
             reconciliation_instrument_ids=reconciliation_instrument_ids,
         ),
-        strategies=[strategy_cfg],
+        strategies=strategy_cfgs,
         data_clients={"IB": data_cfg},
         exec_clients={"IB": exec_cfg},
     )
 
 
 trading_node_manager = TradingNodeManager()
+
+
+def _activate_payload_strategy_safety(payload: _TradingNodePayload) -> None:
+    strategy_paths = (
+        [member.strategy_path for member in payload.strategy_members]
+        if payload.strategy_members
+        else [payload.strategy_path]
+    )
+    seen: set[str] = set()
+    for strategy_path in strategy_paths:
+        if strategy_path in seen:
+            continue
+        activate_runtime_strategy_safety(strategy_path)
+        seen.add(strategy_path)
 
 
 def _redis_database_config() -> DatabaseConfig:
@@ -855,6 +1060,78 @@ def _build_instrument_provider_config(
 ) -> InteractiveBrokersInstrumentProviderConfig:
     parsed_ids = frozenset(InstrumentId.from_str(instrument_id) for instrument_id in instrument_ids)
     return InteractiveBrokersInstrumentProviderConfig(load_ids=parsed_ids or None)
+
+
+def _strategy_config_with_order_tag(config: Mapping[str, Any], order_id_tag: str | None) -> dict[str, Any]:
+    resolved = dict(config)
+    if order_id_tag:
+        resolved.setdefault("order_id_tag", order_id_tag)
+    return resolved
+
+
+def _member_startup_quantity(config: Mapping[str, Any]) -> float:
+    try:
+        return abs(float(config.get("trade_size", 1.0)))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _order_id_tag_for_member(order_index: int, deployment_slug: str) -> str:
+    return f"{order_index}-{deployment_slug}"
+
+
+def _legacy_strategy_id_full(*, strategy_file: str, deployment_slug: str) -> str:
+    import_paths = resolve_importable_strategy_paths(strategy_file)
+    strategy_class_name = import_paths.strategy_path.rsplit(":", 1)[-1]
+    return derive_strategy_id_full(strategy_class_name, deployment_slug, 0)
+
+
+def _build_strategy_member_payloads(
+    member_inputs: list[dict[str, Any]],
+    deployment_slug: str,
+) -> list[_StrategyMemberPayload]:
+    payloads: list[_StrategyMemberPayload] = []
+    for member in sorted(member_inputs, key=lambda item: int(item.get("order_index", 0))):
+        strategy_path = str(member["strategy_path"])
+        strategy_class_name = str(member.get("strategy_class") or strategy_path.rsplit(":", 1)[-1])
+        order_index = int(member.get("order_index", 0))
+        order_id_tag = _order_id_tag_for_member(order_index, deployment_slug)
+        payloads.append(
+            _StrategyMemberPayload(
+                revision_strategy_id=str(member["revision_strategy_id"]),
+                strategy_id=str(member["strategy_id"]),
+                strategy_name=str(member["strategy_name"]),
+                strategy_code_hash=str(member["strategy_code_hash"]),
+                strategy_path=strategy_path,
+                config_path=str(member["config_path"]),
+                config=dict(member["config"]),
+                order_id_tag=order_id_tag,
+                strategy_id_full=derive_strategy_id_full(strategy_class_name, deployment_slug, order_index),
+                instrument_ids=tuple(str(value) for value in member.get("instrument_ids", [])),
+            )
+        )
+    return payloads
+
+
+def _deployment_config_payload(
+    *,
+    config: dict[str, Any] | None,
+    portfolio_revision_id: str | None,
+    member_inputs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if portfolio_revision_id is None:
+        return dict(config or {})
+    return {
+        "portfolio_revision_id": portfolio_revision_id,
+        "member_count": len(member_inputs),
+    }
+
+
+def _aggregate_strategy_code_hashes(member_inputs: list[dict[str, Any]]) -> str:
+    if not member_inputs:
+        return ""
+    payload = "|".join(sorted(str(member["strategy_code_hash"]) for member in member_inputs))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _terminate_managed_process(process: BaseProcess | None) -> None:
@@ -942,6 +1219,47 @@ async def _load_instrument_definitions(
         )
         models = result.scalars().all()
     return {row.instrument_id: row for row in models}
+
+
+async def _load_deployment_members(
+    rows: list[Mapping[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    deployment_ids = [str(row["id"]) for row in rows if row.get("portfolio_revision_id")]
+    if not deployment_ids:
+        return {}
+
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(
+                LiveDeploymentStrategy.deployment_id,
+                LiveDeploymentStrategy.strategy_id_full,
+                LivePortfolioRevisionStrategy.strategy_id,
+                LivePortfolioRevisionStrategy.instruments,
+                LivePortfolioRevisionStrategy.order_index,
+                Strategy.name,
+            )
+            .join(
+                LivePortfolioRevisionStrategy,
+                LivePortfolioRevisionStrategy.id == LiveDeploymentStrategy.revision_strategy_id,
+            )
+            .join(Strategy, Strategy.id == LivePortfolioRevisionStrategy.strategy_id)
+            .where(LiveDeploymentStrategy.deployment_id.in_(deployment_ids))
+            .order_by(LiveDeploymentStrategy.deployment_id, LivePortfolioRevisionStrategy.order_index)
+        )
+        members = result.all()
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for deployment_id, strategy_id_full, strategy_id, instruments, order_index, strategy_name in members:
+        grouped.setdefault(str(deployment_id), []).append(
+            {
+                "strategy_id": str(strategy_id),
+                "strategy_name": str(strategy_name),
+                "strategy_id_full": str(strategy_id_full),
+                "order_index": int(order_index),
+                "instruments": list(instruments or []),
+            }
+        )
+    return grouped
 
 
 def _deployment_broker_view(

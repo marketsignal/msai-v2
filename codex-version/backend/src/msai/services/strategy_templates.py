@@ -186,6 +186,7 @@ def _render_mean_reversion_template(strategy_class: str, config_class: str, modu
         from nautilus_trader.model.objects import Quantity
         from nautilus_trader.trading.config import StrategyConfig
         from nautilus_trader.trading.strategy import Strategy
+        from msai.services.nautilus.failure_isolated_strategy import FailureIsolatedStrategy
 
 
         class {config_class}(StrategyConfig, frozen=True):
@@ -199,7 +200,7 @@ def _render_mean_reversion_template(strategy_class: str, config_class: str, modu
             allow_shorting: bool = True
 
 
-        class {strategy_class}(Strategy):
+        class {strategy_class}(FailureIsolatedStrategy, Strategy):
             """{module_doc}"""
 
             def __init__(self, config: {config_class}) -> None:
@@ -284,6 +285,7 @@ def _render_ema_cross_template(strategy_class: str, config_class: str, module_do
         from nautilus_trader.model.objects import Quantity
         from nautilus_trader.trading.config import StrategyConfig
         from nautilus_trader.trading.strategy import Strategy
+        from msai.services.nautilus.failure_isolated_strategy import FailureIsolatedStrategy
 
 
         class {config_class}(StrategyConfig, frozen=True):
@@ -294,7 +296,7 @@ def _render_ema_cross_template(strategy_class: str, config_class: str, module_do
             trade_size: Decimal = Decimal("1")
 
 
-        class {strategy_class}(Strategy):
+        class {strategy_class}(FailureIsolatedStrategy, Strategy):
             """{module_doc}"""
 
             def __init__(self, config: {config_class}) -> None:
@@ -354,6 +356,7 @@ def _render_donchian_template(strategy_class: str, config_class: str, module_doc
         from nautilus_trader.model.objects import Quantity
         from nautilus_trader.trading.config import StrategyConfig
         from nautilus_trader.trading.strategy import Strategy
+        from msai.services.nautilus.failure_isolated_strategy import FailureIsolatedStrategy
 
 
         class {config_class}(StrategyConfig, frozen=True):
@@ -365,7 +368,7 @@ def _render_donchian_template(strategy_class: str, config_class: str, module_doc
             allow_shorting: bool = True
 
 
-        class {strategy_class}(Strategy):
+        class {strategy_class}(FailureIsolatedStrategy, Strategy):
             """{module_doc}"""
 
             def __init__(self, config: {config_class}) -> None:

@@ -29,6 +29,7 @@ class Trade(Base):
         Index("idx_trades_backtest", "backtest_id"),
         Index("idx_trades_deployment", "deployment_id"),
         Index("idx_trades_strategy", "strategy_id"),
+        Index("idx_trades_strategy_full", "strategy_id_full"),
         Index("idx_trades_executed", "executed_at"),
         Index("idx_trades_instrument", "instrument"),
         Index("idx_trades_broker_trade", "broker_trade_id"),
@@ -39,6 +40,7 @@ class Trade(Base):
     backtest_id: Mapped[str | None] = mapped_column(ForeignKey("backtests.id"), nullable=True)
     deployment_id: Mapped[str | None] = mapped_column(ForeignKey("live_deployments.id"), nullable=True)
     strategy_id: Mapped[str] = mapped_column(ForeignKey("strategies.id"), nullable=False)
+    strategy_id_full: Mapped[str | None] = mapped_column(String(280), nullable=True)
     strategy_code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     instrument: Mapped[str] = mapped_column(String(100), nullable=False)
     side: Mapped[str] = mapped_column(String(10), nullable=False)

@@ -4,6 +4,7 @@ from msai.api.auth import router as auth_router
 from msai.api.backtests import router as backtests_router
 from msai.api.graduation import router as graduation_router
 from msai.api.live import router as live_router
+from msai.api.live_portfolios import router as live_portfolios_router
 from msai.api.market_data import router as market_data_router
 from msai.api.portfolio import router as portfolio_router
 from msai.api.research import router as research_router
@@ -18,6 +19,7 @@ __all__ = [
     "backtests_router",
     "graduation_router",
     "live_router",
+    "live_portfolios_router",
     "market_data_router",
     "portfolio_router",
     "research_router",

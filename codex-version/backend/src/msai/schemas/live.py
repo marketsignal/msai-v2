@@ -10,5 +10,11 @@ class LiveStartRequest(BaseModel):
     paper_trading: bool = True
 
 
+class PortfolioStartRequest(BaseModel):
+    portfolio_revision_id: str
+    account_id: str = Field(min_length=1)
+    paper_trading: bool = True
+
+
 class LiveStopRequest(BaseModel):
     deployment_id: str

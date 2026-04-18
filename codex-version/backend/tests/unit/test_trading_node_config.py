@@ -16,6 +16,7 @@ from msai.services.nautilus.trading_node import (
     _next_ib_client_id_pair,
     _overlapping_live_deployments,
     _runtime_status_is_flat,
+    _StrategyMemberPayload,
     _TradingNodePayload,
     build_trading_node_config,
 )
@@ -24,6 +25,7 @@ from msai.services.nautilus.trading_node import (
 def test_build_trading_node_config_has_ib_clients() -> None:
     payload = _TradingNodePayload(
         deployment_id="dep-1",
+        deployment_slug="slug-1",
         strategy_id="strategy-1",
         strategy_name="example.ema_cross",
         strategy_code_hash="abc123",
@@ -36,6 +38,8 @@ def test_build_trading_node_config_has_ib_clients() -> None:
             "slow_ema_period": 30,
             "trade_size": "1",
         },
+        order_id_tag="0-slug-1",
+        strategy_id_full="EMACrossStrategy-0-slug-1",
         ibg_host="ib-gateway",
         ibg_port=4002,
         data_client_id=11,
@@ -62,6 +66,75 @@ def test_build_trading_node_config_has_ib_clients() -> None:
     ]
     assert config.controller.config["account_id"] == "DU123456"
     assert config.controller.config["liquidation_topic"] == _deployment_liquidation_topic("dep-1")
+
+
+def test_build_trading_node_config_supports_multi_strategy_payload() -> None:
+    payload = _TradingNodePayload(
+        deployment_id="dep-2",
+        deployment_slug="slug-2",
+        strategy_id="strategy-1",
+        strategy_name="portfolio",
+        strategy_code_hash="aggregate-hash",
+        strategy_path="strategies.example.mean_reversion:MeanReversionZScoreStrategy",
+        config_path="strategies.example.mean_reversion:MeanReversionZScoreConfig",
+        config={
+            "instrument_id": "SPY.XNAS",
+            "bar_type": "SPY.XNAS-1-MINUTE-LAST-EXTERNAL",
+            "trade_size": "1",
+        },
+        order_id_tag="0-slug-2",
+        strategy_id_full="MeanReversionZScoreStrategy-0-slug-2",
+        ibg_host="ib-gateway",
+        ibg_port=4002,
+        data_client_id=21,
+        exec_client_id=22,
+        account_id="DU654321",
+        trader_id="TRADER-002",
+        paper_trading=True,
+        instrument_ids=("SPY.XNAS", "QQQ.XNAS"),
+        portfolio_revision_id="revision-1",
+        strategy_members=(
+            _StrategyMemberPayload(
+                revision_strategy_id="member-1",
+                strategy_id="strategy-1",
+                strategy_name="example.mean_reversion",
+                strategy_code_hash="hash-1",
+                strategy_path="strategies.example.mean_reversion:MeanReversionZScoreStrategy",
+                config_path="strategies.example.mean_reversion:MeanReversionZScoreConfig",
+                config={
+                    "instrument_id": "SPY.XNAS",
+                    "bar_type": "SPY.XNAS-1-MINUTE-LAST-EXTERNAL",
+                    "trade_size": "1",
+                },
+                order_id_tag="0-slug-2",
+                strategy_id_full="MeanReversionZScoreStrategy-0-slug-2",
+                instrument_ids=("SPY.XNAS",),
+            ),
+            _StrategyMemberPayload(
+                revision_strategy_id="member-2",
+                strategy_id="strategy-2",
+                strategy_name="example.mean_reversion.two",
+                strategy_code_hash="hash-2",
+                strategy_path="strategies.example.mean_reversion:MeanReversionZScoreStrategy",
+                config_path="strategies.example.mean_reversion:MeanReversionZScoreConfig",
+                config={
+                    "instrument_id": "QQQ.XNAS",
+                    "bar_type": "QQQ.XNAS-1-MINUTE-LAST-EXTERNAL",
+                    "trade_size": "2",
+                },
+                order_id_tag="1-slug-2",
+                strategy_id_full="MeanReversionZScoreStrategy-1-slug-2",
+                instrument_ids=("QQQ.XNAS",),
+            ),
+        ),
+    )
+
+    config = build_trading_node_config(payload)
+
+    assert len(config.strategies) == 2
+    assert config.controller.config["portfolio_revision_id"] == "revision-1"
+    assert len(config.controller.config["strategy_members"]) == 2
+    assert config.controller.config["startup_quantity"] == 3.0
 
 
 def test_deployment_trader_id_is_deterministic() -> None:

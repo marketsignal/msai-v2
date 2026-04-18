@@ -15,6 +15,7 @@ class LiveOrderEvent(Base):
     __table_args__ = (
         Index("idx_live_order_events_deployment", "deployment_id"),
         Index("idx_live_order_events_strategy", "strategy_id"),
+        Index("idx_live_order_events_strategy_full", "strategy_id_full"),
         Index("idx_live_order_events_ts_event", "ts_event"),
         Index("idx_live_order_events_client_order", "client_order_id"),
         Index("idx_live_order_events_venue_order", "venue_order_id"),
@@ -25,6 +26,7 @@ class LiveOrderEvent(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     deployment_id: Mapped[str] = mapped_column(ForeignKey("live_deployments.id"), nullable=False)
     strategy_id: Mapped[str] = mapped_column(ForeignKey("strategies.id"), nullable=False)
+    strategy_id_full: Mapped[str | None] = mapped_column(String(280), nullable=True)
     strategy_code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     paper_trading: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     event_id: Mapped[str] = mapped_column(String(36), nullable=False)

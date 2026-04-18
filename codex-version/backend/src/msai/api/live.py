@@ -5,13 +5,18 @@ from collections.abc import Mapping
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from msai.core.auth import get_current_user
 from msai.core.config import settings
 from msai.core.database import get_db
 from msai.core.logging import get_logger
-from msai.models import LiveOrderEvent, Strategy, Trade
-from msai.schemas.live import LiveStartRequest, LiveStopRequest
+from msai.models import LiveOrderEvent, LivePortfolioRevision, LivePortfolioRevisionStrategy, Strategy, Trade
+from msai.schemas.live import LiveStartRequest, LiveStopRequest, PortfolioStartRequest
+from msai.services.live import (
+    derive_deployment_identity,
+    derive_portfolio_deployment_identity,
+)
 from msai.services.live_runtime import (
     LiveRuntimeUnavailableError,
     live_runtime_client,
@@ -26,12 +31,13 @@ from msai.services.live_state_view import (
 from msai.services.live_updates import load_live_snapshots, publish_live_snapshot
 from msai.services.nautilus.instrument_service import instrument_service
 from msai.services.nautilus.strategy_config import prepare_live_strategy_config
+from msai.services.nautilus.strategy_loader import resolve_importable_strategy_paths
 from msai.services.nautilus.trading_node import (
     LiveLiquidationFailedError,
     LiveStartBlockedError,
     LiveStartFailedError,
 )
-from msai.services.risk_engine import RiskEngine
+from msai.services.risk_engine import RiskEngine, RiskMetrics
 from msai.services.strategy_registry import StrategyRegistry, file_sha256
 from msai.services.user_identity import resolve_user_id_from_claims
 
@@ -70,7 +76,6 @@ async def live_start(
             detail=f"Strategy file not found: {strategy.file_path}",
         )
     user_id = await resolve_user_id_from_claims(db, claims)
-    await db.commit()
     runtime_instruments = list(
         dict.fromkeys(
             [
@@ -79,6 +84,16 @@ async def live_start(
             ]
         )
     )
+    await db.commit()
+    identity_signature = derive_deployment_identity(
+        user_id=user_id,
+        strategy_id=strategy.id,
+        strategy_code_hash=file_sha256(strategy_path),
+        config=strategy_config,
+        account_id=settings.ib_account_id,
+        paper_trading=payload.paper_trading,
+        instruments=runtime_instruments,
+    ).signature()
     try:
         deployment_id = await live_runtime_client.start(
             strategy_id=strategy.id,
@@ -90,6 +105,130 @@ async def live_start(
             strategy_git_sha=None,
             paper_trading=payload.paper_trading,
             started_by=user_id,
+            account_id=settings.ib_account_id,
+            identity_signature=identity_signature,
+        )
+    except LiveStartBlockedError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except LiveStartFailedError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except LiveRuntimeUnavailableError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    return {"deployment_id": deployment_id}
+
+
+@router.post("/start-portfolio")
+async def live_start_portfolio(
+    payload: PortfolioStartRequest,
+    claims: Mapping[str, object] = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, str]:
+    revision = (
+        await db.execute(
+            select(LivePortfolioRevision)
+            .options(
+                selectinload(LivePortfolioRevision.strategies).selectinload(LivePortfolioRevisionStrategy.strategy)
+            )
+            .where(LivePortfolioRevision.id == payload.portfolio_revision_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if revision is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Live portfolio revision not found")
+    if not revision.is_frozen:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only frozen live portfolio revisions can be deployed",
+        )
+    if not revision.strategies:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Live portfolio revision has no strategy members",
+        )
+
+    registry = StrategyRegistry(settings.strategies_root)
+    member_inputs: list[dict[str, object]] = []
+    runtime_instruments: list[str] = []
+    total_quantity = 0.0
+
+    for member in sorted(revision.strategies, key=lambda item: item.order_index):
+        strategy = member.strategy
+        if strategy is None:
+            strategy = await db.get(Strategy, member.strategy_id)
+        if strategy is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Strategy not found")
+        try:
+            canonical_instruments = await instrument_service.canonicalize_live_instruments(
+                db,
+                list(member.instruments),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+        strategy_config = prepare_live_strategy_config(dict(member.config), canonical_instruments)
+        strategy_path = registry.resolve_path(strategy)
+        if not strategy_path.exists():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Strategy file not found: {strategy.file_path}",
+            )
+        import_paths = resolve_importable_strategy_paths(
+            str(strategy_path),
+            strategy_class_name=strategy.strategy_class,
+        )
+        member_inputs.append(
+            {
+                "revision_strategy_id": member.id,
+                "strategy_id": strategy.id,
+                "strategy_name": strategy.name,
+                "strategy_class": strategy.strategy_class,
+                "strategy_code_hash": file_sha256(strategy_path),
+                "strategy_path": import_paths.strategy_path,
+                "config_path": import_paths.config_path,
+                "config": strategy_config,
+                "instrument_ids": canonical_instruments,
+                "order_index": member.order_index,
+            }
+        )
+        runtime_instruments.extend(canonical_instruments)
+        try:
+            total_quantity += abs(float(strategy_config.get("trade_size", 1.0)))
+        except (TypeError, ValueError):
+            total_quantity += 1.0
+
+    decision = await risk_engine.validate_start(
+        strategy="portfolio",
+        instrument=payload.account_id,
+        quantity=max(total_quantity, 1.0),
+        metrics=RiskMetrics(
+            current_pnl=0.0,
+            portfolio_value=0.0,
+            notional_exposure=0.0,
+            margin_used=0.0,
+        ),
+        paper_trading=payload.paper_trading,
+    )
+    if not decision.allowed:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=decision.reason)
+
+    user_id = await resolve_user_id_from_claims(db, claims)
+    await db.commit()
+    identity_signature = derive_portfolio_deployment_identity(
+        user_id=user_id,
+        portfolio_revision_id=revision.id,
+        account_id=payload.account_id,
+        paper_trading=payload.paper_trading,
+    ).signature()
+
+    try:
+        deployment_id = await live_runtime_client.start(
+            portfolio_revision_id=revision.id,
+            strategy_members=member_inputs,
+            instruments=list(dict.fromkeys(runtime_instruments)),
+            paper_trading=payload.paper_trading,
+            started_by=user_id,
+            account_id=payload.account_id,
+            identity_signature=identity_signature,
         )
     except LiveStartBlockedError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

@@ -28,37 +28,43 @@ def build_status_payload(
         if runtime_fresh and runtime_status and status_value not in _TERMINAL_STATUSES:
             status_value = runtime_status
         runtime_authoritative = runtime_fresh and status_value in _ACTIVE_RUNTIME_STATUSES
-        payload.append(
-            {
-                "id": deployment_id,
-                "strategy": strategy_name_by_id.get(str(row["strategy_id"]), row["strategy_id"]),
-                "status": status_value,
-                "started_at": row["started_at"],
-                "daily_pnl": _float_or_zero(runtime.get("daily_pnl")) if runtime_fresh else 0.0,
-                "process_alive": row["process_alive"],
-                "control_mode": row.get("control_mode"),
-                "runtime_fresh": runtime_fresh,
-                "paper_trading": row.get("paper_trading"),
-                "open_positions": (
-                    int(runtime.get("open_positions", 0) or 0)
-                    if runtime_authoritative
-                    else int(row.get("broker_open_positions", 0) or 0)
-                ),
-                "open_orders": (
-                    int(runtime.get("open_orders", 0) or 0)
-                    if runtime_authoritative
-                    else int(row.get("broker_open_orders", 0) or 0)
-                ),
-                "updated_at": runtime.get("updated_at") if runtime_fresh else row.get("broker_updated_at"),
-                "reason": runtime.get("reason") if runtime_fresh else row.get("reason"),
-                "broker_connected": row.get("broker_connected"),
-                "broker_mock_mode": row.get("broker_mock_mode"),
-                "broker_updated_at": row.get("broker_updated_at"),
-                "broker_open_positions": int(row.get("broker_open_positions", 0) or 0),
-                "broker_open_orders": int(row.get("broker_open_orders", 0) or 0),
-                "broker_exposure_detected": bool(row.get("broker_exposure_detected", False)),
-            }
-        )
+        members = runtime.get("members") if runtime_fresh and isinstance(runtime.get("members"), list) else row.get("members")
+        entry = {
+            "id": deployment_id,
+            "strategy": _status_label(row, strategy_name_by_id, members),
+            "status": status_value,
+            "started_at": row["started_at"],
+            "daily_pnl": _float_or_zero(runtime.get("daily_pnl")) if runtime_fresh else 0.0,
+            "process_alive": row["process_alive"],
+            "control_mode": row.get("control_mode"),
+            "runtime_fresh": runtime_fresh,
+            "paper_trading": row.get("paper_trading"),
+            "open_positions": (
+                int(runtime.get("open_positions", 0) or 0)
+                if runtime_authoritative
+                else int(row.get("broker_open_positions", 0) or 0)
+            ),
+            "open_orders": (
+                int(runtime.get("open_orders", 0) or 0)
+                if runtime_authoritative
+                else int(row.get("broker_open_orders", 0) or 0)
+            ),
+            "updated_at": runtime.get("updated_at") if runtime_fresh else row.get("broker_updated_at"),
+            "reason": runtime.get("reason") if runtime_fresh else row.get("reason"),
+            "broker_connected": row.get("broker_connected"),
+            "broker_mock_mode": row.get("broker_mock_mode"),
+            "broker_updated_at": row.get("broker_updated_at"),
+            "broker_open_positions": int(row.get("broker_open_positions", 0) or 0),
+            "broker_open_orders": int(row.get("broker_open_orders", 0) or 0),
+            "broker_exposure_detected": bool(row.get("broker_exposure_detected", False)),
+        }
+        if row.get("portfolio_revision_id"):
+            entry["portfolio_revision_id"] = row.get("portfolio_revision_id")
+        if row.get("account_id"):
+            entry["account_id"] = row.get("account_id")
+        if isinstance(members, list) and members:
+            entry["members"] = [dict(member) for member in members if isinstance(member, Mapping)]
+        payload.append(entry)
     return payload
 
 
@@ -183,3 +189,19 @@ def _float_or_zero(value: object | None) -> float:
         if match is None:
             return 0.0
         return float(match.group(1))
+
+
+def _status_label(
+    row: Mapping[str, Any],
+    strategy_name_by_id: Mapping[str, str],
+    members: object,
+) -> str | None:
+    strategy_id = row.get("strategy_id")
+    if strategy_id:
+        return strategy_name_by_id.get(str(strategy_id), str(strategy_id))
+    if isinstance(members, list) and members:
+        return f"Portfolio ({len(members)} strategies)"
+    portfolio_revision_id = row.get("portfolio_revision_id")
+    if portfolio_revision_id:
+        return f"Portfolio {portfolio_revision_id}"
+    return None

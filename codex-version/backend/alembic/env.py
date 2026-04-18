@@ -12,7 +12,21 @@ from msai.core.config import settings
 from msai.models.base import Base
 
 # Import models so they are attached to Base.metadata for autogenerate.
-from msai.models import audit_log, backtest, live_deployment, strategy, strategy_daily_pnl, trade, user
+from msai.models import (
+    audit_log,
+    backtest,
+    instrument_definition,
+    live_deployment,
+    live_deployment_strategy,
+    live_order_event,
+    live_portfolio,
+    live_portfolio_revision,
+    live_portfolio_revision_strategy,
+    strategy,
+    strategy_daily_pnl,
+    trade,
+    user,
+)
 
 config = context.config
 if config.config_file_name is not None:

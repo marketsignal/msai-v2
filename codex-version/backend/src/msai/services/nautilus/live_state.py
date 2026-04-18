@@ -43,6 +43,9 @@ class LiveStateControllerConfig(ControllerConfig, kw_only=True, frozen=True):
     strategy_db_id: str
     strategy_name: str
     strategy_code_hash: str
+    strategy_id_full: str | None = None
+    portfolio_revision_id: str | None = None
+    strategy_members: list[dict[str, Any]] | None = None
     instrument_ids: tuple[str, ...]
     startup_instrument_id: str
     startup_quantity: float = 1.0
@@ -62,6 +65,9 @@ class LiveStateController(Controller):
                 strategy_db_id="unknown",
                 strategy_name="unknown",
                 strategy_code_hash="unknown",
+                strategy_id_full=None,
+                portfolio_revision_id=None,
+                strategy_members=[],
                 instrument_ids=(),
                 startup_instrument_id="unknown",
             )
@@ -79,7 +85,7 @@ class LiveStateController(Controller):
         self._account_refresh_grace_until: datetime | None = None
         self._shutdown_requested = False
         self._nautilus_strategy_id: StrategyId | None = None
-        self._order_event_topic: str | None = None
+        self._order_event_topics: set[str] = set()
 
     def on_start(self) -> None:
         if self._liquidation_topic:
@@ -136,12 +142,13 @@ class LiveStateController(Controller):
                     topic=self._liquidation_topic,
                     handler=self._handle_liquidation_message,
                 )
-        if self._order_event_topic:
+        for topic in list(self._order_event_topics):
             with suppress(Exception):
                 self.msgbus.unsubscribe(
-                    topic=self._order_event_topic,
+                    topic=topic,
                     handler=self._handle_order_event_message,
                 )
+        self._order_event_topics.clear()
         stopped_snapshot = self._build_terminal_snapshot(
             reason="liquidation_complete" if self._shutdown_requested else "controller_stopped",
             status="stopped",
@@ -165,12 +172,16 @@ class LiveStateController(Controller):
         self._schedule_task(self._handle_order_event(event), "order-event")
 
     async def _handle_order_event(self, event: OrderEvent) -> None:
+        member = self._member_metadata(_identifier_value(getattr(event, "strategy_id", None)))
         try:
             payload = _order_event_payload(
                 event,
                 deployment_id=self.config.deployment_id,
-                strategy_db_id=self.config.strategy_db_id,
-                strategy_code_hash=self.config.strategy_code_hash,
+                strategy_db_id=str(member["strategy_id"]),
+                strategy_id_full=(
+                    str(member["strategy_id_full"]) if member.get("strategy_id_full") else None
+                ),
+                strategy_code_hash=str(member["strategy_code_hash"]),
                 paper_trading=self.config.paper_trading,
             )
         except ValueError as exc:
@@ -304,8 +315,9 @@ class LiveStateController(Controller):
             session.add(
                 LiveOrderEvent(
                     deployment_id=self.config.deployment_id,
-                    strategy_id=self.config.strategy_db_id,
-                    strategy_code_hash=self.config.strategy_code_hash,
+                    strategy_id=str(payload["strategy_id"]),
+                    strategy_id_full=str(payload["strategy_id_full"]) if payload.get("strategy_id_full") else None,
+                    strategy_code_hash=str(payload["strategy_code_hash"]),
                     paper_trading=self.config.paper_trading,
                     event_id=event_id,
                     event_type=str(payload["event_type"]),
@@ -339,8 +351,9 @@ class LiveStateController(Controller):
             session.add(
                 Trade(
                     deployment_id=self.config.deployment_id,
-                    strategy_id=self.config.strategy_db_id,
-                    strategy_code_hash=self.config.strategy_code_hash,
+                    strategy_id=str(payload["strategy_id"]),
+                    strategy_id_full=str(payload["strategy_id_full"]) if payload.get("strategy_id_full") else None,
+                    strategy_code_hash=str(payload["strategy_code_hash"]),
                     instrument=str(payload["instrument"]),
                     side=str(payload["side"]),
                     quantity=float(payload["quantity"]),
@@ -358,11 +371,58 @@ class LiveStateController(Controller):
             )
             await session.commit()
 
+    def _configured_members(self) -> list[dict[str, Any]]:
+        if self.config.strategy_members:
+            return [dict(member) for member in self.config.strategy_members]
+        return [
+            {
+                "strategy_id": self.config.strategy_db_id,
+                "strategy_name": self.config.strategy_name,
+                "strategy_code_hash": self.config.strategy_code_hash,
+                "strategy_id_full": self.config.strategy_id_full,
+                "instrument_ids": list(self.config.instrument_ids),
+                "order_index": 0,
+            }
+        ]
+
+    def _member_metadata(self, strategy_id_full: str | None = None) -> dict[str, Any]:
+        members = self._configured_members()
+        if strategy_id_full:
+            for member in members:
+                if str(member.get("strategy_id_full")) == strategy_id_full:
+                    return member
+        if len(members) == 1:
+            return members[0]
+        return {
+            "strategy_id": self.config.strategy_db_id,
+            "strategy_name": self.config.strategy_name,
+            "strategy_code_hash": self.config.strategy_code_hash,
+            "strategy_id_full": strategy_id_full or self.config.strategy_id_full,
+            "instrument_ids": list(self.config.instrument_ids),
+            "order_index": 0,
+        }
+
+    def _status_members(self) -> list[dict[str, Any]]:
+        members = self._configured_members()
+        if not self.config.portfolio_revision_id and len(members) <= 1:
+            return []
+        return [
+            {
+                "strategy_id": str(member.get("strategy_id")),
+                "strategy_name": str(member.get("strategy_name")),
+                "strategy_id_full": str(member.get("strategy_id_full")) if member.get("strategy_id_full") else None,
+                "order_index": int(member.get("order_index", 0)),
+                "instrument_ids": list(member.get("instrument_ids") or []),
+            }
+            for member in members
+        ]
+
     def _position_rows(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         seen: set[str] = set()
         for position in self.cache.positions_open():
             base = position.to_dict()
+            member = self._member_metadata(_identifier_value(base.get("strategy_id")))
             instrument_id = position.instrument_id
             account_id = position.account_id
             position_id = str(base["position_id"])
@@ -377,7 +437,11 @@ class LiveStateController(Controller):
             rows.append(
                 {
                     "deployment_id": self.config.deployment_id,
-                    "strategy_id": self.config.strategy_db_id,
+                    "strategy_id": str(member["strategy_id"]),
+                    "strategy_name": str(member["strategy_name"]),
+                    "strategy_id_full": (
+                        str(member["strategy_id_full"]) if member.get("strategy_id_full") else None
+                    ),
                     "paper_trading": self.config.paper_trading,
                     "position_id": position_id,
                     "instrument": str(base["instrument_id"]),
@@ -403,8 +467,13 @@ class LiveStateController(Controller):
 
         rows = _frame_records(orders_df)
         for row in rows:
+            member = self._member_metadata(_identifier_value(row.get("strategy_id")))
             row["deployment_id"] = self.config.deployment_id
-            row["strategy_id"] = self.config.strategy_db_id
+            row["strategy_id"] = str(member["strategy_id"])
+            row["strategy_name"] = str(member["strategy_name"])
+            row["strategy_id_full"] = (
+                str(member["strategy_id_full"]) if member.get("strategy_id_full") else None
+            )
             row["paper_trading"] = self.config.paper_trading
             row["instrument"] = row.get("instrument_id")
         return rows
@@ -415,28 +484,34 @@ class LiveStateController(Controller):
             return []
 
         rows = _frame_records(fills_df)
-        payload = [
-            {
-                "deployment_id": self.config.deployment_id,
-                "strategy_id": self.config.strategy_db_id,
-                "paper_trading": self.config.paper_trading,
-                "id": row.get("event_id") or row.get("trade_id"),
-                "executed_at": row.get("ts_event"),
-                "instrument": row.get("instrument_id"),
-                "side": row.get("order_side"),
-                "quantity": _to_float(row.get("last_qty")),
-                "price": _to_float(row.get("last_px")),
-                "commission": _to_float(row.get("commission")),
-                "pnl": 0.0,
-                "broker_trade_id": row.get("trade_id"),
-                "client_order_id": row.get("client_order_id"),
-                "venue_order_id": row.get("venue_order_id"),
-                "position_id": row.get("position_id"),
-                "account_id": row.get("account_id"),
-                "reconciliation": bool(row.get("reconciliation", False)),
-            }
-            for row in rows
-        ]
+        payload = []
+        for row in rows:
+            member = self._member_metadata(_identifier_value(row.get("strategy_id")))
+            payload.append(
+                {
+                    "deployment_id": self.config.deployment_id,
+                    "strategy_id": str(member["strategy_id"]),
+                    "strategy_name": str(member["strategy_name"]),
+                    "strategy_id_full": (
+                        str(member["strategy_id_full"]) if member.get("strategy_id_full") else None
+                    ),
+                    "paper_trading": self.config.paper_trading,
+                    "id": row.get("event_id") or row.get("trade_id"),
+                    "executed_at": row.get("ts_event"),
+                    "instrument": row.get("instrument_id"),
+                    "side": row.get("order_side"),
+                    "quantity": _to_float(row.get("last_qty")),
+                    "price": _to_float(row.get("last_px")),
+                    "commission": _to_float(row.get("commission")),
+                    "pnl": 0.0,
+                    "broker_trade_id": row.get("trade_id"),
+                    "client_order_id": row.get("client_order_id"),
+                    "venue_order_id": row.get("venue_order_id"),
+                    "position_id": row.get("position_id"),
+                    "account_id": row.get("account_id"),
+                    "reconciliation": bool(row.get("reconciliation", False)),
+                }
+            )
         payload.sort(key=lambda row: str(row.get("executed_at", "")), reverse=True)
         return payload
 
@@ -470,6 +545,8 @@ class LiveStateController(Controller):
             "position_count": len(positions),
             "currencies": sorted(currencies),
             "updated_at": datetime.now(UTC).isoformat(),
+            "portfolio_revision_id": self.config.portfolio_revision_id,
+            "account_id": self.config.account_id,
         }
 
     def _build_runtime_snapshot(
@@ -505,6 +582,9 @@ class LiveStateController(Controller):
                 "liquidation_requested_at": (
                     self._liquidation_requested_at.isoformat() if self._liquidation_requested_at is not None else None
                 ),
+                "portfolio_revision_id": self.config.portfolio_revision_id,
+                "account_id": self.config.account_id,
+                "members": self._status_members(),
             },
         }
 
@@ -539,6 +619,9 @@ class LiveStateController(Controller):
                 "liquidation_requested_at": (
                     self._liquidation_requested_at.isoformat() if self._liquidation_requested_at is not None else None
                 ),
+                "portfolio_revision_id": self.config.portfolio_revision_id,
+                "account_id": self.config.account_id,
+                "members": self._status_members(),
             },
         }
 
@@ -557,9 +640,15 @@ class LiveStateController(Controller):
 
     def _fill_payload(self, event: OrderFilled) -> dict[str, Any]:
         executed_at = unix_nanos_to_dt(event.ts_event).replace(tzinfo=UTC).isoformat()
+        member = self._member_metadata(_identifier_value(getattr(event, "strategy_id", None)))
         return {
             "deployment_id": self.config.deployment_id,
-            "strategy_id": self.config.strategy_db_id,
+            "strategy_id": str(member["strategy_id"]),
+            "strategy_name": str(member["strategy_name"]),
+            "strategy_id_full": (
+                str(member["strategy_id_full"]) if member.get("strategy_id_full") else None
+            ),
+            "strategy_code_hash": str(member["strategy_code_hash"]),
             "paper_trading": self.config.paper_trading,
             "id": event.id.value,
             "executed_at": executed_at,
@@ -635,35 +724,35 @@ class LiveStateController(Controller):
             return "liquidating"
         return "running"
 
+    def _resolve_live_strategy_ids(self) -> tuple[StrategyId, ...]:
+        strategy_ids = tuple(self._trader.strategy_ids())
+        if strategy_ids and self._nautilus_strategy_id is None:
+            self._nautilus_strategy_id = strategy_ids[0]
+        return strategy_ids
+
     def _resolve_live_strategy_id(self) -> StrategyId | None:
         if self._nautilus_strategy_id is not None:
             return self._nautilus_strategy_id
-        strategy_ids = self._trader.strategy_ids()
+        strategy_ids = self._resolve_live_strategy_ids()
         if not strategy_ids:
             return None
-        self._nautilus_strategy_id = strategy_ids[0]
         return self._nautilus_strategy_id
 
     def _ensure_order_event_subscription(self) -> None:
-        strategy_id = self._resolve_live_strategy_id()
-        if strategy_id is None:
-            return
-
-        topic = f"events.order.{strategy_id}"
-        if self._order_event_topic == topic:
-            return
-
-        if self._order_event_topic:
+        desired_topics = {f"events.order.{strategy_id}" for strategy_id in self._resolve_live_strategy_ids()}
+        for topic in sorted(self._order_event_topics - desired_topics):
             with suppress(Exception):
                 self.msgbus.unsubscribe(
-                    topic=self._order_event_topic,
+                    topic=topic,
                     handler=self._handle_order_event_message,
                 )
-        self.msgbus.subscribe(
-            topic=topic,
-            handler=self._handle_order_event_message,
-        )
-        self._order_event_topic = topic
+            self._order_event_topics.discard(topic)
+        for topic in sorted(desired_topics - self._order_event_topics):
+            self.msgbus.subscribe(
+                topic=topic,
+                handler=self._handle_order_event_message,
+            )
+            self._order_event_topics.add(topic)
 
     async def _advance_liquidation(self, snapshot: dict[str, Any]) -> None:
         if self._liquidation_requested_at is None or self._shutdown_requested:
@@ -754,6 +843,7 @@ def _order_event_payload(
     *,
     deployment_id: str,
     strategy_db_id: str,
+    strategy_id_full: str | None = None,
     strategy_code_hash: str,
     paper_trading: bool,
 ) -> dict[str, Any]:
@@ -769,6 +859,7 @@ def _order_event_payload(
     return {
         "deployment_id": deployment_id,
         "strategy_id": strategy_db_id,
+        "strategy_id_full": strategy_id_full,
         "strategy_code_hash": strategy_code_hash,
         "paper_trading": paper_trading,
         "event_id": event_id,
