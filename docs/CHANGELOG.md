@@ -55,6 +55,14 @@ All notable changes to msai-v2 will be documented in this file.
 
 **Commits (22 total):** 21b9ec1, 3b2cc35, 7ea6fb1, 75a3cf1, 9282824, 15b2d22, 2fb64b1, 38edeb9, 2829585, 3c26ad3, a2b9b01, 32f0e57, c87751f, c17aef6, b39d318, 71c904b, bfe90e8, c84e697, 7383319, dce4f82, 7324e0b, plus this commit.
 
+**Post-review fixes (2, landed before squash-merge):** Codex GitHub bot reviewed the open PR and raised 2 P1s; both fixed in-branch before merge, both tracked back to earlier-deferred findings from the local review loop.
+
+- `8f5f943` — close previous active alias before inserting new one in `_upsert_definition_and_alias`. Without this, a futures-roll or repeated refresh left multiple aliases active for the same `(instrument_uid, provider)` pair, making `next((a for a in aliases if a.effective_to is None))` order-dependent. Fix runs `UPDATE ... SET effective_to = today WHERE instrument_uid = :uid AND provider = :p AND effective_to IS NULL AND alias_string != :new` before the insert, preserving the half-open `[effective_from, effective_to)` window invariant. Regression test: AAPL.NASDAQ → AAPL.ARCA roll verifies old alias closed today + new one active + exactly one active alias remains.
+
+- `415a858` — raise `AmbiguousSymbolError` on cross-asset-class raw-symbol match in `InstrumentRegistry.find_by_raw_symbol`. Schema uniqueness is `(raw_symbol, provider, asset_class)` — so SPY can legitimately exist as both equity and option-underlying rows. `resolve_for_{live,backtest}` don't pass `asset_class`, so the previous `.limit(1)` silently picked one. Fix fetches all matches when `asset_class is None` and raises with conflicting asset_classes in the message; callers pinning `asset_class` keep the `.limit(1)` fast path. Regression test: SPY under both equity + option asset classes verifies raise-on-ambiguous + resolves-cleanly-when-pinned paths.
+
+**PR shipped as:** squash commit `a52046f` on main (2026-04-17).
+
 ### Changed
 
 - 2026-04-16: Live-supervisor now canonicalizes user-facing instrument ids before passing to strategy config — e.g., `ES.CME` → `ESM6.CME` for futures, identity for stocks/ETF/FX. Overwrites stale explicit `instrument_id` / `bar_type` only when the root symbol changes (futures rollover), preserving operator aggregation choices on stocks/FX.

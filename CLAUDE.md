@@ -5,6 +5,7 @@
 ### What Is This?
 
 MSAI v2 is a personal hedge fund platform for automated trading via Interactive Brokers. It enables defining trading strategies as Python files, backtesting them against historical minute-level data, deploying them to live/paper trading, and monitoring portfolio performance through a web dashboard.
+MSAI v2 is an API-first, CLI-second, UI-third product.
 
 ### Two Competing Implementations
 
@@ -20,8 +21,6 @@ This project has **two versions** built from the same design and implementation 
 | **Redis**       | `localhost:6380`                                  | `localhost:6381`        |
 | **Design doc**  | `docs/plans/2026-02-25-msai-v2-design.md`         | Same                    |
 | **Impl plan**   | `docs/plans/2026-02-25-msai-v2-implementation.md` | Same                    |
-
-Both versions implement the same 50-task plan across 8 milestones. The goal is to run both simultaneously and compare code quality, UI design, test coverage, and production readiness.
 
 ### Running Both Versions Side-by-Side
 
@@ -100,6 +99,77 @@ cd codex-version && docker compose -f docker-compose.dev.yml up -d
 cd claude-version && docker compose -f docker-compose.dev.yml up -d
 cd codex-version && docker compose -f docker-compose.dev.yml up -d
 ```
+
+---
+
+### E2E Configuration
+
+**interface_type:** `fullstack` — MSAI v2 exposes an HTTP API (primary) and a Next.js UI (secondary). Per the project ordering rule ("API-first, CLI-second, UI-third"), the `verify-e2e` agent MUST test the API surface first, then the UI. An API failure means the contract/state is broken — stop immediately and diagnose; do not proceed to UI checks.
+
+**Which version to target.** Every E2E run declares exactly one target: `claude`, `codex`, or `both`. When use cases must be verified against both, run them sequentially (claude first, then codex) and produce one report per target. Never point a single run at mixed ports.
+
+**Server URLs:**
+
+| Target | API base URL            | UI base URL             | Postgres         | Redis            |
+| ------ | ----------------------- | ----------------------- | ---------------- | ---------------- |
+| claude | `http://localhost:8800` | `http://localhost:3300` | `localhost:5433` | `localhost:6380` |
+| codex  | `http://localhost:8400` | `http://localhost:3400` | `localhost:5434` | `localhost:6381` |
+
+All API routes are versioned under `/api/v1/` (see `.claude/rules/api-design.md`). Health: `GET /health`.
+
+**Pre-flight (before any E2E run):**
+
+1. `curl -sf $API/health` on the target — if it fails, start the stack from the version directory: `cd {claude,codex}-version && docker compose -f docker-compose.dev.yml up -d`.
+2. Confirm the UI responds at the target port (only if UI use cases are in scope).
+3. For live-trading use cases: confirm IB Gateway is reachable (paper account `DU...` on port 4002, live account on 4001) — see `.claude/rules/nautilus.md` gotcha #6.
+
+**Auth.** The app uses Azure Entra ID (MSAL on the frontend, PyJWT on the backend). E2E runs should authenticate via the documented login flow OR use a dev-mode bypass token if one is configured — never by forging JWTs or reading secrets from disk.
+
+**ARRANGE (test setup) is allowed via any user-accessible interface:**
+
+- Public API: `POST /api/v1/strategies`, `POST /api/v1/backtests`, `POST /api/v1/live/start`, etc.
+- CLI scripts exposed in each version's `backend/` (treat as documented commands only).
+- The dev seed/bootstrap scripts if present.
+
+**ARRANGE is NOT allowed via:**
+
+- Direct Postgres queries against `localhost:5433` / `localhost:5434`
+- Writing Parquet files into `claude-version/data/` or `codex-version/data/` by hand
+- Pushing into Redis queues directly
+- Reading environment secrets to mint tokens
+
+**VERIFY (assertions) MUST go through the same interface the use case targets.** API use cases check response bodies and subsequent GETs; UI use cases check what Playwright sees on screen (`data-testid`, role selectors) and reload to confirm persistence. Never peek at Postgres, DuckDB, or Parquet to "confirm" — if it isn't visible through the API or UI, it doesn't count as verified.
+
+**Live-trading safety rails.** Default every E2E use case that touches order submission to a paper IB account (see `reference_ib_accounts.md`). Live-account use cases must be opt-in, explicit in the use-case file, and never triggered from the standard regression suite. Stop-the-world when any API use case returns 5xx during a live/paper flow — do not continue UI verification against a node in unknown state (gotcha #13: stopping Nautilus does not close positions).
+
+**Core use-case categories** (for inventory in `tests/e2e/use-cases/`):
+
+- `strategies/` — create, edit, list, hash versioning
+- `backtests/` — submit, poll status, fetch report, download artifacts
+- `live/` — portfolio create, deploy, start/stop, positions, order events
+- `data/` — instrument lookup, catalog browse, bar chart rendering
+- `auth/` — login, token refresh, logout, RBAC
+
+See `.claude/rules/testing.md` for the full use-case lifecycle (draft → execute → graduate) and failure classification (PASS / FAIL_BUG / FAIL_STALE / FAIL_INFRA).
+
+### Playwright Framework
+
+Already scaffolded at the repo root (shared across both versions):
+
+- `playwright.config.ts` — `baseURL` defaults to `http://localhost:3000`; override per run with `PLAYWRIGHT_BASE_URL=http://localhost:3300` (claude UI) or `:3400` (codex UI).
+- `tests/e2e/specs/` — graduated spec files (populated via Phase 6.2c).
+- `tests/e2e/use-cases/` — markdown use cases (draft before graduation).
+- `tests/e2e/fixtures/` — auth fixture + helpers.
+- `tests/e2e/reports/` — HTML + JSON output.
+
+Run specs locally against one target at a time:
+
+```bash
+PLAYWRIGHT_BASE_URL=http://localhost:3300 pnpm exec playwright test   # Claude UI
+PLAYWRIGHT_BASE_URL=http://localhost:3400 pnpm exec playwright test   # Codex UI
+```
+
+API-only use cases don't need Playwright — the `verify-e2e` agent hits the REST endpoints directly with curl/httpx.
 
 ---
 
