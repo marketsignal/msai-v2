@@ -61,12 +61,18 @@ def _write_synthetic_bars(raw_root: Path, *, symbol: str = "AAPL", rows: int = 2
         tz="UTC",
     )
     closes = 100.0 + rng.standard_normal(rows).cumsum() * 0.1
+    opens = closes + rng.standard_normal(rows) * 0.05
+    # high/low must respect the OHLC invariant (high >= max(open, close),
+    # low <= min(open, close)). Deriving them from the open+close extremes
+    # plus a non-negative jitter guarantees Bar.__init__ accepts the row.
+    highs = np.maximum(opens, closes) + np.abs(rng.standard_normal(rows)) * 0.1
+    lows = np.minimum(opens, closes) - np.abs(rng.standard_normal(rows)) * 0.1
     df = pd.DataFrame(
         {
             "timestamp": timestamps,
-            "open": closes + rng.standard_normal(rows) * 0.05,
-            "high": closes + np.abs(rng.standard_normal(rows)) * 0.1,
-            "low": closes - np.abs(rng.standard_normal(rows)) * 0.1,
+            "open": opens,
+            "high": highs,
+            "low": lows,
             "close": closes,
             "volume": rng.integers(100, 1000, rows).astype(np.int64),
         }

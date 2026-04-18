@@ -18,13 +18,14 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from msai.models import Backtest, Base, LiveDeployment, Strategy, User
+from msai.models import Backtest, Base, Strategy, User
 from msai.services.nautilus.audit_hook import (
     OrderAuditWriter,
     OrderSubmittedFacts,
     TradeFillFacts,
     lookup_by_client_order_id,
 )
+from tests.integration._deployment_factory import make_live_deployment
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -83,26 +84,7 @@ async def fixtures(
         session.add(strategy)
         await session.flush()
 
-        slug = uuid4().hex[:16]
-        deployment = LiveDeployment(
-            id=uuid4(),
-            strategy_id=strategy.id,
-            strategy_code_hash="deadbeef" * 8,
-            config={},
-            instruments=["AAPL.NASDAQ"],
-            status="running",
-            paper_trading=True,
-            started_by=user.id,
-            deployment_slug=slug,
-            identity_signature="f" * 64,
-            trader_id=f"MSAI-{slug}",
-            strategy_id_full=f"EMACrossStrategy-{slug}",
-            account_id="DU1234567",
-            message_bus_stream=f"trader-MSAI-{slug}-stream",
-            config_hash="cafebabe" * 8,
-            instruments_signature="AAPL.NASDAQ",
-        )
-        session.add(deployment)
+        deployment = await make_live_deployment(session, user=user, strategy=strategy)
 
         backtest = Backtest(
             id=uuid4(),
@@ -536,9 +518,9 @@ class TestWriteTradeFill:
         async with session_factory() as session:
             count = (
                 await session.execute(
-                    select(func.count()).select_from(Trade).where(
-                        Trade.broker_trade_id == "replay-target-01"
-                    )
+                    select(func.count())
+                    .select_from(Trade)
+                    .where(Trade.broker_trade_id == "replay-target-01")
                 )
             ).scalar_one()
             assert count == 1
@@ -556,33 +538,20 @@ class TestWriteTradeFill:
         composite key keeps them distinct."""
         from sqlalchemy import func, select
 
-        from msai.models import LiveDeployment, Trade
+        from msai.models import Trade
 
         strategy = fixtures["strategy"]
         first_deployment = fixtures["deployment"]
 
         # Create a second deployment under the same strategy.
         async with session_factory() as session:
-            slug2 = uuid4().hex[:16]
-            second_deployment = LiveDeployment(
-                id=uuid4(),
+            second_deployment = await make_live_deployment(
+                session,
+                user_id=first_deployment.started_by,  # type: ignore[union-attr]
                 strategy_id=strategy.id,  # type: ignore[union-attr]
-                strategy_code_hash="cafef00d" * 8,
-                config={},
-                instruments=["EUR/USD.IDEALPRO"],
-                status="running",
-                paper_trading=True,
-                started_by=first_deployment.started_by,  # type: ignore[union-attr]
-                deployment_slug=slug2,
-                identity_signature="e" * 64,
-                trader_id=f"MSAI-{slug2}",
-                strategy_id_full=f"SmokeMarketOrderStrategy-{slug2}",
+                strategy_class="SmokeMarketOrderStrategy",
                 account_id="DU1234568",
-                message_bus_stream=f"trader-MSAI-{slug2}-stream",
-                config_hash="beefcafe" * 8,
-                instruments_signature="EUR/USD.IDEALPRO",
             )
-            session.add(second_deployment)
             await session.commit()
             second_id = second_deployment.id
 
@@ -612,9 +581,9 @@ class TestWriteTradeFill:
         async with session_factory() as session:
             count = (
                 await session.execute(
-                    select(func.count()).select_from(Trade).where(
-                        Trade.broker_trade_id == shared_trade_id
-                    )
+                    select(func.count())
+                    .select_from(Trade)
+                    .where(Trade.broker_trade_id == shared_trade_id)
                 )
             ).scalar_one()
             assert count == 2

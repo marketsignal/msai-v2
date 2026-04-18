@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from msai.live_supervisor.process_manager import ProcessManager
 from msai.models import Base, LiveDeployment, LiveNodeProcess, Strategy, User
 from msai.services.live.failure_kind import FailureKind
+from tests.integration._deployment_factory import make_live_deployment
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -116,26 +117,7 @@ async def deployment(
         session.add(strategy)
         await session.flush()
 
-        slug = uuid4().hex[:16]
-        dep = LiveDeployment(
-            id=uuid4(),
-            strategy_id=strategy.id,
-            strategy_code_hash="deadbeef" * 8,
-            config={"fast": 10, "slow": 20},
-            instruments=["AAPL.NASDAQ"],
-            status="starting",
-            paper_trading=True,
-            started_by=user.id,
-            deployment_slug=slug,
-            identity_signature="f" * 64,
-            trader_id=f"MSAI-{slug}",
-            strategy_id_full=f"EMACrossStrategy-{slug}",
-            account_id="DU1234567",
-            message_bus_stream=f"trader-MSAI-{slug}-stream",
-            config_hash="cafebabe" * 8,
-            instruments_signature="AAPL.NASDAQ",
-        )
-        session.add(dep)
+        dep = await make_live_deployment(session, user=user, strategy=strategy, status="starting")
         await session.commit()
         return dep
 
@@ -225,6 +207,7 @@ async def test_spawn_idempotent_when_row_already_active(
         row = LiveNodeProcess(
             id=uuid4(),
             deployment_id=deployment.id,
+            gateway_session_key="msai-paper-primary:localhost:4002",
             pid=12345,
             host="preseed",
             started_at=datetime.now(UTC),
@@ -274,6 +257,7 @@ async def test_spawn_during_stop_returns_false_not_true(
         row = LiveNodeProcess(
             id=uuid4(),
             deployment_id=deployment.id,
+            gateway_session_key="msai-paper-primary:localhost:4002",
             pid=12345,
             host="preseed",
             started_at=datetime.now(UTC),
@@ -532,6 +516,7 @@ async def test_watchdog_skips_rows_from_other_hosts(
             LiveNodeProcess(
                 id=foreign_row_id,
                 deployment_id=deployment.id,
+                gateway_session_key="msai-paper-primary:localhost:4002",
                 pid=foreign_pid,
                 host="some-other-supervisor-host",
                 started_at=datetime(2000, 1, 1, tzinfo=UTC),
@@ -722,6 +707,7 @@ async def test_stop_after_supervisor_restart_uses_row_pid(
             row = LiveNodeProcess(
                 id=uuid4(),
                 deployment_id=deployment.id,
+                gateway_session_key="msai-paper-primary:localhost:4002",
                 pid=child.pid,
                 host=_socket.gethostname(),
                 started_at=datetime.now(UTC),
@@ -783,6 +769,7 @@ async def test_stop_refuses_cross_host_row(
         row = LiveNodeProcess(
             id=uuid4(),
             deployment_id=deployment.id,
+            gateway_session_key="msai-paper-primary:localhost:4002",
             pid=bogus_pid,
             host="other-supervisor-host",
             started_at=datetime.now(UTC),

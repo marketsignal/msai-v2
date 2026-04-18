@@ -140,7 +140,12 @@ def test_smoke_config_accepts_full_live_injection() -> None:
     }
     decoded = config_cls.parse(msgspec.json.encode(live_config))
     assert decoded.manage_stop is True
-    assert decoded.order_id_tag == "abcd1234abcd1234"
+    # PR #29 (portfolio-per-account-live) prepends an order-index so the
+    # tag matches ``derive_strategy_id_full``'s ``{class}-{order_index}-
+    # {slug}`` convention. The config round-trip MUST preserve the
+    # ``0-`` prefix verbatim — stripping it would desync the StrategyId
+    # minted by Nautilus from the strategy_id_full the supervisor records.
+    assert decoded.order_id_tag == "0-abcd1234abcd1234"
 
 
 def test_round_trip_through_json_preserves_types() -> None:

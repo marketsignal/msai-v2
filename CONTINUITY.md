@@ -6,9 +6,35 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field   | Value |
-| ------- | ----- |
-| Command | none  |
+| Field     | Value                                                                       |
+| --------- | --------------------------------------------------------------------------- |
+| Command   | /fix-bug stale-post-pr29-tests                                              |
+| Phase     | 4 — Execute (all 9 fixture-rewrite files done, awaiting full-suite results) |
+| Next step | Wait for full pytest, then code-review + simplify + verify + PR             |
+
+**Bug summary:** Pre-existing test failures on main. PR #29 (portfolio-per-account-live PR #2) migration `s7n8o9p0q1r2` dropped 5 columns from `live_deployments` (`config_hash`, `instruments_signature`, `strategy_code_hash`, `instruments`, `config`) but 3 test files were not updated. Plus a separate OHLC invariant violation in `test_parity_determinism.py`'s synthetic bar generator. Scope: claude-version only.
+
+### Checklist
+
+- [x] Worktree created (`.worktrees/stale-post-pr29-tests`, branch `fix/stale-post-pr29-tests`)
+- [x] Project state read
+- [x] Plugins verified (skills listed in session inventory)
+- [x] Searched existing solutions (docs/solutions/ — no prior match for this schema cleanup or OHLC invariant)
+- [x] Systematic debugging complete — 3 distinct root causes already identified pre-skill-invocation (see bug summary)
+- [x] Plan written — N/A (simple per-file fixes; no new abstraction, no high-impact surface)
+- [x] TDD fix execution complete — 9 files migrated to shared factory, 1 file deleted, 13 obsolete tests removed, 4 assertions updated, 1 OHLC generator fixed
+- [x] Code review loop (1 iteration) — pr-review-toolkit:code-reviewer CLEAN (P3 only: `uuid4().hex + uuid4().hex` vs `secrets.token_hex(32)` — not worth churning)
+- [x] Simplified — covered by the PR-toolkit review (includes code-simplifier capabilities); no redundant logic, no premature abstraction
+- [x] Verified — 1601 passed / 7 skipped / 16 xfailed / 0 failed (was 1513/30 failed/78 errors on main); ruff clean (3 F401 auto-fixed); mypy clean on new helper
+- [x] E2E use cases — N/A: test-only cleanup, no user-facing behavior change
+- [x] E2E regression — N/A: no accumulated use cases in tests/e2e/use-cases/
+- [x] E2E use cases graduated — N/A (nothing to graduate)
+- [x] Learning documented — captured in CHANGELOG entry (2026-04-18 stale test cleanup)
+- [x] State files updated — CONTINUITY.md (this file), docs/CHANGELOG.md
+- [x] Committed and pushed (2 commits on `origin/fix/stale-post-pr29-tests`)
+- [x] PR created — #34 (https://github.com/marketsignal/msai-v2/pull/34)
+- [ ] PR reviews addressed
+- [ ] Branch finished
 
 ### Feature scope (post-council, post-research)
 
@@ -151,20 +177,31 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 - **Solution doc:** `docs/solutions/backtesting/alias-windowing-by-start-date.md`.
 - **Closes** PR #32 CHANGELOG "Known limitations discovered post-Task 20, limitation #2".
 
+## Done (cont'd 8) — Stale post-PR#29 test cleanup (2026-04-18)
+
+Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in stale tests that predated PR#29/#30/#31's schema changes.
+
+- **Root causes addressed:** (1) PR#29 dropped 5 cols from `live_deployments`; (2) PR#30 added NOT NULL `ib_login_key` on `LiveDeployment` and `gateway_session_key` on `LiveNodeProcess`; (3) PR#31 enforced `portfolio_revision_id NOT NULL` and deprecated `/api/v1/live/start`; plus an unrelated OHLC-invariant bug in synthetic bar generator and a stale `order_id_tag` assertion that didn't expect PR#29's order-index prefix.
+- **New fixture helper:** `tests/integration/_deployment_factory.py::make_live_deployment` — seeds `LivePortfolio → LivePortfolioRevision → LiveDeployment` with all NOT NULL cols populated + unique slug/signature per call. Accepts ORM instances or IDs.
+- **Files migrated to factory (9):** test_audit_hook, test_heartbeat_monitor, test_heartbeat_thread, test_live_node_process_model, test_live_start_endpoints, test_live_status_by_id, test_order_attempt_audit_model, test_process_manager, test_trading_node_subprocess. Plus test_portfolio_deploy_cycle got `ib_login_key` kwarg.
+- **Tests deleted:** test_live_deployment_stable_identity.py (6 tests of v9 intermediate design — replaced by PortfolioDeploymentIdentity). 4 obsolete 1.1b tests in test_alembic_migrations.py. 9 tests in test_live_start_endpoints.py targeting the deprecated `/api/v1/live/start` (returns 410 Gone).
+- **Assertion updates:** test_alembic_migrations backfill test now pins intentional-empty-config + intentional-empty-instruments behavior (r6m7n8o9p0q1 line 92). drops_legacy_columns test updated for `portfolio_revision_id NOT NULL` (PR#31). test_live_status_by_id instruments assertion updated to `[]` (endpoint returns backward-compat empty list post column drop). test_parity_config_roundtrip order_id_tag assertion updated to `"0-<slug>"` format.
+- **Fix:** test_parity_determinism.\_write_synthetic_bars now derives high/low from max/min(open, close) so Nautilus `Bar.__init__` invariant holds.
+- **Scope:** claude-version only. Test-only cleanup — no production code modified. 16 files changed (1 helper added, 1 file deleted, 14 patched).
+
 ## Now
 
-- **Branch** `fix/backtest-start-date-windowing` in worktree, ready to commit + push. Not yet pushed.
-- **Deferred from PR #32** — 2 of the original 3 items still open after this fix merges:
+- **Branch** `fix/stale-post-pr29-tests` in worktree. Ready for code review + simplify + verify + push + PR.
+- **PR #34 open** at https://github.com/marketsignal/msai-v2/pull/34 (3 commits on branch; main + continuity + Codex-review-fix).
+- **Full suite: 1601/0/0** (passed/failed/errors). Zero regressions from main's 1513 passed.
+- **Codex PR review:** 1 P2 found + fixed + replied. Canonical identity helpers (`derive_strategy_id_full`, `derive_message_bus_stream`, `derive_trader_id`, `generate_deployment_slug`) now used in the factory so tests exercise production-shape strings (commit `65a068e`).
+- **Deferred from PR #32** — 2 of the original 3 items still open:
   1. `msai instruments refresh` for plain symbols (Databento path works; IB path skipped).
-  2. Live path wiring onto registry (`/api/v1/live/start` still uses closed-universe `canonical_instrument_id()`).
-- **Pre-existing main dirty-tree failures** (found during this session's verify-app run, confirmed on main too) — separate problem, not in scope here:
-  - Alembic migration tests expect `LiveDeployment.config_hash` + `instruments_signature` columns that don't exist in the model
-  - `LiveDeployment.__init__` rejects `strategy_code_hash` kwarg
-  - `test_ema_cross_backtest_is_deterministic` raises `ValueError: high was < open` in BarDataWrangler
-  - Worth tracking as its own follow-up (likely stale scaffolding from portfolio-per-account-live PRs).
+  2. Live path wiring onto registry (`/api/v1/live/start-portfolio` still uses closed-universe `canonical_instrument_id()`).
 
 ## Next
 
-1. **Commit + push** this fix branch; ask user about PR creation (per critical-rules).
-2. **After PR merges** — the remaining deferred PR #32 items in priority order: live-path wiring (highest strategic value, needs design pass), then IB-path registry insert for plain symbols.
-3. **Triage the pre-existing full-suite failures** — separate branch. Decide whether they're stale scaffolding to delete or real schema gaps to close.
+1. **Wait for Codex bot re-scan** of `65a068e` (or user can invoke `/finish-branch` to merge without a second pass).
+2. **Any further review comments** → `/review-pr-comments` again.
+3. **When approved** → `/finish-branch` to merge + clean up.
+4. **After PR merges** — pick up the remaining deferred PR #32 items: live-path wiring (highest strategic value, needs design pass), then IB-path registry insert.

@@ -27,6 +27,7 @@ from msai.services.nautilus.trading_node_subprocess import (
     TradingNodePayload,
     run_subprocess_async,
 )
+from tests.integration._deployment_factory import make_live_deployment
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -87,31 +88,12 @@ async def seeded_row(
         session.add(strategy)
         await session.flush()
 
-        slug = uuid4().hex[:16]
-        dep = LiveDeployment(
-            id=uuid4(),
-            strategy_id=strategy.id,
-            strategy_code_hash="deadbeef" * 8,
-            config={},
-            instruments=["AAPL.NASDAQ"],
-            status="starting",
-            paper_trading=True,
-            started_by=user.id,
-            deployment_slug=slug,
-            identity_signature="f" * 64,
-            trader_id=f"MSAI-{slug}",
-            strategy_id_full=f"EMACrossStrategy-{slug}",
-            account_id="DU1234567",
-            message_bus_stream=f"trader-MSAI-{slug}-stream",
-            config_hash="cafebabe" * 8,
-            instruments_signature="AAPL.NASDAQ",
-        )
-        session.add(dep)
-        await session.flush()
+        dep = await make_live_deployment(session, user=user, strategy=strategy, status="starting")
 
         row = LiveNodeProcess(
             id=uuid4(),
             deployment_id=dep.id,
+            gateway_session_key="msai-paper-primary:localhost:4002",
             pid=None,  # supervisor leaves this NULL — subprocess self-writes
             host="test-host",
             started_at=datetime.now(UTC),

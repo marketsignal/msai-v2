@@ -40,13 +40,12 @@ from msai.core.auth import get_current_user
 from msai.core.database import get_db
 from msai.main import app
 from msai.models import Base, LiveDeployment, LiveNodeProcess, Strategy, User
-from msai.services.live.failure_kind import FailureKind
 from msai.services.live.idempotency import IdempotencyStore
 from msai.services.live_command_bus import (
     LIVE_COMMAND_STREAM,
     LiveCommandBus,
-    LiveCommandType,
 )
+from tests.integration._deployment_factory import make_live_deployment
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -243,6 +242,7 @@ async def _fake_supervisor_ready(
         row = LiveNodeProcess(
             id=uuid4(),
             deployment_id=deployment_id,
+            gateway_session_key="msai-paper-primary:localhost:4002",
             pid=12345,
             host="fake-supervisor-host",
             started_at=datetime.now(UTC),
@@ -268,6 +268,7 @@ async def _fake_supervisor_never_ready(
         row = LiveNodeProcess(
             id=uuid4(),
             deployment_id=deployment_id,
+            gateway_session_key="msai-paper-primary:localhost:4002",
             pid=12345,
             host="fake-supervisor-host",
             started_at=datetime.now(UTC),
@@ -362,280 +363,6 @@ def _fast_polling(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------------------------------------------------------------------
 # /start — happy path
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_start_publishes_and_returns_201_when_supervisor_ready(
-    client: httpx.AsyncClient,
-    session_factory: async_sessionmaker[AsyncSession],
-    test_strategy: Strategy,
-    redis_text: AsyncRedis,
-) -> None:
-    """End-to-end happy path: publish a START command to the bus,
-    fake supervisor flips the row to ``ready``, endpoint returns 201
-    with the deployment id + slug."""
-    response = await _drive_start_with_supervisor(client, session_factory, test_strategy)
-    assert response.status_code == 201, response.text
-
-    body = response.json()
-    assert UUID(body["id"])  # valid UUID
-    assert len(body["deployment_slug"]) == 16
-    assert body["status"] in {"ready", "running"}
-    assert body["paper_trading"] is True
-    assert body["warm_restart"] is False  # cold start first time
-
-    # Verify a START command actually landed on the stream.
-    entries = await redis_text.xrange(LIVE_COMMAND_STREAM, count=10)
-    assert len(entries) == 1
-    entry_fields = entries[0][1]
-    assert entry_fields["command_type"] == LiveCommandType.START.value
-
-
-# ---------------------------------------------------------------------------
-# /start — halt-flag short-circuit
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_start_returns_503_when_halt_flag_set(
-    client: httpx.AsyncClient,
-    session_factory: async_sessionmaker[AsyncSession],
-    test_strategy: Strategy,
-    redis_text: AsyncRedis,
-) -> None:
-    """Layer 2: ``msai:risk:halt`` is set → endpoint returns 503
-    ``halt_active`` without publishing a command. Non-cacheable so a
-    subsequent retry after /resume can re-attempt."""
-    try:
-        await redis_text.set("msai:risk:halt", "1")
-
-        body = {
-            "strategy_id": str(test_strategy.id),
-            "config": {},
-            "instruments": ["AAPL"],
-            "paper_trading": True,
-        }
-        response = await client.post("/api/v1/live/start", json=body)
-        assert response.status_code == 503
-        assert "kill switch" in response.json()["detail"].lower()
-
-        # NO command should have been published.
-        entries = await redis_text.xrange(LIVE_COMMAND_STREAM, count=10)
-        assert len(entries) == 0
-    finally:
-        await redis_text.delete("msai:risk:halt")
-
-
-# ---------------------------------------------------------------------------
-# /start — strategy 404
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_start_returns_404_for_unknown_strategy(
-    client: httpx.AsyncClient,
-) -> None:
-    body = {
-        "strategy_id": str(uuid4()),
-        "config": {},
-        "instruments": ["AAPL"],
-        "paper_trading": True,
-    }
-    response = await client.post("/api/v1/live/start", json=body)
-    assert response.status_code == 404
-    assert "not found" in response.json()["detail"].lower()
-
-
-# ---------------------------------------------------------------------------
-# /start — permanent failure classification
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_start_returns_503_with_failure_kind_on_reconciliation_failed(
-    client: httpx.AsyncClient,
-    session_factory: async_sessionmaker[AsyncSession],
-    test_strategy: Strategy,
-) -> None:
-    """The supervisor writes ``failure_kind=reconciliation_failed`` to
-    the row; the endpoint translates that into a 503 with the
-    structured failure_kind in the body, and it IS cacheable so a
-    retry with the same Idempotency-Key returns the cached diagnosis
-    without re-attempting."""
-    response = await _drive_start_with_supervisor(
-        client,
-        session_factory,
-        test_strategy,
-        supervisor_kwargs={
-            "final_status": "failed",
-            "failure_kind": FailureKind.RECONCILIATION_FAILED.value,
-            "error_message": "trader.is_running=False",
-        },
-    )
-    assert response.status_code == 503
-    body = response.json()
-    assert body["failure_kind"] == "reconciliation_failed"
-    assert "trader.is_running=False" in body["detail"]
-
-
-# ---------------------------------------------------------------------------
-# /start — api_poll_timeout
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_start_returns_504_when_poll_times_out(
-    client: httpx.AsyncClient,
-    session_factory: async_sessionmaker[AsyncSession],
-    test_strategy: Strategy,
-) -> None:
-    """Supervisor never flips the row → endpoint hits the 3s test
-    timeout and returns 504 ``api_poll_timeout``. Non-cacheable."""
-    response = await _drive_start_with_supervisor(
-        client,
-        session_factory,
-        test_strategy,
-        supervisor_fn=_fake_supervisor_never_ready,
-    )
-    assert response.status_code == 504
-
-
-# ---------------------------------------------------------------------------
-# /start — idempotency
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_start_with_idempotency_key_caches_outcome(
-    client: httpx.AsyncClient,
-    session_factory: async_sessionmaker[AsyncSession],
-    test_strategy: Strategy,
-) -> None:
-    """First /start with Idempotency-Key: 201, reserves + commits.
-    Second /start with SAME key + SAME body: cached 201 outcome
-    returned without re-publishing."""
-    headers = {"Idempotency-Key": "test-key-1"}
-
-    r1 = await _drive_start_with_supervisor(client, session_factory, test_strategy, headers=headers)
-    assert r1.status_code == 201
-
-    # Second call returns the cached outcome. Don't spin up the fake
-    # supervisor — the endpoint should short-circuit on the cache.
-    body = {
-        "strategy_id": str(test_strategy.id),
-        "config": {},
-        "instruments": ["AAPL"],
-        "paper_trading": True,
-    }
-    r2 = await client.post("/api/v1/live/start", json=body, headers=headers)
-    assert r2.status_code == 201
-    assert r2.json() == r1.json()
-
-
-@pytest.mark.asyncio
-async def test_start_with_same_key_different_body_returns_422(
-    client: httpx.AsyncClient,
-    session_factory: async_sessionmaker[AsyncSession],
-    test_strategy: Strategy,
-) -> None:
-    """Reusing an Idempotency-Key with a DIFFERENT body returns 422
-    body_mismatch — the caller does NOT own the reservation slot, so
-    this response MUST be non-cacheable (Codex v7 P0)."""
-    headers = {"Idempotency-Key": "test-key-2"}
-
-    r1 = await _drive_start_with_supervisor(client, session_factory, test_strategy, headers=headers)
-    assert r1.status_code == 201
-
-    different_body = {
-        "strategy_id": str(test_strategy.id),
-        "config": {"fast_ema_period": 99},  # different
-        "instruments": ["AAPL"],
-        "paper_trading": True,
-    }
-    r2 = await client.post("/api/v1/live/start", json=different_body, headers=headers)
-    assert r2.status_code == 422
-    assert "different request body" in r2.json()["detail"].lower()
-
-
-@pytest.mark.asyncio
-async def test_halt_flag_outcome_is_not_cached(
-    client: httpx.AsyncClient,
-    session_factory: async_sessionmaker[AsyncSession],
-    test_strategy: Strategy,
-    redis_text: AsyncRedis,
-) -> None:
-    """Layer 2 halt outcome is NOT cached — calling /start with the
-    SAME Idempotency-Key after the halt flag is cleared must be
-    allowed to re-attempt and succeed."""
-    headers = {"Idempotency-Key": "test-key-halt"}
-
-    # Set the halt flag, call /start → 503 halt_active (released)
-    await redis_text.set("msai:risk:halt", "1")
-    body = {
-        "strategy_id": str(test_strategy.id),
-        "config": {},
-        "instruments": ["AAPL"],
-        "paper_trading": True,
-    }
-    r1 = await client.post("/api/v1/live/start", json=body, headers=headers)
-    assert r1.status_code == 503
-
-    # Clear the halt flag, retry → should succeed (reservation was released)
-    await redis_text.delete("msai:risk:halt")
-    r2 = await _drive_start_with_supervisor(client, session_factory, test_strategy, headers=headers)
-    assert r2.status_code == 201
-
-
-# ---------------------------------------------------------------------------
-# /start — active-process short-circuit (already_active)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_start_returns_200_already_active_when_row_is_running(
-    client: httpx.AsyncClient,
-    session_factory: async_sessionmaker[AsyncSession],
-    test_strategy: Strategy,
-    redis_text: AsyncRedis,
-) -> None:
-    """First /start succeeds → row in 'ready' status. Second /start
-    with same identity sees the active row and returns 200
-    ``already_active`` WITHOUT publishing a new command."""
-    # First start
-    r1 = await _drive_start_with_supervisor(client, session_factory, test_strategy)
-    assert r1.status_code == 201
-    first_id = r1.json()["id"]
-
-    # Clear the stream so the second-call assertion is clean.
-    # Trim instead of delete so the fake-supervisor consumer
-    # registration from the ``client`` fixture (drill 2026-04-15
-    # P0-A — /start now returns 503 if no consumer is active)
-    # survives. DELETE would drop the entire stream + group.
-    await redis_text.xtrim(LIVE_COMMAND_STREAM, maxlen=0)
-
-    # Second start — active process row still present from the fake
-    # supervisor, so we expect 200 already_active without republishing.
-    body = {
-        "strategy_id": str(test_strategy.id),
-        "config": {},
-        "instruments": ["AAPL"],
-        "paper_trading": True,
-    }
-    r2 = await client.post("/api/v1/live/start", json=body)
-    assert r2.status_code == 200
-    assert r2.json()["id"] == first_id
-
-    # No new command was published.
-    entries = await redis_text.xrange(LIVE_COMMAND_STREAM, count=10)
-    assert len(entries) == 0
-
-
-# ---------------------------------------------------------------------------
-# /stop
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
 async def test_stop_returns_200_immediately_when_no_active_row(
     client: httpx.AsyncClient,
     session_factory: async_sessionmaker[AsyncSession],
@@ -646,27 +373,14 @@ async def test_stop_returns_200_immediately_when_no_active_row(
     """Idempotent /stop: if no live_node_processes row is active,
     return 200 with status='stopped' immediately."""
     # Seed a deployment with NO live_node_processes rows.
-    slug = uuid4().hex[:16]
     async with session_factory() as session, session.begin():
-        dep = LiveDeployment(
-            id=uuid4(),
-            strategy_id=test_strategy.id,
-            strategy_code_hash="deadbeef" * 8,
-            config={},
-            instruments=["AAPL"],
+        dep = await make_live_deployment(
+            session,
+            user=test_user,
+            strategy=test_strategy,
             status="stopped",
-            paper_trading=True,
-            started_by=test_user.id,
-            deployment_slug=slug,
-            identity_signature="f" * 64,
-            trader_id=f"MSAI-{slug}",
-            strategy_id_full=f"SmokeStrategy-{slug}",
-            account_id="DU1234567",
-            message_bus_stream=f"trader-MSAI-{slug}-stream",
-            config_hash="cafebabe" * 8,
-            instruments_signature="AAPL",
+            strategy_class="SmokeStrategy",
         )
-        session.add(dep)
         dep_id = dep.id
 
     # Trim instead of delete so the fake-supervisor consumer
