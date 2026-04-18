@@ -59,3 +59,13 @@ docker-compose.override.yml
 scripts/ib-gateway-config/*.ini
 .worktrees/
 .ibaccounts.txt
+
+# Docker runtime state (IB Gateway logs/jars/configs, Nautilus cache, scheduler, ingestion status)
+claude-version/data/ib-gateway/
+claude-version/data/nautilus/
+claude-version/data/scheduler/
+claude-version/data/ingestion_status.json
+codex-version/data/ib-gateway/
+codex-version/data/nautilus/
+codex-version/data/scheduler/
+codex-version/data/ingestion_status.json
