@@ -82,7 +82,7 @@ class InstrumentSpec:
         symbol: Root ticker / underlying (e.g. ``AAPL``, ``ES``, ``SPX``,
             ``EUR``). For forex, the base currency.
         venue: IB exchange acronym used as the Nautilus ``Venue``
-            (e.g. ``NASDAQ``, ``XCME``, ``SMART``, ``IDEALPRO``). MUST
+            (e.g. ``NASDAQ``, ``CME``, ``SMART``, ``IDEALPRO``). MUST
             match the ``Venue`` Nautilus derives from the resolved
             contract — see gotcha #4.
         currency: Quote currency. Defaults to USD. For forex this is
