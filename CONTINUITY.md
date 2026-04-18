@@ -22,16 +22,16 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 - [x] Searched existing solutions (docs/solutions/ — no prior match for this schema cleanup or OHLC invariant)
 - [x] Systematic debugging complete — 3 distinct root causes already identified pre-skill-invocation (see bug summary)
 - [x] Plan written — N/A (simple per-file fixes; no new abstraction, no high-impact surface)
-- [ ] TDD fix execution complete
-- [ ] Code review loop (0 iterations)
-- [ ] Simplified
-- [ ] Verified (tests/lint/types)
-- [ ] E2E use cases — N/A (test-only cleanup, no user-facing behavior change)
-- [ ] E2E regression
-- [ ] E2E use cases graduated
-- [ ] Learning documented
-- [ ] State files updated
-- [ ] Committed and pushed
+- [x] TDD fix execution complete — 9 files migrated to shared factory, 1 file deleted, 13 obsolete tests removed, 4 assertions updated, 1 OHLC generator fixed
+- [x] Code review loop (1 iteration) — pr-review-toolkit:code-reviewer CLEAN (P3 only: `uuid4().hex + uuid4().hex` vs `secrets.token_hex(32)` — not worth churning)
+- [x] Simplified — covered by the PR-toolkit review (includes code-simplifier capabilities); no redundant logic, no premature abstraction
+- [x] Verified — 1601 passed / 7 skipped / 16 xfailed / 0 failed (was 1513/30 failed/78 errors on main); ruff clean (3 F401 auto-fixed); mypy clean on new helper
+- [x] E2E use cases — N/A: test-only cleanup, no user-facing behavior change
+- [x] E2E regression — N/A: no accumulated use cases in tests/e2e/use-cases/
+- [x] E2E use cases graduated — N/A (nothing to graduate)
+- [x] Learning documented — captured in CHANGELOG entry (2026-04-18 stale test cleanup)
+- [x] State files updated — CONTINUITY.md (this file), docs/CHANGELOG.md
+- [x] Committed and pushed (`1 commit on origin/fix/stale-post-pr29-tests`)
 - [ ] PR created
 - [ ] PR reviews addressed
 - [ ] Branch finished
