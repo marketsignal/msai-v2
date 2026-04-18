@@ -6,35 +6,9 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field     | Value                                                          |
-| --------- | -------------------------------------------------------------- |
-| Command   | /fix-bug backtest-start-date-windowing                         |
-| Phase     | 6 — Finish (quality gates passed; ready to commit + push + PR) |
-| Next step | Commit + push, then ask user about PR creation                 |
-
-**Bug summary:** `SecurityMaster.resolve_for_backtest` uses today's date for `InstrumentRegistry.find_by_alias`, not the backtest's `start_date`. Post-roll historical backtests silently get today's front-month alias. Flagged in PR #32 CHANGELOG under "Known limitations discovered post-Task 20 (limitation #2)". Target: claude-version. Scope: backtest-only.
-
-### Checklist
-
-- [x] Worktree created (`.worktrees/backtest-start-date-windowing`, branch `fix/backtest-start-date-windowing`)
-- [x] Project state read
-- [x] Plugins verified (superpowers + pr-review-toolkit listed in skill inventory)
-- [x] Searched existing solutions (docs/solutions/backtesting/ — nothing prior matched)
-- [x] Systematic debugging complete — root cause identified: 2 warm paths in `resolve_for_backtest` ignoring `start` kwarg
-- [x] Plan written — N/A (simple fix per workflow, Phase 3 skipped; 1 file + 1 test file, not high-impact surface)
-- [x] TDD fix execution complete — red → green (3 new tests added, 1 file edited)
-- [x] Code review loop (1 iteration) — PASS (pr-review-toolkit:code-reviewer CLEAN, only P3 nits; codex CLI stalled after retry, workflow permits single-reviewer when the other is unavailable)
-- [x] Simplified — 3 parallel review agents (reuse/quality/efficiency) all CLEAN (P3-only); formatter-churn in adjacent methods kept (aligned with ruff-format project standard)
-- [x] Verified — 122/122 in-scope tests pass; ruff clean on changed files; mypy clean on changed lines (53 unrelated pre-existing errors in other lines of the same file). Full-suite failures (30/78) confirmed pre-existing on main, untouched by this fix
-- [x] E2E verified — N/A: fix is internally observable only. Reproducing via public API requires seeding the registry with multiple alias windows for a single symbol, which can't be done through sanctioned ARRANGE channels (`msai instruments refresh` has no effective_from/effective_to param; direct DB inserts forbidden). Integration tests with seeded sessions are the test of record.
-- [x] E2E regression — N/A: tests/e2e/use-cases/ is empty (no accumulated UCs)
-- [x] E2E use cases graduated — N/A (nothing to graduate)
-- [x] Learning documented — `docs/solutions/backtesting/alias-windowing-by-start-date.md`
-- [x] State files updated — CONTINUITY.md (this file), docs/CHANGELOG.md
-- [ ] Committed and pushed
-- [ ] PR created
-- [ ] PR reviews addressed
-- [ ] Branch finished
+| Field   | Value |
+| ------- | ----- |
+| Command | none  |
 
 ### Feature scope (post-council, post-research)
 
