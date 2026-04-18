@@ -162,6 +162,54 @@ async def test_asset_class_check_rejects_invalid(
 
 
 @pytest.mark.asyncio
+async def test_effective_window_check_rejects_inverted_window(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """``ck_instrument_aliases_effective_window`` rejects an alias row whose
+    ``effective_to`` is on/before ``effective_from``. ``NULL`` for
+    ``effective_to`` (the active-alias case) is allowed.
+    """
+    async with session_factory() as session:
+        idef = InstrumentDefinition(
+            raw_symbol="ES",
+            listing_venue="CME",
+            routing_venue="CME",
+            asset_class="futures",
+            provider="interactive_brokers",
+        )
+        session.add(idef)
+        await session.flush()
+        uid = idef.instrument_uid
+        # Active alias with effective_to=None — allowed.
+        session.add(
+            InstrumentAlias(
+                instrument_uid=uid,
+                alias_string="ESM6.CME",
+                venue_format="exchange_name",
+                provider="interactive_brokers",
+                effective_from=date(2026, 3, 17),
+                effective_to=None,
+            )
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        # Inverted window — effective_to == effective_from — must fail.
+        session.add(
+            InstrumentAlias(
+                instrument_uid=uid,
+                alias_string="ESM6.CME",
+                venue_format="exchange_name",
+                provider="interactive_brokers",
+                effective_from=date(2026, 6, 1),
+                effective_to=date(2026, 6, 1),
+            )
+        )
+        with pytest.raises(IntegrityError):
+            await session.commit()
+
+
+@pytest.mark.asyncio
 async def test_continuous_pattern_check_rejects_invalid_shape(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

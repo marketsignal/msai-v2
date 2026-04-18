@@ -119,9 +119,20 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.func.now(),
         ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.func.now(),
+            onupdate=sa.func.now(),
+        ),
         sa.CheckConstraint(
             "venue_format IN ('exchange_name','mic_code','databento_continuous')",
             name="ck_instrument_aliases_venue_format",
+        ),
+        sa.CheckConstraint(
+            "effective_to IS NULL OR effective_to > effective_from",
+            name="ck_instrument_aliases_effective_window",
         ),
         sa.UniqueConstraint(
             "alias_string",

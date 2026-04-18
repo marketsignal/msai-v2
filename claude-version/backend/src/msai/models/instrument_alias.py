@@ -38,6 +38,10 @@ class InstrumentAlias(Base):
             "venue_format IN ('exchange_name','mic_code','databento_continuous')",
             name="ck_instrument_aliases_venue_format",
         ),
+        CheckConstraint(
+            "effective_to IS NULL OR effective_to > effective_from",
+            name="ck_instrument_aliases_effective_window",
+        ),
         UniqueConstraint(
             "alias_string",
             "provider",
@@ -68,6 +72,12 @@ class InstrumentAlias(Base):
     effective_to: Mapped[date | None] = mapped_column(Date, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
     )
 
     definition: Mapped[InstrumentDefinition] = relationship(
