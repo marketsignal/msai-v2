@@ -28,6 +28,18 @@ class RegistryDefinitionNotFoundError(Exception):
     """Raised when a requested symbol has no matching registry row."""
 
 
+class AmbiguousSymbolError(Exception):
+    """Raised when a raw symbol matches multiple definitions and the caller
+    did not pin ``asset_class``.
+
+    Schema uniqueness is ``(raw_symbol, provider, asset_class)`` — so a
+    single ``(raw_symbol, provider)`` pair can legitimately have multiple
+    rows across asset_classes (e.g. ``SPY`` as equity AND as option
+    underlying). Without ``asset_class`` the resolver has no deterministic
+    pick, so we refuse rather than silently grab one.
+    """
+
+
 @dataclass
 class InstrumentRegistry:
     session: AsyncSession
@@ -75,14 +87,34 @@ class InstrumentRegistry:
         """Return the definition for ``raw_symbol`` under ``provider`` (and
         optional ``asset_class``). Returns ``None`` on miss. Callers MUST
         specify ``provider`` -- cross-provider dual-listings are by design
-        (schema uniqueness is ``(raw_symbol, provider, asset_class)``)."""
+        (schema uniqueness is ``(raw_symbol, provider, asset_class)``).
+
+        Raises:
+            AmbiguousSymbolError: ``asset_class`` was not specified and
+                more than one row matches ``(raw_symbol, provider)``.
+                The schema allows multiple rows per that pair across
+                different asset_classes; without ``asset_class`` pinned
+                the resolver cannot pick deterministically.
+        """
         stmt = select(InstrumentDefinition).where(
             InstrumentDefinition.raw_symbol == raw_symbol,
             InstrumentDefinition.provider == provider,
         )
         if asset_class is not None:
             stmt = stmt.where(InstrumentDefinition.asset_class == asset_class)
-        return (await self.session.execute(stmt.limit(1))).scalar_one_or_none()
+            return (await self.session.execute(stmt.limit(1))).scalar_one_or_none()
+
+        # Without asset_class, fetch all matches and detect ambiguity
+        # rather than silently ``limit(1)`` onto an arbitrary row.
+        rows = (await self.session.execute(stmt)).scalars().all()
+        if len(rows) > 1:
+            classes = sorted({r.asset_class for r in rows})
+            raise AmbiguousSymbolError(
+                f"Symbol {raw_symbol!r} matches {len(rows)} definitions under "
+                f"provider {provider!r} across asset_classes {classes}; "
+                "specify asset_class explicitly."
+            )
+        return rows[0] if rows else None
 
     async def require_definition(
         self,

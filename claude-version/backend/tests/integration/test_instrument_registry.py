@@ -21,6 +21,7 @@ from msai.models import Base
 from msai.models.instrument_alias import InstrumentAlias
 from msai.models.instrument_definition import InstrumentDefinition
 from msai.services.nautilus.security_master.registry import (
+    AmbiguousSymbolError,
     InstrumentRegistry,
     RegistryDefinitionNotFoundError,
 )
@@ -149,3 +150,36 @@ async def test_require_definition_raises_on_miss(
             await registry.require_definition(
                 "ZZZZ.NASDAQ", provider="interactive_brokers"
             )
+
+
+@pytest.mark.asyncio
+async def test_find_by_raw_symbol_raises_on_ambiguous_asset_classes(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Schema allows multiple rows per (raw_symbol, provider) across
+    asset_classes. Without asset_class, resolver must refuse rather than
+    silently pick."""
+    async with session_factory() as session:
+        # Seed SPY as equity AND as option-underlying under same provider
+        for ac in ("equity", "option"):
+            session.add(
+                InstrumentDefinition(
+                    raw_symbol="SPY",
+                    listing_venue="NASDAQ",
+                    routing_venue="NASDAQ",
+                    asset_class=ac,
+                    provider="databento",
+                )
+            )
+        await session.commit()
+
+        registry = InstrumentRegistry(session)
+        with pytest.raises(AmbiguousSymbolError, match="SPY"):
+            await registry.find_by_raw_symbol("SPY", provider="databento")
+
+        # Specifying asset_class resolves unambiguously
+        result_equity = await registry.find_by_raw_symbol(
+            "SPY", provider="databento", asset_class="equity"
+        )
+        assert result_equity is not None
+        assert result_equity.asset_class == "equity"
