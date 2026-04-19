@@ -158,44 +158,31 @@ def _build_production_payload_factory(
             # connection (which gateway container to reach), not
             # the DEPLOYMENT's business intent (which account to
             # trade under).
-            # Accept both raw IB ports and socat proxy ports.
-            _paper_ports = (4002, 4004)
-            _live_ports = (4001, 4003)
-            expected_ports = _paper_ports if deployment.paper_trading else _live_ports
-            if settings.ib_port not in expected_ports:
-                raise ValueError(
-                    f"deployment {deployment_id} has paper_trading="
-                    f"{deployment.paper_trading} (expected IB_PORT in "
-                    f"{expected_ports}) but supervisor is configured "
-                    f"with IB_PORT={settings.ib_port}. Flipping modes "
-                    f"requires restarting the supervisor with matching "
-                    f"IB_PORT — otherwise the deployment would connect "
-                    f"to the wrong gateway (real money under a paper "
-                    f"row, or paper orders under a live row)."
-                )
+            # Gotcha #6 guard: validate port vs (a) the deployment row's
+            # paper_trading flag, and (b) the deployment row's account_id
+            # (NOT settings.ib_account_id — account is per-deployment).
+            #
+            # Keep `deployment_account` local so the downstream payload
+            # assembly still receives the stripped value the subprocess
+            # expects. Local import avoids supervisor-startup import
+            # order issues.
+            from msai.services.nautilus.ib_port_validator import (
+                validate_port_account_consistency,
+                validate_port_vs_paper_trading,
+            )
 
-            # ``account_id`` consistency with ``paper_trading``.
-            # Paper accounts start with ``DU`` or ``DF`` (FA sub-accounts
-            # use ``DFP`` prefix); live accounts don't start with ``D``.
-            # This mirrors ``_validate_port_account_consistency`` in
-            # ``live_node_config.py`` but catches the mismatch one
-            # layer earlier (before build_live_trading_node_config
-            # even sees it).
-            _paper_prefixes = ("DU", "DF")
             deployment_account = (deployment.account_id or "").strip()
-            _is_paper = any(deployment_account.startswith(p) for p in _paper_prefixes)
-            if deployment.paper_trading and not _is_paper:
-                raise ValueError(
-                    f"deployment {deployment_id} has paper_trading=True but "
-                    f"account_id='{deployment_account}' does not start with "
-                    f"any of {_paper_prefixes}. Paper accounts must use DU*/DF* IDs."
+            try:
+                validate_port_vs_paper_trading(
+                    settings.ib_port,
+                    paper_trading=deployment.paper_trading,
                 )
-            if not deployment.paper_trading and _is_paper:
-                raise ValueError(
-                    f"deployment {deployment_id} has paper_trading=False but "
-                    f"account_id='{deployment_account}' starts with a paper prefix. "
-                    f"Live deployments require non-paper account IDs."
+                validate_port_account_consistency(
+                    settings.ib_port,
+                    deployment_account,
                 )
+            except ValueError as exc:
+                raise ValueError(f"deployment {deployment_id}: {exc}") from exc
 
             # ---------------------------------------------------------
             # Resolve IB host/port: multi-login GatewayRouter or
