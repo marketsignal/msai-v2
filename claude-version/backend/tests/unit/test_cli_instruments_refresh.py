@@ -176,6 +176,8 @@ class TestRefreshDatabento:
         "ES.CME",  # bare-root futures dotted alias
         "ESM6.CME",  # month-qualified futures alias (CLI's own ES output)
         "ES.XCME",  # legacy MIC — still accepted for backwards compat
+        "EUR",  # FX shorthand — still accepted by canonical_instrument_id
+        "EUR.IDEALPRO",  # FX shorthand + current venue
     ],
 )
 def test_ib_provider_accepts_dotted_and_futures_aliases(

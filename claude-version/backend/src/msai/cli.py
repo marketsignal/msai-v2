@@ -772,21 +772,31 @@ def instruments_refresh(
         # trap (e.g. ``SPY.NASDAQ`` silently normalizing to ``SPY``
         # via generic suffix stripping).
         known = phase_1_paper_symbols()
-        # Legacy MIC suffixes still accepted by canonical_instrument_id
-        # for backwards compatibility with older configs/scripts.
-        # Mirror that surface so operators upgrading from a pre-venue-
-        # rename config don't suddenly get rejected at the CLI.
-        legacy_mic_by_root = {"ES": "XCME"}
+        # Mirror the compatibility surface canonical_instrument_id
+        # already accepts so the pre-warm CLI isn't narrower than
+        # SecurityMaster.resolve_for_live (iter-4/iter-6 review):
+        #
+        # - ``ES.XCME`` — legacy MIC, pre-venue-rename configs
+        # - ``EUR`` — bare shorthand for ``EUR/USD``
+        #
+        # Values are EXTRA aliases beyond {root, canonical, stable}.
+        # Bare-shorthand entries (no dot) also admit the shorthand +
+        # current-venue dotted form.
+        LEGACY_ALIASES_BY_ROOT: dict[str, tuple[str, ...]] = {
+            "ES": ("ES.XCME",),
+            "EUR/USD": ("EUR",),
+        }
         accepted: dict[str, str] = {}
         for root in known:
             accepted[root] = root
             canonical = canonical_instrument_id(root)
             accepted[canonical] = root
-            stable = f"{root}.{canonical.rsplit('.', 1)[1]}"
-            accepted[stable] = root
-            legacy = legacy_mic_by_root.get(root)
-            if legacy is not None:
-                accepted[f"{root}.{legacy}"] = root
+            canonical_venue = canonical.rsplit(".", 1)[1]
+            accepted[f"{root}.{canonical_venue}"] = root
+            for legacy in LEGACY_ALIASES_BY_ROOT.get(root, ()):
+                accepted[legacy] = root
+                if "." not in legacy:
+                    accepted[f"{legacy}.{canonical_venue}"] = root
 
         normalized: list[str] = []
         unknown: list[str] = []
