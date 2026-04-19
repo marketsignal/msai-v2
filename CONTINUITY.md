@@ -47,12 +47,36 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
   - [ ] scripts/verify-paper-soak.sh (comment)
   - [ ] docs/decisions/which-version-to-keep.md (file-path references)
   - [ ] Root CLAUDE.md rewrite (absorb claude-version/CLAUDE.md content, drop all claude-version/ prefixes)
-  - [ ] CONTINUITY.md recent entries (self-referential)
-- [ ] Flatten commit 3: CHANGELOG entry for flatten
-- [ ] Sanity check — claude stack still boots after flatten (docker compose up -d from repo root)
-- [ ] Push
-- [ ] PR created (pending user approval)
+  - [x] CONTINUITY.md recent entries (self-referential)
+- [x] Flatten commit 3: CHANGELOG entry for flatten
+- [x] Sanity check — static (compose parse + bind-mount paths exist + /health on main's running stack); full boot deferred to post-merge restart
+- [x] Push
+- [x] PR #36 created
+- [x] Codex review — 3 P2 findings fixed in-branch (commit `af7257c`): broker/live profile name, CLI positional args, API endpoint paths
+- [ ] **CI still failing after setup-uv fix — deferred** (see below)
 - [ ] Merged + branch deleted
+
+### Deferred — CI hardening (follow-up PR)
+
+The first-ever CI run on this workflow (now at `.github/workflows/ci.yml` post-flatten) fails with 0s-duration / empty jobs / no annotations / `started_at: null` / `rerequestable: false`. Classic workflow-parse or policy rejection.
+
+- **Tried:** bumped `astral-sh/setup-uv` from `v4.3.0` (does not exist; 404 from GitHub) to `v7.3.0` (commit `b7eaafd`). Did not fix the parse failure.
+- **Verified:** YAML parses locally (`python3 -c "import yaml; yaml.safe_load(...)"`), all 4 action pins resolve via GitHub API, no BOM, ASCII-clean. GitHub sees the correct file content at the head SHA (diff clean).
+- **Suspected causes, not yet ruled out:**
+  - Org-level Actions policy on `marketsignal` restricting 3rd-party actions (cannot verify — `orgs/marketsignal/actions/permissions` requires admin scope)
+  - Required workflow allowlist blocking `astral-sh/setup-uv` / `pnpm/action-setup`
+  - Workflow registration quirk — display name showing `.github/workflows/ci.yml` (file path) instead of `CI` suggests GitHub can't fully parse the `name:` field
+- **User directive:** merge anyway; land this work; harden CI separately. Reason: the PR scope is archive + flatten, not CI overhaul. CI was broken pre-flatten (file was at `claude-version/.github/workflows/` which GitHub didn't detect); flatten surfaced the bug but didn't introduce it.
+- **Follow-up PR scope (prioritized):**
+  1. Probe minimal `Ping` workflow to isolate org-policy vs per-workflow issue
+  2. Add `.github/dependabot.yml` to prevent action-version rot (this class of bug would have been caught months ago)
+  3. Add `pytest-xdist -n auto` (free ~3x backend test speedup)
+  4. Add `--cov-fail-under=<baseline>` coverage floor
+  5. `on: push:` without branch filter so feature branch pushes get CI feedback
+  6. `workflow_dispatch` trigger so runs are manually re-triggerable
+  7. Consider docker-compose smoke test (`docker compose config --quiet` + optional full `up -d` + health-poll)
+  8. Security scanning: `pip-audit`, `npm audit`, Trivy on Dockerfiles
+- **Bug-not-left-behind rationale:** broken CI pin IS a bug, fixed in this PR (`b7eaafd`). The remaining zero-duration failure is either (a) an org-policy gap that the flatten didn't cause — it just allowed the workflow to finally attempt registration — or (b) a symptom that needs admin-level diagnostic access to resolve. Shipping fix for the known bug + deferring the investigative work is the correct call.
 
 ## Done
 
