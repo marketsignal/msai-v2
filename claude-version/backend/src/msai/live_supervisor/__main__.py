@@ -158,31 +158,7 @@ def _build_production_payload_factory(
             # connection (which gateway container to reach), not
             # the DEPLOYMENT's business intent (which account to
             # trade under).
-            # Gotcha #6 guard: validate port vs (a) the deployment row's
-            # paper_trading flag, and (b) the deployment row's account_id
-            # (NOT settings.ib_account_id — account is per-deployment).
-            #
-            # Keep `deployment_account` local so the downstream payload
-            # assembly still receives the stripped value the subprocess
-            # expects. Local import avoids supervisor-startup import
-            # order issues.
-            from msai.services.nautilus.ib_port_validator import (
-                validate_port_account_consistency,
-                validate_port_vs_paper_trading,
-            )
-
             deployment_account = (deployment.account_id or "").strip()
-            try:
-                validate_port_vs_paper_trading(
-                    settings.ib_port,
-                    paper_trading=deployment.paper_trading,
-                )
-                validate_port_account_consistency(
-                    settings.ib_port,
-                    deployment_account,
-                )
-            except ValueError as exc:
-                raise ValueError(f"deployment {deployment_id}: {exc}") from exc
 
             # ---------------------------------------------------------
             # Resolve IB host/port: multi-login GatewayRouter or
@@ -195,6 +171,26 @@ def _build_production_payload_factory(
             else:
                 ib_host = settings.ib_host
                 ib_port = settings.ib_port
+
+            # Gotcha #6 guard: validate the ROUTED port (ib_port, not
+            # settings.ib_port) against (a) deployment.paper_trading and
+            # (b) deployment.account_id. In multi-login setups the
+            # supervisor default may be paper (4002/4004) while a given
+            # login routes to live (4001/4003) — we must validate the
+            # endpoint the subprocess will actually hit.
+            from msai.services.nautilus.ib_port_validator import (
+                validate_port_account_consistency,
+                validate_port_vs_paper_trading,
+            )
+
+            try:
+                validate_port_vs_paper_trading(
+                    ib_port,
+                    paper_trading=deployment.paper_trading,
+                )
+                validate_port_account_consistency(ib_port, deployment_account)
+            except ValueError as exc:
+                raise ValueError(f"deployment {deployment_id}: {exc}") from exc
 
             # ---------------------------------------------------------
             # Branch: portfolio-based vs single-strategy deployment
