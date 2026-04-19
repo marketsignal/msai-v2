@@ -6,9 +6,77 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field   | Value |
-| ------- | ----- |
-| Command | none  |
+| Field     | Value                                                          |
+| --------- | -------------------------------------------------------------- |
+| Command   | /new-feature playwright-e2e-port (pivoted — archive + flatten) |
+| Phase     | 6 — Finish                                                     |
+| Next step | Complete content edits for flatten, commit 2, push, PR         |
+
+### Checklist (final scope = archive + flatten, no port)
+
+- [x] Worktree created at `.worktrees/playwright-e2e-port` off `e9ac08e`
+- [x] Focused research (N/A — no new libraries)
+- [x] Implementation plan written (then superseded by option C + flatten)
+- [x] Plan review loop (1 iteration) — Claude + Codex both NEEDS_FIX; root cause = UI drift
+- [x] **Pivot 1**: option C (abandon port, delete codex-version directly)
+- [x] **Pivot 2**: user additionally requested flatten (no more claude-version/ or codex-version/ labels anywhere; claude contents at repo root)
+- [x] Updated decision doc + scratch
+- [x] Tagged `codex-final` on `e9ac08e` (archival)
+- [x] `git rm -r codex-version/` (~17K LOC, commit `7ea2c5e`)
+- [x] Deleted 15 Feb-25 baseline PNGs (commit `7ea2c5e`)
+- [x] First root `CLAUDE.md` rewrite for single-stack (commit `7ea2c5e`; will be re-rewritten for flatten)
+- [x] Retargeted `playwright.config.ts` baseURL → `http://localhost:3300` (commit `7ea2c5e`)
+- [x] CHANGELOG entry for delete (commit `3e89728`)
+- [x] **Flatten commit 1 (pure moves, commit `9c30116`)**: git mv claude-version/{backend,frontend,strategies,data,docker-compose.\*,.github,.env.example,.python-version,README.md} to repo root; merged scripts/ and docs/; deleted claude-version/CLAUDE.md + .gitignore (content absorbed elsewhere)
+- [ ] **Flatten commit 2 (content edits — IN PROGRESS)**: strip `claude-version/` prefixes from code/tests/scripts/docs; simplify provenance comments (drop `codex-version/` paths); update .gitignore, CLAUDE.md, CONTINUITY.md, decision doc
+  - [x] README.md (layout diagram)
+  - [x] .gitignore (strip version prefixes, add useful patterns)
+  - [x] backend/src/msai/core/config.py (comment)
+  - [x] backend/src/msai/schemas/alert.py (drop Ported-from comment)
+  - [x] backend/src/msai/api/alerts.py (drop Ported-from comment)
+  - [x] backend/src/msai/services/report_generator.py (drop Ported-from comment)
+  - [x] backend/src/msai/services/alerting.py (drop Ported-from comment)
+  - [x] backend/src/msai/services/nautilus/security_master/continuous_futures.py (simplify 3 mentions)
+  - [x] backend/tests/unit/test_ema_cross_save_load_roundtrip.py, test_live_node_config.py, test_smoke_strategy.py (comments)
+  - [x] backend/tests/integration/test_migrate_catalog.py (docstring)
+  - [x] backend/tests/e2e/test_security_master_phase2.py, test_recovery_phase4.py, test_live_trading_phase1.py (docstrings)
+  - [ ] backend/tests/e2e/test_live_streaming_phase3.py (docstring)
+  - [ ] scripts/seed_market_data.py (docstring — 2 mentions)
+  - [ ] scripts/parity_check.py (docstring)
+  - [ ] scripts/migrate_catalog_to_canonical.py (docstring — 2 mentions)
+  - [ ] scripts/verify-paper-soak.sh (comment)
+  - [ ] docs/decisions/which-version-to-keep.md (file-path references)
+  - [ ] Root CLAUDE.md rewrite (absorb claude-version/CLAUDE.md content, drop all claude-version/ prefixes)
+  - [x] CONTINUITY.md recent entries (self-referential)
+- [x] Flatten commit 3: CHANGELOG entry for flatten
+- [x] Sanity check — static (compose parse + bind-mount paths exist + /health on main's running stack); full boot deferred to post-merge restart
+- [x] Push
+- [x] PR #36 created
+- [x] Codex review — 3 P2 findings fixed in-branch (commit `af7257c`): broker/live profile name, CLI positional args, API endpoint paths
+- [ ] **CI still failing after setup-uv fix — deferred** (see below)
+- [ ] Merged + branch deleted
+
+### Deferred — CI hardening (follow-up PR)
+
+The first-ever CI run on this workflow (now at `.github/workflows/ci.yml` post-flatten) fails with 0s-duration / empty jobs / no annotations / `started_at: null` / `rerequestable: false`. Classic workflow-parse or policy rejection.
+
+- **Tried:** bumped `astral-sh/setup-uv` from `v4.3.0` (does not exist; 404 from GitHub) to `v7.3.0` (commit `b7eaafd`). Did not fix the parse failure.
+- **Verified:** YAML parses locally (`python3 -c "import yaml; yaml.safe_load(...)"`), all 4 action pins resolve via GitHub API, no BOM, ASCII-clean. GitHub sees the correct file content at the head SHA (diff clean).
+- **Suspected causes, not yet ruled out:**
+  - Org-level Actions policy on `marketsignal` restricting 3rd-party actions (cannot verify — `orgs/marketsignal/actions/permissions` requires admin scope)
+  - Required workflow allowlist blocking `astral-sh/setup-uv` / `pnpm/action-setup`
+  - Workflow registration quirk — display name showing `.github/workflows/ci.yml` (file path) instead of `CI` suggests GitHub can't fully parse the `name:` field
+- **User directive:** merge anyway; land this work; harden CI separately. Reason: the PR scope is archive + flatten, not CI overhaul. CI was broken pre-flatten (file was at `claude-version/.github/workflows/` which GitHub didn't detect); flatten surfaced the bug but didn't introduce it.
+- **Follow-up PR scope (prioritized):**
+  1. Probe minimal `Ping` workflow to isolate org-policy vs per-workflow issue
+  2. Add `.github/dependabot.yml` to prevent action-version rot (this class of bug would have been caught months ago)
+  3. Add `pytest-xdist -n auto` (free ~3x backend test speedup)
+  4. Add `--cov-fail-under=<baseline>` coverage floor
+  5. `on: push:` without branch filter so feature branch pushes get CI feedback
+  6. `workflow_dispatch` trigger so runs are manually re-triggerable
+  7. Consider docker-compose smoke test (`docker compose config --quiet` + optional full `up -d` + health-poll)
+  8. Security scanning: `pip-audit`, `npm audit`, Trivy on Dockerfiles
+- **Bug-not-left-behind rationale:** broken CI pin IS a bug, fixed in this PR (`b7eaafd`). The remaining zero-duration failure is either (a) an org-policy gap that the flatten didn't cause — it just allowed the workflow to finally attempt registration — or (b) a symptom that needs admin-level diagnostic access to resolve. Shipping fix for the known bug + deferring the investigative work is the correct call.
 
 ## Done
 

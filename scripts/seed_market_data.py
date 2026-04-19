@@ -6,8 +6,7 @@ January 2025 (~20 trading days × 390 minutes = ~7,800 bars per symbol).
 Writes Parquet files to: {data_root}/parquet/stocks/{SYMBOL}/2025/01.parquet
 
 Usage:
-    python scripts/seed_market_data.py claude-version/data
-    python scripts/seed_market_data.py codex-version/data
+    python scripts/seed_market_data.py data
 """
 
 from __future__ import annotations
@@ -129,7 +128,7 @@ def write_parquet(df: pd.DataFrame, data_root: Path, asset_class: str, symbol: s
 def main() -> None:
     if len(sys.argv) < 2:
         print("Usage: python scripts/seed_market_data.py <data_root>")
-        print("  e.g. python scripts/seed_market_data.py claude-version/data")
+        print("  e.g. python scripts/seed_market_data.py data")
         sys.exit(1)
 
     data_root = Path(sys.argv[1])

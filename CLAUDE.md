@@ -1,104 +1,244 @@
-# CLAUDE.md - MSAI v2 (MarketSignal AI)
+# CLAUDE.md — MSAI v2 (MarketSignal AI)
 
 ## Project Overview
 
 ### What Is This?
 
-MSAI v2 is a personal hedge fund platform for automated trading via Interactive Brokers. It enables defining trading strategies as Python files, backtesting them against historical minute-level data, deploying them to live/paper trading, and monitoring portfolio performance through a web dashboard.
-MSAI v2 is an API-first, CLI-second, UI-third product.
+MSAI v2 is a personal hedge fund platform for automated trading via Interactive Brokers. It enables defining trading strategies as Python files, backtesting them against historical minute-level data, deploying them to live/paper trading, and monitoring portfolio performance through a web dashboard. MSAI v2 is an API-first, CLI-second, UI-third product.
 
-### Two Competing Implementations
+### History
 
-This project has **two versions** built from the same design and implementation plan, now being compared side-by-side:
+This project was originally built in parallel by two AI implementations from the same PRD, and compared side-by-side through 2026-02 to 2026-04. The comparison concluded 2026-04-19 (council verdict in [`docs/decisions/which-version-to-keep.md`](docs/decisions/which-version-to-keep.md)); the losing implementation was archived at tag `codex-final` and removed. The surviving implementation was then flattened from its subdirectory to the repo root. **This IS the shipping implementation; there is no "version" suffix anywhere.** A brief attempt to port the archived Playwright specs was abandoned when plan review found the UI drift too large — see the decision-doc postscript.
 
-|                 | Claude Version                                    | Codex Version           |
-| --------------- | ------------------------------------------------- | ----------------------- |
-| **Built by**    | Claude Opus 4.6                                   | OpenAI Codex (GPT-5.3)  |
-| **Location**    | `claude-version/`                                 | `codex-version/`        |
-| **Frontend**    | `http://localhost:3300`                           | `http://localhost:3400` |
-| **Backend API** | `http://localhost:8800`                           | `http://localhost:8400` |
-| **PostgreSQL**  | `localhost:5433`                                  | `localhost:5434`        |
-| **Redis**       | `localhost:6380`                                  | `localhost:6381`        |
-| **Design doc**  | `docs/plans/2026-02-25-msai-v2-design.md`         | Same                    |
-| **Impl plan**   | `docs/plans/2026-02-25-msai-v2-implementation.md` | Same                    |
-
-### Running Both Versions Side-by-Side
-
-```bash
-# Start Claude version (ports 3300, 8800, 5433, 6380)
-cd claude-version && docker compose -f docker-compose.dev.yml up -d
-
-# Start Codex version (ports 3400, 8400, 5434, 6381)
-cd codex-version && docker compose -f docker-compose.dev.yml up -d
-
-# Open both in browser
-open http://localhost:3300   # Claude frontend
-open http://localhost:3400   # Codex frontend
-
-# API health checks
-curl http://localhost:8800/health   # Claude backend
-curl http://localhost:8400/health   # Codex backend
-
-# Stop both
-cd claude-version && docker compose -f docker-compose.dev.yml down
-cd codex-version && docker compose -f docker-compose.dev.yml down
-```
-
-### Tech Stack (both versions)
+### Stack
 
 - **Backend:** Python 3.12 + FastAPI + NautilusTrader + arq (Redis job queue)
-- **Frontend:** Next.js 15 + React + shadcn/ui + Tailwind CSS + TradingView Charts
+- **Frontend:** Next.js 15 + React + shadcn/ui + Tailwind CSS + TradingView Charts + Recharts
 - **Database:** PostgreSQL 16 + Parquet files + DuckDB + Redis 7
 - **Auth:** Azure Entra ID (MSAL frontend, PyJWT backend)
-- **Deploy:** Docker Compose on Azure VM
+- **Deploy:** Docker Compose on Azure VM (dev: single-host; prod: single-VM D4s_v5, Phase 2 splits to 2-VM for real money)
+- **Data Sources:** Polygon.io (stocks/options), Databento (futures), IB Gateway (execution only)
+
+### Ports (dev)
+
+| Service            | Host port | Container port |
+| ------------------ | --------- | -------------- |
+| Frontend (Next.js) | `3300`    | `3000`         |
+| Backend (FastAPI)  | `8800`    | `8000`         |
+| PostgreSQL         | `5433`    | `5432`         |
+| Redis              | `6380`    | `6379`         |
+
+### Running the stack
+
+```bash
+docker compose -f docker-compose.dev.yml up -d
+
+# Health checks
+curl http://localhost:8800/health
+open http://localhost:3300
+
+# Logs + stop
+docker compose -f docker-compose.dev.yml logs -f
+docker compose -f docker-compose.dev.yml down
+```
+
+IB Gateway is behind the `broker` Compose profile:
+
+```bash
+COMPOSE_PROFILES=broker docker compose -f docker-compose.dev.yml --env-file .env up -d
+```
 
 ### File Structure
 
 ```
 msai-v2/
-├── claude-version/              # Built by Claude Opus 4.6
-│   ├── backend/                 # FastAPI + Python (153 tests)
-│   ├── frontend/                # Next.js 15 + shadcn/ui
-│   ├── docker-compose.dev.yml   # Ports: 3300, 8800, 5433, 6380
-│   ├── docker-compose.prod.yml
-│   └── CLAUDE.md                # Version-specific instructions
-├── codex-version/               # Built by OpenAI Codex (GPT-5.3)
-│   ├── backend/                 # FastAPI + Python
-│   ├── frontend/                # Next.js 15 + shadcn/ui
-│   ├── docker-compose.dev.yml   # Ports: 3400, 8400, 5434, 6381
-│   ├── docker-compose.prod.yml
-│   └── CLAUDE.md                # Version-specific instructions
+├── backend/                 # FastAPI + Python (~32.5K LOC, 536 tests)
+│   ├── src/msai/
+│   │   ├── api/             # FastAPI routers (auth, strategies, backtests, live, portfolios, market-data, account, websocket, alerts)
+│   │   ├── core/            # Config, auth, database, logging, queue, secrets, audit, data_integrity, metrics
+│   │   ├── live_supervisor/ # Subprocess spawner for TradingNode — heartbeat monitor, process manager, command bus
+│   │   ├── models/          # SQLAlchemy 2.0 models (~30 tables)
+│   │   ├── schemas/         # Pydantic request/response
+│   │   ├── services/        # Business logic (risk_engine, alerting, parquet_store, nautilus/*, security_master/*, live/*, data_sources/*)
+│   │   ├── workers/         # arq background workers (backtest, research, portfolio, ingest, live_supervisor)
+│   │   ├── main.py          # FastAPI app entrypoint
+│   │   └── cli.py           # Typer CLI (8 sub-apps)
+│   ├── tests/{unit,integration,e2e}/
+│   ├── alembic/             # Database migrations
+│   ├── Dockerfile + Dockerfile.dev
+│   └── pyproject.toml
+├── frontend/                # Next.js 15 + shadcn/ui (15 primitives) + typed API client
+│   └── src/{app,components,lib}/
+├── strategies/              # Python strategy files (git-only in Phase 1)
+├── data/                    # Parquet + reports (gitignored)
 ├── docs/
-│   ├── plans/
-│   │   ├── 2026-02-25-msai-v2-design.md           # Architecture (shared)
-│   │   └── 2026-02-25-msai-v2-implementation.md    # 50-task plan (shared)
-│   └── CHANGELOG.md
-├── research/
-│   └── trading-research-links.md   # 52 curated research links
-├── .claude/                     # Claude Code configuration
-│   ├── commands/                # Workflow commands
-│   └── rules/                   # Coding standards (auto-loaded)
-├── CLAUDE.md                    # This file (parent)
-└── CONTINUITY.md                # Session state
+│   ├── decisions/           # Architectural decisions (e.g., which-version-to-keep.md)
+│   ├── plans/               # Design + implementation plans
+│   ├── prds/                # PRDs + discussion logs
+│   ├── runbooks/            # Operational runbooks (vm-setup, disaster-recovery, ib-gateway)
+│   ├── architecture/        # Platform overview + module maps
+│   ├── solutions/           # Post-incident knowledge base
+│   ├── research/            # Pre-implementation research briefs
+│   ├── CHANGELOG.md
+│   ├── nautilus-reference.md    # Full NautilusTrader reference
+│   └── nautilus-natives-audit.md
+├── tests/e2e/               # Playwright scaffold (specs currently empty)
+│   ├── fixtures/
+│   ├── specs/
+│   └── use-cases/
+├── scripts/                 # Operator-invokable scripts (seed_market_data, parity_check, restart-workers, migrate_catalog_to_canonical, etc.)
+├── .github/workflows/       # CI
+├── .claude/                 # Claude Code configuration (hooks, rules, commands, skills)
+├── playwright.config.ts     # Default baseURL http://localhost:3300
+├── docker-compose.dev.yml   # Ports: 3300, 8800, 5433, 6380
+├── docker-compose.prod.yml
+├── CLAUDE.md                # This file
+├── CONTINUITY.md            # Session state
+└── README.md
 ```
 
 ### Key Commands
 
 ```bash
-# Claude version
-cd claude-version/backend && uv run pytest tests/ -v       # 153 tests
-cd claude-version/frontend && pnpm build                    # Build check
-cd claude-version && docker compose -f docker-compose.dev.yml up -d
+# Backend development
+cd backend && uv run pytest tests/ -v
+cd backend && uv run ruff check src/
+cd backend && uv run mypy src/ --strict
+cd backend && uv run uvicorn msai.main:app --reload   # Dev server on :8000 (Docker maps to :8800)
 
-# Codex version
-cd codex-version/backend && uv run pytest tests/ -v         # Tests
-cd codex-version/frontend && pnpm build                     # Build check
-cd codex-version && docker compose -f docker-compose.dev.yml up -d
+# Frontend development
+cd frontend && pnpm dev                               # Dev server on :3000 (Docker maps to :3300)
+cd frontend && pnpm build
+cd frontend && pnpm lint
 
-# Run both simultaneously
-cd claude-version && docker compose -f docker-compose.dev.yml up -d
-cd codex-version && docker compose -f docker-compose.dev.yml up -d
+# Docker dev (preferred — hot reload via volume mounts)
+docker compose -f docker-compose.dev.yml up -d
+docker compose -f docker-compose.dev.yml logs -f
+docker compose -f docker-compose.dev.yml down
+
+# Docker prod
+docker compose -f docker-compose.prod.yml up -d
+
+# CLI tools (msai is organized as sub-apps: live, strategy, backtest, research,
+# graduation, portfolio, account, system, instruments; plus top-level ingest,
+# ingest-daily, data-status, health)
+cd backend && uv run msai ingest stocks AAPL,MSFT 2024-01-01 2025-01-01   # positional: asset symbols start end
+cd backend && uv run msai data-status
+cd backend && uv run msai live status
+cd backend && uv run msai live kill-all
+cd backend && uv run msai instruments refresh --symbols AAPL,ES --provider interactive_brokers
+
+# Database migrations
+cd backend && uv run alembic upgrade head
+cd backend && uv run alembic revision --autogenerate -m "description"
+
+# Worker stale-import refresh (after merges touching src/msai/{services,workers,live_supervisor})
+./scripts/restart-workers.sh
+./scripts/restart-workers.sh --with-broker   # also restart live-supervisor + ib-gateway
 ```
+
+### API Endpoints
+
+```
+/health                              # Liveness probe (unauthenticated)
+/ready                               # Readiness probe (unauthenticated)
+/api/v1/auth/me                      # GET  Current user from JWT
+/api/v1/auth/logout                  # POST Placeholder logout
+/api/v1/strategies/                  # GET/PATCH/DELETE  Strategy registry
+/api/v1/strategies/{id}/validate     # POST Validate strategy loads
+/api/v1/backtests/run                # POST Start backtest (arq job)
+/api/v1/backtests/{id}/status        # GET  Poll job status
+/api/v1/backtests/{id}/results       # GET  Metrics + trade log
+/api/v1/backtests/{id}/report        # GET  Download QuantStats HTML
+/api/v1/backtests/history            # GET  List past backtests
+/api/v1/live/start-portfolio         # POST Deploy portfolio revision (risk-validated)
+/api/v1/live/stop                    # POST Stop deployment
+/api/v1/live/kill-all                # POST Emergency halt all
+/api/v1/live/status                  # GET  All deployments
+/api/v1/live/positions               # GET  Open positions
+/api/v1/live/trades                  # GET  Recent executions
+/api/v1/live/stream/{deployment_id}  # WS   Real-time updates (JWT first-message auth)
+/api/v1/live-portfolios/             # GET/POST/PATCH Portfolio CRUD + revision lifecycle
+/api/v1/market-data/bars/{symbol}    # GET  OHLCV bars from Parquet via DuckDB
+/api/v1/market-data/symbols          # GET  Available symbols
+/api/v1/market-data/status           # GET  Storage stats
+/api/v1/market-data/ingest           # POST Trigger data download (arq job)
+/api/v1/account/summary              # GET  IB account data
+/api/v1/account/portfolio            # GET  IB positions
+/api/v1/account/health               # GET  IB Gateway status
+/api/v1/alerts/                      # GET  Recent alert history
+```
+
+All endpoints except `/health` and `/ready` require Azure Entra ID JWT authentication.
+
+---
+
+## Architecture Notes
+
+### Data Flow
+
+- **Historical data**: Polygon/Databento → Python ingestion → atomic Parquet writes → `{DATA_ROOT}/parquet/{asset_class}/{symbol}/{YYYY}/{MM}.parquet`
+- **Backtesting**: FastAPI → arq queue → backtest worker → NautilusTrader BacktestRunner → QuantStats report → results in PostgreSQL
+- **Live trading**: FastAPI → risk engine validation → `live_supervisor` spawns TradingNode subprocess → NautilusTrader → IB Gateway. Supervisor owns heartbeat monitor + command bus (Redis Streams + consumer groups + PEL recovery + DLQ).
+- **Dashboard queries**: Frontend → FastAPI → DuckDB (in-memory, reads Parquet) → JSON response
+
+### Key Design Decisions
+
+- `DATA_ROOT` env var controls all Parquet/report paths (Docker: `/app/data`, local: `./data`)
+- Strategies are Python files in `strategies/` dir (no UI uploads in Phase 1 — git-only)
+- `strategy_code_hash` (SHA256) stored on every backtest/deployment for reproducibility
+- Data lineage on Backtest (nautilus_version, python_version, data_snapshot)
+- arq (not multiprocessing) for job queue — handles retry, timeout, dead-letter
+- PyJWT for backend JWT validation (NOT MSAL — MSAL is frontend only)
+- Backend accepts `X-API-Key` header as alternative to Bearer JWT (dev/CLI/testing via `MSAI_API_KEY` env)
+- Risk engine validates before every live deployment start; 4-layer kill-all (Redis halt flag + supervisor re-check + push-stop + SIGTERM+flatten)
+- Trade dedup via partial unique index on `(deployment_id, broker_trade_id) WHERE broker_trade_id IS NOT NULL` — idempotent reconciliation replay
+- WebSocket auth: first message must be JWT token within 5 seconds; reconnect hydrates orders/trades/status/risk_halt from DB
+
+### Portfolio-per-account
+
+Live deployments sit under a `LivePortfolio → LivePortfolioRevision → LiveDeployment` chain. Revisions are immutable once frozen. Multi-strategy TradingNode via `TradingNodeConfig.strategies=[N ImportableStrategyConfigs]`. `FailureIsolatedStrategy` base class wraps event handlers via `__init_subclass__` so one strategy crashing doesn't kill the node.
+
+### Instrument Registry (2026-04-17 / PR #32 + #35)
+
+Tables `instrument_definitions` + `instrument_aliases` hold control-plane metadata for instrument resolution. UUID-keyed with effective-date windowing on aliases for futures rolls. `SecurityMaster.resolve_for_backtest` honors `start` kwarg for historical alias windowing. `msai instruments refresh --provider interactive_brokers` CLI warms the registry via IB qualification.
+
+**Deferred follow-ups** (see CONTINUITY):
+
+- Live-path wiring onto registry (currently `/live/start-portfolio` uses closed-universe `canonical_instrument_id()`)
+- `instrument_cache` → registry migration
+- Strategy config-schema extraction for UI form generation
+
+### Environment Variables
+
+```
+DATABASE_URL=postgresql+asyncpg://msai:password@postgres:5432/msai
+REDIS_URL=redis://redis:6379
+DATA_ROOT=/app/data
+ENVIRONMENT=development|production
+MSAI_API_KEY=msai-dev-key               # Alternative to Bearer JWT for dev/CLI/testing
+AZURE_TENANT_ID=your-tenant-id
+AZURE_CLIENT_ID=your-client-id
+JWT_TENANT_ID=your-tenant-id
+JWT_CLIENT_ID=your-client-id
+CORS_ORIGINS=["http://localhost:3000"]
+POLYGON_API_KEY=your-key
+DATABENTO_API_KEY=your-key
+IB_GATEWAY_HOST=ib-gateway
+IB_GATEWAY_PORT_PAPER=4002
+IB_GATEWAY_PORT_LIVE=4001
+IB_ACCOUNT_ID=DU...                     # paper; real money starts with U
+```
+
+### Revival of archived implementation (if ever needed)
+
+Everything in the archived parallel implementation at the time of deletion is preserved at git tag `codex-final`:
+
+```bash
+git checkout codex-final -- <path-inside-codex-version>
+```
+
+No active work relies on it.
 
 ---
 
@@ -106,35 +246,35 @@ cd codex-version && docker compose -f docker-compose.dev.yml up -d
 
 **interface_type:** `fullstack` — MSAI v2 exposes an HTTP API (primary) and a Next.js UI (secondary). Per the project ordering rule ("API-first, CLI-second, UI-third"), the `verify-e2e` agent MUST test the API surface first, then the UI. An API failure means the contract/state is broken — stop immediately and diagnose; do not proceed to UI checks.
 
-**Which version to target.** Every E2E run declares exactly one target: `claude`, `codex`, or `both`. When use cases must be verified against both, run them sequentially (claude first, then codex) and produce one report per target. Never point a single run at mixed ports.
-
 **Server URLs:**
 
-| Target | API base URL            | UI base URL             | Postgres         | Redis            |
-| ------ | ----------------------- | ----------------------- | ---------------- | ---------------- |
-| claude | `http://localhost:8800` | `http://localhost:3300` | `localhost:5433` | `localhost:6380` |
-| codex  | `http://localhost:8400` | `http://localhost:3400` | `localhost:5434` | `localhost:6381` |
+| Surface    | URL                     |
+| ---------- | ----------------------- |
+| API base   | `http://localhost:8800` |
+| UI base    | `http://localhost:3300` |
+| PostgreSQL | `localhost:5433`        |
+| Redis      | `localhost:6380`        |
 
 All API routes are versioned under `/api/v1/` (see `.claude/rules/api-design.md`). Health: `GET /health`.
 
 **Pre-flight (before any E2E run):**
 
-1. `curl -sf $API/health` on the target — if it fails, start the stack from the version directory: `cd {claude,codex}-version && docker compose -f docker-compose.dev.yml up -d`.
-2. Confirm the UI responds at the target port (only if UI use cases are in scope).
+1. `curl -sf http://localhost:8800/health` — if it fails, start the stack: `docker compose -f docker-compose.dev.yml up -d`.
+2. Confirm the UI responds at `http://localhost:3300` (only if UI use cases are in scope).
 3. For live-trading use cases: confirm IB Gateway is reachable (paper account `DU...` on port 4002, live account on 4001) — see `.claude/rules/nautilus.md` gotcha #6.
 
 **Auth.** The app uses Azure Entra ID (MSAL on the frontend, PyJWT on the backend). E2E runs should authenticate via the documented login flow OR use a dev-mode bypass token if one is configured — never by forging JWTs or reading secrets from disk.
 
 **ARRANGE (test setup) is allowed via any user-accessible interface:**
 
-- Public API: `POST /api/v1/strategies`, `POST /api/v1/backtests`, `POST /api/v1/live/start`, etc.
-- CLI scripts exposed in each version's `backend/` (treat as documented commands only).
+- Public API: `POST /api/v1/backtests/run`, `POST /api/v1/live/start-portfolio`, `POST /api/v1/live-portfolios/`, etc. Note: strategies are registered from the filesystem via git, not created through the API (Phase 1 decision — no UI uploads).
+- CLI scripts exposed under `backend/` (treat as documented commands only).
 - The dev seed/bootstrap scripts if present.
 
 **ARRANGE is NOT allowed via:**
 
-- Direct Postgres queries against `localhost:5433` / `localhost:5434`
-- Writing Parquet files into `claude-version/data/` or `codex-version/data/` by hand
+- Direct Postgres queries against `localhost:5433`
+- Writing Parquet files into `data/` by hand
 - Pushing into Redis queues directly
 - Reading environment secrets to mint tokens
 
@@ -154,19 +294,18 @@ See `.claude/rules/testing.md` for the full use-case lifecycle (draft → execut
 
 ### Playwright Framework
 
-Already scaffolded at the repo root (shared across both versions):
+Scaffolded at the repo root:
 
-- `playwright.config.ts` — `baseURL` defaults to `http://localhost:3000`; override per run with `PLAYWRIGHT_BASE_URL=http://localhost:3300` (claude UI) or `:3400` (codex UI).
-- `tests/e2e/specs/` — graduated spec files (populated via Phase 6.2c).
+- `playwright.config.ts` — `baseURL` defaults to `http://localhost:3300`. Override per run with `PLAYWRIGHT_BASE_URL=<url>`.
+- `tests/e2e/specs/` — graduated spec files (currently empty; future feature work should author specs here using `getByTestId` / role-based selectors).
 - `tests/e2e/use-cases/` — markdown use cases (draft before graduation).
 - `tests/e2e/fixtures/` — auth fixture + helpers.
 - `tests/e2e/reports/` — HTML + JSON output.
 
-Run specs locally against one target at a time:
+Run specs locally:
 
 ```bash
-PLAYWRIGHT_BASE_URL=http://localhost:3300 pnpm exec playwright test   # Claude UI
-PLAYWRIGHT_BASE_URL=http://localhost:3400 pnpm exec playwright test   # Codex UI
+pnpm exec playwright test
 ```
 
 API-only use cases don't need Playwright — the `verify-e2e` agent hits the REST endpoints directly with curl/httpx.
@@ -179,6 +318,7 @@ API-only use cases don't need Playwright — the `verify-e2e` agent hits the RES
 - Always include at least one dynamic/animated element: SVG waves, Lottie, shader gradients, or canvas particles
 - Prefer organic shapes (blobs, curves, clip-paths) over straight edges and 90-degree corners
 - Animations must respect `prefers-reduced-motion` — provide static fallbacks
+- Premium, dark-mode-first aesthetic (Linear.app / Vercel.com style). Font: Geist. Color: shadcn/ui dark theme via CSS custom properties (oklch).
 
 ## Detailed Rules
 
