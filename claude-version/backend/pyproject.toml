@@ -66,3 +66,6 @@ strict = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "ib_paper: opt-in test that requires a running paper IB Gateway (set RUN_PAPER_E2E=1)",
+]
