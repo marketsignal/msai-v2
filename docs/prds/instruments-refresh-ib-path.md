@@ -297,11 +297,11 @@ None. This PR writes to existing tables (`instrument_definitions`, `instrument_a
 
 ### Settings Additions (`core/config.py`)
 
-| Field                        | Type  | Default | Env Alias                    | Notes                                                                                                           |
-| ---------------------------- | ----- | ------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `ib_connect_timeout_seconds` | `int` | `5`     | `IB_CONNECT_TIMEOUT_SECONDS` | Wall-clock budget for the IB Gateway TCP + client-ready probe                                                   |
-| `ib_request_timeout_seconds` | `int` | `30`    | `IB_REQUEST_TIMEOUT_SECONDS` | Per-symbol qualification round-trip; `int` to match Nautilus signature                                          |
-| `ib_instrument_client_id`    | `int` | `999`   | `IB_INSTRUMENT_CLIENT_ID`    | Out-of-band reservation; must NOT collide with live-node derived IDs (100-200 range). Printed in preflight log. |
+| Field                        | Type  | Default | Env Alias                    | Notes                                                                                                                                                                                                                                                                          |
+| ---------------------------- | ----- | ------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ib_connect_timeout_seconds` | `int` | `5`     | `IB_CONNECT_TIMEOUT_SECONDS` | Wall-clock budget for the IB Gateway TCP + client-ready probe                                                                                                                                                                                                                  |
+| `ib_request_timeout_seconds` | `int` | `30`    | `IB_REQUEST_TIMEOUT_SECONDS` | Per-symbol qualification round-trip; `int` to match Nautilus signature                                                                                                                                                                                                         |
+| `ib_instrument_client_id`    | `int` | `999`   | `IB_INSTRUMENT_CLIENT_ID`    | Pragmatic default — arbitrary integer outside values operators typically set manually. Live subprocesses derive their client_id from a 31-bit hash of the deployment slug, so collision is possible but extremely unlikely. Printed in preflight log so the value is explicit. |
 
 ### Data Validation Rules
 

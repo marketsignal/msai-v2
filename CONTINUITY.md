@@ -6,11 +6,11 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field     | Value                                    |
-| --------- | ---------------------------------------- |
-| Command   | /new-feature instruments-refresh-ib-path |
-| Phase     | 3 — Design                               |
-| Next step | /superpowers:brainstorming               |
+| Field     | Value                                                                            |
+| --------- | -------------------------------------------------------------------------------- |
+| Command   | /new-feature instruments-refresh-ib-path                                         |
+| Phase     | 5 — Quality Gates + Manual Drill                                                 |
+| Next step | Phase D manual paper drill (operator + paper IB Gateway) + Phase E quality gates |
 
 ### Checklist
 
@@ -24,8 +24,8 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 - [x] Approach comparison filled (council discussion Round 2 resolved the 6 design Qs; one remaining arch question resolved via Codex second opinion)
 - [x] Contrarian gate passed — 5-advisor council fired (standalone mode via /council) with Codex chairman synthesis
 - [x] Council verdict: hybrid answers per chairman recommendation; 3 blocking objections adopted, 2 scope-creep additions overruled
-- [ ] Plan written
-- [ ] Plan review loop (0 iterations) — iterate until no P0/P1/P2
+- [x] Plan written (`docs/plans/2026-04-18-instruments-refresh-ib-path.md`)
+- [x] Plan review loop (4 iterations) — PASS. Codex iter 1: 6 P1 + 4 P2 + 2 P3. Iter 2: 1 P1 + 4 P2 + 1 P3. Iter 3: 1 P1. Iter 4: clean.
 - [ ] TDD execution complete
 - [ ] Code review loop (0 iterations) — iterate until no P0/P1/P2
 - [ ] Simplified
@@ -175,17 +175,22 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 
 ## Now
 
-- **On `main` (clean history, no active workflow).** PR #34 merged at `a992453`; continuity-clear at `1c681a0`.
-- **Dirty working tree diagnosis (2026-04-18 15:29):** `claude-codex-forge/setup.sh --with-playwright -f` was run, picking up forge PR #482 ("Playwright security + caller/agent protocol fixes"). Produced 4 dirty files:
-  - ✅ `playwright.config.ts` (new, intended — forge template)
-  - ✅ `docs/ci-templates/{e2e.yml,README.md}` (new, intended — reference CI, not auto-activated)
-  - ✅ `tests/e2e/fixtures/auth.ts` (upgraded, intended — removes `TEST_API_KEY`/localStorage bearer-token path; cookie-session only now; adds SECURITY WARNING)
-  - ❌ `docs/CHANGELOG.md` — template-stomped (96 lines of msai-v2 PR history wiped via `setup.sh -f` → `FORCE=true` branch at line 591). **Restored from HEAD this session.**
-- **Remaining dirty state:** the 3 legitimate forge PR #482 adoption changes, ready for review + commit.
+- **Active workflow:** `/new-feature instruments-refresh-ib-path` on branch `feat/instruments-refresh-ib-path` (worktree).
+- **Phase 4 batches 1-4 complete:** Phases A (foundation) + B (CLI impl) + C1 (opt-in smoke) + B4/B5 (docs) all shipped locally (9 commits on branch: 38db52b, af4f031, fe8bfbe, 52410cb, 32b63d8, 6fd2b75, be829a5, ea1bbef, cb13042, ab69af7, 3b8a782, 104a594).
+- **Docker stack restarted from worktree (2026-04-18 20:27):** containers now bind-mount the worktree's claude-version/backend/src. Backend healthy. IB Gateway mid-login cycle — waiting for paper session to settle before running the manual drill (Phase D).
 
 ## Next
 
-1. **Review + commit Playwright security bundle** (user task) — suggested: `chore(e2e): adopt claude-codex-forge PR #482 Playwright security fixes`.
-2. **Deferred PR #32 items** (pick up after commit):
-   - **Live path wiring onto registry** — `/api/v1/live/start-portfolio` still uses closed-universe `canonical_instrument_id()`. Highest strategic value; needs design pass (→ `/new-feature`).
-   - **`msai instruments refresh` for plain symbols** — Databento path works; IB path skipped.
+1. **Phase E — quality gates** (in progress): full unit suite + lint + typecheck on all changed files.
+2. **Phase F — state sync:** finalize CONTINUITY + CHANGELOG at final state.
+3. **Phase G — `/finish-branch`:** push branch, open PR, handle reviews, merge.
+
+### Phase D drill results (2026-04-18 20:30 UTC)
+
+All 5 drills pass against paper IB Gateway (DUP733213 @ ib-gateway:4004 via docker compose exec backend):
+
+- D2 happy path: exit 0 in 2.6s, AAPL → AAPL.NASDAQ, 1 def + 1 alias row written
+- D3 idempotent re-run: 1/1 counts unchanged
+- D4 gateway-down fast-fail: 7.7s exit non-zero + operator hint
+- D5 port/account mismatch: 1.3s exit non-zero, no IB attempted
+  - **`msai instruments refresh` for plain symbols** — Databento path works; IB path skipped.

@@ -145,12 +145,14 @@ ib_request_timeout_seconds: int = Field(
 ib_instrument_client_id: int = Field(
     default=999,
     validation_alias=AliasChoices("IB_INSTRUMENT_CLIENT_ID"),
-    description="Out-of-band IB client_id reserved for `msai instruments "
-                "refresh`. MUST NOT collide with live-subprocess derived IDs "
-                "(100-200 range). Surfaced in CLI help + every preflight log "
-                "so the reservation is explicit, not hidden. Nautilus gotcha "
-                "#3: concurrent clients on the same client_id silently "
-                "disconnect each other.",
+    description="Pragmatic default IB client_id for `msai instruments "
+                "refresh`. Live subprocesses derive their client_id from a "
+                "31-bit hash of the deployment slug (live_node_config.py::"
+                "_derive_client_id), so collision with 999 is mathematically "
+                "possible but extremely unlikely. Surfaced in CLI help + "
+                "every preflight log so the operator sees which id is in "
+                "use. Nautilus gotcha #3: concurrent clients on the same "
+                "client_id silently disconnect each other.",
 )
 ```
 
