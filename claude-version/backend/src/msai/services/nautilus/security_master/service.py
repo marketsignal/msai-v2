@@ -238,15 +238,22 @@ class SecurityMaster:
                 is ``None`` — construct the :class:`SecurityMaster` with
                 ``qualifier=...`` for any live-trading entrypoint.
         """
+        # Use CME-local date (America/Chicago), matching what
+        # canonical_instrument_id + build_ib_instrument_provider_config
+        # use — otherwise on late-UTC-night runs the UTC date disagrees
+        # with the exchange date and the two resolve to different
+        # quarterly contracts. Invariant test at
+        # test_live_instrument_bootstrap.py:297-310.
         from msai.services.nautilus.live_instrument_bootstrap import (
             canonical_instrument_id,
+            exchange_local_today,
         )
         from msai.services.nautilus.security_master.registry import (
             InstrumentRegistry,
         )
 
         registry = InstrumentRegistry(self._db)
-        today = datetime.now(UTC).date()
+        today = exchange_local_today()
         out: list[str] = []
         for sym in symbols:
             # Warm path A — caller passed an already-qualified dotted alias
@@ -277,7 +284,7 @@ class SecurityMaster:
                     "construct SecurityMaster with qualifier=... for live use."
                 )
             canonical = canonical_instrument_id(sym, today=today)
-            spec = self._spec_from_canonical(canonical)
+            spec = self._spec_from_canonical(canonical, today=today)
             instrument = await self.resolve(spec)  # cache-first
             alias_str = str(instrument.id)
             routing_venue = instrument.id.venue.value
@@ -519,7 +526,12 @@ class SecurityMaster:
 
         return asset_class_for_instrument_type(instrument.__class__.__name__)
 
-    def _spec_from_canonical(self, canonical: str) -> InstrumentSpec:
+    def _spec_from_canonical(
+        self,
+        canonical: str,
+        *,
+        today: date | None = None,
+    ) -> InstrumentSpec:
         """Parse an already-resolved canonical alias string into an
         :class:`InstrumentSpec` for downstream :meth:`resolve`.
 
@@ -531,6 +543,11 @@ class SecurityMaster:
         - ``SPY.ARCA`` → equity / ARCA
         - ``EUR/USD.IDEALPRO`` → forex / IDEALPRO
         - ``ESM6.CME`` (or similar) → future / CME
+          ``today`` is used to compute the third-Friday expiry. Without
+          it the spec has ``expiry=None`` and ``IBQualifier`` maps it
+          to ``CONTFUT`` — IB Gateway then returns the continuous
+          placeholder, not the concrete front-month. Plan-review iter
+          1 P1 fix.
 
         Raises:
             ValueError: On an unknown venue suffix — callers should
@@ -553,7 +570,37 @@ class SecurityMaster:
                 currency=quote or "USD",
             )
         if venue == "CME":
-            return InstrumentSpec(asset_class="future", symbol=symbol, venue="CME")
+            # Import locally to avoid a security_master →
+            # live_instrument_bootstrap cycle at module import time.
+            from datetime import timedelta
+
+            from msai.services.nautilus.live_instrument_bootstrap import (
+                _current_quarterly_expiry,
+                exchange_local_today,
+            )
+
+            if today is None:
+                today = exchange_local_today()
+            # Incoming symbol is the local-symbol form ("ESM6") — root
+            # + 1-char month code + 1-digit year. InstrumentSpec
+            # RECOMPUTES that suffix from expiry, so passing "ESM6" +
+            # expiry would yield "ESM6M6.CME". Strip to the root.
+            root = symbol[:-2]
+            # _current_quarterly_expiry returns YYYYMM (month precision).
+            # Compute the third-Friday date so spec_to_ib_contract emits
+            # the yyyyMMdd IB expects.
+            expiry_str = _current_quarterly_expiry(today)  # YYYYMM
+            year = int(expiry_str[0:4])
+            month = int(expiry_str[4:6])
+            first_of_month = date(year, month, 1)
+            first_friday_offset = (4 - first_of_month.weekday()) % 7
+            third_friday = first_of_month + timedelta(days=first_friday_offset + 14)
+            return InstrumentSpec(
+                asset_class="future",
+                symbol=root,
+                venue="CME",
+                expiry=third_friday,
+            )
         raise ValueError(
             f"Unknown venue {venue!r} in canonical {canonical!r} — extend "
             "SecurityMaster._spec_from_canonical for new venues."

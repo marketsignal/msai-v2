@@ -343,3 +343,72 @@ async def test_resolve_for_live_closes_prior_active_alias_on_new_insert(
             .all()
         )
         assert active_count == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_live_es_routes_through_fixed_month_future(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Regression (plan-review iter 1 P1, iter 2/3/4 refined): resolving
+    ES through ``resolve_for_live``'s cold path must build a FUT spec
+    with expiry — NOT a CONTFUT spec (expiry=None), and NOT an
+    ESM6-rooted spec that would double-encode the month via
+    ``InstrumentSpec.canonical_id`` (producing "ESM6M6.CME").
+
+    Asserts:
+      (a) expiry set on the spec (rules out CONTFUT)
+      (b) root symbol 'ES' (not 'ESM6' — rules out duplicate-month bug)
+      (c) asset_class + venue are future/CME (full roundtrip shape).
+
+    Uses the same mock shape as
+    ``test_resolve_for_live_cold_miss_calls_ib_and_upserts``.
+    """
+    async with session_factory() as session:
+        captured_specs: list = []
+
+        fake_instrument = MagicMock()
+        fake_instrument.id = MagicMock()
+        fake_instrument.id.__str__ = MagicMock(return_value="ESM6.CME")
+        fake_instrument.id.venue.value = "CME"
+        fake_instrument.raw_symbol.value = "ES"
+        fake_instrument.__class__.__name__ = "FuturesContract"
+        fake_instrument.to_dict = MagicMock(
+            return_value={
+                "type": "FuturesContract",
+                "instrument_id": "ESM6.CME",
+                "raw_symbol": "ES",
+            }
+        )
+
+        async def _capture_and_return(spec):
+            captured_specs.append(spec)
+            return fake_instrument
+
+        mock_qualifier = MagicMock()
+        mock_qualifier.qualify = AsyncMock(side_effect=_capture_and_return)
+
+        mock_provider = MagicMock()
+        fake_details = MagicMock()
+        fake_details.contract.primaryExchange = "CME"
+        mock_provider.contract_details = {fake_instrument.id: fake_details}
+        mock_qualifier._provider = mock_provider
+
+        sm = SecurityMaster(qualifier=mock_qualifier, db=session)
+
+        # Act
+        ids = await sm.resolve_for_live(["ES"])
+
+        # Assert — return value shape
+        assert len(ids) == 1
+
+        # Assert — the spec the qualifier got
+        assert len(captured_specs) == 1
+        spec = captured_specs[0]
+        assert spec.asset_class == "future"
+        assert spec.venue == "CME"
+        assert spec.expiry is not None, "gotcha: no expiry → maps to CONTFUT"
+        assert spec.symbol == "ES", (
+            f"must be root 'ES', not local-symbol 'ESM6' — otherwise "
+            f"InstrumentSpec.canonical_id produces 'ESM6M6.CME'. "
+            f"Got: {spec.symbol!r}"
+        )
