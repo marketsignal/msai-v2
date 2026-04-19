@@ -241,9 +241,7 @@ async def test_resolve_for_live_concurrent_cold_miss_is_race_safe(
         rows = (
             (
                 await session.execute(
-                    select(InstrumentDefinition).where(
-                        InstrumentDefinition.raw_symbol == "MSFT"
-                    )
+                    select(InstrumentDefinition).where(InstrumentDefinition.raw_symbol == "MSFT")
                 )
             )
             .scalars()
@@ -412,3 +410,86 @@ async def test_resolve_for_live_es_routes_through_fixed_month_future(
             f"InstrumentSpec.canonical_id produces 'ESM6M6.CME'. "
             f"Got: {spec.symbol!r}"
         )
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_live_warm_raw_symbol_falls_through_on_stale_alias(
+    session_factory: async_sessionmaker[async_sessionmaker[AsyncSession] | AsyncSession],  # type: ignore[type-arg]
+) -> None:
+    """Regression (iter-7 P1): if the registry has an active ES alias
+    pointing at an old front month (e.g. ``ESM6.CME`` after the June
+    expiry), a bare-ticker refresh (``msai instruments refresh
+    --symbols ES``) must NOT return that stale alias. Instead the
+    warm-B path recomputes today's canonical, sees it differs, and
+    falls through to the cold path to re-qualify + close-and-open.
+    """
+    async with session_factory() as session:
+        # Arrange: seed the registry with a STALE active ES alias.
+        # We store ``ESH1.CME`` (March 2021) which is guaranteed to
+        # differ from whatever today's front month is.
+        idef = InstrumentDefinition(
+            raw_symbol="ES",
+            listing_venue="CME",
+            routing_venue="CME",
+            asset_class="futures",
+            provider="interactive_brokers",
+            lifecycle_state="active",
+        )
+        session.add(idef)
+        await session.flush()
+        session.add(
+            InstrumentAlias(
+                instrument_uid=idef.instrument_uid,
+                alias_string="ESH1.CME",  # deliberately stale
+                venue_format="exchange_name",
+                provider="interactive_brokers",
+                effective_from=date(2021, 1, 1),
+            )
+        )
+        await session.commit()
+
+        # Stub qualifier: if warm path B returned the stale alias,
+        # the cold path wouldn't fire and qualify wouldn't be called.
+        # If the cold path DID fire, qualify IS called — which is
+        # what we assert below.
+        from unittest.mock import AsyncMock, MagicMock
+
+        fake_instrument = MagicMock()
+        fake_instrument.id = MagicMock()
+        today_canonical = None
+        try:
+            from msai.services.nautilus.live_instrument_bootstrap import (
+                canonical_instrument_id,
+            )
+
+            today_canonical = canonical_instrument_id("ES")
+        except Exception:  # pragma: no cover — sanity
+            today_canonical = "ESM6.CME"
+        fake_instrument.id.__str__ = MagicMock(return_value=today_canonical)
+        fake_instrument.id.venue.value = "CME"
+        fake_instrument.raw_symbol.value = "ES"
+        fake_instrument.__class__.__name__ = "FuturesContract"
+        fake_instrument.to_dict = MagicMock(
+            return_value={
+                "type": "FuturesContract",
+                "instrument_id": today_canonical,
+                "raw_symbol": "ES",
+            }
+        )
+
+        mock_qualifier = MagicMock()
+        mock_qualifier.qualify = AsyncMock(return_value=fake_instrument)
+
+        mock_provider = MagicMock()
+        fake_details = MagicMock()
+        fake_details.contract.primaryExchange = "CME"
+        mock_provider.contract_details = {fake_instrument.id: fake_details}
+        mock_qualifier._provider = mock_provider
+
+        sm = SecurityMaster(qualifier=mock_qualifier, db=session)
+        resolved = await sm.resolve_for_live(["ES"])
+
+        # Cold path MUST have fired — qualify was called.
+        mock_qualifier.qualify.assert_awaited()
+        # And the result must be today's canonical (not the stale stored alias).
+        assert resolved == [today_canonical]

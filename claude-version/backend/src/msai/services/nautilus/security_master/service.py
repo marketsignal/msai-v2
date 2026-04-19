@@ -261,13 +261,22 @@ class SecurityMaster:
                 if idef is not None:
                     out.append(sym)
                     continue
-            # Warm path B — caller passed a bare ticker, resolve to active alias
+            # Warm path B — caller passed a bare ticker, resolve to active alias.
+            # For symbols with a roll date (ES), the stored active alias may be
+            # stale after a quarterly roll. Recompute today's canonical and
+            # fall through to cold path if it differs so the re-qualify +
+            # upsert closes the old alias and opens the new one.
             idef = await registry.find_by_raw_symbol(sym, provider="interactive_brokers")
             if idef is not None:
                 active_alias = next((a for a in idef.aliases if a.effective_to is None), None)
                 if active_alias is not None:
-                    out.append(active_alias.alias_string)
-                    continue
+                    try:
+                        expected = canonical_instrument_id(sym, today=today)
+                    except ValueError:
+                        expected = None
+                    if expected is None or expected == active_alias.alias_string:
+                        out.append(active_alias.alias_string)
+                        continue
             # Cold path — delegate to existing live_instrument_bootstrap
             # front-month rollover + existing SecurityMaster.resolve(spec).
             # Reason: live_instrument_bootstrap.canonical_instrument_id(...)
@@ -649,7 +658,17 @@ class SecurityMaster:
             )
             .on_conflict_do_update(
                 constraint="uq_instrument_definitions_symbol_provider_asset",
-                set_={"refreshed_at": now},
+                # Refresh venue fields on conflict so an alias move
+                # (e.g. AAPL.NASDAQ → AAPL.ARCA) propagates to the
+                # definition row, not just the alias table. Without
+                # this, callers reading InstrumentDefinition get
+                # permanently stale venue metadata after the first
+                # venue change.
+                set_={
+                    "refreshed_at": now,
+                    "listing_venue": listing_venue,
+                    "routing_venue": routing_venue,
+                },
             )
             .returning(InstrumentDefinition.__table__.c.instrument_uid)
         )

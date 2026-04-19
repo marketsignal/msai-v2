@@ -782,7 +782,7 @@ def instruments_refresh(
         # Values are EXTRA aliases beyond {root, canonical, stable}.
         # Bare-shorthand entries (no dot) also admit the shorthand +
         # current-venue dotted form.
-        LEGACY_ALIASES_BY_ROOT: dict[str, tuple[str, ...]] = {
+        legacy_aliases_by_root: dict[str, tuple[str, ...]] = {
             "ES": ("ES.XCME",),
             "EUR/USD": ("EUR",),
         }
@@ -793,7 +793,7 @@ def instruments_refresh(
             accepted[canonical] = root
             canonical_venue = canonical.rsplit(".", 1)[1]
             accepted[f"{root}.{canonical_venue}"] = root
-            for legacy in LEGACY_ALIASES_BY_ROOT.get(root, ()):
+            for legacy in legacy_aliases_by_root.get(root, ()):
                 accepted[legacy] = root
                 if "." not in legacy:
                     accepted[f"{legacy}.{canonical_venue}"] = root
