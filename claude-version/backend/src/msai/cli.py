@@ -772,8 +772,23 @@ def instruments_refresh(
         except ValueError as exc:
             _fail(str(exc))
 
-        # TODO(Task B3): connect + qualify + teardown
-        _fail("Task B2 complete; connect+qualify not yet implemented — continue with Task B3.")
+        # Preflight 3: log the resolved tuple so operators can grep
+        # `docker logs` if anything downstream goes wrong.
+        typer.echo(
+            f"Pre-warming IB registry: host={settings.ib_host} "
+            f"port={settings.ib_port} "
+            f"account={settings.ib_account_id.strip()} "
+            f"client_id={settings.ib_instrument_client_id} "
+            f"connect_timeout={settings.ib_connect_timeout_seconds}s "
+            f"request_timeout={settings.ib_request_timeout_seconds}s"
+        )
+
+        try:
+            resolved = asyncio.run(_run_ib_resolve_for_live(symbol_list))
+        except _IBGatewayUnreachableError as exc:
+            _fail(str(exc))
+        _emit_json({"provider": provider, "resolved": resolved})
+        return
 
     if provider != "databento":
         raise typer.BadParameter(
@@ -821,6 +836,144 @@ def instruments_refresh(
     typer.echo(f"Pre-warming registry for {symbol_list} via Databento...")
     resolved = asyncio.run(_run())
     _emit_json({"provider": provider, "resolved": resolved})
+
+
+class _IBGatewayUnreachableError(RuntimeError):
+    """Raised by ``_run_ib_resolve_for_live`` when the caller-side
+    ``asyncio.wait_for`` fence on ``client._is_client_ready`` fires.
+
+    Caught at the CLI boundary and converted to ``_fail(str(exc))`` so
+    the operator sees a clear hint naming the relevant env vars and
+    the paper/live mismatch trap.
+    """
+
+
+async def _run_ib_resolve_for_live(symbol_list: list[str]) -> list[str]:
+    """Short-lived Nautilus IB client lifecycle wrapping
+    :meth:`SecurityMaster.resolve_for_live`.
+
+    Lifecycle (research-verified against NautilusTrader 1.223.0):
+
+    1. Cap the IB client's internal reconnect loop to one attempt
+       (``IB_MAX_CONNECTION_ATTEMPTS=1``) BEFORE constructing the
+       client. ``_connect`` (``connection.py:45-99``) catches all
+       exceptions and ``_start_async``'s outer ``while not
+       _is_ib_connected`` loop retries forever in the background —
+       capping attempts makes the retry loop bounded (research brief
+       finding #4).
+    2. Build MessageBus + Cache + LiveClock.
+    3. ``get_cached_ib_client(...)`` — this ALREADY calls
+       ``client.start()`` internally at construction
+       (``factories.py:122,134``). Do NOT call ``client.start()``
+       again (plan-review iter 1 P1).
+    4. Connect fence: ``asyncio.wait_for`` on
+       ``client._is_client_ready.wait()`` — the caller owns the
+       timeout. Nautilus's ``wait_until_ready``
+       (``client.py:362-376``) silently swallows ``TimeoutError`` and
+       only logs, giving a "dead gateway looks ready" false-negative
+       (research brief finding #1).
+    5. ``get_cached_interactive_brokers_instrument_provider`` → wrap
+       in the existing :class:`IBQualifier`.
+    6. ``SecurityMaster.resolve_for_live(symbols)`` + commit. Upserts
+       rows into ``instrument_definitions`` + ``instrument_aliases``.
+    7. ``try/finally`` teardown: ``await client._stop_async()``
+       DIRECTLY. The public ``client.stop()`` only schedules
+       ``_stop_async`` as a task (``client.py:275,279``) — awaiting
+       it ourselves guarantees the TCP disconnect completes before
+       the process exits (US-005: re-run within 60s without zombie
+       ``client_id`` slot). FSM state doesn't matter because we're
+       exiting immediately.
+    """
+    import os
+
+    # Finding #4 fix: cap the reconnect loop BEFORE client construction.
+    # `get_cached_ib_client` reads this env var on first call to
+    # `_start_async`; setting it AFTER construction is too late.
+    os.environ.setdefault("IB_MAX_CONNECTION_ATTEMPTS", "1")
+
+    # Import Nautilus only inside the function so the CLI module stays
+    # importable on machines without the IB extras (ruff / mypy in CI).
+    from nautilus_trader.adapters.interactive_brokers.factories import (
+        get_cached_ib_client,
+        get_cached_interactive_brokers_instrument_provider,
+    )
+    from nautilus_trader.cache.cache import Cache
+    from nautilus_trader.common.component import LiveClock, MessageBus
+    from nautilus_trader.model.identifiers import TraderId
+
+    from msai.services.nautilus.live_instrument_bootstrap import (
+        build_ib_instrument_provider_config,
+    )
+    from msai.services.nautilus.security_master.ib_qualifier import IBQualifier
+
+    clock = LiveClock()
+    trader_id = TraderId("MSAI-INSTRUMENTS-REFRESH")
+    msgbus = MessageBus(trader_id=trader_id, clock=clock)
+    cache = Cache()
+
+    client = get_cached_ib_client(
+        loop=asyncio.get_running_loop(),
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+        host=settings.ib_host,
+        port=settings.ib_port,
+        client_id=settings.ib_instrument_client_id,
+        request_timeout_secs=settings.ib_request_timeout_seconds,
+    )
+    # NOTE: get_cached_ib_client ALREADY calls client.start() internally
+    # (nautilus_trader/adapters/interactive_brokers/factories.py:122,134).
+    # DO NOT call client.start() here — it would schedule a second
+    # _start_async task, racing the first.
+
+    try:
+        # Caller-side timeout fence — bypasses `wait_until_ready`
+        # which swallows TimeoutError (research brief finding #1).
+        try:
+            await asyncio.wait_for(
+                client._is_client_ready.wait(),
+                timeout=settings.ib_connect_timeout_seconds,
+            )
+        except TimeoutError as exc:
+            raise _IBGatewayUnreachableError(
+                f"IB Gateway not reachable at {settings.ib_host}:"
+                f"{settings.ib_port} within "
+                f"{settings.ib_connect_timeout_seconds}s. Check: "
+                f"(a) gateway container running, "
+                f"(b) IB_PORT matches IB_ACCOUNT_ID prefix "
+                f"(DU/DF* → paper 4002/4004, U* → live 4001/4003), "
+                f"(c) IB_INSTRUMENT_CLIENT_ID={settings.ib_instrument_client_id} "
+                f"not colliding with an active subprocess."
+            ) from exc
+
+        provider_cfg = build_ib_instrument_provider_config(symbol_list)
+        provider = get_cached_interactive_brokers_instrument_provider(
+            client=client,
+            clock=clock,
+            config=provider_cfg,
+        )
+        qualifier = IBQualifier(provider)
+
+        async with async_session_factory() as session:
+            sm = SecurityMaster(qualifier=qualifier, db=session)
+            try:
+                resolved = await sm.resolve_for_live(symbol_list)
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+
+        return resolved
+    finally:
+        # Plan-review iter 1 P1 (#6): await `_stop_async` DIRECTLY.
+        # `client.stop()` would schedule it as a task (client.py:275,
+        # 279) — if we then also awaited it we'd run the coroutine
+        # twice. Going direct sidesteps the race and the FSM state
+        # doesn't matter because the process exits immediately after.
+        try:
+            await client._stop_async()
+        except Exception:  # pragma: no cover — best-effort teardown
+            log.warning("ib_refresh_teardown_error", exc_info=True)
 
 
 if __name__ == "__main__":

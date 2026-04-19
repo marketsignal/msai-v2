@@ -222,3 +222,169 @@ def test_ib_provider_rejects_port_account_mismatch(
     combined = (result.stderr or "") + (result.stdout or "") + result.output
     assert "4001" in combined
     assert "DU1234567" in combined
+
+
+@pytest.fixture
+def _ib_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Env setup for IB branch tests. Patches `msai.cli.settings`
+    directly — see monkeypatch pattern note on
+    test_ib_provider_rejects_port_account_mismatch."""
+    import msai.cli as cli_mod
+    from msai.core.config import Settings
+
+    monkeypatch.setenv("IB_PORT", "4002")
+    monkeypatch.setenv("IB_ACCOUNT_ID", "DU1234567")
+    monkeypatch.setenv("IB_HOST", "127.0.0.1")
+    monkeypatch.setenv("IB_CONNECT_TIMEOUT_SECONDS", "5")
+    monkeypatch.setenv("IB_REQUEST_TIMEOUT_SECONDS", "30")
+    monkeypatch.setenv("IB_INSTRUMENT_CLIENT_ID", "999")
+    monkeypatch.setattr(cli_mod, "settings", Settings())
+
+
+def test_ib_provider_happy_path_calls_factory_and_resolve(
+    _ib_env: None, runner: CliRunner,
+) -> None:
+    """AAPL qualifies via the mocked factory chain + IBQualifier, then
+    SecurityMaster.resolve_for_live commits. Exit 0. Asserts:
+    - CORRECT factory kwargs (host, port, client_id, request_timeout_secs)
+    - client.start() is NOT called (factory already starts the client)
+    - client.stop() is NOT called (we await _stop_async directly)
+    - _stop_async IS awaited in finally (even on failure).
+    """
+    # Mock the factory chain
+    mock_client = MagicMock()
+    mock_client._is_client_ready = MagicMock()
+    mock_client._is_client_ready.wait = AsyncMock(return_value=None)
+    mock_client.start = MagicMock()
+    mock_client.stop = MagicMock()
+    mock_client._stop_async = AsyncMock(return_value=None)
+
+    mock_provider = MagicMock()
+
+    mock_get_client = MagicMock(return_value=mock_client)
+    mock_get_provider = MagicMock(return_value=mock_provider)
+
+    # Mock SecurityMaster.resolve_for_live so the test doesn't hit a DB.
+    async def _fake_resolve(self, symbols: list[str]) -> list[str]:
+        return [f"{s}.NASDAQ" for s in symbols]
+
+    fake_session = MagicMock()
+    fake_session.commit = AsyncMock()
+    fake_session.rollback = AsyncMock()
+    fake_session_cm = MagicMock()
+    fake_session_cm.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "nautilus_trader.adapters.interactive_brokers.factories.get_cached_ib_client",
+            mock_get_client,
+        ),
+        patch(
+            "nautilus_trader.adapters.interactive_brokers.factories."
+            "get_cached_interactive_brokers_instrument_provider",
+            mock_get_provider,
+        ),
+        patch(
+            "msai.services.nautilus.security_master.service.SecurityMaster.resolve_for_live",
+            _fake_resolve,
+        ),
+        patch("msai.cli.async_session_factory", return_value=fake_session_cm),
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "instruments",
+                "refresh",
+                "--symbols",
+                "AAPL",
+                "--provider",
+                "interactive_brokers",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "AAPL" in result.output
+
+    # --- Factory kwargs correctness ---
+    assert mock_get_client.called
+    kwargs = mock_get_client.call_args.kwargs
+    assert kwargs["host"] == "127.0.0.1"
+    assert kwargs["port"] == 4002
+    assert kwargs["client_id"] == 999
+    assert kwargs["request_timeout_secs"] == 30
+
+    # --- Lifecycle correctness (Codex plan-review iter 1 P1s) ---
+    # Factory already calls client.start() internally; CLI must NOT call it.
+    mock_client.start.assert_not_called()
+    # Public stop() only schedules the async stop; CLI must NOT call it.
+    mock_client.stop.assert_not_called()
+    # _stop_async MUST have been awaited directly.
+    mock_client._stop_async.assert_awaited_once()
+
+
+def test_ib_provider_dead_gateway_times_out_with_operator_hint(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner,
+) -> None:
+    """When the IB client never reaches ready state, CLI times out in
+    the short connect-timeout window, prints an operator hint naming
+    all relevant env vars, and still awaits _stop_async in teardown."""
+    import asyncio
+
+    import msai.cli as cli_mod
+    from msai.core.config import Settings
+
+    # 1s connect timeout for fast test; paper env so preflight passes.
+    monkeypatch.setenv("IB_PORT", "4002")
+    monkeypatch.setenv("IB_ACCOUNT_ID", "DU1234567")
+    monkeypatch.setenv("IB_HOST", "127.0.0.1")
+    monkeypatch.setenv("IB_CONNECT_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("IB_REQUEST_TIMEOUT_SECONDS", "30")
+    monkeypatch.setenv("IB_INSTRUMENT_CLIENT_ID", "999")
+    monkeypatch.setattr(cli_mod, "settings", Settings())
+
+    mock_client = MagicMock()
+
+    async def _never() -> None:
+        await asyncio.sleep(3600)
+
+    mock_client._is_client_ready = MagicMock()
+    mock_client._is_client_ready.wait = _never
+    mock_client.start = MagicMock()
+    mock_client.stop = MagicMock()
+    mock_client._stop_async = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "nautilus_trader.adapters.interactive_brokers.factories.get_cached_ib_client",
+            return_value=mock_client,
+        ),
+        patch(
+            "nautilus_trader.adapters.interactive_brokers.factories."
+            "get_cached_interactive_brokers_instrument_provider",
+            return_value=MagicMock(),
+        ),
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "instruments",
+                "refresh",
+                "--symbols",
+                "AAPL",
+                "--provider",
+                "interactive_brokers",
+            ],
+        )
+
+    assert result.exit_code != 0
+    combined = (result.stderr or "") + (result.stdout or "") + result.output
+    # Operator hint names all 4 env vars (either by name or by value).
+    assert "IB_HOST" in combined or "127.0.0.1" in combined
+    assert "IB_PORT" in combined or "4002" in combined
+    assert "IB_ACCOUNT_ID" in combined or "DU1234567" in combined
+    assert "IB_INSTRUMENT_CLIENT_ID" in combined or "999" in combined
+    # Teardown still ran — _stop_async awaited even on timeout.
+    mock_client._stop_async.assert_awaited_once()
+    # stop() must NOT have been called (avoids double _stop_async).
+    mock_client.stop.assert_not_called()
