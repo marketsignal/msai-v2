@@ -698,8 +698,11 @@ def instruments_refresh(
         "databento",
         "--provider",
         help=(
-            "Provider to pre-warm: ``databento`` (supported) or "
-            "``interactive_brokers`` (deferred to follow-up PR)."
+            "Provider to pre-warm: ``databento`` (Parquet ``.Z.N`` "
+            "continuous futures via DatabentoClient) or "
+            "``interactive_brokers`` (short-lived IB Gateway client; "
+            "uses ``IB_INSTRUMENT_CLIENT_ID=999`` by default — see "
+            "nautilus.md gotcha #3 for the collision contract)."
         ),
     ),
     start: str = typer.Option(
@@ -721,20 +724,33 @@ def instruments_refresh(
     """Pre-warm the instrument registry so later deployments never hit a
     cold-miss at bar-event time.
 
-    This is the PRD §47-48 pre-warm tool.  Operators run it before
+    This is the PRD §47-48 pre-warm tool. Operators run it before
     deploying a new strategy so:
 
     * Backtest resolve (:meth:`SecurityMaster.resolve_for_backtest`)
-      succeeds on the ``.Z.N`` continuous-futures path by downloading the
-      Databento ``definition`` payload and upserting the registry row.
+      succeeds on the ``.Z.N`` continuous-futures path by downloading
+      the Databento ``definition`` payload and upserting the registry
+      row.
     * Live resolve (:meth:`SecurityMaster.resolve_for_live`) — for
-      ``--provider interactive_brokers`` — is **deferred to a follow-up
-      PR** because the claude-version :class:`Settings` model does not
-      yet expose the fields required to build a short-lived
-      :class:`IBQualifier` (``ib_request_timeout_seconds``,
-      ``ib_instrument_client_id``, dual paper/live port).  Adding those
-      is out-of-scope for the registry PR; the Databento path is the
-      shipping surface.
+      ``--provider interactive_brokers`` — connects a short-lived
+      Nautilus IB client, qualifies each requested symbol against IB
+      Gateway, upserts registry rows, then disconnects. Day-1 scope
+      is the closed universe ``resolve_for_live`` supports today:
+      ``AAPL``, ``MSFT``, ``SPY``, ``EUR/USD``, ``ES``.
+
+    Settings read (for ``--provider interactive_brokers``):
+
+    * ``IB_HOST`` / ``IB_PORT`` / ``IB_ACCOUNT_ID`` — gateway target
+      (paper port 4002/4004 + ``DU*``/``DF*`` account, or live port
+      4001/4003 + non-``D`` account; gotcha #6 mismatch guard fires
+      at preflight).
+    * ``IB_CONNECT_TIMEOUT_SECONDS`` (default 5) — gateway-reachability
+      probe.
+    * ``IB_REQUEST_TIMEOUT_SECONDS`` (default 30) — per-symbol
+      qualification round-trip.
+    * ``IB_INSTRUMENT_CLIENT_ID`` (default 999) — surfaced in every
+      preflight log; see nautilus.md gotcha #3 for the collision
+      contract.
     """
     symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
     if not symbol_list:
