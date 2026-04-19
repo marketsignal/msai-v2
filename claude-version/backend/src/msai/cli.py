@@ -913,9 +913,12 @@ async def _run_ib_resolve_for_live(symbol_list: list[str]) -> list[str]:
         get_cached_ib_client,
         get_cached_interactive_brokers_instrument_provider,
     )
-    from nautilus_trader.cache.cache import Cache
-    from nautilus_trader.common.component import LiveClock, MessageBus
-    from nautilus_trader.model.identifiers import TraderId
+    from nautilus_trader.cache.cache import Cache  # type: ignore[import-not-found]
+    from nautilus_trader.common.component import (  # type: ignore[import-not-found]
+        LiveClock,
+        MessageBus,
+    )
+    from nautilus_trader.model.identifiers import TraderId  # type: ignore[import-not-found]
 
     from msai.services.nautilus.live_instrument_bootstrap import (
         build_ib_instrument_provider_config,
