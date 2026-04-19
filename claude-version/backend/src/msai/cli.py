@@ -757,9 +757,23 @@ def instruments_refresh(
                 f"live-path wiring PR (follow-up)."
             )
 
-        # TODO(Task B2): port/account validator preflight
+        # Preflight 2: port/account mode consistency (gotcha #6 guard).
+        # Runs BEFORE any IB connection so a misconfigured operator
+        # can't even burn the client_id slot trying.
+        from msai.services.nautilus.ib_port_validator import (
+            validate_port_account_consistency,
+        )
+
+        try:
+            validate_port_account_consistency(
+                settings.ib_port,
+                settings.ib_account_id,
+            )
+        except ValueError as exc:
+            _fail(str(exc))
+
         # TODO(Task B3): connect + qualify + teardown
-        _fail("Task B1 complete; connect+qualify not yet implemented — continue with Task B2.")
+        _fail("Task B2 complete; connect+qualify not yet implemented — continue with Task B3.")
 
     if provider != "databento":
         raise typer.BadParameter(

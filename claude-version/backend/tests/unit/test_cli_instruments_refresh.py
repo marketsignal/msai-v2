@@ -187,3 +187,38 @@ def test_ib_provider_rejects_unknown_symbol(runner: CliRunner) -> None:
     # Error names the unknown symbol AND the closed universe
     assert "NVDA" in combined
     assert "AAPL" in combined  # a symbol from PHASE_1_PAPER_SYMBOLS
+
+
+def test_ib_provider_rejects_port_account_mismatch(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner,
+) -> None:
+    """Preflight validator fires BEFORE any IB connection attempt when
+    IB_PORT and IB_ACCOUNT_ID disagree on paper vs live.
+
+    Patches ``msai.cli.settings`` directly — NOT
+    ``msai.core.config.settings`` — because ``cli.py`` imports
+    ``settings`` at module load, binding the local reference eagerly.
+    """
+    import msai.cli as cli_mod
+    from msai.core.config import Settings
+
+    # Live port + paper account → gotcha #6 silent misroute trap.
+    monkeypatch.setenv("IB_PORT", "4001")
+    monkeypatch.setenv("IB_ACCOUNT_ID", "DU1234567")
+    monkeypatch.setattr(cli_mod, "settings", Settings())
+
+    result = runner.invoke(
+        app,
+        [
+            "instruments",
+            "refresh",
+            "--symbols",
+            "AAPL",
+            "--provider",
+            "interactive_brokers",
+        ],
+    )
+    assert result.exit_code != 0
+    combined = (result.stderr or "") + (result.stdout or "") + result.output
+    assert "4001" in combined
+    assert "DU1234567" in combined
