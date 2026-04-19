@@ -139,23 +139,19 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 
 ## Now
 
-- **Active workflow:** `/new-feature instruments-refresh-ib-path` on branch `feat/instruments-refresh-ib-path` (worktree); pushed to origin (17+ commits ahead of main).
-- **Code review loop — iter 3 mid-investigation (22:41 UTC).** Iter 1 found 1 Codex P2 (dotted symbols) + 1 simplify P2 (third_friday dedup) + 4 P1 / 3 P2 comment-quality; fixed in `eaaa446`. Iter 2 surfaced 1 more P2 — the dotted-alias strip didn't handle month-qualified futures like `ESM6.CME`; fixed in `1a9a751` with parametrized test across 4 alias shapes. Iter 3 Codex review running (~134 lines into investigation).
-- **Phase D paper drill PASSED** (2026-04-18 20:30 UTC) — all 5 drills green against paper IB Gateway DUP733213.
-- **Feedback memory saved:** `feedback_code_review_iteration_discipline.md` — user enforces plan-review-style iteration discipline on the code-review loop; re-run reviewers on each fix commit before pushing/PR.
+- **On `main` clean** at `c6b42bb`. PR #35 (msai instruments refresh --provider interactive_brokers) merged 2026-04-19 06:04 UTC; worktree + local/remote branch cleaned up; dev stack restarted from main (backend healthy at :8800).
+- No active workflow. Feedback memory saved mid-session: `feedback_code_review_iteration_discipline.md` (re-run reviewers on each fix commit before PR).
 
-## Next
+## Next — remaining deferred items
 
-1. **Phase E — quality gates** (in progress): full unit suite + lint + typecheck on all changed files.
-2. **Phase F — state sync:** finalize CONTINUITY + CHANGELOG at final state.
-3. **Phase G — `/finish-branch`:** push branch, open PR, handle reviews, merge.
+From PR #32 ("db-backed-strategy-registry") + PR #35 scope-outs:
 
-### Phase D drill results (2026-04-18 20:30 UTC)
+1. **Live-path wiring onto registry** (highest strategic value). `/api/v1/live/start-portfolio` + live supervisor still use closed-universe `canonical_instrument_id()` instead of warm-reading `instrument_definitions` / `instrument_aliases` that PR #35 now populates. Needs a design pass — likely `/new-feature live-path-wiring-registry`. Without this, the IB refresh CLI's registry rows go unused by live flows.
+2. **`instrument_cache` → registry migration.** Legacy `instrument_cache` table coexists with the new registry, not migrated yet. Skeleton at `docs/plans/2026-04-17-db-backed-strategy-registry.md` §"InstrumentCache → Registry Migration".
+3. **Strategy config-schema extraction** for UI form generation. Skeleton at the same plan file §"Strategy Config Schema Extraction + API".
 
-All 5 drills pass against paper IB Gateway (DUP733213 @ ib-gateway:4004 via docker compose exec backend):
+### PR #35 documented known limitations (ship-blockers for future work)
 
-- D2 happy path: exit 0 in 2.6s, AAPL → AAPL.NASDAQ, 1 def + 1 alias row written
-- D3 idempotent re-run: 1/1 counts unchanged
-- D4 gateway-down fast-fail: 7.7s exit non-zero + operator hint
-- D5 port/account mismatch: 1.3s exit non-zero, no IB attempted
-  - **`msai instruments refresh` for plain symbols** — Databento path works; IB path skipped.
+- **Midnight-CT roll-day race** — preflight and `_run_ib_resolve_for_live` call `exchange_local_today()` independently; narrow window, operator-recoverable.
+- **CLI preflight doesn't accept registry-moved aliases for non-futures** — manifests only if IB qualification returned a venue the hardcoded `canonical_instrument_id` mapping doesn't match.
+- **IB path of `msai instruments refresh`** — now shipped in PR #35.
