@@ -4,6 +4,10 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### Removed
+
+- 2026-04-19: **`codex-version/` archived and deleted** (branch `feat/playwright-e2e-port`, commit `7ea2c5e`). Council verdict 2026-04-19 (`docs/decisions/which-version-to-keep.md`) chose to keep `claude-version` and delete `codex-version`. An initial attempt to port codex's 9 Playwright specs as a prerequisite for deletion was abandoned after plan-review iteration 1 found UI drift too large to port faithfully (14 of 15 codex copy strings absent from claude; e.g., `"Backtest Runner"`, `"Research Console"`, `"Interactive Brokers status"`, `"Daily Universe"`). Option C (direct delete, no port) adopted — see decision-doc postscript. **Changes:** (1) tagged pre-delete commit `e9ac08e` as `codex-final` for archival (revival via `git checkout codex-final -- codex-version/`); (2) `git rm -r codex-version/` (~17K LOC, 297 files); (3) removed 15 Feb-25 baseline screenshot PNGs at repo root (~2.4 MB, unreferenced); (4) updated root `CLAUDE.md` to reflect single-stack operation (dropped "Two Competing Implementations" table, dual-port E2E matrix, etc.); (5) retargeted `playwright.config.ts` default `baseURL` to `http://localhost:3300`; (6) updated `scripts/seed_market_data.py` usage docstring. Abandoned port plan + research preserved at `docs/plans/2026-04-19-playwright-e2e-port.md` + `docs/research/2026-04-19-playwright-e2e-port.md` as audit trail. 5-advisor council verdict preserved in `docs/decisions/` with minority report (Contrarian objection re: multi-login gateway + instrument-registry scope creep — deferred to 6-month architecture-governance review 2026-10-19).
+
 ### In progress
 
 - 2026-04-18: `msai instruments refresh --provider interactive_brokers` — completing PR #32 deferred item #2. Branch `feat/instruments-refresh-ib-path`.
