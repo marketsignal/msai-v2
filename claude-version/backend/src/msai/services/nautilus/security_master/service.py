@@ -71,6 +71,14 @@ DEFAULT_CACHE_VALIDITY_DAYS = 30
 returns the cached value AND schedules a background refresh."""
 
 
+_ROLL_SENSITIVE_ROOTS: frozenset[str] = frozenset({"ES"})
+"""Raw symbols whose canonical alias changes over time (quarterly
+futures roll). For these, ``resolve_for_live``'s warm path B compares
+the stored active alias to ``canonical_instrument_id(sym, today=today)``
+and falls through to the cold path on mismatch so the roll triggers a
+re-qualify. For non-rollable symbols the registry is authoritative."""
+
+
 class DatabentoDefinitionMissing(Exception):  # noqa: N818 — spec-mandated name (codex parity)
     """Raised by :meth:`SecurityMaster.resolve_for_backtest` when a requested
     symbol has no active registry row under the ``databento`` provider and
@@ -261,20 +269,29 @@ class SecurityMaster:
                 if idef is not None:
                     out.append(sym)
                     continue
-            # Warm path B — caller passed a bare ticker, resolve to active alias.
-            # For symbols with a roll date (ES), the stored active alias may be
-            # stale after a quarterly roll. Recompute today's canonical and
-            # fall through to cold path if it differs so the re-qualify +
-            # upsert closes the old alias and opens the new one.
+            # Warm path B — caller passed a bare ticker, resolve to
+            # active alias. For roll-sensitive symbols (futures that
+            # quarterly-roll like ES), the stored active alias may be
+            # stale after an expiry; compare against today's canonical
+            # and fall through to cold path if it differs so the
+            # re-qualify + upsert closes the old alias and opens the
+            # new one. For non-rollable symbols (AAPL/MSFT/SPY/EUR/USD)
+            # the registry IS authoritative — a legitimate alias move
+            # (e.g. AAPL.NASDAQ → AAPL.ARCA) must be honored, not
+            # reverted to canonical_instrument_id's hardcoded default.
             idef = await registry.find_by_raw_symbol(sym, provider="interactive_brokers")
             if idef is not None:
                 active_alias = next((a for a in idef.aliases if a.effective_to is None), None)
                 if active_alias is not None:
-                    try:
-                        expected = canonical_instrument_id(sym, today=today)
-                    except ValueError:
-                        expected = None
-                    if expected is None or expected == active_alias.alias_string:
+                    is_stale = False
+                    if sym in _ROLL_SENSITIVE_ROOTS:
+                        try:
+                            expected = canonical_instrument_id(sym, today=today)
+                        except ValueError:
+                            expected = None
+                        if expected is not None and expected != active_alias.alias_string:
+                            is_stale = True
+                    if not is_stale:
                         out.append(active_alias.alias_string)
                         continue
             # Cold path — delegate to existing live_instrument_bootstrap

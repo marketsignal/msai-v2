@@ -493,3 +493,50 @@ async def test_resolve_for_live_warm_raw_symbol_falls_through_on_stale_alias(
         mock_qualifier.qualify.assert_awaited()
         # And the result must be today's canonical (not the stale stored alias).
         assert resolved == [today_canonical]
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_live_warm_honors_nonrollable_alias_move(
+    session_factory: async_sessionmaker[async_sessionmaker[AsyncSession] | AsyncSession],  # type: ignore[type-arg]
+) -> None:
+    """Regression (iter-8 P1): for non-rollable symbols (AAPL/MSFT/
+    SPY/EUR/USD), the registry's active alias is authoritative — a
+    legitimate alias move (e.g. AAPL.NASDAQ → AAPL.ARCA) must be
+    returned as-is by warm path B, NOT reverted to
+    canonical_instrument_id's hardcoded default.
+
+    Otherwise warm-only callers (qualifier=None) would raise
+    'Cold-miss resolve ... requires an IBQualifier' after any venue
+    change that IB qualification returned.
+    """
+    async with session_factory() as session:
+        # Arrange: AAPL was moved to ARCA (hypothetical but plausible).
+        idef = InstrumentDefinition(
+            raw_symbol="AAPL",
+            listing_venue="ARCA",
+            routing_venue="ARCA",
+            asset_class="equity",
+            provider="interactive_brokers",
+            lifecycle_state="active",
+        )
+        session.add(idef)
+        await session.flush()
+        session.add(
+            InstrumentAlias(
+                instrument_uid=idef.instrument_uid,
+                alias_string="AAPL.ARCA",  # moved from NASDAQ
+                venue_format="exchange_name",
+                provider="interactive_brokers",
+                effective_from=date(2026, 1, 1),
+            )
+        )
+        await session.commit()
+
+        # qualifier=None — warm-only caller. Must NOT raise.
+        sm = SecurityMaster(qualifier=None, db=session)
+        resolved = await sm.resolve_for_live(["AAPL"])
+
+        assert resolved == ["AAPL.ARCA"], (
+            f"warm path B should honor the registry's active alias "
+            f"(AAPL.ARCA) for non-rollable AAPL; got {resolved!r}"
+        )
