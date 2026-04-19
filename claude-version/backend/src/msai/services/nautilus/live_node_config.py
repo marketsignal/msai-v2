@@ -58,24 +58,12 @@ from nautilus_trader.model.identifiers import TraderId
 from pydantic import BaseModel, Field
 
 from msai.core.config import settings
+from msai.services.nautilus.ib_port_validator import (
+    validate_port_account_consistency,
+)
 from msai.services.nautilus.live_instrument_bootstrap import (
     build_ib_instrument_provider_config,
 )
-
-# IB Gateway listens on:
-#   4001 — live trading
-#   4002 — paper trading
-# Both with the same wire protocol, distinguished only by which account
-# the gateway is logged into. Mismatching the port and account id is
-# the silent failure mode gotcha #6 catches.
-# Socat proxy ports used by the gnzsnz/ib-gateway-docker image.
-# The gateway's Java process listens on 127.0.0.1:4002 (paper) /
-# 127.0.0.1:4001 (live), but socat proxies them to 0.0.0.0:4004 /
-# 0.0.0.0:4003 so other containers can connect. Both raw and socat
-# ports are accepted.
-_IB_PAPER_PORTS = (4002, 4004)
-_IB_LIVE_PORTS = (4001, 4003)
-_IB_PAPER_PREFIXES = ("DU", "DF")  # IB paper-account ids: DU (standard), DF/DFP (FA sub-accounts)
 
 
 def build_redis_database_config() -> DatabaseConfig:
@@ -174,47 +162,6 @@ def _derive_trader_id(deployment_slug: str) -> TraderId:
     return TraderId(f"MSAI-{deployment_slug}")
 
 
-def _validate_port_account_consistency(port: int, account_id: str) -> None:
-    """Reject silent gotcha-#6 misconfigurations at build time.
-
-    - 4002 + non-DU account → "paper port + live account"
-    - 4001 + DU account     → "live port + paper account"
-    - any other port        → "unsupported IB Gateway port"
-    - blank/whitespace-only account_id → rejected before classification
-
-    Account ids are stripped of surrounding whitespace before
-    classification so a value like ``' DU1234567'`` from a misformatted
-    ``.env`` file isn't misclassified as a live account (Codex Task
-    1.5 iteration 2 P2 fix).
-    """
-    normalized_account = account_id.strip()
-    if not normalized_account:
-        raise ValueError(
-            "IB account id is empty (or whitespace only) — set IB_ACCOUNT_ID "
-            "to a real paper or live account id before starting a deployment."
-        )
-    is_paper_account = any(normalized_account.startswith(p) for p in _IB_PAPER_PREFIXES)
-    if port in _IB_PAPER_PORTS:
-        if not is_paper_account:
-            raise ValueError(
-                f"IB paper port {port} requires a paper account id (starts with "
-                f"one of {_IB_PAPER_PREFIXES}); got live account {normalized_account!r}. "
-                "This combination silently produces no data — see Nautilus gotcha #6."
-            )
-    elif port in _IB_LIVE_PORTS:
-        if is_paper_account:
-            raise ValueError(
-                f"IB live port {port} requires a live account id (must NOT start "
-                f"with any of {_IB_PAPER_PREFIXES}); got paper account {normalized_account!r}. "
-                "This combination silently produces no data — see Nautilus gotcha #6."
-            )
-    else:
-        raise ValueError(
-            f"unsupported IB Gateway port {port}: only {_IB_LIVE_PORTS} (live) "
-            f"and {_IB_PAPER_PORTS} (paper) are recognized."
-        )
-
-
 def build_live_trading_node_config(
     *,
     deployment_slug: str,
@@ -299,13 +246,13 @@ def build_live_trading_node_config(
         )
     # Normalize the account id ONCE and thread the normalized value through
     # both the validator and the exec client config. If we only strip inside
-    # ``_validate_port_account_consistency`` (Task 1.5 iter2 P2) but leave
+    # ``validate_port_account_consistency`` (Task 1.5 iter2 P2) but leave
     # the exec client to receive the raw ``ib_settings.account_id``, a value
     # like ``" DU1234567"`` from a misformatted ``.env`` passes validation
     # but reaches Nautilus with leading whitespace — IB Gateway then fails
     # the account match on connect (Codex batch 3 P2 fix).
     normalized_account_id = ib_settings.account_id.strip()
-    _validate_port_account_consistency(ib_settings.port, normalized_account_id)
+    validate_port_account_consistency(ib_settings.port, normalized_account_id)
 
     instrument_provider_config = build_ib_instrument_provider_config(
         paper_symbols,
@@ -526,7 +473,7 @@ def build_portfolio_trading_node_config(
     sorted_instruments = sorted(all_instruments)
 
     normalized_account_id = ib_settings.account_id.strip()
-    _validate_port_account_consistency(ib_settings.port, normalized_account_id)
+    validate_port_account_consistency(ib_settings.port, normalized_account_id)
 
     instrument_provider_config = build_ib_instrument_provider_config(
         sorted_instruments,

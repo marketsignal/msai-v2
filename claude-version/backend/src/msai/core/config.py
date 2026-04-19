@@ -78,6 +78,41 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("IB_PORT", "IB_GATEWAY_PORT_PAPER"),
     )
 
+    # ------------------------------------------------------------------
+    # IB short-lived-client tunables (used by `msai instruments refresh`
+    # and any other one-shot IB connection that isn't a live subprocess).
+    # ------------------------------------------------------------------
+
+    # Wall-clock budget for the IB Gateway TCP connection + client-ready
+    # probe. Intentionally separate from ``ib_request_timeout_seconds``
+    # so a dead gateway fails fast (~5s) while slow individual
+    # qualifications still honor the longer per-request timeout.
+    ib_connect_timeout_seconds: int = Field(
+        default=5,
+        validation_alias=AliasChoices("IB_CONNECT_TIMEOUT_SECONDS"),
+    )
+
+    # Post-connect per-request timeout for IB contract qualification
+    # (``reqContractDetails`` round-trip). ``int`` matches Nautilus
+    # ``get_cached_ib_client(request_timeout_secs=...)`` signature.
+    ib_request_timeout_seconds: int = Field(
+        default=30,
+        validation_alias=AliasChoices("IB_REQUEST_TIMEOUT_SECONDS"),
+    )
+
+    # Pragmatic default IB ``client_id`` for ``msai instruments
+    # refresh``. Live subprocesses derive their client_id from a 31-bit
+    # hash of the deployment slug (``live_node_config.py::
+    # _derive_client_id``), so collision with 999 is mathematically
+    # possible but extremely unlikely. Surfaced in CLI help + every
+    # preflight log so the operator sees which id the CLI is using.
+    # See nautilus.md gotcha #3 — two clients on the same ``client_id``
+    # silently disconnect each other.
+    ib_instrument_client_id: int = Field(
+        default=999,
+        validation_alias=AliasChoices("IB_INSTRUMENT_CLIENT_ID"),
+    )
+
     # IB market data type: REALTIME (default, requires subscription),
     # DELAYED (15-min delayed, free for most instruments),
     # DELAYED_FROZEN (last available delayed snapshot).

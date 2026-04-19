@@ -8,10 +8,9 @@ registry.  It has two provider paths:
   :meth:`SecurityMaster._resolve_databento_continuous`.  Tested here by
   mocking the Databento client + SecurityMaster.
 
-- ``--provider interactive_brokers`` — deferred to a follow-up PR
-  (IBQualifier construction requires IB settings + factory plumbing that
-  this PR does not ship).  We verify the command raises a clear
-  ``NotImplementedError``-style exit with an operator hint.
+- ``--provider interactive_brokers`` — short-lived Nautilus IB
+  client. Tested here with the factory chain + ``SecurityMaster``
+  mocked so the tests don't touch real IB Gateway.
 """
 
 from __future__ import annotations
@@ -165,34 +164,394 @@ class TestRefreshDatabento:
 
 
 # ----------------------------------------------------------------------
-# --provider interactive_brokers path (deferred to follow-up PR)
+# --provider interactive_brokers path
 # ----------------------------------------------------------------------
 
 
-class TestRefreshIBDeferred:
-    def test_refresh_ib_raises_not_implemented(self, runner: CliRunner) -> None:
-        """The IB provider path is explicitly deferred: invoking it raises a
-        clear error pointing operators at the Databento path + the
-        follow-up PR.
+def _accepted_alias_cases() -> list[str]:
+    """Build the accept-list dynamically so ES's month-qualified
+    alias follows today's canonical (doesn't rot on quarterly roll)."""
+    from msai.services.nautilus.live_instrument_bootstrap import (
+        canonical_instrument_id,
+    )
 
-        Rationale: the claude-version ``Settings`` model does not yet have
-        ``ib_request_timeout_seconds`` / ``ib_instrument_client_id`` /
-        ``ib_port_paper`` fields needed to build a short-lived
-        :class:`IBQualifier`.  Adding those is out-of-scope for the
-        registry PR; they land with the live-wiring follow-up.
-        """
+    return [
+        "AAPL.NASDAQ",  # equity dotted alias
+        "EUR/USD.IDEALPRO",  # FX dotted alias
+        "ES.CME",  # bare-root futures dotted alias
+        canonical_instrument_id("ES"),  # CLI's own ES output (today's FM)
+        "ES.XCME",  # legacy MIC — still accepted for backwards compat
+        "EUR",  # FX shorthand — still accepted by canonical_instrument_id
+        "EUR.IDEALPRO",  # FX shorthand + current venue
+    ]
+
+
+@pytest.mark.parametrize("symbol", _accepted_alias_cases())
+def test_ib_provider_accepts_dotted_and_futures_aliases(
+    symbol: str,
+    monkeypatch: pytest.MonkeyPatch,
+    runner: CliRunner,
+) -> None:
+    """PRD US-006: operators must be able to feed the CLI's own
+    ``resolved`` output back in as a re-run. That output contains
+    dotted aliases for equity/FX AND month-qualified futures aliases.
+    Preflight must accept all shapes in ``_accepted_alias_cases``.
+
+    Stubs ``_run_ib_resolve_for_live`` so we don't block on a real
+    IB connect attempt (preflight-only assertion).
+    """
+    import msai.cli as cli_mod
+    from msai.core.config import Settings
+
+    monkeypatch.setenv("IB_PORT", "4002")
+    monkeypatch.setenv("IB_ACCOUNT_ID", "DU1234567")
+    monkeypatch.setattr(cli_mod, "settings", Settings())
+
+    with patch.object(
+        cli_mod,
+        "_run_ib_resolve_for_live",
+        new=AsyncMock(return_value=["stub"]),
+    ):
         result = runner.invoke(
             app,
             [
                 "instruments",
                 "refresh",
                 "--symbols",
-                "AAPL,ES",
+                symbol,
+                "--provider",
+                "interactive_brokers",
+            ],
+        )
+    # Preflight must NOT reject (unknown-symbol branch).
+    combined = (result.stderr or "") + (result.stdout or "") + result.output
+    assert "not in the closed universe" not in combined, combined
+
+
+@pytest.mark.parametrize(
+    "symbol",
+    [
+        "SPY.NASDAQ",  # known root, wrong venue — exact match fails
+        "AAPLXX.NASDAQ",  # unknown root with known venue
+        "ESM6",  # month-qualified futures without venue — ambiguous input
+        "ES.NASDAQ",  # futures with wrong venue
+    ],
+)
+def test_ib_provider_rejects_malformed_aliases(
+    symbol: str,
+    runner: CliRunner,
+) -> None:
+    """Preflight uses exact-match on the accepted-alias set, not
+    permissive suffix stripping — inputs that would previously slip
+    through (e.g. ``SPY.NASDAQ`` masquerading as bare ``SPY``, or
+    ``AAPLXX.NASDAQ`` getting silently normalized to ``AAPL``) must
+    be rejected.
+    """
+    result = runner.invoke(
+        app,
+        [
+            "instruments",
+            "refresh",
+            "--symbols",
+            symbol,
+            "--provider",
+            "interactive_brokers",
+        ],
+    )
+    assert result.exit_code != 0
+    combined = (result.stderr or "") + (result.stdout or "") + result.output
+    assert "not in the closed universe" in combined, combined
+
+
+def test_ib_provider_rejects_unknown_symbol(runner: CliRunner) -> None:
+    """Symbols outside PHASE_1_PAPER_SYMBOLS are rejected in preflight,
+    before any IB connection is attempted."""
+    result = runner.invoke(
+        app,
+        [
+            "instruments",
+            "refresh",
+            "--symbols",
+            "NVDA",
+            "--provider",
+            "interactive_brokers",
+        ],
+    )
+    assert result.exit_code != 0
+    combined = (result.stderr or "") + (result.stdout or "") + result.output
+    # Error names the unknown symbol AND the closed universe
+    assert "NVDA" in combined
+    assert "AAPL" in combined  # a symbol from PHASE_1_PAPER_SYMBOLS
+
+
+def test_ib_provider_rejects_port_account_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    runner: CliRunner,
+) -> None:
+    """Preflight validator fires BEFORE any IB connection attempt when
+    IB_PORT and IB_ACCOUNT_ID disagree on paper vs live.
+
+    Patches ``msai.cli.settings`` directly — NOT
+    ``msai.core.config.settings`` — because ``cli.py`` imports
+    ``settings`` at module load, binding the local reference eagerly.
+    """
+    import msai.cli as cli_mod
+    from msai.core.config import Settings
+
+    # Live port + paper account → gotcha #6 silent misroute trap.
+    monkeypatch.setenv("IB_PORT", "4001")
+    monkeypatch.setenv("IB_ACCOUNT_ID", "DU1234567")
+    monkeypatch.setattr(cli_mod, "settings", Settings())
+
+    result = runner.invoke(
+        app,
+        [
+            "instruments",
+            "refresh",
+            "--symbols",
+            "AAPL",
+            "--provider",
+            "interactive_brokers",
+        ],
+    )
+    assert result.exit_code != 0
+    combined = (result.stderr or "") + (result.stdout or "") + result.output
+    assert "4001" in combined
+    assert "DU1234567" in combined
+
+
+@pytest.fixture
+def _ib_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Env setup for IB branch tests. Patches `msai.cli.settings`
+    directly — see monkeypatch pattern note on
+    test_ib_provider_rejects_port_account_mismatch."""
+    import msai.cli as cli_mod
+    from msai.core.config import Settings
+
+    monkeypatch.setenv("IB_PORT", "4002")
+    monkeypatch.setenv("IB_ACCOUNT_ID", "DU1234567")
+    monkeypatch.setenv("IB_HOST", "127.0.0.1")
+    monkeypatch.setenv("IB_CONNECT_TIMEOUT_SECONDS", "5")
+    monkeypatch.setenv("IB_REQUEST_TIMEOUT_SECONDS", "30")
+    monkeypatch.setenv("IB_INSTRUMENT_CLIENT_ID", "999")
+    monkeypatch.setattr(cli_mod, "settings", Settings())
+
+
+def test_ib_provider_per_symbol_commit_preserves_earlier_successes(
+    _ib_env: None,
+    runner: CliRunner,
+) -> None:
+    """PRD US-001 edge case: 'Mid-batch qualification failure (symbol
+    #2/5) → Exit non-zero; rows for symbols already qualified are
+    committed (idempotent re-run recovers).'
+
+    CLI loops symbol-by-symbol and commits each. A failure on symbol
+    2 rolls back only the failed symbol's session state; symbol 1's
+    commit is durable. Verified here by counting session.commit() calls.
+    """
+    mock_client = MagicMock()
+    mock_client._is_client_ready = MagicMock()
+    mock_client._is_client_ready.wait = AsyncMock(return_value=None)
+    mock_client._stop_async = AsyncMock(return_value=None)
+
+    # resolve_for_live succeeds on AAPL, fails on MSFT.
+    call_count = {"n": 0}
+
+    async def _fake_resolve(self, symbols: list[str]) -> list[str]:
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise RuntimeError("simulated IB failure on symbol #2")
+        return [f"{s}.NASDAQ" for s in symbols]
+
+    fake_session = MagicMock()
+    fake_session.commit = AsyncMock()
+    fake_session.rollback = AsyncMock()
+    fake_session_cm = MagicMock()
+    fake_session_cm.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "nautilus_trader.adapters.interactive_brokers.factories.get_cached_ib_client",
+            return_value=mock_client,
+        ),
+        patch(
+            "nautilus_trader.adapters.interactive_brokers.factories."
+            "get_cached_interactive_brokers_instrument_provider",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "msai.services.nautilus.security_master.service.SecurityMaster.resolve_for_live",
+            _fake_resolve,
+        ),
+        patch("msai.cli.async_session_factory", return_value=fake_session_cm),
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "instruments",
+                "refresh",
+                "--symbols",
+                "AAPL,MSFT",
                 "--provider",
                 "interactive_brokers",
             ],
         )
 
-        assert result.exit_code != 0
-        # Error must point operators at the Databento path + follow-up PR.
-        assert "follow-up" in result.output.lower() or "databento" in result.output.lower()
+    # Exit non-zero (symbol 2 failed).
+    assert result.exit_code != 0
+    # But: symbol 1's success was committed (1 commit), symbol 2's
+    # rollback fired once (for the failed call).
+    assert fake_session.commit.await_count == 1
+    assert fake_session.rollback.await_count == 1
+
+
+def test_ib_provider_happy_path_calls_factory_and_resolve(
+    _ib_env: None,
+    runner: CliRunner,
+) -> None:
+    """AAPL qualifies via the mocked factory chain + IBQualifier, then
+    SecurityMaster.resolve_for_live commits. Exit 0. Asserts:
+    - CORRECT factory kwargs (host, port, client_id, request_timeout_secs)
+    - client.start() is NOT called (factory already starts the client)
+    - client.stop() is NOT called (we await _stop_async directly)
+    - _stop_async IS awaited in finally (even on failure).
+    """
+    # Mock the factory chain
+    mock_client = MagicMock()
+    mock_client._is_client_ready = MagicMock()
+    mock_client._is_client_ready.wait = AsyncMock(return_value=None)
+    mock_client.start = MagicMock()
+    mock_client.stop = MagicMock()
+    mock_client._stop_async = AsyncMock(return_value=None)
+
+    mock_provider = MagicMock()
+
+    mock_get_client = MagicMock(return_value=mock_client)
+    mock_get_provider = MagicMock(return_value=mock_provider)
+
+    # Mock SecurityMaster.resolve_for_live so the test doesn't hit a DB.
+    async def _fake_resolve(self, symbols: list[str]) -> list[str]:
+        return [f"{s}.NASDAQ" for s in symbols]
+
+    fake_session = MagicMock()
+    fake_session.commit = AsyncMock()
+    fake_session.rollback = AsyncMock()
+    fake_session_cm = MagicMock()
+    fake_session_cm.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "nautilus_trader.adapters.interactive_brokers.factories.get_cached_ib_client",
+            mock_get_client,
+        ),
+        patch(
+            "nautilus_trader.adapters.interactive_brokers.factories."
+            "get_cached_interactive_brokers_instrument_provider",
+            mock_get_provider,
+        ),
+        patch(
+            "msai.services.nautilus.security_master.service.SecurityMaster.resolve_for_live",
+            _fake_resolve,
+        ),
+        patch("msai.cli.async_session_factory", return_value=fake_session_cm),
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "instruments",
+                "refresh",
+                "--symbols",
+                "AAPL",
+                "--provider",
+                "interactive_brokers",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "AAPL" in result.output
+
+    # --- Factory kwargs correctness ---
+    assert mock_get_client.called
+    kwargs = mock_get_client.call_args.kwargs
+    assert kwargs["host"] == "127.0.0.1"
+    assert kwargs["port"] == 4002
+    assert kwargs["client_id"] == 999
+    assert kwargs["request_timeout_secs"] == 30
+
+    # --- Lifecycle correctness (Codex plan-review iter 1 P1s) ---
+    # Factory already calls client.start() internally; CLI must NOT call it.
+    mock_client.start.assert_not_called()
+    # Public stop() only schedules the async stop; CLI must NOT call it.
+    mock_client.stop.assert_not_called()
+    # _stop_async MUST have been awaited directly.
+    mock_client._stop_async.assert_awaited_once()
+
+
+def test_ib_provider_dead_gateway_times_out_with_operator_hint(
+    monkeypatch: pytest.MonkeyPatch,
+    runner: CliRunner,
+) -> None:
+    """When the IB client never reaches ready state, CLI times out in
+    the short connect-timeout window, prints an operator hint naming
+    all relevant env vars, and still awaits _stop_async in teardown."""
+    import asyncio
+
+    import msai.cli as cli_mod
+    from msai.core.config import Settings
+
+    # 1s connect timeout for fast test; paper env so preflight passes.
+    monkeypatch.setenv("IB_PORT", "4002")
+    monkeypatch.setenv("IB_ACCOUNT_ID", "DU1234567")
+    monkeypatch.setenv("IB_HOST", "127.0.0.1")
+    monkeypatch.setenv("IB_CONNECT_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("IB_REQUEST_TIMEOUT_SECONDS", "30")
+    monkeypatch.setenv("IB_INSTRUMENT_CLIENT_ID", "999")
+    monkeypatch.setattr(cli_mod, "settings", Settings())
+
+    mock_client = MagicMock()
+
+    async def _never() -> None:
+        await asyncio.sleep(3600)
+
+    mock_client._is_client_ready = MagicMock()
+    mock_client._is_client_ready.wait = _never
+    mock_client.start = MagicMock()
+    mock_client.stop = MagicMock()
+    mock_client._stop_async = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "nautilus_trader.adapters.interactive_brokers.factories.get_cached_ib_client",
+            return_value=mock_client,
+        ),
+        patch(
+            "nautilus_trader.adapters.interactive_brokers.factories."
+            "get_cached_interactive_brokers_instrument_provider",
+            return_value=MagicMock(),
+        ),
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "instruments",
+                "refresh",
+                "--symbols",
+                "AAPL",
+                "--provider",
+                "interactive_brokers",
+            ],
+        )
+
+    assert result.exit_code != 0
+    combined = (result.stderr or "") + (result.stdout or "") + result.output
+    # Operator hint names all 4 env vars (either by name or by value).
+    assert "IB_HOST" in combined or "127.0.0.1" in combined
+    assert "IB_PORT" in combined or "4002" in combined
+    assert "IB_ACCOUNT_ID" in combined or "DU1234567" in combined
+    assert "IB_INSTRUMENT_CLIENT_ID" in combined or "999" in combined
+    # Teardown still ran — _stop_async awaited even on timeout.
+    mock_client._stop_async.assert_awaited_once()
+    # stop() must NOT have been called (avoids double _stop_async).
+    mock_client.stop.assert_not_called()

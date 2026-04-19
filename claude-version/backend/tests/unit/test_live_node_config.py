@@ -342,14 +342,17 @@ class TestValidation:
     def test_paper_port_with_live_account_raises(self) -> None:
         """Gotcha #6: port 4002 (paper) + a live account id is a silent
         data-flow killer — IB Gateway accepts the connection but
-        provides no data. Fail loudly at config-build time."""
-        with pytest.raises(ValueError, match="paper port .* live account"):
+        provides no data. Fail loudly at config-build time.
+
+        Integration-level regression — detailed validator coverage
+        lives in ``test_ib_port_validator.py``."""
+        with pytest.raises(ValueError, match="paper port .* live-prefix"):
             _build(ib_settings=IBSettings(host="127.0.0.1", port=4002, account_id="U1234567"))
 
     def test_live_port_with_paper_account_raises(self) -> None:
         """Inverse of the previous case: port 4001 (live) + a paper
         account id (``DU...``) is also wrong and equally silent."""
-        with pytest.raises(ValueError, match="live port .* paper account"):
+        with pytest.raises(ValueError, match="live port .* paper-prefix"):
             _build(ib_settings=IBSettings(host="127.0.0.1", port=4001, account_id="DU1234567"))
 
     def test_paper_port_with_paper_account_succeeds(self) -> None:
@@ -361,7 +364,7 @@ class TestValidation:
     def test_unknown_port_raises(self) -> None:
         """Only 4001 (live) and 4002 (paper) are recognized — anything
         else is a typo we should catch at build time."""
-        with pytest.raises(ValueError, match="unsupported IB Gateway port"):
+        with pytest.raises(ValueError, match="unknown IB port"):
             _build(ib_settings=IBSettings(host="127.0.0.1", port=9999, account_id="DU1234567"))
 
     def test_unknown_paper_symbol_raises(self) -> None:

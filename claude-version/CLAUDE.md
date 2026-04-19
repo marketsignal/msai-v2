@@ -173,7 +173,7 @@ New tables `instrument_definitions` + `instrument_aliases` hold control-plane me
 - `instrument_cache` table coexists with the new registry and is not migrated yet. Deferred to a follow-up PR — see the skeleton at the end of `docs/plans/2026-04-17-db-backed-strategy-registry.md` §"Split-off PR Skeleton".
 - Strategy config-schema extraction for UI form generation. Deferred to a follow-up PR — see the skeleton at the end of `docs/plans/2026-04-17-db-backed-strategy-registry.md` §"Split-off PR Skeleton".
 
-The `msai instruments refresh --provider interactive_brokers` path is currently deferred — follow-up PR will add the required `Settings` fields (`ib_request_timeout_seconds`, `ib_instrument_client_id`, etc.) plus the full IBQualifier factory.
+The `msai instruments refresh --provider interactive_brokers` path is live as of 2026-04-18. Requires `IB_HOST`, `IB_PORT`, `IB_ACCOUNT_ID` to be set; optional tunables are `IB_CONNECT_TIMEOUT_SECONDS` (default 5), `IB_REQUEST_TIMEOUT_SECONDS` (default 30), `IB_INSTRUMENT_CLIENT_ID` (default 999 — pragmatic, NOT a guaranteed reservation; see nautilus.md gotcha #3). Day-1 scope: closed universe (`AAPL`, `MSFT`, `SPY`, `EUR/USD`, `ES`) matching `resolve_for_live`.
 
 ### Environment Variables
 

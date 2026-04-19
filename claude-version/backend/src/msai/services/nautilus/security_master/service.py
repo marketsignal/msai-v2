@@ -71,6 +71,14 @@ DEFAULT_CACHE_VALIDITY_DAYS = 30
 returns the cached value AND schedules a background refresh."""
 
 
+_ROLL_SENSITIVE_ROOTS: frozenset[str] = frozenset({"ES"})
+"""Raw symbols whose canonical alias changes over time (quarterly
+futures roll). For these, ``resolve_for_live``'s warm path B compares
+the stored active alias to ``canonical_instrument_id(sym, today=today)``
+and falls through to the cold path on mismatch so the roll triggers a
+re-qualify. For non-rollable symbols the registry is authoritative."""
+
+
 class DatabentoDefinitionMissing(Exception):  # noqa: N818 — spec-mandated name (codex parity)
     """Raised by :meth:`SecurityMaster.resolve_for_backtest` when a requested
     symbol has no active registry row under the ``databento`` provider and
@@ -238,15 +246,21 @@ class SecurityMaster:
                 is ``None`` — construct the :class:`SecurityMaster` with
                 ``qualifier=...`` for any live-trading entrypoint.
         """
+        # Use CME-local date (America/Chicago), matching what
+        # canonical_instrument_id + build_ib_instrument_provider_config
+        # use — otherwise on late-UTC-night runs the UTC date disagrees
+        # with the exchange date and the two resolve to different
+        # quarterly contracts.
         from msai.services.nautilus.live_instrument_bootstrap import (
             canonical_instrument_id,
+            exchange_local_today,
         )
         from msai.services.nautilus.security_master.registry import (
             InstrumentRegistry,
         )
 
         registry = InstrumentRegistry(self._db)
-        today = datetime.now(UTC).date()
+        today = exchange_local_today()
         out: list[str] = []
         for sym in symbols:
             # Warm path A — caller passed an already-qualified dotted alias
@@ -255,13 +269,31 @@ class SecurityMaster:
                 if idef is not None:
                     out.append(sym)
                     continue
-            # Warm path B — caller passed a bare ticker, resolve to active alias
+            # Warm path B — caller passed a bare ticker, resolve to
+            # active alias. For roll-sensitive symbols (futures that
+            # quarterly-roll like ES), the stored active alias may be
+            # stale after an expiry; compare against today's canonical
+            # and fall through to cold path if it differs so the
+            # re-qualify + upsert closes the old alias and opens the
+            # new one. For non-rollable symbols (AAPL/MSFT/SPY/EUR/USD)
+            # the registry IS authoritative — a legitimate alias move
+            # (e.g. AAPL.NASDAQ → AAPL.ARCA) must be honored, not
+            # reverted to canonical_instrument_id's hardcoded default.
             idef = await registry.find_by_raw_symbol(sym, provider="interactive_brokers")
             if idef is not None:
                 active_alias = next((a for a in idef.aliases if a.effective_to is None), None)
                 if active_alias is not None:
-                    out.append(active_alias.alias_string)
-                    continue
+                    is_stale = False
+                    if sym in _ROLL_SENSITIVE_ROOTS:
+                        try:
+                            expected = canonical_instrument_id(sym, today=today)
+                        except ValueError:
+                            expected = None
+                        if expected is not None and expected != active_alias.alias_string:
+                            is_stale = True
+                    if not is_stale:
+                        out.append(active_alias.alias_string)
+                        continue
             # Cold path — delegate to existing live_instrument_bootstrap
             # front-month rollover + existing SecurityMaster.resolve(spec).
             # Reason: live_instrument_bootstrap.canonical_instrument_id(...)
@@ -277,7 +309,7 @@ class SecurityMaster:
                     "construct SecurityMaster with qualifier=... for live use."
                 )
             canonical = canonical_instrument_id(sym, today=today)
-            spec = self._spec_from_canonical(canonical)
+            spec = self._spec_from_canonical(canonical, today=today)
             instrument = await self.resolve(spec)  # cache-first
             alias_str = str(instrument.id)
             routing_venue = instrument.id.venue.value
@@ -519,7 +551,12 @@ class SecurityMaster:
 
         return asset_class_for_instrument_type(instrument.__class__.__name__)
 
-    def _spec_from_canonical(self, canonical: str) -> InstrumentSpec:
+    def _spec_from_canonical(
+        self,
+        canonical: str,
+        *,
+        today: date | None = None,
+    ) -> InstrumentSpec:
         """Parse an already-resolved canonical alias string into an
         :class:`InstrumentSpec` for downstream :meth:`resolve`.
 
@@ -530,7 +567,11 @@ class SecurityMaster:
         - ``AAPL.NASDAQ`` / ``MSFT.NASDAQ`` → equity / NASDAQ
         - ``SPY.ARCA`` → equity / ARCA
         - ``EUR/USD.IDEALPRO`` → forex / IDEALPRO
-        - ``ESM6.CME`` (or similar) → future / CME
+        - ``ESM6.CME`` (or similar) → future / CME.
+          ``today`` is used to compute the third-Friday expiry. Without
+          it the spec has ``expiry=None`` and ``IBQualifier`` maps it
+          to ``CONTFUT`` — IB Gateway then returns the continuous
+          placeholder, not the concrete front-month.
 
         Raises:
             ValueError: On an unknown venue suffix — callers should
@@ -553,7 +594,32 @@ class SecurityMaster:
                 currency=quote or "USD",
             )
         if venue == "CME":
-            return InstrumentSpec(asset_class="future", symbol=symbol, venue="CME")
+            # Import locally to avoid a security_master →
+            # live_instrument_bootstrap cycle at module import time.
+            from msai.services.nautilus.live_instrument_bootstrap import (
+                _current_quarterly_expiry,
+                exchange_local_today,
+                third_friday_of,
+            )
+
+            if today is None:
+                today = exchange_local_today()
+            # Incoming symbol is the local-symbol form ("ESM6") — root
+            # + 1-char month code + 1-digit year. InstrumentSpec
+            # RECOMPUTES that suffix from expiry, so passing "ESM6" +
+            # expiry would yield "ESM6M6.CME". Strip to the root.
+            root = symbol[:-2]
+            expiry_str = _current_quarterly_expiry(today)  # YYYYMM
+            expiry = third_friday_of(
+                int(expiry_str[0:4]),
+                int(expiry_str[4:6]),
+            )
+            return InstrumentSpec(
+                asset_class="future",
+                symbol=root,
+                venue="CME",
+                expiry=expiry,
+            )
         raise ValueError(
             f"Unknown venue {venue!r} in canonical {canonical!r} — extend "
             "SecurityMaster._spec_from_canonical for new venues."
@@ -609,7 +675,17 @@ class SecurityMaster:
             )
             .on_conflict_do_update(
                 constraint="uq_instrument_definitions_symbol_provider_asset",
-                set_={"refreshed_at": now},
+                # Refresh venue fields on conflict so an alias move
+                # (e.g. AAPL.NASDAQ → AAPL.ARCA) propagates to the
+                # definition row, not just the alias table. Without
+                # this, callers reading InstrumentDefinition get
+                # permanently stale venue metadata after the first
+                # venue change.
+                set_={
+                    "refreshed_at": now,
+                    "listing_venue": listing_venue,
+                    "routing_venue": routing_venue,
+                },
             )
             .returning(InstrumentDefinition.__table__.c.instrument_uid)
         )

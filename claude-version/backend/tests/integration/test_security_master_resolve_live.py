@@ -241,9 +241,7 @@ async def test_resolve_for_live_concurrent_cold_miss_is_race_safe(
         rows = (
             (
                 await session.execute(
-                    select(InstrumentDefinition).where(
-                        InstrumentDefinition.raw_symbol == "MSFT"
-                    )
+                    select(InstrumentDefinition).where(InstrumentDefinition.raw_symbol == "MSFT")
                 )
             )
             .scalars()
@@ -343,3 +341,202 @@ async def test_resolve_for_live_closes_prior_active_alias_on_new_insert(
             .all()
         )
         assert active_count == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_live_es_routes_through_fixed_month_future(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Regression (plan-review iter 1 P1, iter 2/3/4 refined): resolving
+    ES through ``resolve_for_live``'s cold path must build a FUT spec
+    with expiry — NOT a CONTFUT spec (expiry=None), and NOT an
+    ESM6-rooted spec that would double-encode the month via
+    ``InstrumentSpec.canonical_id`` (producing "ESM6M6.CME").
+
+    Asserts:
+      (a) expiry set on the spec (rules out CONTFUT)
+      (b) root symbol 'ES' (not 'ESM6' — rules out duplicate-month bug)
+      (c) asset_class + venue are future/CME (full roundtrip shape).
+
+    Uses the same mock shape as
+    ``test_resolve_for_live_cold_miss_calls_ib_and_upserts``.
+    """
+    async with session_factory() as session:
+        captured_specs: list = []
+
+        fake_instrument = MagicMock()
+        fake_instrument.id = MagicMock()
+        fake_instrument.id.__str__ = MagicMock(return_value="ESM6.CME")
+        fake_instrument.id.venue.value = "CME"
+        fake_instrument.raw_symbol.value = "ES"
+        fake_instrument.__class__.__name__ = "FuturesContract"
+        fake_instrument.to_dict = MagicMock(
+            return_value={
+                "type": "FuturesContract",
+                "instrument_id": "ESM6.CME",
+                "raw_symbol": "ES",
+            }
+        )
+
+        async def _capture_and_return(spec):
+            captured_specs.append(spec)
+            return fake_instrument
+
+        mock_qualifier = MagicMock()
+        mock_qualifier.qualify = AsyncMock(side_effect=_capture_and_return)
+
+        mock_provider = MagicMock()
+        fake_details = MagicMock()
+        fake_details.contract.primaryExchange = "CME"
+        mock_provider.contract_details = {fake_instrument.id: fake_details}
+        mock_qualifier._provider = mock_provider
+
+        sm = SecurityMaster(qualifier=mock_qualifier, db=session)
+
+        # Act
+        ids = await sm.resolve_for_live(["ES"])
+
+        # Assert — return value shape
+        assert len(ids) == 1
+
+        # Assert — the spec the qualifier got
+        assert len(captured_specs) == 1
+        spec = captured_specs[0]
+        assert spec.asset_class == "future"
+        assert spec.venue == "CME"
+        assert spec.expiry is not None, "gotcha: no expiry → maps to CONTFUT"
+        assert spec.symbol == "ES", (
+            f"must be root 'ES', not local-symbol 'ESM6' — otherwise "
+            f"InstrumentSpec.canonical_id produces 'ESM6M6.CME'. "
+            f"Got: {spec.symbol!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_live_warm_raw_symbol_falls_through_on_stale_alias(
+    session_factory: async_sessionmaker[async_sessionmaker[AsyncSession] | AsyncSession],  # type: ignore[type-arg]
+) -> None:
+    """Regression (iter-7 P1): if the registry has an active ES alias
+    pointing at an old front month (e.g. ``ESM6.CME`` after the June
+    expiry), a bare-ticker refresh (``msai instruments refresh
+    --symbols ES``) must NOT return that stale alias. Instead the
+    warm-B path recomputes today's canonical, sees it differs, and
+    falls through to the cold path to re-qualify + close-and-open.
+    """
+    async with session_factory() as session:
+        # Arrange: seed the registry with a STALE active ES alias.
+        # We store ``ESH1.CME`` (March 2021) which is guaranteed to
+        # differ from whatever today's front month is.
+        idef = InstrumentDefinition(
+            raw_symbol="ES",
+            listing_venue="CME",
+            routing_venue="CME",
+            asset_class="futures",
+            provider="interactive_brokers",
+            lifecycle_state="active",
+        )
+        session.add(idef)
+        await session.flush()
+        session.add(
+            InstrumentAlias(
+                instrument_uid=idef.instrument_uid,
+                alias_string="ESH1.CME",  # deliberately stale
+                venue_format="exchange_name",
+                provider="interactive_brokers",
+                effective_from=date(2021, 1, 1),
+            )
+        )
+        await session.commit()
+
+        # Stub qualifier: if warm path B returned the stale alias,
+        # the cold path wouldn't fire and qualify wouldn't be called.
+        # If the cold path DID fire, qualify IS called — which is
+        # what we assert below.
+        from unittest.mock import AsyncMock, MagicMock
+
+        fake_instrument = MagicMock()
+        fake_instrument.id = MagicMock()
+        today_canonical = None
+        try:
+            from msai.services.nautilus.live_instrument_bootstrap import (
+                canonical_instrument_id,
+            )
+
+            today_canonical = canonical_instrument_id("ES")
+        except Exception:  # pragma: no cover — sanity
+            today_canonical = "ESM6.CME"
+        fake_instrument.id.__str__ = MagicMock(return_value=today_canonical)
+        fake_instrument.id.venue.value = "CME"
+        fake_instrument.raw_symbol.value = "ES"
+        fake_instrument.__class__.__name__ = "FuturesContract"
+        fake_instrument.to_dict = MagicMock(
+            return_value={
+                "type": "FuturesContract",
+                "instrument_id": today_canonical,
+                "raw_symbol": "ES",
+            }
+        )
+
+        mock_qualifier = MagicMock()
+        mock_qualifier.qualify = AsyncMock(return_value=fake_instrument)
+
+        mock_provider = MagicMock()
+        fake_details = MagicMock()
+        fake_details.contract.primaryExchange = "CME"
+        mock_provider.contract_details = {fake_instrument.id: fake_details}
+        mock_qualifier._provider = mock_provider
+
+        sm = SecurityMaster(qualifier=mock_qualifier, db=session)
+        resolved = await sm.resolve_for_live(["ES"])
+
+        # Cold path MUST have fired — qualify was called.
+        mock_qualifier.qualify.assert_awaited()
+        # And the result must be today's canonical (not the stale stored alias).
+        assert resolved == [today_canonical]
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_live_warm_honors_nonrollable_alias_move(
+    session_factory: async_sessionmaker[async_sessionmaker[AsyncSession] | AsyncSession],  # type: ignore[type-arg]
+) -> None:
+    """Regression (iter-8 P1): for non-rollable symbols (AAPL/MSFT/
+    SPY/EUR/USD), the registry's active alias is authoritative — a
+    legitimate alias move (e.g. AAPL.NASDAQ → AAPL.ARCA) must be
+    returned as-is by warm path B, NOT reverted to
+    canonical_instrument_id's hardcoded default.
+
+    Otherwise warm-only callers (qualifier=None) would raise
+    'Cold-miss resolve ... requires an IBQualifier' after any venue
+    change that IB qualification returned.
+    """
+    async with session_factory() as session:
+        # Arrange: AAPL was moved to ARCA (hypothetical but plausible).
+        idef = InstrumentDefinition(
+            raw_symbol="AAPL",
+            listing_venue="ARCA",
+            routing_venue="ARCA",
+            asset_class="equity",
+            provider="interactive_brokers",
+            lifecycle_state="active",
+        )
+        session.add(idef)
+        await session.flush()
+        session.add(
+            InstrumentAlias(
+                instrument_uid=idef.instrument_uid,
+                alias_string="AAPL.ARCA",  # moved from NASDAQ
+                venue_format="exchange_name",
+                provider="interactive_brokers",
+                effective_from=date(2026, 1, 1),
+            )
+        )
+        await session.commit()
+
+        # qualifier=None — warm-only caller. Must NOT raise.
+        sm = SecurityMaster(qualifier=None, db=session)
+        resolved = await sm.resolve_for_live(["AAPL"])
+
+        assert resolved == ["AAPL.ARCA"], (
+            f"warm path B should honor the registry's active alias "
+            f"(AAPL.ARCA) for non-rollable AAPL; got {resolved!r}"
+        )

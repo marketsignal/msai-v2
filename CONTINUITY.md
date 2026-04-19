@@ -6,35 +6,45 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field   | Value |
-| ------- | ----- |
-| Command | none  |
+| Field     | Value                                                                            |
+| --------- | -------------------------------------------------------------------------------- |
+| Command   | /new-feature instruments-refresh-ib-path                                         |
+| Phase     | 5 — Quality Gates + Manual Drill                                                 |
+| Next step | Phase D manual paper drill (operator + paper IB Gateway) + Phase E quality gates |
 
-### Feature scope (post-council, post-research)
+### Checklist
 
-**Decision:** hybrid — stable logical PK at the schema layer + exchange-name runtime alias at the Nautilus boundary. Council verdict: `/tmp/msai-research/council/chairman-verdict.md`. Full discussion + research + Q&A log in `docs/prds/db-backed-strategy-registry-discussion.md`.
+- [x] Worktree created
+- [x] Project state read
+- [x] Plugins verified
+- [x] PRD created
+- [x] Research artifact produced (`docs/research/` — via research-first agent)
+- [ ] Design guidance loaded (if UI)
+- [x] Brainstorming complete (design doc: `docs/plans/2026-04-18-instruments-refresh-ib-path-design.md`)
+- [x] Approach comparison filled (council discussion Round 2 resolved the 6 design Qs; one remaining arch question resolved via Codex second opinion)
+- [x] Contrarian gate passed — 5-advisor council fired (standalone mode via /council) with Codex chairman synthesis
+- [x] Council verdict: hybrid answers per chairman recommendation; 3 blocking objections adopted, 2 scope-creep additions overruled
+- [x] Plan written (`docs/plans/2026-04-18-instruments-refresh-ib-path.md`)
+- [x] Plan review loop (4 iterations) — PASS. Codex iter 1: 6 P1 + 4 P2 + 2 P3. Iter 2: 1 P1 + 4 P2 + 1 P3. Iter 3: 1 P1. Iter 4: clean.
+- [x] TDD execution complete (13 code/test commits across 4 batches, all red→green→refactor)
+- [x] Code review loop (10 iterations) — PASS. Iter 1 wide (dotted symbols + third_friday dup + comments); iter 2 ESM6.CME missed; iter 3 strip too permissive; iter 4 partial-durability transactional + ES.XCME legacy; iter 5 routed-port regression I introduced; iter 6 bare EUR shorthand; iter 7 ES roll-forward + venue-update; iter 8 stale-check too aggressive; iter 9 JSON stdout banner + smoke count-growth; iter 10 P3-only (hardcoded ES month + test stub) — convergence. Every iteration's finding narrower than previous; textbook productive-convergence trajectory.
+- [x] Simplified — 3 parallel simplify agents (reuse/quality/efficiency) ran and their P1/P2 findings folded into eaaa446.
+- [x] Verified (tests/lint/types) — verify-app agent PASS: 1406→1407 unit tests (+ dotted-alias test) + 232 integration pass + ruff clean on touched files + mypy at main baseline.
+- [x] E2E use cases designed (Phase 3.2b) — 6 user stories in PRD with Gherkin scenarios
+- [x] E2E verified — N/A via verify-e2e agent: manual Phase D paper drill on 2026-04-18 20:30 UTC executed all 5 use cases against running paper IB Gateway (DUP733213). Results persisted in docs/CHANGELOG.md Phase D section. Opt-in `pytest.mark.ib_paper` smoke file at `tests/e2e/test_instruments_refresh_ib_smoke.py` provides automated regression surface for future re-verification.
+- [ ] E2E regression passed (Phase 5.4b)
+- [ ] E2E use cases graduated to tests/e2e/use-cases/ (Phase 6.2b)
+- [ ] E2E specs graduated to tests/e2e/specs/ (Phase 6.2c — if Playwright framework installed)
+- [ ] Learnings documented (if any)
+- [ ] State files updated
+- [ ] Committed and pushed
+- [ ] PR created
+- [ ] PR reviews addressed
+- [ ] Branch finished
 
-**Deliverables in this PR:**
+### Feature scope
 
-1. **`InstrumentDefinition` table** keyed on `instrument_uid` (UUID), NOT on InstrumentId string. Columns: `raw_symbol`, `listing_venue`, `routing_venue`, `asset_class`, `provider`, `roll_policy`, `refreshed_at`, `lifecycle_state`. NO copy of Nautilus `Instrument` payloads — delegate that to Nautilus's own cache DB.
-2. **`instrument_alias` table** — `(uid, alias_string, venue_format, provider, effective_from, effective_to)`. Queryable in both directions.
-3. **Runtime canonical alias = exchange-name**: `AAPL.NASDAQ`, `ES.CME`, `EURUSD.IDEALPRO`, `<localSymbol>.SMART` for future options. Matches IB defaults; minimal migration.
-4. **Split-brain normalization bundled**: replace `.XCME` → `.CME` in 7 source-file docstrings/examples + 26 test fixtures + `security_master/specs.py` canonical-format doc. No Parquet disk rewrite (MSAI storage is symbol-partitioned). Nautilus cache re-warms on first boot.
-5. **Listing vs routing venue split**: both as first-class columns from day one. Options (future work) need `CBOE` listing + `SMART` routing distinct.
-6. **Continuous-futures `.Z.N` helper**: port from codex-version `services/nautilus/instrument_service.py:440-605`. Real gap — Nautilus Databento adapter has no continuous-symbol normalization. IB `ES.CME`→`ESM6.CME` roll stays (already working, PR #23).
-7. **Nautilus primitive wiring**: set `CacheConfig(database=redis)` (nautilus.md gotcha #7). Write Instruments into `ParquetDataCatalog` during catalog-builder. Nautilus owns payload durability; MSAI owns control-plane metadata.
-8. **Databento loader config**: set `use_exchange_as_venue=True` in MSAI's ingestion so Databento emits exchange-name natively matching IB default output.
-9. **Pydantic config-schema extraction**: small sidecar on `StrategyRegistry` (`model_json_schema()` + defaults). API exposes; UI consumption is future work.
-10. **Service integration**: async `SecurityMaster.resolve_for_live(symbol)` + `resolve_for_backtest(symbol)`. Sync `find(instrument_id)` via Nautilus cache for hot path. Keep existing `canonical_instrument_id()` in `live_instrument_bootstrap.py` for IB futures roll.
-11. **Migration strategy**: lazy (empty table at ship). `msai instruments refresh` CLI for explicit pre-warming. Seed rows for known continuous-futures symbols.
-
-**Source files to mine:** `codex-version/backend/src/msai/services/nautilus/instrument_service.py` (lines 32–106 for `ResolvedInstrumentDefinition`; 440–605 for Databento `.Z.N` helpers) and `codex-version/backend/src/msai/models/instrument_definition.py` (reference schema, adapted for UUID PK).
-
-**Open items for implementation:**
-
-- Quantify mixed-format rows in live `live_deployment_strategy` when docker stack is up.
-- Verify Nautilus cache DB fully subsumes codex-version's msgpack `instrument_data` JSONB column (strong hypothesis: yes).
-- Verify `Databento loader use_exchange_as_venue=True` emits `CME`/`NYMEX`/`CBOT` correctly in MSAI's ingestion end-to-end.
+Complete the deferred `msai instruments refresh --provider interactive_brokers` path. Currently (claude-version/backend/src/msai/cli.py:747-756) that branch hard-fails with a deferral message. The blocker is that `Settings` lacks `ib_request_timeout_seconds`, `ib_instrument_client_id`, and a paper/live port selector needed to build an `IBQualifier`. Deliverables: (a) extend `Settings` with the missing fields + env-var aliases, (b) add a small IBQualifier factory, (c) wire it into `instruments_refresh` to call `SecurityMaster.resolve_for_live`, (d) tests + docstring updates. Touches IB wiring — mind Nautilus gotcha #3 (unique client_id) + gotcha #6 (paper/live port consistency).
 
 ## Done
 
@@ -165,17 +175,23 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 
 ## Now
 
-- **On `main` (clean history, no active workflow).** PR #34 merged at `a992453`; continuity-clear at `1c681a0`.
-- **Dirty working tree diagnosis (2026-04-18 15:29):** `claude-codex-forge/setup.sh --with-playwright -f` was run, picking up forge PR #482 ("Playwright security + caller/agent protocol fixes"). Produced 4 dirty files:
-  - ✅ `playwright.config.ts` (new, intended — forge template)
-  - ✅ `docs/ci-templates/{e2e.yml,README.md}` (new, intended — reference CI, not auto-activated)
-  - ✅ `tests/e2e/fixtures/auth.ts` (upgraded, intended — removes `TEST_API_KEY`/localStorage bearer-token path; cookie-session only now; adds SECURITY WARNING)
-  - ❌ `docs/CHANGELOG.md` — template-stomped (96 lines of msai-v2 PR history wiped via `setup.sh -f` → `FORCE=true` branch at line 591). **Restored from HEAD this session.**
-- **Remaining dirty state:** the 3 legitimate forge PR #482 adoption changes, ready for review + commit.
+- **Active workflow:** `/new-feature instruments-refresh-ib-path` on branch `feat/instruments-refresh-ib-path` (worktree); pushed to origin (17+ commits ahead of main).
+- **Code review loop — iter 3 mid-investigation (22:41 UTC).** Iter 1 found 1 Codex P2 (dotted symbols) + 1 simplify P2 (third_friday dedup) + 4 P1 / 3 P2 comment-quality; fixed in `eaaa446`. Iter 2 surfaced 1 more P2 — the dotted-alias strip didn't handle month-qualified futures like `ESM6.CME`; fixed in `1a9a751` with parametrized test across 4 alias shapes. Iter 3 Codex review running (~134 lines into investigation).
+- **Phase D paper drill PASSED** (2026-04-18 20:30 UTC) — all 5 drills green against paper IB Gateway DUP733213.
+- **Feedback memory saved:** `feedback_code_review_iteration_discipline.md` — user enforces plan-review-style iteration discipline on the code-review loop; re-run reviewers on each fix commit before pushing/PR.
 
 ## Next
 
-1. **Review + commit Playwright security bundle** (user task) — suggested: `chore(e2e): adopt claude-codex-forge PR #482 Playwright security fixes`.
-2. **Deferred PR #32 items** (pick up after commit):
-   - **Live path wiring onto registry** — `/api/v1/live/start-portfolio` still uses closed-universe `canonical_instrument_id()`. Highest strategic value; needs design pass (→ `/new-feature`).
-   - **`msai instruments refresh` for plain symbols** — Databento path works; IB path skipped.
+1. **Phase E — quality gates** (in progress): full unit suite + lint + typecheck on all changed files.
+2. **Phase F — state sync:** finalize CONTINUITY + CHANGELOG at final state.
+3. **Phase G — `/finish-branch`:** push branch, open PR, handle reviews, merge.
+
+### Phase D drill results (2026-04-18 20:30 UTC)
+
+All 5 drills pass against paper IB Gateway (DUP733213 @ ib-gateway:4004 via docker compose exec backend):
+
+- D2 happy path: exit 0 in 2.6s, AAPL → AAPL.NASDAQ, 1 def + 1 alias row written
+- D3 idempotent re-run: 1/1 counts unchanged
+- D4 gateway-down fast-fail: 7.7s exit non-zero + operator hint
+- D5 port/account mismatch: 1.3s exit non-zero, no IB attempted
+  - **`msai instruments refresh` for plain symbols** — Databento path works; IB path skipped.

@@ -344,9 +344,7 @@ def backtest_run(
 @backtest_app.command("history")
 def backtest_history(
     page: int = typer.Option(1, help="Page number (1-indexed)"),
-    page_size: int = typer.Option(
-        20, help="Rows per page (backend max is 100)"
-    ),
+    page_size: int = typer.Option(20, help="Rows per page (backend max is 100)"),
 ) -> None:
     """List recent backtests with status + metrics.
 
@@ -527,9 +525,7 @@ def graduation_show(
             headers=_api_headers(),
             timeout=10.0,
         )
-        transitions = (
-            transitions_response.json() if transitions_response.is_success else []
-        )
+        transitions = transitions_response.json() if transitions_response.is_success else []
     except httpx.RequestError:
         # Transport error on the transitions fetch isn't fatal — the
         # candidate body still has value.
@@ -665,17 +661,17 @@ def system_health() -> None:
         (
             "account",
             "/api/v1/account/health",
-            lambda b: isinstance(b, dict)
-            and b.get("status") == "healthy"
-            and bool(b.get("gateway_connected")),
+            lambda b: (
+                isinstance(b, dict)
+                and b.get("status") == "healthy"
+                and bool(b.get("gateway_connected"))
+            ),
         ),
     ]
     parts: dict[str, object] = {}
     for label, path, body_ok_fn in probes:
         try:
-            response = httpx.get(
-                f"{_api_base()}{path}", headers=_api_headers(), timeout=5.0
-            )
+            response = httpx.get(f"{_api_base()}{path}", headers=_api_headers(), timeout=5.0)
             parts[label] = _parse_probe(response, body_ok_fn)
         except httpx.ConnectError:
             parts[label] = {"error": "connection refused"}
@@ -702,8 +698,11 @@ def instruments_refresh(
         "databento",
         "--provider",
         help=(
-            "Provider to pre-warm: ``databento`` (supported) or "
-            "``interactive_brokers`` (deferred to follow-up PR)."
+            "Provider to pre-warm: ``databento`` (Parquet ``.Z.N`` "
+            "continuous futures via DatabentoClient) or "
+            "``interactive_brokers`` (short-lived IB Gateway client; "
+            "uses ``IB_INSTRUMENT_CLIENT_ID=999`` by default — see "
+            "nautilus.md gotcha #3 for the collision contract)."
         ),
     ),
     start: str = typer.Option(
@@ -725,35 +724,131 @@ def instruments_refresh(
     """Pre-warm the instrument registry so later deployments never hit a
     cold-miss at bar-event time.
 
-    This is the PRD §47-48 pre-warm tool.  Operators run it before
+    This is the PRD §47-48 pre-warm tool. Operators run it before
     deploying a new strategy so:
 
     * Backtest resolve (:meth:`SecurityMaster.resolve_for_backtest`)
-      succeeds on the ``.Z.N`` continuous-futures path by downloading the
-      Databento ``definition`` payload and upserting the registry row.
+      succeeds on the ``.Z.N`` continuous-futures path by downloading
+      the Databento ``definition`` payload and upserting the registry
+      row.
     * Live resolve (:meth:`SecurityMaster.resolve_for_live`) — for
-      ``--provider interactive_brokers`` — is **deferred to a follow-up
-      PR** because the claude-version :class:`Settings` model does not
-      yet expose the fields required to build a short-lived
-      :class:`IBQualifier` (``ib_request_timeout_seconds``,
-      ``ib_instrument_client_id``, dual paper/live port).  Adding those
-      is out-of-scope for the registry PR; the Databento path is the
-      shipping surface.
+      ``--provider interactive_brokers`` — connects a short-lived
+      Nautilus IB client, qualifies each requested symbol against IB
+      Gateway, upserts registry rows, then disconnects. Day-1 scope
+      is the closed universe ``resolve_for_live`` supports today:
+      ``AAPL``, ``MSFT``, ``SPY``, ``EUR/USD``, ``ES``.
+
+    Settings read (for ``--provider interactive_brokers``):
+
+    * ``IB_HOST`` / ``IB_PORT`` / ``IB_ACCOUNT_ID`` — gateway target
+      (paper port 4002/4004 + ``DU*``/``DF*`` account, or live port
+      4001/4003 + non-``D`` account; gotcha #6 mismatch guard fires
+      at preflight).
+    * ``IB_CONNECT_TIMEOUT_SECONDS`` (default 5) — gateway-reachability
+      probe.
+    * ``IB_REQUEST_TIMEOUT_SECONDS`` (default 30) — per-symbol
+      qualification round-trip.
+    * ``IB_INSTRUMENT_CLIENT_ID`` (default 999) — surfaced in every
+      preflight log; see nautilus.md gotcha #3 for the collision
+      contract.
     """
     symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
     if not symbol_list:
         _fail("no symbols provided")
 
     if provider == "interactive_brokers":
-        _fail(
-            "The `--provider interactive_brokers` path is deferred to a "
-            "follow-up PR — IBQualifier construction requires IB settings "
-            "that are not yet on the Settings model (see CLI docstring for "
-            "details).  For now, pre-warm the Databento registry with "
-            "`--provider databento` and run the live deployment — "
-            "SecurityMaster.resolve_for_live will cold-resolve via the "
-            "existing live_instrument_bootstrap path on first start.",
+        from msai.services.nautilus.live_instrument_bootstrap import (
+            canonical_instrument_id,
+            phase_1_paper_symbols,
         )
+
+        # Build an exact accepted-alias set per supported root. Each
+        # root admits three shapes: bare (``AAPL``), stable dotted
+        # (``AAPL.NASDAQ``, ``ES.CME``), and the concrete canonical
+        # form that canonical_instrument_id produces (``ESM6.CME``
+        # for today's front-month ES). PRD US-006: operators must
+        # be able to feed the CLI's own ``resolved`` output back in
+        # as a re-run. Exact membership avoids the permissive-strip
+        # trap (e.g. ``SPY.NASDAQ`` silently normalizing to ``SPY``
+        # via generic suffix stripping).
+        known = phase_1_paper_symbols()
+        # Mirror the compatibility surface canonical_instrument_id
+        # already accepts so the pre-warm CLI isn't narrower than
+        # SecurityMaster.resolve_for_live (iter-4/iter-6 review):
+        #
+        # - ``ES.XCME`` — legacy MIC, pre-venue-rename configs
+        # - ``EUR`` — bare shorthand for ``EUR/USD``
+        #
+        # Values are EXTRA aliases beyond {root, canonical, stable}.
+        # Bare-shorthand entries (no dot) also admit the shorthand +
+        # current-venue dotted form.
+        legacy_aliases_by_root: dict[str, tuple[str, ...]] = {
+            "ES": ("ES.XCME",),
+            "EUR/USD": ("EUR",),
+        }
+        accepted: dict[str, str] = {}
+        for root in known:
+            accepted[root] = root
+            canonical = canonical_instrument_id(root)
+            accepted[canonical] = root
+            canonical_venue = canonical.rsplit(".", 1)[1]
+            accepted[f"{root}.{canonical_venue}"] = root
+            for legacy in legacy_aliases_by_root.get(root, ()):
+                accepted[legacy] = root
+                if "." not in legacy:
+                    accepted[f"{legacy}.{canonical_venue}"] = root
+
+        normalized: list[str] = []
+        unknown: list[str] = []
+        for s in symbol_list:
+            if s in accepted:
+                normalized.append(accepted[s])
+            else:
+                unknown.append(s)
+        if unknown:
+            _fail(
+                f"symbol(s) {unknown} not in the closed universe for "
+                f"--provider interactive_brokers. Supported inputs: "
+                f"{sorted(accepted)}. Options outside this list "
+                f"require the live-path wiring PR (follow-up)."
+            )
+        symbol_list = normalized
+
+        # Port/account mode consistency (gotcha #6 guard). Runs BEFORE
+        # any IB connection so a misconfigured operator can't even
+        # burn the client_id slot trying.
+        from msai.services.nautilus.ib_port_validator import (
+            validate_port_account_consistency,
+        )
+
+        try:
+            validate_port_account_consistency(
+                settings.ib_port,
+                settings.ib_account_id,
+            )
+        except ValueError as exc:
+            _fail(str(exc))
+
+        # Log the resolved tuple so operators can grep `docker logs`
+        # if anything downstream goes wrong. Written to stderr so
+        # stdout stays valid JSON for piping into jq/scripts — the
+        # Databento branch's _emit_json contract applies here too.
+        typer.echo(
+            f"Pre-warming IB registry: host={settings.ib_host} "
+            f"port={settings.ib_port} "
+            f"account={settings.ib_account_id.strip()} "
+            f"client_id={settings.ib_instrument_client_id} "
+            f"connect_timeout={settings.ib_connect_timeout_seconds}s "
+            f"request_timeout={settings.ib_request_timeout_seconds}s",
+            err=True,
+        )
+
+        try:
+            resolved = asyncio.run(_run_ib_resolve_for_live(symbol_list))
+        except _IBGatewayUnreachableError as exc:
+            _fail(str(exc))
+        _emit_json({"provider": provider, "resolved": resolved})
+        return
 
     if provider != "databento":
         raise typer.BadParameter(
@@ -801,6 +896,150 @@ def instruments_refresh(
     typer.echo(f"Pre-warming registry for {symbol_list} via Databento...")
     resolved = asyncio.run(_run())
     _emit_json({"provider": provider, "resolved": resolved})
+
+
+class _IBGatewayUnreachableError(RuntimeError):
+    """Raised by ``_run_ib_resolve_for_live`` when the caller-side
+    ``asyncio.wait_for`` fence on ``client._is_client_ready`` fires.
+
+    Caught at the CLI boundary and converted to ``_fail(str(exc))`` so
+    the operator sees a clear hint naming the relevant env vars and
+    the paper/live mismatch trap.
+    """
+
+
+async def _run_ib_resolve_for_live(symbol_list: list[str]) -> list[str]:
+    """Short-lived Nautilus IB client lifecycle wrapping
+    :meth:`SecurityMaster.resolve_for_live`.
+
+    Lifecycle:
+
+    1. Cap the IB client's internal reconnect loop to one attempt
+       (``IB_MAX_CONNECTION_ATTEMPTS=1``) BEFORE constructing the
+       client. ``InteractiveBrokersClient._connect`` catches all
+       exceptions and ``_start_async``'s outer ``while not
+       _is_ib_connected`` loop retries forever in the background;
+       capping attempts makes the retry loop bounded.
+    2. Build MessageBus + Cache + LiveClock.
+    3. ``get_cached_ib_client(...)`` — this ALREADY calls
+       ``client.start()`` internally at construction. Do NOT call
+       ``client.start()`` again: it would schedule a second
+       ``_start_async`` task racing the first.
+    4. Connect fence: ``asyncio.wait_for`` on
+       ``client._is_client_ready.wait()`` — the caller owns the
+       timeout. Nautilus's ``wait_until_ready`` silently swallows
+       ``TimeoutError`` and only logs, giving a "dead gateway looks
+       ready" false-negative.
+    5. ``get_cached_interactive_brokers_instrument_provider`` → wrap
+       in the existing :class:`IBQualifier`.
+    6. ``SecurityMaster.resolve_for_live(symbols)`` + commit. Upserts
+       rows into ``instrument_definitions`` + ``instrument_aliases``.
+    7. ``try/finally`` teardown: ``await client._stop_async()``
+       DIRECTLY. The public ``client.stop()`` only schedules
+       ``_stop_async`` as a task; awaiting it ourselves guarantees
+       the TCP disconnect completes before the process exits (US-005:
+       re-run within 60s without leaving a zombie ``client_id``
+       slot). FSM state doesn't matter because we're exiting
+       immediately.
+    """
+    import os
+
+    # Cap the reconnect loop BEFORE client construction — the client
+    # reads this env var on first call to `_start_async`; setting it
+    # AFTER construction is too late.
+    os.environ.setdefault("IB_MAX_CONNECTION_ATTEMPTS", "1")
+
+    # Import Nautilus only inside the function so the CLI module stays
+    # importable on machines without the IB extras (ruff / mypy in CI).
+    from nautilus_trader.adapters.interactive_brokers.factories import (
+        get_cached_ib_client,
+        get_cached_interactive_brokers_instrument_provider,
+    )
+    from nautilus_trader.cache.cache import Cache  # type: ignore[import-not-found]
+    from nautilus_trader.common.component import (  # type: ignore[import-not-found]
+        LiveClock,
+        MessageBus,
+    )
+    from nautilus_trader.model.identifiers import TraderId  # type: ignore[import-not-found]
+
+    from msai.services.nautilus.live_instrument_bootstrap import (
+        build_ib_instrument_provider_config,
+    )
+    from msai.services.nautilus.security_master.ib_qualifier import IBQualifier
+
+    clock = LiveClock()
+    trader_id = TraderId("MSAI-INSTRUMENTS-REFRESH")
+    msgbus = MessageBus(trader_id=trader_id, clock=clock)
+    cache = Cache()
+
+    client = get_cached_ib_client(
+        loop=asyncio.get_running_loop(),
+        msgbus=msgbus,
+        cache=cache,
+        clock=clock,
+        host=settings.ib_host,
+        port=settings.ib_port,
+        client_id=settings.ib_instrument_client_id,
+        request_timeout_secs=settings.ib_request_timeout_seconds,
+    )
+    # NOTE: get_cached_ib_client ALREADY calls client.start() internally.
+    # DO NOT call client.start() here — it would schedule a second
+    # _start_async task racing the first.
+
+    try:
+        # Caller-side timeout fence — bypasses `wait_until_ready`
+        # which silently swallows TimeoutError and only logs.
+        try:
+            await asyncio.wait_for(
+                client._is_client_ready.wait(),
+                timeout=settings.ib_connect_timeout_seconds,
+            )
+        except TimeoutError as exc:
+            raise _IBGatewayUnreachableError(
+                f"IB Gateway not reachable at {settings.ib_host}:"
+                f"{settings.ib_port} within "
+                f"{settings.ib_connect_timeout_seconds}s. Check: "
+                f"(a) gateway container running, "
+                f"(b) IB_PORT matches IB_ACCOUNT_ID prefix "
+                f"(DU/DF* → paper 4002/4004, U* → live 4001/4003), "
+                f"(c) IB_INSTRUMENT_CLIENT_ID={settings.ib_instrument_client_id} "
+                f"not colliding with an active subprocess."
+            ) from exc
+
+        provider_cfg = build_ib_instrument_provider_config(symbol_list)
+        provider = get_cached_interactive_brokers_instrument_provider(
+            client=client,
+            clock=clock,
+            config=provider_cfg,
+        )
+        qualifier = IBQualifier(provider)
+
+        # Commit per symbol so a mid-batch failure preserves the
+        # already-qualified rows (PRD US-001 edge case: "rows for
+        # symbols already qualified are committed; idempotent re-run
+        # recovers"). A single batched commit would roll back symbol
+        # 1's flushed rows when symbol 2 fails.
+        resolved: list[str] = []
+        async with async_session_factory() as session:
+            sm = SecurityMaster(qualifier=qualifier, db=session)
+            for sym in symbol_list:
+                try:
+                    resolved.extend(await sm.resolve_for_live([sym]))
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
+                    raise
+
+        return resolved
+    finally:
+        # Await `_stop_async` DIRECTLY. `client.stop()` would schedule
+        # it as a task — if we then also awaited it we'd run the
+        # coroutine twice. Going direct sidesteps the race; FSM state
+        # doesn't matter because the process exits immediately after.
+        try:
+            await client._stop_async()
+        except Exception:  # pragma: no cover — best-effort teardown
+            log.warning("ib_refresh_teardown_error", exc_info=True)
 
 
 if __name__ == "__main__":
