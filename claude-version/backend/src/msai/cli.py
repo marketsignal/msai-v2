@@ -830,14 +830,17 @@ def instruments_refresh(
             _fail(str(exc))
 
         # Log the resolved tuple so operators can grep `docker logs`
-        # if anything downstream goes wrong.
+        # if anything downstream goes wrong. Written to stderr so
+        # stdout stays valid JSON for piping into jq/scripts — the
+        # Databento branch's _emit_json contract applies here too.
         typer.echo(
             f"Pre-warming IB registry: host={settings.ib_host} "
             f"port={settings.ib_port} "
             f"account={settings.ib_account_id.strip()} "
             f"client_id={settings.ib_instrument_client_id} "
             f"connect_timeout={settings.ib_connect_timeout_seconds}s "
-            f"request_timeout={settings.ib_request_timeout_seconds}s"
+            f"request_timeout={settings.ib_request_timeout_seconds}s",
+            err=True,
         )
 
         try:
