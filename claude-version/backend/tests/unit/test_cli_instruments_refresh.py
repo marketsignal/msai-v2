@@ -175,6 +175,7 @@ class TestRefreshDatabento:
         "EUR/USD.IDEALPRO",  # FX dotted alias
         "ES.CME",  # bare-root futures dotted alias
         "ESM6.CME",  # month-qualified futures alias (CLI's own ES output)
+        "ES.XCME",  # legacy MIC — still accepted for backwards compat
     ],
 )
 def test_ib_provider_accepts_dotted_and_futures_aliases(
@@ -317,6 +318,75 @@ def _ib_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("IB_REQUEST_TIMEOUT_SECONDS", "30")
     monkeypatch.setenv("IB_INSTRUMENT_CLIENT_ID", "999")
     monkeypatch.setattr(cli_mod, "settings", Settings())
+
+
+def test_ib_provider_per_symbol_commit_preserves_earlier_successes(
+    _ib_env: None,
+    runner: CliRunner,
+) -> None:
+    """PRD US-001 edge case: 'Mid-batch qualification failure (symbol
+    #2/5) → Exit non-zero; rows for symbols already qualified are
+    committed (idempotent re-run recovers).'
+
+    CLI loops symbol-by-symbol and commits each. A failure on symbol
+    2 rolls back only the failed symbol's session state; symbol 1's
+    commit is durable. Verified here by counting session.commit() calls.
+    """
+    mock_client = MagicMock()
+    mock_client._is_client_ready = MagicMock()
+    mock_client._is_client_ready.wait = AsyncMock(return_value=None)
+    mock_client._stop_async = AsyncMock(return_value=None)
+
+    # resolve_for_live succeeds on AAPL, fails on MSFT.
+    call_count = {"n": 0}
+
+    async def _fake_resolve(self, symbols: list[str]) -> list[str]:
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise RuntimeError("simulated IB failure on symbol #2")
+        return [f"{s}.NASDAQ" for s in symbols]
+
+    fake_session = MagicMock()
+    fake_session.commit = AsyncMock()
+    fake_session.rollback = AsyncMock()
+    fake_session_cm = MagicMock()
+    fake_session_cm.__aenter__ = AsyncMock(return_value=fake_session)
+    fake_session_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with (
+        patch(
+            "nautilus_trader.adapters.interactive_brokers.factories.get_cached_ib_client",
+            return_value=mock_client,
+        ),
+        patch(
+            "nautilus_trader.adapters.interactive_brokers.factories."
+            "get_cached_interactive_brokers_instrument_provider",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "msai.services.nautilus.security_master.service.SecurityMaster.resolve_for_live",
+            _fake_resolve,
+        ),
+        patch("msai.cli.async_session_factory", return_value=fake_session_cm),
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "instruments",
+                "refresh",
+                "--symbols",
+                "AAPL,MSFT",
+                "--provider",
+                "interactive_brokers",
+            ],
+        )
+
+    # Exit non-zero (symbol 2 failed).
+    assert result.exit_code != 0
+    # But: symbol 1's success was committed (1 commit), symbol 2's
+    # rollback fired once (for the failed call).
+    assert fake_session.commit.await_count == 1
+    assert fake_session.rollback.await_count == 1
 
 
 def test_ib_provider_happy_path_calls_factory_and_resolve(

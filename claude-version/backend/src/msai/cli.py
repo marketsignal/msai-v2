@@ -772,6 +772,11 @@ def instruments_refresh(
         # trap (e.g. ``SPY.NASDAQ`` silently normalizing to ``SPY``
         # via generic suffix stripping).
         known = phase_1_paper_symbols()
+        # Legacy MIC suffixes still accepted by canonical_instrument_id
+        # for backwards compatibility with older configs/scripts.
+        # Mirror that surface so operators upgrading from a pre-venue-
+        # rename config don't suddenly get rejected at the CLI.
+        legacy_mic_by_root = {"ES": "XCME"}
         accepted: dict[str, str] = {}
         for root in known:
             accepted[root] = root
@@ -779,6 +784,9 @@ def instruments_refresh(
             accepted[canonical] = root
             stable = f"{root}.{canonical.rsplit('.', 1)[1]}"
             accepted[stable] = root
+            legacy = legacy_mic_by_root.get(root)
+            if legacy is not None:
+                accepted[f"{root}.{legacy}"] = root
 
         normalized: list[str] = []
         unknown: list[str] = []
@@ -993,14 +1001,21 @@ async def _run_ib_resolve_for_live(symbol_list: list[str]) -> list[str]:
         )
         qualifier = IBQualifier(provider)
 
+        # Commit per symbol so a mid-batch failure preserves the
+        # already-qualified rows (PRD US-001 edge case: "rows for
+        # symbols already qualified are committed; idempotent re-run
+        # recovers"). A single batched commit would roll back symbol
+        # 1's flushed rows when symbol 2 fails.
+        resolved: list[str] = []
         async with async_session_factory() as session:
             sm = SecurityMaster(qualifier=qualifier, db=session)
-            try:
-                resolved = await sm.resolve_for_live(symbol_list)
-                await session.commit()
-            except Exception:
-                await session.rollback()
-                raise
+            for sym in symbol_list:
+                try:
+                    resolved.extend(await sm.resolve_for_live([sym]))
+                    await session.commit()
+                except Exception:
+                    await session.rollback()
+                    raise
 
         return resolved
     finally:
