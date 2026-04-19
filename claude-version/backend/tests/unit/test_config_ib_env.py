@@ -83,3 +83,33 @@ def test_explicit_ib_host_wins_over_alias(monkeypatch: pytest.MonkeyPatch) -> No
 
     settings = Settings()
     assert settings.ib_host == "override.example.com"
+
+
+def test_ib_connect_timeout_seconds_default_and_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fresh instance reads IB_CONNECT_TIMEOUT_SECONDS alias; defaults to 5."""
+    from msai.core.config import Settings
+
+    monkeypatch.delenv("IB_CONNECT_TIMEOUT_SECONDS", raising=False)
+    assert Settings().ib_connect_timeout_seconds == 5
+    monkeypatch.setenv("IB_CONNECT_TIMEOUT_SECONDS", "12")
+    assert Settings().ib_connect_timeout_seconds == 12
+
+
+def test_ib_request_timeout_seconds_default_and_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fresh instance reads IB_REQUEST_TIMEOUT_SECONDS alias; defaults to 30."""
+    from msai.core.config import Settings
+
+    monkeypatch.delenv("IB_REQUEST_TIMEOUT_SECONDS", raising=False)
+    assert Settings().ib_request_timeout_seconds == 30
+    monkeypatch.setenv("IB_REQUEST_TIMEOUT_SECONDS", "60")
+    assert Settings().ib_request_timeout_seconds == 60
+
+
+def test_ib_instrument_client_id_default_and_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fresh instance reads IB_INSTRUMENT_CLIENT_ID alias; defaults to 999."""
+    from msai.core.config import Settings
+
+    monkeypatch.delenv("IB_INSTRUMENT_CLIENT_ID", raising=False)
+    assert Settings().ib_instrument_client_id == 999
+    monkeypatch.setenv("IB_INSTRUMENT_CLIENT_ID", "900")
+    assert Settings().ib_instrument_client_id == 900
