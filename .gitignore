@@ -50,6 +50,7 @@ data/alerts/
 .env
 .env.local
 .env.*.local
+.env.*-backup*
 docker-compose.override.yml
 
 # IB Gateway credentials
