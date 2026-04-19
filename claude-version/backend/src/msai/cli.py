@@ -344,9 +344,7 @@ def backtest_run(
 @backtest_app.command("history")
 def backtest_history(
     page: int = typer.Option(1, help="Page number (1-indexed)"),
-    page_size: int = typer.Option(
-        20, help="Rows per page (backend max is 100)"
-    ),
+    page_size: int = typer.Option(20, help="Rows per page (backend max is 100)"),
 ) -> None:
     """List recent backtests with status + metrics.
 
@@ -527,9 +525,7 @@ def graduation_show(
             headers=_api_headers(),
             timeout=10.0,
         )
-        transitions = (
-            transitions_response.json() if transitions_response.is_success else []
-        )
+        transitions = transitions_response.json() if transitions_response.is_success else []
     except httpx.RequestError:
         # Transport error on the transitions fetch isn't fatal — the
         # candidate body still has value.
@@ -665,17 +661,17 @@ def system_health() -> None:
         (
             "account",
             "/api/v1/account/health",
-            lambda b: isinstance(b, dict)
-            and b.get("status") == "healthy"
-            and bool(b.get("gateway_connected")),
+            lambda b: (
+                isinstance(b, dict)
+                and b.get("status") == "healthy"
+                and bool(b.get("gateway_connected"))
+            ),
         ),
     ]
     parts: dict[str, object] = {}
     for label, path, body_ok_fn in probes:
         try:
-            response = httpx.get(
-                f"{_api_base()}{path}", headers=_api_headers(), timeout=5.0
-            )
+            response = httpx.get(f"{_api_base()}{path}", headers=_api_headers(), timeout=5.0)
             parts[label] = _parse_probe(response, body_ok_fn)
         except httpx.ConnectError:
             parts[label] = {"error": "connection refused"}
@@ -745,15 +741,25 @@ def instruments_refresh(
         _fail("no symbols provided")
 
     if provider == "interactive_brokers":
-        _fail(
-            "The `--provider interactive_brokers` path is deferred to a "
-            "follow-up PR — IBQualifier construction requires IB settings "
-            "that are not yet on the Settings model (see CLI docstring for "
-            "details).  For now, pre-warm the Databento registry with "
-            "`--provider databento` and run the live deployment — "
-            "SecurityMaster.resolve_for_live will cold-resolve via the "
-            "existing live_instrument_bootstrap path on first start.",
+        from msai.services.nautilus.live_instrument_bootstrap import (
+            phase_1_paper_symbols,
         )
+
+        # Preflight 1: reject symbols outside the resolve_for_live
+        # closed universe (AAPL, MSFT, SPY, EUR/USD, ES today).
+        known = phase_1_paper_symbols()
+        unknown = [s for s in symbol_list if s not in known]
+        if unknown:
+            _fail(
+                f"symbol(s) {unknown} not in the closed universe for "
+                f"--provider interactive_brokers. Supported symbols: "
+                f"{sorted(known)}. Options outside this list require the "
+                f"live-path wiring PR (follow-up)."
+            )
+
+        # TODO(Task B2): port/account validator preflight
+        # TODO(Task B3): connect + qualify + teardown
+        _fail("Task B1 complete; connect+qualify not yet implemented — continue with Task B2.")
 
     if provider != "databento":
         raise typer.BadParameter(

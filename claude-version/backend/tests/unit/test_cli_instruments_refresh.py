@@ -8,10 +8,9 @@ registry.  It has two provider paths:
   :meth:`SecurityMaster._resolve_databento_continuous`.  Tested here by
   mocking the Databento client + SecurityMaster.
 
-- ``--provider interactive_brokers`` — deferred to a follow-up PR
-  (IBQualifier construction requires IB settings + factory plumbing that
-  this PR does not ship).  We verify the command raises a clear
-  ``NotImplementedError``-style exit with an operator hint.
+- ``--provider interactive_brokers`` — short-lived Nautilus IB
+  client. Tested here with the factory chain + ``SecurityMaster``
+  mocked so the tests don't touch real IB Gateway.
 """
 
 from __future__ import annotations
@@ -165,34 +164,26 @@ class TestRefreshDatabento:
 
 
 # ----------------------------------------------------------------------
-# --provider interactive_brokers path (deferred to follow-up PR)
+# --provider interactive_brokers path
 # ----------------------------------------------------------------------
 
 
-class TestRefreshIBDeferred:
-    def test_refresh_ib_raises_not_implemented(self, runner: CliRunner) -> None:
-        """The IB provider path is explicitly deferred: invoking it raises a
-        clear error pointing operators at the Databento path + the
-        follow-up PR.
-
-        Rationale: the claude-version ``Settings`` model does not yet have
-        ``ib_request_timeout_seconds`` / ``ib_instrument_client_id`` /
-        ``ib_port_paper`` fields needed to build a short-lived
-        :class:`IBQualifier`.  Adding those is out-of-scope for the
-        registry PR; they land with the live-wiring follow-up.
-        """
-        result = runner.invoke(
-            app,
-            [
-                "instruments",
-                "refresh",
-                "--symbols",
-                "AAPL,ES",
-                "--provider",
-                "interactive_brokers",
-            ],
-        )
-
-        assert result.exit_code != 0
-        # Error must point operators at the Databento path + follow-up PR.
-        assert "follow-up" in result.output.lower() or "databento" in result.output.lower()
+def test_ib_provider_rejects_unknown_symbol(runner: CliRunner) -> None:
+    """Symbols outside PHASE_1_PAPER_SYMBOLS are rejected in preflight,
+    before any IB connection is attempted."""
+    result = runner.invoke(
+        app,
+        [
+            "instruments",
+            "refresh",
+            "--symbols",
+            "NVDA",
+            "--provider",
+            "interactive_brokers",
+        ],
+    )
+    assert result.exit_code != 0
+    combined = (result.stderr or "") + (result.stdout or "") + result.output
+    # Error names the unknown symbol AND the closed universe
+    assert "NVDA" in combined
+    assert "AAPL" in combined  # a symbol from PHASE_1_PAPER_SYMBOLS
