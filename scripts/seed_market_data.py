@@ -7,7 +7,6 @@ Writes Parquet files to: {data_root}/parquet/stocks/{SYMBOL}/2025/01.parquet
 
 Usage:
     python scripts/seed_market_data.py claude-version/data
-    python scripts/seed_market_data.py codex-version/data
 """
 
 from __future__ import annotations

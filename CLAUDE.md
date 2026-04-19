@@ -7,44 +7,11 @@
 MSAI v2 is a personal hedge fund platform for automated trading via Interactive Brokers. It enables defining trading strategies as Python files, backtesting them against historical minute-level data, deploying them to live/paper trading, and monitoring portfolio performance through a web dashboard.
 MSAI v2 is an API-first, CLI-second, UI-third product.
 
-### Two Competing Implementations
+### History: the two-version experiment
 
-This project has **two versions** built from the same design and implementation plan, now being compared side-by-side:
+This project was originally built in parallel by Claude Opus 4.6 (`claude-version/`) and OpenAI Codex GPT-5.3 (`codex-version/`) from the same PRD, and compared side-by-side through 2026-02 to 2026-04. The comparison concluded 2026-04-19 with council verdict **keep claude-version, kill codex-version** (see [`docs/decisions/which-version-to-keep.md`](docs/decisions/which-version-to-keep.md)). `codex-version/` was archived at tag `codex-final` and removed from the tree. A reattempt at porting the codex Playwright specs was abandoned when plan review found the UI drift too large to port faithfully (see the postscript in the decision doc). **Only `claude-version/` ships.**
 
-|                 | Claude Version                                    | Codex Version           |
-| --------------- | ------------------------------------------------- | ----------------------- |
-| **Built by**    | Claude Opus 4.6                                   | OpenAI Codex (GPT-5.3)  |
-| **Location**    | `claude-version/`                                 | `codex-version/`        |
-| **Frontend**    | `http://localhost:3300`                           | `http://localhost:3400` |
-| **Backend API** | `http://localhost:8800`                           | `http://localhost:8400` |
-| **PostgreSQL**  | `localhost:5433`                                  | `localhost:5434`        |
-| **Redis**       | `localhost:6380`                                  | `localhost:6381`        |
-| **Design doc**  | `docs/plans/2026-02-25-msai-v2-design.md`         | Same                    |
-| **Impl plan**   | `docs/plans/2026-02-25-msai-v2-implementation.md` | Same                    |
-
-### Running Both Versions Side-by-Side
-
-```bash
-# Start Claude version (ports 3300, 8800, 5433, 6380)
-cd claude-version && docker compose -f docker-compose.dev.yml up -d
-
-# Start Codex version (ports 3400, 8400, 5434, 6381)
-cd codex-version && docker compose -f docker-compose.dev.yml up -d
-
-# Open both in browser
-open http://localhost:3300   # Claude frontend
-open http://localhost:3400   # Codex frontend
-
-# API health checks
-curl http://localhost:8800/health   # Claude backend
-curl http://localhost:8400/health   # Codex backend
-
-# Stop both
-cd claude-version && docker compose -f docker-compose.dev.yml down
-cd codex-version && docker compose -f docker-compose.dev.yml down
-```
-
-### Tech Stack (both versions)
+### Stack
 
 - **Backend:** Python 3.12 + FastAPI + NautilusTrader + arq (Redis job queue)
 - **Frontend:** Next.js 15 + React + shadcn/ui + Tailwind CSS + TradingView Charts
@@ -52,32 +19,55 @@ cd codex-version && docker compose -f docker-compose.dev.yml down
 - **Auth:** Azure Entra ID (MSAL frontend, PyJWT backend)
 - **Deploy:** Docker Compose on Azure VM
 
+### Ports (dev)
+
+| Service            | Host port | Container port |
+| ------------------ | --------- | -------------- |
+| Frontend (Next.js) | `3300`    | `3000`         |
+| Backend (FastAPI)  | `8800`    | `8000`         |
+| PostgreSQL         | `5433`    | `5432`         |
+| Redis              | `6380`    | `6379`         |
+
+### Running the stack
+
+```bash
+cd claude-version && docker compose -f docker-compose.dev.yml up -d
+
+# Health checks
+curl http://localhost:8800/health
+open http://localhost:3300
+
+# Stop
+cd claude-version && docker compose -f docker-compose.dev.yml down
+```
+
 ### File Structure
 
 ```
 msai-v2/
-├── claude-version/              # Built by Claude Opus 4.6
-│   ├── backend/                 # FastAPI + Python (153 tests)
+├── claude-version/              # The shipping implementation
+│   ├── backend/                 # FastAPI + Python (see claude-version/CLAUDE.md for counts)
 │   ├── frontend/                # Next.js 15 + shadcn/ui
 │   ├── docker-compose.dev.yml   # Ports: 3300, 8800, 5433, 6380
 │   ├── docker-compose.prod.yml
 │   └── CLAUDE.md                # Version-specific instructions
-├── codex-version/               # Built by OpenAI Codex (GPT-5.3)
-│   ├── backend/                 # FastAPI + Python
-│   ├── frontend/                # Next.js 15 + shadcn/ui
-│   ├── docker-compose.dev.yml   # Ports: 3400, 8400, 5434, 6381
-│   ├── docker-compose.prod.yml
-│   └── CLAUDE.md                # Version-specific instructions
 ├── docs/
+│   ├── decisions/
+│   │   └── which-version-to-keep.md    # Council verdict + option-C postscript
 │   ├── plans/
-│   │   ├── 2026-02-25-msai-v2-design.md           # Architecture (shared)
-│   │   └── 2026-02-25-msai-v2-implementation.md    # 50-task plan (shared)
+│   │   ├── 2026-02-25-msai-v2-design.md           # Architecture (the PRD)
+│   │   └── 2026-02-25-msai-v2-implementation.md   # 50-task plan
 │   └── CHANGELOG.md
 ├── research/
 │   └── trading-research-links.md   # 52 curated research links
+├── tests/e2e/                   # Shared Playwright scaffold (no specs shipped yet)
+│   ├── fixtures/
+│   ├── specs/
+│   └── use-cases/
 ├── .claude/                     # Claude Code configuration
 │   ├── commands/                # Workflow commands
 │   └── rules/                   # Coding standards (auto-loaded)
+├── playwright.config.ts         # Default baseURL http://localhost:3300
 ├── CLAUDE.md                    # This file (parent)
 └── CONTINUITY.md                # Session state
 ```
@@ -85,20 +75,31 @@ msai-v2/
 ### Key Commands
 
 ```bash
-# Claude version
-cd claude-version/backend && uv run pytest tests/ -v       # 153 tests
-cd claude-version/frontend && pnpm build                    # Build check
-cd claude-version && docker compose -f docker-compose.dev.yml up -d
+# Backend
+cd claude-version/backend && uv run pytest tests/ -v
+cd claude-version/backend && uv run ruff check src/
+cd claude-version/backend && uv run mypy src/ --strict
 
-# Codex version
-cd codex-version/backend && uv run pytest tests/ -v         # Tests
-cd codex-version/frontend && pnpm build                     # Build check
-cd codex-version && docker compose -f docker-compose.dev.yml up -d
+# Frontend
+cd claude-version/frontend && pnpm build
+cd claude-version/frontend && pnpm lint
 
-# Run both simultaneously
+# Docker dev
 cd claude-version && docker compose -f docker-compose.dev.yml up -d
-cd codex-version && docker compose -f docker-compose.dev.yml up -d
+cd claude-version && docker compose -f docker-compose.dev.yml logs -f
+cd claude-version && docker compose -f docker-compose.dev.yml down
+
+# Worker stale-import refresh (after merges to src/msai/services|workers|live_supervisor)
+cd claude-version && ./scripts/restart-workers.sh
 ```
+
+### Revival of `codex-version` (if ever needed)
+
+```bash
+git checkout codex-final -- codex-version/
+```
+
+Everything in `codex-version/` at deletion time is preserved at tag `codex-final`. No active work relies on it.
 
 ---
 
@@ -106,21 +107,21 @@ cd codex-version && docker compose -f docker-compose.dev.yml up -d
 
 **interface_type:** `fullstack` — MSAI v2 exposes an HTTP API (primary) and a Next.js UI (secondary). Per the project ordering rule ("API-first, CLI-second, UI-third"), the `verify-e2e` agent MUST test the API surface first, then the UI. An API failure means the contract/state is broken — stop immediately and diagnose; do not proceed to UI checks.
 
-**Which version to target.** Every E2E run declares exactly one target: `claude`, `codex`, or `both`. When use cases must be verified against both, run them sequentially (claude first, then codex) and produce one report per target. Never point a single run at mixed ports.
-
 **Server URLs:**
 
-| Target | API base URL            | UI base URL             | Postgres         | Redis            |
-| ------ | ----------------------- | ----------------------- | ---------------- | ---------------- |
-| claude | `http://localhost:8800` | `http://localhost:3300` | `localhost:5433` | `localhost:6380` |
-| codex  | `http://localhost:8400` | `http://localhost:3400` | `localhost:5434` | `localhost:6381` |
+| Surface    | URL                     |
+| ---------- | ----------------------- |
+| API base   | `http://localhost:8800` |
+| UI base    | `http://localhost:3300` |
+| PostgreSQL | `localhost:5433`        |
+| Redis      | `localhost:6380`        |
 
 All API routes are versioned under `/api/v1/` (see `.claude/rules/api-design.md`). Health: `GET /health`.
 
 **Pre-flight (before any E2E run):**
 
-1. `curl -sf $API/health` on the target — if it fails, start the stack from the version directory: `cd {claude,codex}-version && docker compose -f docker-compose.dev.yml up -d`.
-2. Confirm the UI responds at the target port (only if UI use cases are in scope).
+1. `curl -sf http://localhost:8800/health` — if it fails, start the stack: `cd claude-version && docker compose -f docker-compose.dev.yml up -d`.
+2. Confirm the UI responds at `http://localhost:3300` (only if UI use cases are in scope).
 3. For live-trading use cases: confirm IB Gateway is reachable (paper account `DU...` on port 4002, live account on 4001) — see `.claude/rules/nautilus.md` gotcha #6.
 
 **Auth.** The app uses Azure Entra ID (MSAL on the frontend, PyJWT on the backend). E2E runs should authenticate via the documented login flow OR use a dev-mode bypass token if one is configured — never by forging JWTs or reading secrets from disk.
@@ -128,13 +129,13 @@ All API routes are versioned under `/api/v1/` (see `.claude/rules/api-design.md`
 **ARRANGE (test setup) is allowed via any user-accessible interface:**
 
 - Public API: `POST /api/v1/strategies`, `POST /api/v1/backtests`, `POST /api/v1/live/start`, etc.
-- CLI scripts exposed in each version's `backend/` (treat as documented commands only).
+- CLI scripts exposed in `claude-version/backend/` (treat as documented commands only).
 - The dev seed/bootstrap scripts if present.
 
 **ARRANGE is NOT allowed via:**
 
-- Direct Postgres queries against `localhost:5433` / `localhost:5434`
-- Writing Parquet files into `claude-version/data/` or `codex-version/data/` by hand
+- Direct Postgres queries against `localhost:5433`
+- Writing Parquet files into `claude-version/data/` by hand
 - Pushing into Redis queues directly
 - Reading environment secrets to mint tokens
 
@@ -154,19 +155,18 @@ See `.claude/rules/testing.md` for the full use-case lifecycle (draft → execut
 
 ### Playwright Framework
 
-Already scaffolded at the repo root (shared across both versions):
+Scaffolded at the repo root:
 
-- `playwright.config.ts` — `baseURL` defaults to `http://localhost:3000`; override per run with `PLAYWRIGHT_BASE_URL=http://localhost:3300` (claude UI) or `:3400` (codex UI).
-- `tests/e2e/specs/` — graduated spec files (populated via Phase 6.2c).
+- `playwright.config.ts` — `baseURL` defaults to `http://localhost:3300` (claude UI). Override per run with `PLAYWRIGHT_BASE_URL=<url>`.
+- `tests/e2e/specs/` — graduated spec files (currently empty; future feature work should author claude-native specs here using `getByTestId`).
 - `tests/e2e/use-cases/` — markdown use cases (draft before graduation).
 - `tests/e2e/fixtures/` — auth fixture + helpers.
 - `tests/e2e/reports/` — HTML + JSON output.
 
-Run specs locally against one target at a time:
+Run specs locally:
 
 ```bash
-PLAYWRIGHT_BASE_URL=http://localhost:3300 pnpm exec playwright test   # Claude UI
-PLAYWRIGHT_BASE_URL=http://localhost:3400 pnpm exec playwright test   # Codex UI
+pnpm exec playwright test
 ```
 
 API-only use cases don't need Playwright — the `verify-e2e` agent hits the REST endpoints directly with curl/httpx.

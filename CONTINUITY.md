@@ -6,9 +6,49 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field   | Value |
-| ------- | ----- |
-| Command | none  |
+| Field     | Value                                                                |
+| --------- | -------------------------------------------------------------------- |
+| Command   | /new-feature playwright-e2e-port (pivoted to option C: archive only) |
+| Phase     | 6 — Finish                                                           |
+| Next step | Commit + push + ask user re: PR                                      |
+
+### Checklist
+
+- [x] Worktree created at `.worktrees/playwright-e2e-port` off `e9ac08e`
+- [x] Project state read
+- [x] Workflow tracking initialized
+- [x] Focused research (N/A — no new libraries) — `docs/research/2026-04-19-playwright-e2e-port.md`
+- [x] Selector-mapping table built — exploration revealed 14/15 codex copy strings absent from claude
+- [x] Implementation plan written — `docs/plans/2026-04-19-playwright-e2e-port.md`
+- [x] Plan review loop (1 iteration) — Claude + Codex both NEEDS_FIX; root cause = UI drift, not fixable within port scope
+- [x] **Pivot decision**: user chose option C (abandon port, delete codex-version directly). Documented in decision doc postscript.
+- [x] Updated `docs/decisions/which-version-to-keep.md` with option-C postscript + port-list struck through
+- [x] Tagged `codex-final` on `e9ac08e` (archival marker before deletion)
+- [x] `git rm -r codex-version/` (~17K LOC removed)
+- [x] `git rm` 15 Feb-25 baseline screenshot PNGs at repo root (~2.4 MB)
+- [x] Updated root `CLAUDE.md` — dropped "Two Competing Implementations" framing, single-stack operation
+- [x] Updated `playwright.config.ts` — default `baseURL` → `http://localhost:3300`
+- [x] Updated `scripts/seed_market_data.py` — removed codex-version usage example
+- [x] `.mcp.json` — no codex refs (verified)
+- [x] CONTINUITY updated
+- [ ] Sanity check — claude stack still boots after deletion
+- [ ] Committed and pushed
+- [ ] PR created (pending user approval)
+- [ ] Merged + branch deleted
+
+### Scope (as shipped — NOT the original port)
+
+**Original scope (abandoned):** port 9 Playwright specs from `codex-version/frontend/e2e/` to `tests/e2e/specs/`.
+
+**Actual scope (option C — see decision-doc postscript):**
+
+- Formalize keep-claude decision on disk (`docs/decisions/which-version-to-keep.md` + scratch)
+- Archive codex-version at tag `codex-final`
+- Delete `codex-version/` (~17K LOC)
+- Clean up 15 Feb-25 baseline screenshots
+- Update root CLAUDE.md to single-stack operation
+- Retarget `playwright.config.ts` baseURL to claude's `:3300`
+- Future Playwright work will author claude-native specs against `getByTestId`, not revive the codex ones.
 
 ## Done
 

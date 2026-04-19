@@ -30,7 +30,7 @@ export default defineConfig({
 
   use: {
     // Base URL — override via PLAYWRIGHT_BASE_URL env var
-    baseURL: process.env.PLAYWRIGHT_BASE_URL || "http://localhost:3000",
+    baseURL: process.env.PLAYWRIGHT_BASE_URL || "http://localhost:3300",
 
     // SECURITY: trace and video are OFF by default in CI.
     //
