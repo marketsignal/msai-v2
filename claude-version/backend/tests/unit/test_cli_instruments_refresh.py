@@ -168,18 +168,25 @@ class TestRefreshDatabento:
 # ----------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "symbol",
-    [
+def _accepted_alias_cases() -> list[str]:
+    """Build the accept-list dynamically so ES's month-qualified
+    alias follows today's canonical (doesn't rot on quarterly roll)."""
+    from msai.services.nautilus.live_instrument_bootstrap import (
+        canonical_instrument_id,
+    )
+
+    return [
         "AAPL.NASDAQ",  # equity dotted alias
         "EUR/USD.IDEALPRO",  # FX dotted alias
         "ES.CME",  # bare-root futures dotted alias
-        "ESM6.CME",  # month-qualified futures alias (CLI's own ES output)
+        canonical_instrument_id("ES"),  # CLI's own ES output (today's FM)
         "ES.XCME",  # legacy MIC — still accepted for backwards compat
         "EUR",  # FX shorthand — still accepted by canonical_instrument_id
         "EUR.IDEALPRO",  # FX shorthand + current venue
-    ],
-)
+    ]
+
+
+@pytest.mark.parametrize("symbol", _accepted_alias_cases())
 def test_ib_provider_accepts_dotted_and_futures_aliases(
     symbol: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -187,8 +194,11 @@ def test_ib_provider_accepts_dotted_and_futures_aliases(
 ) -> None:
     """PRD US-006: operators must be able to feed the CLI's own
     ``resolved`` output back in as a re-run. That output contains
-    dotted aliases for equity/FX AND month-qualified futures aliases
-    (``ESM6.CME``). Preflight must accept all four shapes.
+    dotted aliases for equity/FX AND month-qualified futures aliases.
+    Preflight must accept all shapes in ``_accepted_alias_cases``.
+
+    Stubs ``_run_ib_resolve_for_live`` so we don't block on a real
+    IB connect attempt (preflight-only assertion).
     """
     import msai.cli as cli_mod
     from msai.core.config import Settings
@@ -197,17 +207,22 @@ def test_ib_provider_accepts_dotted_and_futures_aliases(
     monkeypatch.setenv("IB_ACCOUNT_ID", "DU1234567")
     monkeypatch.setattr(cli_mod, "settings", Settings())
 
-    result = runner.invoke(
-        app,
-        [
-            "instruments",
-            "refresh",
-            "--symbols",
-            symbol,
-            "--provider",
-            "interactive_brokers",
-        ],
-    )
+    with patch.object(
+        cli_mod,
+        "_run_ib_resolve_for_live",
+        new=AsyncMock(return_value=["stub"]),
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "instruments",
+                "refresh",
+                "--symbols",
+                symbol,
+                "--provider",
+                "interactive_brokers",
+            ],
+        )
     # Preflight must NOT reject (unknown-symbol branch).
     combined = (result.stderr or "") + (result.stdout or "") + result.output
     assert "not in the closed universe" not in combined, combined
