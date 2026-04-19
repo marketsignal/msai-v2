@@ -168,6 +168,38 @@ class TestRefreshDatabento:
 # ----------------------------------------------------------------------
 
 
+def test_ib_provider_accepts_dotted_alias_and_strips_to_root(
+    monkeypatch: pytest.MonkeyPatch,
+    runner: CliRunner,
+) -> None:
+    """PRD US-006 edge case: ``AAPL.NASDAQ`` (dotted alias — the CLI's
+    own output shape) must be accepted and stripped to root ``AAPL``
+    before the closed-universe check. Otherwise operators can't feed
+    a previous ``resolved`` output back into the command.
+    """
+    import msai.cli as cli_mod
+    from msai.core.config import Settings
+
+    monkeypatch.setenv("IB_PORT", "4002")
+    monkeypatch.setenv("IB_ACCOUNT_ID", "DU1234567")
+    monkeypatch.setattr(cli_mod, "settings", Settings())
+
+    result = runner.invoke(
+        app,
+        [
+            "instruments",
+            "refresh",
+            "--symbols",
+            "AAPL.NASDAQ",
+            "--provider",
+            "interactive_brokers",
+        ],
+    )
+    # Preflight must NOT reject (unknown-symbol branch).
+    combined = (result.stderr or "") + (result.stdout or "") + result.output
+    assert "not in the closed universe" not in combined, combined
+
+
 def test_ib_provider_rejects_unknown_symbol(runner: CliRunner) -> None:
     """Symbols outside PHASE_1_PAPER_SYMBOLS are rejected in preflight,
     before any IB connection is attempted."""
@@ -190,7 +222,8 @@ def test_ib_provider_rejects_unknown_symbol(runner: CliRunner) -> None:
 
 
 def test_ib_provider_rejects_port_account_mismatch(
-    monkeypatch: pytest.MonkeyPatch, runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    runner: CliRunner,
 ) -> None:
     """Preflight validator fires BEFORE any IB connection attempt when
     IB_PORT and IB_ACCOUNT_ID disagree on paper vs live.
@@ -242,7 +275,8 @@ def _ib_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_ib_provider_happy_path_calls_factory_and_resolve(
-    _ib_env: None, runner: CliRunner,
+    _ib_env: None,
+    runner: CliRunner,
 ) -> None:
     """AAPL qualifies via the mocked factory chain + IBQualifier, then
     SecurityMaster.resolve_for_live commits. Exit 0. Asserts:
@@ -324,7 +358,8 @@ def test_ib_provider_happy_path_calls_factory_and_resolve(
 
 
 def test_ib_provider_dead_gateway_times_out_with_operator_hint(
-    monkeypatch: pytest.MonkeyPatch, runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    runner: CliRunner,
 ) -> None:
     """When the IB client never reaches ready state, CLI times out in
     the short connect-timeout window, prints an operator hint naming

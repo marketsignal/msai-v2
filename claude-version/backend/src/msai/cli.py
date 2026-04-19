@@ -761,21 +761,32 @@ def instruments_refresh(
             phase_1_paper_symbols,
         )
 
-        # Preflight 1: reject symbols outside the resolve_for_live
-        # closed universe (AAPL, MSFT, SPY, EUR/USD, ES today).
+        # Accept both bare roots (``AAPL``) and dotted aliases
+        # (``AAPL.NASDAQ``, ``EUR/USD.IDEALPRO``) per PRD US-006 edge
+        # case — so operators can feed the CLI's own ``resolved`` output
+        # back in as a re-run.
         known = phase_1_paper_symbols()
-        unknown = [s for s in symbol_list if s not in known]
+        normalized: list[str] = []
+        unknown: list[str] = []
+        for s in symbol_list:
+            root = s.rsplit(".", 1)[0] if "." in s else s
+            if root in known:
+                normalized.append(root)
+            else:
+                unknown.append(s)
         if unknown:
             _fail(
                 f"symbol(s) {unknown} not in the closed universe for "
                 f"--provider interactive_brokers. Supported symbols: "
-                f"{sorted(known)}. Options outside this list require the "
-                f"live-path wiring PR (follow-up)."
+                f"{sorted(known)} (bare root or ``ROOT.VENUE`` dotted "
+                f"alias both accepted). Options outside this list "
+                f"require the live-path wiring PR (follow-up)."
             )
+        symbol_list = normalized
 
-        # Preflight 2: port/account mode consistency (gotcha #6 guard).
-        # Runs BEFORE any IB connection so a misconfigured operator
-        # can't even burn the client_id slot trying.
+        # Port/account mode consistency (gotcha #6 guard). Runs BEFORE
+        # any IB connection so a misconfigured operator can't even
+        # burn the client_id slot trying.
         from msai.services.nautilus.ib_port_validator import (
             validate_port_account_consistency,
         )
@@ -788,8 +799,8 @@ def instruments_refresh(
         except ValueError as exc:
             _fail(str(exc))
 
-        # Preflight 3: log the resolved tuple so operators can grep
-        # `docker logs` if anything downstream goes wrong.
+        # Log the resolved tuple so operators can grep `docker logs`
+        # if anything downstream goes wrong.
         typer.echo(
             f"Pre-warming IB registry: host={settings.ib_host} "
             f"port={settings.ib_port} "
@@ -868,43 +879,41 @@ async def _run_ib_resolve_for_live(symbol_list: list[str]) -> list[str]:
     """Short-lived Nautilus IB client lifecycle wrapping
     :meth:`SecurityMaster.resolve_for_live`.
 
-    Lifecycle (research-verified against NautilusTrader 1.223.0):
+    Lifecycle:
 
     1. Cap the IB client's internal reconnect loop to one attempt
        (``IB_MAX_CONNECTION_ATTEMPTS=1``) BEFORE constructing the
-       client. ``_connect`` (``connection.py:45-99``) catches all
+       client. ``InteractiveBrokersClient._connect`` catches all
        exceptions and ``_start_async``'s outer ``while not
-       _is_ib_connected`` loop retries forever in the background —
-       capping attempts makes the retry loop bounded (research brief
-       finding #4).
+       _is_ib_connected`` loop retries forever in the background;
+       capping attempts makes the retry loop bounded.
     2. Build MessageBus + Cache + LiveClock.
     3. ``get_cached_ib_client(...)`` — this ALREADY calls
-       ``client.start()`` internally at construction
-       (``factories.py:122,134``). Do NOT call ``client.start()``
-       again (plan-review iter 1 P1).
+       ``client.start()`` internally at construction. Do NOT call
+       ``client.start()`` again: it would schedule a second
+       ``_start_async`` task racing the first.
     4. Connect fence: ``asyncio.wait_for`` on
        ``client._is_client_ready.wait()`` — the caller owns the
-       timeout. Nautilus's ``wait_until_ready``
-       (``client.py:362-376``) silently swallows ``TimeoutError`` and
-       only logs, giving a "dead gateway looks ready" false-negative
-       (research brief finding #1).
+       timeout. Nautilus's ``wait_until_ready`` silently swallows
+       ``TimeoutError`` and only logs, giving a "dead gateway looks
+       ready" false-negative.
     5. ``get_cached_interactive_brokers_instrument_provider`` → wrap
        in the existing :class:`IBQualifier`.
     6. ``SecurityMaster.resolve_for_live(symbols)`` + commit. Upserts
        rows into ``instrument_definitions`` + ``instrument_aliases``.
     7. ``try/finally`` teardown: ``await client._stop_async()``
        DIRECTLY. The public ``client.stop()`` only schedules
-       ``_stop_async`` as a task (``client.py:275,279``) — awaiting
-       it ourselves guarantees the TCP disconnect completes before
-       the process exits (US-005: re-run within 60s without zombie
-       ``client_id`` slot). FSM state doesn't matter because we're
-       exiting immediately.
+       ``_stop_async`` as a task; awaiting it ourselves guarantees
+       the TCP disconnect completes before the process exits (US-005:
+       re-run within 60s without leaving a zombie ``client_id``
+       slot). FSM state doesn't matter because we're exiting
+       immediately.
     """
     import os
 
-    # Finding #4 fix: cap the reconnect loop BEFORE client construction.
-    # `get_cached_ib_client` reads this env var on first call to
-    # `_start_async`; setting it AFTER construction is too late.
+    # Cap the reconnect loop BEFORE client construction — the client
+    # reads this env var on first call to `_start_async`; setting it
+    # AFTER construction is too late.
     os.environ.setdefault("IB_MAX_CONNECTION_ATTEMPTS", "1")
 
     # Import Nautilus only inside the function so the CLI module stays
@@ -940,14 +949,13 @@ async def _run_ib_resolve_for_live(symbol_list: list[str]) -> list[str]:
         client_id=settings.ib_instrument_client_id,
         request_timeout_secs=settings.ib_request_timeout_seconds,
     )
-    # NOTE: get_cached_ib_client ALREADY calls client.start() internally
-    # (nautilus_trader/adapters/interactive_brokers/factories.py:122,134).
+    # NOTE: get_cached_ib_client ALREADY calls client.start() internally.
     # DO NOT call client.start() here — it would schedule a second
-    # _start_async task, racing the first.
+    # _start_async task racing the first.
 
     try:
         # Caller-side timeout fence — bypasses `wait_until_ready`
-        # which swallows TimeoutError (research brief finding #1).
+        # which silently swallows TimeoutError and only logs.
         try:
             await asyncio.wait_for(
                 client._is_client_ready.wait(),
@@ -984,10 +992,9 @@ async def _run_ib_resolve_for_live(symbol_list: list[str]) -> list[str]:
 
         return resolved
     finally:
-        # Plan-review iter 1 P1 (#6): await `_stop_async` DIRECTLY.
-        # `client.stop()` would schedule it as a task (client.py:275,
-        # 279) — if we then also awaited it we'd run the coroutine
-        # twice. Going direct sidesteps the race and the FSM state
+        # Await `_stop_async` DIRECTLY. `client.stop()` would schedule
+        # it as a task — if we then also awaited it we'd run the
+        # coroutine twice. Going direct sidesteps the race; FSM state
         # doesn't matter because the process exits immediately after.
         try:
             await client._stop_async()

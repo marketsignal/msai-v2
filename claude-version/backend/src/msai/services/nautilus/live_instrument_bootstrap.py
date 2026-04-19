@@ -67,6 +67,19 @@ def exchange_local_today() -> date:
     return datetime.now(_CME_TZ).date()
 
 
+def third_friday_of(year: int, month: int) -> date:
+    """Return the third Friday of ``(year, month)`` — the CME monthly
+    futures expiration convention.
+
+    Public so both :func:`_current_quarterly_expiry` (below) and
+    :meth:`SecurityMaster._spec_from_canonical` can reuse the same
+    arithmetic without re-implementing it.
+    """
+    first = date(year, month, 1)
+    first_friday_offset = (4 - first.weekday()) % 7
+    return first + timedelta(days=first_friday_offset + 14)
+
+
 def _current_quarterly_expiry(today: date) -> str:
     """Return the next quarterly futures expiry as ``YYYYMM``.
 
@@ -99,10 +112,7 @@ def _current_quarterly_expiry(today: date) -> str:
         month = (today.month + months_ahead - 1) % 12 + 1
         if month % 3 != 0:
             continue
-        first_of_month = date(year, month, 1)
-        first_friday_offset = (4 - first_of_month.weekday()) % 7
-        third_friday = first_of_month + timedelta(days=first_friday_offset + 14)
-        if third_friday > today:
+        if third_friday_of(year, month) > today:
             return f"{year}{month:02d}"
     raise RuntimeError("Unreachable: no quarterly expiry within 12 months")
 

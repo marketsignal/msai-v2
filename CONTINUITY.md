@@ -26,12 +26,12 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 - [x] Council verdict: hybrid answers per chairman recommendation; 3 blocking objections adopted, 2 scope-creep additions overruled
 - [x] Plan written (`docs/plans/2026-04-18-instruments-refresh-ib-path.md`)
 - [x] Plan review loop (4 iterations) — PASS. Codex iter 1: 6 P1 + 4 P2 + 2 P3. Iter 2: 1 P1 + 4 P2 + 1 P3. Iter 3: 1 P1. Iter 4: clean.
-- [ ] TDD execution complete
+- [x] TDD execution complete (13 code/test commits across 4 batches, all red→green→refactor)
 - [ ] Code review loop (0 iterations) — iterate until no P0/P1/P2
 - [ ] Simplified
 - [ ] Verified (tests/lint/types)
-- [ ] E2E use cases designed (Phase 3.2b)
-- [ ] E2E verified via verify-e2e agent (Phase 5.4)
+- [x] E2E use cases designed (Phase 3.2b) — 6 user stories in PRD with Gherkin scenarios
+- [x] E2E verified — N/A via verify-e2e agent: manual Phase D paper drill on 2026-04-18 20:30 UTC executed all 5 use cases against running paper IB Gateway (DUP733213). Results persisted in docs/CHANGELOG.md Phase D section. Opt-in `pytest.mark.ib_paper` smoke file at `tests/e2e/test_instruments_refresh_ib_smoke.py` provides automated regression surface for future re-verification.
 - [ ] E2E regression passed (Phase 5.4b)
 - [ ] E2E use cases graduated to tests/e2e/use-cases/ (Phase 6.2b)
 - [ ] E2E specs graduated to tests/e2e/specs/ (Phase 6.2c — if Playwright framework installed)

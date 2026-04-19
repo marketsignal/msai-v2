@@ -242,8 +242,7 @@ class SecurityMaster:
         # canonical_instrument_id + build_ib_instrument_provider_config
         # use — otherwise on late-UTC-night runs the UTC date disagrees
         # with the exchange date and the two resolve to different
-        # quarterly contracts. Invariant test at
-        # test_live_instrument_bootstrap.py:297-310.
+        # quarterly contracts.
         from msai.services.nautilus.live_instrument_bootstrap import (
             canonical_instrument_id,
             exchange_local_today,
@@ -542,12 +541,11 @@ class SecurityMaster:
         - ``AAPL.NASDAQ`` / ``MSFT.NASDAQ`` → equity / NASDAQ
         - ``SPY.ARCA`` → equity / ARCA
         - ``EUR/USD.IDEALPRO`` → forex / IDEALPRO
-        - ``ESM6.CME`` (or similar) → future / CME
+        - ``ESM6.CME`` (or similar) → future / CME.
           ``today`` is used to compute the third-Friday expiry. Without
           it the spec has ``expiry=None`` and ``IBQualifier`` maps it
           to ``CONTFUT`` — IB Gateway then returns the continuous
-          placeholder, not the concrete front-month. Plan-review iter
-          1 P1 fix.
+          placeholder, not the concrete front-month.
 
         Raises:
             ValueError: On an unknown venue suffix — callers should
@@ -572,11 +570,10 @@ class SecurityMaster:
         if venue == "CME":
             # Import locally to avoid a security_master →
             # live_instrument_bootstrap cycle at module import time.
-            from datetime import timedelta
-
             from msai.services.nautilus.live_instrument_bootstrap import (
                 _current_quarterly_expiry,
                 exchange_local_today,
+                third_friday_of,
             )
 
             if today is None:
@@ -586,20 +583,16 @@ class SecurityMaster:
             # RECOMPUTES that suffix from expiry, so passing "ESM6" +
             # expiry would yield "ESM6M6.CME". Strip to the root.
             root = symbol[:-2]
-            # _current_quarterly_expiry returns YYYYMM (month precision).
-            # Compute the third-Friday date so spec_to_ib_contract emits
-            # the yyyyMMdd IB expects.
             expiry_str = _current_quarterly_expiry(today)  # YYYYMM
-            year = int(expiry_str[0:4])
-            month = int(expiry_str[4:6])
-            first_of_month = date(year, month, 1)
-            first_friday_offset = (4 - first_of_month.weekday()) % 7
-            third_friday = first_of_month + timedelta(days=first_friday_offset + 14)
+            expiry = third_friday_of(
+                int(expiry_str[0:4]),
+                int(expiry_str[4:6]),
+            )
             return InstrumentSpec(
                 asset_class="future",
                 symbol=root,
                 venue="CME",
-                expiry=third_friday,
+                expiry=expiry,
             )
         raise ValueError(
             f"Unknown venue {venue!r} in canonical {canonical!r} — extend "
