@@ -210,6 +210,41 @@ def test_ib_provider_accepts_dotted_and_futures_aliases(
     assert "not in the closed universe" not in combined, combined
 
 
+@pytest.mark.parametrize(
+    "symbol",
+    [
+        "SPY.NASDAQ",  # known root, wrong venue — exact match fails
+        "AAPLXX.NASDAQ",  # unknown root with known venue
+        "ESM6",  # month-qualified futures without venue — ambiguous input
+        "ES.NASDAQ",  # futures with wrong venue
+    ],
+)
+def test_ib_provider_rejects_malformed_aliases(
+    symbol: str,
+    runner: CliRunner,
+) -> None:
+    """Preflight uses exact-match on the accepted-alias set, not
+    permissive suffix stripping — inputs that would previously slip
+    through (e.g. ``SPY.NASDAQ`` masquerading as bare ``SPY``, or
+    ``AAPLXX.NASDAQ`` getting silently normalized to ``AAPL``) must
+    be rejected.
+    """
+    result = runner.invoke(
+        app,
+        [
+            "instruments",
+            "refresh",
+            "--symbols",
+            symbol,
+            "--provider",
+            "interactive_brokers",
+        ],
+    )
+    assert result.exit_code != 0
+    combined = (result.stderr or "") + (result.stdout or "") + result.output
+    assert "not in the closed universe" in combined, combined
+
+
 def test_ib_provider_rejects_unknown_symbol(runner: CliRunner) -> None:
     """Symbols outside PHASE_1_PAPER_SYMBOLS are rejected in preflight,
     before any IB connection is attempted."""

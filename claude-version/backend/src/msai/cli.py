@@ -758,39 +758,41 @@ def instruments_refresh(
 
     if provider == "interactive_brokers":
         from msai.services.nautilus.live_instrument_bootstrap import (
+            canonical_instrument_id,
             phase_1_paper_symbols,
         )
 
-        # Accept bare roots (``AAPL``, ``ES``), dotted aliases
-        # (``AAPL.NASDAQ``, ``EUR/USD.IDEALPRO``), AND month-qualified
-        # futures aliases (``ESM6.CME`` — what the CLI emits for ES).
-        # Operators must be able to feed the CLI's own ``resolved``
-        # output back in as a re-run (PRD US-006 edge case).
+        # Build an exact accepted-alias set per supported root. Each
+        # root admits three shapes: bare (``AAPL``), stable dotted
+        # (``AAPL.NASDAQ``, ``ES.CME``), and the concrete canonical
+        # form that canonical_instrument_id produces (``ESM6.CME``
+        # for today's front-month ES). PRD US-006: operators must
+        # be able to feed the CLI's own ``resolved`` output back in
+        # as a re-run. Exact membership avoids the permissive-strip
+        # trap (e.g. ``SPY.NASDAQ`` silently normalizing to ``SPY``
+        # via generic suffix stripping).
         known = phase_1_paper_symbols()
+        accepted: dict[str, str] = {}
+        for root in known:
+            accepted[root] = root
+            canonical = canonical_instrument_id(root)
+            accepted[canonical] = root
+            stable = f"{root}.{canonical.rsplit('.', 1)[1]}"
+            accepted[stable] = root
+
         normalized: list[str] = []
         unknown: list[str] = []
         for s in symbol_list:
-            root = s.rsplit(".", 1)[0] if "." in s else s
-            if root in known:
-                normalized.append(root)
-                continue
-            # Futures local-symbol form (``ESM6``): root + 1-char month
-            # code + 1-digit year. Try stripping the 2-char suffix;
-            # this only matches when the stripped value is a known
-            # futures root (e.g. ``ES``) — other symbols won't
-            # accidentally pass.
-            if len(root) > 2 and root[:-2] in known:
-                normalized.append(root[:-2])
-                continue
-            unknown.append(s)
+            if s in accepted:
+                normalized.append(accepted[s])
+            else:
+                unknown.append(s)
         if unknown:
             _fail(
                 f"symbol(s) {unknown} not in the closed universe for "
-                f"--provider interactive_brokers. Supported symbols: "
-                f"{sorted(known)} (bare root, ``ROOT.VENUE`` dotted "
-                f"alias, or month-qualified futures alias like "
-                f"``ESM6.CME`` all accepted). Options outside this "
-                f"list require the live-path wiring PR (follow-up)."
+                f"--provider interactive_brokers. Supported inputs: "
+                f"{sorted(accepted)}. Options outside this list "
+                f"require the live-path wiring PR (follow-up)."
             )
         symbol_list = normalized
 
