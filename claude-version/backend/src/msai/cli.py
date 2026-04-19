@@ -761,10 +761,11 @@ def instruments_refresh(
             phase_1_paper_symbols,
         )
 
-        # Accept both bare roots (``AAPL``) and dotted aliases
-        # (``AAPL.NASDAQ``, ``EUR/USD.IDEALPRO``) per PRD US-006 edge
-        # case — so operators can feed the CLI's own ``resolved`` output
-        # back in as a re-run.
+        # Accept bare roots (``AAPL``, ``ES``), dotted aliases
+        # (``AAPL.NASDAQ``, ``EUR/USD.IDEALPRO``), AND month-qualified
+        # futures aliases (``ESM6.CME`` — what the CLI emits for ES).
+        # Operators must be able to feed the CLI's own ``resolved``
+        # output back in as a re-run (PRD US-006 edge case).
         known = phase_1_paper_symbols()
         normalized: list[str] = []
         unknown: list[str] = []
@@ -772,15 +773,24 @@ def instruments_refresh(
             root = s.rsplit(".", 1)[0] if "." in s else s
             if root in known:
                 normalized.append(root)
-            else:
-                unknown.append(s)
+                continue
+            # Futures local-symbol form (``ESM6``): root + 1-char month
+            # code + 1-digit year. Try stripping the 2-char suffix;
+            # this only matches when the stripped value is a known
+            # futures root (e.g. ``ES``) — other symbols won't
+            # accidentally pass.
+            if len(root) > 2 and root[:-2] in known:
+                normalized.append(root[:-2])
+                continue
+            unknown.append(s)
         if unknown:
             _fail(
                 f"symbol(s) {unknown} not in the closed universe for "
                 f"--provider interactive_brokers. Supported symbols: "
-                f"{sorted(known)} (bare root or ``ROOT.VENUE`` dotted "
-                f"alias both accepted). Options outside this list "
-                f"require the live-path wiring PR (follow-up)."
+                f"{sorted(known)} (bare root, ``ROOT.VENUE`` dotted "
+                f"alias, or month-qualified futures alias like "
+                f"``ESM6.CME`` all accepted). Options outside this "
+                f"list require the live-path wiring PR (follow-up)."
             )
         symbol_list = normalized
 

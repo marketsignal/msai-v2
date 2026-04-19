@@ -168,14 +168,24 @@ class TestRefreshDatabento:
 # ----------------------------------------------------------------------
 
 
-def test_ib_provider_accepts_dotted_alias_and_strips_to_root(
+@pytest.mark.parametrize(
+    "symbol",
+    [
+        "AAPL.NASDAQ",  # equity dotted alias
+        "EUR/USD.IDEALPRO",  # FX dotted alias
+        "ES.CME",  # bare-root futures dotted alias
+        "ESM6.CME",  # month-qualified futures alias (CLI's own ES output)
+    ],
+)
+def test_ib_provider_accepts_dotted_and_futures_aliases(
+    symbol: str,
     monkeypatch: pytest.MonkeyPatch,
     runner: CliRunner,
 ) -> None:
-    """PRD US-006 edge case: ``AAPL.NASDAQ`` (dotted alias — the CLI's
-    own output shape) must be accepted and stripped to root ``AAPL``
-    before the closed-universe check. Otherwise operators can't feed
-    a previous ``resolved`` output back into the command.
+    """PRD US-006: operators must be able to feed the CLI's own
+    ``resolved`` output back in as a re-run. That output contains
+    dotted aliases for equity/FX AND month-qualified futures aliases
+    (``ESM6.CME``). Preflight must accept all four shapes.
     """
     import msai.cli as cli_mod
     from msai.core.config import Settings
@@ -190,7 +200,7 @@ def test_ib_provider_accepts_dotted_alias_and_strips_to_root(
             "instruments",
             "refresh",
             "--symbols",
-            "AAPL.NASDAQ",
+            symbol,
             "--provider",
             "interactive_brokers",
         ],
