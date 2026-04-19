@@ -4,7 +4,7 @@
 #
 # What this does:
 #
-#   1. Brings up the full Compose stack with the `live` profile
+#   1. Brings up the full Compose stack with the `broker` profile
 #      activated (postgres, redis, backend, backtest-worker,
 #      live-supervisor, ib-gateway, frontend)
 #   2. ``docker compose up --wait`` blocks until EVERY service is
@@ -150,9 +150,9 @@ else
   exit 1
 fi
 
-# Force live profile activation so `docker compose up` starts
+# Force broker profile activation so `docker compose up` starts
 # ib-gateway and live-supervisor. Exported so compose picks it up.
-export COMPOSE_PROFILES=live
+export COMPOSE_PROFILES=broker
 
 mkdir -p logs
 

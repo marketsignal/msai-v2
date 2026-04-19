@@ -1,4 +1,4 @@
-# MSAI v2 -- Claude Version
+# MSAI v2
 
 Personal hedge fund platform for automated trading via Interactive
 Brokers. Strategies are Python files, backtested against historical
@@ -33,7 +33,7 @@ kill switch.
 | Frontend | Next.js 15 + React + shadcn/ui + Tailwind CSS + TradingView Charts                                             |
 | Database | PostgreSQL 16 (app state) + Parquet files (market data) + DuckDB (queries) + Redis 7 (queue + pub/sub + cache) |
 | Auth     | Azure Entra ID (MSAL frontend, PyJWT backend) + API key for dev                                                |
-| Deploy   | Docker Compose (6 services default, 8 with live profile)                                                       |
+| Deploy   | Docker Compose (7 services default, 9 with `broker` profile)                                                   |
 | Data     | Polygon.io (stocks/options) + Databento (futures)                                                              |
 
 ## Quick Start
@@ -56,8 +56,8 @@ docker compose -f docker-compose.dev.yml up -d
 cp .env.example .env
 # Edit .env: TWS_USERID, TWS_PASSWORD, IB_ACCOUNT_ID (DU...)
 
-# 2. Start all 7 services including ib-gateway + live-supervisor
-COMPOSE_PROFILES=live docker compose -f docker-compose.dev.yml up -d
+# 2. Start all 9 services including ib-gateway + live-supervisor
+COMPOSE_PROFILES=broker docker compose -f docker-compose.dev.yml up -d
 
 # 3. Wait for ib-gateway to become healthy (60-180s)
 docker compose -f docker-compose.dev.yml ps
@@ -228,7 +228,7 @@ authentication.
 The `scripts/verify-paper-soak.sh` script automates the full paper soak
 verification:
 
-1. Brings up the full Compose stack with the `live` profile
+1. Brings up the full Compose stack with the `broker` profile
 2. Waits for all services to become healthy (including ib-gateway)
 3. Seeds the smoke strategy row
 4. Runs the Phase 1 E2E harness: start deployment, verify running,

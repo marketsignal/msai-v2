@@ -119,11 +119,13 @@ docker compose -f docker-compose.dev.yml down
 # Docker prod
 docker compose -f docker-compose.prod.yml up -d
 
-# CLI tools
-cd backend && uv run msai ingest --asset stocks --symbols AAPL,MSFT --start 2024-01-01 --end 2025-01-01
+# CLI tools (msai is organized as sub-apps: live, strategy, backtest, research,
+# graduation, portfolio, account, system, instruments; plus top-level ingest,
+# ingest-daily, data-status, health)
+cd backend && uv run msai ingest stocks AAPL,MSFT 2024-01-01 2025-01-01   # positional: asset symbols start end
 cd backend && uv run msai data-status
-cd backend && uv run msai live-status
-cd backend && uv run msai live-kill-all
+cd backend && uv run msai live status
+cd backend && uv run msai live kill-all
 cd backend && uv run msai instruments refresh --symbols AAPL,ES --provider interactive_brokers
 
 # Database migrations
@@ -155,7 +157,7 @@ cd backend && uv run alembic revision --autogenerate -m "description"
 /api/v1/live/status                  # GET  All deployments
 /api/v1/live/positions               # GET  Open positions
 /api/v1/live/trades                  # GET  Recent executions
-/api/v1/live/stream                  # WS   Real-time updates (JWT first-message auth)
+/api/v1/live/stream/{deployment_id}  # WS   Real-time updates (JWT first-message auth)
 /api/v1/live-portfolios/             # GET/POST/PATCH Portfolio CRUD + revision lifecycle
 /api/v1/market-data/bars/{symbol}    # GET  OHLCV bars from Parquet via DuckDB
 /api/v1/market-data/symbols          # GET  Available symbols
@@ -265,7 +267,7 @@ All API routes are versioned under `/api/v1/` (see `.claude/rules/api-design.md`
 
 **ARRANGE (test setup) is allowed via any user-accessible interface:**
 
-- Public API: `POST /api/v1/strategies`, `POST /api/v1/backtests`, `POST /api/v1/live/start-portfolio`, etc.
+- Public API: `POST /api/v1/backtests/run`, `POST /api/v1/live/start-portfolio`, `POST /api/v1/live-portfolios/`, etc. Note: strategies are registered from the filesystem via git, not created through the API (Phase 1 decision — no UI uploads).
 - CLI scripts exposed under `backend/` (treat as documented commands only).
 - The dev seed/bootstrap scripts if present.
 
