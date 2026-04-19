@@ -22,7 +22,7 @@ Running::
 
     export MSAI_E2E_IB_ENABLED=1
     export IB_ACCOUNT_ID=DUxxxxxxx
-    cd claude-version && docker compose -f docker-compose.dev.yml up -d
+    docker compose -f docker-compose.dev.yml up -d
     cd backend && uv run pytest tests/e2e/test_security_master_phase2.py -vv
 """
 

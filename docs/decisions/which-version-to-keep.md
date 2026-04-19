@@ -53,7 +53,7 @@ Both versions implement the core PRD (§2 Scope, §6 Strategy System, §7 Fronte
 
 **Claude's integration-depth wins** (still real; different framing):
 
-- Partial unique index on `(deployment_id, broker_trade_id) WHERE broker_trade_id IS NOT NULL` — dedup on Nautilus reconnection reconciliation (`claude-version/backend/src/msai/models/trade.py:53-58`)
+- Partial unique index on `(deployment_id, broker_trade_id) WHERE broker_trade_id IS NOT NULL` — dedup on Nautilus reconnection reconciliation (`backend/src/msai/models/trade.py:53-58` post-flatten)
 - Data lineage on `Backtest` (nautilus_version, python_version, data_snapshot) for reproducibility (§14 NFR)
 - `instrument_definitions` + `instrument_aliases` registry with alias-windowing by date and IB qualifier routing (PR #32 + #35) — claude-only
 - `msai instruments refresh --provider interactive_brokers` CLI (PR #35) — claude-only
@@ -250,7 +250,7 @@ Started the Playwright port (`/new-feature playwright-e2e-port`) on branch `feat
 
 5. **Mock payload shape incompatibility.** Claude's API returns wrapped responses (`StrategyListResponse.items`, `BacktestHistoryResponse.items`, `LiveStatusResponse.deployments`). Codex specs' `page.route()` mocks return bare arrays. Every mock in every spec needs surgery.
 
-6. **Auth refactor scope was bigger than planned.** Codex flagged `claude-version/frontend/src/components/layout/app-shell.tsx:16-19` also has MSAL coupling via `useIsAuthenticated()` with its own dev bypass. Plan's `providers.tsx`-only refactor was insufficient.
+6. **Auth refactor scope was bigger than planned.** Codex flagged `frontend/src/components/layout/app-shell.tsx:16-19` (post-flatten path) also has MSAL coupling via `useIsAuthenticated()` with its own dev bypass. Plan's `providers.tsx`-only refactor was insufficient.
 
 ### Three options considered
 

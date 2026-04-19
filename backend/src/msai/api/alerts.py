@@ -1,8 +1,7 @@
 """Alerts API router — read-only audit trail of operational alerts.
 
-Ported from codex-version/backend/src/msai/api/alerts.py. The history is
-written by :data:`msai.services.alerting.alerting_service` whenever the
-live supervisor, disconnect handler, or any worker emits an alert.
+The history is written by :data:`msai.services.alerting.alerting_service`
+whenever the live supervisor, disconnect handler, or any worker emits an alert.
 """
 
 from __future__ import annotations

@@ -108,8 +108,7 @@ def _valid_alerts(payload: Mapping[str, object]) -> list[dict[str, str]]:
 class AlertingService:
     """File-backed alert history store.
 
-    Ported from ``codex-version/backend/src/msai/services/alerting.py``. The
-    store is a JSON file with a single ``alerts`` array, newest first,
+    The store is a JSON file with a single ``alerts`` array, newest first,
     capped at :data:`_MAX_HISTORY` entries.
 
     The module-level :data:`alerting_service` singleton is the expected

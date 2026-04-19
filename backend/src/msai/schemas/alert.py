@@ -1,7 +1,4 @@
-"""Pydantic schemas for the alerts API.
-
-Ported from codex-version/backend/src/msai/schemas/alert.py.
-"""
+"""Pydantic schemas for the alerts API."""
 
 from __future__ import annotations
 

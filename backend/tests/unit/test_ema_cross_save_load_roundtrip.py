@@ -26,9 +26,9 @@ from pathlib import Path
 
 import pytest
 
-# backend/tests/unit/test_ema_cross_save_load_roundtrip.py →
-# up four to the claude-version root where ``strategies/``
-# lives. Same pattern test_live_node_config.py uses.
+# backend/tests/unit/test_ema_cross_save_load_roundtrip.py → parents[3]
+# is the repo root where ``strategies/`` lives. Same pattern as
+# test_live_node_config.py.
 _strategies_parent = str(Path(__file__).resolve().parents[3])
 if _strategies_parent not in sys.path:
     sys.path.insert(0, _strategies_parent)

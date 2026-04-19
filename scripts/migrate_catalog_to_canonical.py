@@ -28,13 +28,12 @@ Behavior:
 
 Usage::
 
-    python claude-version/scripts/migrate_catalog_to_canonical.py \\
+    python scripts/migrate_catalog_to_canonical.py \\
         --data-root /app/data \\
         --asset-class stocks
 
-Per the architecture review's Codex finding #13, this script lives
-under ``claude-version/scripts/`` (the user-invokable scripts
-directory), NOT under ``backend/scripts/``.
+Lives under top-level ``scripts/`` (user-invokable scripts), NOT under
+``backend/scripts/``.
 """
 
 from __future__ import annotations

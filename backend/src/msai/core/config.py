@@ -13,8 +13,10 @@ from pathlib import Path
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# In local dev: .../claude-version/backend/src/msai/core/config.py → parents[4] = claude-version/
-# In Docker:    /app/src/msai/core/config.py → parents[3] = /app/
+# Local dev: .../backend/src/msai/core/config.py → parents[4] = repo root.
+# Docker:    /app/src/msai/core/config.py → parents[3] = /app/, so parents[4] = /
+# (the Docker path is shorter; DATA_ROOT env var must override in Docker — see
+# docker-compose.dev.yml which sets DATA_ROOT=/app/data).
 _DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 

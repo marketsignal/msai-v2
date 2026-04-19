@@ -31,12 +31,11 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
-# ``strategies/`` lives at the claude-version root, not under
-# ``backend/src``. Put its parent on sys.path BEFORE the
-# ``strategies.example.*`` import so pytest can resolve it at
-# collection time. The strategy_registry does this at runtime in
-# production; tests that import a strategy directly need to
-# replicate the step.
+# ``strategies/`` lives at the repo root, not under ``backend/src``.
+# Put its parent on sys.path BEFORE the ``strategies.example.*`` import
+# so pytest can resolve it at collection time. The strategy_registry
+# does this at runtime in production; tests that import a strategy
+# directly need to replicate the step.
 _STRATEGIES_PARENT = str(Path(__file__).resolve().parents[3])
 if _STRATEGIES_PARENT not in sys.path:
     sys.path.insert(0, _STRATEGIES_PARENT)

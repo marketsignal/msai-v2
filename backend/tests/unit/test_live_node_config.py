@@ -54,8 +54,8 @@ def _strategies_on_path() -> None:
     import sys
     from pathlib import Path
 
-    # backend/tests/unit/test_live_node_config.py → up four to the
-    # claude-version root, where strategies/ lives.
+    # backend/tests/unit/test_live_node_config.py → parents[3] is the
+    # repo root where strategies/ lives.
     strategies_parent = str(Path(__file__).resolve().parents[3])
     if strategies_parent not in sys.path:
         sys.path.insert(0, strategies_parent)

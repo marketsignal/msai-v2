@@ -1,11 +1,10 @@
 """Integration tests for the catalog-migration script
 (Phase 2 task 2.8).
 
-The script lives at ``claude-version/scripts/migrate_catalog_to_canonical.py``
-(Codex finding #13 — user-invokable scripts go under
-``claude-version/scripts/``, not ``backend/scripts/``). We import
-its ``run`` function directly rather than shelling out so the
-test can use pytest's ``tmp_path`` fixture and stay fast.
+The script lives at ``scripts/migrate_catalog_to_canonical.py`` (user-invokable
+scripts go under the top-level ``scripts/``, not ``backend/scripts/``). We
+import its ``run`` function directly rather than shelling out so the test
+can use pytest's ``tmp_path`` fixture and stay fast.
 """
 
 from __future__ import annotations

@@ -58,11 +58,21 @@ scripts/ib-gateway-config/*.ini
 .ibaccounts.txt
 
 # Docker runtime state (IB Gateway logs/jars/configs, Nautilus cache, scheduler, ingestion status)
-claude-version/data/ib-gateway/
-claude-version/data/nautilus/
-claude-version/data/scheduler/
-claude-version/data/ingestion_status.json
-codex-version/data/ib-gateway/
-codex-version/data/nautilus/
-codex-version/data/scheduler/
-codex-version/data/ingestion_status.json
+data/ib-gateway/
+data/nautilus/
+data/scheduler/
+data/ingestion_status.json
+
+# Logs / Jupyter (from pre-flatten claude-version/.gitignore)
+*.log
+logs/
+.ipynb_checkpoints/
+
+# OS / Windows (from pre-flatten claude-version/.gitignore)
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Secrets
+*.pem
+*.key

@@ -32,7 +32,7 @@
 #
 # Usage:
 #
-#   # from claude-version/ directory
+#   # from repo root
 #   ./scripts/verify-paper-soak.sh
 #
 # Exit codes:

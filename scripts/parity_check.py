@@ -23,7 +23,7 @@ investigation and the Phase 5 acceptance harness.
 
 Usage::
 
-    python claude-version/scripts/parity_check.py \\
+    python scripts/parity_check.py \\
         --left  data/parity/live_orders_2026_03_15.csv \\
         --right data/parity/backtest_orders_2026_03_15.csv
 

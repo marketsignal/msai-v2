@@ -1,11 +1,10 @@
 """Databento continuous-futures symbology helpers.
 
-Adapted from the codex-version ``instrument_service`` module (pattern +
-raw-symbol derivation, synthesis, window helpers). The Databento Python
-adapter in Nautilus 1.223.0 has no native continuous-symbol
-normalization (verified: zero grep hits for
+The Databento Python adapter in Nautilus 1.223.0 has no native
+continuous-symbol normalization (verified: zero grep hits for
 ``continuous|\\.c\\.0|\\.Z\\.`` in ``nautilus_trader/adapters/databento/``),
-so MSAI fills the gap.
+so MSAI fills the gap with pattern detection, raw-symbol derivation,
+synthesis, and effective-window helpers.
 
 Pattern: ``{root}.{c|Z}.{N}`` -- e.g. ``ES.Z.5`` = ES continuous, 5th
 forward-month.
@@ -56,8 +55,8 @@ class ResolvedInstrumentDefinition:
     """Transport object between :func:`resolved_databento_definition` and the
     caller (``SecurityMaster.resolve_for_backtest``).
 
-    Diverges from codex-version: MSAI uses ``listing_venue``/``routing_venue``
-    (per PRD). ``instrument_data`` is NOT carried -- Nautilus's cache DB
+    Uses ``listing_venue`` + ``routing_venue`` (per PRD) rather than a single
+    venue field. ``instrument_data`` is NOT carried -- Nautilus's cache DB
     holds payloads. ``contract_details`` is a transport-only dict used
     during synthesis.
     """
@@ -83,8 +82,7 @@ def resolved_databento_definition(
     """Build a synthetic continuous-futures ``ResolvedInstrumentDefinition``
     from a Databento-loaded set of concrete-month instruments.
 
-    Adapted from the codex-version ``instrument_service`` module. Picks
-    the instrument with the latest ``ts_init`` / ``ts_event`` as the
+    Picks the instrument with the latest ``ts_init`` / ``ts_event`` as the
     representative.
     """
     matching = [

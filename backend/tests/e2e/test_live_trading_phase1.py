@@ -36,7 +36,7 @@ Running:
 
     export MSAI_E2E_IB_ENABLED=1
     export MSAI_E2E_IB_ACCOUNT_ID=DUxxxxxxx
-    cd claude-version && docker compose -f docker-compose.dev.yml up -d
+    docker compose -f docker-compose.dev.yml up -d
     cd backend && uv run pytest tests/e2e/test_live_trading_phase1.py -vv
 """
 
@@ -58,7 +58,7 @@ pytestmark = pytest.mark.skipif(
     reason=(
         "Phase 1 E2E harness gated by MSAI_E2E_IB_ENABLED=1 — requires "
         "the full Docker Compose stack + a real IB Gateway paper account "
-        "reachable from the claude-version backend container."
+        "reachable from the backend container."
     ),
 )
 

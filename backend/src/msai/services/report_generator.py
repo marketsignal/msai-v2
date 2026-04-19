@@ -26,8 +26,6 @@ def _normalize_report_returns(series: pd.Series | None) -> pd.Series:
     day's returns back to a single daily observation.  Already-daily input
     round-trips unchanged because ``(1 + r).prod()`` over a one-element
     group equals ``1 + r``.
-
-    Ported from codex-version/backend/src/msai/services/report_generator.py.
     """
     if series is None:
         return pd.Series(dtype=float)

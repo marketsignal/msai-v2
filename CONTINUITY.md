@@ -6,49 +6,53 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field     | Value                                                                |
-| --------- | -------------------------------------------------------------------- |
-| Command   | /new-feature playwright-e2e-port (pivoted to option C: archive only) |
-| Phase     | 6 — Finish                                                           |
-| Next step | Commit + push + ask user re: PR                                      |
+| Field     | Value                                                          |
+| --------- | -------------------------------------------------------------- |
+| Command   | /new-feature playwright-e2e-port (pivoted — archive + flatten) |
+| Phase     | 6 — Finish                                                     |
+| Next step | Complete content edits for flatten, commit 2, push, PR         |
 
-### Checklist
+### Checklist (final scope = archive + flatten, no port)
 
 - [x] Worktree created at `.worktrees/playwright-e2e-port` off `e9ac08e`
-- [x] Project state read
-- [x] Workflow tracking initialized
-- [x] Focused research (N/A — no new libraries) — `docs/research/2026-04-19-playwright-e2e-port.md`
-- [x] Selector-mapping table built — exploration revealed 14/15 codex copy strings absent from claude
-- [x] Implementation plan written — `docs/plans/2026-04-19-playwright-e2e-port.md`
-- [x] Plan review loop (1 iteration) — Claude + Codex both NEEDS_FIX; root cause = UI drift, not fixable within port scope
-- [x] **Pivot decision**: user chose option C (abandon port, delete codex-version directly). Documented in decision doc postscript.
-- [x] Updated `docs/decisions/which-version-to-keep.md` with option-C postscript + port-list struck through
-- [x] Tagged `codex-final` on `e9ac08e` (archival marker before deletion)
-- [x] `git rm -r codex-version/` (~17K LOC removed)
-- [x] `git rm` 15 Feb-25 baseline screenshot PNGs at repo root (~2.4 MB)
-- [x] Updated root `CLAUDE.md` — dropped "Two Competing Implementations" framing, single-stack operation
-- [x] Updated `playwright.config.ts` — default `baseURL` → `http://localhost:3300`
-- [x] Updated `scripts/seed_market_data.py` — removed codex-version usage example
-- [x] `.mcp.json` — no codex refs (verified)
-- [x] CONTINUITY updated
-- [ ] Sanity check — claude stack still boots after deletion
-- [ ] Committed and pushed
+- [x] Focused research (N/A — no new libraries)
+- [x] Implementation plan written (then superseded by option C + flatten)
+- [x] Plan review loop (1 iteration) — Claude + Codex both NEEDS_FIX; root cause = UI drift
+- [x] **Pivot 1**: option C (abandon port, delete codex-version directly)
+- [x] **Pivot 2**: user additionally requested flatten (no more claude-version/ or codex-version/ labels anywhere; claude contents at repo root)
+- [x] Updated decision doc + scratch
+- [x] Tagged `codex-final` on `e9ac08e` (archival)
+- [x] `git rm -r codex-version/` (~17K LOC, commit `7ea2c5e`)
+- [x] Deleted 15 Feb-25 baseline PNGs (commit `7ea2c5e`)
+- [x] First root `CLAUDE.md` rewrite for single-stack (commit `7ea2c5e`; will be re-rewritten for flatten)
+- [x] Retargeted `playwright.config.ts` baseURL → `http://localhost:3300` (commit `7ea2c5e`)
+- [x] CHANGELOG entry for delete (commit `3e89728`)
+- [x] **Flatten commit 1 (pure moves, commit `9c30116`)**: git mv claude-version/{backend,frontend,strategies,data,docker-compose.\*,.github,.env.example,.python-version,README.md} to repo root; merged scripts/ and docs/; deleted claude-version/CLAUDE.md + .gitignore (content absorbed elsewhere)
+- [ ] **Flatten commit 2 (content edits — IN PROGRESS)**: strip `claude-version/` prefixes from code/tests/scripts/docs; simplify provenance comments (drop `codex-version/` paths); update .gitignore, CLAUDE.md, CONTINUITY.md, decision doc
+  - [x] README.md (layout diagram)
+  - [x] .gitignore (strip version prefixes, add useful patterns)
+  - [x] backend/src/msai/core/config.py (comment)
+  - [x] backend/src/msai/schemas/alert.py (drop Ported-from comment)
+  - [x] backend/src/msai/api/alerts.py (drop Ported-from comment)
+  - [x] backend/src/msai/services/report_generator.py (drop Ported-from comment)
+  - [x] backend/src/msai/services/alerting.py (drop Ported-from comment)
+  - [x] backend/src/msai/services/nautilus/security_master/continuous_futures.py (simplify 3 mentions)
+  - [x] backend/tests/unit/test_ema_cross_save_load_roundtrip.py, test_live_node_config.py, test_smoke_strategy.py (comments)
+  - [x] backend/tests/integration/test_migrate_catalog.py (docstring)
+  - [x] backend/tests/e2e/test_security_master_phase2.py, test_recovery_phase4.py, test_live_trading_phase1.py (docstrings)
+  - [ ] backend/tests/e2e/test_live_streaming_phase3.py (docstring)
+  - [ ] scripts/seed_market_data.py (docstring — 2 mentions)
+  - [ ] scripts/parity_check.py (docstring)
+  - [ ] scripts/migrate_catalog_to_canonical.py (docstring — 2 mentions)
+  - [ ] scripts/verify-paper-soak.sh (comment)
+  - [ ] docs/decisions/which-version-to-keep.md (file-path references)
+  - [ ] Root CLAUDE.md rewrite (absorb claude-version/CLAUDE.md content, drop all claude-version/ prefixes)
+  - [ ] CONTINUITY.md recent entries (self-referential)
+- [ ] Flatten commit 3: CHANGELOG entry for flatten
+- [ ] Sanity check — claude stack still boots after flatten (docker compose up -d from repo root)
+- [ ] Push
 - [ ] PR created (pending user approval)
 - [ ] Merged + branch deleted
-
-### Scope (as shipped — NOT the original port)
-
-**Original scope (abandoned):** port 9 Playwright specs from `codex-version/frontend/e2e/` to `tests/e2e/specs/`.
-
-**Actual scope (option C — see decision-doc postscript):**
-
-- Formalize keep-claude decision on disk (`docs/decisions/which-version-to-keep.md` + scratch)
-- Archive codex-version at tag `codex-final`
-- Delete `codex-version/` (~17K LOC)
-- Clean up 15 Feb-25 baseline screenshots
-- Update root CLAUDE.md to single-stack operation
-- Retarget `playwright.config.ts` baseURL to claude's `:3300`
-- Future Playwright work will author claude-native specs against `getByTestId`, not revive the codex ones.
 
 ## Done
 

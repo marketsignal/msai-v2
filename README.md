@@ -83,7 +83,7 @@ docker compose -f docker-compose.dev.yml down
 ## Repository Layout
 
 ```
-claude-version/
+.
   backend/
     src/msai/
       api/              # FastAPI routers
