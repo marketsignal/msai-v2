@@ -27,7 +27,7 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 - [x] Plan written (`docs/plans/2026-04-18-instruments-refresh-ib-path.md`)
 - [x] Plan review loop (4 iterations) — PASS. Codex iter 1: 6 P1 + 4 P2 + 2 P3. Iter 2: 1 P1 + 4 P2 + 1 P3. Iter 3: 1 P1. Iter 4: clean.
 - [x] TDD execution complete (13 code/test commits across 4 batches, all red→green→refactor)
-- [x] Code review loop (1 iteration) — Codex + pr-review-toolkit:code-reviewer + 3 simplify agents in parallel; 1 P2 (Codex: dotted-symbol normalization) + 1 P2 (reuse+efficiency: third_friday_of duplicate) + 4 P1 + 3 P2 (quality: comment cleanup) — all fixed in commit eaaa446. pr-review-toolkit:code-reviewer returned PASS (only P3 nits).
+- [ ] Code review loop (1 iteration — iter 2 dispatched on fix commit eaaa446, awaiting result) — iter 1: Codex + pr-review-toolkit:code-reviewer + 3 simplify agents found 1 P2 (dotted symbols) + 1 P2 (third_friday_of duplicate) + 4 P1 + 3 P2 (comments) — fixed. iter 2: re-run Codex on fix commit; check box only after iter 2 returns clean (per feedback_code_review_iteration_discipline).
 - [x] Simplified — 3 parallel simplify agents (reuse/quality/efficiency) ran and their P1/P2 findings folded into eaaa446.
 - [x] Verified (tests/lint/types) — verify-app agent PASS: 1406→1407 unit tests (+ dotted-alias test) + 232 integration pass + ruff clean on touched files + mypy at main baseline.
 - [x] E2E use cases designed (Phase 3.2b) — 6 user stories in PRD with Gherkin scenarios
@@ -175,9 +175,10 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 
 ## Now
 
-- **Active workflow:** `/new-feature instruments-refresh-ib-path` on branch `feat/instruments-refresh-ib-path` (worktree).
-- **Phase 4 batches 1-4 complete:** Phases A (foundation) + B (CLI impl) + C1 (opt-in smoke) + B4/B5 (docs) all shipped locally (9 commits on branch: 38db52b, af4f031, fe8bfbe, 52410cb, 32b63d8, 6fd2b75, be829a5, ea1bbef, cb13042, ab69af7, 3b8a782, 104a594).
-- **Docker stack restarted from worktree (2026-04-18 20:27):** containers now bind-mount the worktree's claude-version/backend/src. Backend healthy. IB Gateway mid-login cycle — waiting for paper session to settle before running the manual drill (Phase D).
+- **Active workflow:** `/new-feature instruments-refresh-ib-path` on branch `feat/instruments-refresh-ib-path` (worktree); pushed to origin (17+ commits ahead of main).
+- **Code review loop — iter 3 mid-investigation (22:41 UTC).** Iter 1 found 1 Codex P2 (dotted symbols) + 1 simplify P2 (third_friday dedup) + 4 P1 / 3 P2 comment-quality; fixed in `eaaa446`. Iter 2 surfaced 1 more P2 — the dotted-alias strip didn't handle month-qualified futures like `ESM6.CME`; fixed in `1a9a751` with parametrized test across 4 alias shapes. Iter 3 Codex review running (~134 lines into investigation).
+- **Phase D paper drill PASSED** (2026-04-18 20:30 UTC) — all 5 drills green against paper IB Gateway DUP733213.
+- **Feedback memory saved:** `feedback_code_review_iteration_discipline.md` — user enforces plan-review-style iteration discipline on the code-review loop; re-run reviewers on each fix commit before pushing/PR.
 
 ## Next
 
