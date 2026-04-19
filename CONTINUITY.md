@@ -6,77 +6,9 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field     | Value                                                          |
-| --------- | -------------------------------------------------------------- |
-| Command   | /new-feature playwright-e2e-port (pivoted — archive + flatten) |
-| Phase     | 6 — Finish                                                     |
-| Next step | Complete content edits for flatten, commit 2, push, PR         |
-
-### Checklist (final scope = archive + flatten, no port)
-
-- [x] Worktree created at `.worktrees/playwright-e2e-port` off `e9ac08e`
-- [x] Focused research (N/A — no new libraries)
-- [x] Implementation plan written (then superseded by option C + flatten)
-- [x] Plan review loop (1 iteration) — Claude + Codex both NEEDS_FIX; root cause = UI drift
-- [x] **Pivot 1**: option C (abandon port, delete codex-version directly)
-- [x] **Pivot 2**: user additionally requested flatten (no more claude-version/ or codex-version/ labels anywhere; claude contents at repo root)
-- [x] Updated decision doc + scratch
-- [x] Tagged `codex-final` on `e9ac08e` (archival)
-- [x] `git rm -r codex-version/` (~17K LOC, commit `7ea2c5e`)
-- [x] Deleted 15 Feb-25 baseline PNGs (commit `7ea2c5e`)
-- [x] First root `CLAUDE.md` rewrite for single-stack (commit `7ea2c5e`; will be re-rewritten for flatten)
-- [x] Retargeted `playwright.config.ts` baseURL → `http://localhost:3300` (commit `7ea2c5e`)
-- [x] CHANGELOG entry for delete (commit `3e89728`)
-- [x] **Flatten commit 1 (pure moves, commit `9c30116`)**: git mv claude-version/{backend,frontend,strategies,data,docker-compose.\*,.github,.env.example,.python-version,README.md} to repo root; merged scripts/ and docs/; deleted claude-version/CLAUDE.md + .gitignore (content absorbed elsewhere)
-- [ ] **Flatten commit 2 (content edits — IN PROGRESS)**: strip `claude-version/` prefixes from code/tests/scripts/docs; simplify provenance comments (drop `codex-version/` paths); update .gitignore, CLAUDE.md, CONTINUITY.md, decision doc
-  - [x] README.md (layout diagram)
-  - [x] .gitignore (strip version prefixes, add useful patterns)
-  - [x] backend/src/msai/core/config.py (comment)
-  - [x] backend/src/msai/schemas/alert.py (drop Ported-from comment)
-  - [x] backend/src/msai/api/alerts.py (drop Ported-from comment)
-  - [x] backend/src/msai/services/report_generator.py (drop Ported-from comment)
-  - [x] backend/src/msai/services/alerting.py (drop Ported-from comment)
-  - [x] backend/src/msai/services/nautilus/security_master/continuous_futures.py (simplify 3 mentions)
-  - [x] backend/tests/unit/test_ema_cross_save_load_roundtrip.py, test_live_node_config.py, test_smoke_strategy.py (comments)
-  - [x] backend/tests/integration/test_migrate_catalog.py (docstring)
-  - [x] backend/tests/e2e/test_security_master_phase2.py, test_recovery_phase4.py, test_live_trading_phase1.py (docstrings)
-  - [ ] backend/tests/e2e/test_live_streaming_phase3.py (docstring)
-  - [ ] scripts/seed_market_data.py (docstring — 2 mentions)
-  - [ ] scripts/parity_check.py (docstring)
-  - [ ] scripts/migrate_catalog_to_canonical.py (docstring — 2 mentions)
-  - [ ] scripts/verify-paper-soak.sh (comment)
-  - [ ] docs/decisions/which-version-to-keep.md (file-path references)
-  - [ ] Root CLAUDE.md rewrite (absorb claude-version/CLAUDE.md content, drop all claude-version/ prefixes)
-  - [x] CONTINUITY.md recent entries (self-referential)
-- [x] Flatten commit 3: CHANGELOG entry for flatten
-- [x] Sanity check — static (compose parse + bind-mount paths exist + /health on main's running stack); full boot deferred to post-merge restart
-- [x] Push
-- [x] PR #36 created
-- [x] Codex review — 3 P2 findings fixed in-branch (commit `af7257c`): broker/live profile name, CLI positional args, API endpoint paths
-- [ ] **CI still failing after setup-uv fix — deferred** (see below)
-- [ ] Merged + branch deleted
-
-### Deferred — CI hardening (follow-up PR)
-
-The first-ever CI run on this workflow (now at `.github/workflows/ci.yml` post-flatten) fails with 0s-duration / empty jobs / no annotations / `started_at: null` / `rerequestable: false`. Classic workflow-parse or policy rejection.
-
-- **Tried:** bumped `astral-sh/setup-uv` from `v4.3.0` (does not exist; 404 from GitHub) to `v7.3.0` (commit `b7eaafd`). Did not fix the parse failure.
-- **Verified:** YAML parses locally (`python3 -c "import yaml; yaml.safe_load(...)"`), all 4 action pins resolve via GitHub API, no BOM, ASCII-clean. GitHub sees the correct file content at the head SHA (diff clean).
-- **Suspected causes, not yet ruled out:**
-  - Org-level Actions policy on `marketsignal` restricting 3rd-party actions (cannot verify — `orgs/marketsignal/actions/permissions` requires admin scope)
-  - Required workflow allowlist blocking `astral-sh/setup-uv` / `pnpm/action-setup`
-  - Workflow registration quirk — display name showing `.github/workflows/ci.yml` (file path) instead of `CI` suggests GitHub can't fully parse the `name:` field
-- **User directive:** merge anyway; land this work; harden CI separately. Reason: the PR scope is archive + flatten, not CI overhaul. CI was broken pre-flatten (file was at `claude-version/.github/workflows/` which GitHub didn't detect); flatten surfaced the bug but didn't introduce it.
-- **Follow-up PR scope (prioritized):**
-  1. Probe minimal `Ping` workflow to isolate org-policy vs per-workflow issue
-  2. Add `.github/dependabot.yml` to prevent action-version rot (this class of bug would have been caught months ago)
-  3. Add `pytest-xdist -n auto` (free ~3x backend test speedup)
-  4. Add `--cov-fail-under=<baseline>` coverage floor
-  5. `on: push:` without branch filter so feature branch pushes get CI feedback
-  6. `workflow_dispatch` trigger so runs are manually re-triggerable
-  7. Consider docker-compose smoke test (`docker compose config --quiet` + optional full `up -d` + health-poll)
-  8. Security scanning: `pip-audit`, `npm audit`, Trivy on Dockerfiles
-- **Bug-not-left-behind rationale:** broken CI pin IS a bug, fixed in this PR (`b7eaafd`). The remaining zero-duration failure is either (a) an org-policy gap that the flatten didn't cause — it just allowed the workflow to finally attempt registration — or (b) a symptom that needs admin-level diagnostic access to resolve. Shipping fix for the known bug + deferring the investigative work is the correct call.
+| Field   | Value |
+| ------- | ----- |
+| Command | none  |
 
 ## Done
 
@@ -207,19 +139,34 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 
 ## Now
 
-- **On `main` clean** at `c6b42bb`. PR #35 (msai instruments refresh --provider interactive_brokers) merged 2026-04-19 06:04 UTC; worktree + local/remote branch cleaned up; dev stack restarted from main (backend healthy at :8800).
-- No active workflow. Feedback memory saved mid-session: `feedback_code_review_iteration_discipline.md` (re-run reviewers on each fix commit before PR).
+- **On `main` clean** at `82a56fd`. PR #36 (archive codex-version at tag `codex-final`, flatten claude-version to repo root) merged 2026-04-19 via squash. Worktree + local/remote branch cleaned up. Repo is now single-stack: `backend/`, `frontend/`, `strategies/`, `data/`, `docker-compose.{dev,prod}.yml`, `.github/workflows/ci.yml`, `scripts/`, `docs/` all at root. `claude-version/` and `codex-version/` directories removed from working tree (~3.6 GB of untracked node_modules/.next/.venv also wiped). `.env` rescued from `claude-version/.env` → root `.env` before wipe. Dev stack stopped from old compose path during cleanup — needs restart from new root.
 
 ## Next — remaining deferred items
 
-From PR #32 ("db-backed-strategy-registry") + PR #35 scope-outs:
+### High-priority
 
-1. **Live-path wiring onto registry** (highest strategic value). `/api/v1/live/start-portfolio` + live supervisor still use closed-universe `canonical_instrument_id()` instead of warm-reading `instrument_definitions` / `instrument_aliases` that PR #35 now populates. Needs a design pass — likely `/new-feature live-path-wiring-registry`. Without this, the IB refresh CLI's registry rows go unused by live flows.
-2. **`instrument_cache` → registry migration.** Legacy `instrument_cache` table coexists with the new registry, not migrated yet. Skeleton at `docs/plans/2026-04-17-db-backed-strategy-registry.md` §"InstrumentCache → Registry Migration".
-3. **Strategy config-schema extraction** for UI form generation. Skeleton at the same plan file §"Strategy Config Schema Extraction + API".
+1. **Restart dev stack from new root** — `docker compose -f docker-compose.dev.yml up -d` (operator step; pending).
+2. **CI hardening** (new deferred item, follow-up PR). The workflow at `.github/workflows/ci.yml` was previously buried under `claude-version/.github/workflows/` which GitHub didn't detect. Post-flatten it ran for the first time and fails with 0s-duration / empty jobs — classic workflow-parse or policy rejection. Pre-existing bug; not introduced by the flatten. Fixed the known-broken pin in PR #36 (`astral-sh/setup-uv@v4.3.0` → `v7.3.0`); the remaining failure cause is not diagnosable without org-admin scope. Follow-up PR scope (prioritized):
+   1. Probe minimal `Ping` workflow to isolate org-policy vs per-workflow issue
+   2. `.github/dependabot.yml` — prevents this class of action-pin rot
+   3. `pytest-xdist -n auto` — free ~3x backend-test speedup
+   4. `--cov-fail-under=<baseline>` coverage floor
+   5. `on: push:` without branch filter — feature-branch pushes get CI feedback before PR opens
+   6. `workflow_dispatch` trigger — runs become manually re-triggerable
+   7. Optional docker-compose smoke test (`docker compose config --quiet` at minimum)
+   8. Security scanning — `pip-audit`, `npm audit`, Trivy on Dockerfiles
 
-### PR #35 documented known limitations (ship-blockers for future work)
+### From PR #32 ("db-backed-strategy-registry") + PR #35 scope-outs
+
+3. **Live-path wiring onto registry** (highest strategic value). `/api/v1/live/start-portfolio` + live supervisor still use closed-universe `canonical_instrument_id()` instead of warm-reading `instrument_definitions` / `instrument_aliases` that PR #35 now populates. Needs a design pass — likely `/new-feature live-path-wiring-registry`. Without this, the IB refresh CLI's registry rows go unused by live flows.
+4. **`instrument_cache` → registry migration.** Legacy `instrument_cache` table coexists with the new registry, not migrated yet. Skeleton at `docs/plans/2026-04-17-db-backed-strategy-registry.md` §"InstrumentCache → Registry Migration".
+5. **Strategy config-schema extraction** for UI form generation. Skeleton at the same plan file §"Strategy Config Schema Extraction + API".
+
+### From PR #36 postscript
+
+6. **Architecture-governance review (2026-10-19, 6-month cadence)** — revisit the Contrarian's minority report in `docs/decisions/which-version-to-keep.md`: (a) does the multi-login gateway fabric earn its complexity against actual multi-account operational load? (b) is the instrument registry + alias windowing justified by live-path usage or still scope creep?
+
+### PR #35 documented known limitations
 
 - **Midnight-CT roll-day race** — preflight and `_run_ib_resolve_for_live` call `exchange_local_today()` independently; narrow window, operator-recoverable.
 - **CLI preflight doesn't accept registry-moved aliases for non-futures** — manifests only if IB qualification returned a venue the hardcoded `canonical_instrument_id` mapping doesn't match.
-- **IB path of `msai instruments refresh`** — now shipped in PR #35.
