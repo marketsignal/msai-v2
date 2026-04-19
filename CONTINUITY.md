@@ -6,45 +6,9 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field     | Value                                                                            |
-| --------- | -------------------------------------------------------------------------------- |
-| Command   | /new-feature instruments-refresh-ib-path                                         |
-| Phase     | 5 — Quality Gates + Manual Drill                                                 |
-| Next step | Phase D manual paper drill (operator + paper IB Gateway) + Phase E quality gates |
-
-### Checklist
-
-- [x] Worktree created
-- [x] Project state read
-- [x] Plugins verified
-- [x] PRD created
-- [x] Research artifact produced (`docs/research/` — via research-first agent)
-- [ ] Design guidance loaded (if UI)
-- [x] Brainstorming complete (design doc: `docs/plans/2026-04-18-instruments-refresh-ib-path-design.md`)
-- [x] Approach comparison filled (council discussion Round 2 resolved the 6 design Qs; one remaining arch question resolved via Codex second opinion)
-- [x] Contrarian gate passed — 5-advisor council fired (standalone mode via /council) with Codex chairman synthesis
-- [x] Council verdict: hybrid answers per chairman recommendation; 3 blocking objections adopted, 2 scope-creep additions overruled
-- [x] Plan written (`docs/plans/2026-04-18-instruments-refresh-ib-path.md`)
-- [x] Plan review loop (4 iterations) — PASS. Codex iter 1: 6 P1 + 4 P2 + 2 P3. Iter 2: 1 P1 + 4 P2 + 1 P3. Iter 3: 1 P1. Iter 4: clean.
-- [x] TDD execution complete (13 code/test commits across 4 batches, all red→green→refactor)
-- [x] Code review loop (10 iterations) — PASS. Iter 1 wide (dotted symbols + third_friday dup + comments); iter 2 ESM6.CME missed; iter 3 strip too permissive; iter 4 partial-durability transactional + ES.XCME legacy; iter 5 routed-port regression I introduced; iter 6 bare EUR shorthand; iter 7 ES roll-forward + venue-update; iter 8 stale-check too aggressive; iter 9 JSON stdout banner + smoke count-growth; iter 10 P3-only (hardcoded ES month + test stub) — convergence. Every iteration's finding narrower than previous; textbook productive-convergence trajectory.
-- [x] Simplified — 3 parallel simplify agents (reuse/quality/efficiency) ran and their P1/P2 findings folded into eaaa446.
-- [x] Verified (tests/lint/types) — verify-app agent PASS: 1406→1407 unit tests (+ dotted-alias test) + 232 integration pass + ruff clean on touched files + mypy at main baseline.
-- [x] E2E use cases designed (Phase 3.2b) — 6 user stories in PRD with Gherkin scenarios
-- [x] E2E verified — N/A via verify-e2e agent: manual Phase D paper drill on 2026-04-18 20:30 UTC executed all 5 use cases against running paper IB Gateway (DUP733213). Results persisted in docs/CHANGELOG.md Phase D section. Opt-in `pytest.mark.ib_paper` smoke file at `tests/e2e/test_instruments_refresh_ib_smoke.py` provides automated regression surface for future re-verification.
-- [ ] E2E regression passed (Phase 5.4b)
-- [ ] E2E use cases graduated to tests/e2e/use-cases/ (Phase 6.2b)
-- [ ] E2E specs graduated to tests/e2e/specs/ (Phase 6.2c — if Playwright framework installed)
-- [ ] Learnings documented (if any)
-- [ ] State files updated
-- [ ] Committed and pushed
-- [ ] PR created
-- [ ] PR reviews addressed
-- [ ] Branch finished
-
-### Feature scope
-
-Complete the deferred `msai instruments refresh --provider interactive_brokers` path. Currently (claude-version/backend/src/msai/cli.py:747-756) that branch hard-fails with a deferral message. The blocker is that `Settings` lacks `ib_request_timeout_seconds`, `ib_instrument_client_id`, and a paper/live port selector needed to build an `IBQualifier`. Deliverables: (a) extend `Settings` with the missing fields + env-var aliases, (b) add a small IBQualifier factory, (c) wire it into `instruments_refresh` to call `SecurityMaster.resolve_for_live`, (d) tests + docstring updates. Touches IB wiring — mind Nautilus gotcha #3 (unique client_id) + gotcha #6 (paper/live port consistency).
+| Field   | Value |
+| ------- | ----- |
+| Command | none  |
 
 ## Done
 
