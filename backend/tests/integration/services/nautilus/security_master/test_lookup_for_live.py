@@ -119,6 +119,50 @@ async def test_lookup_dotted_alias_returns_resolved_instrument(
         assert result[0].canonical_id == "AAPL.NASDAQ"
 
 
+async def test_lookup_share_class_ticker_with_period_in_raw_symbol(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Regression (Codex PR#37 P1): raw symbols can legitimately contain
+    a period (NYSE share-class tickers ``BRK.B``, ``BF.B``, ``RDS.A``).
+    The resolver must NOT treat ``"." in sym`` as proof the input is a
+    dotted alias — that routes BRK.B to ``find_by_alias("BRK.B")`` which
+    looks for a literal alias row and misses even when the raw_symbol
+    row exists. The correct dispatch: try ``find_by_raw_symbol`` first,
+    fall back to ``find_by_alias`` only on miss for dotted inputs.
+    """
+    async with session_factory() as session:
+        idef = InstrumentDefinition(
+            raw_symbol="BRK.B",
+            listing_venue="NYSE",
+            routing_venue="SMART",
+            asset_class="equity",
+            provider="interactive_brokers",
+        )
+        session.add(idef)
+        await session.flush()
+        session.add(
+            InstrumentAlias(
+                instrument_uid=idef.instrument_uid,
+                alias_string="BRK.B.NYSE",
+                venue_format="exchange_name",
+                provider="interactive_brokers",
+                effective_from=date(2026, 1, 1),
+            )
+        )
+        await session.commit()
+
+        result = await lookup_for_live(
+            ["BRK.B"],
+            as_of_date=date(2026, 4, 20),
+            session=session,
+        )
+
+        assert len(result) == 1
+        assert result[0].canonical_id == "BRK.B.NYSE"
+        assert result[0].asset_class == AssetClass.EQUITY
+        assert result[0].contract_spec["symbol"] == "BRK.B"
+
+
 async def test_lookup_empty_symbols_raises_value_error(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

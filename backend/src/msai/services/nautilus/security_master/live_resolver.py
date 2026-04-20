@@ -503,25 +503,28 @@ async def lookup_for_live(
     missing: list[str] = []
 
     for sym in symbols:
-        # Dotted vs bare branching — ``alias_string`` always stores the
-        # canonical dotted form (service.py:_upsert_definition_and_alias).
-        if "." in sym:
+        # Dispatch: try raw_symbol first; fall back to alias on miss for
+        # dotted inputs. The "." in sym heuristic alone is unsafe —
+        # NYSE share-class tickers (BRK.B, BF.B, RDS.A) and any other
+        # raw_symbol that legitimately contains a period would be
+        # routed to alias lookup and miss their own raw_symbol row.
+        # raw_symbol is the primary operator-typed key; alias is the
+        # pinned venue form.
+        # The registry raises AmbiguousSymbolError (NOT a ValueError)
+        # on a cross-asset-class raw_symbol match; we wrap it into
+        # AmbiguousRegistryError (subclass of LiveResolverError →
+        # ValueError) so the supervisor's permanent-catch fires instead
+        # of the transient-retry branch.
+        try:
+            idef = await registry.find_by_raw_symbol(sym, provider=provider, asset_class=None)
+        except AmbiguousSymbolError as exc:
+            raise AmbiguousRegistryError(
+                symbol=sym,
+                conflicts=exc.asset_classes,
+                reason=AmbiguousRegistryError.REASON_CROSS_ASSET_CLASS,
+            ) from exc
+        if idef is None and "." in sym:
             idef = await registry.find_by_alias(sym, provider=provider, as_of_date=as_of_date)
-        else:
-            # Bare ticker — resolve via raw_symbol lookup. The registry
-            # raises AmbiguousSymbolError (NOT a ValueError) on a cross-
-            # asset-class match; we wrap it into AmbiguousRegistryError
-            # (subclass of LiveResolverError → ValueError) so the
-            # supervisor's permanent-catch fires instead of the
-            # transient-retry branch.
-            try:
-                idef = await registry.find_by_raw_symbol(sym, provider=provider, asset_class=None)
-            except AmbiguousSymbolError as exc:
-                raise AmbiguousRegistryError(
-                    symbol=sym,
-                    conflicts=exc.asset_classes,
-                    reason=AmbiguousRegistryError.REASON_CROSS_ASSET_CLASS,
-                ) from exc
         if idef is None:
             missing.append(sym)
             continue
