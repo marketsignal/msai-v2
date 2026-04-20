@@ -228,16 +228,92 @@ class EndpointOutcome:
             failure_kind=row_failure_kind,
         )
 
+    @classmethod
+    def registry_permanent_failure(
+        cls,
+        row_failure_kind: FailureKind,
+        error_message: str,
+    ) -> EndpointOutcome:
+        """Build an HTTP 422 from a DB row for the four registry-class
+        ``failure_kind`` values. Accepts ``REGISTRY_MISS``,
+        ``REGISTRY_INCOMPLETE``, ``UNSUPPORTED_ASSET_CLASS``, and
+        ``AMBIGUOUS_REGISTRY``.
 
-_PERMANENT_FAILURE_KINDS: frozenset[FailureKind] = frozenset(
+        ``error_message`` is expected to be a JSON-encoded envelope
+        produced by ``LiveResolverError.to_error_message()``:
+        ``{"code": "...", "message": "...", "details": {...}}``.
+        On parse failure (legacy row, hand-edited column), the whole
+        string becomes the ``message`` and ``details`` is ``{}``.
+
+        Response envelope follows ``.claude/rules/api-design.md``:
+        ``{"error": {"code": str, "message": str, "details": dict},
+           "failure_kind": str}``.
+
+        Cacheable=False because registry failures are OPERATOR-CORRECTABLE
+        (run ``msai instruments refresh`` / close alias / pick supported
+        asset class) — caching the 422 would block retry-after-fix with
+        the same Idempotency-Key. Unlike permanent_failure (503 /
+        build-timeout / reconciliation), retrying after operator
+        correction is the expected recovery path.
+        """
+        assert row_failure_kind in _REGISTRY_FAILURE_KINDS, (
+            f"registry_permanent_failure called with non-registry kind: {row_failure_kind!r}"
+        )
+
+        try:
+            parsed: Any = json.loads(error_message)
+        except (json.JSONDecodeError, TypeError):
+            parsed = {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+
+        code = parsed.get("code") or row_failure_kind.value.upper()
+        message = parsed.get("message") or error_message
+        details_raw = parsed.get("details")
+        details = details_raw if isinstance(details_raw, dict) else {}
+
+        return cls(
+            status_code=422,
+            response={
+                "error": {
+                    "code": code,
+                    "message": message,
+                    "details": details,
+                },
+                "failure_kind": row_failure_kind.value,
+            },
+            cacheable=False,
+            failure_kind=row_failure_kind,
+        )
+
+
+PERMANENT_FAILURE_KINDS: frozenset[FailureKind] = frozenset(
     {
         FailureKind.SPAWN_FAILED_PERMANENT,
         FailureKind.RECONCILIATION_FAILED,
         FailureKind.BUILD_TIMEOUT,
         FailureKind.HEARTBEAT_TIMEOUT,
+        FailureKind.REGISTRY_MISS,
+        FailureKind.REGISTRY_INCOMPLETE,
+        FailureKind.UNSUPPORTED_ASSET_CLASS,
+        FailureKind.AMBIGUOUS_REGISTRY,
         FailureKind.UNKNOWN,
     }
 )
+# Backward compat: leading-underscore alias retained for callers that
+# imported the private name before the public promotion.
+_PERMANENT_FAILURE_KINDS = PERMANENT_FAILURE_KINDS
+
+
+REGISTRY_FAILURE_KINDS: frozenset[FailureKind] = frozenset(
+    {
+        FailureKind.REGISTRY_MISS,
+        FailureKind.REGISTRY_INCOMPLETE,
+        FailureKind.UNSUPPORTED_ASSET_CLASS,
+        FailureKind.AMBIGUOUS_REGISTRY,
+    }
+)
+_REGISTRY_FAILURE_KINDS = REGISTRY_FAILURE_KINDS  # backward compat
 
 
 # ---------------------------------------------------------------------------

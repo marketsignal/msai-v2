@@ -286,6 +286,38 @@ class TestLiveTrades:
         assert isinstance(body["trades"], list)
         assert body["total"] == 0
 
+    async def test_live_trades_deployment_id_filter_applies_where_clause(
+        self, client_with_mock_db: httpx.AsyncClient, mock_db: AsyncMock
+    ) -> None:
+        """Regression (multi-symbol drill 2026-04-20): passing
+        ``?deployment_id=<uuid>`` must add a WHERE clause on
+        ``OrderAttemptAudit.deployment_id`` so callers can scope to a
+        single deployment instead of getting all live fills."""
+        from uuid import uuid4
+
+        dep_id = uuid4()
+        response = await client_with_mock_db.get(f"/api/v1/live/trades?deployment_id={dep_id}")
+        assert response.status_code == 200
+
+        executed_sqls = [
+            str(call.args[0].compile(compile_kwargs={"literal_binds": True}))
+            for call in mock_db.execute.await_args_list
+        ]
+        # SQLAlchemy's literal_binds strips UUID hyphens when compiling
+        # to a Postgres UUID literal; match the hexdigest form.
+        dep_hex = dep_id.hex
+        assert any(
+            "deployment_id" in sql and (str(dep_id) in sql or dep_hex in sql)
+            for sql in executed_sqls
+        ), f"Expected a WHERE on deployment_id={dep_id!s}; got SQLs: {executed_sqls}"
+
+    async def test_live_trades_rejects_malformed_deployment_id(
+        self, client_with_mock_db: httpx.AsyncClient
+    ) -> None:
+        """Non-UUID values are rejected with 422 (FastAPI validation)."""
+        response = await client_with_mock_db.get("/api/v1/live/trades?deployment_id=not-a-uuid")
+        assert response.status_code == 422
+
 
 # ---------------------------------------------------------------------------
 # Supervisor-liveness guard (drill 2026-04-15 P0-A)

@@ -46,6 +46,10 @@ from nautilus_trader.adapters.interactive_brokers.config import (
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
+    from msai.services.nautilus.security_master.live_resolver import (
+        ResolvedInstrument,
+    )
+
 
 # CME local timezone. Quarterly futures contracts roll on the third
 # Friday of the expiry month in the exchange's local calendar. Using
@@ -308,6 +312,73 @@ def build_ib_instrument_provider_config(
         )
 
     contracts = frozenset(symbols_map[s] for s in requested)
+    return InteractiveBrokersInstrumentProviderConfig(
+        symbology_method=SymbologyMethod.IB_SIMPLIFIED,
+        load_contracts=contracts,
+        cache_validity_days=1,
+    )
+
+
+# Known IB contract kwargs for ``_ibcontract_from_spec``. The IB adapter
+# rejects unknown kwargs with ``TypeError``, so we whitelist the fields
+# our ``ResolvedInstrument.contract_spec`` producers emit today (equity,
+# FX, futures) and will emit tomorrow (options extension adds new keys;
+# we filter them out here so the Phase 1 path tolerates forward-compat
+# rows). Keep in sync with
+# ``live_resolver._build_contract_spec`` when new asset classes are wired.
+_IB_CONTRACT_KWARGS: frozenset[str] = frozenset(
+    {
+        "secType",
+        "symbol",
+        "exchange",
+        "primaryExchange",
+        "currency",
+        "lastTradeDateOrContractMonth",
+    }
+)
+
+
+def _ibcontract_from_spec(spec: dict[str, object]) -> IBContract:
+    """Build an :class:`IBContract` from a ``ResolvedInstrument.contract_spec``.
+
+    Filters unknown keys so an options extension (expiry / strike /
+    right) can land in ``contract_spec`` without breaking the Phase 1
+    equity/FX/futures preload path. The IB adapter would otherwise raise
+    ``TypeError: unexpected keyword argument`` on any unknown kwarg.
+    """
+    filtered = {k: v for k, v in spec.items() if k in _IB_CONTRACT_KWARGS}
+    return IBContract(**filtered)  # type: ignore[arg-type]
+
+
+def build_ib_instrument_provider_config_from_resolved(
+    resolved: list[ResolvedInstrument],
+) -> InteractiveBrokersInstrumentProviderConfig:
+    """Build a Nautilus IB instrument provider config from resolved rows.
+
+    Consumes the output of
+    :func:`msai.services.nautilus.security_master.live_resolver.lookup_for_live`
+    — the registry-driven path used by the live-supervisor. Unlike
+    :func:`build_ib_instrument_provider_config` there is NO closed-universe
+    gate; any well-formed ``contract_spec`` is accepted. The resolver is
+    already the validator for Phase 1.
+
+    The configuration structure matches the legacy builder
+    (``IB_SIMPLIFIED`` symbology, ``cache_validity_days=1``) so both
+    paths produce identical provider configs and the subprocess cannot
+    tell which builder fed it.
+
+    Args:
+        resolved: Output of ``lookup_for_live``. May be empty — the
+            supervisor's payload factory is responsible for guarding
+            "no instruments" at the aggregation layer (Task 11's
+            :func:`build_portfolio_trading_node_config`).
+
+    Returns:
+        An :class:`InteractiveBrokersInstrumentProviderConfig` ready to
+        hand to ``InteractiveBrokersDataClientConfig`` /
+        ``InteractiveBrokersExecClientConfig``.
+    """
+    contracts = frozenset(_ibcontract_from_spec(r.contract_spec) for r in resolved)
     return InteractiveBrokersInstrumentProviderConfig(
         symbology_method=SymbologyMethod.IB_SIMPLIFIED,
         load_contracts=contracts,

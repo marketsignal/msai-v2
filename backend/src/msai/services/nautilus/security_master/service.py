@@ -263,9 +263,16 @@ class SecurityMaster:
         today = exchange_local_today()
         out: list[str] = []
         for sym in symbols:
-            # Warm path A — caller passed an already-qualified dotted alias
+            # Warm path A — caller passed an already-qualified dotted alias.
+            # Thread ``today`` (exchange-local CME date) so roll-sensitive
+            # aliases are windowed against the same date the cold path +
+            # canonical_instrument_id use — otherwise a late-UTC-night
+            # run could resolve a different quarterly contract here than
+            # elsewhere in the live path.
             if "." in sym:
-                idef = await registry.find_by_alias(sym, provider="interactive_brokers")
+                idef = await registry.find_by_alias(
+                    sym, provider="interactive_brokers", as_of_date=today
+                )
                 if idef is not None:
                     out.append(sym)
                     continue
@@ -660,6 +667,14 @@ class SecurityMaster:
         """
         from msai.models.instrument_alias import InstrumentAlias
         from msai.models.instrument_definition import InstrumentDefinition
+
+        # FX raw_symbol invariant: registry stores BASE/QUOTE slash form.
+        # IB's localSymbol for CASH pairs is dot form ("EUR.USD"); the
+        # live-resolver's _build_contract_spec splits on "/", and warm
+        # lookups use the operator-typed "EUR/USD". Normalize at the
+        # storage boundary so neither side drifts.
+        if asset_class == "fx" and "/" not in raw_symbol and raw_symbol.count(".") == 1:
+            raw_symbol = raw_symbol.replace(".", "/")
 
         now = datetime.now(UTC)
         def_stmt = (

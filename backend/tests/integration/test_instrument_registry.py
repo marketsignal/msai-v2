@@ -148,7 +148,9 @@ async def test_require_definition_raises_on_miss(
         registry = InstrumentRegistry(session)
         with pytest.raises(RegistryDefinitionNotFoundError):
             await registry.require_definition(
-                "ZZZZ.NASDAQ", provider="interactive_brokers"
+                "ZZZZ.NASDAQ",
+                provider="interactive_brokers",
+                as_of_date=date(2026, 4, 20),
             )
 
 

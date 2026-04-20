@@ -113,14 +113,18 @@ def spec_to_ib_contract(spec: InstrumentSpec) -> IBContract:
                 exchange=spec.venue,
                 currency=spec.currency,
             )
-        # Fixed-month future: IB expects yyyyMMdd in
-        # ``lastTradeDateOrContractMonth``.
+        # Fixed-month future: pass yyyyMM so IB resolves the actual
+        # last-trade date for that contract month. Using yyyyMMdd with a
+        # computed 3rd-Friday date silently fails when the month's expiry
+        # shifts for a market holiday (e.g. Juneteenth 2026-06-19 moves
+        # ESM6 to 2026-06-18). The registry alias (e.g. "ESM6.CME")
+        # pins month + year; IB owns day resolution.
         return IBContract(
             secType="FUT",
             symbol=spec.symbol,
             exchange=spec.venue,
             currency=spec.currency,
-            lastTradeDateOrContractMonth=spec.expiry.strftime("%Y%m%d"),
+            lastTradeDateOrContractMonth=spec.expiry.strftime("%Y%m"),
         )
 
     if asset_class == "option":

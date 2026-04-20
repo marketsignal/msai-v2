@@ -91,6 +91,10 @@ class TestPermanentFailureFactory:
             FailureKind.RECONCILIATION_FAILED,
             FailureKind.BUILD_TIMEOUT,
             FailureKind.HEARTBEAT_TIMEOUT,
+            FailureKind.REGISTRY_MISS,
+            FailureKind.REGISTRY_INCOMPLETE,
+            FailureKind.UNSUPPORTED_ASSET_CLASS,
+            FailureKind.AMBIGUOUS_REGISTRY,
             FailureKind.UNKNOWN,
         ],
     )
