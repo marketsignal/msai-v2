@@ -6,32 +6,13 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field     | Value                                          |
-| --------- | ---------------------------------------------- |
-| Command   | /new-feature live-path-wiring-registry         |
-| Phase     | Phase 4 — TDD execution                        |
-| Next step | Execute 17 tasks in plan (subagent-driven DEV) |
+| Field     | Value |
+| --------- | ----- |
+| Command   | none  |
+| Phase     | none  |
+| Next step | none  |
 
-### Scope (user-ratified 2026-04-19)
-
-- **IN:** registry-backed live-start for any equity, index ETF, forex pair, or future that `msai instruments refresh --provider interactive_brokers` can qualify
-- **OUT:** options trading (deferred — needs own PRD + council)
-- **DESIGN CONSTRAINT:** options must be addable later without re-architecting the resolver contract or IB preload wiring. `lookup_for_live` API shape must accommodate option specs (expiry + strike + call/put) as a future payload variant.
-
-### Council verdict (2026-04-19, ratified)
-
-See `docs/decisions/live-path-registry-wiring.md` — modified Option D. Key constraints:
-
-- New pure-read `lookup_for_live(symbols, as_of_date)` API (NOT `SecurityMaster.resolve_for_live` — that mixes registry reads + IB cold-miss + upserts)
-- Supervisor + `build_ib_instrument_provider_config()` + `live_node_config.py:478` all wire onto the new resolver
-- `spawn_today` in `America/Chicago` threaded explicitly
-- Registry miss = fail fast, operator hint "run `msai instruments refresh --symbols X`"
-- NO IB fallback at live-start critical path
-- NO silent `canonical_instrument_id` fallback
-- Structured telemetry: `live_instrument_resolved` with `{source, symbol, canonical_id, as_of_date}`
-- Real-money drill on U4705114 equivalent to 2026-04-16 AAPL drill BEFORE merge — exercise new path, not canonical helper
-
-### Checklist
+### Checklist (archived — superseded by Done cont'd 9 below)
 
 - [x] Worktree created at `.worktrees/live-path-wiring-registry` off `3fa6097`
 - [x] Project state read
@@ -39,7 +20,7 @@ See `docs/decisions/live-path-registry-wiring.md` — modified Option D. Key con
 - [x] Plugins verified
 - [x] PRD created (Phase 1) — `docs/prds/live-path-wiring-registry.md` v1.0 draft; 10 Q&A defaulted in discussion log; 6 open questions flagged for plan-review
 - [x] Research artifact produced (Phase 2) — N/A-minimal confirmed. Brief at `docs/research/2026-04-20-live-path-wiring-registry.md`. 5 PRD open-questions answered from code: (1) `trading_metrics.py` exists; (2) `alerting.send_alert(level="warning")` supports WARN; (3) `spawn_today_iso` plumbing verified end-to-end through supervisor→payload→subprocess→live_node_config; (4) Nautilus `InteractiveBrokersInstrumentProviderConfig` takes `load_contracts: FrozenSet[IBContract]` — resolver must reconstruct `IBContract` from stored `contract_spec`; (5) `InstrumentRegistry.find_by_alias` defaults to UTC — resolver must make `as_of_date` required (no default).
-- [ ] Brainstorming / Approach comparison / Contrarian gate — **PRE-DONE**: `docs/decisions/live-path-registry-wiring.md` captures the 5-advisor council + chairman verdict. Cite as Phase 3.1/3.1b/3.1c artifact; skip re-running.
+- [x] Brainstorming / Approach comparison / Contrarian gate — **PRE-DONE**: `docs/decisions/live-path-registry-wiring.md` captures the 5-advisor council + chairman verdict. Cite as Phase 3.1/3.1b/3.1c artifact; skip re-running.
 - [x] Plan written (Phase 3.2) — `docs/plans/2026-04-20-live-path-wiring-registry.md` v1; 16 tasks; TDD-structured; 6 spot-checks flagged for plan-review.
 - [x] Plan review loop (4 iterations — closed 2026-04-20) — trajectory: iter-1 3P0/7P1/5P2 → iter-2 0P0/5P1/4P2 → iter-3 0P0/6P1/8P2 → iter-4 0P0/3P1 each reviewer. P0 eliminated at iter-2; P1s narrowed each pass (foundation → API drift → implementation detail → test mechanics). Final iter-4 P1s (cacheable-flag, done-callback exception logging, mock-assertion positional, fixture path, enum-conversion telemetry, counter introspection) all applied in v5 plan. Remaining polish items are P2/P3 test-mechanics details that Phase 4 TDD catches naturally. Foundation stable across all 4 iterations; no architectural drift surfaced. Closed per "3-iteration hard cap + productive-convergence" rule in feedback memory.
   - **iter 1 (2026-04-20)**: Claude 3 P0, 7 P1, 5 P2, 1 P3 · Codex 0 P0, 7 P1, 2 P2, 0 P3. Blocking overlap: send_alert API drift; metrics pattern drift (prometheus_client → hand-rolled registry); bare-ticker branch missing; decade boundary; supervisor failure path; API preflight out-of-scope; grep-based regression; pickle test missing. All fixes staged in plan v2.
@@ -55,18 +36,10 @@ See `docs/decisions/live-path-registry-wiring.md` — modified Option D. Key con
 - [x] Use cases graduated (Phase 6.2b) — 5 use cases (UC-L-REG-001..005) committed at `tests/e2e/use-cases/live/registry-backed-deploy.md`. Phase 5.4 verification report at `tests/e2e/reports/2026-04-20-live-path-wiring-registry.md` (gitignored per project convention; mtime evidence satisfies the gate hook).
 - [x] State files updated — CONTINUITY + CHANGELOG + solution doc + drill runbook all committed.
 - [x] Committed and pushed — 3 commits: `0d3799d` (main implementation), `fffb5ea` (E2E report CONTINUITY update), `<next>` (PRD/research/graduated-cases). Pushing now.
-- [ ] Drill-uncovered bug fixes committed — 3 fixes in working tree (ib_qualifier futures YYYYMM; FX raw_symbol slash normalize; /live/trades deployment_id filter). Tests + ruff + mypy clean. **E2E re-verified against live stack 2026-04-20**: Bug #1 ES refresh PASS, Bug #2 EUR/USD cold-path upsert stores slash form PASS, Bug #3 /live/trades filter PASS (8 total / 2 scoped / 0 bogus / 422 malformed). Needs commit + push.
-- [ ] PR created — deferred until bug-fix commit lands.
-- [ ] PR reviews addressed
-- [ ] Branch finished
-
-### Non-goals for this PR (explicit)
-
-- Options trading (deferred — separate PRD)
-- HTTP preflight layer (Option C from council; revisit after D is live)
-- Deleting `canonical_instrument_id()` (keep for one clean paper week post-merge before removal)
-- Registry management UI (operators still use `msai instruments refresh` CLI)
-- Automatic registry warming (registry remains operator-managed control plane)
+- [x] Drill-uncovered bug fixes committed at `e5afb7e` — 3 fixes (ib_qualifier futures YYYYMM; FX raw_symbol slash normalize; /live/trades deployment_id filter). E2E re-verified against live stack before commit: Bug #1 ES refresh PASS, Bug #2 EUR/USD cold-path upsert stores slash form PASS, Bug #3 /live/trades filter PASS (8 total / 2 scoped / 0 bogus / 422 malformed).
+- [x] PR created — PR #37 (`Live-path wiring onto instrument registry`), squash-merged 2026-04-20 at `29dbe9b`
+- [x] PR reviews addressed — Codex P1 (dispatch heuristic `"." in sym` misclassifies share-class tickers like BRK.B) fixed at `be23558`, replied in-thread, regression test added
+- [x] Branch finished — worktree removed, remote + local branch deleted, main ff'd to `29dbe9b`
 
 ## Done
 
@@ -195,26 +168,34 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 - **Fix:** test_parity_determinism.\_write_synthetic_bars now derives high/low from max/min(open, close) so Nautilus `Bar.__init__` invariant holds.
 - **Scope:** claude-version only. Test-only cleanup — no production code modified. 16 files changed (1 helper added, 1 file deleted, 14 patched).
 
+## Done (cont'd 9) — Live-path wiring onto registry shipped (2026-04-20)
+
+- **PR #37 merged** to main at `29dbe9b` (squash). 8 commits on branch collapsed: 1 main implementation (`0d3799d`), 1 E2E report (`fffb5ea`), 1 PRD/research/graduated-cases (`5342ffe`), 1 pre-PR checklist (`5fe29c7`), 2 drill docs (`665417d` initial AAPL + `7cf74f1` multi-symbol extension), 1 drill-uncovered bug-fix batch (`e5afb7e`), 1 post-review fix (`be23558`).
+- **Scope shipped:** pure-read `lookup_for_live(symbols, as_of_date, session)` resolver over the DB-backed registry replaces the 5-symbol closed-universe `canonical_instrument_id()` + `PHASE_1_PAPER_SYMBOLS` gate on `/api/v1/live/start-portfolio`. Council verdict ratified at `docs/decisions/live-path-registry-wiring.md` (modified Option D). Fail-fast on registry miss with operator-copyable `msai instruments refresh --symbols X` hint; structured `live_instrument_resolved` log + `msai_live_instrument_resolved_total` counter.
+- **Phase gates cleared in order** (per feedback memory `feedback_all_continuity_gates_before_pr.md`): Plan-review loop (4 iters, converging) → Code-review loop (2 iters, clean) → Simplify pass (3 agents) → Verify (1728 tests, 0 fail) → E2E (5 use cases, PASS) → Real-money drill on U4705114 (6 deploys across 5 asset classes, ~$8 total) → Regression + graduation → Commit + push → PR → Codex review → merge. Two pushbacks from Pablo (N/A-rationalized E2E; PR-before-all-gates) captured as `feedback_always_run_e2e_before_pr.md` and `feedback_all_continuity_gates_before_pr.md`.
+- **Drill-uncovered bug batch** (`e5afb7e`, "no bugs left behind"): (a) `ib_qualifier.py` futures use `%Y%m` so IB resolves holiday-adjusted expiry (Juneteenth ESM6 shift); (b) `_upsert_definition_and_alias` normalizes FX `raw_symbol` at storage boundary to slash form; (c) `/live/trades` accepts + applies `deployment_id: UUID` query filter. Each re-verified against the E2E path that surfaced it (feedback memory `feedback_rerun_e2e_after_bug_fixes.md`).
+- **Post-merge cleanup:** worktree removed, remote + local branch deleted, main ff'd to `29dbe9b`.
+
+## Done (cont'd 10) — Dev stack restarted from new root + volume-name pinning (2026-04-20)
+
+- **Problem:** post-flatten `docker compose` from the repo root created a NEW project (`msai-v2`) whose volumes got prefixed with that project name. The actual drill data lived in `live-path-wiring-registry_postgres_data` (from the worktree's compose invocation during PR #37 work). Bringing up the new project without a name-pin would silently spawn a fresh-empty Postgres and lose all registry rows, drill trades, and deployment history.
+- **Fix 1 — data preserved:** Migrated `live-path-wiring-registry_postgres_data` → `msai_postgres_data` via a migration container (`alpine cp -a`). Verified 5 registry rows + 8 live trade fills + 7 deployments preserved.
+- **Fix 2 — never again:** Pinned volume names explicitly in compose so any future project-name change (directory rename, worktree spawn, etc.) cannot orphan stateful volumes:
+  - `docker-compose.dev.yml` — `postgres_data: { name: msai_postgres_data }`
+  - `docker-compose.prod.yml` — same pin on `postgres_data`, `app_data`, `ib_gateway_settings` (3 prod-stateful volumes)
+- **Root cause documented in compose comment:** prevents the next engineer from undoing the pin without understanding why it's there.
+- **Orphan inventory** (left in place; destructive cleanup is a separate decision): `bug-bash_postgres_data`, `codex-version_postgres_data`, `claude-version_postgres_data`, `live-path-wiring-registry_postgres_data`, `mcpgateway_postgres_data`, `claude-version_ib_gateway_settings` — all pre-flatten or worktree artifacts, now superseded by the single pinned `msai_postgres_data`.
+
 ## Now
 
-- **Drill-uncovered bug fixes applied in-branch** (per Pablo directive "no bugs left behind"):
-  - `backend/src/msai/services/nautilus/security_master/ib_qualifier.py:118-128` — futures `lastTradeDateOrContractMonth` uses `%Y%m` (IB resolves holiday-adjusted day). New test `test_fixed_month_future_juneteenth_holiday_uses_month_not_day`.
-  - `backend/src/msai/services/nautilus/security_master/service.py:670-677` — `_upsert_definition_and_alias` normalizes FX `raw_symbol` from IB dot form → registry slash form. New integration test `test_resolve_for_live_fx_upsert_normalizes_raw_symbol_to_slash`.
-  - `backend/src/msai/api/live.py:1119-1158` — `/live/trades` accepts `deployment_id: UUID | None` query param and applies it as a `WHERE` filter. Two new tests (filter applied + malformed UUID → 422).
-- **Verify status:** ruff + mypy --strict clean on edited files (13 pre-existing mypy errors unchanged); 62/62 affected tests pass (ib_qualifier unit, live_api unit, security_master unit, security_master integration).
-- **E2E re-verification of each bug's surfacing path** (2026-04-20, after Pablo pushback "when you fix something you have to go back to the end-to-end testing that surfaces those"):
-  - **Bug #1 (futures YYYYMM):** `msai instruments refresh --symbols ES --provider interactive_brokers` → IB Gateway qualified `ESM6.CME` successfully with `YYYYMM=202606`. PASS.
-  - **Bug #2 (FX slash):** SQL-deleted pre-existing `EUR/USD` registry row → ran `msai instruments refresh --symbols EUR/USD` → cold-path upsert fired → registry now has `raw_symbol='EUR/USD'` (slash) not `EUR.USD` (IB dot form). PASS.
-  - **Bug #3 (/live/trades filter):** curl against live stack with 8 drill trades across 4 deployments → unfiltered=8, scoped by real `deployment_id=2`, scoped by bogus UUID=0, malformed UUID→422. PASS.
-- **Discipline save:** new feedback memory `feedback_rerun_e2e_after_bug_fixes.md` + MEMORY.md index entry — default is to re-run the E2E path that surfaced a bug AFTER fixing it, not just unit/integration tests.
-- **Not yet committed** — 6 changed files in working tree (3 src, 3 tests). Commit message drafted as `fix(live-path): 3 bugs uncovered by multi-symbol drill` (body details each fix + notes E2E re-verification). **Awaiting Pablo approval** to (a) commit + push, (b) `gh pr create`. Both are user-confirm actions per `.claude/rules/critical-rules.md` ("Creating PR to main — Ask").
+- **On `main` clean** at `29dbe9b` with 3 modified tracked files uncommitted: `CONTINUITY.md`, `docker-compose.dev.yml`, `docker-compose.prod.yml`. Stack is up from new root with data preserved. Pre-existing dirty tree (`docs/ci-templates/README.md`, `docs/ci-templates/e2e.yml`, `frontend/playwright.config.ts`, `frontend/tests/`) unchanged — those are your in-progress items, untouched by this session.
+- **Next concrete action:** commit the compose volume-pin + CONTINUITY update, then move on to Next-list items #3 (remove `canonical_instrument_id`), #4 (`instrument_cache` → registry migration), #5 (strategy config-schema extraction) per your sequencing.
 
 ## Next — remaining deferred items
 
 ### High-priority
 
-1. **Restart dev stack from new root** — `docker compose -f docker-compose.dev.yml up -d` (operator step; pending).
-2. **CI hardening** (new deferred item, follow-up PR). The workflow at `.github/workflows/ci.yml` was previously buried under `claude-version/.github/workflows/` which GitHub didn't detect. Post-flatten it ran for the first time and fails with 0s-duration / empty jobs — classic workflow-parse or policy rejection. Pre-existing bug; not introduced by the flatten. Fixed the known-broken pin in PR #36 (`astral-sh/setup-uv@v4.3.0` → `v7.3.0`); the remaining failure cause is not diagnosable without org-admin scope. Follow-up PR scope (prioritized):
+1. **CI hardening** (new deferred item, follow-up PR). The workflow at `.github/workflows/ci.yml` was previously buried under `claude-version/.github/workflows/` which GitHub didn't detect. Post-flatten it ran for the first time and fails with 0s-duration / empty jobs — classic workflow-parse or policy rejection. Pre-existing bug; not introduced by the flatten. Fixed the known-broken pin in PR #36 (`astral-sh/setup-uv@v4.3.0` → `v7.3.0`); the remaining failure cause is not diagnosable without org-admin scope. Follow-up PR scope (prioritized):
    1. Probe minimal `Ping` workflow to isolate org-policy vs per-workflow issue
    2. `.github/dependabot.yml` — prevents this class of action-pin rot
    3. `pytest-xdist -n auto` — free ~3x backend-test speedup
@@ -226,10 +207,10 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 
 ### From PR #32 ("db-backed-strategy-registry") + PR #35 scope-outs
 
-3. **Live-path wiring onto registry** — **IN PROGRESS on this branch** (`feat/live-path-wiring-registry`). Council verdict ratified 2026-04-19 (`docs/decisions/live-path-registry-wiring.md`). Scope limited to the live-start resolver + IB preload. Follow-up (#3b below) captures the broader onboarding story.
-   3b. **Symbol Onboarding UI/API/CLI** (follow-up; new deferred item as of 2026-04-19) — user-facing surfaces to declare "add symbol X of asset class Y (equity/ETF/FX/future)" with the system auto-triggering historical ingest + registry refresh + portfolio-bootstrap helpers. Depends on #3 shipping first (without live-path wiring, the onboarding UI would be a lie — users add symbols that can't actually deploy live). Scope sketch: new `/api/v1/instruments/` CRUD with explicit `asset_class` field + matching CLI sub-app + frontend form + verify `msai ingest` parity across all 4 asset classes. Separate PRD + council required before starting.
-4. **`instrument_cache` → registry migration.** Legacy `instrument_cache` table coexists with the new registry, not migrated yet. Skeleton at `docs/plans/2026-04-17-db-backed-strategy-registry.md` §"InstrumentCache → Registry Migration".
-5. **Strategy config-schema extraction** for UI form generation. Skeleton at the same plan file §"Strategy Config Schema Extraction + API".
+2. **Symbol Onboarding UI/API/CLI** — user-facing surfaces to declare "add symbol X of asset class Y (equity/ETF/FX/future)" with the system auto-triggering historical ingest + registry refresh + portfolio-bootstrap helpers. Now unblocked since PR #37 shipped the live-path wiring. Scope sketch: new `/api/v1/instruments/` CRUD with explicit `asset_class` field + matching CLI sub-app + frontend form + verify `msai ingest` parity across all 4 asset classes. Separate PRD + council required before starting.
+3. **`instrument_cache` → registry migration.** Legacy `instrument_cache` table coexists with the new registry, not migrated yet. Skeleton at `docs/plans/2026-04-17-db-backed-strategy-registry.md` §"InstrumentCache → Registry Migration".
+4. **Strategy config-schema extraction** for UI form generation. Skeleton at the same plan file §"Strategy Config Schema Extraction + API".
+5. **Remove `canonical_instrument_id()`** — Pablo override (2026-04-20): skip the council-suggested "one clean paper week" wait and schedule alongside items 3+4. Non-goal of PR #37 but ready to delete once verified no live deploys hit the legacy path.
 
 ### From PR #36 postscript
 

@@ -308,4 +308,10 @@ services:
       retries: 10
 
 volumes:
+  # Pin the Docker volume name so a compose-project rename (e.g. parent
+  # directory rename, like 2026-04-19 flatten from claude-version/ to
+  # repo root) does NOT orphan the data volume. Without `name:`, the
+  # volume is prefixed with the project name and would reappear as a
+  # new empty volume after the rename — silent data loss.
   postgres_data:
+    name: msai_postgres_data

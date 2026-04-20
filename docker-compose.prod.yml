@@ -313,6 +313,16 @@ services:
           memory: 2G
 
 volumes:
+  # Pin Docker volume names so a compose-project rename (e.g. parent
+  # directory rename) does NOT orphan data volumes. Without `name:`,
+  # the volume is prefixed with the project name and would reappear
+  # as a new empty volume after the rename — silent data loss. This
+  # bit us once on 2026-04-19 during the claude-version → repo-root
+  # flatten; the data was recoverable via migration, but the fix is
+  # to pin names so the bug cannot recur.
   postgres_data:
+    name: msai_postgres_data
   app_data:
+    name: msai_app_data
   ib_gateway_settings:
+    name: msai_ib_gateway_settings
