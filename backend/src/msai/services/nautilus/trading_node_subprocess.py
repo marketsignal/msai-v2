@@ -79,6 +79,10 @@ from msai.services.nautilus.startup_health import (
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from msai.services.nautilus.security_master.live_resolver import (
+        ResolvedInstrument,
+    )
+
 
 log = logging.getLogger(__name__)
 
@@ -95,7 +99,9 @@ class StrategyMemberPayload:
     Carries the per-strategy fields that
     :func:`build_portfolio_trading_node_config` needs to construct an
     :class:`ImportableStrategyConfig` for each member. All fields are
-    primitives / builtins so the payload remains picklable under the
+    primitives / builtins (plus the frozen-dataclass ``ResolvedInstrument``
+    which is itself composed of primitives — Task 11b verifies
+    picklability end-to-end) so the payload remains picklable under the
     ``mp.Process`` spawn context.
     """
 
@@ -113,6 +119,15 @@ class StrategyMemberPayload:
     """Paper symbols this strategy subscribes to (e.g. ``["AAPL", "MSFT"]``).
     Aggregated across all members to build the single
     InstrumentProviderConfig for the TradingNode."""
+    resolved_instruments: tuple[ResolvedInstrument, ...] = ()
+    """Tuple of ``ResolvedInstrument`` from ``lookup_for_live``. Replaces
+    the closed-universe ``PHASE_1_PAPER_SYMBOLS`` gate. Task 11's
+    ``build_portfolio_trading_node_config`` aggregates across members,
+    dedup'd by ``canonical_id``. Empty tuple default preserves existing
+    test construction sites (kwarg-only field). ``ResolvedInstrument``
+    is a frozen dataclass of primitives (``str``, ``StrEnum``, ``dict``,
+    ``tuple[date, date | None]``) — all picklable under the spawn
+    context; Task 11b verifies the round-trip."""
 
 
 @dataclass(frozen=True)
@@ -1240,9 +1255,11 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
             _cache = node.kernel.cache  # for fetching full order details
             _loop = _aio.get_running_loop()
 
-            _strategy_id_lookup: dict[str, UUID] = {
-                m.strategy_id_full: m.strategy_id for m in p.strategy_members
-            } if p.strategy_members else {}
+            _strategy_id_lookup: dict[str, UUID] = (
+                {m.strategy_id_full: m.strategy_id for m in p.strategy_members}
+                if p.strategy_members
+                else {}
+            )
 
             def _resolve_strategy_id(event: Any) -> UUID:
                 if _strategy_id_lookup:

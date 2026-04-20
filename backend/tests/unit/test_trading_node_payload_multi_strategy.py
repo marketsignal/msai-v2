@@ -270,3 +270,62 @@ class TestSupervisorPayloadFactoryPortfolioPath:
         assert callable(resolve_importable_strategy_paths)
         assert callable(compute_file_hash)
         assert hasattr(LivePortfolioRevisionStrategy, "__tablename__")
+
+
+# ---------------------------------------------------------------------------
+# Pickle round-trip (Task 11b)
+# ---------------------------------------------------------------------------
+
+
+def test_payload_pickles_with_resolved_instruments_via_spawn_context() -> None:
+    """Lock the pickle round-trip invariant — prevents a future field
+    addition (Decimal, datetime, Path) from silently breaking mp.spawn.
+    StrategyMemberPayload.resolved_instruments tuple must survive
+    pickle.dumps/loads with all ResolvedInstrument fields intact."""
+    import pickle
+    from datetime import date
+
+    from msai.services.nautilus.security_master.live_resolver import (
+        AssetClass,
+        ResolvedInstrument,
+    )
+
+    resolved = (
+        ResolvedInstrument(
+            canonical_id="QQQ.NASDAQ",
+            asset_class=AssetClass.EQUITY,
+            contract_spec={
+                "secType": "STK",
+                "symbol": "QQQ",
+                "exchange": "SMART",
+                "primaryExchange": "NASDAQ",
+                "currency": "USD",
+            },
+            effective_window=(date(2026, 1, 1), None),
+        ),
+    )
+    member = StrategyMemberPayload(
+        strategy_id=uuid4(),
+        strategy_path="strategies.example.ema_cross:EMACrossStrategy",
+        strategy_config_path="strategies.example.config:EMACrossConfig",
+        strategy_config={},
+        strategy_code_hash="abc123",
+        strategy_id_full="",
+        instruments=["QQQ"],
+        resolved_instruments=resolved,
+    )
+    payload = TradingNodePayload(
+        row_id=uuid4(),
+        deployment_id=uuid4(),
+        deployment_slug="abcd1234abcd1234",
+        strategy_path="strategies.example.ema_cross:EMACrossStrategy",
+        strategy_config_path="strategies.example.config:EMACrossConfig",
+        strategy_members=[member],
+    )
+
+    round_tripped = pickle.loads(pickle.dumps(payload))
+    assert round_tripped.strategy_members[0].resolved_instruments == resolved
+    assert (
+        round_tripped.strategy_members[0].resolved_instruments[0].asset_class is AssetClass.EQUITY
+    )
+    assert round_tripped.strategy_members[0].resolved_instruments[0].canonical_id == "QQQ.NASDAQ"

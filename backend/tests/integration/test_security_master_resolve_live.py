@@ -540,3 +540,74 @@ async def test_resolve_for_live_warm_honors_nonrollable_alias_move(
             f"warm path B should honor the registry's active alias "
             f"(AAPL.ARCA) for non-rollable AAPL; got {resolved!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 3b — registry signature locks + structured AmbiguousSymbolError
+# ---------------------------------------------------------------------------
+
+
+def test_find_by_alias_requires_as_of_date() -> None:
+    """Regression lock: iter-2 plan-review P1 — UTC default regresses
+    roll-day correctness if any caller forgets to pass it.
+
+    :meth:`InstrumentRegistry.find_by_alias`'s ``as_of_date`` kwarg must
+    be required, not defaulted. Callers MUST thread an explicit
+    exchange-local date (Chicago-local ``spawn_today`` / CME trading
+    date) so that a late-UTC-night run doesn't silently resolve to a
+    different quarterly futures contract than the rest of the
+    live-path wiring computed.
+    """
+    import inspect
+
+    from msai.services.nautilus.security_master.registry import InstrumentRegistry
+
+    sig = inspect.signature(InstrumentRegistry.find_by_alias)
+    param = sig.parameters["as_of_date"]
+    assert param.default is inspect.Parameter.empty, (
+        "as_of_date must be required — UTC default regresses roll-day behavior"
+    )
+
+
+def test_require_definition_requires_as_of_date() -> None:
+    """Same rationale as ``test_find_by_alias_requires_as_of_date`` for
+    the thin wrapper :meth:`InstrumentRegistry.require_definition` —
+    leaving a default on the wrapper would reintroduce the silent
+    UTC-vs-exchange-date skew via the convenience path.
+    """
+    import inspect
+
+    from msai.services.nautilus.security_master.registry import InstrumentRegistry
+
+    sig = inspect.signature(InstrumentRegistry.require_definition)
+    param = sig.parameters["as_of_date"]
+    assert param.default is inspect.Parameter.empty, (
+        "as_of_date must be required on require_definition too"
+    )
+
+
+def test_ambiguous_symbol_error_exposes_structured_attributes() -> None:
+    """Task 3's ``lookup_for_live`` wraps this error; must read
+    ``asset_classes`` as a list attribute, not via string parsing of
+    the formatted message.
+
+    The new ``AmbiguousSymbolError.__init__`` takes keyword args
+    ``symbol`` / ``provider`` / ``asset_classes`` and composes the
+    human-readable message itself — so callers can route on the
+    attributes deterministically while ``pytest.raises(..., match="SPY")``
+    continues to work because the symbol is embedded in the message.
+    """
+    from msai.services.nautilus.security_master.registry import (
+        AmbiguousSymbolError,
+    )
+
+    err = AmbiguousSymbolError(
+        symbol="SPY",
+        provider="interactive_brokers",
+        asset_classes=["equity", "option"],
+    )
+    assert err.symbol == "SPY"
+    assert err.provider == "interactive_brokers"
+    assert err.asset_classes == ["equity", "option"]
+    # Message still contains "SPY" so existing `match="SPY"` tests keep passing.
+    assert "SPY" in str(err)

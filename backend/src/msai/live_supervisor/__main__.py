@@ -51,8 +51,10 @@ from msai.services.live.deployment_identity import derive_strategy_id_full
 from msai.services.live.gateway_router import GatewayRouter
 from msai.services.live_command_bus import LiveCommandBus
 from msai.services.nautilus.live_instrument_bootstrap import (
-    canonical_instrument_id,
     exchange_local_today,
+)
+from msai.services.nautilus.security_master.live_resolver import (
+    lookup_for_live,
 )
 from msai.services.nautilus.strategy_loader import resolve_importable_strategy_paths
 from msai.services.nautilus.trading_node_subprocess import (
@@ -277,12 +279,33 @@ def _build_production_payload_factory(
                         member.order_index,
                     )
 
-                    # Per-member instruments: canonicalize for futures rollover
+                    # Per-member instruments: pre-paper_symbols + registry-backed
+                    # resolution. ``lookup_for_live`` raises
+                    # ``RegistryMissError`` / ``RegistryIncompleteError`` /
+                    # ``UnsupportedAssetClassError`` / ``AmbiguousRegistryError``
+                    # (all subclass ``LiveResolverError`` → ``ValueError``), so
+                    # ``ProcessManager``'s permanent-catch fires and dispatches
+                    # on subtype to the specific ``FailureKind``.
                     member_paper_symbols = [inst.split(".")[0] for inst in member.instruments]
-                    member_canonical = [
-                        canonical_instrument_id(inst, today=spawn_today)
-                        for inst in member.instruments
-                    ]
+
+                    # Defensive guard — empty member.instruments is a programmer
+                    # bug (portfolio revision freeze should have rejected it).
+                    # ``strategy_id_full`` is the LOCAL variable from above, NOT
+                    # an attribute on the ORM row.
+                    if not member.instruments:
+                        raise ValueError(
+                            f"strategy member {strategy_id_full!r} has no "
+                            "instruments — portfolio freeze should have "
+                            "rejected this revision"
+                        )
+
+                    resolved_instruments = await lookup_for_live(
+                        list(member.instruments),
+                        as_of_date=spawn_today,
+                        session=session,
+                    )
+                    member_canonical = [r.canonical_id for r in resolved_instruments]
+                    member_resolved = tuple(resolved_instruments)
 
                     # Derive instrument_id + bar_type into the member's
                     # config, same logic as the single-strategy path.
@@ -324,6 +347,7 @@ def _build_production_payload_factory(
                             strategy_code_hash=member_code_hash,
                             strategy_id_full=strategy_id_full,
                             instruments=member_paper_symbols,
+                            resolved_instruments=member_resolved,
                         )
                     )
                     all_paper_symbols.extend(member_paper_symbols)

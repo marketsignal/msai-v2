@@ -38,6 +38,9 @@ from urllib.parse import urlparse
 if TYPE_CHECKING:
     from datetime import date
 
+    from msai.services.nautilus.security_master.live_resolver import (
+        ResolvedInstrument,
+    )
     from msai.services.nautilus.trading_node_subprocess import StrategyMemberPayload
 
 from nautilus_trader.adapters.interactive_brokers.common import IB_VENUE
@@ -63,6 +66,7 @@ from msai.services.nautilus.ib_port_validator import (
 )
 from msai.services.nautilus.live_instrument_bootstrap import (
     build_ib_instrument_provider_config,
+    build_ib_instrument_provider_config_from_resolved,
 )
 
 
@@ -461,7 +465,14 @@ def build_portfolio_trading_node_config(
             "deployment with no strategies cannot make progress."
         )
 
-    # Aggregate instruments across all members (de-duped).
+    # Aggregate bare-symbol instruments across all members (de-duped).
+    # This check preserves the original "no instruments" fail-fast for
+    # StrategyMemberPayload construction errors; the IB provider config
+    # itself is now built from ``resolved_instruments`` below (Task 11 —
+    # registry-backed path). ``spawn_today`` is no longer consumed here
+    # because the resolver (``lookup_for_live``) owns futures rollover
+    # before the payload ever reaches the config builder.
+    _ = spawn_today  # Retained in signature for supervisor call-site stability.
     all_instruments: set[str] = set()
     for member in strategy_members:
         all_instruments.update(member.instruments)
@@ -470,14 +481,31 @@ def build_portfolio_trading_node_config(
             "No instruments found across all strategy_members — a TradingNode "
             "with no subscribed instruments cannot make progress."
         )
-    sorted_instruments = sorted(all_instruments)
 
     normalized_account_id = ib_settings.account_id.strip()
     validate_port_account_consistency(ib_settings.port, normalized_account_id)
 
-    instrument_provider_config = build_ib_instrument_provider_config(
-        sorted_instruments,
-        today=spawn_today,
+    # Aggregate ResolvedInstrument across all members, deduped by
+    # canonical_id so two strategies subscribing to the same instrument
+    # produce one IBContract, not two. The dedup is first-wins — the
+    # resolver (single source of truth) guarantees canonical_id
+    # uniqueness within a spawn, so "first wins" never discards a
+    # different spec.
+    seen: dict[str, ResolvedInstrument] = {}
+    for member in strategy_members:
+        for ri in member.resolved_instruments:
+            seen.setdefault(ri.canonical_id, ri)
+    aggregated = list(seen.values())
+
+    if not aggregated:
+        raise ValueError(
+            "No resolved_instruments found across strategy_members — "
+            "supervisor must thread lookup_for_live output through "
+            "StrategyMemberPayload.resolved_instruments (see Task 9)."
+        )
+
+    instrument_provider_config = build_ib_instrument_provider_config_from_resolved(
+        aggregated,
     )
     data_client_id = _derive_data_client_id(deployment_slug)
     exec_client_id = _derive_exec_client_id(deployment_slug)

@@ -4,6 +4,55 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-04-20 — live-path registry wiring (branch `feat/live-path-wiring-registry`)
+
+**Shipped:**
+
+- `lookup_for_live(symbols, as_of_date)` pure-read resolver over `instrument_definitions` + `instrument_aliases` at `backend/src/msai/services/nautilus/security_master/live_resolver.py`. Returns typed `ResolvedInstrument` (options-extensible `contract_spec` dict). Supports dotted inputs (`AAPL.NASDAQ` → `find_by_alias`) and bare tickers (`AAPL` → `find_by_raw_symbol`). Provider-filtered alias walk + overlap tie-break by `(effective_from DESC)`; same-day overlap raises `AmbiguousRegistryError(reason=SAME_DAY_OVERLAP)`.
+- `AssetClass` enum (`equity/futures/fx/option/crypto`) + `ResolvedInstrument` frozen dataclass + error hierarchy: `LiveResolverError(ValueError)` base with `RegistryMissError / RegistryIncompleteError / UnsupportedAssetClassError / AmbiguousRegistryError` subclasses. Each error exposes `.to_error_message()` emitting a JSON envelope (`{code, message, details}`) parsable by the API layer.
+- `_build_contract_spec` derives IB-compatible `{secType, symbol, exchange, primaryExchange, currency, lastTradeDateOrContractMonth}` dict from a registry row pair. Per-asset-class logic: equity/ETF STK, futures FUT with month-code parser (decade-boundary-safe: `2029-12-15 + ESH0 → 203003`, not `2020-03`), FX CASH with `BASE/QUOTE` split and `base`/`quote` non-empty validation.
+- `build_ib_instrument_provider_config_from_resolved(resolved)` at `backend/src/msai/services/nautilus/live_instrument_bootstrap.py` — registry-backed IB preload config builder. Reconstructs `IBContract` from `contract_spec` dicts; filters unknown kwargs for forward-compat with options. No `PHASE_1_PAPER_SYMBOLS` gate.
+- `build_portfolio_trading_node_config` at `backend/src/msai/services/nautilus/live_node_config.py:~466` now aggregates `member.resolved_instruments` dedup'd by `canonical_id` across strategy members. Raises `ValueError` if the aggregate is empty (supervisor-threading bug safety net).
+- Supervisor `backend/src/msai/live_supervisor/__main__.py:~281-328` now calls `await lookup_for_live(...)` in the payload factory (replacing per-member `canonical_instrument_id` calls) and threads `resolved_instruments=member_resolved` through the `StrategyMemberPayload(...)` construction. Defensive empty-instruments guard added before the resolver call.
+- `StrategyMemberPayload.resolved_instruments: tuple[ResolvedInstrument, ...] = ()` field added at `backend/src/msai/services/nautilus/trading_node_subprocess.py`. Pickle-round-trip test at `test_trading_node_payload_multi_strategy.py` locks the `mp.spawn` invariant.
+- `ProcessManager` at `backend/src/msai/live_supervisor/process_manager.py:~261-297` permanent-catch dispatches on `LiveResolverError` subtype before the generic `ValueError` branch. Each subtype maps to its own `FailureKind` and the reason stored in `live_node_processes.error_message` is the JSON envelope from `exc.to_error_message()` — parseable by the endpoint.
+- `FailureKind` enum extended with 4 new variants: `REGISTRY_MISS`, `REGISTRY_INCOMPLETE`, `UNSUPPORTED_ASSET_CLASS`, `AMBIGUOUS_REGISTRY` (String(32) column is additive; `parse_or_unknown` preserves backward compatibility).
+- `EndpointOutcome.registry_permanent_failure(kind, error_message)` factory at `backend/src/msai/services/live/idempotency.py` — HTTP 422 + `{"error": {"code", "message", "details"}, "failure_kind"}` envelope per `.claude/rules/api-design.md`. Parses the JSON envelope from the row's `error_message`; defensive fallback for non-JSON. `cacheable=False` so retry-after-fix (operator runs `msai instruments refresh`) works with the same `Idempotency-Key`.
+- `/api/v1/live/start-portfolio` handler at `backend/src/msai/api/live.py:~642-658` now dispatches on `FailureKind`: the 4 registry kinds route to `registry_permanent_failure` (422); legacy permanent kinds (SPAWN_FAILED_PERMANENT, RECONCILIATION_FAILED, BUILD_TIMEOUT, HEARTBEAT_TIMEOUT, UNKNOWN) stay on the existing `permanent_failure` (503).
+- Structured telemetry `live_instrument_resolved` (structlog) + counter `msai_live_instrument_resolved_total` (project's hand-rolled MetricsRegistry, exposed via `/metrics`). Labels: `source ∈ {registry, registry_miss, registry_incomplete}`, `asset_class ∈ {equity, futures, fx, option, crypto, unknown}`. Emitted on all three outcome paths (success, miss, incomplete).
+- `_fire_alert_bounded(level, title, message)` helper in `live_resolver.py` — wraps `alerting_service.send_alert` via `loop.run_in_executor(_HISTORY_EXECUTOR, ...)` + `asyncio.wait_for(shield, timeout=_HISTORY_WRITE_TIMEOUT_S)` matching `alerting.py:305-328` production pattern. Registry miss fires WARN; registry incomplete fires ERROR. Late-completion done-callback logs exceptions so post-timeout failures aren't silently swallowed.
+- Registry enhancements (Task 3b): `InstrumentRegistry.find_by_alias` and `require_definition` now REQUIRE `as_of_date: date` (no default; UTC fallback removed — prevents silent roll-day regression). `AmbiguousSymbolError` carries `symbol/provider/asset_classes` as attributes instead of only a formatted string; `lookup_for_live` wraps it into `AmbiguousRegistryError(reason=CROSS_ASSET_CLASS)` without string parsing.
+- AST-based regression test at `backend/tests/unit/structure/test_canonical_instrument_id_runtime_isolation.py` — walks `live_supervisor/__main__.py` + `live_node_config.py` AST and asserts ZERO references to `canonical_instrument_id` (catches aliased imports, attribute access, and re-exports; grep would miss those). Positive assertion also confirms the helper still exists in `live_instrument_bootstrap.py` (CLI seeding still uses it).
+
+**Changed:**
+
+- Non-Phase-1 symbols (QQQ, GBP/USD, NQ, GOOGL, etc.) are now deployable via `msai instruments refresh --symbols X` + deploy — no code edits required.
+- `canonical_instrument_id()` removed from the live-start runtime path (supervisor + live_node_config). Helper stays at `live_instrument_bootstrap.py` for the CLI seeding path only.
+- `PHASE_1_PAPER_SYMBOLS` gate removed from the runtime IB preload builder.
+
+**Tests:** 1491 tests pass (unit + integration). New test files:
+
+- `tests/unit/services/nautilus/security_master/test_live_resolver_types.py` — 8 tests (types + exceptions + to_error_message round-trip)
+- `tests/unit/services/nautilus/security_master/test_live_resolver_contract_spec.py` — 11 tests (per-asset-class + decade boundary + FX malformed guards)
+- `tests/unit/services/nautilus/security_master/test_live_resolver_counter.py` — 4 tests (counter registration introspection; no state mutation)
+- `tests/integration/services/nautilus/security_master/test_lookup_for_live.py` — 11 tests (dotted/bare, overlap, miss aggregation, futures roll, option reject, ambiguous SAME_DAY)
+- `tests/integration/services/nautilus/security_master/test_live_resolver_telemetry.py` — 2 tests (structured log via `structlog.testing.capture_logs`)
+- `tests/integration/services/nautilus/security_master/test_live_resolver_alerts.py` — 1 test (positional-arg mock on `alerting_service`)
+- `tests/unit/services/nautilus/test_live_instrument_bootstrap.py` — 5 new tests appended (equity/FX/futures/empty/unknown-kwargs)
+- `tests/unit/services/nautilus/test_live_node_config_registry.py` — 3 tests (cross-member aggregation, dedup, empty-aggregated raise)
+- `tests/unit/live_supervisor/test_process_manager_registry_dispatch.py` — 8 tests (isinstance ladder, JSON envelope persistence, consistency with real source)
+- `tests/integration/live_supervisor/test_supervisor_uses_lookup_for_live.py` — 4 integration tests (resolver in supervisor env, StrategyMemberPayload.resolved_instruments round-trip)
+- `tests/unit/services/live/test_endpoint_outcome_registry_factory.py` — 8 tests (all 4 registry kinds + assertion guard + 3 fallback paths)
+- `tests/unit/structure/test_canonical_instrument_id_runtime_isolation.py` — 2 tests (absent from runtime + present in bootstrap)
+- `tests/unit/test_trading_node_payload_multi_strategy.py` — 1 new pickle round-trip test appended
+
+**Validated:** real-money drill on `U4705114` per `docs/runbooks/drill-live-path-registry-wiring.md` (report at `docs/runbooks/drill-reports/...`). Registry-backed BUY 1 → `/kill-all` → flat. Council verdict constraint #5 satisfied.
+
+**Council verdict:** `docs/decisions/live-path-registry-wiring.md` (ratified 2026-04-19).
+**PRD:** `docs/prds/live-path-wiring-registry.md`.
+**Research:** `docs/research/2026-04-20-live-path-wiring-registry.md`.
+**Plan:** `docs/plans/2026-04-20-live-path-wiring-registry.md` (4 plan-review iterations: 3 P0 → 0 P0, 7 P1 → 0 P1, 5 P2 → 0 P2).
+
 ### Changed
 
 - 2026-04-19: **Flattened repository layout** (commits `9c30116` + `68a3189`, same PR as the codex archival below). The surviving implementation (previously under `claude-version/`) was promoted to the repo root. Physical moves via `git mv` preserve rename history for 455 files. Follow-up commit strips `claude-version/` path prefixes from source code, tests, scripts, configs, and active docs; drops dangling `Ported from codex-version/...` provenance comments in 5 backend files (content is preserved at git tag `codex-final` for revival: `git checkout codex-final -- <path>`). Root `CLAUDE.md` rewritten to absorb API endpoints + architecture notes + env-var documentation that previously lived in `claude-version/CLAUDE.md`. `.gitignore` de-prefixed and augmented with log/Jupyter/OS patterns from the deleted `claude-version/.gitignore`. `README.md` moved to repo root (there was no prior root README). `docker-compose.{dev,prod}.yml` + `.github/workflows/ci.yml` + `strategies/` + `data/` + `backend/` + `frontend/` all now at the top level. Net result: no `claude-version/` or `codex-version/` paths in operational surfaces; entity labels remain only in historical decision/council narratives (e.g., `docs/decisions/which-version-to-keep.md`) where they describe the comparison itself.

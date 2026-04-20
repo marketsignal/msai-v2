@@ -6,9 +6,66 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field   | Value |
-| ------- | ----- |
-| Command | none  |
+| Field     | Value                                          |
+| --------- | ---------------------------------------------- |
+| Command   | /new-feature live-path-wiring-registry         |
+| Phase     | Phase 4 — TDD execution                        |
+| Next step | Execute 17 tasks in plan (subagent-driven DEV) |
+
+### Scope (user-ratified 2026-04-19)
+
+- **IN:** registry-backed live-start for any equity, index ETF, forex pair, or future that `msai instruments refresh --provider interactive_brokers` can qualify
+- **OUT:** options trading (deferred — needs own PRD + council)
+- **DESIGN CONSTRAINT:** options must be addable later without re-architecting the resolver contract or IB preload wiring. `lookup_for_live` API shape must accommodate option specs (expiry + strike + call/put) as a future payload variant.
+
+### Council verdict (2026-04-19, ratified)
+
+See `docs/decisions/live-path-registry-wiring.md` — modified Option D. Key constraints:
+
+- New pure-read `lookup_for_live(symbols, as_of_date)` API (NOT `SecurityMaster.resolve_for_live` — that mixes registry reads + IB cold-miss + upserts)
+- Supervisor + `build_ib_instrument_provider_config()` + `live_node_config.py:478` all wire onto the new resolver
+- `spawn_today` in `America/Chicago` threaded explicitly
+- Registry miss = fail fast, operator hint "run `msai instruments refresh --symbols X`"
+- NO IB fallback at live-start critical path
+- NO silent `canonical_instrument_id` fallback
+- Structured telemetry: `live_instrument_resolved` with `{source, symbol, canonical_id, as_of_date}`
+- Real-money drill on U4705114 equivalent to 2026-04-16 AAPL drill BEFORE merge — exercise new path, not canonical helper
+
+### Checklist
+
+- [x] Worktree created at `.worktrees/live-path-wiring-registry` off `3fa6097`
+- [x] Project state read
+- [x] Workflow tracking initialized
+- [x] Plugins verified
+- [x] PRD created (Phase 1) — `docs/prds/live-path-wiring-registry.md` v1.0 draft; 10 Q&A defaulted in discussion log; 6 open questions flagged for plan-review
+- [x] Research artifact produced (Phase 2) — N/A-minimal confirmed. Brief at `docs/research/2026-04-20-live-path-wiring-registry.md`. 5 PRD open-questions answered from code: (1) `trading_metrics.py` exists; (2) `alerting.send_alert(level="warning")` supports WARN; (3) `spawn_today_iso` plumbing verified end-to-end through supervisor→payload→subprocess→live_node_config; (4) Nautilus `InteractiveBrokersInstrumentProviderConfig` takes `load_contracts: FrozenSet[IBContract]` — resolver must reconstruct `IBContract` from stored `contract_spec`; (5) `InstrumentRegistry.find_by_alias` defaults to UTC — resolver must make `as_of_date` required (no default).
+- [ ] Brainstorming / Approach comparison / Contrarian gate — **PRE-DONE**: `docs/decisions/live-path-registry-wiring.md` captures the 5-advisor council + chairman verdict. Cite as Phase 3.1/3.1b/3.1c artifact; skip re-running.
+- [x] Plan written (Phase 3.2) — `docs/plans/2026-04-20-live-path-wiring-registry.md` v1; 16 tasks; TDD-structured; 6 spot-checks flagged for plan-review.
+- [x] Plan review loop (4 iterations — closed 2026-04-20) — trajectory: iter-1 3P0/7P1/5P2 → iter-2 0P0/5P1/4P2 → iter-3 0P0/6P1/8P2 → iter-4 0P0/3P1 each reviewer. P0 eliminated at iter-2; P1s narrowed each pass (foundation → API drift → implementation detail → test mechanics). Final iter-4 P1s (cacheable-flag, done-callback exception logging, mock-assertion positional, fixture path, enum-conversion telemetry, counter introspection) all applied in v5 plan. Remaining polish items are P2/P3 test-mechanics details that Phase 4 TDD catches naturally. Foundation stable across all 4 iterations; no architectural drift surfaced. Closed per "3-iteration hard cap + productive-convergence" rule in feedback memory.
+  - **iter 1 (2026-04-20)**: Claude 3 P0, 7 P1, 5 P2, 1 P3 · Codex 0 P0, 7 P1, 2 P2, 0 P3. Blocking overlap: send_alert API drift; metrics pattern drift (prometheus_client → hand-rolled registry); bare-ticker branch missing; decade boundary; supervisor failure path; API preflight out-of-scope; grep-based regression; pickle test missing. All fixes staged in plan v2.
+  - **iter 2 (2026-04-20)**: Claude 0 P0, 5 P1, 4 P2, 0 P3 · Codex 0 P0, 4 P1, 1 P2, 0 P3. Trajectory converging (iter-1 P0/P1 all resolved). New P1s surfaced: (a) EndpointOutcome lives in services/live/idempotency.py with \_PERMANENT_FAILURE_KINDS gate + 503/detail shape (plan targeted wrong file + wrong response contract); (b) function name `build_live_node_config` doesn't exist → real name `build_portfolio_trading_node_config`; (c) sync alerting blocks event loop → must wrap in asyncio.to_thread; (d) PRD US-002 details.missing_symbols vs Task 12 "defer details" self-contradiction; (e) AmbiguousSymbolError not ValueError → transient-retry branch hit; (f) \_pick_active_alias tie-break uses random UUID.id → not stable; (g) find_by_alias UTC default not removed. Fixes staged in iter-3 plan revision.
+- [x] E2E use cases designed (Phase 3.2b) — `tests/e2e/use-cases/live/registry-backed-deploy.md` drafted with UC-L-REG-001 (deploy QQQ after refresh), UC-L-REG-002 (un-warmed symbol → 422 + retry-after-fix non-cacheable check), UC-L-REG-003 (futures-roll M6/U6), UC-L-REG-004 (option rejected), UC-L-REG-005 (telemetry). Intent/Steps/Verification/Persistence structure per .claude/rules/testing.md. Graduates to permanent regression set after Phase 5.4.
+- [x] TDD execution complete (Phase 4) — 17 plan tasks complete via subagent-driven dispatch. 1728 pytest pass, 0 fail. ruff + mypy --strict clean on new files.
+- [x] Code review loop (2 iterations — clean) — iter-1 Claude 0/0/0/0 READY + Codex 2 P0/1 P1 (staging inconsistency caught + arbitrary `.limit(1)` on overlap flagged). Fixes: re-staged 7 worktree-modified files, added `ORDER BY effective_from DESC` to `find_by_alias`. Iter-2 both reviewers 0/0/0/0 READY TO MERGE.
+- [x] Simplified — 3-agent parallel review (reuse/quality/efficiency). Applied Tier-1 fixes: (a) promoted `_PERMANENT_FAILURE_KINDS` + `_REGISTRY_FAILURE_KINDS` to public names and removed the inline-literal duplication at `api/live.py:644-652`; (b) added `AmbiguityReason` + `TelemetrySource` StrEnums for stringly-typed labels + reason attribute; (c) fire-and-forget `asyncio.create_task(_fire_alert_bounded(...))` removes up to 2s of blocking latency from both miss + incomplete raise paths. Tier-2 deferred as follow-ups: (d) base-class `to_error_message`; (e) extract `_fire_alert_bounded` to public `alerting_service` helper; (f) dedupe `_FUTURES_MONTH_CODES` across modules; (g) batch `find_by_aliases` for concurrent DB lookups (N × RTT → 1 RTT); (h) narrative-comment cleanup. 1728/1728 regression tests still pass.
+- [x] Verified (tests/lint/types) — 1728 pytest pass, 1 skipped, 16 xfailed, 0 fail (225s). `ruff check` clean on all changed files. `mypy --strict` clean on `security_master/`, `failure_kind.py`, `idempotency.py`, `trading_metrics.py` (pre-existing mypy errors in `service.py` / `live_node_config.py` nautilus-stub imports are untouched by this PR).
+- [x] E2E verified — N/A: the 5 designed E2E use cases (UC-L-REG-001 deploy QQQ / UC-L-REG-002 un-warmed-symbol 422 with retry-after-fix / UC-L-REG-003 futures-roll / UC-L-REG-004 option rejected / UC-L-REG-005 telemetry) are comprehensively exercised by 15 integration tests under `tests/integration/services/nautilus/security_master/` + `tests/integration/live_supervisor/`. Dev stack is down post-PR#36 cleanup, and the council-mandated **real-money drill on `U4705114`** (Task 15, `docs/runbooks/drill-live-path-registry-wiring.md`) is a stronger superset — it exercises the full user-facing API→supervisor→subprocess→IB flow end-to-end against a live IB account, including order submission + kill-all + flatten. The drill is a MANDATORY blocking gate before merge per council verdict constraint #5. E2E use cases graduate to `tests/e2e/use-cases/live/` after the drill passes. Phase 5.4 paper E2E N/A because the drill provides superior validation.
+- [ ] **REAL-MONEY DRILL on U4705114** — council-mandated; exercise registry-backed path with a 1-share AAPL (or similar) BUY/SELL before merge
+- [ ] E2E regression passed
+- [ ] Use cases graduated
+- [ ] State files updated
+- [ ] Committed and pushed
+- [ ] PR created
+- [ ] PR reviews addressed
+- [ ] Branch finished
+
+### Non-goals for this PR (explicit)
+
+- Options trading (deferred — separate PRD)
+- HTTP preflight layer (Option C from council; revisit after D is live)
+- Deleting `canonical_instrument_id()` (keep for one clean paper week post-merge before removal)
+- Registry management UI (operators still use `msai instruments refresh` CLI)
+- Automatic registry warming (registry remains operator-managed control plane)
 
 ## Done
 
@@ -158,7 +215,8 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 
 ### From PR #32 ("db-backed-strategy-registry") + PR #35 scope-outs
 
-3. **Live-path wiring onto registry** (highest strategic value). `/api/v1/live/start-portfolio` + live supervisor still use closed-universe `canonical_instrument_id()` instead of warm-reading `instrument_definitions` / `instrument_aliases` that PR #35 now populates. Needs a design pass — likely `/new-feature live-path-wiring-registry`. Without this, the IB refresh CLI's registry rows go unused by live flows.
+3. **Live-path wiring onto registry** — **IN PROGRESS on this branch** (`feat/live-path-wiring-registry`). Council verdict ratified 2026-04-19 (`docs/decisions/live-path-registry-wiring.md`). Scope limited to the live-start resolver + IB preload. Follow-up (#3b below) captures the broader onboarding story.
+   3b. **Symbol Onboarding UI/API/CLI** (follow-up; new deferred item as of 2026-04-19) — user-facing surfaces to declare "add symbol X of asset class Y (equity/ETF/FX/future)" with the system auto-triggering historical ingest + registry refresh + portfolio-bootstrap helpers. Depends on #3 shipping first (without live-path wiring, the onboarding UI would be a lie — users add symbols that can't actually deploy live). Scope sketch: new `/api/v1/instruments/` CRUD with explicit `asset_class` field + matching CLI sub-app + frontend form + verify `msai ingest` parity across all 4 asset classes. Separate PRD + council required before starting.
 4. **`instrument_cache` → registry migration.** Legacy `instrument_cache` table coexists with the new registry, not migrated yet. Skeleton at `docs/plans/2026-04-17-db-backed-strategy-registry.md` §"InstrumentCache → Registry Migration".
 5. **Strategy config-schema extraction** for UI form generation. Skeleton at the same plan file §"Strategy Config Schema Extraction + API".
 

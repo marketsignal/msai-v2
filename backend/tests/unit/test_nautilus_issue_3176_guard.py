@@ -19,14 +19,37 @@ drops legitimate fills from reconciliation.
 
 from __future__ import annotations
 
-from typing import Any
 from uuid import uuid4
 
 from msai.services.nautilus.live_node_config import (
     IBSettings,
     build_portfolio_trading_node_config,
 )
+from msai.services.nautilus.security_master.live_resolver import (
+    AssetClass,
+    ResolvedInstrument,
+)
 from msai.services.nautilus.trading_node_subprocess import StrategyMemberPayload
+
+
+def _synth_resolved(symbols: list[str]) -> tuple[ResolvedInstrument, ...]:
+    from datetime import date
+
+    return tuple(
+        ResolvedInstrument(
+            canonical_id=s if "." in s else f"{s}.NASDAQ",
+            asset_class=AssetClass.EQUITY,
+            contract_spec={
+                "secType": "STK",
+                "symbol": s.partition(".")[0],
+                "exchange": "SMART",
+                "primaryExchange": s.partition(".")[2] or "NASDAQ",
+                "currency": "USD",
+            },
+            effective_window=(date(2026, 1, 1), None),
+        )
+        for s in symbols
+    )
 
 
 def _make_member(
@@ -34,13 +57,15 @@ def _make_member(
     instruments: list[str] | None = None,
     strategy_id_full: str = "",
 ) -> StrategyMemberPayload:
+    instruments_val = instruments if instruments is not None else ["AAPL"]
     return StrategyMemberPayload(
         strategy_id=uuid4(),
         strategy_path="strategies.example.ema_cross:EMACrossStrategy",
         strategy_config_path="strategies.example.config:EMACrossConfig",
         strategy_config={},
         strategy_id_full=strategy_id_full,
-        instruments=instruments if instruments is not None else ["AAPL"],
+        instruments=instruments_val,
+        resolved_instruments=_synth_resolved(instruments_val),
     )
 
 

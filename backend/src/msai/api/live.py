@@ -49,6 +49,8 @@ from msai.services.live.deployment_identity import (
 )
 from msai.services.live.failure_kind import FailureKind
 from msai.services.live.idempotency import (
+    PERMANENT_FAILURE_KINDS,
+    REGISTRY_FAILURE_KINDS,
     BodyMismatchReservation,
     CachedOutcome,
     EndpointOutcome,
@@ -639,18 +641,19 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
                 await idem.release(reservation.redis_key)
             return _apply_outcome(outcome)
 
-        permanent_kinds = {
-            FailureKind.SPAWN_FAILED_PERMANENT,
-            FailureKind.RECONCILIATION_FAILED,
-            FailureKind.BUILD_TIMEOUT,
-            FailureKind.HEARTBEAT_TIMEOUT,
-            FailureKind.UNKNOWN,
-        }
-        if kind not in permanent_kinds:
+        if kind not in PERMANENT_FAILURE_KINDS:
             kind = FailureKind.UNKNOWN
-        outcome = EndpointOutcome.permanent_failure(kind, row.error_message or "unknown failure")
+        if kind in REGISTRY_FAILURE_KINDS:
+            outcome = EndpointOutcome.registry_permanent_failure(kind, row.error_message or "{}")
+        else:
+            outcome = EndpointOutcome.permanent_failure(
+                kind, row.error_message or "unknown failure"
+            )
         if reservation is not None:
-            await idem.commit(reservation.redis_key, body_hash, outcome)
+            if outcome.cacheable:
+                await idem.commit(reservation.redis_key, body_hash, outcome)
+            else:
+                await idem.release(reservation.redis_key)
         return _apply_outcome(outcome)
 
     except Exception:

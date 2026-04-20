@@ -24,6 +24,10 @@ from uuid import uuid4
 
 import pytest
 
+from msai.services.nautilus.security_master.live_resolver import (
+    AssetClass,
+    ResolvedInstrument,
+)
 from msai.services.nautilus.trading_node_subprocess import (
     StrategyMemberPayload,
     TradingNodePayload,
@@ -486,6 +490,33 @@ def test_closure_body_matches_production_factory_source() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _synth_resolved(symbols: list[str]) -> tuple[ResolvedInstrument, ...]:
+    """Fabricate ``ResolvedInstrument`` rows for each bare symbol.
+
+    Test-only fallback used when a test doesn't explicitly supply
+    ``resolved_instruments``. Real spawns thread rows from
+    ``lookup_for_live``; here we produce equity rows that satisfy
+    ``build_portfolio_trading_node_config``'s aggregation check.
+    """
+    from datetime import date
+
+    return tuple(
+        ResolvedInstrument(
+            canonical_id=s if "." in s else f"{s}.NASDAQ",
+            asset_class=AssetClass.EQUITY,
+            contract_spec={
+                "secType": "STK",
+                "symbol": s.partition(".")[0],
+                "exchange": "SMART",
+                "primaryExchange": s.partition(".")[2] or "NASDAQ",
+                "currency": "USD",
+            },
+            effective_window=(date(2026, 1, 1), None),
+        )
+        for s in symbols
+    )
+
+
 def _make_member(
     *,
     instruments: list[str] | None = None,
@@ -493,14 +524,22 @@ def _make_member(
     strategy_config_path: str = "strategies.example.config:EMACrossConfig",
     strategy_config: dict[str, Any] | None = None,
     strategy_id_full: str = "",
+    resolved_instruments: tuple[ResolvedInstrument, ...] | None = None,
 ) -> StrategyMemberPayload:
+    instruments_val = instruments if instruments is not None else ["AAPL"]
+    resolved_val = (
+        resolved_instruments
+        if resolved_instruments is not None
+        else _synth_resolved(instruments_val)
+    )
     return StrategyMemberPayload(
         strategy_id=uuid4(),
         strategy_path=strategy_path,
         strategy_config_path=strategy_config_path,
         strategy_config=strategy_config if strategy_config is not None else {},
         strategy_id_full=strategy_id_full,
-        instruments=instruments if instruments is not None else ["AAPL"],
+        instruments=instruments_val,
+        resolved_instruments=resolved_val,
     )
 
 

@@ -96,6 +96,28 @@ class FailureKind(StrEnum):
     it automatically, the operator must restart the supervisor or
     the deployment."""
 
+    REGISTRY_MISS = "registry_miss"
+    """``lookup_for_live`` raised ``RegistryMissError`` — one or more
+    symbols lack an active registry alias. Permanent; operator must run
+    ``msai instruments refresh --symbols <X>`` before retrying. Endpoint
+    maps this to HTTP 422 code=REGISTRY_MISS."""
+
+    REGISTRY_INCOMPLETE = "registry_incomplete"
+    """``lookup_for_live`` raised ``RegistryIncompleteError`` — a matched
+    row has NULL/malformed required fields. Data-integrity issue; fire
+    ERROR alert. Endpoint maps to HTTP 422 code=REGISTRY_INCOMPLETE."""
+
+    UNSUPPORTED_ASSET_CLASS = "unsupported_asset_class"
+    """``lookup_for_live`` raised ``UnsupportedAssetClassError`` — a row
+    resolved to ``option`` or ``crypto``. Endpoint maps to HTTP 422
+    code=UNSUPPORTED_ASSET_CLASS."""
+
+    AMBIGUOUS_REGISTRY = "ambiguous_registry"
+    """``lookup_for_live`` raised ``AmbiguousRegistryError`` — a bare
+    symbol matches multiple registry rows across asset_classes, OR
+    multiple active aliases share the same ``effective_from`` (operator-
+    seeded overlap). Endpoint maps to HTTP 422 code=AMBIGUOUS_REGISTRY."""
+
     UNKNOWN = "unknown"
     """Fallback for rows whose ``failure_kind`` column is NULL or
     carries a value not in this enum. Used by :meth:`parse_or_unknown`

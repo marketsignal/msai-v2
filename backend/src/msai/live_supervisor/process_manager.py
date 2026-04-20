@@ -281,18 +281,58 @@ class ProcessManager:
                 #
                 # Mark failed + ACK so the command is removed from
                 # the PEL.
+                #
+                # Task 9 (live-path-wiring-registry): dispatch on
+                # resolver-specific subtypes so the endpoint can
+                # return distinct HTTP error codes (REGISTRY_MISS vs
+                # REGISTRY_INCOMPLETE vs UNSUPPORTED_ASSET_CLASS vs
+                # AMBIGUOUS_REGISTRY vs the generic
+                # SPAWN_FAILED_PERMANENT fallback). Lazy import to
+                # avoid pulling the resolver into process_manager's
+                # startup cost.
+                from msai.services.nautilus.security_master.live_resolver import (
+                    AmbiguousRegistryError,
+                    LiveResolverError,
+                    RegistryIncompleteError,
+                    RegistryMissError,
+                    UnsupportedAssetClassError,
+                )
+
+                if isinstance(exc, RegistryMissError):
+                    kind = FailureKind.REGISTRY_MISS
+                elif isinstance(exc, RegistryIncompleteError):
+                    kind = FailureKind.REGISTRY_INCOMPLETE
+                elif isinstance(exc, UnsupportedAssetClassError):
+                    kind = FailureKind.UNSUPPORTED_ASSET_CLASS
+                elif isinstance(exc, AmbiguousRegistryError):
+                    kind = FailureKind.AMBIGUOUS_REGISTRY
+                else:
+                    kind = FailureKind.SPAWN_FAILED_PERMANENT
+
+                # For resolver-class errors, persist the structured
+                # JSON envelope as reason so the EndpointOutcome
+                # factory (Task 12) can parse back into {code,
+                # message, details}. For other errors, preserve the
+                # existing "payload factory failed (permanent): "
+                # prefix.
+                if isinstance(exc, LiveResolverError):
+                    reason = exc.to_error_message()
+                else:
+                    reason = f"payload factory failed (permanent): {exc}"
+
                 log.exception(
                     "spawn_payload_factory_failed_permanent",
                     extra={
                         "deployment_id": str(deployment_id),
                         "deployment_slug": deployment_slug,
                         "exception_type": type(exc).__name__,
+                        "failure_kind": kind.value,
                     },
                 )
                 await self._mark_failed(
                     row_id=row_id,
-                    reason=f"payload factory failed (permanent): {exc}",
-                    failure_kind=FailureKind.SPAWN_FAILED_PERMANENT,
+                    reason=reason,
+                    failure_kind=kind,
                 )
                 return True
             except Exception as exc:  # noqa: BLE001
