@@ -1120,32 +1120,35 @@ async def live_positions(
 async def live_trades(
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
+    deployment_id: UUID | None = Query(default=None),  # noqa: B008
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> LiveTradesResponse:
     """Recent live trade executions from order_attempt_audits.
 
+    If ``deployment_id`` is provided, results are scoped to that
+    deployment. Otherwise returns fills across all deployments.
+
     NOTE: Returns ALL live fills, not scoped to the authenticated user.
     Single-operator design — see /positions docstring for rationale.
     """
+    from sqlalchemy.sql.elements import ColumnElement
+
     from msai.models.order_attempt_audit import OrderAttemptAudit
 
-    count_q = (
-        select(func.count())
-        .select_from(OrderAttemptAudit)
-        .where(
-            OrderAttemptAudit.is_live.is_(True),
-            OrderAttemptAudit.status.in_(("filled", "partially_filled")),
-        )
-    )
+    base_filters: list[ColumnElement[bool]] = [
+        OrderAttemptAudit.is_live.is_(True),
+        OrderAttemptAudit.status.in_(("filled", "partially_filled")),
+    ]
+    if deployment_id is not None:
+        base_filters.append(OrderAttemptAudit.deployment_id == deployment_id)
+
+    count_q = select(func.count()).select_from(OrderAttemptAudit).where(*base_filters)
     total = (await db.execute(count_q)).scalar_one()
 
     rows_q = (
         select(OrderAttemptAudit)
-        .where(
-            OrderAttemptAudit.is_live.is_(True),
-            OrderAttemptAudit.status.in_(("filled", "partially_filled")),
-        )
+        .where(*base_filters)
         .order_by(OrderAttemptAudit.ts_attempted.desc())
         .limit(limit)
         .offset(offset)

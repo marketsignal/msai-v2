@@ -413,6 +413,57 @@ async def test_resolve_for_live_es_routes_through_fixed_month_future(
 
 
 @pytest.mark.asyncio
+async def test_resolve_for_live_fx_upsert_normalizes_raw_symbol_to_slash(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Regression (multi-symbol drill 2026-04-20): IB's localSymbol for
+    CASH pairs comes back as dot form ("EUR.USD"), but the live resolver's
+    ``_build_contract_spec`` splits FX raw_symbol on "/" and warm lookups
+    use the operator-typed "EUR/USD". Storage must normalize to slash
+    form so neither side drifts.
+    """
+    async with session_factory() as session:
+        fake_instrument = MagicMock()
+        fake_instrument.id = MagicMock()
+        fake_instrument.id.__str__ = MagicMock(return_value="EUR/USD.IDEALPRO")
+        fake_instrument.id.venue.value = "IDEALPRO"
+        # IB's localSymbol for CASH pair: dot form.
+        fake_instrument.raw_symbol.value = "EUR.USD"
+        fake_instrument.__class__.__name__ = "CurrencyPair"
+        fake_instrument.to_dict = MagicMock(
+            return_value={
+                "type": "CurrencyPair",
+                "instrument_id": "EUR/USD.IDEALPRO",
+                "raw_symbol": "EUR.USD",
+            }
+        )
+
+        mock_qualifier = MagicMock()
+        mock_qualifier.qualify = AsyncMock(return_value=fake_instrument)
+        mock_provider = MagicMock()
+        fake_details = MagicMock()
+        fake_details.contract.primaryExchange = "IDEALPRO"
+        mock_provider.contract_details = {fake_instrument.id: fake_details}
+        mock_qualifier._provider = mock_provider
+
+        sm = SecurityMaster(qualifier=mock_qualifier, db=session)
+
+        ids = await sm.resolve_for_live(["EUR/USD"])
+        assert ids == ["EUR/USD.IDEALPRO"]
+
+        idef_row = (
+            await session.execute(
+                select(InstrumentDefinition).where(
+                    InstrumentDefinition.provider == "interactive_brokers",
+                    InstrumentDefinition.asset_class == "fx",
+                )
+            )
+        ).scalar_one()
+        # Core assertion: storage is slash form, not IB's dot form.
+        assert idef_row.raw_symbol == "EUR/USD"
+
+
+@pytest.mark.asyncio
 async def test_resolve_for_live_warm_raw_symbol_falls_through_on_stale_alias(
     session_factory: async_sessionmaker[async_sessionmaker[AsyncSession] | AsyncSession],  # type: ignore[type-arg]
 ) -> None:

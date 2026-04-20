@@ -668,6 +668,14 @@ class SecurityMaster:
         from msai.models.instrument_alias import InstrumentAlias
         from msai.models.instrument_definition import InstrumentDefinition
 
+        # FX raw_symbol invariant: registry stores BASE/QUOTE slash form.
+        # IB's localSymbol for CASH pairs is dot form ("EUR.USD"); the
+        # live-resolver's _build_contract_spec splits on "/", and warm
+        # lookups use the operator-typed "EUR/USD". Normalize at the
+        # storage boundary so neither side drifts.
+        if asset_class == "fx" and "/" not in raw_symbol and raw_symbol.count(".") == 1:
+            raw_symbol = raw_symbol.replace(".", "/")
+
         now = datetime.now(UTC)
         def_stmt = (
             pg_insert(InstrumentDefinition.__table__)

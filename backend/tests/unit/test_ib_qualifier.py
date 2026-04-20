@@ -69,7 +69,23 @@ class TestSpecToContractFuture:
         assert contract.secType == "FUT"
         assert contract.symbol == "ES"
         assert contract.exchange == "CME"
-        assert contract.lastTradeDateOrContractMonth == "20250620"
+        # IB resolves the actual last-trade date from yyyyMM — this
+        # avoids the computed-3rd-Friday trap when a holiday shifts it.
+        assert contract.lastTradeDateOrContractMonth == "202506"
+
+    def test_fixed_month_future_juneteenth_holiday_uses_month_not_day(self) -> None:
+        """Regression for multi-symbol drill 2026-04-20: when the 3rd
+        Friday (2026-06-19) is Juneteenth, ESM6 actually settles
+        2026-06-18. Passing yyyyMMdd='20260619' to IB fails; passing
+        yyyyMM='202606' lets IB resolve the holiday-adjusted date."""
+        spec = InstrumentSpec(
+            asset_class="future",
+            symbol="ES",
+            venue="CME",
+            expiry=date(2026, 6, 19),  # computed 3rd Friday (Juneteenth)
+        )
+        contract = spec_to_ib_contract(spec)
+        assert contract.lastTradeDateOrContractMonth == "202606"
 
     def test_continuous_future(self) -> None:
         """``expiry=None`` → CONTFUT secType with no expiry field."""
