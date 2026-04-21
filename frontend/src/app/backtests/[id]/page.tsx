@@ -10,6 +10,7 @@ import {
   ResultsCharts,
   type ResultsChartsBacktest,
 } from "@/components/backtests/results-charts";
+import { FailureCard } from "@/components/backtests/failure-card";
 import { TradeLog } from "@/components/backtests/trade-log";
 import {
   apiFetch,
@@ -208,7 +209,9 @@ export default function BacktestDetailPage({
         </div>
       )}
 
-      {status.status !== "completed" ? (
+      {status.status === "failed" && status.error ? (
+        <FailureCard error={status.error} />
+      ) : status.status !== "completed" ? (
         <div className="flex h-48 items-center justify-center rounded-md border border-border/50 text-sm text-muted-foreground">
           {status.status === "failed"
             ? "Backtest failed. Check worker logs for details."

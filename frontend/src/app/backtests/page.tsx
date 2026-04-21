@@ -19,6 +19,11 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { ExternalLink } from "lucide-react";
 import { RunBacktestForm } from "@/components/backtests/run-form";
 import {
@@ -146,20 +151,62 @@ export default function BacktestsPage(): React.ReactElement {
                         {bt.start_date} to {bt.end_date}
                       </TableCell>
                       <TableCell>
-                        <Badge
-                          variant="secondary"
-                          className={statusColor(bt.status)}
-                        >
-                          {bt.status}
-                        </Badge>
+                        {bt.status === "failed" && bt.error_public_message ? (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              {/* tabIndex={0} + role="button" make
+                                  the Badge keyboard-focusable — Radix Tooltip
+                                  opens on focus (not just hover) for a11y. */}
+                              <Badge
+                                variant="secondary"
+                                className={`${statusColor(bt.status)} cursor-help`}
+                                data-testid={`backtest-status-${bt.id}`}
+                                tabIndex={0}
+                                role="button"
+                                aria-label={`Backtest failed: ${bt.error_public_message.slice(0, 80)}`}
+                              >
+                                {bt.status}
+                              </Badge>
+                            </TooltipTrigger>
+                            <TooltipContent
+                              side="top"
+                              className="max-w-xs whitespace-pre-wrap text-xs"
+                              data-testid={`backtest-error-tooltip-${bt.id}`}
+                            >
+                              {bt.error_public_message.length > 150
+                                ? `${bt.error_public_message.slice(0, 150)}…`
+                                : bt.error_public_message}
+                            </TooltipContent>
+                          </Tooltip>
+                        ) : (
+                          <Badge
+                            variant="secondary"
+                            className={statusColor(bt.status)}
+                          >
+                            {bt.status}
+                          </Badge>
+                        )}
                       </TableCell>
                       <TableCell className="text-right text-muted-foreground">
                         {formatDate(bt.created_at)}
                       </TableCell>
                       <TableCell>
-                        {bt.status === "completed" && (
-                          <Button asChild variant="ghost" size="icon-xs">
-                            <Link href={`/backtests/${bt.id}`}>
+                        {(bt.status === "completed" ||
+                          bt.status === "failed") && (
+                          <Button
+                            asChild
+                            variant="ghost"
+                            size="icon-xs"
+                            aria-label={
+                              bt.status === "failed"
+                                ? "View failure details"
+                                : "View backtest results"
+                            }
+                          >
+                            <Link
+                              href={`/backtests/${bt.id}`}
+                              data-testid={`backtest-detail-link-${bt.id}`}
+                            >
                               <ExternalLink className="size-3.5" />
                             </Link>
                           </Button>

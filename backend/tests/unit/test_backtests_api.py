@@ -216,3 +216,76 @@ class TestPrepareAndValidateBacktestConfig:
                 config_class_name=config_class,
                 canonical_instruments=["AAPL.NASDAQ"],
             )
+
+
+# ---------------------------------------------------------------------------
+# Tests: failure envelope (Task B8, feature backtest-failure-surfacing)
+# ---------------------------------------------------------------------------
+
+
+class TestStatusEndpointReturnsErrorEnvelope:
+    """Verify GET /api/v1/backtests/{id}/status surfaces the structured
+    ErrorEnvelope for failed rows, null for non-failed, and sanitized
+    raw message for historical (pre-migration) rows with NULL public_message.
+    """
+
+    async def test_failed_row_returns_structured_envelope(
+        self, client, seed_failed_backtest
+    ) -> None:
+        bt_id, _raw_msg = seed_failed_backtest
+        response = await client.get(f"/api/v1/backtests/{bt_id}/status")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "failed"
+        assert body["error"] is not None
+        assert body["error"]["code"] == "missing_data"
+        assert body["error"]["message"]
+        assert body["error"]["suggested_action"]
+        assert body["error"]["remediation"]["kind"] == "ingest_data"
+
+    async def test_pending_row_has_no_error_field(self, client, seed_pending_backtest) -> None:
+        bt_id = seed_pending_backtest
+        response = await client.get(f"/api/v1/backtests/{bt_id}/status")
+        assert response.status_code == 200
+        body = response.json()
+        # [Phase 5 P2] PRD contract: ``error`` is ABSENT (not null) on
+        # non-failed rows. ``response_model_exclude_none=True`` enforces.
+        assert "error" not in body
+
+    async def test_historical_row_degrades_to_unknown(
+        self, client, seed_historical_failed_row
+    ) -> None:
+        """US-006: post-migration, historical failed rows have
+        error_code='unknown' (server_default), error_public_message=NULL,
+        and their raw error_message populated. The API must surface
+        the stored message through error.message (sanitized-on-read) —
+        never a blank envelope."""
+        bt_id = seed_historical_failed_row
+        response = await client.get(f"/api/v1/backtests/{bt_id}/status")
+        body = response.json()
+        assert body["error"]["code"] == "unknown"
+        assert body["error"]["message"]  # stored raw message surfaces (sanitized)
+        # Sanitizer must strip /app/ paths even on read.
+        assert "/app/" not in body["error"]["message"]
+
+
+class TestHistoryEndpointReturnsCompactError:
+    """Verify GET /api/v1/backtests/history items expose error_code +
+    error_public_message on failed rows (compact, no suggested_action /
+    remediation — those live only on the detail endpoint).
+    """
+
+    async def test_failed_rows_include_error_code_and_message(
+        self, client, seed_failed_backtest
+    ) -> None:
+        response = await client.get("/api/v1/backtests/history")
+        assert response.status_code == 200
+        items = response.json()["items"]
+        failed = [i for i in items if i["status"] == "failed"]
+        assert failed, "fixture must seed at least one failed row"
+        f = failed[0]
+        assert "error_code" in f
+        assert "error_public_message" in f
+        # History is compact — no suggested_action / remediation here.
+        assert "suggested_action" not in f
+        assert "remediation" not in f

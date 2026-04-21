@@ -142,6 +142,28 @@ export interface StrategyListResponse {
   total: number;
 }
 
+export type RemediationKind =
+  | "ingest_data"
+  | "contact_support"
+  | "retry"
+  | "none";
+
+export interface Remediation {
+  kind: RemediationKind;
+  symbols?: string[] | null;
+  asset_class?: string | null;
+  start_date?: string | null;
+  end_date?: string | null;
+  auto_available: boolean;
+}
+
+export interface ErrorEnvelope {
+  code: string;
+  message: string;
+  suggested_action?: string | null;
+  remediation?: Remediation | null;
+}
+
 export interface BacktestHistoryItem {
   id: string;
   strategy_id: string;
@@ -149,6 +171,8 @@ export interface BacktestHistoryItem {
   start_date: string;
   end_date: string;
   created_at: string;
+  error_code?: string | null;
+  error_public_message?: string | null;
 }
 
 export interface BacktestHistoryResponse {
@@ -160,8 +184,12 @@ export interface BacktestStatusResponse {
   id: string;
   status: "pending" | "running" | "completed" | "failed";
   progress: number;
-  started_at: string | null;
-  completed_at: string | null;
+  // optional (not just nullable) because the backend uses
+  // ``response_model_exclude_none=True`` — pending/running rows have these
+  // absent, not null. Same applies to ``error`` below.
+  started_at?: string | null;
+  completed_at?: string | null;
+  error?: ErrorEnvelope | null;
 }
 
 export interface BacktestMetrics {

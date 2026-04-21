@@ -31,7 +31,11 @@ from msai.schemas.backtest import (
     BacktestResultsResponse,
     BacktestRunRequest,
     BacktestStatusResponse,
+    ErrorEnvelope,
+    Remediation,
 )
+from msai.services.backtests.failure_code import FailureCode
+from msai.services.backtests.sanitize import sanitize_public_message
 from msai.services.data_sources.databento_client import DatabentoClient
 from msai.services.nautilus.security_master.service import (
     DatabentoDefinitionMissing,
@@ -174,7 +178,16 @@ def _prepare_and_validate_backtest_config(
     return prepared
 
 
-@router.post("/run", status_code=status.HTTP_201_CREATED, response_model=BacktestStatusResponse)
+@router.post(
+    "/run",
+    status_code=status.HTTP_201_CREATED,
+    response_model=BacktestStatusResponse,
+    # PRD contract: `error` field is ABSENT (not `null`) when the row is not
+    # failed. exclude_none strips every None field — also strips null
+    # started_at/completed_at until the worker populates them, which is the
+    # correct presentation anyway.
+    response_model_exclude_none=True,
+)
 async def run_backtest(
     body: BacktestRunRequest,
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
@@ -311,6 +324,7 @@ async def run_backtest(
         progress=backtest.progress,
         started_at=backtest.started_at,
         completed_at=backtest.completed_at,
+        error=_build_error_envelope(backtest),
     )
 
 
@@ -341,6 +355,14 @@ async def list_backtests(
             start_date=bt.start_date,
             end_date=bt.end_date,
             created_at=bt.created_at,
+            # Only surface error fields on failed rows; sanitize-on-read
+            # when error_public_message is NULL (pre-migration) but error_message set.
+            error_code=bt.error_code if bt.status == "failed" else None,
+            error_public_message=(
+                (bt.error_public_message or sanitize_public_message(bt.error_message))
+                if bt.status == "failed"
+                else None
+            ),
         )
         for bt in backtests
     ]
@@ -348,7 +370,12 @@ async def list_backtests(
     return BacktestListResponse(items=items, total=total)
 
 
-@router.get("/{job_id}/status", response_model=BacktestStatusResponse)
+@router.get(
+    "/{job_id}/status",
+    response_model=BacktestStatusResponse,
+    # Same exclude_none contract as POST /run above.
+    response_model_exclude_none=True,
+)
 async def get_backtest_status(
     job_id: UUID,
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
@@ -370,6 +397,7 @@ async def get_backtest_status(
         progress=backtest.progress,
         started_at=backtest.started_at,
         completed_at=backtest.completed_at,
+        error=_build_error_envelope(backtest),
     )
 
 
@@ -461,4 +489,40 @@ async def get_backtest_report(
         path=str(report_file),
         media_type="text/html",
         filename=f"backtest_{job_id}_report.html",
+    )
+
+
+def _build_error_envelope(row: Backtest) -> ErrorEnvelope | None:
+    """Return the structured error envelope for a ``failed`` row, or ``None``.
+
+    Non-failed rows (pending/running/completed) always return ``None``.
+    Historical rows (pre-migration) with ``error_code == 'unknown'`` still
+    surface with their stored ``error_message`` — US-006 null-safe read —
+    but sanitized on the fly so raw paths / tokens don't leak.
+
+    The migration deliberately does NOT backfill
+    ``error_public_message`` from the raw ``error_message`` column,
+    because that would leak unsanitized content. Instead, when the
+    public column is NULL here AND the raw message is populated
+    (pre-migration row or a classifier bug), we sanitize-on-read.
+    """
+    if row.status != "failed":
+        return None
+
+    code = FailureCode.parse_or_unknown(row.error_code)
+    message = (
+        row.error_public_message
+        or sanitize_public_message(row.error_message)
+        or f"Backtest failed (code={code.value}); see server logs for details"
+    )
+
+    remediation = None
+    if row.error_remediation is not None:
+        remediation = Remediation.model_validate(row.error_remediation)
+
+    return ErrorEnvelope(
+        code=code.value,
+        message=message,
+        suggested_action=row.error_suggested_action,
+        remediation=remediation,
     )

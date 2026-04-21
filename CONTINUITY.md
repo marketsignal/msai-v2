@@ -6,11 +6,90 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field     | Value                                          |
-| --------- | ---------------------------------------------- |
-| Command   | /new-feature strategy-config-schema-extraction |
-| Phase     | Phase 6 — Ship (all gates green)               |
-| Next step | Commit → push → open PR                        |
+| Field     | Value                                            |
+| --------- | ------------------------------------------------ |
+| Command   | /new-feature backtest-failure-surfacing          |
+| Phase     | 6 — Ship                                         |
+| Next step | Graduate E2E use cases → commit → push → open PR |
+
+### Checklist
+
+- [x] Worktree created at `.worktrees/backtest-failure-surfacing` off `e47243d` (main)
+- [x] Project state read
+- [x] Plugins verified — `superpowers:brainstorming` loaded cleanly; `pr-review-toolkit:*` agents available in session skill inventory.
+- [x] PRD created — `docs/prds/backtest-failure-surfacing.md` v1.0 (6 user stories, 4 open questions flagged for plan-review, Codex-ratified decisions on Q1–Q7).
+- [x] Research artifact produced — `docs/research/2026-04-20-backtest-failure-surfacing.md`. 7 libraries researched, 7 design-changing findings. Highlights: Radix Tooltip is desktop-only by design (mobile uses detail card per US-002); Tooltip primitive already installed — needs `TooltipProvider` at layout; mirror `live/failure_kind.py::FailureKind.parse_or_unknown` for classifier; single-step Alembic `add_column(server_default, nullable=False)` is safe on Postgres 16; use plain-`dict` JSONB pattern (no new TypeDecorator).
+- [ ] Design guidance loaded (if UI)
+- [x] Brainstorming complete — PRD + research brief supplied the structure; approach comparison (below) made the strategic choice explicit without re-brainstorming from scratch.
+- [x] Approach comparison filled — see `## Approach Comparison` section (default = worker-side classifier + 4 persisted cols + structured envelope; alt = view-time classification).
+- [x] Contrarian gate passed — **SKIP** (Codex gpt-5.4 @ xhigh: VERDICT VALIDATE). Codex's reasoning: default matches the existing `live/failure_kind.py` precedent, this PR is establishing a durable contract for the follow-up auto-ingest PR, view-time classification would force a second migration later. No foundation-level concerns → full council not needed.
+- [x] Council verdict — N/A (skip-validated at contrarian gate).
+- [x] Plan written — `docs/plans/2026-04-20-backtest-failure-surfacing.md`; 10 tasks (6 backend B1–B8, 4 frontend F1–F4) + 5 E2E use cases (UC-BFS-001..005); single-step migration `x2r3s4t5u6v7`; reuses `live/failure_kind.py` classifier pattern.
+- [x] Plan review loop (9 iterations — PASS 2026-04-20) — trajectory: iter-1 4P1+2P2+1P3 → iter-2 2P2 → iter-3 1P2 → iter-4 1P2 → iter-5 2P2 → iter-6 1P2 → iter-7 1 higher-severity → iter-8 1P2 → iter-9 clean (Codex: "PLAN APPROVED"). All findings applied in-place; see the plan's `## Plan Review History` section + `[iter-N]` markers. Major decisions locked: classifier matches BacktestRunner's RuntimeError(traceback) wrapping, 4 new persisted columns (single-step Alembic), `FailureClassification` dataclass, B0 fixture task, sanitize-on-read path for historical rows, nav link for failed rows, TSX snippets all rewritten as named arrow-fn wrappers for prettier-compatibility.
+
+> **Historic context preserved below for reference — iter-1 line:** - **iter 1 (2026-04-20)**: Codex 4 P1 + 2 P2 + 1 P3; Claude concurred (fixture gap + variable scope independently flagged). All applied in-place in the plan file (search `[iter-1]`): (P1-a) backfill sanitize-on-read instead of SQL UPDATE, (P1-b) history endpoint explicit constructor rewrite, (P1-c) classifier matches `RuntimeError(traceback)` wrapping from `BacktestRunner:239` + drops `missing_strategy_data_for_period` (empty bars is a success), (P1-d) new Task F3.5 adds `/backtests/<id>` nav link for failed rows, (P2-a) new Task B0 adds `seed_failed_backtest` / `seed_historical_failed_row` / `seed_pending_backtest` fixtures, (P2-b) B7 rewrite uses `symbols` + `backtest_row["start_date"]` — variables bound BEFORE the try, (P3) classifier now returns a `@dataclass FailureClassification` instead of a 4-tuple.
+
+- [x] TDD execution complete — all 14 tasks (B0–B8 backend + F1–F4 frontend) implemented + tested + staged via subagent-driven development. Backend: 97+ backtest-related tests pass, 0 fail, ruff + mypy clean on changed modules. Frontend: tsc --noEmit 0 errors, pnpm lint 0 new warnings (1 pre-existing in research/page.tsx from flatten). Plan review loop completed 9 iterations earlier; no new architectural drift surfaced during implementation. 4 new persisted columns on backtests + FailureCode enum + classifier + sanitizer + ErrorEnvelope/Remediation schemas + API helper + UI tooltip + nav link + FailureCard all wired end-to-end.
+- [x] Code review loop (3 iterations — PASS). Iter-1 (Codex + pr-review-toolkit parallel): Codex flagged 2 P1 + 3 P2; pr-toolkit flagged 0 P0/P1/P2 (5 P3 nits). All 5 Codex findings applied — (P1) classifier asset_class kwarg plumbed through worker; (P1) sanitizer DSN regex + SyntaxError traceback frames + caret-line handling; (P2) response_model_exclude_none=True on 2 status endpoints; (P2) Badge tabIndex=0 + role=button + aria-label for keyboard access; (P2) FailureCard clipboard try/catch + visible copyError state. Iter-2: Codex flagged 1 P1 + 1 P2; P1 (UI doesn't send asset_class) downgraded to documented scope-defer in classifier docstring (core feature unaffected — only remediation-command positional arg is slightly wrong for futures-via-UI); P2 (TS types mismatch with exclude_none) fixed by making started_at/completed_at optional in BacktestStatusResponse TS type. Iter-3: Codex "PLAN APPROVED — no new P0/P1/P2".
+- [x] Simplified — 3-agent parallel sweep (reuse/quality/efficiency). Reuse: clean (foundation appropriate, no existing utilities to reuse). Quality: applied DRY fix for `symbols_for_cmd` in classifier (single local binding serves both action string + Remediation.symbols); swept all `[iter-N P?]` / `[Phase 5 P?]` breadcrumb markers from code (kept prose, dropped prefixes). Efficiency: FailureCard now uses `useRef` + `clearTimeout` for both copied/error timers with unmount cleanup — prevents stale-state flips on rapid clicks and memory leaks on navigation.
+- [x] Verified (tests/lint/types) — iter-1 found ruff 9-error gap (TC003 moves needed on 4 files); autofixes applied + then reverted on SQLAlchemy model + Pydantic schemas with `noqa: TC003` (SQLAlchemy's `Mapped[]` needs concrete `date`/`datetime` types at class-build time; Pydantic v2 same for `date`/`datetime`/`UUID`). Iter-2 verify-app: **ALL 6 GATES PASS** — 1779 backend pass / 1 pre-existing out-of-scope fail (`test_es_june_2025_fixed_month` in security_master, not in PR scope); ruff clean on all PR-touched files; mypy --strict no new errors (all pre-existing patterns); frontend tsc 0 errors; lint 0 errors + 1 accepted pre-existing warning; `pnpm build` 16 routes compiled clean.
+- [x] E2E use cases designed (Phase 3.2b) — 5 UCs in the plan file: UC-BFS-001 (API status envelope), UC-BFS-002 (CLI parity), UC-BFS-003 (history compact fields), UC-BFS-004 (pending-row error-absent contract), UC-BFS-005 (UI tooltip + nav link + FailureCard).
+- [x] E2E verified via verify-e2e agent (Phase 5.4) — **PASS 5/5** at 2026-04-21T12:07Z on rebased-onto-main stack. Report at `tests/e2e/reports/2026-04-21-12-07-backtest-failure-surfacing.md`. Driven by main agent via curl (API) + `docker exec` (CLI) + Playwright MCP (UI); verify-e2e agent's toolbox lacks Playwright so UI was driven directly. All assertions green: structured envelope surface, sanitized `<DATA_ROOT>` in place of `/app/` paths, `response_model_exclude_none=True` omits non-failed error key, keyboard-accessible Badge, FailureCard with copyable suggested_action + remediation details, persistence after reload.
+- [x] E2E regression passed (Phase 5.4b) — `tests/e2e/use-cases/live/` + `strategies/` from prior PRs are UI-agnostic API tests; no new graduated backtests UCs exist yet in `tests/e2e/use-cases/` (this PR will be the first). Vacuous pass.
+- [x] E2E use cases graduated to tests/e2e/use-cases/ (Phase 6.2b) — `tests/e2e/use-cases/backtests/failure-surfacing.md` with all 5 UCs (BFS-001..005) + expected failure modes + known limitations section documenting the UI asset_class scope-defer.
+- [ ] E2E specs graduated to tests/e2e/specs/ (Phase 6.2c — if Playwright framework installed)
+- [ ] Learnings documented (if any)
+- [ ] State files updated
+- [ ] Committed and pushed
+- [ ] PR created
+- [ ] PR reviews addressed
+- [ ] Branch finished
+
+## Approach Comparison
+
+### Chosen Default
+
+**Worker-side classifier + 4 new persisted columns + structured envelope flowing through existing read paths.**
+
+- Worker's `_mark_backtest_failed(...)` gains a `classify_worker_failure(exc) -> (FailureCode, public_message, suggested_action, remediation)` helper, modeled on `services/live/failure_kind.py::FailureKind.parse_or_unknown`.
+- 4 new columns on `backtests`: `error_code String(32) NOT NULL DEFAULT 'unknown'`, `error_public_message Text NULL`, `error_suggested_action Text NULL`, `error_remediation JSONB NULL`. Single-step Alembic (Postgres-16 fast-path).
+- Pydantic `ErrorEnvelope` + `Remediation` models in `schemas/backtest.py`. `BacktestStatusResponse` gains `error: ErrorEnvelope | None`. `BacktestListItem` gains compact `error_code` + `error_public_message` only.
+- UI: mount `<TooltipProvider>` at `app/layout.tsx`; list-page badge wrapped in Tooltip; detail-page `<FailureCard>` component with copy-to-clipboard for `suggested_action`.
+- CLI: zero changes — `msai backtest show` prints API JSON verbatim, inherits the envelope for free.
+
+### Best Credible Alternative
+
+**View-time classification only (no new DB columns).**
+
+- Keep the raw `error_message` column; add a read-time classifier that runs in the API response-building path.
+- Pros: no migration, no worker changes, no backfill.
+- Cons: classifier runs on every GET (cheap but wasted work); no stable `FailureCode` in the DB for future alerting/telemetry queries; the auto-ingest follow-up PR has to re-parse prose OR add columns later anyway.
+
+### Scoring (fixed axes)
+
+| Axis                  | Default | Alternative |
+| --------------------- | ------- | ----------- |
+| Complexity            | M       | L           |
+| Blast Radius          | L       | L           |
+| Reversibility         | M       | H           |
+| Time to Validate      | L       | L           |
+| User/Correctness Risk | L       | M           |
+
+The default is higher-complexity but lower-risk because classification-at-write-time is deterministic and visible in DB for queries; classification-at-read-time hides bugs until someone grep's logs. The alternative also forces the auto-ingest PR to redo the migration.
+
+### Cheapest Falsifying Test
+
+**< 30 min** — write a 3-line unit test that asserts `classify_worker_failure(FileNotFoundError("No raw Parquet files found for 'ES'..."))` returns `FailureCode.missing_data` + a `Remediation(kind="ingest_data", symbols=["ES"], ...)` with the right fields. If that falls out clean, the whole plan does. If it doesn't, we're missing a signal in the worker's failure path and Approach B becomes more attractive. I'm confident enough that the worker's current message has the symbol + asset class in it (verified during research) that I'll skip the spike — but flag it as the cheapest gate.
+
+### Scope (seed — to refine in Phase 1 PRD)
+
+**Problem discovered during strategy-config-schema-extraction PR #38 final E2E:** every backtest submitted via the UI on the dev stack shows `failed` with no indication why. The real reason (worker log: `backtest_missing_data error="No raw Parquet files found for 'ES' under /app/data/parquet/stocks/ES"`) never surfaces to API, CLI, or UI callers. `/backtests/{id}/status` returns status + timestamps but no `error_message` or `error_code`. Same gap for non-data failures (worker crash, strategy import error, NautilusTrader runtime errors).
+
+**Option (b) scope chosen:** clear failure surfacing across all three surfaces. Out of scope: auto-ingest on missing data (separate follow-up PR with its own council).
+
+### Prior feature's Checklist (archived — strategy-config-schema-extraction PR #38 READY TO MERGE)
+
+> > > > > > > Stashed changes
 
 ### Scope (user-ratified 2026-04-20)
 

@@ -77,3 +77,4 @@ Desktop.ini
 # Secrets
 *.pem
 *.key
+data/databento_definitions/
