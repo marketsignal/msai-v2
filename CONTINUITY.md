@@ -6,11 +6,11 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field     | Value                                             |
-| --------- | ------------------------------------------------- |
-| Command   | /new-feature backtest-auto-ingest-on-missing-data |
-| Phase     | 6 — Ship                                          |
-| Next step | Graduate E2E use cases → commit → push → open PR  |
+| Field     | Value |
+| --------- | ----- |
+| Command   | none  |
+| Phase     | —     |
+| Next step | —     |
 
 ### Checklist
 
@@ -320,6 +320,14 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 - **Drill-uncovered bug batch** (`e5afb7e`, "no bugs left behind"): (a) `ib_qualifier.py` futures use `%Y%m` so IB resolves holiday-adjusted expiry (Juneteenth ESM6 shift); (b) `_upsert_definition_and_alias` normalizes FX `raw_symbol` at storage boundary to slash form; (c) `/live/trades` accepts + applies `deployment_id: UUID` query filter. Each re-verified against the E2E path that surfaced it (feedback memory `feedback_rerun_e2e_after_bug_fixes.md`).
 - **Post-merge cleanup:** worktree removed, remote + local branch deleted, main ff'd to `29dbe9b`.
 
+## Done (cont'd 11) — Backtest auto-ingest on missing data shipped (2026-04-21 / PR #40)
+
+- **Merged to main** at `43051da` — transparent self-heal pipeline: when backtest fails with `FailureCode.MISSING_DATA`, orchestrator auto-downloads data (bounded lazy, ≤10y, ≤20 symbols, no options chain fan-out) via dedicated `msai:ingest` arq queue, then re-runs. Failure envelope only surfaces when auto-heal itself fails.
+- **New primitives:** `run_auto_heal` orchestrator, `AutoHealLock` (Redis SET NX EX + Lua CAS), `AutoHealGuardrails` (frozen+slots invariants), `derive_asset_class` (async registry-first with shape fallback), `SecurityMaster.asset_class_for_alias` (registry→ingest taxonomy translation), `verify_catalog_coverage` (Nautilus-native with 7-day edge-gap tolerance).
+- **Bug closures:** PR #39 stocks-mis-routing bug closed via server-side `asset_class` derivation. 2-line queue-routing bug fixed (`enqueue_ingest` now passes `_queue_name`; `IngestWorkerSettings.functions` includes `run_ingest`). Two latent bugs surfaced + fixed during live SPY demo: venue-convention mismatch (`SPY.XNAS` vs `SPY.NASDAQ`) → use `ensure_catalog_data` for canonical IDs; coverage check too strict → 7-day tolerance. Codex review P1 + P2 addressed post-PR (run_auto_heal error-containment + frontend loading state on poll errors).
+- **Quality trail:** Plan review 8 iters (10→7→2→1→1→1→1→0), code review 3 iters (16→1→0), simplify 12 fixes, verify-app 6/6 gates GREEN (1896 pytest pass), E2E 5/5 UCs (UC-BAI-001 happy path demonstrated end-to-end with real SPY Jan 2024: 418 trades, Sharpe 4.97, +112.15% return in 12s wall-clock).
+- **Follow-up deferred (see `## Next` items 7-8):** (a) Extend `/results` with equity_curve / drawdown_series / monthly_returns timeseries + wire trade log through UI (pre-existing empty charts — not a regression). (b) Bootstrap instrument registry from Databento catalog (avoid manual SQL seed for equities).
+
 ## Done (cont'd 10) — Dev stack restarted from new root + volume-name pinning (2026-04-20)
 
 - **Problem:** post-flatten `docker compose` from the repo root created a NEW project (`msai-v2`) whose volumes got prefixed with that project name. The actual drill data lived in `live-path-wiring-registry_postgres_data` (from the worktree's compose invocation during PR #37 work). Bringing up the new project without a name-pin would silently spawn a fresh-empty Postgres and lose all registry rows, drill trades, and deployment history.
@@ -332,25 +340,11 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 
 ## Now
 
-- **Active workflow: `/new-feature strategy-config-schema-extraction`** on worktree `.worktrees/strategy-config-schema-extraction` off `e47243d`. Phase 5 quality gates in progress; **PAUSED on user interrupt** (UI flickering from my local dev server attempt — stopped).
-- **Code status — DONE and verified:**
-  - Phase 0 spike PASSED (5/5). Phase 1 PRD + Phase 2 research brief + Phase 3.2 plan all landed.
-  - Phase 3.3 plan review: Codex iter-1 returned 1 P0 + 5 P1 + 2 P2 + 1 P3 — **P0 FIXED** (validation moved post-instrument-resolve, canonical IDs injected before `StrategyConfig.parse` to match the worker's `_prepare_strategy_config`). Remaining P1s either rolled into the implementation (B1 stale-against-branch since code was already built; B3 acceptance criteria refined) or addressed in B6 (reuse via `load_strategy_class` + `_prepare_strategy_config` mirror), F2 (integrated into `RunBacktestForm` not `BacktestsPage`), B7 (explicit parity test).
-  - Phase 4 TDD: backend B1–B7 + frontend F1–F2 shipped (see "Done cont'd 11" and CHANGELOG).
-  - Phase 5.3 verify: **1504/1504 unit tests pass** on backend. Ruff clean on all files I modified (3 remaining ruff errors are pre-existing TC003 style nits on baseline). mypy --strict: zero net-new errors (4 pre-existing nautilus-stub + load_strategy_class `Any`-return remain on baseline). Frontend: `pnpm build` + `tsc --noEmit` + `eslint` all clean.
-  - Includes pre-existing test fix-up `test_es_june_2025_fixed_month` (leftover from PR #37's YYYYMM change) — "no bugs left behind".
-- **Phase 5.4 E2E — PARTIAL (blocked on two inherited infra issues):**
-  - UC-SCS-001 (API: `/strategies/{id}` schema response) — **PASS**
-  - UC-SCS-002 (UI: typed form renders on strategy select) — **FAIL_INFRA** (frontend Docker container's Next.js 15 + Turbopack + pnpm-symlink CSS-import resolution fails on `tw-animate-css` + `shadcn/tailwind.css` + `@/components/providers`. Pre-existing since PR #36 flatten. Host `pnpm build` and `pnpm dev` both succeed — feature code is correct). My attempt to use local dev server on :3001 caused UI flickering — Pablo interrupted; I stopped the server.
-  - UC-SCS-003 Step 1 (invalid instrument → 422 on resolve path) — **PASS**
-  - UC-SCS-003 Step 2 (valid instrument + malformed config → 422 via `StrategyConfig.parse`) — **FAIL_INFRA** (empty databento registry; sanctioned ARRANGE via `msai instruments refresh --provider databento` fails with `FuturesContract.to_dict()` error that hangs under `ES.n.0`; `interactive_brokers` path was registered but backtest endpoint hits `databento` provider. Code path IS unit-tested at `tests/unit/test_backtests_api.py::TestPrepareAndValidateBacktestConfig::test_rejects_malformed_instrument_id_with_422_and_field_path` — the 422 envelope shape is proven.)
-  - UC-SCS-004 (`config_schema_status` enum surfaces for every row) — **PASS**
-- **E2E report:** will be written to `tests/e2e/reports/2026-04-20-strategy-config-schema-extraction.md` when the run can complete; partial report currently in conversation (verify-e2e agent output verbatim).
-- **Dev compose volume-pin note:** added `./frontend/tsconfig.json` + `./frontend/package.json` mounts to `docker-compose.dev.yml` so future TS config changes propagate without image rebuild. Does not fix the CSS-resolver issue.
-- **Awaiting Pablo's decision:**
-  1. **Ship-with-docs** — accept UC-SCS-002 + UC-SCS-003 Step 2 as FAIL_INFRA (documented in the E2E report), same shape as PR #37's UC-003 fallback. Code correctness proven by unit tests + parity test + the 3/5 E2E UCs that passed.
-  2. **Fix container build first** — diagnose Next/Turbopack/pnpm Linux CSS issue (~1-2 hrs estimated). Then UC-SCS-002 E2E passes.
-  3. **Pause cold.** All work durable on disk (15 files modified/new). Resume in a fresh session.
+- **No active workflow.** Last shipped: PR #40 "Backtest auto-ingest on missing data — transparent self-heal" (merged `43051da` 2026-04-21). See "Done (cont'd 11)" for details.
+- **Follow-up candidates** (see `## Next — remaining deferred items`):
+  - Item #7: extend `/backtests/{id}/results` with timeseries fields (equity_curve, drawdown_series, monthly_returns) + wire TradeLog. Pre-existing UI gap, user-flagged during SPY demo.
+  - Item #8: Databento catalog bootstrap for instrument registry (avoid manual SQL seed for equities).
+- **Stack:** main on `43051da`; worktrees clean (all merged); dev compose volumes preserved via pins (see "Done cont'd 10"). `docker compose -f docker-compose.dev.yml up -d` from `/Users/pablomarin/Code/msai-v2` if you want to keep the stack running. 3. **Pause cold.** All work durable on disk (15 files modified/new). Resume in a fresh session.
 
 ## Known issues surfaced this session (for follow-up — "no bugs left behind" tracker)
 
