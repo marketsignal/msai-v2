@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
-from uuid import UUID, uuid4
+from datetime import (  # noqa: TC003 — SQLAlchemy needs concrete types at Mapped[] reflection
+    date,
+    datetime,
+)
+from uuid import UUID, uuid4  # noqa: TC003 — same reason
 
-from sqlalchemy import Date, DateTime, ForeignKey, SmallInteger, String, Text
+from sqlalchemy import Date, DateTime, ForeignKey, SmallInteger, String, Text, func
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy import func
 
 from msai.models.base import Base
 
@@ -42,12 +44,19 @@ class Backtest(Base):
     metrics: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     report_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    started_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    completed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    # --- Error classification (added by PR #<this>) ----------------------
+    # Populated by the worker at ``_mark_backtest_failed`` time via
+    # ``services/backtests/classifier.py``. Read back by the API's
+    # ``_build_error_envelope`` helper, which returns ``None`` for non-failed
+    # rows and uses :meth:`FailureCode.parse_or_unknown` + sanitizer for
+    # pre-migration rows that carry ``error_code == 'unknown'`` + a raw
+    # ``error_message`` but no ``error_public_message``.
+    error_code: Mapped[str] = mapped_column(String(32), nullable=False, server_default="unknown")
+    error_public_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_suggested_action: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_remediation: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_by: Mapped[UUID | None] = mapped_column(
         ForeignKey("users.id"), index=True, nullable=True
     )
@@ -64,10 +73,8 @@ class Backtest(Base):
     queue_job_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     worker_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     attempt: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0)
-    heartbeat_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Relationships
-    strategy: Mapped["Strategy"] = relationship(lazy="selectin")  # noqa: F821
-    creator: Mapped["User"] = relationship(lazy="selectin")  # noqa: F821
+    strategy: Mapped[Strategy] = relationship(lazy="selectin")  # noqa: F821
+    creator: Mapped[User] = relationship(lazy="selectin")  # noqa: F821

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
 from datetime import UTC, date, datetime
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -13,6 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from msai.core.database import get_db
 from msai.main import app
 from msai.models.backtest import Backtest
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
 
 
 @pytest.fixture(autouse=True)
@@ -74,6 +77,10 @@ def _make_backtest(**overrides: object) -> Backtest:
         end_date=date(2025, 1, 15),
         status="pending",
         progress=0,
+        # [B8] BacktestListItem requires created_at non-null; populate
+        # here so the history endpoint's pydantic validation accepts
+        # the row. Per-fixture overrides can still set a different value.
+        created_at=datetime.now(UTC),
     )
     base.update(overrides)
     return Backtest(**base)

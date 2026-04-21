@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
-from typing import Any
-from uuid import UUID
+from datetime import (  # noqa: TC003 — Pydantic v2 needs concrete types at model build time
+    date,
+    datetime,
+)
+from typing import Any, Literal
+from uuid import UUID  # noqa: TC003 — same reason
 
 from pydantic import BaseModel
 
@@ -27,6 +30,7 @@ class BacktestStatusResponse(BaseModel):
     progress: int
     started_at: datetime | None
     completed_at: datetime | None
+    error: ErrorEnvelope | None = None
 
     model_config = {"from_attributes": True}
 
@@ -56,6 +60,8 @@ class BacktestListItem(BaseModel):
     start_date: date
     end_date: date
     created_at: datetime
+    error_code: str | None = None
+    error_public_message: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -65,3 +71,43 @@ class BacktestListResponse(BaseModel):
 
     items: list[BacktestListItem]
     total: int
+
+
+# ---------------------------------------------------------------------------
+# Error envelope (failure-surfacing PR)
+# ---------------------------------------------------------------------------
+
+
+class Remediation(BaseModel):
+    """Machine-readable remediation metadata.
+
+    MVP-only ``kind == 'ingest_data'`` carries full fields. Other kinds
+    stay minimal in this PR; the follow-up auto-ingest PR flips
+    ``auto_available`` to ``True`` for the kinds it can handle.
+
+    Keep ``kind`` as ``Literal[...]`` so OpenAPI emits a proper
+    ``enum`` and client-side type-narrowing works without loading a
+    separate enum module.
+    """
+
+    kind: Literal["ingest_data", "contact_support", "retry", "none"]
+    symbols: list[str] | None = None
+    asset_class: str | None = None
+    start_date: date | None = None
+    end_date: date | None = None
+    auto_available: bool = False
+
+
+class ErrorEnvelope(BaseModel):
+    """Structured failure payload surfaced on `BacktestStatusResponse.error`.
+
+    Deliberately symmetric with the api-design.md error envelope used by
+    the 422 path on ``POST /backtests/run`` (see PR #38): same
+    ``{code, message, ...}`` top-level shape so UI / CLI can share
+    rendering helpers.
+    """
+
+    code: str
+    message: str
+    suggested_action: str | None = None
+    remediation: Remediation | None = None

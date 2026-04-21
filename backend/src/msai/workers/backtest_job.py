@@ -30,7 +30,10 @@ import socket
 import sys
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from datetime import date
 
 import pandas as pd
 
@@ -201,31 +204,35 @@ async def run_backtest_job(
             total_return=result.metrics.get("total_return", 0.0),
         )
 
-    except FileNotFoundError as exc:
-        # Missing raw data -- most common failure mode, deserves a clean
-        # error message rather than a raw traceback.
-        log.error(
-            "backtest_missing_data",
-            backtest_id=backtest_id,
-            error=str(exc),
-        )
-        await _mark_backtest_failed(backtest_id, str(exc))
-
-    except TimeoutError as exc:
-        log.error(
-            "backtest_timeout",
-            backtest_id=backtest_id,
-            error=str(exc),
-        )
-        await _mark_backtest_failed(backtest_id, f"Backtest timed out: {exc}")
-
     except Exception as exc:
-        log.exception(
-            "backtest_job_failed",
+        # Single exit path -- classifier discriminates by exception type + message.
+        # Preserve structured log events operators grep on; the classifier's
+        # error_code becomes a first-class log field, not a replacement.
+        if isinstance(exc, FileNotFoundError):
+            log.error("backtest_missing_data", backtest_id=backtest_id, error=str(exc))
+        elif isinstance(exc, TimeoutError):
+            log.error("backtest_timeout", backtest_id=backtest_id, error=str(exc))
+        else:
+            log.exception(
+                "backtest_job_failed",
+                backtest_id=backtest_id,
+                error=str(exc),
+                exc_type=exc.__class__.__name__,
+            )
+        await _mark_backtest_failed(
             backtest_id=backtest_id,
-            error=str(exc),
+            exc=exc,
+            # `symbols` is bound on line ~89 from backtest_row["instruments"],
+            # i.e. the user-submitted list -- exactly what the remediation
+            # command needs to echo back. `instrument_ids` (the canonicalized
+            # post-ensure_catalog_data list) is intentionally NOT used here
+            # because it's unbound when the exception fires inside
+            # ensure_catalog_data.
+            instruments=list(symbols),
+            asset_class=asset_class,
+            start_date=backtest_row["start_date"],
+            end_date=backtest_row["end_date"],
         )
-        await _mark_backtest_failed(backtest_id, str(exc))
 
 
 # ---------------------------------------------------------------------------
@@ -343,20 +350,57 @@ async def _finalize_backtest(
         await session.commit()
 
 
-async def _mark_backtest_failed(backtest_id: str, error_message: str) -> None:
-    """Update a backtest row to ``failed`` with a user-visible error message.
+async def _mark_backtest_failed(
+    *,
+    backtest_id: str,
+    exc: BaseException,
+    instruments: list[str],
+    start_date: date,
+    end_date: date,
+    asset_class: str | None = None,
+) -> None:
+    """Update a backtest row to ``failed`` with structured classification.
+
+    Classifies ``exc`` via :func:`classify_worker_failure` and persists
+    the envelope fields alongside the raw ``error_message`` (kept for
+    operators who want the full unsanitized exception).
+
+    ``asset_class`` is the caller-known classification hint (worker has
+    it from the config) — passed through so the classifier can build a
+    precise `msai ingest <asset_class> ...` remediation command even
+    when `settings.parquet_root` doesn't match the hard-coded
+    `/app/data/parquet/...` regex used to recover it from the message.
 
     Swallows all exceptions from the update itself -- if we can't even
     reach the database there's nothing more we can do, and we don't want
     to override the original failure with a DB error.
     """
+    from msai.services.backtests.classifier import classify_worker_failure
+
+    classification = classify_worker_failure(
+        exc,
+        instruments=instruments,
+        start_date=start_date,
+        end_date=end_date,
+        asset_class=asset_class,
+    )
+    remediation_json = (
+        classification.remediation.model_dump(mode="json")
+        if classification.remediation is not None
+        else None
+    )
+
     try:
         async with async_session_factory() as session:
             row = await session.get(Backtest, backtest_id)
             if row is None:
                 return
             row.status = "failed"
-            row.error_message = error_message
+            row.error_message = str(exc) or exc.__class__.__name__  # raw
+            row.error_code = classification.code.value
+            row.error_public_message = classification.public_message
+            row.error_suggested_action = classification.suggested_action
+            row.error_remediation = remediation_json
             row.completed_at = datetime.now(UTC)
             await session.commit()
     except Exception:

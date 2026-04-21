@@ -4,7 +4,7 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
-### 2026-04-21 — strategy config schema extraction (branch `feat/strategy-config-schema-extraction`) — READY TO MERGE
+### 2026-04-21 — strategy config schema extraction (branch `feat/strategy-config-schema-extraction`) — MERGED as PR #38
 
 **Shipped on branch (not yet in main):**
 
@@ -46,7 +46,52 @@ All notable changes to msai-v2 will be documented in this file.
 **Infra bugs found + fixed in-branch ("no bugs left behind"):**
 
 - **FE-01 FIXED** Docker `msai-claude-frontend` failed to resolve CSS `@import "tw-animate-css"` + `@import "shadcn/tailwind.css"` + path alias `@/components/providers` despite modules present in `node_modules`. Root cause: `postcss.config.mjs` + `next.config.ts` never mounted/copied into container, so Next.js fell back to a no-op config. Fix: added `./frontend/postcss.config.mjs:/app/postcss.config.mjs:ro` + `./frontend/next.config.ts:/app/next.config.ts:ro` + `./frontend/tsconfig.json:/app/tsconfig.json:ro` + `./frontend/package.json:/app/package.json:ro` volume mounts in `docker-compose.dev.yml`, plus `COPY postcss.config.mjs next.config.ts tsconfig.json ./` in `frontend/Dockerfile.dev` as baseline. Host `pnpm build` + container `npm run dev` both now succeed with Tailwind v4 + path aliases resolving.
-- **BE-01 FIXED** `msai instruments refresh --provider databento --symbols ES.n.0` failed with `TypeError: FuturesContract.to_dict() takes no arguments (1 given)` at `backend/src/msai/services/nautilus/security_master/parser.py::nautilus_instrument_to_cache_json`. Root cause: Nautilus ships `FuturesContract` in two backends — Cython instruments expose `to_dict(obj)` (staticmethod-style, needs self passed explicitly), pyo3 instruments expose bound `to_dict(self)`. Databento's loader returns pyo3 instruments; IB qualification returns Cython. Fix: try/except dual dispatch — `try: instrument.to_dict() except TypeError: instrument.to_dict(instrument)`. New regression tests `TestNautilusInstrumentToCacheJson::test_prefers_bound_method_first` + `test_falls_back_to_staticmethod_signature_on_typeerror`.
+- # **BE-01 FIXED** `msai instruments refresh --provider databento --symbols ES.n.0` failed with `TypeError: FuturesContract.to_dict() takes no arguments (1 given)` at `backend/src/msai/services/nautilus/security_master/parser.py::nautilus_instrument_to_cache_json`. Root cause: Nautilus ships `FuturesContract` in two backends — Cython instruments expose `to_dict(obj)` (staticmethod-style, needs self passed explicitly), pyo3 instruments expose bound `to_dict(self)`. Databento's loader returns pyo3 instruments; IB qualification returns Cython. Fix: try/except dual dispatch — `try: instrument.to_dict() except TypeError: instrument.to_dict(instrument)`. New regression tests `TestNautilusInstrumentToCacheJson::test_prefers_bound_method_first` + `test_falls_back_to_staticmethod_signature_on_typeerror`.
+
+### 2026-04-21 — backtest failure surfacing (branch `feat/backtest-failure-surfacing`) — IN PROGRESS
+
+**Shipped on branch (not yet in main):**
+
+- `msai.services.backtests` package (new) — 3 modules + 1 classifier:
+  - `failure_code.py` — `FailureCode` `StrEnum` with 5 members (`missing_data`, `strategy_import_error`, `engine_crash`, `timeout`, `unknown`) + null-safe `parse_or_unknown(value)` classmethod. Mirrors the existing `services/live/failure_kind.py::FailureKind` precedent.
+  - `sanitize.py` — `sanitize_public_message(raw)` strips `/app/...` → `<DATA_ROOT>/...` + `<APP>/...`, `/Users|/home/...` → `<HOME>`, traceback `File "...", line N` bookkeeping (including `SyntaxError` frames without the `in <func>` suffix + caret lines), JWT triples, bearer tokens, `api_key=...` secret-KV, and DSN-with-credentials (`postgresql+asyncpg://user:pass@host:5432/db` → `postgresql+asyncpg://<redacted>`). Truncates to 1 KB. Module-level compiled regexes.
+  - `classifier.py` — `classify_worker_failure(exc, *, instruments, start_date, end_date, asset_class=None) -> FailureClassification` returns a `@dataclass(frozen=True, slots=True)` with `code / public_message / suggested_action / remediation`. Handles direct + wrapped-RuntimeError classification paths (BacktestRunner wraps subprocess exceptions at `backend/src/msai/services/nautilus/backtest_runner.py:239` as `RuntimeError(traceback_text)`, so classifier regex-matches `\b(ImportError|ModuleNotFoundError|SyntaxError|NameError)\b` against the wrapped text to recover STRATEGY_IMPORT_ERROR vs ENGINE_CRASH). Remediation for `missing_data` emits `msai ingest <asset_class> <symbols> <start> <end>` with caller-supplied `asset_class` overriding regex-capture fallback. `public_message` always non-empty (US-006 contract).
+- New Alembic migration `x2r3s4t5u6v7_add_backtest_error_classification` — revises `v0q1r2s3t4u5`. Adds `backtests.error_code: String(32) NOT NULL DEFAULT 'unknown'` (PG16 `attmissingval` fast path) + `error_public_message: Text NULL` + `error_suggested_action: Text NULL` + `error_remediation: JSONB NULL`. NO SQL backfill of `error_public_message` (would leak raw content); `_build_error_envelope` sanitizes-on-read for pre-migration rows.
+- `Backtest` SQLAlchemy model extended with the 4 new columns; types match migration exactly.
+- `Remediation` (Pydantic `Literal["ingest_data", "contact_support", "retry", "none"]` kind + optional symbols/asset_class/start/end + `auto_available=False` default) and `ErrorEnvelope` (code, message, suggested_action?, remediation?) added to `backend/src/msai/schemas/backtest.py`. Symmetric with the api-design.md 422 shape used by PR #38.
+- `BacktestStatusResponse` gains `error: ErrorEnvelope | None = None`; `BacktestListItem` gains compact `error_code` + `error_public_message` (no `suggested_action` / `remediation` in list responses — bandwidth discipline).
+- `_build_error_envelope(row)` helper at `backend/src/msai/api/backtests.py` returns `None` for non-failed rows, sanitize-on-read when `error_public_message IS NULL` but `error_message` populated (US-006 null-safe). Wired into `POST /run`, `GET /{id}/status`, and `GET /history`.
+- `POST /run` + `GET /{id}/status` decorated with `response_model_exclude_none=True` so the `error` key is ABSENT (not `null`) on non-failed rows per PRD contract — TS types updated to match (`error?: ...`, `started_at?: ...`, `completed_at?: ...`).
+- `_mark_backtest_failed` rewritten at `backend/src/msai/workers/backtest_job.py` — signature: `(backtest_id, exc, instruments, start_date, end_date, asset_class=None)`. Calls classifier, persists all 4 new columns + raw `error_message` fallback-to-class-name for empty-str exceptions. Collapsed 3 except blocks in `run_backtest_job` → 1, preserving the 3 structured-log event names operators grep on (`backtest_missing_data` / `backtest_timeout` / `backtest_job_failed`). Uses `symbols` (bound before try) + `backtest_row["start/end_date"]`, NOT `instrument_ids` (unbound on early failure).
+- Frontend:
+  - `frontend/src/lib/api.ts` — `RemediationKind`/`Remediation`/`ErrorEnvelope` TS interfaces; `BacktestStatusResponse` + `BacktestHistoryItem` extended.
+  - `<TooltipProvider delayDuration={200}>` mounted in `frontend/src/app/layout.tsx`.
+  - `frontend/src/app/backtests/page.tsx` — `failed` rows wrap the status `<Badge>` in a Radix `<Tooltip>` showing the first 150 chars of `error_public_message`; `tabIndex={0}` + `role="button"` + `aria-label` for keyboard accessibility (Radix tooltips are desktop-hover-only per WAI-ARIA spec — mobile users access the full envelope via the new nav link). Failed rows also get an `<ExternalLink>` action-cell button linking to `/backtests/[id]`.
+  - `frontend/src/components/backtests/failure-card.tsx` (new, ~147 LOC) — full structured envelope with code badge, sanitized message, `<pre><code>` block for `suggested_action` + `aria-label`ed copy-to-clipboard button, remediation details (symbols / asset_class / date range). Timer cleanup via `useRef` + `useEffect` unmount guard + clear-before-set on rapid clicks. Clipboard `try/catch` handles unsupported/insecure-origin environments with a visible fallback message.
+  - `frontend/src/app/backtests/[id]/page.tsx` mounts `<FailureCard>` when `status === "failed" && status.error`.
+- 7 new test files (~570 LOC): `test_backtest_failure_code.py` (4), `test_backtest_sanitize.py` (11 — including DSN + SyntaxError-frame regression), `test_backtest_schemas.py` (5), `test_backtest_classifier.py` (11 — including caller-asset_class-override + wrapped-RuntimeError paths), `test_backtest_mark_failed.py` (5 — persists every classifier code end-to-end at the worker boundary), `test_backtest_model.py` (4), `test_backtest_fixtures.py` (3 smoke tests for B0's seed fixtures).
+- 3 new test classes appended to `test_backtests_api.py` — envelope on `/status` for failed/pending/historical rows + compact error fields on `/history`.
+- Shared fixtures `seed_failed_backtest` / `seed_historical_failed_row` / `seed_pending_backtest` added to `backend/tests/unit/conftest.py` — all install `get_db` override via `AsyncMock(spec=AsyncSession)` + `try/finally` cleanup.
+
+**Artifacts produced:**
+
+- PRD: `docs/prds/backtest-failure-surfacing.md` (6 user stories + Codex-ratified Q1–Q7 design decisions)
+- Discussion log: `docs/prds/backtest-failure-surfacing-discussion.md`
+- Research brief: `docs/research/2026-04-20-backtest-failure-surfacing.md` (7 libraries surveyed — Radix Tooltip, Pydantic Literal, SQLAlchemy JSONB, Alembic NOT-NULL migration, Playwright hover, StrEnum)
+- Plan: `docs/plans/2026-04-20-backtest-failure-surfacing.md` (14 tasks: B0–B8 + F1–F4; 9 plan-review iterations)
+- Worker stale-import refresh ran via `docker compose -f docker-compose.dev.yml restart` (Phase 5.4 pending).
+
+**Phase 5 gates status:**
+
+- 5.1 Code-review loop: **3 iterations — PASS.** Iter-1 Codex 2 P1 + 3 P2 / pr-toolkit 0 P0/P1/P2 + 5 P3 nits. Iter-1 findings applied: classifier `asset_class` kwarg plumbed through worker; sanitizer DSN + SyntaxError-frame regressions added; `response_model_exclude_none=True`; Badge `tabIndex=0`/role/aria-label for keyboard access; `FailureCard` clipboard try/catch. Iter-2 Codex 1 P1 (UI doesn't send `asset_class`) + 1 P2 (TS types mismatch); P1 documented as scope-defer in classifier docstring (core feature works; only `stocks` positional arg will be wrong for futures-via-UI); P2 fixed via `started_at?`/`completed_at?` TS optional. Iter-3: Codex "PLAN APPROVED — no new P0/P1/P2".
+- 5.2 Simplify: 3-agent sweep. Reuse: clean. Quality: DRY'd `symbols_for_cmd` in classifier + swept all `[iter-N P?]` / `[Phase 5 P?]` breadcrumb markers from code (kept prose, dropped prefixes). Efficiency: `FailureCard` timers now `useRef` + `clearTimeout` + unmount cleanup.
+- 5.3 Verify: verify-app iter-1 FAIL (ruff 9 errors); iter-2 **ALL 6 GATES PASS** — 1779 backend tests (1 pre-existing out-of-scope fail: `test_es_june_2025_fixed_month` in security_master), ruff clean on PR-touched files, mypy --strict no new errors, frontend tsc 0 errors, pnpm build clean.
+- 5.4 E2E: pending (UC-BFS-001..005 defined in the plan — 1 API status-envelope, 1 API history-compact, 1 CLI `msai backtest show`, 1 UI tooltip + nav, 1 UI FailureCard).
+
+**Known limitation (documented scope-defer):**
+
+- The UI's Run Backtest form does not currently send `config.asset_class`; worker defaults to `"stocks"`. For a futures-backtest launched via UI against a symbol like `ES.n.0`, the remediation command will read `msai ingest stocks ES.n.0 ...` instead of `msai ingest futures`. Core feature (user sees WHY the backtest failed) is unaffected — only the positional `asset_class` arg of the suggested command is wrong. Follow-up PR: either add an `asset_class` dropdown to the UI form, or derive it server-side from the resolved canonical instrument ID shape.
+  > > > > > > > Stashed changes
 
 ### 2026-04-20 — live-path registry wiring (branch `feat/live-path-wiring-registry`)
 
