@@ -141,6 +141,10 @@ export default function BacktestDetailPage({
             ? `Failed to load backtest (${err.status})`
             : "Failed to load backtest";
         setError(msg);
+        // Clear loading so the error UI + back-navigation render on
+        // repeated API failures; otherwise the user is stuck on the
+        // "Loading backtest..." spinner forever. Codex review P2 2026-04-21.
+        setLoading(false);
         timerId = setTimeout(() => {
           void poll();
         }, 5000);

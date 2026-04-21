@@ -359,3 +359,48 @@ class TestAutoHealRetryLoop:
         auto_heal_mock.assert_not_called()
         assert fake_row.status == "failed"
         assert fake_row.error_code == "engine_crash"
+
+    async def test_backtest_job_run_auto_heal_raises_still_marks_failed(
+        self,
+        fake_row: Backtest,
+        session_factory: _SessionFactoryStub,
+        arq_ctx: dict[str, Any],
+    ) -> None:
+        """run_auto_heal raising (e.g., Redis connection error) must NOT leave
+        the backtest stuck in ``running``.
+
+        Regression for Codex PR review P1 2026-04-21 — if the orchestrator
+        itself raises inside the ``except FileNotFoundError`` handler, Python
+        doesn't re-catch it. Without the inner try/except wrap, the exception
+        escapes the while-loop past the ``if terminal_exc is not None:`` block
+        and ``_handle_terminal_failure`` is never called.
+        """
+        import redis.exceptions
+
+        ensure_mock = MagicMock(
+            side_effect=FileNotFoundError(
+                "No raw Parquet files found for 'AAPL' under /app/data/parquet/stocks/AAPL. Run..."
+            )
+        )
+        auto_heal_mock = AsyncMock(
+            side_effect=redis.exceptions.ConnectionError("Redis unavailable")
+        )
+
+        with (
+            patch("msai.workers.backtest_job.async_session_factory", session_factory),
+            patch("msai.workers.backtest_job.ensure_catalog_data", ensure_mock),
+            patch("msai.workers.backtest_job.run_auto_heal", auto_heal_mock),
+        ):
+            await run_backtest_job(
+                arq_ctx,
+                str(fake_row.id),
+                "/tmp/strategy.py",  # noqa: S108
+                {"asset_class": "stocks"},
+            )
+
+        # Backtest MUST be marked failed — not left stuck as running.
+        assert fake_row.status == "failed"
+        # redis ConnectionError is a RuntimeError subclass → classifier maps to
+        # engine_crash. The exact code isn't the point; "row isn't running" is.
+        assert fake_row.error_message is not None
+        assert "Redis unavailable" in fake_row.error_message

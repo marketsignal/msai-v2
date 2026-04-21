@@ -185,15 +185,30 @@ async def run_backtest_job(
                 return  # happy path — execution succeeded
             except FileNotFoundError as exc:
                 if attempt == 1:
-                    result = await run_auto_heal(
-                        backtest_id=backtest_id,
-                        instruments=symbols,
-                        start=backtest_row["start_date"],
-                        end=backtest_row["end_date"],
-                        catalog_root=settings.nautilus_catalog_root,
-                        caller_asset_class_hint=asset_class,
-                        pool=ctx["redis"],
-                    )
+                    # Wrap run_auto_heal so any exception it raises (e.g.,
+                    # Redis connection errors that AutoHealLock intentionally
+                    # propagates) becomes the terminal_exc. Without this guard
+                    # an exception raised INSIDE this except-handler escapes
+                    # the while-loop without ever reaching
+                    # _handle_terminal_failure, leaving the backtest row
+                    # stuck as "running". Codex review P1 2026-04-21.
+                    try:
+                        result = await run_auto_heal(
+                            backtest_id=backtest_id,
+                            instruments=symbols,
+                            start=backtest_row["start_date"],
+                            end=backtest_row["end_date"],
+                            catalog_root=settings.nautilus_catalog_root,
+                            caller_asset_class_hint=asset_class,
+                            pool=ctx["redis"],
+                        )
+                    except Exception as heal_exc:  # noqa: BLE001 — never let heal kill the backtest silently
+                        log.exception(
+                            "backtest_auto_heal_orchestrator_raised",
+                            backtest_id=backtest_id,
+                        )
+                        terminal_exc = heal_exc
+                        break
                     if result.outcome == AutoHealOutcome.SUCCESS:
                         # Re-enter the execution body with healed data.
                         continue
