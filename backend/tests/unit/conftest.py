@@ -87,7 +87,6 @@ def _mock_session_returning(row: Backtest) -> AsyncMock:
     mock_scalars.all.return_value = [row]
     mock_result.scalars.return_value = mock_scalars
     mock_result.scalar_one_or_none.return_value = row
-    mock_result.scalar_one.return_value = 1
     session.execute.return_value = mock_result
     return session
 
@@ -113,7 +112,7 @@ async def seed_failed_backtest() -> AsyncGenerator[tuple[str, str], None]:
     )
     session = _mock_session_returning(row)
 
-    async def _override() -> AsyncGenerator[AsyncMock, None]:
+    async def _override() -> AsyncGenerator[AsyncSession, None]:
         yield session
 
     app.dependency_overrides[get_db] = _override
@@ -136,7 +135,7 @@ async def seed_historical_failed_row() -> AsyncGenerator[str, None]:
     )
     session = _mock_session_returning(row)
 
-    async def _override() -> AsyncGenerator[AsyncMock, None]:
+    async def _override() -> AsyncGenerator[AsyncSession, None]:
         yield session
 
     app.dependency_overrides[get_db] = _override
@@ -151,7 +150,7 @@ async def seed_pending_backtest() -> AsyncGenerator[str, None]:
     row = _make_backtest(status="pending", error_code="unknown")
     session = _mock_session_returning(row)
 
-    async def _override() -> AsyncGenerator[AsyncMock, None]:
+    async def _override() -> AsyncGenerator[AsyncSession, None]:
         yield session
 
     app.dependency_overrides[get_db] = _override
