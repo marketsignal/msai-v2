@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 from arq.connections import ArqRedis, RedisSettings
 
+from msai.core.config import settings
 from msai.core.queue import (
     _parse_redis_url,
     enqueue_backtest,
@@ -96,6 +97,7 @@ class TestEnqueueIngest:
             provider="auto",
             dataset=None,
             schema=None,
+            _queue_name=settings.ingest_queue_name,
         )
 
     @pytest.mark.asyncio
@@ -126,4 +128,43 @@ class TestEnqueueIngest:
             provider="databento",
             dataset="EQUS.MINI",
             schema="ohlcv-1m",
+            _queue_name=settings.ingest_queue_name,
         )
+
+    @pytest.mark.asyncio
+    async def test_enqueue_ingest_routes_to_ingest_queue(self) -> None:
+        """On-demand ingest must NOT land on the default backtest queue."""
+        # Arrange
+        fake_pool = AsyncMock(spec=ArqRedis)
+        fake_pool.enqueue_job = AsyncMock()
+
+        # Act
+        await enqueue_ingest(
+            pool=fake_pool,
+            asset_class="stocks",
+            symbols=["AAPL"],
+            start="2024-01-01",
+            end="2024-12-31",
+        )
+
+        # Assert
+        assert fake_pool.enqueue_job.await_count == 1
+        _, kwargs = fake_pool.enqueue_job.call_args
+        assert kwargs.get("_queue_name") == settings.ingest_queue_name
+
+
+class TestIngestWorkerFunctionRegistration:
+    """Task B2 — on-demand ingest must be serviced by the ingest worker."""
+
+    def test_ingest_worker_registers_on_demand_ingest(self) -> None:
+        """``IngestWorkerSettings.functions`` must include ``run_ingest``.
+
+        Without this registration the dedicated ``msai:ingest`` queue has no
+        consumer for on-demand auto-heal ingest jobs — the `_queue_name`
+        routing in ``enqueue_ingest`` would silently route to a dead queue.
+        """
+        from msai.workers.ingest_settings import IngestWorkerSettings
+
+        fn_names = [fn.__name__ for fn in IngestWorkerSettings.functions]
+        assert "run_ingest" in fn_names
+        assert "run_nightly_ingest" in fn_names

@@ -20,6 +20,16 @@ The function is intentionally verbose about error handling -- a silent
 backtest failure is one of the worst user experiences imaginable because
 it tends to look like "the job is still running" until someone checks the
 logs.
+
+Task B8 wires the missing-data path into a bounded retry-once loop via
+:func:`msai.services.backtests.auto_heal.run_auto_heal`: the first
+``FileNotFoundError`` from ``ensure_catalog_data`` triggers one
+auto-heal cycle, and on ``AutoHealOutcome.SUCCESS`` the execution body
+re-enters with the same backtest snapshot. ``_start_backtest`` runs
+exactly once so the ``attempt`` counter does not double-increment.
+Non-SUCCESS outcomes are translated to typed exceptions via
+:data:`_OUTCOME_TO_EXC` so the classifier continues to produce the
+right :class:`FailureCode`.
 """
 
 from __future__ import annotations
@@ -42,6 +52,7 @@ from msai.core.database import async_session_factory
 from msai.core.logging import get_logger
 from msai.models.backtest import Backtest
 from msai.models.trade import Trade
+from msai.services.backtests.auto_heal import AutoHealOutcome, run_auto_heal
 from msai.services.nautilus.backtest_runner import BacktestResult, BacktestRunner
 from msai.services.nautilus.catalog_builder import describe_catalog, ensure_catalog_data
 from msai.services.report_generator import ReportGenerator
@@ -50,6 +61,26 @@ log = get_logger(__name__)
 
 _WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 _HEARTBEAT_INTERVAL_S = 15
+
+
+# Map non-SUCCESS auto-heal outcomes to exception types the
+# ``classify_worker_failure`` branch will re-tag correctly. The
+# classifier branches on ``isinstance(exc, ...)`` so the exception type
+# is what picks the ``FailureCode``:
+#
+# * ``FileNotFoundError`` → ``FailureCode.MISSING_DATA`` — used for
+#   ``GUARDRAIL_REJECTED`` and ``COVERAGE_STILL_MISSING``. Both stay as
+#   MISSING_DATA because the remediation is still "get more data" even
+#   when auto-heal declined to fetch it. The retry-once cap prevents a
+#   second heal attempt from firing.
+# * ``TimeoutError`` → ``FailureCode.TIMEOUT``
+# * ``RuntimeError`` → ``FailureCode.ENGINE_CRASH``
+_OUTCOME_TO_EXC: dict[AutoHealOutcome, type[BaseException]] = {
+    AutoHealOutcome.GUARDRAIL_REJECTED: FileNotFoundError,
+    AutoHealOutcome.COVERAGE_STILL_MISSING: FileNotFoundError,
+    AutoHealOutcome.TIMEOUT: TimeoutError,
+    AutoHealOutcome.INGEST_FAILED: RuntimeError,
+}
 
 
 async def run_backtest_job(
@@ -66,7 +97,9 @@ async def run_backtest_job(
     surface them to the user.
 
     Args:
-        ctx: arq worker context (unused here but part of the arq contract).
+        ctx: arq worker context. ``ctx["redis"]`` is the ``ArqRedis``
+            pool the auto-heal orchestrator uses to enqueue the ingest
+            job on the dedicated queue and poll its status.
         backtest_id: UUID string of the :class:`Backtest` row to execute.
         strategy_path: Absolute path to the strategy source file on disk.
             The backtest runner will import this file in a spawned
@@ -76,14 +109,14 @@ async def run_backtest_job(
             the strategy's expected schema (instrument_id, bar_type,
             period knobs, trade size, ...).
     """
-    _ = ctx
     log.info(
         "backtest_job_started",
         backtest_id=backtest_id,
         strategy_path=strategy_path,
     )
 
-    # --- 1. Mark running ---------------------------------------------------
+    # --- 1. Mark running ---
+    # Called ONCE — snapshot reused on retry-after-heal so attempt doesn't double-increment.
     backtest_row = await _start_backtest(backtest_id)
     if backtest_row is None:
         log.error("backtest_not_found", backtest_id=backtest_id)
@@ -100,139 +133,236 @@ async def run_backtest_job(
     # compatibility with older payloads.
     asset_class: str = str(config.get("asset_class", "stocks"))
 
+    # --- Heartbeat task (spawned once at the outer level so it keeps
+    # firing through both attempts and through the auto-heal poll loop
+    # in between). Cancelled in the outer finally.
+    stop_heartbeat = asyncio.Event()
+
+    async def _refresh_heartbeat() -> None:
+        while not stop_heartbeat.is_set():
+            try:
+                async with async_session_factory() as hb_session:
+                    row = await hb_session.get(Backtest, backtest_id)
+                    if row is not None:
+                        row.heartbeat_at = datetime.now(UTC)
+                        await hb_session.commit()
+            except Exception:  # noqa: BLE001 — best-effort heartbeat
+                log.warning(
+                    "backtest_heartbeat_refresh_failed",
+                    backtest_id=backtest_id,
+                    exc_info=True,
+                )
+            await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
+
+    heartbeat_task = asyncio.create_task(_refresh_heartbeat())
+
     try:
-        # --- 2. Build / refresh the Nautilus catalog ----------------------
-        instrument_ids = ensure_catalog_data(
-            symbols=symbols,
-            raw_parquet_root=settings.parquet_root,
-            catalog_root=settings.nautilus_catalog_root,
-            asset_class=asset_class,
-        )
-        log.info(
-            "backtest_catalog_ready",
-            backtest_id=backtest_id,
-            instrument_ids=instrument_ids,
-        )
+        # --- 2. Retry-once loop (Task B8) -----------------------------------
+        # Attempt 1: run the full execution body. If it raises
+        # FileNotFoundError (ensure_catalog_data couldn't find raw
+        # Parquet) we trigger one auto-heal cycle. On SUCCESS we loop
+        # back into attempt 2 with the SAME snapshot (no second
+        # _start_backtest, no double attempt-counter increment).
+        # On any non-SUCCESS outcome or on any non-FNF exception we
+        # break out to the terminal-failure handler below.
+        attempt = 0
+        terminal_exc: BaseException | None = None
+        while attempt < 2:
+            attempt += 1
+            try:
+                await _execute_backtest(
+                    backtest_row=backtest_row,
+                    backtest_id=backtest_id,
+                    strategy_path=strategy_path,
+                    config=config,
+                    symbols=symbols,
+                    asset_class=asset_class,
+                    start_iso=start_iso,
+                    end_iso=end_iso,
+                    strategy_id=strategy_id,
+                    strategy_code_hash=strategy_code_hash,
+                )
+                return  # happy path — execution succeeded
+            except FileNotFoundError as exc:
+                if attempt == 1:
+                    result = await run_auto_heal(
+                        backtest_id=backtest_id,
+                        instruments=symbols,
+                        start=backtest_row["start_date"],
+                        end=backtest_row["end_date"],
+                        catalog_root=settings.nautilus_catalog_root,
+                        caller_asset_class_hint=asset_class,
+                        pool=ctx["redis"],
+                    )
+                    if result.outcome == AutoHealOutcome.SUCCESS:
+                        # Re-enter the execution body with healed data.
+                        continue
+                    exc_cls = _OUTCOME_TO_EXC.get(result.outcome, FileNotFoundError)
+                    terminal_exc = exc_cls(
+                        result.reason_human or result.outcome.value,
+                    )
+                    break
+                # Second-attempt FNF — heal didn't stick; surface raw.
+                terminal_exc = exc
+                break
+            except Exception as exc:  # noqa: BLE001 — terminal handler classifies
+                terminal_exc = exc
+                break
 
-        # --- 2b. Capture data lineage snapshot ----------------------------
-        lineage_snapshot = describe_catalog(
-            instruments=instrument_ids,
-            data_path=str(settings.parquet_root),
-        )
-        python_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-        try:
-            import nautilus_trader  # noqa: WPS433
-
-            nautilus_ver: str | None = nautilus_trader.__version__
-        except Exception:
-            nautilus_ver = None
-
-        await _persist_lineage(
-            backtest_id=backtest_id,
-            nautilus_version=nautilus_ver,
-            python_version=python_ver,
-            data_snapshot=lineage_snapshot,
-        )
-
-        # --- 3. Build the strategy config with the resolved instrument ----
-        # If the caller didn't supply an instrument_id / bar_type we inject
-        # them from the backtest row so the Nautilus StrategyConfig can be
-        # instantiated inside the subprocess.
-        strategy_config = _prepare_strategy_config(config, instrument_ids)
-
-        # --- 4. Run the backtest ------------------------------------------
-        # Run in a thread with a parallel heartbeat task so the watchdog
-        # doesn't kill long-running backtests (>10 min default threshold).
-        runner = BacktestRunner()
-        stop_heartbeat = asyncio.Event()
-
-        async def _refresh_heartbeat() -> None:
-            while not stop_heartbeat.is_set():
-                try:
-                    async with async_session_factory() as hb_session:
-                        row = await hb_session.get(Backtest, backtest_id)
-                        if row is not None:
-                            row.heartbeat_at = datetime.now(UTC)
-                            await hb_session.commit()
-                except Exception:
-                    log.warning("backtest_heartbeat_refresh_failed", backtest_id=backtest_id)
-                await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
-
-        heartbeat_task = asyncio.create_task(_refresh_heartbeat())
-        try:
-            result: BacktestResult = await asyncio.to_thread(
-                runner.run,
-                strategy_file=strategy_path,
-                strategy_config=strategy_config,
-                instrument_ids=instrument_ids,
-                start_date=start_iso,
-                end_date=end_iso,
-                catalog_path=settings.nautilus_catalog_root,
-                timeout_seconds=settings.backtest_timeout_seconds,
-            )
-        finally:
-            stop_heartbeat.set()
-            heartbeat_task.cancel()
-
-        # --- 5. Generate QuantStats report -------------------------------
-        returns_series = _extract_returns_series(result.account_df)
-        report_generator = ReportGenerator()
-        html = report_generator.generate_tearsheet(
-            returns=returns_series,
-            title=f"Backtest {backtest_id}",
-        )
-        report_path = report_generator.save_report(
-            html=html,
-            backtest_id=backtest_id,
-            data_root=str(settings.data_root),
-        )
-
-        # --- 6. Persist results + trade rows -----------------------------
-        await _finalize_backtest(
-            backtest_id=backtest_id,
-            metrics=result.metrics,
-            report_path=report_path,
-            orders_df=result.orders_df,
-            strategy_id=strategy_id,
-            strategy_code_hash=strategy_code_hash,
-        )
-
-        log.info(
-            "backtest_job_completed",
-            backtest_id=backtest_id,
-            num_trades=result.metrics.get("num_trades", 0),
-            total_return=result.metrics.get("total_return", 0.0),
-        )
-
-    except Exception as exc:
-        # Single exit path -- classifier discriminates by exception type + message.
-        # Preserve structured log events operators grep on; the classifier's
-        # error_code becomes a first-class log field, not a replacement.
-        if isinstance(exc, FileNotFoundError):
-            log.error("backtest_missing_data", backtest_id=backtest_id, error=str(exc))
-        elif isinstance(exc, TimeoutError):
-            log.error("backtest_timeout", backtest_id=backtest_id, error=str(exc))
-        else:
-            log.exception(
-                "backtest_job_failed",
+        if terminal_exc is not None:
+            await _handle_terminal_failure(
                 backtest_id=backtest_id,
-                error=str(exc),
-                exc_type=exc.__class__.__name__,
+                symbols=symbols,
+                asset_class=asset_class,
+                backtest_row=backtest_row,
+                exc=terminal_exc,
             )
-        await _mark_backtest_failed(
+    finally:
+        stop_heartbeat.set()
+        heartbeat_task.cancel()
+
+
+async def _execute_backtest(
+    *,
+    backtest_row: dict[str, Any],
+    backtest_id: str,
+    strategy_path: str,
+    config: dict[str, Any],
+    symbols: list[str],
+    asset_class: str,
+    start_iso: str,
+    end_iso: str,
+    strategy_id: Any,
+    strategy_code_hash: str,
+) -> None:
+    """Run the catalog-build + subprocess-spawn + finalize pipeline.
+
+    Extracted from ``run_backtest_job`` so the retry-once loop can
+    re-enter with the same backtest snapshot on a successful heal
+    without calling ``_start_backtest`` a second time. Any exception
+    propagates to the retry loop which decides whether to invoke
+    auto-heal or hand off to ``_handle_terminal_failure``.
+    """
+    # --- Build / refresh the Nautilus catalog -------------------------------
+    instrument_ids = ensure_catalog_data(
+        symbols=symbols,
+        raw_parquet_root=settings.parquet_root,
+        catalog_root=settings.nautilus_catalog_root,
+        asset_class=asset_class,
+    )
+    log.info(
+        "backtest_catalog_ready",
+        backtest_id=backtest_id,
+        instrument_ids=instrument_ids,
+    )
+
+    # --- Capture data lineage snapshot --------------------------------------
+    lineage_snapshot = describe_catalog(
+        instruments=instrument_ids,
+        data_path=str(settings.parquet_root),
+    )
+    python_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    try:
+        import nautilus_trader  # noqa: WPS433
+
+        nautilus_ver: str | None = nautilus_trader.__version__
+    except Exception:  # noqa: BLE001 — best-effort version capture
+        log.warning("nautilus_version_capture_failed", exc_info=True)
+        nautilus_ver = None
+
+    await _persist_lineage(
+        backtest_id=backtest_id,
+        nautilus_version=nautilus_ver,
+        python_version=python_ver,
+        data_snapshot=lineage_snapshot,
+    )
+
+    # --- Build the strategy config with the resolved instrument -------------
+    strategy_config = _prepare_strategy_config(config, instrument_ids)
+
+    # --- Run the backtest ---------------------------------------------------
+    runner = BacktestRunner()
+    result: BacktestResult = await asyncio.to_thread(
+        runner.run,
+        strategy_file=strategy_path,
+        strategy_config=strategy_config,
+        instrument_ids=instrument_ids,
+        start_date=start_iso,
+        end_date=end_iso,
+        catalog_path=settings.nautilus_catalog_root,
+        timeout_seconds=settings.backtest_timeout_seconds,
+    )
+
+    # --- Generate QuantStats report -----------------------------------------
+    returns_series = _extract_returns_series(result.account_df)
+    report_generator = ReportGenerator()
+    html = report_generator.generate_tearsheet(
+        returns=returns_series,
+        title=f"Backtest {backtest_id}",
+    )
+    report_path = report_generator.save_report(
+        html=html,
+        backtest_id=backtest_id,
+        data_root=str(settings.data_root),
+    )
+
+    # --- Persist results + trade rows ---------------------------------------
+    await _finalize_backtest(
+        backtest_id=backtest_id,
+        metrics=result.metrics,
+        report_path=report_path,
+        orders_df=result.orders_df,
+        strategy_id=strategy_id,
+        strategy_code_hash=strategy_code_hash,
+    )
+
+    log.info(
+        "backtest_job_completed",
+        backtest_id=backtest_id,
+        num_trades=result.metrics.get("num_trades", 0),
+        total_return=result.metrics.get("total_return", 0.0),
+    )
+
+
+async def _handle_terminal_failure(
+    *,
+    backtest_id: str,
+    symbols: list[str],
+    asset_class: str,
+    backtest_row: dict[str, Any],
+    exc: BaseException,
+) -> None:
+    """Log + persist a terminal backtest failure.
+
+    Emits the same structured log events operators grep on
+    (``backtest_missing_data`` / ``backtest_timeout`` /
+    ``backtest_job_failed``) and delegates envelope construction to
+    :func:`_mark_backtest_failed`, which calls the shared classifier.
+    """
+    if isinstance(exc, FileNotFoundError):
+        log.error("backtest_missing_data", backtest_id=backtest_id, error=str(exc))
+    elif isinstance(exc, TimeoutError):
+        log.error("backtest_timeout", backtest_id=backtest_id, error=str(exc))
+    else:
+        log.exception(
+            "backtest_job_failed",
             backtest_id=backtest_id,
-            exc=exc,
-            # `symbols` is bound on line ~89 from backtest_row["instruments"],
-            # i.e. the user-submitted list -- exactly what the remediation
-            # command needs to echo back. `instrument_ids` (the canonicalized
-            # post-ensure_catalog_data list) is intentionally NOT used here
-            # because it's unbound when the exception fires inside
-            # ensure_catalog_data.
-            instruments=list(symbols),
-            asset_class=asset_class,
-            start_date=backtest_row["start_date"],
-            end_date=backtest_row["end_date"],
+            error=str(exc),
+            exc_type=exc.__class__.__name__,
         )
+    await _mark_backtest_failed(
+        backtest_id=backtest_id,
+        exc=exc,
+        # ``symbols`` is the user-submitted list — exactly what the
+        # remediation command needs to echo back. The canonicalized
+        # ``instrument_ids`` list is intentionally NOT used here
+        # because it's unbound when the exception fires inside
+        # ``ensure_catalog_data``.
+        instruments=list(symbols),
+        asset_class=asset_class,
+        start_date=backtest_row["start_date"],
+        end_date=backtest_row["end_date"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +427,7 @@ async def _persist_lineage(
             row.python_version = python_version
             row.data_snapshot = data_snapshot
             await session.commit()
-    except Exception:
+    except Exception:  # noqa: BLE001 — best-effort lineage persist
         log.warning("backtest_lineage_persist_failed", backtest_id=backtest_id, exc_info=True)
 
 
@@ -403,7 +533,7 @@ async def _mark_backtest_failed(
             row.error_remediation = remediation_json
             row.completed_at = datetime.now(UTC)
             await session.commit()
-    except Exception:
+    except Exception:  # noqa: BLE001 — already in error path
         log.exception("backtest_status_update_failed", backtest_id=backtest_id)
 
 

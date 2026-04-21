@@ -6,11 +6,14 @@ and enqueue backtest / data-ingest jobs.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from arq import create_pool
 from arq.connections import ArqRedis, RedisSettings
+
+if TYPE_CHECKING:
+    from arq.jobs import Job
 
 __all__ = [
     "ArqRedis",
@@ -154,8 +157,13 @@ async def enqueue_ingest(
     provider: str = "auto",
     dataset: str | None = None,
     schema: str | None = None,
-) -> None:
-    """Enqueue a ``run_ingest`` job.
+) -> Job | None:
+    """Enqueue a ``run_ingest`` job onto the dedicated ingest queue.
+
+    Routes the job to ``settings.ingest_queue_name`` (``"msai:ingest"``) so
+    it is serviced by the dedicated ingest worker pool -- NOT the default
+    backtest worker.  This isolation prevents long-running ingest jobs
+    from starving backtest throughput.
 
     Args:
         pool: An active arq Redis connection pool.
@@ -166,8 +174,15 @@ async def enqueue_ingest(
         provider: Data provider (``"auto"``, ``"databento"``, or ``"polygon"``).
         dataset: Override the default Databento dataset.
         schema: Override the default Databento schema.
+
+    Returns:
+        The arq :class:`~arq.jobs.Job` handle if enqueued, or ``None`` if
+        the job was deduplicated by arq.  Callers that want to poll the
+        job status can use the returned handle's ``job_id``.
     """
-    await pool.enqueue_job(
+    from msai.core.config import settings as _settings  # lazy to avoid circular deps
+
+    job: Job | None = await pool.enqueue_job(
         "run_ingest",
         asset_class=asset_class,
         symbols=symbols,
@@ -176,4 +191,6 @@ async def enqueue_ingest(
         provider=provider,
         dataset=dataset,
         schema=schema,
+        _queue_name=_settings.ingest_queue_name,
     )
+    return job

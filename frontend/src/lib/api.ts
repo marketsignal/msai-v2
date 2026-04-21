@@ -173,6 +173,8 @@ export interface BacktestHistoryItem {
   created_at: string;
   error_code?: string | null;
   error_public_message?: string | null;
+  phase?: "awaiting_data" | null;
+  progress_message?: string | null;
 }
 
 export interface BacktestHistoryResponse {
@@ -190,6 +192,8 @@ export interface BacktestStatusResponse {
   started_at?: string | null;
   completed_at?: string | null;
   error?: ErrorEnvelope | null;
+  phase?: "awaiting_data" | null;
+  progress_message?: string | null;
 }
 
 export interface BacktestMetrics {
