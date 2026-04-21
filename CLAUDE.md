@@ -1,3 +1,5 @@
+@CONTINUITY.md
+
 # CLAUDE.md — MSAI v2 (MarketSignal AI)
 
 ## Project Overview
@@ -68,7 +70,9 @@ msai-v2/
 │   ├── Dockerfile + Dockerfile.dev
 │   └── pyproject.toml
 ├── frontend/                # Next.js 15 + shadcn/ui (15 primitives) + typed API client
-│   └── src/{app,components,lib}/
+│   ├── src/{app,components,lib}/
+│   ├── playwright.config.ts       # Playwright scaffold — baseURL http://localhost:3300
+│   └── tests/e2e/{specs,fixtures,.auth}/  # Graduated specs + auth fixture
 ├── strategies/              # Python strategy files (git-only in Phase 1)
 ├── data/                    # Parquet + reports (gitignored)
 ├── docs/
@@ -82,14 +86,12 @@ msai-v2/
 │   ├── CHANGELOG.md
 │   ├── nautilus-reference.md    # Full NautilusTrader reference
 │   └── nautilus-natives-audit.md
-├── tests/e2e/               # Playwright scaffold (specs currently empty)
-│   ├── fixtures/
-│   ├── specs/
-│   └── use-cases/
+├── tests/e2e/               # Agent artifacts (NOT Playwright scaffold — that lives in frontend/)
+│   ├── use-cases/           # Markdown use cases (draft + graduated)
+│   └── reports/             # verify-e2e agent output
 ├── scripts/                 # Operator-invokable scripts (seed_market_data, parity_check, restart-workers, migrate_catalog_to_canonical, etc.)
 ├── .github/workflows/       # CI
 ├── .claude/                 # Claude Code configuration (hooks, rules, commands, skills)
-├── playwright.config.ts     # Default baseURL http://localhost:3300
 ├── docker-compose.dev.yml   # Ports: 3300, 8800, 5433, 6380
 ├── docker-compose.prod.yml
 ├── CLAUDE.md                # This file
@@ -294,21 +296,31 @@ See `.claude/rules/testing.md` for the full use-case lifecycle (draft → execut
 
 ### Playwright Framework
 
-Scaffolded at the repo root:
+Scaffolded inside `frontend/` because msai-v2 is a backend+frontend split and the forge's `setup.sh --with-playwright` auto-detects the lone `package.json` subdirectory:
 
-- `playwright.config.ts` — `baseURL` defaults to `http://localhost:3300`. Override per run with `PLAYWRIGHT_BASE_URL=<url>`.
-- `tests/e2e/specs/` — graduated spec files (currently empty; future feature work should author specs here using `getByTestId` / role-based selectors).
-- `tests/e2e/use-cases/` — markdown use cases (draft before graduation).
-- `tests/e2e/fixtures/` — auth fixture + helpers.
-- `tests/e2e/reports/` — HTML + JSON output.
+- `frontend/playwright.config.ts` — `baseURL` defaults to `http://localhost:3300` (host-exposed Docker port). Override per run with `PLAYWRIGHT_BASE_URL=<url>`.
+- `frontend/tests/e2e/specs/` — graduated spec files (currently empty; future feature work should author specs here using `getByTestId` / role-based selectors).
+- `frontend/tests/e2e/fixtures/` — auth fixture + helpers.
+- `frontend/tests/e2e/.auth/` — gitignored storage state (credentials).
+
+Verify-e2e agent artifacts live at the repo root (independent of the Playwright framework):
+
+- `tests/e2e/use-cases/` — markdown use cases (draft before graduation, then checked in under `backtests/`, `strategies/`, `live/`, etc.).
+- `tests/e2e/reports/` — verify-e2e agent output (markdown reports, HTML on failure).
 
 Run specs locally:
 
 ```bash
-pnpm exec playwright test
+cd frontend && pnpm exec playwright test
 ```
 
 API-only use cases don't need Playwright — the `verify-e2e` agent hits the REST endpoints directly with curl/httpx.
+
+### Research Enforcement
+
+The `research-first` agent runs in Phase 2 of `/new-feature` (before design begins). It queries Context7, WebSearch, and WebFetch for every external library this feature touches and produces a brief at `docs/research/YYYY-MM-DD-<feature>.md`. The design phase reads this brief to avoid building on stale assumptions.
+
+For bug fixes, targeted research runs after root-cause isolation (Phase 2.5 of `/fix-bug`).
 
 ---
 
@@ -319,6 +331,18 @@ API-only use cases don't need Playwright — the `verify-e2e` agent hits the RES
 - Prefer organic shapes (blobs, curves, clip-paths) over straight edges and 90-degree corners
 - Animations must respect `prefers-reduced-motion` — provide static fallbacks
 - Premium, dark-mode-first aesthetic (Linear.app / Vercel.com style). Font: Geist. Color: shadcn/ui dark theme via CSS custom properties (oklch).
+
+## No Bugs Left Behind Policy
+
+**NEVER defer known issues "for later."** When a review, test, or tool flags an issue — fix it in the same branch before moving on. This applies to:
+
+- Code bugs found during review
+- Deployment/infrastructure issues found during testing
+- Configuration mismatches across environments (Docker, K8s, Helm)
+- Security findings from any reviewer (Claude, Codex, PR toolkit)
+- Test coverage gaps for new code
+
+No "follow-up PRs" for known problems. No "v2" for things that should work in v1. If it's found, it's fixed — or the branch isn't ready.
 
 ## Detailed Rules
 

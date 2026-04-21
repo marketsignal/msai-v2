@@ -4,6 +4,24 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-04-21 — CLAUDE.md template sync from claude-codex-forge (uncommitted, no workflow)
+
+Non-substantive docs update syncing `CLAUDE.md` against the current `claude-codex-forge/CLAUDE.template.md`:
+
+- Added `@CONTINUITY.md` import at line 1 so CONTINUITY auto-loads into every session.
+- Added `### Research Enforcement` subsection explaining the `research-first` Phase-2 brief at `docs/research/YYYY-MM-DD-<feature>.md`.
+- Added top-level `## No Bugs Left Behind Policy` H2 (surfaces the policy already in `.claude/rules/critical-rules.md`).
+
+Commit when convenient; not on an active workflow branch.
+
+**Playwright scaffold location — RESOLVED (Option b, forge intent).** Moved Playwright scaffold to `frontend/` to match the forge's `setup.sh --with-playwright` auto-detect (which finds the lone `package.json` subdir in msai-v2's backend+frontend split). Executed:
+
+- Deleted root `playwright.config.ts` + root `tests/e2e/{.auth,fixtures}/` (stale Apr-19 scaffold from pre-auto-detect setup.sh).
+- Kept root `tests/e2e/{use-cases,reports}/` (verify-e2e agent artifacts, independent of the Playwright framework).
+- Fixed `frontend/playwright.config.ts` baseURL from `:3000` (container-internal) → `:3300` (host-exposed Docker port, matches the existing local-dev convention).
+- Accepted the uncommitted `docs/ci-templates/{README.md,e2e.yml}` diff — stamps `working-directory: frontend` + updated comments.
+- Updated CLAUDE.md file-tree block + Playwright Framework section to document `frontend/` scaffold + the agent-artifact split at repo root.
+
 ### 2026-04-21 — backtest auto-ingest on missing data (branch `feat/backtest-auto-ingest-on-missing-data`) — READY FOR PR
 
 **What this PR does:** When a backtest fails with `FailureCode.MISSING_DATA`, the platform transparently auto-downloads the missing data (bounded lazy: ≤10y, ≤20 symbols, no options-chain fan-out) and re-runs the backtest. Agents submitting backtests via API/CLI/UI see success without seeing the missing-data failure — the failure envelope only surfaces when auto-heal itself fails (guardrail rejection, 30-min cap timeout, or provider error). Closes the PR #39 scope-defer by deriving `asset_class` server-side from the canonical instrument ID.

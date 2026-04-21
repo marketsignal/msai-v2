@@ -1,7 +1,7 @@
 # E2E Tests — GitHub Actions workflow
 #
 # This template is installed by `setup.sh --with-playwright` to
-# `docs/ci-templates/e2e.yml`. The . placeholder below is
+# `docs/ci-templates/e2e.yml`. The frontend placeholder below is
 # substituted at setup time with the directory where Playwright was scaffolded
 # (repo root for flat layouts, frontend/ or apps/web/ for monorepos, or
 # whatever --playwright-dir pointed at). To ACTIVATE:
@@ -30,10 +30,10 @@
 #   3. Secrets: configure `TEST_USER_EMAIL` + `TEST_USER_PASSWORD` as GitHub
 #      repo secrets. Configure `PLAYWRIGHT_BASE_URL` as a repo variable.
 #   4. Working directory: all pnpm/playwright steps below run inside
-#      . (set to "." if Playwright lives at repo root).
+#      frontend (set to "." if Playwright lives at repo root).
 #      The cache path for actions/setup-node must match.
 #   5. Workspace install: if your repo uses pnpm workspaces and install must
-#      happen at repo root (not inside .), move the Install
+#      happen at repo root (not inside frontend), move the Install
 #      dependencies step out of the job-level working-directory by adding
 #      `working-directory: .` to that step explicitly.
 
@@ -54,7 +54,7 @@ jobs:
     timeout-minutes: 10
     defaults:
       run:
-        working-directory: .
+        working-directory: frontend
     steps:
       - uses: actions/checkout@v4
 
@@ -63,7 +63,7 @@ jobs:
           node-version: 20
           cache: 'pnpm'
           # Cache path must match where the lockfile lives
-          cache-dependency-path: './pnpm-lock.yaml'
+          cache-dependency-path: 'frontend/pnpm-lock.yaml'
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -87,7 +87,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: playwright-report-smoke
-          path: ./playwright-report/
+          path: frontend/playwright-report/
           retention-days: 30
 
   e2e-full:
@@ -97,7 +97,7 @@ jobs:
     timeout-minutes: 30
     defaults:
       run:
-        working-directory: .
+        working-directory: frontend
     steps:
       - uses: actions/checkout@v4
 
@@ -105,7 +105,7 @@ jobs:
         with:
           node-version: 20
           cache: 'pnpm'
-          cache-dependency-path: './pnpm-lock.yaml'
+          cache-dependency-path: 'frontend/pnpm-lock.yaml'
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -129,5 +129,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: playwright-report-full
-          path: ./playwright-report/
+          path: frontend/playwright-report/
           retention-days: 30

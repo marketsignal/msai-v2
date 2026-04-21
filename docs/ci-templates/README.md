@@ -36,7 +36,7 @@ The same stamped path is also used for `actions/setup-node`'s `cache-dependency-
 GitLab, Jenkins, CircleCI: port manually. The core commands are:
 
 ```bash
-# From . (repo root or your frontend subdir):
+# From frontend (repo root or your frontend subdir):
 pnpm install --frozen-lockfile
 pnpm exec playwright install --with-deps chromium
 pnpm exec playwright test [--grep @smoke]
