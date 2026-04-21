@@ -31,6 +31,17 @@ class BacktestStatusResponse(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     error: ErrorEnvelope | None = None
+    # --- Auto-heal lifecycle (added by backtest-auto-ingest PR, Task B9) ---
+    # When an auto-heal cycle is in flight, ``phase == "awaiting_data"`` and
+    # ``progress_message`` carries the user-facing "Downloading ..." text.
+    # Both are ``None`` outside heal windows. The endpoint keeps
+    # ``response_model_exclude_none=True`` so older clients that don't know
+    # these keys see no-op-absent behaviour (backward compat with PR #39).
+    # Extension point: currently the only non-None value is "awaiting_data".
+    # Future phase values (e.g., "finalizing", "generating_report") can be
+    # added without a schema break — clients already handle None.
+    phase: Literal["awaiting_data"] | None = None
+    progress_message: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -62,6 +73,9 @@ class BacktestListItem(BaseModel):
     created_at: datetime
     error_code: str | None = None
     error_public_message: str | None = None
+    # See :class:`BacktestStatusResponse.phase` for semantics.
+    phase: Literal["awaiting_data"] | None = None
+    progress_message: str | None = None
 
     model_config = {"from_attributes": True}
 

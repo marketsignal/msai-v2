@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from msai.schemas.backtest import Remediation
+from msai.services.backtests.derive_asset_class import derive_asset_class_sync
 from msai.services.backtests.failure_code import FailureCode
 from msai.services.backtests.sanitize import sanitize_public_message
 
@@ -83,17 +84,12 @@ def classify_worker_failure(
     in because the regex-recovered asset_class only works when
     ``settings.parquet_root`` is ``/app/data/parquet`` (container default)
     — local dev with a different parquet_root would lose it, and the
-    remediation command becomes generic instead of actionable.
-
-    **Known limitation (Phase 5 iter-2, deferred):** the UI's Run Backtest
-    form does not currently send ``config.asset_class``; the worker defaults
-    to ``"stocks"``. So for a futures-backtest launched via UI against a
-    symbol like ``ES.n.0``, the remediation command will incorrectly say
-    ``msai ingest stocks ES.n.0 ...`` instead of ``msai ingest futures``.
-    The user still sees that data is missing and what symbols to ingest —
-    the only wrong part is the ``stocks`` positional argument. Follow-up
-    PR: either add an asset_class dropdown to the UI, or derive it
-    server-side from the resolved canonical instrument ID shape.
+    remediation command becomes generic instead of actionable. When the
+    caller did not supply one and the regex cannot recover it (or it is
+    wrong), we derive it server-side from the symbol shape via
+    :func:`derive_asset_class_sync` — closes the Task B3 scope-defer so a
+    futures backtest against ``ES.n.0`` no longer emits
+    ``msai ingest stocks ES.n.0 ...``.
     """
     raw_message = str(exc) or exc.__class__.__name__
 
@@ -102,9 +98,15 @@ def classify_worker_failure(
     m = _MISSING_DATA_RE.search(raw_message)
     if isinstance(exc, FileNotFoundError) or m is not None:
         public_msg = sanitize_public_message(raw_message) or "Backtest data missing"
-        # Prefer caller-supplied asset_class (always accurate); fall back to
-        # regex capture for the container-default path shape.
-        resolved_asset_class = asset_class or (m.group(2) if m else None)
+        # Server-authoritative asset_class: shape-derivation (handles the
+        # canonical-ID form the worker config always carries) beats the
+        # caller hint, which in turn beats a regex-captured path fragment.
+        # Shape wins first because the classifier runs on the user-submitted
+        # ``instruments`` list; the hint is a default the worker may have
+        # set to ``"stocks"`` regardless of what was actually requested.
+        resolved_asset_class = (
+            derive_asset_class_sync(instruments) or asset_class or (m.group(2) if m else None)
+        )
         # Symbols for both the CLI command string and the structured
         # Remediation.symbols field — prefer the user-submitted list so
         # the command echoes exactly what they asked for; fall back to the
@@ -121,13 +123,14 @@ def classify_worker_failure(
                 "Run the data ingestion pipeline for the missing symbol(s) "
                 "before re-running this backtest."
             )
+        # Stays False — retry-once in backtest_job prevents a second heal cycle.
         remediation = Remediation(
             kind="ingest_data",
             symbols=symbols_for_cmd,
             asset_class=resolved_asset_class,
             start_date=start_date,
             end_date=end_date,
-            auto_available=False,  # MVP — follow-up PR flips this
+            auto_available=False,
         )
         return FailureClassification(
             code=FailureCode.MISSING_DATA,

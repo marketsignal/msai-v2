@@ -25,18 +25,22 @@ Design goals
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 import pyarrow.parquet as pq
-from nautilus_trader.model.data import BarType
+from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 from nautilus_trader.persistence.wranglers import BarDataWrangler
 
 from msai.core.logging import get_logger
 from msai.services.nautilus.instruments import resolve_instrument
+
+if TYPE_CHECKING:
+    from datetime import date
 
 log = get_logger(__name__)
 
@@ -464,3 +468,68 @@ def describe_catalog(
         "files": files_info[:50],  # Cap to avoid huge JSON in the DB
         "catalog_hash": catalog_hash,
     }
+
+
+def verify_catalog_coverage(
+    *,
+    catalog_root: Path,
+    instrument_ids: list[str],
+    bar_spec: str = _BAR_SPEC,
+    start: date,
+    end: date,
+) -> list[tuple[str, list[tuple[int, int]]]]:
+    """Return per-instrument gaps against the requested date range.
+
+    Uses Nautilus-native
+    :meth:`ParquetDataCatalog.get_missing_intervals_for_request`, which
+    scans the catalog's ``{start_ns}-{end_ns}.parquet`` filename
+    convention under ``{catalog_root}/data/bar/{instrument_id}-{bar_spec}/``
+    and returns the ``(start_ns, end_ns)`` intervals inside ``[start, end]``
+    that are NOT covered by an existing file.
+
+    The auto-heal orchestrator calls this after an ingest job completes
+    to verify the data we asked for actually landed on disk before
+    retrying a backtest.
+
+    Args:
+        catalog_root: Nautilus catalog root directory.
+        instrument_ids: Canonical Nautilus instrument ID strings
+            (e.g. ``"AAPL.NASDAQ"``).
+        bar_spec: Bar-type suffix; defaults to the project's 1-minute
+            external spec (``_BAR_SPEC``).
+        start: Inclusive requested start date (converted to ns at
+            00:00:00 UTC).
+        end: Inclusive requested end date. Converted to
+            ``(end + 1 day) * 1e9 - 1`` ns so a catalog covering the
+            full requested window reports zero gaps. The obvious
+            ``end 23:59:59`` form leaves a 1-second tail because
+            Nautilus bars are ns-granular and the last minute-bar of
+            the day stamps its close after ``23:59:59.000000000``
+            (iter-2 P2-b regression).
+
+    Returns:
+        A list of ``(instrument_id, gaps)`` tuples in the same order
+        as ``instrument_ids``. ``gaps`` is a list of
+        ``(start_ns, end_ns)`` tuples; empty list means full coverage.
+    """
+    catalog = ParquetDataCatalog(str(catalog_root))
+    start_ns = int(datetime(start.year, start.month, start.day, tzinfo=UTC).timestamp() * 1e9)
+    end_ns = (
+        int(
+            (datetime(end.year, end.month, end.day, tzinfo=UTC) + timedelta(days=1)).timestamp()
+            * 1e9
+        )
+        - 1
+    )
+
+    results: list[tuple[str, list[tuple[int, int]]]] = []
+    for instrument_id in instrument_ids:
+        bar_type = BarType.from_str(f"{instrument_id}-{bar_spec}")
+        gaps = catalog.get_missing_intervals_for_request(
+            start=start_ns,
+            end=end_ns,
+            data_cls=Bar,
+            identifier=str(bar_type),
+        )
+        results.append((instrument_id, list(gaps)))
+    return results

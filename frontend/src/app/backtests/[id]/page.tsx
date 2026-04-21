@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { ArrowLeft, Download } from "lucide-react";
+import { ArrowLeft, Download, Loader2 } from "lucide-react";
 import {
   ResultsCharts,
   type ResultsChartsBacktest,
@@ -20,6 +20,8 @@ import {
   type BacktestStatusResponse,
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+
+const MAX_RESULTS_RETRIES = 10; // 10 × 3s = 30s wall-clock window
 
 function statusColor(status: string): string {
   switch (status) {
@@ -51,45 +53,108 @@ export default function BacktestDetailPage({
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    let cancelled = false;
-    const load = async (): Promise<void> => {
-      setLoading(true);
-      setError(null);
+    let active = true;
+    let timerId: ReturnType<typeof setTimeout> | null = null;
+    // Local `let` (not useState) — useEffect deps are [id, getToken] only,
+    // so a useState counter would close over its initial value and the
+    // exhaustion branch would never fire. A local `let` owned by this
+    // effect instance persists across poll() invocations correctly.
+    let resultsRetries = 0;
+    let isInitialLoad = true;
+
+    const poll = async (): Promise<void> => {
+      if (!active) return;
       try {
         const token = await getToken();
-        const statusData = await apiGet<BacktestStatusResponse>(
+        const fresh = await apiGet<BacktestStatusResponse>(
           `/api/v1/backtests/${encodeURIComponent(id)}/status`,
           token,
         );
-        if (cancelled) return;
-        setStatus(statusData);
-
-        if (statusData.status === "completed") {
-          const resultsData = await apiGet<BacktestResultsResponse>(
-            `/api/v1/backtests/${encodeURIComponent(id)}/results`,
-            token,
-          );
-          if (cancelled) return;
-          setResults(resultsData);
+        if (!active) return;
+        if (isInitialLoad) {
+          setStatus(fresh);
+          isInitialLoad = false;
+        } else {
+          // Shallow-compare guard: polling fires every 3s; avoid needless
+          // re-renders when the status payload is unchanged.
+          setStatus((prev) => {
+            if (
+              prev &&
+              prev.id === fresh.id &&
+              prev.status === fresh.status &&
+              prev.phase === fresh.phase &&
+              prev.progress_message === fresh.progress_message &&
+              prev.progress === fresh.progress &&
+              prev.completed_at === fresh.completed_at &&
+              prev.started_at === fresh.started_at
+            ) {
+              return prev; // no-op — React bails out on same reference
+            }
+            return fresh;
+          });
+        }
+        setLoading(false);
+        // On running → completed, fetch /results. If /results transiently
+        // 404s (race between status-commit and results-commit in the worker),
+        // keep polling up to a bounded retry budget —
+        // MAX_RESULTS_RETRIES × 3s = 30s window. On success OR exhaustion,
+        // stop polling; exhaustion leaves status="completed" visible and
+        // metrics=null until manual refresh.
+        if (fresh.status === "completed") {
+          try {
+            const results = await apiGet<BacktestResultsResponse>(
+              `/api/v1/backtests/${encodeURIComponent(id)}/results`,
+              token,
+            );
+            if (!active) return;
+            setResults(results);
+            return; // success — stop polling
+          } catch {
+            if (!active) return;
+            if (resultsRetries >= MAX_RESULTS_RETRIES) {
+              return; // budget exhausted — stop polling; manual refresh will retry
+            }
+            resultsRetries += 1;
+            timerId = setTimeout(() => {
+              void poll();
+            }, 3000);
+            return;
+          }
+        }
+        if (fresh.status === "failed") {
+          return; // terminal — stop polling
+        }
+        if (fresh.status === "pending" || fresh.status === "running") {
+          timerId = setTimeout(() => {
+            void poll();
+          }, 3000);
         }
       } catch (err) {
-        if (cancelled) return;
+        if (!active) return;
         if (err instanceof ApiError && err.status === 404) {
           setNotFound(true);
-        } else {
-          const msg =
-            err instanceof ApiError
-              ? `Failed to load backtest (${err.status})`
-              : "Failed to load backtest";
-          setError(msg);
+          setLoading(false);
+          return;
         }
-      } finally {
-        if (!cancelled) setLoading(false);
+        const msg =
+          err instanceof ApiError
+            ? `Failed to load backtest (${err.status})`
+            : "Failed to load backtest";
+        setError(msg);
+        // Clear loading so the error UI + back-navigation render on
+        // repeated API failures; otherwise the user is stuck on the
+        // "Loading backtest..." spinner forever. Codex review P2 2026-04-21.
+        setLoading(false);
+        timerId = setTimeout(() => {
+          void poll();
+        }, 5000);
       }
     };
-    void load();
+
+    void poll();
     return () => {
-      cancelled = true;
+      active = false;
+      if (timerId !== null) clearTimeout(timerId);
     };
   }, [id, getToken]);
 
@@ -189,6 +254,17 @@ export default function BacktestDetailPage({
                 ? ` • Completed ${new Date(status.completed_at).toLocaleString()}`
                 : ""}
             </p>
+            {status.phase === "awaiting_data" && (
+              <div
+                data-testid="backtest-phase-indicator"
+                className="mt-1 flex items-center gap-2 text-sm text-muted-foreground"
+              >
+                <Loader2 className="h-3 w-3 animate-spin" />
+                <span data-testid="backtest-phase-message">
+                  {status.progress_message || "Downloading data…"}
+                </span>
+              </div>
+            )}
           </div>
         </div>
         {status.status === "completed" && (

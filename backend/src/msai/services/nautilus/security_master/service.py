@@ -46,6 +46,7 @@ from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from msai.core.config import settings
+from msai.core.logging import get_logger
 from msai.models.instrument_cache import InstrumentCache
 from msai.services.nautilus.security_master.continuous_futures import (
     is_databento_continuous_pattern,
@@ -66,9 +67,29 @@ if TYPE_CHECKING:
     from msai.services.nautilus.security_master.ib_qualifier import IBQualifier
 
 
+log = get_logger(__name__)
+
+
 DEFAULT_CACHE_VALIDITY_DAYS = 30
 """Rows older than this are considered stale — the next resolve
 returns the cached value AND schedules a background refresh."""
+
+
+_REGISTRY_TO_INGEST_ASSET_CLASS: dict[str, str] = {
+    "equity": "stocks",
+    "future": "futures",
+    "option": "options",
+    "forex": "forex",
+    "crypto": "crypto",
+    # ``index`` is not currently an ingest-taxonomy key; pass-through
+    # so the operator sees the raw value rather than a silent coerce.
+    "index": "index",
+}
+"""[iter-2 P1-a] Registry/spec-taxonomy (``InstrumentSpec.asset_class``)
+→ ingest / Parquet-storage taxonomy. Used by
+:meth:`SecurityMaster.asset_class_for_alias` — keep module-level so
+callers can inspect the mapping for testing + telemetry without
+instantiating a SecurityMaster."""
 
 
 _ROLL_SENSITIVE_ROOTS: frozenset[str] = frozenset({"ES"})
@@ -557,6 +578,44 @@ class SecurityMaster:
         )
 
         return asset_class_for_instrument_type(instrument.__class__.__name__)
+
+    def asset_class_for_alias(self, alias_str: str) -> str | None:
+        """Canonical alias → ingest-taxonomy asset_class.
+
+        Public wrapper over :meth:`_spec_from_canonical` that translates
+        the registry/spec taxonomy (``"equity"`` / ``"future"`` /
+        ``"option"`` / ``"forex"`` / ``"index"``) to the ingest /
+        Parquet-storage taxonomy (``"stocks"`` / ``"futures"`` /
+        ``"options"`` / ``"forex"`` / ``"crypto"``).
+
+        This mapping is critical — if the wrong name reaches
+        ``DataIngestionService._resolve_plan`` the Parquet writes go
+        to the wrong directory (e.g. ``data/parquet/equity/``) while
+        the catalog reader expects ``data/parquet/stocks/``, producing
+        a perpetual auto-heal loop. [iter-2 P1-a.]
+
+        Returns ``None`` if the alias shape is unknown — callers fall
+        back to the shape heuristic in
+        :func:`msai.services.backtests.derive_asset_class.derive_asset_class_sync`.
+        """
+        if not alias_str:
+            return None
+        try:
+            spec = self._spec_from_canonical(alias_str)
+        except Exception:  # noqa: BLE001 — unknown venue / malformed alias
+            log.warning(
+                "asset_class_for_alias_spec_failed",
+                alias=alias_str,
+                exc_info=True,
+            )
+            return None
+
+        registry_taxon: str | None = getattr(spec, "asset_class", None)
+        if registry_taxon is None:
+            return None
+        # Unknown taxonomy passes through unchanged — operator can still
+        # see it and decide; tests parametrize each known key.
+        return _REGISTRY_TO_INGEST_ASSET_CLASS.get(registry_taxon, registry_taxon)
 
     def _spec_from_canonical(
         self,

@@ -325,6 +325,8 @@ async def run_backtest(
         started_at=backtest.started_at,
         completed_at=backtest.completed_at,
         error=_build_error_envelope(backtest),
+        phase=None,
+        progress_message=None,
     )
 
 
@@ -363,6 +365,8 @@ async def list_backtests(
                 if bt.status == "failed"
                 else None
             ),
+            phase=bt.phase,  # type: ignore[arg-type]
+            progress_message=bt.progress_message,
         )
         for bt in backtests
     ]
@@ -398,6 +402,8 @@ async def get_backtest_status(
         started_at=backtest.started_at,
         completed_at=backtest.completed_at,
         error=_build_error_envelope(backtest),
+        phase=backtest.phase,  # type: ignore[arg-type]
+        progress_message=backtest.progress_message,
     )
 
 

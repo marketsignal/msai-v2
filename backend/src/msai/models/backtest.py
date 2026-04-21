@@ -55,6 +55,14 @@ class Backtest(Base):
     error_public_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_suggested_action: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_remediation: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # --- Auto-heal lifecycle (added by the backtest-auto-ingest PR) -------
+    # Populated by ``services/backtests/auto_heal.py`` while the worker
+    # waits for a triggered ingest job to complete. All four are cleared
+    # together when the heal reaches a terminal state.
+    phase: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    progress_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    heal_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    heal_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_by: Mapped[UUID | None] = mapped_column(

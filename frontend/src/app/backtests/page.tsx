@@ -186,13 +186,22 @@ export default function BacktestsPage(): React.ReactElement {
                             {bt.status}
                           </Badge>
                         )}
+                        {bt.status === "running" &&
+                          bt.phase === "awaiting_data" && (
+                            <Badge
+                              data-testid="backtest-list-fetching-badge"
+                              variant="outline"
+                              className="ml-1 text-xs"
+                            >
+                              Fetching data…
+                            </Badge>
+                          )}
                       </TableCell>
                       <TableCell className="text-right text-muted-foreground">
                         {formatDate(bt.created_at)}
                       </TableCell>
                       <TableCell>
-                        {(bt.status === "completed" ||
-                          bt.status === "failed") && (
+                        {bt.status !== "pending" && (
                           <Button
                             asChild
                             variant="ghost"

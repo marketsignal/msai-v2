@@ -39,7 +39,13 @@ class TestClassifyWorkerFailure:
         assert result.remediation is not None
         assert result.remediation.kind == "ingest_data"
         assert result.remediation.symbols == ["ES.n.0"]
-        assert result.remediation.asset_class == "stocks"
+        # B3: shape-derivation beats the regex-captured path fragment.
+        # ``ES.n.0`` is unambiguously a futures continuous symbol — the
+        # old assertion expected ``"stocks"`` (the worker default that
+        # slipped through pre-B3 because there was no server-authoritative
+        # derivation). Closing PR #39's scope-defer flips this to the
+        # correct asset_class.
+        assert result.remediation.asset_class == "futures"
         assert result.remediation.auto_available is False
 
     def test_timeout_error_is_classified(self):

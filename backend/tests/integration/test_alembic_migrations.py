@@ -878,3 +878,88 @@ async def test_migration_drops_legacy_columns_keeps_identity(
     )
     uc = unique_constraints["uq_live_deployments_revision_account"]
     assert set(uc["column_names"]) == {"portfolio_revision_id", "account_id"}
+
+
+# ---------------------------------------------------------------------------
+# PR — backtest auto-ingest on missing data: Task B0
+# y3s4t5u6v7w8 adds 4 additive nullable auto-heal columns to backtests.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def isolated_postgres_url_auto_heal() -> Iterator[str]:
+    """Dedicated container for the Task B0 auto-heal columns migration test."""
+    from testcontainers.postgres import PostgresContainer
+
+    with PostgresContainer("postgres:16-alpine") as pg:
+        yield pg.get_connection_url().replace("psycopg2", "asyncpg")
+
+
+@pytest.mark.asyncio
+async def test_y3_backtest_auto_heal_columns_roundtrip(
+    isolated_postgres_url_auto_heal: str,
+) -> None:
+    """y3s4t5u6v7w8 adds phase/progress_message/heal_started_at/heal_job_id,
+    all nullable. Upgrade -> inspect -> downgrade -> re-upgrade must all
+    succeed cleanly.
+    """
+    # Upgrade to head (includes y3s4t5u6v7w8)
+    _run_alembic_upgrade(isolated_postgres_url_auto_heal)
+
+    engine = create_async_engine(isolated_postgres_url_auto_heal)
+    try:
+        async with engine.connect() as conn:
+
+            def _inspect(sync_conn: object) -> dict[str, tuple[bool, str]]:
+                insp = inspect(sync_conn)
+                cols = {c["name"]: c for c in insp.get_columns("backtests")}
+                return {
+                    name: (cols[name]["nullable"], str(cols[name]["type"]).lower())
+                    for name in (
+                        "phase",
+                        "progress_message",
+                        "heal_started_at",
+                        "heal_job_id",
+                    )
+                    if name in cols
+                }
+
+            shape = await conn.run_sync(_inspect)
+    finally:
+        await engine.dispose()
+
+    assert set(shape) == {
+        "phase",
+        "progress_message",
+        "heal_started_at",
+        "heal_job_id",
+    }, f"missing auto-heal columns: {shape}"
+
+    # All 4 must be nullable
+    for name, (nullable, _type) in shape.items():
+        assert nullable is True, f"{name} must be nullable, got nullable={nullable}"
+
+    # Type spot-checks (Postgres type names as emitted by SQLAlchemy reflection)
+    assert "varchar" in shape["phase"][1]
+    assert "text" in shape["progress_message"][1]
+    assert "timestamp" in shape["heal_started_at"][1]
+    assert "varchar" in shape["heal_job_id"][1]
+
+    # Downgrade one step (drops the 4 columns), then re-upgrade.
+    _run_alembic(isolated_postgres_url_auto_heal, "downgrade", "-1")
+
+    engine = create_async_engine(isolated_postgres_url_auto_heal)
+    try:
+        async with engine.connect() as conn:
+            cols_after_down = await conn.run_sync(
+                lambda sc: {c["name"] for c in inspect(sc).get_columns("backtests")}
+            )
+    finally:
+        await engine.dispose()
+    assert "phase" not in cols_after_down
+    assert "progress_message" not in cols_after_down
+    assert "heal_started_at" not in cols_after_down
+    assert "heal_job_id" not in cols_after_down
+
+    # Re-upgrade must re-land the columns.
+    _run_alembic_upgrade(isolated_postgres_url_auto_heal)

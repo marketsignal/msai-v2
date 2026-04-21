@@ -171,6 +171,26 @@ class Settings(BaseSettings):
     # Queue names (dedicated queues prevent cross-worker job leakage)
     research_queue_name: str = "msai:research"
     portfolio_queue_name: str = "msai:portfolio"
+
+    # Ingest queue (existing topology — see docker-compose.dev.yml
+    # ``ingest-worker`` service). The backtest auto-heal path enqueues
+    # on-demand ingest jobs here rather than on the default backtest
+    # queue so the backtest worker isn't blocked by its own dependency.
+    ingest_queue_name: str = "msai:ingest"
+
+    # Auto-heal knobs (council-locked defaults, 2026-04-21).
+    # See docs/prds/backtest-auto-ingest-on-missing-data.md §5
+    # (Technical Constraints) and the research brief §1-2 for the math
+    # behind these values. These bound cost + wall-clock on the
+    # auto-triggered ingest path to prevent a single backtest from
+    # monopolising the provider quota or the ingest worker.
+    auto_heal_max_years: int = 10
+    auto_heal_max_symbols: int = 20
+    auto_heal_allow_options: bool = False
+    auto_heal_wall_clock_cap_seconds: int = 1800
+    auto_heal_poll_interval_seconds: int = 10
+    auto_heal_lock_ttl_seconds: int = 3000
+
     research_worker_jobs: int = 2
     research_timeout_seconds: int = 14400  # 4 hours
     research_max_parallelism: int = max(1, min(4, (cpu_count() or 1) - 1))
