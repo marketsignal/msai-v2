@@ -34,14 +34,25 @@ import importlib.util
 import inspect
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,  # noqa: TC002 — runtime use on session.execute in sync_strategies_to_db
+)
+
 from msai.core.logging import get_logger
+from msai.models.strategy import Strategy
+from msai.services.nautilus.schema_hooks import (
+    ConfigSchemaStatus,
+    build_user_schema,
+)
 from msai.services.strategy_governance import StrategyGovernanceService
 
 if TYPE_CHECKING:
-    from pathlib import Path
     from types import ModuleType
+
 
 log = get_logger(__name__)
 
@@ -63,9 +74,23 @@ class DiscoveredStrategy:
         config_class_name: The matching ``*Config`` class name, or
             ``None`` if the strategy has no Nautilus config class.
         code_hash: SHA256 hex digest of the file's contents -- used to
-            pin a backtest or live deployment to an exact code version.
+            pin a backtest or live deployment to an exact code version
+            AND to skip schema recompute in ``sync_strategies_to_db``
+            when unchanged.
         description: The strategy class docstring, stripped.  ``None`` if
             the class has no docstring.
+        config_schema: JSON Schema describing the user-defined fields of
+            the strategy's ``*Config`` class. ``None`` iff
+            ``config_schema_status != "ready"``. Trimmed to
+            ``__annotations__`` keys — inherited ``StrategyConfig`` base
+            plumbing is NOT included. Populated by
+            :func:`build_user_schema`.
+        default_config: Map of field name → default value (msgspec-encoded
+            form) for fields that declare one. Fields without defaults
+            are omitted. ``None`` iff ``config_schema_status != "ready"``.
+        config_schema_status: One of ``"ready" | "unsupported" |
+            "extraction_failed" | "no_config_class"`` — tells the frontend
+            whether the auto-form is available for this strategy.
     """
 
     name: str
@@ -75,6 +100,9 @@ class DiscoveredStrategy:
     code_hash: str
     description: str | None = None
     governance_status: str = "unchecked"
+    config_schema: dict[str, Any] | None = None
+    default_config: dict[str, Any] | None = None
+    config_schema_status: str = "no_config_class"
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +193,28 @@ def discover_strategies(strategies_dir: Path) -> list[DiscoveredStrategy]:
 
         config_cls = _find_config_class(module)
 
+        # Per-strategy ``try/except`` — a single broken ``*Config`` cannot
+        # poison the whole list. This mirrors the import-failure
+        # handling above. The status field disambiguates "extraction
+        # failed" from "no config class" for the API response.
+        try:
+            schema, defaults, status = build_user_schema(config_cls)
+        except Exception as exc:  # noqa: BLE001 — defensive; build_user_schema already catches
+            log.warning(
+                "strategy_schema_extraction_failed",
+                path=str(py_file),
+                config_class=(config_cls.__name__ if config_cls else None),
+                error=str(exc),
+            )
+            schema, defaults = None, None
+            status = ConfigSchemaStatus.EXTRACTION_FAILED
+        if status is ConfigSchemaStatus.EXTRACTION_FAILED:
+            log.warning(
+                "strategy_schema_extraction_failed",
+                path=str(py_file),
+                config_class=(config_cls.__name__ if config_cls else None),
+            )
+
         rel = py_file.relative_to(strategies_dir)
         dotted_name = rel.with_suffix("").as_posix().replace("/", ".")
 
@@ -177,6 +227,9 @@ def discover_strategies(strategies_dir: Path) -> list[DiscoveredStrategy]:
                 code_hash=compute_file_hash(py_file),
                 description=(inspect.getdoc(strategy_cls) or None),
                 governance_status="passed",
+                config_schema=schema,
+                default_config=defaults,
+                config_schema_status=status.value,
             )
         )
 
@@ -327,11 +380,45 @@ def _find_config_class(module: ModuleType) -> type | None:
     Returns:
         The matching config class, or ``None`` if none was found.
     """
+    # Mirror `_find_strategy_class`: prefer a ``*Config`` class DEFINED
+    # in the target module. Without this filter, an alphabetically-late
+    # user-defined config (e.g. ``ZetaConfig``) loses to any imported
+    # base class (``StrategyConfig``, ``LiveExecEngineConfig``) whose
+    # name happens to end with "config". Nautilus ``StrategyConfig``'s
+    # base class IS hit by the old logic on strategies that
+    # ``from nautilus_trader.trading.config import StrategyConfig``
+    # + define a late-alphabetical subclass.
+    #
+    # Fallback to imported classes (the original behavior) ONLY if no
+    # same-module match exists — covers the "strategies.example.config"
+    # split-module case this helper's docstring flags.
+    same_module: type | None = None
+    imported_fallback: type | None = None
     for _, cls in inspect.getmembers(module, inspect.isclass):
-        if cls.__name__.lower().endswith("config") and hasattr(cls, "parse"):
-            return cls
+        if not (cls.__name__.lower().endswith("config") and hasattr(cls, "parse")):
+            continue
+        if cls.__module__ == module.__name__:
+            if same_module is None:
+                same_module = cls
+        elif imported_fallback is None:
+            imported_fallback = cls
+    if same_module is not None:
+        return same_module
+    # The imported-fallback branch permits the ``strategies.example``
+    # layout where the config class lives in a sibling ``config.py``
+    # and is re-imported into the strategy module. Filter out the
+    # Nautilus base ``StrategyConfig`` explicitly — it's imported by
+    # ~every strategy file and has ``.parse``, so the naive fallback
+    # would pick it up and emit an empty config schema.
+    try:
+        from nautilus_trader.trading.config import StrategyConfig as _NautilusBase
+    except Exception:  # pragma: no cover — Nautilus not importable
+        _NautilusBase = None  # type: ignore[assignment]
+    if imported_fallback is not None and (
+        _NautilusBase is None or imported_fallback is not _NautilusBase
+    ):
+        return imported_fallback
     return None
-
 
 
 def _infer_strategies_root(module_path: Path) -> Path | None:
@@ -388,3 +475,126 @@ def load_strategy_class(module_path: Path, class_name: str) -> type[Any]:
     if cls is None:
         raise ImportError(f"Class {class_name} not found in {module_path}")
     return cls
+
+
+# ---------------------------------------------------------------------------
+# DB sync — shared by list + detail endpoints
+# ---------------------------------------------------------------------------
+
+
+async def sync_strategies_to_db(
+    session: AsyncSession,
+    strategies_dir: Path,
+    *,
+    prune_missing: bool = True,
+) -> list[tuple[Strategy, DiscoveredStrategy]]:
+    """Scan ``strategies_dir``, upsert each discovered strategy, return rows.
+
+    Called by both ``GET /api/v1/strategies/`` (list) and
+    ``GET /api/v1/strategies/{id}`` (detail) so neither endpoint depends
+    on the other's side effects (Maintainer blocking objection #2,
+    2026-04-20 council).
+
+    Memoization: if a row already exists with ``row.code_hash ==
+    discovered.code_hash``, the schema/defaults/status columns are NOT
+    recomputed or overwritten (Hawk blocking objection #1). When the
+    hash changes (file edit, re-export, etc.), the row's schema columns
+    refresh atomically with the hash bump.
+
+    ``code_hash`` covers BOTH the strategy file and a sibling ``config.py``
+    (if present) — Codex review P1 2026-04-20: a config-only edit in
+    ``strategies/<pkg>/config.py`` wouldn't bump the strategy file's
+    hash, so persisted schema would go stale. Combined hash fixes that.
+
+    ``prune_missing`` deletes rows whose ``file_path`` no longer exists
+    on disk (rename / delete). Orphaned rows would otherwise remain
+    addressable by their stable UUID from backtest + portfolio foreign
+    keys — leaking rows only users with an old bookmark would hit.
+
+    Returns a list of ``(db_row, discovered_info)`` tuples in
+    filesystem-sorted order, mirroring ``discover_strategies`` output.
+    Caller is responsible for ``await session.commit()`` after calling.
+    """
+    discovered = discover_strategies(strategies_dir)
+
+    existing_rows = (await session.execute(select(Strategy))).scalars().all()
+    existing_by_path: dict[str, Strategy] = {row.file_path: row for row in existing_rows}
+
+    discovered_paths = {str(info.module_path) for info in discovered}
+
+    paired: list[tuple[Strategy, DiscoveredStrategy]] = []
+    for info in discovered:
+        file_path = str(info.module_path)
+        # Combined hash: strategy file + sibling config.py (if any).
+        # A schema/defaults change in config.py must invalidate the
+        # memoized schema cache even if the strategy file is unchanged.
+        combined_hash = _combined_strategy_hash(info)
+        row = existing_by_path.get(file_path)
+        if row is None:
+            row = Strategy(
+                name=info.name,
+                description=info.description,
+                file_path=file_path,
+                strategy_class=info.strategy_class_name,
+                config_class=info.config_class_name,
+                config_schema=info.config_schema,
+                default_config=info.default_config,
+                config_schema_status=info.config_schema_status,
+                code_hash=combined_hash,
+            )
+            session.add(row)
+        else:
+            row.name = info.name
+            row.description = info.description
+            row.strategy_class = info.strategy_class_name
+            # Memoize: only recompute schema when the combined hash
+            # actually changed. Avoids re-running msgspec.json.schema
+            # on every /api/v1/strategies/ GET.
+            if row.code_hash != combined_hash:
+                row.config_class = info.config_class_name
+                row.config_schema = info.config_schema
+                row.default_config = info.default_config
+                row.config_schema_status = info.config_schema_status
+                row.code_hash = combined_hash
+        paired.append((row, info))
+
+    # Prune orphaned rows — strategy file was renamed or deleted.
+    # Keeps the DB consistent with disk state.
+    if prune_missing:
+        for path, stale_row in existing_by_path.items():
+            if path in discovered_paths:
+                continue
+            if not Path(path).exists():
+                await session.delete(stale_row)
+
+    return paired
+
+
+def _combined_strategy_hash(info: DiscoveredStrategy) -> str:
+    """Return a SHA256 that changes when the strategy file OR its
+    sibling ``config.py`` changes.
+
+    MSAI's example ``strategies/example/ema_cross.py`` imports its
+    config class from ``strategies/example/config.py``. If the user
+    edits only ``config.py`` (e.g. changes a default value or adds a
+    field), the strategy file's own hash is unchanged, so the raw
+    ``info.code_hash`` wouldn't invalidate the memoized schema cache
+    in :func:`sync_strategies_to_db` — users would see stale defaults
+    in the UI form until they manually touch the strategy file.
+
+    Defense-in-depth: if a sibling ``config.py`` exists in the same
+    directory, fold its content hash into the returned hash. Works
+    for both the split-module layout (``config.py`` alongside the
+    strategy) and the single-file layout (no ``config.py`` → returns
+    ``info.code_hash`` verbatim). Doesn't recurse through arbitrary
+    imports — that would balloon the hash surface — but covers the
+    most-common Nautilus layout.
+    """
+    sibling = info.module_path.parent / "config.py"
+    if not sibling.is_file() or sibling.resolve() == info.module_path.resolve():
+        return info.code_hash
+    combined = hashlib.sha256()
+    combined.update(info.code_hash.encode("ascii"))
+    combined.update(b"\x00")
+    combined.update(compute_file_hash(sibling).encode("ascii"))
+    return combined.hexdigest()

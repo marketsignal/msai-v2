@@ -56,7 +56,10 @@ class TestFuturesEndToEnd:
         assert contract.secType == "FUT"
         assert contract.symbol == "ES"
         assert contract.exchange == "CME"
-        assert contract.lastTradeDateOrContractMonth == "20250620"
+        # IB resolves the actual last-trade date from yyyyMM — this
+        # avoids the computed-3rd-Friday trap on holiday-shifted months
+        # (e.g. Juneteenth 2026-06-19). PR #37 pinned the format.
+        assert contract.lastTradeDateOrContractMonth == "202506"
 
     def test_continuous_es_no_expiry(self) -> None:
         """CONTFUT secType for the continuous-front-month ES — the

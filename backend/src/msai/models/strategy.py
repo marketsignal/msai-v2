@@ -27,8 +27,25 @@ class Strategy(TimestampMixin, Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     file_path: Mapped[str] = mapped_column(String(500), nullable=False)
     strategy_class: Mapped[str] = mapped_column(String(255), nullable=False)
+    # The discovered ``*Config`` class's class name (not derivable from
+    # ``strategy_class`` — e.g. EMACrossStrategy → EMACrossConfig BUT
+    # FooStrategy → FooStrategyConfig or FooParams are all legal).
+    # Server-side validation at POST /backtests/run uses this exact name
+    # rather than re-deriving a suffix swap from ``strategy_class``.
+    # Nullable for strategies with no matching config class.
+    config_class: Mapped[str | None] = mapped_column(String(255), nullable=True)
     config_schema: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     default_config: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Four-state enum. See ``services/nautilus/schema_hooks.ConfigSchemaStatus``.
+    # Stored as String(32) to match the existing ``governance_status`` pattern
+    # on this table — no DB CHECK constraint is added; the enum is enforced
+    # at the application layer via ``ConfigSchemaStatus(value)``.
+    config_schema_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="no_config_class", server_default="no_config_class"
+    )
+    # SHA256 of the strategy file's bytes. Populated by the discovery sync;
+    # compared against disk to decide whether to recompute ``config_schema``.
+    code_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     governance_status: Mapped[str | None] = mapped_column(
         String(20), nullable=True, default="unchecked"
     )
@@ -37,4 +54,4 @@ class Strategy(TimestampMixin, Base):
     )
 
     # Relationships
-    creator: Mapped["User"] = relationship(lazy="selectin")  # noqa: F821
+    creator: Mapped[User] = relationship(lazy="selectin")  # noqa: F821

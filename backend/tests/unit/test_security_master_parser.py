@@ -145,3 +145,58 @@ class TestExtractTradingHours:
         # The parser records the OPEN date's weekday. Mon+Tue+Wed opens.
         days_in_rth_or_eth = {s["day"] for s in result["rth"] + result["eth"]}
         assert days_in_rth_or_eth == {"MON", "TUE", "WED"}
+
+
+# ---------------------------------------------------------------------------
+# nautilus_instrument_to_cache_json — Cython + pyo3 dual-path (BE-01 fix)
+# ---------------------------------------------------------------------------
+
+
+class TestNautilusInstrumentToCacheJson:
+    """Covers the 2026-04-20 BE-01 fix: Databento's DBN loader returns
+    pyo3-backed `FuturesContract` (standard `.to_dict(self)` signature)
+    while IB + TestInstrumentProvider return Cython-backed instruments
+    (staticmethod-style `.to_dict(obj)`). Both must flow through the
+    cache-JSON helper without a TypeError.
+    """
+
+    def test_cython_instrument_serializes(self) -> None:
+        from nautilus_trader.test_kit.providers import TestInstrumentProvider
+
+        from msai.services.nautilus.security_master.parser import (
+            nautilus_instrument_to_cache_json,
+        )
+
+        # TestInstrumentProvider.es_future → Cython FuturesContract
+        fut = TestInstrumentProvider.es_future(2026, 6)
+        d = nautilus_instrument_to_cache_json(fut)
+        assert d["type"] == "FuturesContract"
+        assert "raw_symbol" in d
+
+    def test_pyo3_instrument_serializes(self) -> None:
+        """Simulates the pyo3-FuturesContract shape the Databento loader
+        returns. We build a plain class with a bound-method ``to_dict``
+        that mirrors pyo3's calling convention (``TypeError: takes no
+        arguments (1 given)`` when called with an extra arg). The helper
+        must fall through to the zero-arg form and succeed.
+        """
+        from msai.services.nautilus.security_master.parser import (
+            nautilus_instrument_to_cache_json,
+        )
+
+        class _Pyo3Shim:
+            """Mimics nautilus_trader.core.nautilus_pyo3.model.FuturesContract.
+
+            Cython FuturesContract: ``to_dict(obj)`` — called as
+            ``instance.to_dict(instance)``.
+            pyo3 FuturesContract:   ``to_dict(self, /)`` — called as
+            ``instance.to_dict()``. Passing an extra arg raises the
+            exact TypeError observed in the E2E reproduction.
+            """
+
+            def to_dict(self) -> dict:
+                return {"type": "FuturesContract", "raw_symbol": "ES.n.0", "shim": True}
+
+        out = nautilus_instrument_to_cache_json(_Pyo3Shim())  # type: ignore[arg-type]
+        assert out["shim"] is True
+        assert out["raw_symbol"] == "ES.n.0"

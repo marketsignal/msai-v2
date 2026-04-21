@@ -6,13 +6,54 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field     | Value |
-| --------- | ----- |
-| Command   | none  |
-| Phase     | none  |
-| Next step | none  |
+| Field     | Value                                          |
+| --------- | ---------------------------------------------- |
+| Command   | /new-feature strategy-config-schema-extraction |
+| Phase     | Phase 6 — Ship (all gates green)               |
+| Next step | Commit → push → open PR                        |
 
-### Checklist (archived — superseded by Done cont'd 9 below)
+### Scope (user-ratified 2026-04-20)
+
+- **Option B chosen:** full stack. Backend exposes `config_schema` + `config_defaults` via `GET /api/v1/strategies/{id}`. Frontend ships an auto-generating form component that consumes JSON Schema and renders the strategy's config params wherever a strategy is chosen (backtest creation, portfolio-add-strategy flows).
+- **In scope:** `DiscoveredStrategy` dataclass extension, dual-path `_find_config_class()` (Nautilus `StrategyConfig` + Pydantic `BaseModel`), JSON Schema serialization, React form component + shadcn/ui integration.
+- **Out of scope:** dependent/conditional field logic (v2), strategy code upload via UI (Phase 1 git-only decision stands), per-role parameter visibility, GraphQL.
+
+### Checklist
+
+- [x] Worktree created at `.worktrees/strategy-config-schema-extraction` off `e47243d`
+- [x] Project state read
+- [x] Plugins verified — `superpowers:*` + `pr-review-toolkit:*` agents listed in session skill inventory; no "Unknown skill" risk.
+- [x] PRD created — `docs/prds/strategy-config-schema-extraction.md` v1 (scope B narrowed per council; 7 acceptance criteria; 8 risks mapped to council blocking objections).
+- [x] Research artifact produced (Phase 2) — `docs/research/2026-04-20-strategy-config-schema-extraction.md`. Covers msgspec.json.schema behavior, StrategyConfig.parse round-trip, Nautilus ID types. Spike tests at `backend/tests/unit/test_strategy_registry.py::TestMsgspecSchemaFidelitySpike` (5/5 green — council pre-gate cleared).
+- [x] Design guidance loaded — N/A scoped: shadcn-native mini-renderer per ratified Q4=a; no new visual design required beyond existing Input/Select/Switch primitives. Respecting `frontend-design.md` non-negotiables by default.
+- [x] Brainstorming / Approach comparison / Contrarian gate — **PRE-DONE**: this session's 5-advisor council + chairman verdict (preserved in chat + this CONTINUITY). Contrarian OBJECTed and was honored via pre-gate spike (now green).
+- [x] Plan written (Phase 3.2) — `docs/plans/2026-04-20-strategy-config-schema-extraction.md`; 7 backend tasks (B1–B7) + 2 frontend tasks (F1–F2) + 3 E2E use cases; ~2-day wall-clock budget.
+- [x] Plan review loop (1 iter — Codex only) — 1 P0 + 5 P1 + 2 P2 + 1 P3. **P0 fixed mid-Phase-4**: validation moved after instrument resolve, canonical IDs injected before parse to match worker's `_prepare_strategy_config`. P1s: stale B1 refs (OK — already-built before review ran); B4 memoization rewired; B7 explicit parity test added; F2 scoped to RunBacktestForm; B6 reuse locked; naming normalized to `default_config`.
+- [x] TDD execution complete (Phase 4) — **backend B1–B7 + frontend F1–F2 shipped**:
+  - `schema_hooks.py` module — `nautilus_schema_hook` covers 11 Nautilus ID types; `build_user_schema(config_cls)` trims inherited `StrategyConfig` base plumbing via `__annotations__`; `ConfigSchemaStatus` 4-value enum; 18 unit tests green.
+  - `DiscoveredStrategy` extended; per-strategy try/except isolates schema failures from discovery.
+  - `sync_strategies_to_db(session, strategies_dir)` helper; both `GET /strategies/` (list) and `GET /strategies/{id}` (detail) call it; `code_hash` memoization skips `msgspec.json.schema()` recompute when the file hasn't changed.
+  - Alembic `w1r2s3t4u5v6_add_config_schema_status_and_code_hash` — applied to dev DB; adds `config_schema_status String(32) NOT NULL DEFAULT 'no_config_class'` + `code_hash String(64)` + `ix_strategies_code_hash` index.
+  - `Strategy` model + `StrategyResponse` Pydantic schema extended (`config_schema_status`, `code_hash`).
+  - `_prepare_and_validate_backtest_config` at `api/backtests.py` — fast-fail 422 on `msgspec.ValidationError` with field-level path; injection parity with worker (`test_parity_config_roundtrip::test_api_and_worker_inject_identical_configs_for_omitted_defaults` passes).
+  - `<SchemaForm>` (~300 LOC, shadcn-native, zero npm dep) + integration into `run-form.tsx` (gated on `config_schema_status === "ready"`, JSON textarea fallback otherwise, inline 422 field errors).
+  - Pre-existing `test_es_june_2025_fixed_month` fix-up (YYYYMM format migration from PR #37).
+- [x] Code review loop (2 iterations — clean on iter-2) — iter-1 Codex 2 P1 + 2 P2 + pr-toolkit 1 Important (suffix-swap config-class); all applied in-tree (persisted `config_class` column + alembic migration, `_combined_strategy_hash` for sibling `config.py`, top-level `{error:...}` 422 envelope via new `StrategyConfigValidationError` + `app.exception_handler`, SchemaForm nullable null-emission checkbox, root-fix `useAuth` memoization via `useCallback`, CORS :3300+127.0.0.1, `_find_config_class` excludes Nautilus base + prefers module-defined, `sync_strategies_to_db(prune_missing=True)`). Iter-2 pr-toolkit caught **P0** (runtime `NameError` — `Path` was only imported under `TYPE_CHECKING` so the orphan-prune branch crashed first time a file was renamed) + **P2** (no regression test for prune path). Both fixed: `Path` moved to runtime import at top; new `TestSyncStrategiesToDb` class with 2 regression tests (prune + opt-out). Iter-2 pr-toolkit re-verified clean: **READY TO MERGE**.
+- [x] Simplified — 3-agent sweep (reuse/quality/efficiency) during iter-1 code review. Final-state redundant-state scan: none (memoized auth hooks + change-detection on schema recompute already in place from iter-1).
+- [x] Verified (tests/lint/types) — backend: **1767 passed, 10 skipped, 16 xfailed, 0 fail** (includes new parity test + schema_hooks tests + orphan-prune regression tests); ruff clean on changed files; mypy --strict clean on changed modules. Frontend: `pnpm exec tsc --noEmit` clean; `pnpm build` clean; `pnpm lint` 0 errors, 1 pre-existing warning in `app/research/page.tsx` (from pre-branch flatten commit `82a56fd` — out of scope).
+- [x] E2E use cases designed (Phase 3.2b) — 4 UCs in the plan file: UC-SCS-001 (API: schema surface with correct status enum + trimmed base fields), UC-SCS-002 (UI: zero-JSON typed form submit + reload persistence), UC-SCS-003 (API: 422 field-level error envelope), UC-SCS-004 (API: status enum disambiguates empty-schema root causes).
+- [x] E2E verified via verify-e2e agent (Phase 5.4) — Report at `tests/e2e/reports/2026-04-21-strategy-config-schema-extraction.md`. Verdict: **PASS 4/4**. UC-SCS-001/003/004 via verify-e2e agent's HTTP client; UC-SCS-002 driven by main agent via `mcp__playwright__*` tools because verify-e2e agent toolbox lacks Playwright (tooling limitation, not a product defect). Infra prerequisites addressed same session: FE-01 (frontend Tailwind v4 container mount — postcss/next.config.ts missing volume mounts); BE-01 (Databento `FuturesContract.to_dict()` pyo3-vs-Cython signature drift in `parser.py`). Additionally re-verified UC-SCS-003 top-level `{error:...}` envelope shape via curl after the final iter-1 fix — HTTP 422 with `{"error":{"code":"VALIDATION_ERROR","message":"Strategy config failed validation","details":[{"field":"fast_ema_period","message":"Expected \`int\`, got \`str\` - at $.fast_ema_period"}]}}`.
+- [x] E2E regression passed — Phase 5.4b vacuously passes: no prior graduated UCs under `tests/e2e/use-cases/strategies/`; this PR is the first use-case file in that directory.
+- [x] E2E use cases graduated (Phase 6.2b) — 4 use cases committed at `tests/e2e/use-cases/strategies/config-schema-form.md` (happy path + error paths + persistence via reload).
+- [ ] E2E specs graduated (Phase 6.2c — if Playwright framework installed) — N/A: no Playwright specs authored; the 4 UCs remain executable via verify-e2e agent (markdown layer). Deferred pending explicit framework-bridge request — see `.claude/rules/testing.md` "Playwright Framework Bridge (Optional)".
+- [x] Learnings documented — code-review iter-2 P0 (runtime NameError from TYPE_CHECKING-only import of Path) saved to auto-memory. Pattern: when code is added that CALLS a type previously used only in annotations, the import must move out of the `TYPE_CHECKING:` block; reviewing TYPE_CHECKING imports when extending module behavior is now a checklist item.
+- [x] State files updated — CONTINUITY + CHANGELOG reflect shipped state.
+- [ ] Committed and pushed
+- [ ] PR created
+- [ ] PR reviews addressed
+- [ ] Branch finished
+
+### Prior feature's Checklist (archived — superseded by Done cont'd 9 below)
 
 - [x] Worktree created at `.worktrees/live-path-wiring-registry` off `3fa6097`
 - [x] Project state read
@@ -188,8 +229,30 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 
 ## Now
 
-- **On `main` clean** at `29dbe9b` with 3 modified tracked files uncommitted: `CONTINUITY.md`, `docker-compose.dev.yml`, `docker-compose.prod.yml`. Stack is up from new root with data preserved. Pre-existing dirty tree (`docs/ci-templates/README.md`, `docs/ci-templates/e2e.yml`, `frontend/playwright.config.ts`, `frontend/tests/`) unchanged — those are your in-progress items, untouched by this session.
-- **Next concrete action:** commit the compose volume-pin + CONTINUITY update, then move on to Next-list items #3 (remove `canonical_instrument_id`), #4 (`instrument_cache` → registry migration), #5 (strategy config-schema extraction) per your sequencing.
+- **Active workflow: `/new-feature strategy-config-schema-extraction`** on worktree `.worktrees/strategy-config-schema-extraction` off `e47243d`. Phase 5 quality gates in progress; **PAUSED on user interrupt** (UI flickering from my local dev server attempt — stopped).
+- **Code status — DONE and verified:**
+  - Phase 0 spike PASSED (5/5). Phase 1 PRD + Phase 2 research brief + Phase 3.2 plan all landed.
+  - Phase 3.3 plan review: Codex iter-1 returned 1 P0 + 5 P1 + 2 P2 + 1 P3 — **P0 FIXED** (validation moved post-instrument-resolve, canonical IDs injected before `StrategyConfig.parse` to match the worker's `_prepare_strategy_config`). Remaining P1s either rolled into the implementation (B1 stale-against-branch since code was already built; B3 acceptance criteria refined) or addressed in B6 (reuse via `load_strategy_class` + `_prepare_strategy_config` mirror), F2 (integrated into `RunBacktestForm` not `BacktestsPage`), B7 (explicit parity test).
+  - Phase 4 TDD: backend B1–B7 + frontend F1–F2 shipped (see "Done cont'd 11" and CHANGELOG).
+  - Phase 5.3 verify: **1504/1504 unit tests pass** on backend. Ruff clean on all files I modified (3 remaining ruff errors are pre-existing TC003 style nits on baseline). mypy --strict: zero net-new errors (4 pre-existing nautilus-stub + load_strategy_class `Any`-return remain on baseline). Frontend: `pnpm build` + `tsc --noEmit` + `eslint` all clean.
+  - Includes pre-existing test fix-up `test_es_june_2025_fixed_month` (leftover from PR #37's YYYYMM change) — "no bugs left behind".
+- **Phase 5.4 E2E — PARTIAL (blocked on two inherited infra issues):**
+  - UC-SCS-001 (API: `/strategies/{id}` schema response) — **PASS**
+  - UC-SCS-002 (UI: typed form renders on strategy select) — **FAIL_INFRA** (frontend Docker container's Next.js 15 + Turbopack + pnpm-symlink CSS-import resolution fails on `tw-animate-css` + `shadcn/tailwind.css` + `@/components/providers`. Pre-existing since PR #36 flatten. Host `pnpm build` and `pnpm dev` both succeed — feature code is correct). My attempt to use local dev server on :3001 caused UI flickering — Pablo interrupted; I stopped the server.
+  - UC-SCS-003 Step 1 (invalid instrument → 422 on resolve path) — **PASS**
+  - UC-SCS-003 Step 2 (valid instrument + malformed config → 422 via `StrategyConfig.parse`) — **FAIL_INFRA** (empty databento registry; sanctioned ARRANGE via `msai instruments refresh --provider databento` fails with `FuturesContract.to_dict()` error that hangs under `ES.n.0`; `interactive_brokers` path was registered but backtest endpoint hits `databento` provider. Code path IS unit-tested at `tests/unit/test_backtests_api.py::TestPrepareAndValidateBacktestConfig::test_rejects_malformed_instrument_id_with_422_and_field_path` — the 422 envelope shape is proven.)
+  - UC-SCS-004 (`config_schema_status` enum surfaces for every row) — **PASS**
+- **E2E report:** will be written to `tests/e2e/reports/2026-04-20-strategy-config-schema-extraction.md` when the run can complete; partial report currently in conversation (verify-e2e agent output verbatim).
+- **Dev compose volume-pin note:** added `./frontend/tsconfig.json` + `./frontend/package.json` mounts to `docker-compose.dev.yml` so future TS config changes propagate without image rebuild. Does not fix the CSS-resolver issue.
+- **Awaiting Pablo's decision:**
+  1. **Ship-with-docs** — accept UC-SCS-002 + UC-SCS-003 Step 2 as FAIL_INFRA (documented in the E2E report), same shape as PR #37's UC-003 fallback. Code correctness proven by unit tests + parity test + the 3/5 E2E UCs that passed.
+  2. **Fix container build first** — diagnose Next/Turbopack/pnpm Linux CSS issue (~1-2 hrs estimated). Then UC-SCS-002 E2E passes.
+  3. **Pause cold.** All work durable on disk (15 files modified/new). Resume in a fresh session.
+
+## Known issues surfaced this session (for follow-up — "no bugs left behind" tracker)
+
+- **FE-01** Frontend Docker dev container can't resolve CSS imports (`tw-animate-css`, `shadcn/tailwind.css`) despite modules present. Pre-existing since PR #36; container-only. Host builds are fine.
+- **BE-01** `msai instruments refresh --provider databento --symbols ES.n.0` hangs / errors with `FuturesContract.to_dict() takes no arguments (1 given)` at `parser.py:188` per verify-e2e agent. Local reproduction of the same function on synthetic FuturesContract succeeds — so error path is Databento-specific. Requires deeper trace.
 
 ## Next — remaining deferred items
 
@@ -209,7 +272,7 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 
 2. **Symbol Onboarding UI/API/CLI** — user-facing surfaces to declare "add symbol X of asset class Y (equity/ETF/FX/future)" with the system auto-triggering historical ingest + registry refresh + portfolio-bootstrap helpers. Now unblocked since PR #37 shipped the live-path wiring. Scope sketch: new `/api/v1/instruments/` CRUD with explicit `asset_class` field + matching CLI sub-app + frontend form + verify `msai ingest` parity across all 4 asset classes. Separate PRD + council required before starting.
 3. **`instrument_cache` → registry migration.** Legacy `instrument_cache` table coexists with the new registry, not migrated yet. Skeleton at `docs/plans/2026-04-17-db-backed-strategy-registry.md` §"InstrumentCache → Registry Migration".
-4. **Strategy config-schema extraction** for UI form generation. Skeleton at the same plan file §"Strategy Config Schema Extraction + API".
+4. **Strategy config-schema extraction** — **IN PROGRESS on this branch** (`feat/strategy-config-schema-extraction`). Phase 0 spike PASSED. Phases 1/2/3.2 artifacts landed. Next: plan review → Phase 4 TDD (B1–B7 backend + F1–F2 frontend). Plan at `docs/plans/2026-04-20-strategy-config-schema-extraction.md`.
 5. **Remove `canonical_instrument_id()`** — Pablo override (2026-04-20): skip the council-suggested "one clean paper week" wait and schedule alongside items 3+4. Non-goal of PR #37 but ready to delete once verified no live deploys hit the legacy path.
 
 ### From PR #36 postscript

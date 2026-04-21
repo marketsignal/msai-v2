@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 from uuid import UUID, uuid4
@@ -14,7 +14,6 @@ import pytest
 from msai.core.database import get_db
 from msai.main import app
 from msai.models.strategy import Strategy
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -35,10 +34,10 @@ class _FakeSession:
     def __init__(self) -> None:
         self._rows: list[Strategy] = []
 
-    async def execute(self, _stmt: object) -> "_FakeSession":
+    async def execute(self, _stmt: object) -> _FakeSession:
         return self
 
-    def scalars(self) -> "_FakeSession":
+    def scalars(self) -> _FakeSession:
         return self
 
     def all(self) -> list[Strategy]:
@@ -51,7 +50,7 @@ class _FakeSession:
         if row.id is None:
             row.id = uuid4()
         if row.created_at is None:
-            row.created_at = datetime.now(timezone.utc)
+            row.created_at = datetime.now(UTC)
         self._rows.append(row)
 
     async def commit(self) -> None:
@@ -131,6 +130,57 @@ class TestListStrategies:
         body = response.json()
         assert body["total"] == 0
         assert body["items"] == []
+
+    async def test_list_strategies_surfaces_config_schema_status(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """Each strategy row carries a ``config_schema_status`` so the
+        frontend can distinguish ready-for-form-render from degraded
+        cases (council blocking objection Hawk #3, Maintainer #1)."""
+        with patch("msai.api.strategies._STRATEGIES_DIR", STRATEGIES_DIR):
+            response = await client.get("/api/v1/strategies/")
+
+        assert response.status_code == 200
+        body = response.json()
+        for item in body["items"]:
+            assert "config_schema_status" in item
+            assert item["config_schema_status"] in {
+                "ready",
+                "unsupported",
+                "extraction_failed",
+                "no_config_class",
+            }
+
+    async def test_list_strategies_ema_cross_exposes_ready_schema(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """EMACrossStrategy extracts cleanly via msgspec schema_hook —
+        status=ready + user-field schema populated + inherited base
+        fields trimmed (council acceptance criterion #1)."""
+        with patch("msai.api.strategies._STRATEGIES_DIR", STRATEGIES_DIR):
+            response = await client.get("/api/v1/strategies/")
+
+        assert response.status_code == 200
+        body = response.json()
+        ema = next(
+            (i for i in body["items"] if i["strategy_class"] == "EMACrossStrategy"),
+            None,
+        )
+        assert ema is not None
+        assert ema["config_schema_status"] == "ready"
+        schema = ema["config_schema"]
+        assert schema is not None
+        assert schema["type"] == "object"
+        # User fields present, inherited plumbing absent
+        assert "fast_ema_period" in schema["properties"]
+        assert "instrument_id" in schema["properties"]
+        assert "manage_stop" not in schema["properties"]  # inherited — trimmed
+        assert "order_id_tag" not in schema["properties"]  # inherited — trimmed
+        # Defaults populated
+        defaults = ema["default_config"]
+        assert defaults is not None
+        assert defaults["fast_ema_period"] == 10
+        assert defaults["slow_ema_period"] == 30
 
 
 # ---------------------------------------------------------------------------
