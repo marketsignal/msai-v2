@@ -173,9 +173,8 @@ def nautilus_instrument_to_cache_json(instrument: Instrument) -> dict[str, Any]:
     JSONB-compatible dict for the ``nautilus_instrument_json``
     column.
 
-    Nautilus's ``Instrument`` base class provides ``to_dict(self)``
-    (``nautilus_trader/model/instruments/base.pyx``) that produces
-    a flat dict of strings/numbers — directly serializable to
+    Nautilus's ``Instrument`` base class provides ``to_dict()`` that
+    produces a flat dict of strings/numbers — directly serializable to
     JSONB without any additional encoding.
 
     We do NOT write our own serialization here. If Nautilus changes
@@ -184,5 +183,28 @@ def nautilus_instrument_to_cache_json(instrument: Instrument) -> dict[str, Any]:
     read from the cache via ``Instrument.from_dict(row)``, so any
     drift between the writer and reader paths is automatically
     reconciled when we upgrade Nautilus).
+
+    Nautilus ships two parallel ``FuturesContract`` implementations:
+
+    * Cython (``nautilus_trader.model.instruments.*``) — ``to_dict``
+      is a staticmethod-style signature: ``to_dict(obj) -> dict``,
+      called as ``FuturesContract.to_dict(instance)`` or
+      ``instance.to_dict(instance)``. Raises ``TypeError: takes
+      exactly 1 positional argument (0 given)`` on a zero-arg call.
+    * pyo3 (``nautilus_trader.core.nautilus_pyo3.model.*``) — a
+      standard bound-method signature: ``to_dict(self, /) -> dict``,
+      called as ``instance.to_dict()``. Raises ``TypeError: takes no
+      arguments (1 given)`` on an extra-arg call.
+
+    The Databento DBN loader returns pyo3-backed instruments while
+    the IB adapter + ``TestInstrumentProvider`` return Cython-backed
+    ones. Both flow through this helper, so we try the bound-method
+    form first (pyo3) and fall back to the staticmethod form (Cython).
     """
-    return instrument.to_dict(instrument)
+    try:
+        return instrument.to_dict()  # type: ignore[call-arg]
+    except TypeError:
+        # Cython path — the staticmethod-style signature requires the
+        # instance explicitly. Not a fallback for bugs; both call
+        # patterns are legitimate Nautilus APIs for different classes.
+        return instrument.to_dict(instrument)

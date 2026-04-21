@@ -27,7 +27,12 @@ from msai.api.account import router as account_router
 from msai.api.alerts import router as alerts_router
 from msai.api.asset_universe import router as universe_router
 from msai.api.auth import router as auth_router
-from msai.api.backtests import router as backtests_router
+from msai.api.backtests import (
+    StrategyConfigValidationError,
+)
+from msai.api.backtests import (
+    router as backtests_router,
+)
 from msai.api.graduation import router as graduation_router
 from msai.api.live import router as live_router
 from msai.api.market_data import router as market_data_router
@@ -232,6 +237,29 @@ app.add_middleware(
 )
 
 app.middleware("http")(logging_middleware)
+
+
+# ---------------------------------------------------------------------------
+# Exception handlers
+# ---------------------------------------------------------------------------
+
+
+@app.exception_handler(StrategyConfigValidationError)
+async def _strategy_config_validation_handler(
+    request: Request,  # noqa: ARG001 — FastAPI handler signature
+    exc: StrategyConfigValidationError,
+) -> JSONResponse:
+    """Render :class:`StrategyConfigValidationError` as the api-design.md
+    envelope (top-level ``{"error": {code, message, details}}``).
+
+    Raising ``HTTPException(detail={"error": ...})`` would produce
+    ``{"detail": {"error": ...}}`` because FastAPI wraps ``detail`` as
+    a top-level key. This handler sidesteps that by returning a
+    ``JSONResponse`` directly. Frontend ``extract422Envelope`` accepts
+    both shapes so older ``{"detail": ...}`` responses still parse.
+    """
+    return JSONResponse(status_code=422, content=exc.envelope())
+
 
 # ---------------------------------------------------------------------------
 # API Routers

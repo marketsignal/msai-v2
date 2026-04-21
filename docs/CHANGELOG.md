@@ -4,6 +4,50 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-04-21 — strategy config schema extraction (branch `feat/strategy-config-schema-extraction`) — READY TO MERGE
+
+**Shipped on branch (not yet in main):**
+
+- `msai.services.nautilus.schema_hooks` module with `nautilus_schema_hook` (covers `InstrumentId`, `BarType`, `StrategyId`, `Venue`, `Symbol`, `AccountId`, `ClientId`, `OrderListId`, `PositionId`, `TraderId`, `ComponentId`), `ConfigSchemaStatus` StrEnum (`ready | unsupported | extraction_failed | no_config_class`), and `build_user_schema(config_cls) -> (schema, defaults, status)` that trims inherited `StrategyConfig` base-class fields via `config_cls.__annotations__` so the frontend form only shows user-defined parameters. 18 unit tests green.
+- `DiscoveredStrategy` extended with `config_schema`, `default_config`, `config_schema_status` fields at `backend/src/msai/services/strategy_registry.py:53-81`.
+- `discover_strategies` wraps `build_user_schema()` in per-strategy `try/except` (Hawk council blocking objection #1) — a single malformed `*Config` class cannot poison the whole discovery list; it surfaces with `config_schema_status == "extraction_failed"` instead.
+- `sync_strategies_to_db(session, strategies_dir)` helper at `backend/src/msai/services/strategy_registry.py:~370` decouples list/detail endpoint side effects (Maintainer council blocking objection #2). Both `GET /api/v1/strategies/` and `GET /api/v1/strategies/{id}` now call it; the detail endpoint no longer depends on list having run first to sync DB state.
+- Memoization by `code_hash` in the sync helper (Hawk council blocking objection #2) — when a row's stored `code_hash` matches the on-disk file hash, schema columns are NOT recomputed, avoiding an `msgspec.json.schema()` call on every `GET /strategies/` request.
+- New Alembic migration `w1r2s3t4u5v6_add_config_schema_status_and_code_hash` — revises `v0q1r2s3t4u5`. Adds `strategies.config_schema_status: String(32) NOT NULL DEFAULT 'no_config_class'` and `strategies.code_hash: String(64) NULL` with `ix_strategies_code_hash` index.
+- `Strategy` SQLAlchemy model + `StrategyResponse` Pydantic schema extended with `config_schema_status` and `code_hash` columns/fields.
+- Server-authoritative config validation on `POST /api/v1/backtests/run` (Hawk council blocking objection #4, 2026-04-20): `_validate_backtest_config()` helper loads the strategy's `*Config` class, runs `config_cls.parse(json.dumps(config))`, catches `msgspec.ValidationError` and returns HTTP 422 with `error.details[].field` extracted from the msgspec error path. Same rule applies to CLI/API/UI callers; validation is skipped gracefully when the strategy has no `*Config` class (legacy path).
+
+**Artifacts produced:**
+
+- Council pre-gate spike: `backend/tests/unit/test_strategy_registry.py::TestMsgspecSchemaFidelitySpike` (5 tests) — pinned `msgspec.json.schema(…, schema_hook=...)` behavior + `StrategyConfig.parse()` round-trip + field-level error paths. Gate PASSED 2026-04-20.
+- PRD: `docs/prds/strategy-config-schema-extraction.md`
+- Discussion log: `docs/prds/strategy-config-schema-extraction-discussion.md`
+- Research brief: `docs/research/2026-04-20-strategy-config-schema-extraction.md`
+- Plan: `docs/plans/2026-04-20-strategy-config-schema-extraction.md`
+
+**Additional shipped (later in session):**
+
+- B7 parity test at `backend/tests/integration/test_parity_config_roundtrip.py::test_api_and_worker_inject_identical_configs_for_omitted_defaults` — asserts the API's `_prepare_and_validate_backtest_config` and the worker's `_prepare_strategy_config` produce byte-identical dicts for the same user-submitted config + resolved instruments. Contrarian council blocking objection #2 resolved.
+- F1 `<SchemaForm>` mini-renderer at `frontend/src/components/strategies/schema-form.tsx` (~300 LOC, shadcn-native, zero new npm dep). Dispatches `integer / number / string / boolean / enum / nullable` field types; renders format hints for `x-format: instrument-id` / `bar-type`; hides backend-injected fields (`instrument_id`, `bar_type`) from the form since they're derived server-side from the separate `Instruments` input.
+- F2 integration in `frontend/src/components/backtests/run-form.tsx`: fetches `/api/v1/strategies/{id}` on selection change, activates `<SchemaForm>` only when `config_schema_status === "ready"`, falls back to JSON textarea otherwise. 422 field-level errors (from B6's envelope) rendered inline under the relevant field.
+- `StrategyResponse` TypeScript interface at `frontend/src/lib/api.ts` extended with `config_schema_status` + `ConfigSchemaStatus` type export.
+- E2E use cases authored at `tests/e2e/use-cases/strategies/config-schema-form.md` (4 UCs: UC-SCS-001 to 004).
+- Pre-existing test fix-up: `tests/unit/test_security_master_multi_asset.py::test_es_june_2025_fixed_month` updated to assert `YYYYMM` not `YYYYMMDD` — leftover from PR #37's format migration. "No bugs left behind".
+- Dev compose `docker-compose.dev.yml` gained volume mounts for `./frontend/tsconfig.json` + `./frontend/package.json` so TS config + dep updates propagate without rebuilding the dev image.
+
+**Phase 5 gates status (all GREEN):**
+
+- 5.1 Code-review loop (2 iterations — clean on iter-2). Iter-1 Codex + pr-review-toolkit found: (P1) config-class suffix-swap misclassifies `FooParams` / `FooStrategyConfig`; (P1) `code_hash` doesn't track sibling `config.py`; (P2) 422 envelope wrapped under `detail`; (P2) SchemaForm didn't emit null for nullable fields; (P2) `useEffect` stale closures from unmemoized `getToken`; (P2) CORS didn't include 3300; plus Important #1 `_find_config_class` may pick up imported `StrategyConfig` base + Important #2 no orphan-row prune on file rename. All applied: added `config_class` String(255) column on `Strategy` model + alembic migration bump; `_combined_strategy_hash(info)` folds sibling `config.py` hash; new `StrategyConfigValidationError` + `@app.exception_handler` in `main.py` returns top-level `{error: {code, message, details}}` per api-design.md; SchemaForm "Use null (unset)" checkbox for `anyOf(T, null)` fields; `useAuth` memoized via `useCallback` on `login`/`logout`/`getToken` (root fix — drops all per-consumer `eslint-disable` workarounds); CORS defaults extended to include `http://localhost:3300` + 127.0.0.1 variants; `_find_config_class` explicitly excludes Nautilus base + prefers module-defined; `sync_strategies_to_db(prune_missing=True)` deletes orphan rows. Iter-2 pr-toolkit caught **P0** (runtime `NameError` — `Path` was only imported under `TYPE_CHECKING` so the orphan-prune branch would crash the first time a file was renamed in prod) + **P2** (missing regression test for prune path). Both fixed: `from pathlib import Path` moved to runtime import; new `TestSyncStrategiesToDb` class adds 2 regression tests. Iter-2 pr-toolkit verdict: **READY TO MERGE**.
+- 5.2 Simplify: 3-agent sweep run during iter-1 review (reuse/quality/efficiency). No redundant state or duplicate utilities surfaced — memoized auth hooks + change-detection on schema recompute already in place.
+- 5.3 Verify: **1767 backend tests pass**, 10 skipped, 16 xfailed, 0 fail (includes new `TestSyncStrategiesToDb` + `TestPrepareAndValidateBacktestConfig` + `TestMsgspecSchemaFidelitySpike` + `test_security_master_parser::TestNautilusInstrumentToCacheJson`). `ruff check` clean on changed files; `mypy --strict` clean on changed modules. Frontend: `pnpm exec tsc --noEmit` clean; `pnpm build` clean; `pnpm lint` 0 errors, 1 pre-existing warning in `app/research/page.tsx` (from pre-branch flatten commit `82a56fd` — out of scope).
+- 5.4 E2E verify-e2e: **PASS 4/4**. Report at `tests/e2e/reports/2026-04-21-strategy-config-schema-extraction.md`. UC-SCS-001/003/004 via the verify-e2e agent over HTTP; UC-SCS-002 driven by the main agent via `mcp__playwright__*` against the running stack (verify-e2e agent toolbox doesn't include Playwright — tooling limitation). Infra bugs FE-01 + BE-01 (listed below) were fixed IN-BRANCH before the final run; the final 422 envelope shape was re-verified via direct curl after the iter-1 exception-handler fix.
+- 5.4b E2E regression: vacuously passes — `tests/e2e/use-cases/strategies/` was empty prior to this PR; this is the first graduated use-case file in that category.
+
+**Infra bugs found + fixed in-branch ("no bugs left behind"):**
+
+- **FE-01 FIXED** Docker `msai-claude-frontend` failed to resolve CSS `@import "tw-animate-css"` + `@import "shadcn/tailwind.css"` + path alias `@/components/providers` despite modules present in `node_modules`. Root cause: `postcss.config.mjs` + `next.config.ts` never mounted/copied into container, so Next.js fell back to a no-op config. Fix: added `./frontend/postcss.config.mjs:/app/postcss.config.mjs:ro` + `./frontend/next.config.ts:/app/next.config.ts:ro` + `./frontend/tsconfig.json:/app/tsconfig.json:ro` + `./frontend/package.json:/app/package.json:ro` volume mounts in `docker-compose.dev.yml`, plus `COPY postcss.config.mjs next.config.ts tsconfig.json ./` in `frontend/Dockerfile.dev` as baseline. Host `pnpm build` + container `npm run dev` both now succeed with Tailwind v4 + path aliases resolving.
+- **BE-01 FIXED** `msai instruments refresh --provider databento --symbols ES.n.0` failed with `TypeError: FuturesContract.to_dict() takes no arguments (1 given)` at `backend/src/msai/services/nautilus/security_master/parser.py::nautilus_instrument_to_cache_json`. Root cause: Nautilus ships `FuturesContract` in two backends — Cython instruments expose `to_dict(obj)` (staticmethod-style, needs self passed explicitly), pyo3 instruments expose bound `to_dict(self)`. Databento's loader returns pyo3 instruments; IB qualification returns Cython. Fix: try/except dual dispatch — `try: instrument.to_dict() except TypeError: instrument.to_dict(instrument)`. New regression tests `TestNautilusInstrumentToCacheJson::test_prefers_bound_method_first` + `test_falls_back_to_staticmethod_signature_on_typeerror`.
+
 ### 2026-04-20 — live-path registry wiring (branch `feat/live-path-wiring-registry`)
 
 **Shipped:**

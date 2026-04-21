@@ -109,6 +109,12 @@ export interface BarsResponse {
   count: number;
 }
 
+export type ConfigSchemaStatus =
+  | "ready"
+  | "unsupported"
+  | "extraction_failed"
+  | "no_config_class";
+
 export interface StrategyResponse {
   id: string;
   name: string;
@@ -118,6 +124,16 @@ export interface StrategyResponse {
   file_path: string;
   config_schema: Record<string, unknown> | null;
   default_config: Record<string, unknown> | null;
+  /**
+   * Emitted by backend ``build_user_schema()`` — one of:
+   * - ``"ready"`` — ``config_schema`` + ``default_config`` are both non-null.
+   * - ``"unsupported"`` — the strategy's Config uses a type the schema_hook doesn't cover.
+   * - ``"extraction_failed"`` — msgspec.json.schema raised an unexpected exception.
+   * - ``"no_config_class"`` — the strategy has no matching ``*Config`` class.
+   *
+   * Frontend auto-form (``SchemaForm``) activates only on ``"ready"``.
+   */
+  config_schema_status: ConfigSchemaStatus;
   created_at: string;
 }
 

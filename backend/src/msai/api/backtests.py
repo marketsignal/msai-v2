@@ -37,10 +37,141 @@ from msai.services.nautilus.security_master.service import (
     DatabentoDefinitionMissing,
     SecurityMaster,
 )
+from msai.services.strategy_registry import load_strategy_class
 
 log = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/backtests", tags=["backtests"])
+
+
+class StrategyConfigValidationError(Exception):
+    """Raised by :func:`_prepare_and_validate_backtest_config` when the
+    user-submitted config fails ``StrategyConfig.parse()``.
+
+    Carries the structured 422 envelope that ``main.py``'s exception
+    handler renders as a top-level ``{"error": {...}}`` JSON response
+    per ``.claude/rules/api-design.md``. Raising this (instead of
+    ``HTTPException(detail={...})``) avoids FastAPI's default
+    ``{"detail": <x>}`` wrapper, which would produce the non-compliant
+    ``{"detail": {"error": {...}}}`` shape observed during the
+    2026-04-21 code review.
+    """
+
+    def __init__(self, *, field: str | None, message: str) -> None:
+        self.field = field or "(unknown)"
+        self.message = message
+        super().__init__(f"{self.field}: {message}")
+
+    def envelope(self) -> dict[str, Any]:
+        return {
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "Strategy config failed validation",
+                "details": [{"field": self.field, "message": self.message}],
+            }
+        }
+
+
+def _prepare_and_validate_backtest_config(
+    config: dict[str, Any],
+    *,
+    strategy_file_path: str,
+    config_class_name: str | None,
+    canonical_instruments: list[str],
+) -> dict[str, Any]:
+    """Prepare + server-authoritatively validate the backtest config.
+
+    Why this lives at the API layer (Hawk council blocking objection #4 +
+    Contrarian #2, 2026-04-20): CLI and API callers should hit the same
+    validation surface as the UI. Worker-only validation means malformed
+    payloads sit in the queue before failing, and the persisted
+    ``Backtest.config`` diverges from what portfolio/live paths normalize
+    to. Doing the merge + parse at the API means one source of truth.
+
+    Prep: if the caller omitted ``instrument_id`` / ``bar_type``, inject
+    the first canonical instrument — mirrors the worker's
+    ``_prepare_strategy_config`` at
+    ``backend/src/msai/workers/backtest_job.py:371``. Persisting the
+    PREPARED dict (caller's code does this after the return) closes the
+    divergence with portfolio_service's merge logic.
+
+    Validation: load the strategy's ``*Config`` class by the name that
+    **discovery persisted** (``Strategy.config_class``, not a suffix-swap
+    guess — Codex/pr-toolkit code review 2026-04-21: suffix-swap silently
+    skips validation for classes named ``FooStrategyConfig`` / ``FooParams``
+    / any non-``"{Name}Config"`` shape). Dump the prepared dict to JSON,
+    run ``StrategyConfig.parse()``. msgspec's ``ValidationError`` carries
+    a ``$.<field>`` path that we extract for the 422 response so the
+    frontend can highlight the bad field.
+
+    Returns the prepared config dict on success; raises
+    ``HTTPException(422)`` on ``msgspec.ValidationError`` with a
+    structured ``detail`` payload keyed for ``frontend/src/lib/api.ts``.
+
+    ``config_class_name = None`` is a legitimate state (strategy has no
+    matching ``*Config`` class). Validation is silently skipped in that
+    case — the worker's auto-discovery at backtest-runner time still
+    catches malformed payloads.
+    """
+    import json
+
+    import msgspec
+
+    # --- Prep: inject canonical instruments to match worker behavior ---
+    prepared = dict(config)
+    if canonical_instruments:
+        if "instrument_id" not in prepared:
+            prepared["instrument_id"] = canonical_instruments[0]
+        if "bar_type" not in prepared:
+            prepared["bar_type"] = f"{canonical_instruments[0]}-1-MINUTE-LAST-EXTERNAL"
+
+    # --- Locate config class ---
+    if not config_class_name:
+        log.info(
+            "backtest_config_validation_skipped",
+            reason="no_config_class",
+            strategy_file=strategy_file_path,
+        )
+        return prepared
+
+    strategy_path = Path(strategy_file_path)
+    if not strategy_path.exists():
+        log.warning(
+            "backtest_config_validation_skipped",
+            reason="strategy_file_missing",
+            file_path=strategy_file_path,
+        )
+        return prepared
+
+    try:
+        config_cls = load_strategy_class(strategy_path, config_class_name)
+    except ImportError:
+        log.info(
+            "backtest_config_validation_skipped",
+            reason="config_class_not_importable",
+            strategy_file=strategy_file_path,
+            config_class=config_class_name,
+        )
+        return prepared
+
+    # --- Parse ---
+    try:
+        config_cls.parse(json.dumps(prepared))
+    except msgspec.ValidationError as exc:
+        # msgspec error format: "<reason> - at `$.<field>`". Strip the
+        # backtick wrapping, leading ``$.``, and any trailing
+        # whitespace so the client receives a plain field name like
+        # ``instrument_id`` that matches the keys in
+        # ``schema.properties`` for inline-error rendering.
+        raw = str(exc)
+        field = None
+        if " - at " in raw:
+            _, _, path = raw.partition(" - at ")
+            # Strip wrapping backticks + leading "$." → plain dotted path
+            field = path.strip().strip("`").removeprefix("$.").strip()
+        raise StrategyConfigValidationError(field=field, message=raw) from exc
+
+    return prepared
 
 
 @router.post("/run", status_code=status.HTTP_201_CREATED, response_model=BacktestStatusResponse)
@@ -126,6 +257,19 @@ async def run_backtest(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         ) from exc
+
+    # Server-authoritative config validation (Hawk council blocking
+    # objection #4, 2026-04-20). Happens AFTER instrument resolve so
+    # canonical IDs are available to inject into the config dict before
+    # msgspec.parse — matches the worker's _prepare_strategy_config
+    # behavior so persisted ``Backtest.config`` is the same shape as
+    # what portfolio/live paths normalize to (Contrarian #2).
+    worker_config = _prepare_and_validate_backtest_config(
+        worker_config,
+        strategy_file_path=strategy.file_path,
+        config_class_name=strategy.config_class,
+        canonical_instruments=canonical_instruments,
+    )
 
     # Create the backtest record
     backtest = Backtest(

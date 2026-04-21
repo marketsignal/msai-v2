@@ -36,7 +36,19 @@ class Settings(BaseSettings):
     azure_tenant_id: str = ""
     azure_client_id: str = ""
     msai_api_key: str = ""
-    cors_origins: list[str] = ["http://localhost:3000"]
+    # localhost + 127.0.0.1 pairs for host dev server (``pnpm dev``
+    # outside Docker, port 3000) AND Docker Compose-mapped frontend
+    # (container's 3000 on host 3300 per docker-compose.dev.yml). Both
+    # origins must be allowed so browser→:8800 isn't CORS-blocked;
+    # API-key auth gates access. The 127.0.0.1 pair handles Safari's
+    # hostname-strict behavior + edge cases where dev tooling resolves
+    # to the loopback IP instead of the localhost alias.
+    cors_origins: list[str] = [
+        "http://localhost:3000",
+        "http://localhost:3300",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:3300",
+    ]
     polygon_api_key: str = ""
     databento_api_key: str = ""
     databento_equities_dataset: str = "EQUS.MINI"

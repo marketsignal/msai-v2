@@ -162,3 +162,317 @@ class TestLoadStrategyClass:
 
         with pytest.raises(ImportError):
             load_strategy_class(bad_path, "SomeStrategy")
+
+
+# ---------------------------------------------------------------------------
+# Council pre-gate spike — msgspec JSON Schema fidelity for Nautilus types
+# (2026-04-20 council verdict; see
+#  docs/prds/strategy-config-schema-extraction-discussion.md)
+#
+# The Contrarian flagged that `msgspec.json.schema()` behavior on Nautilus-
+# native types (`InstrumentId`, `BarType`, `Decimal`) is unverified. These
+# tests ARE the verification. They pin the three properties any later
+# extraction must rely on:
+#
+#   (a) msgspec.json.schema(..., schema_hook=...) produces usable schema
+#       for an EMACrossConfig — integers/decimals/defaults/nullable fields
+#       render as expected; Nautilus ID types map to typed strings.
+#   (b) StrategyConfig.parse(json_str) is the canonical round-trip:
+#       string-shaped payloads decode into typed instances, unknown-format
+#       values raise msgspec.ValidationError with field-level paths
+#       suitable for 422 surfaces.
+#   (c) User-defined fields can be distinguished from 17 inherited
+#       StrategyConfig base-class fields via `__annotations__` so the
+#       renderer doesn't expose `manage_stop`, `order_id_tag`, etc.
+# ---------------------------------------------------------------------------
+
+
+# Mirror strategies/example/config.py at module scope so msgspec can
+# resolve the lazy `from __future__ import annotations` forward refs
+# against real class objects in the module's globals. Re-declaring
+# (rather than importing from the strategies package) avoids sys.path
+# coupling to the runtime registry's _ensure_strategies_importable hack.
+from decimal import Decimal as _SpikeDecimal  # noqa: E402
+
+from nautilus_trader.model.data import BarType as _SpikeBarType  # noqa: E402
+from nautilus_trader.model.identifiers import InstrumentId as _SpikeInstrumentId  # noqa: E402
+from nautilus_trader.trading.config import StrategyConfig as _SpikeStrategyConfig  # noqa: E402
+
+InstrumentId = _SpikeInstrumentId
+BarType = _SpikeBarType
+Decimal = _SpikeDecimal
+
+
+class _SpikeEMACrossConfig(_SpikeStrategyConfig, frozen=True):
+    instrument_id: InstrumentId
+    bar_type: BarType
+    fast_ema_period: int = 10
+    slow_ema_period: int = 30
+    trade_size: Decimal = Decimal("1")
+
+
+class TestMsgspecSchemaFidelitySpike:
+    """Council pre-gate — pin msgspec schema/parse behavior before building the renderer."""
+
+    @staticmethod
+    def _ema_cross_config() -> type:
+        return _SpikeEMACrossConfig
+
+    @staticmethod
+    def _nautilus_schema_hook(t: type) -> dict:
+        """Map Nautilus ID types to typed strings with format hints.
+
+        `msgspec.json.schema()` raises TypeError on any custom class unless
+        a schema_hook covers it. We map all Nautilus identifier classes to
+        `type: string` so the renderer can pick a text input; `InstrumentId`
+        and `BarType` get ``x-format`` + examples for nicer widgets later.
+        """
+        from nautilus_trader.model.data import BarType
+        from nautilus_trader.model.identifiers import (
+            AccountId,
+            ClientId,
+            ComponentId,
+            InstrumentId,
+            OrderListId,
+            PositionId,
+            StrategyId,
+            Symbol,
+            TraderId,
+            Venue,
+        )
+
+        if t is InstrumentId:
+            return {
+                "type": "string",
+                "title": "Instrument ID",
+                "x-format": "instrument-id",
+                "description": "SYMBOL.VENUE",
+                "examples": ["AAPL.NASDAQ", "EUR/USD.IDEALPRO"],
+            }
+        if t is BarType:
+            return {
+                "type": "string",
+                "title": "Bar Type",
+                "x-format": "bar-type",
+                "description": "INSTRUMENT_ID-STEP-AGGREGATION-PRICE_TYPE-SOURCE",
+                "examples": ["AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL"],
+            }
+        nautilus_id_types = (
+            StrategyId,
+            ComponentId,
+            Venue,
+            Symbol,
+            AccountId,
+            ClientId,
+            OrderListId,
+            PositionId,
+            TraderId,
+        )
+        if t in nautilus_id_types:
+            return {"type": "string", "title": t.__name__}
+        raise NotImplementedError(f"no schema hook for {t!r}")
+
+    def test_json_schema_extracts_with_nautilus_hook(self) -> None:
+        """schema_hook maps Nautilus IDs → typed strings; primitives render natively."""
+        import msgspec
+
+        config_cls = self._ema_cross_config()
+        schema = msgspec.json.schema(config_cls, schema_hook=self._nautilus_schema_hook)
+
+        ema_def = schema["$defs"][config_cls.__name__]
+        props = ema_def["properties"]
+
+        # Nautilus ID types → typed string with format hint
+        assert props["instrument_id"]["type"] == "string"
+        assert props["instrument_id"]["x-format"] == "instrument-id"
+        assert "AAPL.NASDAQ" in props["instrument_id"]["examples"]
+
+        assert props["bar_type"]["type"] == "string"
+        assert props["bar_type"]["x-format"] == "bar-type"
+
+        # Primitives with defaults
+        assert props["fast_ema_period"] == {"type": "integer", "default": 10}
+        assert props["slow_ema_period"] == {"type": "integer", "default": 30}
+        assert props["trade_size"] == {"type": "string", "format": "decimal", "default": "1"}
+
+    def test_json_schema_includes_inherited_base_fields(self) -> None:
+        """msgspec emits the whole struct including StrategyConfig base plumbing.
+
+        Pinning this behavior so the extractor knows to trim via
+        ``__annotations__`` — we do NOT want the form to expose
+        ``manage_stop``, ``order_id_tag``, etc. by default.
+        """
+        import msgspec
+
+        config_cls = self._ema_cross_config()
+        schema = msgspec.json.schema(config_cls, schema_hook=self._nautilus_schema_hook)
+        props = schema["$defs"][config_cls.__name__]["properties"]
+
+        inherited = {
+            "strategy_id",
+            "order_id_tag",
+            "use_uuid_client_order_ids",
+            "manage_stop",
+            "log_events",
+        }
+        assert inherited.issubset(props.keys()), (
+            "msgspec.json.schema emits all fields incl. inherited — trim via __annotations__"
+        )
+
+    def test_user_defined_fields_via_annotations(self) -> None:
+        """``EMACrossConfig.__annotations__`` lists only the 5 user-defined fields."""
+        config_cls = self._ema_cross_config()
+        own_fields = set(config_cls.__annotations__.keys())
+        assert own_fields == {
+            "instrument_id",
+            "bar_type",
+            "fast_ema_period",
+            "slow_ema_period",
+            "trade_size",
+        }
+
+    def test_strategy_config_parse_round_trip(self) -> None:
+        """StrategyConfig.parse(json_string) accepts string payloads → typed instances."""
+        from decimal import Decimal
+
+        from nautilus_trader.model.data import BarType
+        from nautilus_trader.model.identifiers import InstrumentId
+
+        config_cls = self._ema_cross_config()
+        payload = (
+            '{"instrument_id":"AAPL.NASDAQ",'
+            '"bar_type":"AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL",'
+            '"fast_ema_period":5,'
+            '"trade_size":"2.5"}'
+        )
+
+        instance = config_cls.parse(payload)
+
+        assert isinstance(instance.instrument_id, InstrumentId)
+        assert str(instance.instrument_id) == "AAPL.NASDAQ"
+        assert isinstance(instance.bar_type, BarType)
+        assert instance.fast_ema_period == 5
+        assert instance.slow_ema_period == 30  # default honored
+        assert isinstance(instance.trade_size, Decimal)
+        assert instance.trade_size == Decimal("2.5")
+
+    def test_strategy_config_parse_malformed_raises_field_level_error(self) -> None:
+        """Bad InstrumentId → msgspec.ValidationError with field path — usable for 422."""
+        import msgspec
+
+        config_cls = self._ema_cross_config()
+        bad_payload = '{"instrument_id":"garbage","bar_type":"AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL"}'
+
+        with pytest.raises(msgspec.ValidationError) as excinfo:
+            config_cls.parse(bad_payload)
+
+        # Field-level path is present in the message — renderable inline
+        assert "$.instrument_id" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Tests: sync_strategies_to_db (prune_missing branch)
+# ---------------------------------------------------------------------------
+
+
+class _FakeAsyncSession:
+    """Minimal async session covering ``sync_strategies_to_db`` call surface.
+
+    Supports ``execute(select(Strategy)).scalars().all()``, ``add()``,
+    ``delete()``. Commit is a no-op — caller commits.
+    """
+
+    def __init__(self, existing: list[Strategy] | None = None) -> None:
+        from msai.models.strategy import Strategy
+
+        self._rows: list[Strategy] = list(existing or [])
+        self.deleted: list[Strategy] = []
+
+    async def execute(self, _stmt: object) -> _FakeAsyncSession:
+        return self
+
+    def scalars(self) -> _FakeAsyncSession:
+        return self
+
+    def all(self) -> list[Strategy]:
+        from msai.models.strategy import Strategy  # noqa: F401  (used in annotation)
+
+        return [r for r in self._rows if r not in self.deleted]
+
+    def add(self, row: Strategy) -> None:
+        self._rows.append(row)
+
+    async def delete(self, row: Strategy) -> None:
+        self.deleted.append(row)
+
+
+class TestSyncStrategiesToDb:
+    """Tests for :func:`sync_strategies_to_db` — orphan-prune branch."""
+
+    async def test_sync_prunes_row_whose_file_no_longer_exists(self, tmp_path: Path) -> None:
+        """Code-review iter-2 regression for P0 (pr-review-toolkit 2026-04-21):
+
+        The ``prune_missing=True`` branch deletes rows whose ``file_path``
+        no longer exists on disk. Prior to this test, ``Path`` was only
+        imported under ``TYPE_CHECKING`` so the ``Path(path).exists()``
+        call would ``NameError`` at runtime the first time a user renamed
+        or deleted a strategy file.
+        """
+        from msai.models.strategy import Strategy
+        from msai.services.strategy_registry import sync_strategies_to_db
+
+        strategies_dir = tmp_path / "strategies"
+        strategies_dir.mkdir()
+
+        orphan_file = tmp_path / "deleted_strategy.py"
+        orphan_row = Strategy(
+            name="deleted.strategy",
+            file_path=str(orphan_file),
+            strategy_class="DeletedStrategy",
+            config_class=None,
+            config_schema=None,
+            default_config=None,
+            config_schema_status="no_config_class",
+            code_hash="deadbeef",
+        )
+        session = _FakeAsyncSession(existing=[orphan_row])
+
+        # File does NOT exist; empty strategies_dir → no discovered rows
+        assert not orphan_file.exists()
+
+        result = await sync_strategies_to_db(
+            session,  # type: ignore[arg-type]
+            strategies_dir,
+            prune_missing=True,
+        )
+
+        assert result == []
+        assert orphan_row in session.deleted, "Orphan row (file vanished from disk) must be pruned"
+
+    async def test_sync_keeps_orphan_row_when_prune_missing_false(self, tmp_path: Path) -> None:
+        """Opt-out: ``prune_missing=False`` keeps rows whose file disappeared."""
+        from msai.models.strategy import Strategy
+        from msai.services.strategy_registry import sync_strategies_to_db
+
+        strategies_dir = tmp_path / "strategies"
+        strategies_dir.mkdir()
+
+        orphan_row = Strategy(
+            name="kept.strategy",
+            file_path=str(tmp_path / "gone.py"),
+            strategy_class="KeptStrategy",
+            config_class=None,
+            config_schema=None,
+            default_config=None,
+            config_schema_status="no_config_class",
+            code_hash="cafebabe",
+        )
+        session = _FakeAsyncSession(existing=[orphan_row])
+
+        await sync_strategies_to_db(
+            session,  # type: ignore[arg-type]
+            strategies_dir,
+            prune_missing=False,
+        )
+
+        assert orphan_row not in session.deleted

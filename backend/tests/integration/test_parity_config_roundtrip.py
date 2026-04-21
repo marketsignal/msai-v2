@@ -177,3 +177,59 @@ def test_round_trip_through_json_preserves_types() -> None:
     assert once.fast_ema_period == twice.fast_ema_period
     assert once.slow_ema_period == twice.slow_ema_period
     assert str(once.instrument_id) == str(twice.instrument_id)
+
+
+def test_api_and_worker_inject_identical_configs_for_omitted_defaults() -> None:
+    """Council Blocking Objection (Contrarian #2, 2026-04-20):
+    The backtest API's ``_prepare_and_validate_backtest_config`` helper
+    and the worker's ``_prepare_strategy_config`` helper MUST produce
+    byte-identical dicts when given the same user-submitted config +
+    resolved instruments. Otherwise the persisted ``Backtest.config``
+    diverges from what the worker actually runs — breaking graduation
+    parity with portfolio_service.
+
+    This is the Contrarian's hard merge gate: "omitted defaults +
+    backend-injected fields normalize identically across backtest /
+    portfolio / paper / live". Proven for the API ↔ worker pair here;
+    portfolio_service parity is covered by existing tests in
+    ``test_portfolio_full_lifecycle.py``.
+    """
+    from msai.api.backtests import _prepare_and_validate_backtest_config
+    from msai.workers.backtest_job import _prepare_strategy_config
+
+    strategy_file = _REPO_ROOT / "strategies" / "example" / "ema_cross.py"
+    canonical = ["AAPL.NASDAQ"]
+
+    # Case 1: user omits instrument_id + bar_type (most common — the
+    # form hides them because they're derived from ``instruments``)
+    user_config = {"fast_ema_period": 5, "slow_ema_period": 20}
+
+    api_result = _prepare_and_validate_backtest_config(
+        dict(user_config),
+        strategy_file_path=str(strategy_file),
+        config_class_name="EMACrossConfig",
+        canonical_instruments=canonical,
+    )
+    worker_result = _prepare_strategy_config(dict(user_config), canonical)
+
+    assert api_result == worker_result, (
+        "API and worker config-prep helpers diverged — "
+        "persisted Backtest.config will not match the worker's runtime config."
+    )
+
+    # Case 2: user supplies their own instrument_id — the API helper
+    # must preserve it, same as the worker.
+    user_config_with_override = {
+        "instrument_id": "MSFT.NASDAQ",
+        "bar_type": "MSFT.NASDAQ-5-MINUTE-LAST-EXTERNAL",
+        "fast_ema_period": 3,
+    }
+    api_override = _prepare_and_validate_backtest_config(
+        dict(user_config_with_override),
+        strategy_file_path=str(strategy_file),
+        config_class_name="EMACrossConfig",
+        canonical_instruments=canonical,
+    )
+    worker_override = _prepare_strategy_config(dict(user_config_with_override), canonical)
+    assert api_override == worker_override
+    assert api_override["instrument_id"] == "MSFT.NASDAQ"  # override respected

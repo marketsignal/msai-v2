@@ -25,9 +25,7 @@ from msai.models.strategy import Strategy
 from msai.schemas.common import MessageResponse
 from msai.schemas.strategy import StrategyListResponse, StrategyResponse, StrategyUpdate
 from msai.services.strategy_registry import (
-    DiscoveredStrategy,
-    compute_file_hash,
-    discover_strategies,
+    sync_strategies_to_db,
     validate_strategy_file,
 )
 
@@ -49,36 +47,9 @@ async def list_strategies(
     every response row has a stable database ID that ``/{id}`` and the
     backtest endpoints can look up.
     """
-    discovered: list[DiscoveredStrategy] = discover_strategies(_STRATEGIES_DIR)
-
-    # Index existing rows by file path for upsert
-    existing_result = await db.execute(select(Strategy))
-    existing: dict[str, Strategy] = {
-        row.file_path: row for row in existing_result.scalars().all()
-    }
-
-    db_rows: list[Strategy] = []
-    for info in discovered:
-        file_path = str(info.module_path)
-        row = existing.get(file_path)
-        if row is None:
-            row = Strategy(
-                name=info.name,
-                description=info.description,
-                file_path=file_path,
-                strategy_class=info.strategy_class_name,
-                config_schema=None,
-                default_config=None,
-            )
-            db.add(row)
-        else:
-            row.name = info.name
-            row.description = info.description
-            row.strategy_class = info.strategy_class_name
-        db_rows.append(row)
-
+    paired = await sync_strategies_to_db(db, _STRATEGIES_DIR)
     await db.commit()
-    for row in db_rows:
+    for row, _ in paired:
         await db.refresh(row)
 
     items: list[StrategyResponse] = [
@@ -88,15 +59,14 @@ async def list_strategies(
             description=row.description,
             file_path=row.file_path,
             strategy_class=row.strategy_class,
+            config_class=row.config_class,
             config_schema=row.config_schema,
             default_config=row.default_config,
-            code_hash=next(
-                (info.code_hash for info in discovered if str(info.module_path) == row.file_path),
-                "",
-            ),
+            config_schema_status=row.config_schema_status,
+            code_hash=row.code_hash or "",
             created_at=row.created_at,
         )
-        for row in db_rows
+        for row, _ in paired
     ]
 
     return StrategyListResponse(items=items, total=len(items))
@@ -108,7 +78,20 @@ async def get_strategy(
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> StrategyResponse:
-    """Retrieve a single strategy by its database ID."""
+    """Retrieve a single strategy by its database ID.
+
+    Calls :func:`sync_strategies_to_db` before reading the row so the
+    detail endpoint works on a cold DB (no prior list call needed) and
+    picks up ``config_schema`` updates for files edited since the last
+    list call. Memoization inside the sync ensures the cost is a
+    single filesystem scan + zero schema recompute when nothing changed.
+    """
+    # Refresh DB state from disk so the detail response reflects the
+    # current file contents (Maintainer council blocking objection #2:
+    # the detail endpoint must not depend on list-endpoint side effects).
+    await sync_strategies_to_db(db, _STRATEGIES_DIR)
+    await db.commit()
+
     result = await db.execute(select(Strategy).where(Strategy.id == strategy_id))
     strategy: Strategy | None = result.scalar_one_or_none()
 
@@ -118,21 +101,17 @@ async def get_strategy(
             detail=f"Strategy {strategy_id} not found",
         )
 
-    code_hash = ""
-    if strategy.file_path:
-        file_path = Path(strategy.file_path)
-        if file_path.exists():
-            code_hash = compute_file_hash(file_path)
-
     return StrategyResponse(
         id=strategy.id,
         name=strategy.name,
         description=strategy.description,
         file_path=strategy.file_path,
         strategy_class=strategy.strategy_class,
+        config_class=strategy.config_class,
         config_schema=strategy.config_schema,
         default_config=strategy.default_config,
-        code_hash=code_hash,
+        config_schema_status=strategy.config_schema_status,
+        code_hash=strategy.code_hash or "",
         created_at=strategy.created_at,
     )
 
@@ -161,21 +140,17 @@ async def update_strategy(
     await db.commit()
     await db.refresh(strategy)
 
-    code_hash = ""
-    if strategy.file_path:
-        file_path = Path(strategy.file_path)
-        if file_path.exists():
-            code_hash = compute_file_hash(file_path)
-
     return StrategyResponse(
         id=strategy.id,
         name=strategy.name,
         description=strategy.description,
         file_path=strategy.file_path,
         strategy_class=strategy.strategy_class,
+        config_class=strategy.config_class,
         config_schema=strategy.config_schema,
         default_config=strategy.default_config,
-        code_hash=code_hash,
+        config_schema_status=strategy.config_schema_status,
+        code_hash=strategy.code_hash or "",
         created_at=strategy.created_at,
     )
 

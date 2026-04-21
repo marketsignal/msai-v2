@@ -295,6 +295,17 @@ services:
     volumes:
       - ./frontend/src:/app/src:ro
       - ./frontend/public:/app/public:ro
+      # Mount tsconfig + package.json + postcss/next configs so edits
+      # (path aliases, new deps, PostCSS plugins, Next config flags)
+      # reach the dev server without an image rebuild. Image-baked
+      # configs are fine for prod; dev needs hot-reload on config too.
+      # Without postcss.config.mjs the Tailwind v4 `@import` directives
+      # in globals.css fail to resolve (caused the 2026-04-20 frontend
+      # FAIL_INFRA during strategy-config-schema-extraction E2E).
+      - ./frontend/tsconfig.json:/app/tsconfig.json:ro
+      - ./frontend/package.json:/app/package.json:ro
+      - ./frontend/postcss.config.mjs:/app/postcss.config.mjs:ro
+      - ./frontend/next.config.ts:/app/next.config.ts:ro
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8800
       NEXT_PUBLIC_MSAI_API_KEY: ${MSAI_API_KEY:-msai-dev-key}

@@ -3,4 +3,11 @@ WORKDIR /app
 RUN corepack enable && corepack prepare pnpm@9.15.0 --activate
 COPY package.json pnpm-lock.yaml* ./
 RUN pnpm install --frozen-lockfile || pnpm install
+# Config files NEXT.JS + Turbopack + Tailwind v4 need at dev-server
+# startup. Without postcss.config.mjs, globals.css @import directives
+# fail with "Module not found" because the @tailwindcss/postcss plugin
+# isn't loaded. docker-compose.dev.yml volume-mounts these too so edits
+# reach the container without a rebuild, but we copy them here so
+# plain `docker run` / image-only use cases still work.
+COPY postcss.config.mjs next.config.ts tsconfig.json ./
 CMD ["pnpm", "dev"]
