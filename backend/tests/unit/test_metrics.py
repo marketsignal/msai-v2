@@ -169,3 +169,38 @@ class TestRegistry:
         assert '\\"' in rendered  # escaped double-quote
         assert "\\\\" in rendered  # escaped backslash
         assert "\\n" in rendered  # escaped newline
+
+
+class TestHistogram:
+    def test_histogram_records_observations_and_buckets(self) -> None:
+        from msai.services.observability.metrics import MetricsRegistry
+
+        registry = MetricsRegistry()
+        hist = registry.histogram(
+            "msai_test_hist",
+            "Test histogram.",
+            buckets=(100, 1_000, 10_000),
+        )
+        hist.observe(50)
+        hist.observe(500)
+        hist.observe(5_000)
+        hist.observe(50_000)
+
+        text = registry.render()
+        assert "msai_test_hist_bucket" in text
+        assert "msai_test_hist_sum" in text
+        assert "msai_test_hist_count" in text
+        # 50 → le=100; 500 → le=1000; 5000 → le=10000; 50000 only le=+Inf
+        assert 'msai_test_hist_bucket{le="100"} 1' in text
+        assert 'msai_test_hist_bucket{le="1000"} 2' in text
+        assert 'msai_test_hist_bucket{le="10000"} 3' in text
+        assert 'msai_test_hist_bucket{le="+Inf"} 4' in text
+        assert "msai_test_hist_count 4" in text
+
+    def test_histogram_idempotent_registration(self) -> None:
+        from msai.services.observability.metrics import MetricsRegistry
+
+        registry = MetricsRegistry()
+        h1 = registry.histogram("msai_dup", "dup", buckets=(1, 10))
+        h2 = registry.histogram("msai_dup", "dup", buckets=(1, 10))
+        assert h1 is h2

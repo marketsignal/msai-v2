@@ -174,6 +174,53 @@ class _GaugeChild:
         self._parent.dec(amount, **self._labels)
 
 
+class Histogram(_LabeledMetric):
+    """Histogram with cumulative buckets (Prometheus-style).
+
+    Follows the existing ``_LabeledMetric`` contract: ``self.name``,
+    ``self.help_text``, ``render()`` returns ``list[str]``. Stored
+    under ``MetricsRegistry._metrics`` alongside Counter + Gauge.
+
+    Buckets are cumulative: an observation of ``v`` increments every
+    bucket whose upper bound ``le`` satisfies ``v <= le``. The ``+Inf``
+    bucket is always appended so ``_count`` equals the ``+Inf`` bucket
+    value, per the Prometheus exposition format.
+    """
+
+    metric_type = "histogram"
+
+    def __init__(self, name: str, help_text: str, buckets: tuple[int, ...]) -> None:
+        super().__init__(name, help_text)
+        # Always include +Inf upper bound; sort ascending for deterministic render.
+        self._bucket_upper_bounds: tuple[int | float, ...] = tuple(sorted(buckets)) + (
+            float("inf"),
+        )
+        self._bucket_counts: list[int] = [0] * len(self._bucket_upper_bounds)
+        self._sum: float = 0.0
+        self._count: int = 0
+
+    def observe(self, value: float) -> None:
+        with self._lock:
+            self._sum += float(value)
+            self._count += 1
+            for i, upper in enumerate(self._bucket_upper_bounds):
+                if value <= upper:
+                    self._bucket_counts[i] += 1  # cumulative at observe time
+
+    def render(self) -> list[str]:
+        lines: list[str] = [
+            f"# HELP {self.name} {self.help_text}",
+            f"# TYPE {self.name} histogram",
+        ]
+        with self._lock:
+            for upper, count in zip(self._bucket_upper_bounds, self._bucket_counts, strict=True):
+                label = "+Inf" if upper == float("inf") else str(upper)
+                lines.append(f'{self.name}_bucket{{le="{label}"}} {count}')
+            lines.append(f"{self.name}_sum {self._sum}")
+            lines.append(f"{self.name}_count {self._count}")
+        return lines
+
+
 class MetricsRegistry:
     """Per-process registry of all metrics. Counters and
     gauges live here; the FastAPI ``/metrics`` endpoint
@@ -212,6 +259,22 @@ class MetricsRegistry:
             gauge = Gauge(name, help_text)
             self._metrics[name] = gauge
             return gauge
+
+    def histogram(self, name: str, help_text: str, buckets: tuple[int, ...]) -> Histogram:
+        """Get-or-create a histogram. Idempotent — calling twice
+        with the same name returns the same instance so module-level
+        callers don't have to coordinate registration."""
+        with self._lock:
+            existing = self._metrics.get(name)
+            if existing is not None:
+                if not isinstance(existing, Histogram):
+                    raise TypeError(
+                        f"metric {name!r} already registered as {type(existing).__name__}"
+                    )
+                return existing
+            hist = Histogram(name, help_text, buckets)
+            self._metrics[name] = hist
+            return hist
 
     def render(self) -> str:
         """Render every registered metric in Prometheus text
