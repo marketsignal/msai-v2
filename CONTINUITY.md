@@ -349,7 +349,7 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
   - Item #2: Symbol Onboarding UI/API/CLI (unblocked since PR #37 live-path wiring landed).
   - Item #8: Databento catalog bootstrap for instrument registry (avoid manual SQL seed for equities).
 - **Uncommitted on main:** `frontend/playwright.config.ts` baseURL reverted `:3300` → `:3000` — leftover from the 2026-04-22 computer reset. Contradicts the 2026-04-21 decision (host-exposed Docker port for local runs). Revert when convenient.
-- **Stack:** main on `330e56a`; worktrees clean (all merged); dev compose volumes preserved via pins (see "Done cont'd 10"). `docker compose -f docker-compose.dev.yml up -d` from `/Users/pablomarin/Code/msai-v2` to start. After PR #41 merge, run `./scripts/restart-workers.sh` so `backtest-worker` + `job-watchdog` pick up the new `_materialize_series_payload` + signed-URL code.
+- **Stack:** main on `75c4c1e` (PR #41 merge at `330e56a` + this CONTINUITY cleanup); worktrees clean (all merged); dev compose volumes preserved via pins (see "Done cont'd 10"). **Docker daemon is down post-reset** — start Docker Desktop, then `docker compose -f docker-compose.dev.yml up -d` from `/Users/pablomarin/Code/msai-v2`, then `./scripts/restart-workers.sh` so `backtest-worker` + `job-watchdog` pick up the new `_materialize_series_payload` + signed-URL code.
 
 ## Known issues surfaced this session (for follow-up — "no bugs left behind" tracker)
 
