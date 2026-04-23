@@ -446,7 +446,7 @@ class ProcessManager:
             return True  # ACK — no retry until /resume
 
         try:
-            process = self._spawn_ctx.Process(
+            process = self._spawn_ctx.Process(  # type: ignore[attr-defined]  # BaseContext typed too wide; concrete ctxs (spawn/fork) expose Process
                 target=self._spawn_target,
                 args=spawn_args,
             )

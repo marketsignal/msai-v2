@@ -86,7 +86,7 @@ async def acquire_compute_slots(
                 json.dumps(payload, sort_keys=True),
                 ex=settings.compute_slot_lease_seconds,
             )
-            await redis.sadd(_ACTIVE_SET_KEY, lease_id)
+            await redis.sadd(_ACTIVE_SET_KEY, lease_id)  # type: ignore[misc]  # redis-py ResponseT union defeats await narrowing
             logger.info(
                 "compute_slots_acquired",
                 lease_id=lease_id,
@@ -132,7 +132,7 @@ async def renew_compute_slots(redis: ArqRedis, lease_id: str) -> None:
 async def release_compute_slots(redis: ArqRedis, lease_id: str) -> None:
     """Release slots immediately.  Call in a ``finally`` block."""
     await redis.delete(_lease_key(lease_id))
-    await redis.srem(_ACTIVE_SET_KEY, lease_id)
+    await redis.srem(_ACTIVE_SET_KEY, lease_id)  # type: ignore[misc]  # redis-py ResponseT union defeats await narrowing
     logger.info("compute_slots_released", lease_id=lease_id)
 
 
@@ -166,7 +166,7 @@ async def _active_slot_usage(redis: ArqRedis) -> int:
 
 async def _active_leases(redis: ArqRedis) -> list[dict[str, Any]]:
     """Return payloads of all live leases, removing stale ids from the set."""
-    member_ids = await redis.smembers(_ACTIVE_SET_KEY)
+    member_ids = await redis.smembers(_ACTIVE_SET_KEY)  # type: ignore[misc]  # redis-py ResponseT union defeats await narrowing
     leases: list[dict[str, Any]] = []
     stale: list[str] = []
 
@@ -185,7 +185,7 @@ async def _active_leases(redis: ArqRedis) -> list[dict[str, Any]]:
             stale.append(lease_id)
 
     if stale:
-        await redis.srem(_ACTIVE_SET_KEY, *stale)
+        await redis.srem(_ACTIVE_SET_KEY, *stale)  # type: ignore[misc]  # redis-py ResponseT union defeats await narrowing
         logger.info("compute_slots_pruned_stale", stale_ids=stale)
 
     leases.sort(

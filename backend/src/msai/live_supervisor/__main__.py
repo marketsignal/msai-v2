@@ -199,7 +199,7 @@ def _build_production_payload_factory(
             # ---------------------------------------------------------
             if deployment.portfolio_revision_id is not None:
                 # Portfolio-based deployment — load all revision members
-                members: list[LivePortfolioRevisionStrategy] = (
+                members: list[LivePortfolioRevisionStrategy] = list(
                     (
                         await session.execute(
                             select(LivePortfolioRevisionStrategy)

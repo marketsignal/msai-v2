@@ -266,7 +266,9 @@ def build_live_trading_node_config(
     exec_client_id = _derive_exec_client_id(deployment_slug)
 
     # Map the string config value to the Nautilus enum.
-    from nautilus_trader.adapters.interactive_brokers.config import IBMarketDataTypeEnum
+    from nautilus_trader.adapters.interactive_brokers.config import (  # type: ignore[attr-defined]  # Nautilus 1.223 re-exports it but without __all__ entry
+        IBMarketDataTypeEnum,
+    )
 
     _mdt_map = {
         "REALTIME": IBMarketDataTypeEnum.REALTIME,
@@ -511,7 +513,9 @@ def build_portfolio_trading_node_config(
     exec_client_id = _derive_exec_client_id(deployment_slug)
 
     # Map the string config value to the Nautilus enum.
-    from nautilus_trader.adapters.interactive_brokers.config import IBMarketDataTypeEnum
+    from nautilus_trader.adapters.interactive_brokers.config import (  # type: ignore[attr-defined]  # Nautilus 1.223 re-exports it but without __all__ entry
+        IBMarketDataTypeEnum,
+    )
 
     _mdt_map = {
         "REALTIME": IBMarketDataTypeEnum.REALTIME,

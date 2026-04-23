@@ -6,8 +6,12 @@ from datetime import (  # noqa: TC003 — SQLAlchemy needs concrete types at Map
     date,
     datetime,
 )
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4  # noqa: TC003 — same reason
+
+if TYPE_CHECKING:
+    from msai.models.strategy import Strategy
+    from msai.models.user import User
 
 from sqlalchemy import (
     CheckConstraint,
@@ -45,13 +49,13 @@ class Backtest(Base):
     )
     strategy_code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     strategy_git_sha: Mapped[str | None] = mapped_column(String(40), nullable=True)
-    config: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     instruments: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False)
     start_date: Mapped[date] = mapped_column(Date, nullable=False)
     end_date: Mapped[date] = mapped_column(Date, nullable=False)
     status: Mapped[str] = mapped_column(String(50), nullable=False, server_default="pending")
     progress: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="0")
-    metrics: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    metrics: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     report_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     # --- Canonical analytics series ------------------------------------
     # ``series`` holds the canonical daily-normalized payload
@@ -81,7 +85,7 @@ class Backtest(Base):
     error_code: Mapped[str] = mapped_column(String(32), nullable=False, server_default="unknown")
     error_public_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_suggested_action: Mapped[str | None] = mapped_column(Text, nullable=True)
-    error_remediation: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    error_remediation: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     # --- Auto-heal lifecycle (added by the backtest-auto-ingest PR) -------
     # Populated by ``services/backtests/auto_heal.py`` while the worker
     # waits for a triggered ingest job to complete. All four are cleared
@@ -101,7 +105,7 @@ class Backtest(Base):
     # can be traced back to the exact software versions and data files used.
     nautilus_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     python_version: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    data_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    data_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     # Job lifecycle fields (used by the watchdog to detect stale/orphaned jobs)
     queue_name: Mapped[str | None] = mapped_column(String(100), nullable=True)

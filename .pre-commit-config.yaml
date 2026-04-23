@@ -1,0 +1,16 @@
+# Pre-commit hooks.
+#
+# Install once per clone: `uv tool install pre-commit && pre-commit install`.
+# Runs on every `git commit` via .git/hooks/pre-commit.
+#
+# Scope: workflow + lint safety nets that are cheap to run locally.
+# Heavy gates (mypy --strict, pytest) stay in CI.
+
+repos:
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.7
+    hooks:
+      - id: actionlint
+        # Validates `.github/workflows/*.yml` syntax + expression contexts.
+        # Would have caught the post-flatten hashFiles() parse bug fixed in
+        # PR #42 before the first push.

@@ -280,7 +280,7 @@ class LiveCommandBus:
         for key, value in payload.items():
             fields[f"payload_{key}"] = json.dumps(value)
 
-        entry_id = await self._redis.xadd(self._stream, fields)
+        entry_id: str = await self._redis.xadd(self._stream, fields)  # type: ignore[arg-type]  # redis-py stubs mistype mapping values; str is accepted at runtime
         log.info(
             "live_command_published",
             extra={
@@ -466,7 +466,7 @@ class LiveCommandBus:
             "dlq_reason": reason,
             "moved_at": _utcnow_iso(),
         }
-        await self._redis.xadd(self._dlq_stream, dlq_fields)
+        await self._redis.xadd(self._dlq_stream, dlq_fields)  # type: ignore[arg-type]  # redis-py stubs mistype mapping values
         await self._redis.xack(self._stream, self._group, entry_id)
         log.error(
             "live_command_moved_to_dlq",

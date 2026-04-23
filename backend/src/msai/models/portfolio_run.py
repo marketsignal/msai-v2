@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import Date, DateTime, ForeignKey, Integer, String, Text, func
@@ -11,6 +11,10 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from msai.models.base import Base
+
+if TYPE_CHECKING:
+    from msai.models.portfolio import Portfolio
+    from msai.models.user import User
 
 
 class PortfolioRun(Base):
@@ -31,7 +35,7 @@ class PortfolioRun(Base):
         ForeignKey("portfolios.id"), index=True, nullable=False
     )
     status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="pending")
-    metrics: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    metrics: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     series: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
     allocations: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
     report_path: Mapped[str | None] = mapped_column(String(512), nullable=True)

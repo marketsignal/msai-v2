@@ -25,11 +25,15 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
+from arq.cron import cron as _cron
+
 from msai.core.config import settings
 from msai.core.logging import get_logger
 from msai.core.queue import _parse_redis_url
 from msai.services.job_watchdog import run_watchdog_once
 from msai.workers.backtest_job import run_backtest_job
+from msai.workers.nightly_ingest import run_nightly_ingest_if_due as _nightly_if_due
+from msai.workers.pnl_aggregation import aggregate_daily_pnl as _pnl
 
 if TYPE_CHECKING:
     from arq.connections import RedisSettings
@@ -136,10 +140,6 @@ class WorkerSettings:
     #   parity) so non-US markets can schedule by local close and the
     #   ingest is at-most-once per scheduled-tz calendar day.
     # Watchdog: every 60 seconds (minute=None, second=0 → fires at :00 each minute).
-    from arq.cron import cron as _cron
-
-    from msai.workers.nightly_ingest import run_nightly_ingest_if_due as _nightly_if_due
-    from msai.workers.pnl_aggregation import aggregate_daily_pnl as _pnl
 
     cron_jobs = [
         _cron(_pnl, hour=21, minute=30),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import ForeignKey, String, Text
@@ -9,6 +10,9 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from msai.models.base import Base, TimestampMixin
+
+if TYPE_CHECKING:
+    from msai.models.user import User
 
 
 class Strategy(TimestampMixin, Base):
@@ -34,8 +38,8 @@ class Strategy(TimestampMixin, Base):
     # rather than re-deriving a suffix swap from ``strategy_class``.
     # Nullable for strategies with no matching config class.
     config_class: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    config_schema: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    default_config: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    config_schema: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    default_config: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     # Four-state enum. See ``services/nautilus/schema_hooks.ConfigSchemaStatus``.
     # Stored as String(32) to match the existing ``governance_status`` pattern
     # on this table — no DB CHECK constraint is added; the enum is enforced

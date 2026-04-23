@@ -686,7 +686,7 @@ def _prepare_strategy_config(
     return prepared
 
 
-def _extract_returns_series(account_df: pd.DataFrame) -> pd.Series:  # type: ignore[type-arg]
+def _extract_returns_series(account_df: pd.DataFrame) -> pd.Series:
     """Pull a time-indexed returns series out of the Nautilus account report.
 
     Nautilus's :func:`generate_account_report` does not always include a
@@ -796,7 +796,8 @@ def _pick_timestamp(row: dict[str, Any]) -> datetime:
             continue
         parsed = pd.to_datetime(raw, utc=True, errors="coerce")
         if not pd.isna(parsed):
-            return parsed.to_pydatetime()
+            py_dt: datetime = parsed.to_pydatetime()
+            return py_dt
     return datetime.now(UTC)
 
 

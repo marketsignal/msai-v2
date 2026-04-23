@@ -4,6 +4,46 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-04-23 — Mypy --strict cleanup (branch `fix/mypy-strict-cleanup`) — MYPY NOW A BLOCKING CI GATE
+
+**Context:** PR #42 unblocked CI end-to-end but left `mypy --strict` with `continue-on-error: true` because 132 pre-existing errors accumulated while CI was broken. Per Codex-ratified sequencing, this cleanup was scheduled before #8 Databento bootstrap so the remaining CI gate could start blocking.
+
+**Outcome:** 128 mypy errors on `src/` → 0. `continue-on-error: true` removed from `ci.yml`. CI run `24846320955` green end-to-end (frontend 52s + backend 6m29s, all gates blocking).
+
+**Scope — 128 errors resolved across 14 rule categories via per-site triage (no blanket ignores):**
+
+- **26 × name-defined:** Added `if TYPE_CHECKING:` imports for SQLAlchemy relationship forward references across 12 model files. PR #42's UP037 auto-fix had unquoted `Mapped["Strategy"]` → `Mapped[Strategy]`; SQLA resolves via its class registry at runtime, but mypy needs names at type-check time.
+- **31 × type-arg:** Bare `dict` / `dict | None` on SQLAlchemy `Mapped[...]` JSONB columns + function signatures → `dict[str, Any]`. Added `from typing import Any` where missing.
+- **18 × unused-ignore:** Removed stale `# type: ignore[import-untyped]` comments across 8 files. Extended `[[tool.mypy.overrides]]` with `azure.*` so optional Azure Key Vault deps no longer raise `import-not-found` when absent.
+- **14 × valid-type + attr-defined on `list?[X]`:** `builtins.list[X]` in annotations inside classes whose own `async def list()` method shadows the builtin (`services/{asset_universe,portfolio_service}.py`).
+- **11 × attr-defined (library stub gaps):** Targeted `# type: ignore[attr-defined]` with rationale comments for `BaseContext.Process` (multiprocessing ctx) + `IBMarketDataTypeEnum` (Nautilus 1.223 re-exports without `__all__` entry).
+- **6 × arg-type on SQLAlchemy `pg_insert`:** Pass mapped class instead of `.__table__` at 3 sites; `.__table__.delete()` → `sqlalchemy.delete(Model)` at one site.
+- **6 × no-any-return:** Typed-local-var returns at 6 boundaries (security_master/parser.py, nautilus/parity/normalizer.py, strategy_registry.py, live_command_bus.py, workers/backtest_job.py).
+- **4 × misc (redis-py await narrowing):** `await redis.<method>(...)` sites in `compute_slots.py` get narrow `# type: ignore[misc]` — redis-py's `ResponseT = Awaitable[T] | T` union defeats await narrowing.
+- **3 × misc (class-scoped import):** Hoisted `arq.cron`, `nightly_ingest`, `pnl_aggregation` from class-body imports to module level in `workers/settings.py`. Verified no circular-import or startup side-effect changes.
+- **3 × no-untyped-call:** `quantstats.reports.html(...)` + 2 × `redis.asyncio.from_url(...)` get narrow ignores with rationale.
+- **2 × arg-type (Path→str):** `MarketDataQuery(str(path))` in `api/market_data.py` + `services/data_ingestion.py`.
+- **2 × no-untyped-def:** Added `Iterator[None]` + `Callable[...]` annotations in `nautilus/trading_node_subprocess.py` + `cli.py`.
+- **2 × Sequence→list assignment:** Wrap `scalars().all()` in `list(...)` in `api/live.py` + `live_supervisor/__main__.py`.
+- **1 × misc (lambda closure-capture):** Replaced default-arg lambda with explicit named nested function `_run_ingest` in `portfolio_service.py`; preserves per-iteration default-arg-capture semantics without a blanket `type: ignore`.
+- **1 × misc (class-or-None sentinel):** `NautilusBase = None` fallback in strategy_registry.py gets `# type: ignore[misc,assignment]` with a rationale comment explaining both codes.
+- **1 × attr-defined (secrets.py):** Azure SecretClient typed `Any` instead of `object` so `.get_secret(...)` resolves post-override.
+
+**CI hardening (plan M11):**
+
+- `.github/workflows/ci.yml`: drop `continue-on-error: true` from mypy step. `uv run mypy src/ --strict` is now a hard-blocking gate on every PR.
+- `.pre-commit-config.yaml`: new file, wires `actionlint@v1.7.7` for `.github/workflows/` parse-bug detection before first push. Would have caught PR #42's `hashFiles()` bug locally.
+
+**Simplify sweep applied inline (3 fixes from the 3-agent reuse/quality/efficiency review):**
+
+- pg_insert parity at `security_master/service.py:865` — third site now matches the other two (dropped `# type: ignore[arg-type]`).
+- `strategy_registry.py:416` `[misc,assignment]` dual-ignore now has a rationale comment explaining both codes.
+- `portfolio_service.py` `_run_ingest` closure — inlined the redundant `async_class`/`async_syms` intermediates.
+
+**Verification:** mypy --strict clean on 166 source files · ruff clean · pytest 1703/1703 unit · actionlint clean on both workflows · CI run `24846320955` green.
+
+**Known carry-overs (NOT in this PR):** none. This is the final CI-hardening follow-up from PR #42.
+
 ### 2026-04-23 — CI probe + full unblock (branch `fix/ci-ping-probe`) — CI GREEN END-TO-END
 
 **Context:** Per Codex-ratified sequencing, the plan was CI probe → #8 Databento bootstrap → #2 Symbol Onboarding → #3 `instrument_cache` migration. Probe started as a `/quick-fix` scoped to "add minimal Ping workflow + open `ci.yml` triggers + `workflow_dispatch` — diagnose org-policy-vs-config". Escalated to `/fix-bug` when the probe uncovered 110-error ruff drift, 147-error mypy drift, a pytest pythonpath gap, a stale test fixture, and two CI-env-only test failures — all documented-or-implicit fall-out of CI never actually running since the post-flatten rename.

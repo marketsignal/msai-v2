@@ -56,7 +56,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 import httpx
 import typer
@@ -133,8 +137,8 @@ def _api_call(
     method: str,
     path: str,
     *,
-    json_body: dict | None = None,
-    params: dict | None = None,
+    json_body: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
     timeout: float = 30.0,
 ) -> httpx.Response:
     """Make an authenticated request against the MSAI API.
@@ -637,9 +641,12 @@ def system_health() -> None:
     as ``ok: false``.
     """
 
-    def _parse_probe(response: httpx.Response, body_ok_fn) -> dict[str, object]:
+    def _parse_probe(
+        response: httpx.Response,
+        body_ok_fn: Callable[[Any], bool],
+    ) -> dict[str, object]:
         """Derive ``ok`` from the response body when needed."""
-        body: object | None = None
+        body: Any = None
         try:
             body = response.json()
         except ValueError:
@@ -651,7 +658,7 @@ def system_health() -> None:
             "body": body,
         }
 
-    probes: list[tuple[str, str, object]] = [
+    probes: list[tuple[str, str, Callable[[Any], bool]]] = [
         # label, path, body-ok predicate
         ("api", "/health", lambda _b: True),
         ("ready", "/ready", lambda _b: True),
@@ -955,12 +962,12 @@ async def _run_ib_resolve_for_live(symbol_list: list[str]) -> list[str]:
         get_cached_ib_client,
         get_cached_interactive_brokers_instrument_provider,
     )
-    from nautilus_trader.cache.cache import Cache  # type: ignore[import-not-found]
-    from nautilus_trader.common.component import (  # type: ignore[import-not-found]
+    from nautilus_trader.cache.cache import Cache
+    from nautilus_trader.common.component import (
         LiveClock,
         MessageBus,
     )
-    from nautilus_trader.model.identifiers import TraderId  # type: ignore[import-not-found]
+    from nautilus_trader.model.identifiers import TraderId
 
     from msai.services.nautilus.live_instrument_bootstrap import (
         build_ib_instrument_provider_config,

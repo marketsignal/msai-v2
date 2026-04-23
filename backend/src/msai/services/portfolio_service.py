@@ -40,6 +40,7 @@ from msai.services.nautilus.catalog_builder import ensure_catalog_data
 from msai.services.report_generator import ReportGenerator
 
 if TYPE_CHECKING:
+    import builtins
     from uuid import UUID
 
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -139,7 +140,7 @@ class PortfolioService:
         self,
         session: AsyncSession,
         limit: int = 100,
-    ) -> list[Portfolio]:
+    ) -> builtins.list[Portfolio]:
         """List portfolios ordered by creation time (newest first).
 
         Args:
@@ -179,7 +180,7 @@ class PortfolioService:
         self,
         session: AsyncSession,
         portfolio_id: UUID,
-    ) -> list[PortfolioAllocation]:
+    ) -> builtins.list[PortfolioAllocation]:
         """List allocations for a portfolio.
 
         Args:
@@ -248,7 +249,7 @@ class PortfolioService:
         session: AsyncSession,
         portfolio_id: UUID | None = None,
         limit: int = 100,
-    ) -> list[PortfolioRun]:
+    ) -> builtins.list[PortfolioRun]:
         """List portfolio runs, optionally filtered by portfolio.
 
         Args:
@@ -437,15 +438,21 @@ class PortfolioService:
             symbols_by_asset.setdefault(asset, set()).update(allocation["instruments"])
         loop = asyncio.get_running_loop()
         for asset_class, symbols in symbols_by_asset.items():
-            await loop.run_in_executor(
-                None,
-                lambda ac=asset_class, syms=sorted(symbols): ensure_catalog_data(  # noqa: B008
+            # Default-arg capture via a named nested function. Mypy can't
+            # infer types through the default-arg-lambda pattern, and a blanket
+            # `type: ignore` on the lambda is worse than this explicit form.
+            def _run_ingest(
+                ac: str = asset_class,
+                syms: list[str] = sorted(symbols),  # noqa: B008
+            ) -> None:
+                ensure_catalog_data(
                     symbols=syms,
                     raw_parquet_root=settings.parquet_root,
                     catalog_root=settings.nautilus_catalog_root,
                     asset_class=ac,
-                ),
-            )
+                )
+
+            await loop.run_in_executor(None, _run_ingest)
 
         strategy_results = await self._execute_candidate_backtests(
             runner=runner,
@@ -638,7 +645,7 @@ class PortfolioService:
         self,
         session: AsyncSession,
         portfolio_id: UUID,
-    ) -> list[PortfolioAllocation]:
+    ) -> builtins.list[PortfolioAllocation]:
         """Eager-load allocations with candidate + strategy for orchestration."""
         stmt = (
             select(PortfolioAllocation)
@@ -655,10 +662,10 @@ class PortfolioService:
 
     def _resolve_allocations(
         self,
-        allocations: list[PortfolioAllocation],
+        allocations: builtins.list[PortfolioAllocation],
         *,
         objective: PortfolioObjective,
-    ) -> list[dict[str, Any]]:
+    ) -> builtins.list[dict[str, Any]]:
         """Flatten DB allocations into orchestration-ready dicts.
 
         Pulls strategy file/class/config from the related
@@ -668,7 +675,7 @@ class PortfolioService:
         values like 0.001) is preserved.  Weights are normalized to sum to
         1.0 across the resolved allocations.
         """
-        rows: list[dict[str, Any]] = []
+        rows: builtins.list[dict[str, Any]] = []
         for allocation in allocations:
             candidate = allocation.candidate
             if candidate is None:
@@ -723,11 +730,11 @@ class PortfolioService:
         self,
         *,
         runner: BacktestRunner,
-        allocations: list[dict[str, Any]],
+        allocations: builtins.list[dict[str, Any]],
         start_date: str,
         end_date: str,
         max_parallelism: int | None,
-    ) -> list[dict[str, Any]]:
+    ) -> builtins.list[dict[str, Any]]:
         """Run every allocation's backtest, in parallel when configured.
 
         **Concurrency cap:** ``worker_count`` is clamped to
@@ -874,7 +881,7 @@ def _heuristic_weight(metrics: dict[str, Any], objective: PortfolioObjective) ->
 
 def _effective_leverage(
     *,
-    weighted_series: list[tuple[str, float, pd.Series]],
+    weighted_series: builtins.list[tuple[str, float, pd.Series]],
     requested_leverage: float,
     downside_target: float | None,
 ) -> float:
@@ -1006,7 +1013,7 @@ def _load_benchmark_returns(
 
 def _prepare_strategy_config(
     config: dict[str, Any],
-    instrument_ids: list[str],
+    instrument_ids: builtins.list[str],
 ) -> dict[str, Any]:
     """Inject default ``instrument_id`` / ``bar_type`` for Nautilus strategies.
 

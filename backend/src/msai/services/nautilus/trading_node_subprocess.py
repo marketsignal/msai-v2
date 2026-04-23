@@ -77,6 +77,8 @@ from msai.services.nautilus.startup_health import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from msai.services.nautilus.security_master.live_resolver import (
@@ -1051,7 +1053,7 @@ async def _maybe_await(value: Any) -> Any:
 
 
 @contextmanager
-def _safe_dispose(node: Any):
+def _safe_dispose(node: Any) -> Iterator[None]:
     """Call ``node.dispose()`` swallowing any exception.
 
     Gotcha #20: ``dispose()`` must run on every code path to release

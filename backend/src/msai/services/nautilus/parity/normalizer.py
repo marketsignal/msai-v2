@@ -109,7 +109,8 @@ def _ts_to_datetime(value: object) -> datetime:
         return value if value.tzinfo else value.replace(tzinfo=UTC)
     if isinstance(value, pd.Timestamp):
         ts = value.tz_convert(UTC) if value.tz is not None else value.tz_localize(UTC)
-        return ts.to_pydatetime()
+        py_dt: datetime = ts.to_pydatetime()
+        return py_dt
     if isinstance(value, str):
         return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
     raise TypeError(f"unsupported timestamp value type: {type(value).__name__}")

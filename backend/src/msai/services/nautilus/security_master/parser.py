@@ -202,9 +202,11 @@ def nautilus_instrument_to_cache_json(instrument: Instrument) -> dict[str, Any]:
     form first (pyo3) and fall back to the staticmethod form (Cython).
     """
     try:
-        return instrument.to_dict()  # type: ignore[call-arg]
+        result: dict[str, Any] = instrument.to_dict()
+        return result
     except TypeError:
         # Cython path — the staticmethod-style signature requires the
         # instance explicitly. Not a fallback for bugs; both call
         # patterns are legitimate Nautilus APIs for different classes.
-        return instrument.to_dict(instrument)
+        fallback: dict[str, Any] = instrument.to_dict(instrument)
+        return fallback

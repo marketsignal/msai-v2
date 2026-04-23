@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
@@ -19,6 +20,11 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from msai.models.base import Base
+
+if TYPE_CHECKING:
+    from msai.models.backtest import Backtest
+    from msai.models.live_deployment import LiveDeployment
+    from msai.models.strategy import Strategy
 
 
 class Trade(Base):
@@ -60,15 +66,11 @@ class Trade(Base):
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
-    backtest_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("backtests.id"), nullable=True
-    )
+    backtest_id: Mapped[UUID | None] = mapped_column(ForeignKey("backtests.id"), nullable=True)
     deployment_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("live_deployments.id"), nullable=True
     )
-    strategy_id: Mapped[UUID] = mapped_column(
-        ForeignKey("strategies.id"), nullable=False
-    )
+    strategy_id: Mapped[UUID] = mapped_column(ForeignKey("strategies.id"), nullable=False)
     strategy_code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     instrument: Mapped[str] = mapped_column(String(100), nullable=False)
     side: Mapped[str] = mapped_column(String(10), nullable=False)

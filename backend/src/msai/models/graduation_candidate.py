@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import DateTime, ForeignKey, String, Text
@@ -10,6 +11,12 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from msai.models.base import Base, TimestampMixin
+
+if TYPE_CHECKING:
+    from msai.models.live_deployment import LiveDeployment
+    from msai.models.research_job import ResearchJob
+    from msai.models.strategy import Strategy
+    from msai.models.user import User
 
 
 class GraduationCandidate(TimestampMixin, Base):
@@ -30,8 +37,8 @@ class GraduationCandidate(TimestampMixin, Base):
         ForeignKey("research_jobs.id"), index=True, nullable=True
     )
     stage: Mapped[str] = mapped_column(String(32), nullable=False, server_default="discovery")
-    config: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    metrics: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    metrics: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     deployment_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("live_deployments.id"), index=True, nullable=True
     )

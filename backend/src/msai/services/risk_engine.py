@@ -10,6 +10,7 @@ reset (typically at the start of the next trading day).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from msai.core.logging import get_logger
 
@@ -115,7 +116,7 @@ class RiskEngine:
             )
         return allowed
 
-    def validate_deployment(self, config: dict, num_active: int) -> tuple[bool, str]:
+    def validate_deployment(self, config: dict[str, Any], num_active: int) -> tuple[bool, str]:
         """Validate whether a new live deployment is allowed.
 
         Args:

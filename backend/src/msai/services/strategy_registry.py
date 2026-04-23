@@ -413,7 +413,7 @@ def _find_config_class(module: ModuleType) -> type | None:
     try:
         from nautilus_trader.trading.config import StrategyConfig as NautilusBase  # noqa: N806
     except Exception:  # pragma: no cover — Nautilus not importable
-        NautilusBase = None  # type: ignore[assignment]  # noqa: N806
+        NautilusBase = None  # type: ignore[misc,assignment]  # class-or-None sentinel: "Cannot assign to a type" [misc] + None→type[X] [assignment]  # noqa: N806
     if imported_fallback is not None and (
         NautilusBase is None or imported_fallback is not NautilusBase
     ):
@@ -471,7 +471,7 @@ def load_strategy_class(module_path: Path, class_name: str) -> type[Any]:
         _ensure_strategies_importable(strategies_dir)
         module = _import_strategy_module(module_path, strategies_dir)
 
-    cls = getattr(module, class_name, None)
+    cls: type[Any] | None = getattr(module, class_name, None)
     if cls is None:
         raise ImportError(f"Class {class_name} not found in {module_path}")
     return cls

@@ -47,8 +47,8 @@ class ReportGenerator:
 
     def generate_tearsheet(
         self,
-        returns: pd.Series,  # type: ignore[type-arg]
-        benchmark: pd.Series | None = None,  # type: ignore[type-arg]
+        returns: pd.Series,
+        benchmark: pd.Series | None = None,
         title: str = "MSAI Backtest Report",
     ) -> str:
         """Generate a QuantStats HTML tearsheet from a returns series.
@@ -85,7 +85,7 @@ class ReportGenerator:
             with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w") as tmp:
                 tmp_path = tmp.name
 
-            qs.reports.html(
+            qs.reports.html(  # type: ignore[no-untyped-call]  # quantstats ships no stubs
                 returns,
                 benchmark=normalized_benchmark,
                 title=title,
@@ -140,7 +140,7 @@ class ReportGenerator:
 
     def _generate_fallback_report(
         self,
-        returns: pd.Series,  # type: ignore[type-arg]
+        returns: pd.Series,
         title: str,
     ) -> str:
         """Generate a basic HTML report when QuantStats is not available.

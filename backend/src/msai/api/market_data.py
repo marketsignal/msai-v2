@@ -34,7 +34,7 @@ router = APIRouter(prefix="/api/v1/market-data", tags=["market-data"])
 
 
 def _get_query_service() -> MarketDataQuery:
-    return MarketDataQuery(settings.data_root)
+    return MarketDataQuery(str(settings.data_root))
 
 
 # ---------------------------------------------------------------------------

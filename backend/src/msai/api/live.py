@@ -14,7 +14,7 @@ from uuid import UUID  # noqa: TC003 — FastAPI resolves the type at runtime fo
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from fastapi.responses import JSONResponse
-from sqlalchemy import case, func, select
+from sqlalchemy import case, delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from msai.api.live_deps import get_command_bus, get_idempotency_store
@@ -349,7 +349,7 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
                 ),
             )
 
-        members: list[LivePortfolioRevisionStrategy] = (
+        members: list[LivePortfolioRevisionStrategy] = list(
             (
                 await db.execute(
                     select(LivePortfolioRevisionStrategy)
@@ -416,7 +416,7 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
         now = datetime.now(UTC)
         deployment_table = LiveDeployment.__table__
 
-        stmt = pg_insert(deployment_table).values(
+        stmt = pg_insert(LiveDeployment).values(
             strategy_id=first_strategy.id,
             status="starting",
             paper_trading=request.paper_trading,
@@ -465,7 +465,7 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
         # accumulate stale entries. Then INSERT one row per revision
         # member with the derived strategy_id_full.
         await db.execute(
-            LiveDeploymentStrategy.__table__.delete().where(
+            delete(LiveDeploymentStrategy).where(
                 LiveDeploymentStrategy.deployment_id == deployment_id
             )
         )
