@@ -14,6 +14,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import date, timedelta
+from typing import Any
 
 import pandas as pd
 
@@ -77,7 +78,7 @@ class DataIngestionService:
         provider: str = "auto",
         dataset: str | None = None,
         schema: str | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Bulk download historical data for the given symbols.
 
         Routes each symbol to the appropriate data source based on the
@@ -171,7 +172,7 @@ class DataIngestionService:
         dataset: str | None = None,
         schema: str | None = None,
         target_date: date | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Fetch a single trading session's data.
 
         ``target_date`` is the session date to fetch (caller's calendar,
@@ -231,9 +232,9 @@ class DataIngestionService:
             schema=schema,
         )
 
-    def data_status(self) -> dict:
+    def data_status(self) -> dict[str, Any]:
         """Return the most recent ingestion status and storage stats."""
-        payload: dict
+        payload: dict[str, Any]
         if self.status_file.exists():
             payload = json.loads(self.status_file.read_text())
         else:
@@ -246,7 +247,7 @@ class DataIngestionService:
     # Internal
     # ------------------------------------------------------------------
 
-    def _write_status(self, payload: dict) -> None:
+    def _write_status(self, payload: dict[str, Any]) -> None:
         """Persist ingestion run result to the status file."""
         self.status_file.parent.mkdir(parents=True, exist_ok=True)
         status = self.data_status()
@@ -326,7 +327,7 @@ class DataIngestionService:
 
 
 async def run_ingest(
-    ctx: dict,
+    ctx: dict[str, Any],
     asset_class: str,
     symbols: list[str],
     start: str,

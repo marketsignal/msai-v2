@@ -51,6 +51,8 @@ venues) don't have a meaningful trading-hours window.
 
 from __future__ import annotations
 
+from typing import Any
+
 from datetime import datetime  # noqa: TC003 — required at runtime for SQLAlchemy Mapped[]
 
 from sqlalchemy import DateTime, Index, String
@@ -87,17 +89,17 @@ class InstrumentCache(Base, TimestampMixin):
     )
     """IB venue acronym (``NASDAQ``, ``CME``, ``IDEALPRO``, ``SMART``)."""
 
-    ib_contract_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    ib_contract_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     """Full IB ``Contract`` fields as JSONB. Used by SecurityMaster to
     rebuild the IB contract without hitting IB again."""
 
-    nautilus_instrument_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    nautilus_instrument_json: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     """Serialized Nautilus ``Instrument`` so the live subprocess +
     backtest runner rebuild the SAME Nautilus object. Parity matters
     here — any drift between serialization formats breaks the
     backtest/live contract Phase 2 exists to enforce."""
 
-    trading_hours: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    trading_hours: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     """See module docstring for schema. NULL for 24h instruments
     (forex, continuous futures on CME)."""
 

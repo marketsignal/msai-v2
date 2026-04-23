@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import DateTime, ForeignKey, String, Text
@@ -37,8 +37,8 @@ class GraduationCandidate(TimestampMixin, Base):
         ForeignKey("research_jobs.id"), index=True, nullable=True
     )
     stage: Mapped[str] = mapped_column(String(32), nullable=False, server_default="discovery")
-    config: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    metrics: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    metrics: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     deployment_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("live_deployments.id"), index=True, nullable=True
     )

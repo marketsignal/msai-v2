@@ -844,7 +844,7 @@ class SecurityMaster:
         spec: InstrumentSpec,
         canonical_id: str,
         instrument: Instrument,
-        trading_hours_json: dict | None,
+        trading_hours_json: dict[str, Any] | None,
     ) -> None:
         """Upsert into ``instrument_cache`` using
         ``INSERT ... ON CONFLICT DO UPDATE`` so concurrent resolves
@@ -889,7 +889,7 @@ class SecurityMaster:
     # Trading-hours extraction hook
     # ------------------------------------------------------------------
 
-    def _trading_hours_for(self, *, canonical_id: str) -> dict | None:
+    def _trading_hours_for(self, *, canonical_id: str) -> dict[str, Any] | None:
         """Extract trading hours from the qualifier provider's
         cached :class:`ContractDetails` for the given canonical id.
 
@@ -987,7 +987,7 @@ def _instrument_from_cache_row(row: InstrumentCache) -> Instrument:
     return cls.from_dict(data)
 
 
-def _ib_contract_to_dict(contract) -> dict:  # type: ignore[no-untyped-def]
+def _ib_contract_to_dict(contract) -> dict[str, Any]:  # type: ignore[no-untyped-def]
     """Serialize an IBContract msgspec struct to a plain dict.
 
     ``msgspec.structs.asdict`` is the canonical way to convert a

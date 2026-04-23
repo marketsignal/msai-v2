@@ -35,7 +35,7 @@ class PortfolioRun(Base):
         ForeignKey("portfolios.id"), index=True, nullable=False
     )
     status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="pending")
-    metrics: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    metrics: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     series: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
     allocations: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
     report_path: Mapped[str | None] = mapped_column(String(512), nullable=True)

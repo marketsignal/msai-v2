@@ -53,6 +53,8 @@ or the settings-level key — matches the backend's dual-mode auth in
 
 from __future__ import annotations
 
+from typing import Any
+
 import asyncio
 import json
 import os
@@ -133,8 +135,8 @@ def _api_call(
     method: str,
     path: str,
     *,
-    json_body: dict | None = None,
-    params: dict | None = None,
+    json_body: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
     timeout: float = 30.0,
 ) -> httpx.Response:
     """Make an authenticated request against the MSAI API.

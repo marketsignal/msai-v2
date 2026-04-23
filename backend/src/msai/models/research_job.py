@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import DateTime, ForeignKey, SmallInteger, String, Text, func
@@ -31,13 +31,13 @@ class ResearchJob(Base):
         ForeignKey("strategies.id"), index=True, nullable=False
     )
     job_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    config: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="pending")
     progress: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="0")
     progress_message: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    results: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    best_config: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    best_metrics: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    results: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    best_config: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    best_metrics: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

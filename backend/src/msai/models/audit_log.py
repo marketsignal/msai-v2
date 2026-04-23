@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from sqlalchemy import BigInteger, ForeignKey, Index, String, func
@@ -37,7 +37,7 @@ class AuditLog(Base):
     action: Mapped[str] = mapped_column(String(100), nullable=False)
     resource_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
     resource_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
-    details: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    details: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     # Relationships
