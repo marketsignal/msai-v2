@@ -18,6 +18,9 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import PyJWKClient
 
 from msai.core.config import settings
+from msai.core.logging import get_logger
+
+log = get_logger(__name__)
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -125,8 +128,37 @@ async def get_current_user(
     return payload
 
 
+async def get_current_user_or_none(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),  # noqa: B008
+) -> dict[str, Any] | None:
+    """Same as ``get_current_user`` but returns ``None`` on missing auth.
+
+    Use ONLY when the caller has a fallback auth path (e.g., a signed
+    token in a query string). Returning ``None`` instead of raising 401
+    lets the caller decide whether the fallback is sufficient; without
+    this helper every dependency would short-circuit the request with
+    a 401 before the handler could inspect the alternative credential.
+    """
+    api_key = request.headers.get("X-API-Key")
+    if api_key is None and credentials is None:
+        return None
+    try:
+        return await get_current_user(request=request, credentials=credentials)
+    except HTTPException as exc:
+        # A credential WAS presented but failed validation. Log to distinguish
+        # a misconfigured Entra tenant / expired JWT / bad API key from the
+        # legitimate "iframe fetch, no session" path above.
+        log.info(
+            "auth_optional_declined",
+            detail=str(exc.detail),
+            status_code=exc.status_code,
+        )
+        return None
+
+
 async def resolve_user_id(
-    db: "AsyncSession",
+    db: AsyncSession,
     claims: dict[str, Any],
 ) -> UUID | None:
     """Resolve JWT claims to a ``users.id`` UUID, auto-creating the row if needed.

@@ -2,20 +2,23 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
+import pandas as pd
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from msai.core.database import get_db
 from msai.main import app
 from msai.models.backtest import Backtest
+from msai.models.trade import Trade
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Callable
 
 
 @pytest.fixture(autouse=True)
@@ -50,7 +53,7 @@ def _clear_ib_factory_globals():
 
 
 # ---------------------------------------------------------------------------
-# Failed-backtest seed fixtures (Task B0 — backtest-failure-surfacing)
+# Failed-backtest seed fixtures
 # ---------------------------------------------------------------------------
 #
 # These fixtures install an override for ``get_db`` that yields an AsyncMock
@@ -165,3 +168,121 @@ async def seed_pending_backtest() -> AsyncGenerator[str, None]:
         yield str(row.id)
     finally:
         app.dependency_overrides.pop(get_db, None)
+
+
+# ---------------------------------------------------------------------------
+# Pure-factory helpers for backtest model fixtures
+# ---------------------------------------------------------------------------
+#
+# These build in-memory Python objects only — NO DB persistence. They are
+# consumed by unit tests + API-level integration tests that mock sessions
+# via ``AsyncMock`` and serve the rows through ``_mock_session_returning``.
+
+
+def _make_backtest_completed_with_series(**overrides: object) -> Backtest:
+    """Completed backtest with ``series_status='ready'`` + canonical payload."""
+    default_series: dict[str, object] = {
+        "daily": [
+            {
+                "date": "2024-01-02",
+                "equity": 100_500.0,
+                "drawdown": 0.0,
+                "daily_return": 0.005,
+            },
+            {
+                "date": "2024-01-03",
+                "equity": 101_000.0,
+                "drawdown": 0.0,
+                "daily_return": 0.005,
+            },
+        ],
+        "monthly_returns": [{"month": "2024-01", "pct": 0.01}],
+    }
+    defaults: dict[str, object] = {
+        "status": "completed",
+        "metrics": {"sharpe_ratio": 2.1, "total_return": 0.01, "num_trades": 4},
+        "report_path": "/tmp/ready-report.html",
+        "series": default_series,
+        "series_status": "ready",
+    }
+    defaults.update(overrides)
+    return _make_backtest(**defaults)
+
+
+def _make_backtest_legacy(**overrides: object) -> Backtest:
+    """Pre-PR Backtest: ``series=None``, ``series_status='not_materialized'``.
+
+    SQLAlchemy ``server_default`` only applies at DB INSERT time. Pure-factory
+    helpers don't round-trip the DB, so we set ``series_status`` explicitly —
+    otherwise the attribute would be ``None`` on the returned instance and
+    ``_mock_session_returning()`` would serve a row with ``series_status=None``
+    to handlers that expect ``"not_materialized"``.
+    """
+    defaults: dict[str, object] = {
+        "status": "completed",
+        "metrics": {"sharpe_ratio": 1.2, "total_return": 0.05, "num_trades": 10},
+        "report_path": "/tmp/legacy-report.html",
+        "series": None,
+        "series_status": "not_materialized",
+    }
+    defaults.update(overrides)
+    return _make_backtest(**defaults)
+
+
+def _make_backtest_failed_series(**overrides: object) -> Backtest:
+    """Completed backtest with ``series_status='failed'`` (metrics present, series NULL)."""
+    defaults: dict[str, object] = {
+        "status": "completed",
+        "metrics": {"sharpe_ratio": 0.8, "total_return": 0.02, "num_trades": 6},
+        "report_path": "/tmp/fail-report.html",
+        "series": None,
+        "series_status": "failed",
+    }
+    defaults.update(overrides)
+    return _make_backtest(**defaults)
+
+
+def _make_backtest_with_trades(n: int) -> tuple[Backtest, list[Trade]]:
+    """SYNC factory: in-memory backtest + N individual Trade fills.
+
+    Purposely synchronous — consumed without ``await`` in mocked-session tests.
+    Includes ``pnl=None`` on every third row to exercise the coalesce path in
+    the API handler.
+    """
+    bt = _make_backtest(status="completed", metrics={"num_trades": n})
+    base_ts = datetime(2024, 1, 2, 9, 30, tzinfo=UTC)
+    trades: list[Trade] = []
+    for i in range(n):
+        t = Trade(
+            id=uuid4(),
+            backtest_id=bt.id,
+            strategy_id=bt.strategy_id,
+            strategy_code_hash=bt.strategy_code_hash,
+            instrument="SPY.XNAS",
+            side="BUY" if i % 2 == 0 else "SELL",
+            quantity=Decimal("10"),
+            price=Decimal("450.00"),
+            pnl=Decimal("5.00") if i % 3 != 0 else None,
+            commission=Decimal("0.50"),
+            executed_at=base_ts + timedelta(seconds=i),
+        )
+        trades.append(t)
+    return bt, trades
+
+
+@pytest.fixture
+def account_df_factory() -> Callable[..., pd.DataFrame]:
+    """Factory: Nautilus-shaped ``account_df`` with tz-aware ``returns`` column."""
+
+    def _factory(periods: int = 21, seed: float = 0.001) -> pd.DataFrame:
+        idx = pd.date_range("2024-01-02", periods=periods, freq="B", tz="UTC")
+        returns = pd.Series(
+            [seed * (1 + i * 0.1) for i in range(periods)],
+            index=idx,
+            name="returns",
+        )
+        frame = pd.DataFrame({"returns": returns})
+        frame.index = idx
+        return frame
+
+    return _factory

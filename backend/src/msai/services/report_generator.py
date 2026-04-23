@@ -8,55 +8,24 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
-
-import pandas as pd
-from pandas.api.types import is_numeric_dtype
+from typing import TYPE_CHECKING
 
 from msai.core.logging import get_logger
+from msai.services.analytics_math import normalize_daily_returns
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 log = get_logger(__name__)
 
 
 def _normalize_report_returns(series: pd.Series | None) -> pd.Series:
-    """Normalise a returns series for QuantStats.
+    """Legacy wrapper — delegates to ``analytics_math.normalize_daily_returns``.
 
-    QuantStats treats every row as one trading period and annualises with
-    ``sqrt(252)``, so minute-bar input inflates Sharpe/Sortino/vol by
-    ``sqrt(390)`` (~20x).  We group by UTC calendar date and compound each
-    day's returns back to a single daily observation.  Already-daily input
-    round-trips unchanged because ``(1 + r).prod()`` over a one-element
-    group equals ``1 + r``.
+    Kept for backwards-compatibility with existing callers; migrate them
+    gradually and remove this wrapper in a future PR.
     """
-    if series is None:
-        return pd.Series(dtype=float)
-
-    normalized = pd.Series(series).copy()
-    if normalized.empty:
-        return pd.Series(dtype=float)
-
-    normalized = pd.to_numeric(normalized, errors="coerce").dropna()
-    if normalized.empty:
-        return pd.Series(dtype=float)
-
-    index = normalized.index
-    if isinstance(index, pd.DatetimeIndex):
-        timestamp_index: pd.DatetimeIndex | None = index
-    elif is_numeric_dtype(index):
-        timestamp_index = None
-    else:
-        parsed = pd.to_datetime(index, utc=True, errors="coerce")
-        timestamp_index = parsed if isinstance(parsed, pd.DatetimeIndex) else None
-
-    if isinstance(timestamp_index, pd.DatetimeIndex) and not timestamp_index.isna().all():
-        normalized.index = timestamp_index
-        normalized = normalized[~normalized.index.isna()]
-        if normalized.empty:
-            return pd.Series(dtype=float)
-        normalized = ((1.0 + normalized).groupby(normalized.index.normalize()).prod() - 1.0).astype(
-            float
-        )
-
-    return normalized.sort_index()
+    return normalize_daily_returns(series)
 
 
 # Try to import quantstats; gracefully degrade if unavailable.

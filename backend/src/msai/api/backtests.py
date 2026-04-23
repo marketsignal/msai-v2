@@ -6,18 +6,20 @@ results retrieval, and history browsing.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID  # noqa: TC003 — FastAPI resolves path param types at runtime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import func, select
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-from msai.core.auth import get_current_user
+from msai.core.auth import get_current_user, get_current_user_or_none
 from msai.core.config import settings
 from msai.core.database import get_db
 from msai.core.logging import get_logger
@@ -28,9 +30,12 @@ from msai.models.trade import Trade
 from msai.schemas.backtest import (
     BacktestListItem,
     BacktestListResponse,
+    BacktestReportTokenResponse,
     BacktestResultsResponse,
     BacktestRunRequest,
     BacktestStatusResponse,
+    BacktestTradeItem,
+    BacktestTradesResponse,
     ErrorEnvelope,
     Remediation,
 )
@@ -40,6 +45,15 @@ from msai.services.data_sources.databento_client import DatabentoClient
 from msai.services.nautilus.security_master.service import (
     DatabentoDefinitionMissing,
     SecurityMaster,
+)
+from msai.services.observability.trading_metrics import (
+    msai_backtest_results_payload_bytes,
+    msai_backtest_trades_page_count,
+)
+from msai.services.report_signer import (
+    InvalidReportTokenError,
+    sign_report_token,
+    verify_report_token,
 )
 from msai.services.strategy_registry import load_strategy_class
 
@@ -57,8 +71,7 @@ class StrategyConfigValidationError(Exception):
     per ``.claude/rules/api-design.md``. Raising this (instead of
     ``HTTPException(detail={...})``) avoids FastAPI's default
     ``{"detail": <x>}`` wrapper, which would produce the non-compliant
-    ``{"detail": {"error": {...}}}`` shape observed during the
-    2026-04-21 code review.
+    ``{"detail": {"error": {...}}}`` shape.
     """
 
     def __init__(self, *, field: str | None, message: str) -> None:
@@ -76,6 +89,50 @@ class StrategyConfigValidationError(Exception):
         }
 
 
+def _error_response(status_code: int, code: str, message: str) -> JSONResponse:
+    """Build the canonical ``{"error": {"code", "message"}}`` JSONResponse.
+
+    Every error path in this router uses ``JSONResponse`` (not
+    ``HTTPException``) because FastAPI wraps ``HTTPException.detail`` under
+    ``{"detail": ...}`` while ``.claude/rules/api-design.md`` requires the
+    envelope at top-level.
+    """
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": {"code": code, "message": message}},
+    )
+
+
+@lru_cache(maxsize=1)
+def _resolved_reports_dir(data_root: str) -> Path:
+    """Cache ``{data_root}/reports`` resolution.
+
+    ``settings.data_root`` is effectively static for the process lifetime
+    (env-var driven), so we resolve once and reuse. Keyed on ``data_root``
+    so test monkeypatches that swap it invalidate cleanly.
+    """
+    return (Path(data_root) / "reports").resolve()
+
+
+def _report_is_deliverable(report_path: str | None) -> bool:
+    """Return ``True`` iff ``/report`` would actually serve the file today.
+
+    Shared eligibility gate for ``/results`` (``has_report`` flag),
+    ``/report-token`` (mint refusal), and ``/report`` itself. Checks:
+    (1) path is set, (2) resolved path stays under ``{data_root}/reports``,
+    (3) file exists on disk. Keeping the three endpoints in sync prevents
+    the UI from opening a "Full report" tab whose signed URL ``/report``
+    then rejects.
+    """
+    if report_path is None:
+        return False
+    resolved = Path(report_path).resolve()
+    expected_dir = _resolved_reports_dir(settings.data_root)
+    if not resolved.is_relative_to(expected_dir):
+        return False
+    return resolved.is_file()
+
+
 def _prepare_and_validate_backtest_config(
     config: dict[str, Any],
     *,
@@ -85,37 +142,23 @@ def _prepare_and_validate_backtest_config(
 ) -> dict[str, Any]:
     """Prepare + server-authoritatively validate the backtest config.
 
-    Why this lives at the API layer (Hawk council blocking objection #4 +
-    Contrarian #2, 2026-04-20): CLI and API callers should hit the same
-    validation surface as the UI. Worker-only validation means malformed
-    payloads sit in the queue before failing, and the persisted
-    ``Backtest.config`` diverges from what portfolio/live paths normalize
-    to. Doing the merge + parse at the API means one source of truth.
+    Server-side validation so CLI / API / UI callers hit the same surface,
+    malformed payloads fail fast (not in the worker queue), and
+    persisted ``Backtest.config`` matches what portfolio/live paths normalize to.
 
-    Prep: if the caller omitted ``instrument_id`` / ``bar_type``, inject
-    the first canonical instrument — mirrors the worker's
-    ``_prepare_strategy_config`` at
-    ``backend/src/msai/workers/backtest_job.py:371``. Persisting the
-    PREPARED dict (caller's code does this after the return) closes the
-    divergence with portfolio_service's merge logic.
+    Prep: inject the first canonical instrument into ``instrument_id`` /
+    ``bar_type`` if missing — mirrors the worker's ``_prepare_strategy_config``.
 
-    Validation: load the strategy's ``*Config`` class by the name that
-    **discovery persisted** (``Strategy.config_class``, not a suffix-swap
-    guess — Codex/pr-toolkit code review 2026-04-21: suffix-swap silently
-    skips validation for classes named ``FooStrategyConfig`` / ``FooParams``
-    / any non-``"{Name}Config"`` shape). Dump the prepared dict to JSON,
-    run ``StrategyConfig.parse()``. msgspec's ``ValidationError`` carries
-    a ``$.<field>`` path that we extract for the 422 response so the
-    frontend can highlight the bad field.
+    Validation: load the strategy's ``*Config`` class via the name that
+    discovery persisted (``Strategy.config_class``), run
+    ``StrategyConfig.parse()`` on the prepared dict, and re-raise as
+    :class:`StrategyConfigValidationError` with the ``$.<field>`` path
+    extracted from msgspec so the frontend can highlight the bad field.
 
-    Returns the prepared config dict on success; raises
-    ``HTTPException(422)`` on ``msgspec.ValidationError`` with a
-    structured ``detail`` payload keyed for ``frontend/src/lib/api.ts``.
-
-    ``config_class_name = None`` is a legitimate state (strategy has no
-    matching ``*Config`` class). Validation is silently skipped in that
-    case — the worker's auto-discovery at backtest-runner time still
-    catches malformed payloads.
+    Returns the prepared config dict on success. Validation is skipped when
+    ``config_class_name`` is ``None`` (strategy has no matching ``*Config``
+    class); the worker's auto-discovery still catches malformed payloads
+    at backtest-runner time.
     """
     import json
 
@@ -162,16 +205,13 @@ def _prepare_and_validate_backtest_config(
     try:
         config_cls.parse(json.dumps(prepared))
     except msgspec.ValidationError as exc:
-        # msgspec error format: "<reason> - at `$.<field>`". Strip the
-        # backtick wrapping, leading ``$.``, and any trailing
-        # whitespace so the client receives a plain field name like
-        # ``instrument_id`` that matches the keys in
-        # ``schema.properties`` for inline-error rendering.
+        # msgspec format: "<reason> - at `$.<field>`". Strip backticks +
+        # leading "$." so the client receives a plain key (e.g.
+        # ``instrument_id``) matching ``schema.properties`` for inline rendering.
         raw = str(exc)
         field = None
         if " - at " in raw:
             _, _, path = raw.partition(" - at ")
-            # Strip wrapping backticks + leading "$." → plain dotted path
             field = path.strip().strip("`").removeprefix("$.").strip()
         raise StrategyConfigValidationError(field=field, message=raw) from exc
 
@@ -226,16 +266,13 @@ async def run_backtest(
     # caller's dict is not mutated downstream.
     worker_config = dict(body.config)
 
-    # Resolve every instrument the caller supplied through the DB-backed
-    # registry BEFORE storing the backtest row. ``resolve_for_backtest``
-    # is fail-loud on a warm-path miss (``DatabentoDefinitionMissing`` —
-    # operator must run ``msai instruments refresh`` first) with one
-    # exception: the ``<root>.Z.<N>`` continuous-futures synthesis path
-    # calls Databento on cold-miss. Backtest resolution never needs an
-    # IB round-trip, so ``qualifier=None``. ``databento_client`` is
-    # ``None`` when the API key is unset — the resolver will raise a
-    # ``ValueError`` with a clear message on the ``.Z.N`` cold-miss
-    # path, which is the desired behaviour.
+    # Resolve instruments through the DB-backed registry before storing
+    # the row. ``resolve_for_backtest`` is fail-loud on a warm-path miss
+    # (``DatabentoDefinitionMissing`` — operator runs ``msai instruments
+    # refresh``), except continuous-futures (``<root>.Z.<N>``) which fall
+    # through to a Databento cold-fetch. ``qualifier=None`` because backtest
+    # resolution never needs IB; ``databento_client=None`` (unset API key)
+    # raises a ValueError on the continuous-futures path, which is desired.
     databento_client = (
         DatabentoClient(settings.databento_api_key) if settings.databento_api_key else None
     )
@@ -271,12 +308,9 @@ async def run_backtest(
             detail=str(exc),
         ) from exc
 
-    # Server-authoritative config validation (Hawk council blocking
-    # objection #4, 2026-04-20). Happens AFTER instrument resolve so
-    # canonical IDs are available to inject into the config dict before
-    # msgspec.parse — matches the worker's _prepare_strategy_config
-    # behavior so persisted ``Backtest.config`` is the same shape as
-    # what portfolio/live paths normalize to (Contrarian #2).
+    # Validation happens AFTER instrument resolve so canonical IDs are
+    # injected before msgspec.parse — matches the worker's
+    # _prepare_strategy_config behavior.
     worker_config = _prepare_and_validate_backtest_config(
         worker_config,
         strategy_file_path=strategy.file_path,
@@ -412,89 +446,307 @@ async def get_backtest_results(
     job_id: UUID,
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
-) -> BacktestResultsResponse:
-    """Return metrics, trade count, and individual trade rows for a backtest."""
+) -> BacktestResultsResponse | JSONResponse:
+    """Return aggregate metrics + canonical series payload + trade count.
+
+    Trades are no longer inline — see ``GET /api/v1/backtests/{id}/trades``
+    for paginated fills. ``has_report`` is derived server-side from
+    ``Backtest.report_path is not None`` + a file-existence check; the raw
+    path is never exposed in the response.
+    """
     result = await db.execute(select(Backtest).where(Backtest.id == job_id))
     backtest: Backtest | None = result.scalar_one_or_none()
 
     if backtest is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Backtest {job_id} not found",
+        return _error_response(
+            status.HTTP_404_NOT_FOUND,
+            "NOT_FOUND",
+            f"Backtest {job_id} not found",
         )
 
-    # Fetch every trade generated by this backtest so the UI can render
-    # the trade log without a second round-trip.
-    trade_rows_result = await db.execute(
-        select(Trade).where(Trade.backtest_id == job_id).order_by(Trade.executed_at.asc())
+    # Aggregate count only — trade rows are paginated via /trades.
+    trade_count_result = await db.execute(
+        select(func.count()).select_from(Trade).where(Trade.backtest_id == job_id)
     )
-    trade_rows = trade_rows_result.scalars().all()
+    trade_count = trade_count_result.scalar_one()
 
-    trade_count = len(trade_rows)
+    has_report = _report_is_deliverable(backtest.report_path)
 
-    trades_payload: list[dict[str, Any]] = [
-        {
-            "id": str(trade.id),
-            "instrument": trade.instrument,
-            "side": trade.side,
-            "quantity": float(trade.quantity),
-            "price": float(trade.price),
-            "pnl": float(trade.pnl) if trade.pnl is not None else 0.0,
-            "commission": float(trade.commission) if trade.commission is not None else 0.0,
-            "executed_at": trade.executed_at.isoformat(),
-        }
-        for trade in trade_rows
-    ]
-
-    return BacktestResultsResponse(
+    response = BacktestResultsResponse(
         id=backtest.id,
         metrics=backtest.metrics,
+        # DB stores the JSONB payload as ``dict[str, Any] | None``; Pydantic
+        # coerces the dict into ``SeriesPayload`` at response-model build time.
+        # The worker only writes dicts that already conform to the schema
+        # (it builds them via ``build_series_payload()``), so the coercion
+        # is lossless at runtime.
+        series=backtest.series,  # type: ignore[arg-type]
         trade_count=trade_count,
-        trades=trades_payload,
+        # DB stores series_status as VARCHAR(32); the schema types it as the
+        # ``SeriesStatus`` Literal. Narrow at the boundary — runtime values
+        # are guaranteed to be one of the enum strings by the migration's
+        # CHECK constraint + the worker's atomic write.
+        series_status=backtest.series_status,  # type: ignore[arg-type]
+        has_report=has_report,
+    )
+    # Observe response-body size so SRE can compare against the worker-write
+    # site in ``_materialize_series_payload`` and detect accidental payload
+    # bloat. ``model_dump_json`` serializes once (avoids the dict-intermediate
+    # walk of ``_json.dumps(model_dump(mode="json"))``).
+    msai_backtest_results_payload_bytes.observe(len(response.model_dump_json().encode("utf-8")))
+    return response
+
+
+# ---------------------------------------------------------------------------
+# GET /{id}/trades — paginated fill log
+# ---------------------------------------------------------------------------
+# Oversize ``page_size`` is clamped (not 422'd) to match other list endpoints.
+# Secondary sort on ``Trade.id ASC`` gives deterministic pagination when
+# multiple fills share the same ``executed_at``.
+
+MAX_TRADE_PAGE_SIZE = 500
+DEFAULT_TRADE_PAGE_SIZE = 100
+# Page_size histogram buckets — cap cardinality to 3 labels rather than
+# one time series per distinct page_size value.
+_PAGE_SIZE_SMALL_BUCKET = 100
+_PAGE_SIZE_MEDIUM_BUCKET = 250
+
+
+@router.get("/{job_id}/trades", response_model=BacktestTradesResponse)
+async def get_backtest_trades(
+    job_id: UUID,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_TRADE_PAGE_SIZE, ge=1),
+    claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+) -> BacktestTradesResponse | JSONResponse:
+    """Return paginated individual fills for a backtest.
+
+    Sorted by ``(executed_at, id) ASC`` so results are deterministic even
+    when multiple fills share the same timestamp.
+
+    ``page_size`` is clamped to ``MAX_TRADE_PAGE_SIZE`` (500) server-side;
+    oversized requests are truncated rather than rejected so the endpoint
+    is robust against imprecise clients (project convention — matches
+    ResearchJobListResponse + GraduationCandidateListResponse).
+    """
+    effective_page_size = min(page_size, MAX_TRADE_PAGE_SIZE)
+    if effective_page_size <= _PAGE_SIZE_SMALL_BUCKET:
+        page_size_bucket = f"<={_PAGE_SIZE_SMALL_BUCKET}"
+    elif effective_page_size <= _PAGE_SIZE_MEDIUM_BUCKET:
+        page_size_bucket = f"<={_PAGE_SIZE_MEDIUM_BUCKET}"
+    else:
+        page_size_bucket = f"<={MAX_TRADE_PAGE_SIZE}"
+    msai_backtest_trades_page_count.labels(page_size=page_size_bucket).inc()
+
+    exists_result = await db.execute(select(Backtest.id).where(Backtest.id == job_id))
+    if exists_result.scalar_one_or_none() is None:
+        return _error_response(
+            status.HTTP_404_NOT_FOUND,
+            "NOT_FOUND",
+            f"Backtest {job_id} not found",
+        )
+
+    total_result = await db.execute(
+        select(func.count()).select_from(Trade).where(Trade.backtest_id == job_id)
+    )
+    total = total_result.scalar_one()
+
+    offset = (page - 1) * effective_page_size
+    rows_result = await db.execute(
+        select(Trade)
+        .where(Trade.backtest_id == job_id)
+        # Secondary sort on id breaks ties on equal executed_at — deterministic
+        # pagination across pages.
+        .order_by(Trade.executed_at.asc(), Trade.id.asc())
+        .offset(offset)
+        .limit(effective_page_size)
+    )
+    rows = list(rows_result.scalars().all())
+
+    items = [
+        BacktestTradeItem(
+            id=r.id,
+            instrument=r.instrument,
+            # Worker writes ``OrderSide.name`` which emits only "BUY"/"SELL";
+            # schema narrows to that Literal. Runtime-guaranteed by the writer.
+            side=r.side,  # type: ignore[arg-type]
+            quantity=float(r.quantity),
+            price=float(r.price),
+            pnl=float(r.pnl) if r.pnl is not None else 0.0,
+            commission=float(r.commission) if r.commission is not None else 0.0,
+            executed_at=r.executed_at,
+        )
+        for r in rows
+    ]
+
+    return BacktestTradesResponse(
+        items=items,
+        total=total,
+        page=page,
+        page_size=effective_page_size,
     )
 
 
-@router.get("/{job_id}/report")
-async def get_backtest_report(
+@router.post(
+    "/{job_id}/report-token",
+    response_model=BacktestReportTokenResponse,
+)
+async def mint_backtest_report_token(
     job_id: UUID,
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
-) -> FileResponse:
-    """Return the QuantStats HTML report file for a completed backtest."""
+) -> BacktestReportTokenResponse | JSONResponse:
+    """Mint a short-lived signed URL for the report iframe.
+
+    The returned URL embeds an HMAC token scoped to
+    ``(backtest_id, user_sub, expires_at)``. The frontend loads the URL
+    verbatim as an iframe ``src`` — no Next.js proxy, no server-side
+    API key in the browser container. Expires after
+    ``settings.report_token_ttl_seconds`` (default 60s), so browser-history
+    leakage is inert shortly after render.
+    """
+    result = await db.execute(select(Backtest).where(Backtest.id == job_id))
+    backtest: Backtest | None = result.scalar_one_or_none()
+    if backtest is None:
+        return _error_response(
+            status.HTTP_404_NOT_FOUND,
+            "NOT_FOUND",
+            f"Backtest {job_id} not found",
+        )
+    # Same eligibility gate the /report GET will enforce — reject the
+    # mint here rather than handing out a signed URL the downstream GET
+    # will refuse. Keeps the UI's "Full report" tab honest.
+    if not _report_is_deliverable(backtest.report_path):
+        return _error_response(
+            status.HTTP_404_NOT_FOUND,
+            "NO_REPORT",
+            "Report not available",
+        )
+
+    user_sub = claims.get("sub", "unknown")
+    expires_at = datetime.now(UTC) + timedelta(seconds=settings.report_token_ttl_seconds)
+    token = sign_report_token(
+        backtest_id=job_id,
+        user_sub=user_sub,
+        expires_at=expires_at,
+        secret=settings.report_signing_secret,
+    )
+    return BacktestReportTokenResponse(
+        signed_url=f"/api/v1/backtests/{job_id}/report?token={token}",
+        expires_at=expires_at,
+    )
+
+
+@router.get("/{job_id}/report", response_model=None)
+async def get_backtest_report(
+    job_id: UUID,
+    token: str | None = None,
+    claims: dict[str, Any] | None = Depends(get_current_user_or_none),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+) -> FileResponse | JSONResponse:
+    """Return the QuantStats HTML report file for a completed backtest.
+
+    Accepts either:
+
+    - A signed ``?token=<hmac>`` query param scoped to this backtest_id
+      (minted via ``POST /{id}/report-token``), used for iframe auth
+      without a Next.js proxy; OR
+    - Bearer JWT / ``X-API-Key`` header auth — the traditional
+      ``get_current_user`` contract.
+
+    When both are absent, returns 401 ``UNAUTHENTICATED``. When ``?token=``
+    is present but invalid / expired / minted for a different backtest,
+    returns 401 ``INVALID_TOKEN``.
+    """
+    if token is not None:
+        try:
+            token_claims = verify_report_token(
+                token,
+                backtest_id=job_id,
+                secret=settings.report_signing_secret,
+            )
+        except InvalidReportTokenError as exc:
+            return _error_response(
+                status.HTTP_401_UNAUTHORIZED,
+                "INVALID_TOKEN",
+                str(exc),
+            )
+        # Cross-user replay guard: when a session is attached, its ``sub``
+        # must match the token's ``user_sub``. Pure signed-URL iframe fetches
+        # (no session) stand on the token alone — that's the capability model.
+        if claims is not None and claims.get("sub") != token_claims.user_sub:
+            # WARNING so the forensic trail survives even if the browser
+            # silently absorbs the 403.
+            log.warning(
+                "backtest_report_token_sub_mismatch",
+                backtest_id=str(job_id),
+                session_sub=claims.get("sub"),
+                token_user_sub=token_claims.user_sub,
+            )
+            return _error_response(
+                status.HTTP_403_FORBIDDEN,
+                "TOKEN_SUB_MISMATCH",
+                "Report token was not minted for this session",
+            )
+        log.info(
+            "backtest_report_served",
+            backtest_id=str(job_id),
+            auth_via="token",
+            token_user_sub=token_claims.user_sub,
+        )
+    elif claims is None:
+        return _error_response(
+            status.HTTP_401_UNAUTHORIZED,
+            "UNAUTHENTICATED",
+            "Missing auth",
+        )
+
     result = await db.execute(select(Backtest).where(Backtest.id == job_id))
     backtest: Backtest | None = result.scalar_one_or_none()
 
     if backtest is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Backtest {job_id} not found",
+        return _error_response(
+            status.HTTP_404_NOT_FOUND,
+            "NOT_FOUND",
+            f"Backtest {job_id} not found",
         )
 
     if backtest.report_path is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No report available for backtest {job_id}",
+        return _error_response(
+            status.HTTP_404_NOT_FOUND,
+            "NO_REPORT",
+            f"No report available for backtest {job_id}",
         )
 
-    # Path traversal protection: ensure resolved path is within expected directory
+    # Containment check — ``Path.is_relative_to`` rejects prefix-collision
+    # bypasses (``/app/data/reports_evil/x.html``) that ``str.startswith`` would
+    # accept. Belt-and-suspenders in case user input ever influences report_path.
     report_file = Path(backtest.report_path).resolve()
     expected_dir = (Path(settings.data_root) / "reports").resolve()
-    if not str(report_file).startswith(str(expected_dir)):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid report path",
+    if not report_file.is_relative_to(expected_dir):
+        return _error_response(
+            status.HTTP_403_FORBIDDEN,
+            "FORBIDDEN",
+            "Invalid report path",
         )
 
     if not report_file.is_file():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Report file not found on disk for backtest {job_id}",
+        return _error_response(
+            status.HTTP_404_NOT_FOUND,
+            "REPORT_FILE_MISSING",
+            f"Report file not found on disk for backtest {job_id}",
         )
 
+    # ``content_disposition_type="inline"`` is critical: Starlette's default
+    # ``attachment`` disposition would make browsers download the HTML rather
+    # than render it in the "Full report" iframe. ``inline`` keeps the
+    # filename hint for the "Download Report" button flow.
     return FileResponse(
         path=str(report_file),
         media_type="text/html",
         filename=f"backtest_{job_id}_report.html",
+        content_disposition_type="inline",
     )
 
 

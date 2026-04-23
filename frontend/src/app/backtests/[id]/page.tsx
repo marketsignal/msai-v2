@@ -11,7 +11,9 @@ import {
   type ResultsChartsBacktest,
 } from "@/components/backtests/results-charts";
 import { FailureCard } from "@/components/backtests/failure-card";
+import { ReportIframe } from "@/components/backtests/report-iframe";
 import { TradeLog } from "@/components/backtests/trade-log";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   apiFetch,
   apiGet,
@@ -108,11 +110,22 @@ export default function BacktestDetailPage({
             );
             if (!active) return;
             setResults(results);
+            setError(null);
             return; // success — stop polling
-          } catch {
+          } catch (resultsErr) {
             if (!active) return;
             if (resultsRetries >= MAX_RESULTS_RETRIES) {
-              return; // budget exhausted — stop polling; manual refresh will retry
+              // Budget exhausted. Surface the error so the user sees a
+              // clear banner instead of a silently-empty "completed"
+              // shell with no body and no actionable message. The
+              // render path still shows the header + back button via
+              // the error route.
+              const msg =
+                resultsErr instanceof ApiError
+                  ? `Results unavailable (HTTP ${resultsErr.status}). Try refreshing the page.`
+                  : "Results unavailable. Try refreshing the page.";
+              setError(msg);
+              return;
             }
             resultsRetries += 1;
             timerId = setTimeout(() => {
@@ -201,10 +214,6 @@ export default function BacktestDetailPage({
       totalTrades: m.num_trades,
     };
   }, [results]);
-
-  // The backend results endpoint does not yet return an equity curve or
-  // a trade log. Show empty charts until the backend supports it.
-  const equityCurve: { date: string; equity: number; drawdown: number }[] = [];
 
   if (loading) {
     return (
@@ -301,13 +310,32 @@ export default function BacktestDetailPage({
           failed to populate results.
         </div>
       ) : backtestForCharts ? (
-        <>
-          <ResultsCharts
-            backtest={backtestForCharts}
-            equityCurve={equityCurve}
-          />
-          <TradeLog trades={[]} />
-        </>
+        <Tabs defaultValue="native" className="mt-2">
+          <TabsList>
+            <TabsTrigger value="native">Native view</TabsTrigger>
+            <TabsTrigger
+              value="full_report"
+              disabled={!results?.has_report}
+              data-testid="tab-full-report"
+            >
+              Full report
+            </TabsTrigger>
+          </TabsList>
+          <TabsContent value="native" className="space-y-6">
+            <ResultsCharts
+              backtest={backtestForCharts}
+              series={results?.series ?? null}
+              seriesStatus={results?.series_status ?? "not_materialized"}
+            />
+            <TradeLog backtestId={id} />
+          </TabsContent>
+          <TabsContent value="full_report">
+            <ReportIframe
+              backtestId={id}
+              hasReport={Boolean(results?.has_report)}
+            />
+          </TabsContent>
+        </Tabs>
       ) : null}
     </div>
   );

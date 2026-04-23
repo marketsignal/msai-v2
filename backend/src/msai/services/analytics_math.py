@@ -2,9 +2,70 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypedDict
 
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
+
+
+class _DailyPointDict(TypedDict):
+    date: str
+    equity: float
+    drawdown: float
+    daily_return: float
+
+
+class _MonthlyReturnDict(TypedDict):
+    month: str
+    pct: float
+
+
+class _PayloadDict(TypedDict):
+    daily: list[_DailyPointDict]
+    monthly_returns: list[_MonthlyReturnDict]
+
+
+def normalize_daily_returns(series: pd.Series | None) -> pd.Series:
+    """Canonical returns normalization shared by the QuantStats report
+    generator and the persisted ``Backtest.series`` payload.
+
+    QuantStats treats every row as one trading period and annualises with
+    ``sqrt(252)``, so minute-bar input inflates Sharpe/Sortino/vol by
+    ``sqrt(390)`` (~20x).  We group by UTC calendar date and compound each
+    day's returns back to a single daily observation.  Already-daily input
+    round-trips unchanged because ``(1 + r).prod()`` over a one-element
+    group equals ``1 + r``.
+    """
+    if series is None:
+        return pd.Series(dtype=float)
+
+    normalized = pd.Series(series).copy()
+    if normalized.empty:
+        return pd.Series(dtype=float)
+
+    normalized = pd.to_numeric(normalized, errors="coerce").dropna()
+    if normalized.empty:
+        return pd.Series(dtype=float)
+
+    index = normalized.index
+    if isinstance(index, pd.DatetimeIndex):
+        timestamp_index: pd.DatetimeIndex | None = index
+    elif is_numeric_dtype(index):
+        timestamp_index = None
+    else:
+        parsed = pd.to_datetime(index, utc=True, errors="coerce")
+        timestamp_index = parsed if isinstance(parsed, pd.DatetimeIndex) else None
+
+    if isinstance(timestamp_index, pd.DatetimeIndex) and not timestamp_index.isna().all():
+        normalized.index = timestamp_index
+        normalized = normalized[~normalized.index.isna()]
+        if normalized.empty:
+            return pd.Series(dtype=float)
+        normalized = ((1.0 + normalized).groupby(normalized.index.normalize()).prod() - 1.0).astype(
+            float
+        )
+
+    return normalized.sort_index()
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,7 +197,10 @@ def combine_weighted_returns(
         return pd.Series(dtype=float)
 
     frame = pd.concat(
-        [(_clean_returns_series(series) * weight).rename(name) for name, weight, series in weighted_series],
+        [
+            (_clean_returns_series(series) * weight).rename(name)
+            for name, weight, series in weighted_series
+        ],
         axis=1,
         join="outer",
     ).sort_index()
@@ -151,7 +215,9 @@ def normalize_weights(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if total <= 0:
         equal = 1.0 / len(rows) if rows else 0.0
         return [{**row, "weight": equal} for row in rows]
-    return [{**row, "weight": max(float(row.get("weight", 0.0) or 0.0), 0.0) / total} for row in rows]
+    return [
+        {**row, "weight": max(float(row.get("weight", 0.0) or 0.0), 0.0) / total} for row in rows
+    ]
 
 
 def infer_periods_per_year(index: pd.Index) -> float:
@@ -179,6 +245,55 @@ def infer_periods_per_year(index: pd.Index) -> float:
     return 252.0
 
 
+def build_series_payload(
+    returns: pd.Series | None, starting_equity: float = 100_000.0
+) -> _PayloadDict:
+    """Build the canonical ``SeriesPayload`` dict from a returns Series.
+
+    Delegates equity + drawdown math to the existing
+    :func:`build_series_from_returns` helper (single compute path — the
+    QuantStats HTML and the native charts MUST derive from the same math,
+    or they'll diverge on compounding conventions) and adds month-end
+    aggregation on top. Output shape matches
+    :class:`msai.schemas.backtest.SeriesPayload` so the dict round-trips
+    through Pydantic validation.
+
+    Returns an empty payload ``{"daily": [], "monthly_returns": []}`` if the
+    input is empty or ``None``.
+    """
+    daily_returns = normalize_daily_returns(returns)
+    if daily_returns.empty:
+        return {"daily": [], "monthly_returns": []}
+
+    # Delegate to existing helper for equity/drawdown math — same formula,
+    # same DataFrame shape [timestamp, returns, equity, drawdown].
+    frame = build_series_from_returns(daily_returns, base_value=starting_equity)
+    if frame.empty:
+        return {"daily": [], "monthly_returns": []}
+
+    # ``itertuples(index=False)`` avoids the per-row Series allocation that
+    # ``iterrows()`` produces. Timestamps come from a DatetimeIndex via
+    # ``build_series_from_returns`` so ``strftime`` is supported directly.
+    daily: list[_DailyPointDict] = [
+        {
+            "date": row.timestamp.strftime("%Y-%m-%d"),
+            "equity": float(row.equity),
+            "drawdown": float(row.drawdown),
+            "daily_return": float(row.returns),
+        }
+        for row in frame.itertuples(index=False)
+    ]
+
+    # Monthly returns: compound daily into month-end aggregates
+    monthly_series = (1.0 + daily_returns).resample("ME").prod() - 1.0
+    monthly_returns: list[_MonthlyReturnDict] = [
+        {"month": pd.Timestamp(ts).strftime("%Y-%m"), "pct": float(pct)}
+        for ts, pct in zip(monthly_series.index, monthly_series, strict=True)
+    ]
+
+    return {"daily": daily, "monthly_returns": monthly_returns}
+
+
 def dataframe_to_series_payload(frame: pd.DataFrame) -> list[dict[str, float | str]]:
     if frame.empty:
         return []
@@ -198,10 +313,14 @@ def dataframe_to_series_payload(frame: pd.DataFrame) -> list[dict[str, float | s
 def _clean_returns_series(series: pd.Series) -> pd.Series:
     if series.empty:
         return pd.Series(dtype=float)
-    cleaned = pd.to_numeric(series, errors="coerce").replace([float("inf"), float("-inf")], pd.NA).dropna()
+    cleaned = (
+        pd.to_numeric(series, errors="coerce")
+        .replace([float("inf"), float("-inf")], pd.NA)
+        .dropna()
+    )
     if not isinstance(cleaned.index, pd.DatetimeIndex):
         cleaned.index = pd.to_datetime(cleaned.index, utc=True, errors="coerce")
-    cleaned = cleaned[~cleaned.index.isna()]  # type: ignore[attr-defined]
+    cleaned = cleaned[~cleaned.index.isna()]
     return cleaned.astype(float).sort_index()
 
 

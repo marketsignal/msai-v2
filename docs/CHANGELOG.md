@@ -4,6 +4,91 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-04-21 — Backtest results charts & trade log (branch `feat/backtest-results-charts-and-trades`) — PHASE 4 EXECUTION IN PROGRESS
+
+**What this PR will do:** Surface Pyfolio-style tear-sheet content (equity curve, drawdown, monthly-returns heatmap, paginated trade log + in-app QuantStats iframe) on every completed backtest's detail page, plus preserve the existing downloadable HTML report. Closes CONTINUITY #7 (UI-RESULTS-01) flagged by Pablo during the 2026-04-21 SPY live demo.
+
+**Phase 1-3 committed** at `84de2cf` (PRD + council-ratified decision doc + research brief + 11-iter-converged implementation plan).
+
+**Phase 4 COMPLETE — subagent-driven, 17 waves / 17 tasks. Backend (W1–W10) + Frontend (W11–W17) all shipped.**
+
+- Wave 1 ✅ B0b (Histogram primitive at `2178f29`), B1 (Alembic migration `z4x5y6z7a8b9` adds `Backtest.series` JSONB + `series_status` VARCHAR(32)).
+- Wave 2 ✅ B2 (`SeriesPayload` / `SeriesStatus` / `SeriesDailyPoint` / `SeriesMonthlyReturn` Pydantic types + `Backtest.series` + `series_status` columns on the SQLAlchemy model).
+- Wave 3 ✅ B0 (unit-test persistence fixtures), B3 (canonical `normalize_daily_returns` extracted to `analytics_math.py`; `_normalize_report_returns` now delegates).
+- Wave 4 ✅ B4 (`build_series_payload` — daily + monthly-end TypedDict payload, round-trips through `SeriesPayload`).
+- Wave 5 ✅ B6 (`BacktestResultsResponse` extended with `series` / `series_status` / `has_report`; inline `trades` field removed).
+- Wave 6 ✅ B10 (HMAC signed-URL machinery: `report_signer.py` module + `POST /{id}/report-token` + `GET /report?token=` extension + `BacktestReportTokenResponse` + `get_current_user_or_none` helper + prod-secret guard + `report_token_ttl_seconds ≤ 300` cap).
+- Wave 7 ✅ B7 (wire new response shape on `GET /results` — `func.count()` for `trade_count`, `JSONResponse`-wrapped 404 envelope).
+- Wave 8 ✅ B8 (paginated `GET /{id}/trades` with `(executed_at, id)` secondary sort + server-side page-size clamp at 500).
+- Wave 9 ✅ B5 (worker integration — `_materialize_series_payload` helper in `workers/backtest_job.py` + caller-side invocation in `_execute_backtest` + `_finalize_backtest` signature extended with `series_payload` + `series_status`; fail-soft failure log with `nautilus_version` per PRD §7).
+- Wave 10 ✅ B9 (payload-size observability — canonical `msai_backtest_results_payload_bytes` histogram registered in `trading_metrics.py` with 1KB/10KB/100KB/1MB/10MB buckets; observed at BOTH worker-write and `/results` response; `msai_backtest_trades_page_count` counter labeled by effective page_size on `/trades`).
+- Wave 11 ✅ F1 (frontend TS types — `SeriesStatus`, `SeriesDailyPoint`, `SeriesMonthlyReturn`, `SeriesPayload`, extended `BacktestResultsResponse`, replaced `BacktestTradeItem` with individual-fill shape, new `BacktestTradesResponse` + `BacktestReportTokenResponse`, `getBacktestTrades()` + `getBacktestReportToken()` client helpers).
+- Wave 12 ✅ F2 (`<ReportIframe>` — signed-URL flow; mounts → `useAuth()` → `getBacktestReportToken()` → origin-qualifies against `NEXT_PUBLIC_API_URL` → sets iframe `src` with `sandbox="allow-scripts allow-same-origin"`. Per-mount fetch so expired 60s tokens auto-refresh on tab re-open).
+- Wave 13 ✅ F3 (detail-page Tabs wrapper — Native view / Full report split; removed `equityCurve: []` + `<TradeLog trades={[]} />` hardcodes at `app/backtests/[id]/page.tsx`).
+- Wave 14 ✅ F4 (wired equity + drawdown charts to `series.daily`; drawdown formatters updated for ratio→percent conversion; gate on `seriesStatus === "ready" && daily.length > 0` with `<SeriesStatusIndicator>` fallback).
+- Wave 15 ✅ F5 (native `<MonthlyReturnsHeatmap>` — CSS Grid + Tailwind oklch cells, year rows × month columns, intensity scaling on |pct|, hover tooltip with precise pct).
+- Wave 16 ✅ F7 (shared `<SeriesStatusIndicator>` — 3-state empty: info for `not_materialized`, amber warning for `failed`, fragment for `ready`).
+- Wave 17 ✅ F6 (paginated `<TradeLog>` — `backtestId` prop drives `useAuth` + `getBacktestTrades`; Prev/Next buttons + page-of-N counter; per-fill columns: timestamp / instrument / side badge / quantity / price / P&L / commission; loading/error/empty states).
+
+**Inline "no bugs left behind" fix:** `@playwright/test` package wasn't installed after the 2026-04-21 Playwright scaffold move from repo-root to `frontend/`, which was breaking `pnpm build`'s typecheck step. Installed as devDep (~2 MB metadata; browsers remain un-downloaded, which is fine for build-only) — `pnpm build` now compiles 16/16 routes clean.
+
+**Phase 4 final test totals:** Backend 96/96 pytest green across `test_backtest_job`, `test_analytics_math`, `test_backtest_schemas`, `test_backtest_model`, `test_report_signer`, `test_metrics`, and `test_backtests_api` integration. Ruff + mypy --strict clean on all touched backend files. Frontend `tsc --noEmit` clean, `pnpm build` 16/16 routes OK, `pnpm lint` 0 errors (2 pre-existing warnings in unrelated files).
+
+**Session recovery (2026-04-21 context compaction):** Waves 1–8 work was shelved to `stash@{0}` during context compaction and restored cleanly on resume via `git stash pop`. No work lost.
+
+**Phase 5 — Code review loop iter-1 (2026-04-22):** 6 reviewers in parallel (Codex CLI + 5 pr-review-toolkit agents). Raw findings: 3 P0 + ~20 P1 + ~12 P2. All applied inline:
+
+_Security P0s:_ (1) prod-secret guard extended to reject empty + short (<32 char) secrets — HMAC with empty key silently turns signed URLs into a forgeable no-op; (2) path-traversal check switched from `str.startswith()` (defeated by prefix collision like `.../reports_evil/...`) to `Path.is_relative_to()`; (3) `user_sub` claim now enforced when a session is attached (cross-user token replay returns 403 `TOKEN_SUB_MISMATCH`) while still allowing the capability-token pattern for the iframe fetch.
+
+_P1 fixes:_ Alembic CHECK constraint on `series_status` (values outside `{ready,not_materialized,failed}` now fail at write, not as API 500 at read); Pydantic `model_validator` enforces the `series ⇔ series_status == "ready"` invariant; `has_report` now checks `Path.is_file()` so stale DB pointers don't produce a "click-tab-see-spinner-see-404" UX; all `/report` error paths use `JSONResponse` with structured codes (`NOT_FOUND`, `NO_REPORT`, `FORBIDDEN`, `REPORT_FILE_MISSING`, `INVALID_TOKEN`, `TOKEN_SUB_MISMATCH`); empty-series `"ready"` state gets a distinct `<EmptySeriesPanel>` instead of silently blank chart cards; `/results` retry-exhaustion surfaces an error banner instead of null-rendering; `BacktestTradeItem.side` narrowed to `Literal["BUY","SELL"]`; `msai_backtest_trades_page_count` bucketed to 3 label classes (cardinality guard); `NEXT_PUBLIC_API_URL` default corrected `:8000`→`:8800` across 3 call sites; `CancelledError`/`SystemExit`/`KeyboardInterrupt` explicitly re-raised in `_materialize_series_payload`; 4 KB token input cap in `verify_report_token`; iter-N/task-ID/advisor-name/date references scrubbed from production code per CLAUDE.md rule.
+
+_Frontend UX:_ `<ReportIframe>` + `<TradeLog>` now map `ApiError.body.error.code` to user-facing copy ("Report link expired — switch tabs to reload", etc.) instead of leaking URL templates.
+
+_Tests added:_ 4 `get_current_user_or_none` unit tests; 6 prod-secret-guard Settings tests; 2 new signer edge tests (tampered-payload distinct from cross-backtest; oversized-token rejection); 3 `/report` auth-boundary integration tests (no-auth+no-token, invalid-token-string, sub-mismatch); 3 P2 gap-closures (`page_size=0` rejection, secondary-sort order-preservation, path-traversal negative); alembic round-trip extended to verify the CHECK constraint survives upgrade/downgrade/re-upgrade.
+
+_Current test totals:_ 114/114 backend pytest pass; ruff clean; mypy --strict clean on PR-touched source files; frontend `tsc --noEmit` + `pnpm lint` clean. Iter-2 pending.
+
+**Phase 5 — Code review loop iter-2 → iter-6 (2026-04-22):** 5 additional iterations, narrowing each pass. Trajectory: iter-2 (0 P0 + 5 P1 + 6 P2) → iter-3 (2 P1) → iter-4 (1 P1 + 3 comment residuals) → iter-5 (1 P1 + 1 P2) → iter-6 (0/0/0 across 5 available reviewers; Codex pending). Each iteration strictly narrower than the previous — productive convergence.
+
+_Iter-2 fixes:_ `SeriesDailyPoint.equity` relaxed to `ge=0.0` (total-loss days legitimate); `TOKEN_SUB_MISMATCH` logs WARNING for cross-user-replay forensic trail; `_report_is_deliverable()` helper deployed across `/results`, `/report-token`, `/report` for eligibility parity; `get_current_user_or_none` logs INFO on HTTPException swallow; `verify_report_token` exception catch narrowed to `(binascii.Error, ValueError, UnicodeDecodeError, json.JSONDecodeError)`; comment scrub extended to `core/config.py` + test files.
+
+_Iter-3 fixes:_ Resolved merge-conflict markers in `tests/unit/test_metrics.py`; rebuilt alembic rejecting-INSERT test with correct Strategy columns (`config_schema_status`, not the non-existent `status`); added `math.isnan` guard in `Histogram.observe` to preserve Prometheus `+Inf bucket count == _count` invariant.
+
+_Iter-4 fixes:_ Git index state resolution (`git add` on previously-UU files); 3 comment residual scrubs (schemas "council verdict", conftest "Task B0" ×2).
+
+_Iter-5 fixes (critical iframe-rendering bug):_ Codex caught `FileResponse(..., filename=...)` defaulting to `Content-Disposition: attachment`, which would make browsers download the QS HTML instead of rendering it inside the iframe. Fix: `content_disposition_type="inline"` + new integration-test assertion pinning the header contract. Also: CONTINUITY.md merge-marker cleanup; `Task B10` docstring scrub in test_report_signer.py.
+
+_Iter-6 verdicts:_ code-reviewer CONVERGED · silent-failure-hunter CONVERGED · pr-test-analyzer CONVERGED · comment-analyzer CONVERGED · type-design-analyzer CONVERGED · Codex found 1 P2 (chart X-axis TZ off-by-one: `new Date("YYYY-MM-DD")` + local `getMonth/getDate` renders each point one calendar day early for US timezones).
+
+_Iter-6 fix (iframe bug aftermath):_ introduced `formatTickDate(isoDate: string) -> string` helper in `results-charts.tsx` that parses YYYY-MM-DD string components directly (no `new Date()` coercion). Both equity + drawdown chart `XAxis tickFormatter` props switched to the helper. Fallback returns the original string on malformed input so the chart tick never crashes.
+
+_Iter-7 verdicts:_ code-reviewer · silent-failure-hunter · pr-test-analyzer · comment-analyzer · type-design-analyzer · Codex — all 6 CONVERGED. **Code review loop PASS after 7 iterations.**
+
+**Phase 5.2 — Simplify pass (3 agents parallel):** _Reuse:_ `_error_response(status_code, code, message) -> JSONResponse` helper extracted into `api/backtests.py`; 11 call sites deduped (~50 LOC removed). _Quality:_ 13 edits across 7 files — magic numbers named (heatmap oklch constants, chart tick interval, histogram bucket bounds, page-size buckets), narrative comments trimmed. _Efficiency:_ `MonthlyReturnsHeatmap` year/month pivot wrapped in `useMemo` so it doesn't rebuild on every parent render.
+
+**Phase 5.3 — Verify (via verify-app subagent):** Caught 3 regressions from earlier iter-fixes, all corrected inline. (1) P0 React hooks-order: `useMemo` in `MonthlyReturnsHeatmap` was placed after the empty-state early return — moved above; `pnpm lint` + `pnpm build` now clean (16/16 routes compile). (2) mypy unused `type: ignore` in `analytics_math.py:323` — removed. (3) `test_coverage_still_missing_after_ingest_returns_partial_gap` fails — confirmed pre-existing at HEAD via stash-check (0 diff on `auto_heal.py` and the test file from HEAD), not a regression. Final: 1701/1702 unit + 24/24 integration + 6/6 Settings + 4/4 auth-optional tests pass. Ruff clean on all 21 PR-touched files. mypy --strict clean on PR source. Frontend `tsc --noEmit` + `pnpm lint` + `pnpm build` clean.
+
+**Phase 5.4 — E2E verified (verify-e2e agent + Playwright MCP):** Report at `tests/e2e/reports/2026-04-22-backtest-results-charts-and-trades.md`. **Verdict: PASS 5/6 + 1 SKIPPED_INFRA** — no FAIL_BUG.
+
+- UC-BRC-001 (fresh-backtest happy path): API + UI PASS. Submitted SPY 2024-01 backtest, auto-heal downloaded data, `series_status="ready"`, 318 trades, Sharpe 5.05. Full-report tab iframe rendered QuantStats tearsheet inline (Cumulative Returns + Key Performance Metrics).
+- UC-BRC-002 (legacy-row empty state): API + UI PASS. Pre-feature backtest shows `<SeriesStatusIndicator>` empty-state ("Analytics unavailable for this backtest"), Full-report tab disabled when `has_report=false`.
+- UC-BRC-003 (compute-failed distinct state): SKIPPED_INFRA — state unreachable through public inputs; unit coverage in `test_backtest_job.py` + `test_backtest_schemas.py` pins the contract.
+- UC-BRC-004 (paginated trade log): API + UI PASS. TradeLog shows "318 fills · Page 1 of 4", Previous disabled on page 1, Next advances to "Page 2 of 4".
+- UC-BRC-005 (signed-URL auth boundary): API PASS on all 6 steps — unauthenticated 401, malformed token 401, valid token 200 with `Content-Disposition: inline`, expired 401, cross-backtest 401, cross-user 403 with WARNING log.
+- UC-BRC-006 (iframe inline + download): PASS (via UC-001). `content_disposition_type="inline"` fix validated end-to-end — iframe renders 334 KB QS HTML inline, Download Report button works separately.
+
+**Phase 5.4b — E2E regression:** PASS. UC-BRC-001's auto-heal execution doubles as regression coverage for PR #40 UC-BAI-001. Error-envelope contract (PR #39) exercised by UC-BRC-005. Strategy config-form surface (PR #38) untouched. Live-trading surface (PR #37) untouched + skipped per live-trading safety rail.
+
+**Phase 6.2b — UCs graduated:** 6 UCs committed at `tests/e2e/use-cases/backtests/results-charts-and-trades.md`.
+
+_Final test totals after iter-6:_ 123/123 backend pytest pass; ruff clean on all PR source + test files; mypy --strict clean on PR source files; frontend `tsc --noEmit` + `pnpm lint` clean (0 errors, 2 pre-existing warnings in unrelated files).
+
+**Architectural pivot at plan-review iter-9:** original Next.js iframe proxy with server-side `MSAI_API_KEY` was an auth bypass. Redesigned as stateless HMAC signed URLs (60s TTL, scoped to `backtest_id + user_sub`) — scales to multi-tenant services per Pablo's roadmap.
+
+This entry will be replaced with the full PR-merge changelog when Phase 6 completes.
+
+---
+
 ### 2026-04-21 — CLAUDE.md template sync from claude-codex-forge (uncommitted, no workflow)
 
 Non-substantive docs update syncing `CLAUDE.md` against the current `claude-codex-forge/CLAUDE.template.md`:

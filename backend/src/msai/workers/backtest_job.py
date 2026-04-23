@@ -16,25 +16,22 @@ Lifecycle for a single job:
 6. On any failure, mark the backtest ``failed`` with a readable error
    message so the UI can display it.
 
-The function is intentionally verbose about error handling -- a silent
-backtest failure is one of the worst user experiences imaginable because
-it tends to look like "the job is still running" until someone checks the
-logs.
+Error handling is intentionally verbose — a silent backtest failure
+looks like "still running" until someone checks logs.
 
-Task B8 wires the missing-data path into a bounded retry-once loop via
-:func:`msai.services.backtests.auto_heal.run_auto_heal`: the first
-``FileNotFoundError`` from ``ensure_catalog_data`` triggers one
-auto-heal cycle, and on ``AutoHealOutcome.SUCCESS`` the execution body
-re-enters with the same backtest snapshot. ``_start_backtest`` runs
-exactly once so the ``attempt`` counter does not double-increment.
-Non-SUCCESS outcomes are translated to typed exceptions via
-:data:`_OUTCOME_TO_EXC` so the classifier continues to produce the
-right :class:`FailureCode`.
+Missing-data is handled by a bounded retry-once loop via
+:func:`msai.services.backtests.auto_heal.run_auto_heal`. The first
+``FileNotFoundError`` from ``ensure_catalog_data`` triggers one heal
+cycle; on ``AutoHealOutcome.SUCCESS`` the execution body re-enters
+with the same snapshot (``_start_backtest`` runs once). Non-SUCCESS
+outcomes map through :data:`_OUTCOME_TO_EXC` so the classifier still
+produces the right :class:`FailureCode`.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import socket
 import sys
@@ -52,15 +49,19 @@ from msai.core.database import async_session_factory
 from msai.core.logging import get_logger
 from msai.models.backtest import Backtest
 from msai.models.trade import Trade
+from msai.schemas.backtest import SeriesPayload
+from msai.services.analytics_math import build_series_payload
 from msai.services.backtests.auto_heal import AutoHealOutcome, run_auto_heal
 from msai.services.nautilus.backtest_runner import BacktestResult, BacktestRunner
 from msai.services.nautilus.catalog_builder import describe_catalog, ensure_catalog_data
+from msai.services.observability.trading_metrics import msai_backtest_results_payload_bytes
 from msai.services.report_generator import ReportGenerator
 
 log = get_logger(__name__)
 
 _WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 _HEARTBEAT_INTERVAL_S = 15
+_SERIES_PAYLOAD_BYTES_WARN_THRESHOLD = 1_048_576  # 1 MB — log-only soft budget
 
 
 # Map non-SUCCESS auto-heal outcomes to exception types the
@@ -81,6 +82,81 @@ _OUTCOME_TO_EXC: dict[AutoHealOutcome, type[BaseException]] = {
     AutoHealOutcome.TIMEOUT: TimeoutError,
     AutoHealOutcome.INGEST_FAILED: RuntimeError,
 }
+
+
+def _materialize_series_payload(
+    returns_series: pd.Series,
+    backtest_id: str,
+    nautilus_version: str | None = None,
+) -> tuple[dict[str, Any] | None, str]:
+    """Build the canonical :class:`SeriesPayload` from a returns series.
+
+    Fail-soft: returns ``(None, "failed")`` on any exception so a corrupt
+    series never blocks the downstream metrics/report write in
+    :func:`_finalize_backtest`. The caller is expected to pass both the
+    dict payload and the status string straight through to the finalizer
+    so both columns are persisted in one transaction.
+
+    Args:
+        returns_series: Pandas Series of period-over-period returns with
+            a UTC ``DatetimeIndex`` (produced by
+            :func:`_extract_returns_series`). May be empty — in which
+            case :func:`build_series_payload` returns the canonical
+            empty ``{"daily": [], "monthly_returns": []}``.
+        backtest_id: UUID string of the backtest — only used for log
+            correlation.
+        nautilus_version: Nautilus version captured earlier in
+            :func:`_execute_backtest` for data-lineage purposes.
+            Propagated to the failure log per the PRD §7 audit contract
+            so operators can correlate failures with the engine version
+            that produced the account DataFrame.
+
+    Returns:
+        ``(payload_dict, "ready")`` on success — the payload has been
+        round-tripped through :class:`SeriesPayload` so the caller can
+        trust the shape.
+
+        ``(None, "failed")`` on any exception — a WARNING log event
+        ``backtest_series_materialization_failed`` is emitted with
+        ``exc_info`` + ``nautilus_version``; the backtest itself is
+        still marked ``completed`` by the caller. See PRD §7 audit
+        contract.
+    """
+    try:
+        # Widen TypedDict → ``dict[str, Any]`` at the boundary; the Pydantic
+        # round-trip below is the actual shape guard, so a regression in
+        # ``build_series_payload`` surfaces here as a failure event rather
+        # than at read time in /results.
+        payload: dict[str, Any] = dict(build_series_payload(returns_series))
+        SeriesPayload.model_validate(payload)
+        payload_bytes = len(json.dumps(payload).encode("utf-8"))
+        msai_backtest_results_payload_bytes.observe(payload_bytes)
+        if payload_bytes > _SERIES_PAYLOAD_BYTES_WARN_THRESHOLD:
+            log.warning(
+                "backtest_series_payload_oversized",
+                backtest_id=backtest_id,
+                payload_bytes=payload_bytes,
+            )
+        log.info(
+            "backtest_series_materialized",
+            backtest_id=backtest_id,
+            daily_rows=len(payload["daily"]),
+            monthly_rows=len(payload["monthly_returns"]),
+            payload_bytes=payload_bytes,
+        )
+        return payload, "ready"
+    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+        # Propagate cooperative shutdown signals — otherwise a cancelled run
+        # mis-finalizes as ``series_status="failed"`` + ``status="completed"``.
+        raise
+    except Exception:  # noqa: BLE001 — fail-soft: a corrupt series shouldn't kill the run
+        log.warning(
+            "backtest_series_materialization_failed",
+            backtest_id=backtest_id,
+            nautilus_version=nautilus_version,
+            exc_info=True,
+        )
+        return None, "failed"
 
 
 async def run_backtest_job(
@@ -157,14 +233,10 @@ async def run_backtest_job(
     heartbeat_task = asyncio.create_task(_refresh_heartbeat())
 
     try:
-        # --- 2. Retry-once loop (Task B8) -----------------------------------
-        # Attempt 1: run the full execution body. If it raises
-        # FileNotFoundError (ensure_catalog_data couldn't find raw
-        # Parquet) we trigger one auto-heal cycle. On SUCCESS we loop
-        # back into attempt 2 with the SAME snapshot (no second
-        # _start_backtest, no double attempt-counter increment).
-        # On any non-SUCCESS outcome or on any non-FNF exception we
-        # break out to the terminal-failure handler below.
+        # --- 2. Retry-once loop -----------------------------------
+        # Attempt 1: run execution. FileNotFoundError triggers one
+        # auto-heal cycle; SUCCESS re-enters with the same snapshot.
+        # Anything else falls through to terminal-failure handling.
         attempt = 0
         terminal_exc: BaseException | None = None
         while attempt < 2:
@@ -185,13 +257,10 @@ async def run_backtest_job(
                 return  # happy path — execution succeeded
             except FileNotFoundError as exc:
                 if attempt == 1:
-                    # Wrap run_auto_heal so any exception it raises (e.g.,
-                    # Redis connection errors that AutoHealLock intentionally
-                    # propagates) becomes the terminal_exc. Without this guard
-                    # an exception raised INSIDE this except-handler escapes
-                    # the while-loop without ever reaching
-                    # _handle_terminal_failure, leaving the backtest row
-                    # stuck as "running". Codex review P1 2026-04-21.
+                    # Guard run_auto_heal so any exception it raises (e.g.
+                    # AutoHealLock Redis errors) lands in _handle_terminal_failure
+                    # rather than escaping this except-handler and stranding the
+                    # row in "running".
                     try:
                         result = await run_auto_heal(
                             backtest_id=backtest_id,
@@ -321,6 +390,19 @@ async def _execute_backtest(
         data_root=str(settings.data_root),
     )
 
+    # --- Materialize canonical analytics series ---------------------------
+    # Done here in the caller (not inside ``_finalize_backtest``) because
+    # the returns series is already in scope from the report-generation
+    # step above. Fail-soft: ``_materialize_series_payload`` returns
+    # ``(None, "failed")`` on any exception so the finalize write still
+    # lands and the backtest row reaches ``completed`` even when series
+    # construction blows up.
+    series_payload, series_status = _materialize_series_payload(
+        returns_series=returns_series,
+        backtest_id=backtest_id,
+        nautilus_version=nautilus_ver,
+    )
+
     # --- Persist results + trade rows ---------------------------------------
     await _finalize_backtest(
         backtest_id=backtest_id,
@@ -329,6 +411,8 @@ async def _execute_backtest(
         orders_df=result.orders_df,
         strategy_id=strategy_id,
         strategy_code_hash=strategy_code_hash,
+        series_payload=series_payload,
+        series_status=series_status,
     )
 
     log.info(
@@ -454,11 +538,17 @@ async def _finalize_backtest(
     orders_df: pd.DataFrame,
     strategy_id: Any,
     strategy_code_hash: str,
+    series_payload: dict[str, Any] | None,
+    series_status: str,
 ) -> None:
-    """Persist metrics, report path, and trade rows for a completed backtest.
+    """Persist metrics, report path, series, and trade rows atomically.
 
     Runs inside a single DB transaction so the backtest row and its
-    child ``trades`` are committed atomically.
+    child ``trades`` are committed atomically — including the
+    ``series`` / ``series_status`` columns. Callers (only
+    :func:`_execute_backtest` today) build the payload via
+    :func:`_materialize_series_payload` and pass both fields straight
+    through.
 
     Args:
         backtest_id: UUID string of the backtest row to update.
@@ -470,6 +560,17 @@ async def _finalize_backtest(
             every trade for easy provenance lookups.
         strategy_code_hash: SHA256 of the strategy source at run time --
             stored on each trade for reproducibility.
+        series_payload: Canonical ``SeriesPayload`` dict as returned by
+            :func:`_materialize_series_payload`. ``None`` means the
+            worker could not build a payload for this run and
+            ``series_status`` must be ``"failed"`` to disambiguate from
+            legacy ``"not_materialized"`` rows.
+        series_status: One of ``"ready"`` / ``"failed"``. Mirrors
+            :data:`msai.schemas.backtest.SeriesStatus`. The
+            ``"not_materialized"`` default is owned by the DB column and
+            should never be written here — if the worker reaches
+            ``_finalize_backtest`` it has always attempted
+            materialization.
     """
     async with async_session_factory() as session:
         row = await session.get(Backtest, backtest_id)
@@ -481,6 +582,8 @@ async def _finalize_backtest(
         row.metrics = dict(metrics)
         row.report_path = report_path
         row.completed_at = datetime.now(UTC)
+        row.series = series_payload
+        row.series_status = series_status
 
         for order in orders_df.to_dict(orient="records"):
             trade = _order_row_to_trade(

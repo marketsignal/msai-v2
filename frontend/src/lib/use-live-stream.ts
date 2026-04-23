@@ -167,7 +167,7 @@ const RECONNECT_MAX_MS = 30_000;
  * to ``ws(s)`` so the same env var drives both REST and WS.
  */
 function buildWsUrl(deploymentId: string): string {
-  const base = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+  const base = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8800";
   const wsBase = base.replace(/^http/i, "ws");
   return `${wsBase}/api/v1/live/stream/${deploymentId}`;
 }
