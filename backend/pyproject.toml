@@ -76,6 +76,31 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "TCH"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
+# Stale `# type: ignore` comments accumulate as library stubs improve — we
+# re-enable this once the existing backlog is cleaned up in a dedicated PR.
+warn_unused_ignores = false
+
+# Third-party libraries without published stubs. Treat their APIs as Any.
+[[tool.mypy.overrides]]
+module = [
+    "nautilus_trader.*",
+    "databento.*",
+    "databento_dbn.*",
+    "polygon.*",
+    "ib_async.*",
+    "ib_insync.*",
+    "arq.*",
+    "quantstats.*",
+    "pandas.*",
+    "pyarrow.*",
+    "duckdb.*",
+    "structlog.*",
+    "msal.*",
+    "redis.*",
+    "sklearn.*",
+    "testcontainers.*",
+]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
