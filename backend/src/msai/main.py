@@ -11,8 +11,9 @@ Creates and configures the FastAPI application with:
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING
+import asyncio
+from contextlib import asynccontextmanager, suppress
+from typing import TYPE_CHECKING, Any
 from uuid import UUID  # noqa: TC003 — FastAPI resolves the type at runtime for path params
 
 from fastapi import FastAPI, Request, Response, WebSocket
@@ -22,6 +23,8 @@ from sqlalchemy import select
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
+
+    from msai.services.nautilus.projection.registry import StreamRegistry
 
 from msai.api.account import router as account_router
 from msai.api.alerts import router as alerts_router
@@ -84,29 +87,27 @@ async def _ensure_api_key_user() -> bool:
         return False  # DB may not be ready yet (migrations pending)
 
 
-import asyncio
-
 _projection_tasks: list[asyncio.Task[None]] = []
 _projection_stop = asyncio.Event()
 _projection_redis_clients: list[Any] = []  # closed on shutdown
 
 # Module-level singleton so /api/v1/live/start can register new deployments
 # after boot. Lazy-initialized in _start_projection_tasks.
-_stream_registry: StreamRegistry | None = None  # type: ignore[name-defined]
+_stream_registry: StreamRegistry | None = None
 
 
-def get_stream_registry() -> StreamRegistry:  # type: ignore[name-defined]
+def get_stream_registry() -> StreamRegistry:
     """Return the per-worker StreamRegistry singleton.
 
     Called by the live router when a new deployment is started so the
     projection consumer discovers the new Nautilus message bus stream
     without requiring a FastAPI restart.
     """
-    from msai.services.nautilus.projection.registry import StreamRegistry as _SR
+    from msai.services.nautilus.projection.registry import StreamRegistry
 
     global _stream_registry  # noqa: PLW0603
     if _stream_registry is None:
-        _stream_registry = _SR()
+        _stream_registry = StreamRegistry()
     return _stream_registry
 
 
@@ -186,18 +187,14 @@ async def _stop_projection_tasks() -> None:
     _projection_stop.set()
     for task in _projection_tasks:
         task.cancel()
-        try:
+        with suppress(asyncio.CancelledError):
             await task
-        except asyncio.CancelledError:
-            pass
     _projection_tasks.clear()
 
     # Close Redis clients to avoid connection leaks on shutdown
     for client in _projection_redis_clients:
-        try:
+        with suppress(Exception):
             await client.aclose()
-        except Exception:  # noqa: BLE001
-            pass
     _projection_redis_clients.clear()
 
 

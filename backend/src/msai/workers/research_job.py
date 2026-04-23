@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+from contextlib import suppress
 from datetime import UTC, date, datetime
 from typing import Any
 
@@ -118,13 +119,16 @@ async def run_research_job(
                 try:
                     async with async_session_factory() as session:
                         job = await session.get(ResearchJob, job_id)
-                        if job is not None and (
-                            job.status == "cancelled"
-                            or (job.progress_message or "").startswith("Cancel")
+                        if (
+                            job is not None
+                            and (
+                                job.status == "cancelled"
+                                or (job.progress_message or "").startswith("Cancel")
+                            )
+                            and not cancel_requested.is_set()
                         ):
-                            if not cancel_requested.is_set():
-                                log.info("research_job_cancel_detected", job_id=job_id)
-                                cancel_requested.set()
+                            log.info("research_job_cancel_detected", job_id=job_id)
+                            cancel_requested.set()
                 except Exception:
                     log.warning("research_heartbeat_cancel_check_failed", job_id=job_id)
 
@@ -195,9 +199,7 @@ async def run_research_job(
                 stage_fractions=payload.get("stage_fractions"),
                 reduction_factor=int(payload.get("reduction_factor", 2)),
                 min_trades=(
-                    int(payload["min_trades"])
-                    if payload.get("min_trades") is not None
-                    else None
+                    int(payload["min_trades"]) if payload.get("min_trades") is not None else None
                 ),
                 require_positive_return=bool(payload.get("require_positive_return", False)),
                 holdout_fraction=(
@@ -225,9 +227,7 @@ async def run_research_job(
                 train_days=int(payload["train_days"]),
                 test_days=int(payload["test_days"]),
                 step_days=(
-                    int(payload["step_days"])
-                    if payload.get("step_days") is not None
-                    else None
+                    int(payload["step_days"]) if payload.get("step_days") is not None else None
                 ),
                 mode=str(payload.get("mode", "rolling")),
                 data_path=settings.nautilus_catalog_root,
@@ -237,9 +237,7 @@ async def run_research_job(
                 stage_fractions=payload.get("stage_fractions"),
                 reduction_factor=int(payload.get("reduction_factor", 2)),
                 min_trades=(
-                    int(payload["min_trades"])
-                    if payload.get("min_trades") is not None
-                    else None
+                    int(payload["min_trades"]) if payload.get("min_trades") is not None else None
                 ),
                 require_positive_return=bool(payload.get("require_positive_return", False)),
                 holdout_fraction=(
@@ -289,10 +287,8 @@ async def run_research_job(
         # Wait for the heartbeat task to exit cleanly
         if heartbeat_task is not None:
             heartbeat_task.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await heartbeat_task
-            except asyncio.CancelledError:
-                pass
         if lease_id is not None:
             await release_compute_slots(redis, lease_id)
 
@@ -378,8 +374,8 @@ async def _finalize_job(job_id: str, report: dict[str, Any]) -> None:
             if windows:
                 best_window = max(
                     (w for w in windows if w.get("test_result")),
-                    key=lambda w: (w.get("test_result") or {}).get("metrics", {}).get(
-                        objective_metric_key, 0
+                    key=lambda w: (
+                        (w.get("test_result") or {}).get("metrics", {}).get(objective_metric_key, 0)
                     ),
                     default=None,
                 )

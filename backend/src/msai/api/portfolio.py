@@ -83,7 +83,7 @@ async def create_portfolio(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
-        )
+        ) from exc
     await db.commit()
     await db.refresh(portfolio)
 
@@ -99,8 +99,8 @@ async def create_portfolio(
 
 @router.get("/runs", response_model=PortfolioRunListResponse)
 async def list_portfolio_runs(
-    portfolio_id: UUID | None = Query(default=None, description="Filter by portfolio"),
-    limit: int = Query(default=100, ge=1, le=500),
+    portfolio_id: UUID | None = Query(default=None, description="Filter by portfolio"),  # noqa: B008
+    limit: int = Query(default=100, ge=1, le=500),  # noqa: B008
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> PortfolioRunListResponse:
@@ -132,7 +132,7 @@ async def get_portfolio_run(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Portfolio run {run_id} not found",
-        )
+        ) from None
     return PortfolioRunResponse.model_validate(run)
 
 
@@ -154,7 +154,7 @@ async def get_portfolio_run_report(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Portfolio run {run_id} not found",
-        )
+        ) from None
 
     if run.report_path is None:
         raise HTTPException(
@@ -202,7 +202,7 @@ async def get_portfolio(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Portfolio {portfolio_id} not found",
-        )
+        ) from None
     return PortfolioResponse.model_validate(portfolio)
 
 
@@ -231,7 +231,7 @@ async def create_portfolio_run(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Portfolio {portfolio_id} not found",
-        )
+        ) from None
 
     # Enqueue to arq BEFORE commit -- if enqueue fails, rollback the row
     try:

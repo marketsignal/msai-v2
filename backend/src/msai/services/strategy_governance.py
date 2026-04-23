@@ -81,13 +81,10 @@ class StrategyGovernanceService:
                     top_module = alias.name.split(".")[0]
                     if top_module in self.BLOCKED_IMPORTS:
                         violations.append(f"Blocked import '{alias.name}' at line {node.lineno}")
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    top_module = node.module.split(".")[0]
-                    if top_module in self.BLOCKED_IMPORTS:
-                        violations.append(
-                            f"Blocked import from '{node.module}' at line {node.lineno}"
-                        )
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                top_module = node.module.split(".")[0]
+                if top_module in self.BLOCKED_IMPORTS:
+                    violations.append(f"Blocked import from '{node.module}' at line {node.lineno}")
         return violations
 
     def _check_dangerous_patterns(self, tree: ast.Module) -> list[str]:

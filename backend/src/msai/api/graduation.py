@@ -95,7 +95,7 @@ async def create_candidate(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
-        )
+        ) from exc
     await db.commit()
     await db.refresh(candidate)
 
@@ -120,7 +120,7 @@ async def get_candidate(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Candidate {candidate_id} not found",
-        )
+        ) from None
     return GraduationCandidateResponse.model_validate(candidate)
 
 
@@ -156,7 +156,7 @@ async def update_candidate_stage(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Candidate {candidate_id} not found",
-        )
+        ) from None
     except GraduationStageError as exc:
         # Include the current stage's allowed transitions in the error response
         current_candidate = await db.get(GraduationCandidate, candidate_id)
@@ -169,7 +169,7 @@ async def update_candidate_stage(
                 "current_stage": current_stage,
                 "allowed_transitions": allowed,
             },
-        )
+        ) from exc
 
     await db.commit()
     await db.refresh(candidate)

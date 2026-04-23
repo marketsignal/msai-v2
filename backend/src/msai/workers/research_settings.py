@@ -39,7 +39,10 @@ asyncio.set_event_loop_policy(None)
 
 
 class ResearchWorkerSettings:
-    """arq worker configuration for ``arq msai.workers.research_settings.ResearchWorkerSettings``."""
+    """arq worker configuration for the research queue.
+
+    Invoked as ``arq msai.workers.research_settings.ResearchWorkerSettings``.
+    """
 
     functions = [run_research_job]
     redis_settings: RedisSettings = _parse_redis_url(settings.redis_url)

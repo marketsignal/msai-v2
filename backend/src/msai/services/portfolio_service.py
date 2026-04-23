@@ -439,7 +439,7 @@ class PortfolioService:
         for asset_class, symbols in symbols_by_asset.items():
             await loop.run_in_executor(
                 None,
-                lambda ac=asset_class, syms=sorted(symbols): ensure_catalog_data(
+                lambda ac=asset_class, syms=sorted(symbols): ensure_catalog_data(  # noqa: B008
                     symbols=syms,
                     raw_parquet_root=settings.parquet_root,
                     catalog_root=settings.nautilus_catalog_root,
