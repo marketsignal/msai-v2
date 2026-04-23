@@ -46,3 +46,24 @@ LIVE_INSTRUMENT_RESOLVED_TOTAL = _r.counter(
 # Counter API (metrics.py:116-138). ``source`` ∈ {registry, registry_miss,
 # registry_incomplete}; ``asset_class`` mirrors ``AssetClass`` values plus
 # ``unknown`` when the row is unresolvable.
+
+# Backtest results payload size — observed at worker-write (post-JSONB
+# materialization) AND /results response. Detects accidental payload bloat
+# (e.g. minute-bar leak into the JSONB) on either hop.
+_1_KB = 1_024
+_10_KB = 10_240
+_100_KB = 102_400
+_1_MB = 1_048_576
+_10_MB = 10_485_760
+msai_backtest_results_payload_bytes = _r.histogram(
+    "msai_backtest_results_payload_bytes",
+    "Size in bytes of the Backtest.series JSONB payload "
+    "(observed at worker-write + /results response).",
+    buckets=(_1_KB, _10_KB, _100_KB, _1_MB, _10_MB),
+)
+
+# Paginated /trades endpoint — labeled by page_size bucket.
+msai_backtest_trades_page_count = _r.counter(
+    "msai_backtest_trades_page_count",
+    "Count of GET /api/v1/backtests/{id}/trades requests, labeled by page_size.",
+)

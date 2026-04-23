@@ -6,9 +6,19 @@ from datetime import (  # noqa: TC003 — SQLAlchemy needs concrete types at Map
     date,
     datetime,
 )
+from typing import Any
 from uuid import UUID, uuid4  # noqa: TC003 — same reason
 
-from sqlalchemy import Date, DateTime, ForeignKey, SmallInteger, String, Text, func
+from sqlalchemy import (
+    CheckConstraint,
+    Date,
+    DateTime,
+    ForeignKey,
+    SmallInteger,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -43,8 +53,25 @@ class Backtest(Base):
     progress: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="0")
     metrics: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     report_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # --- Canonical analytics series ------------------------------------
+    # ``series`` holds the canonical daily-normalized payload
+    # (:class:`msai.schemas.backtest.SeriesPayload`) — equity curve,
+    # drawdown series, daily returns, monthly aggregation — used by both
+    # the native React charts and the /results endpoint. Nullable because
+    # legacy rows (pre-migration) and failed-materialize rows carry no
+    # payload.
+    # ``series_status`` disambiguates ``ready`` (payload populated),
+    # ``not_materialized`` (legacy / never computed; DB DEFAULT), and
+    # ``failed`` (worker hit an error while building the payload — the
+    # backtest itself may still be ``completed``).
+    series: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    series_status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        server_default="not_materialized",
+    )
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # --- Error classification (added by PR #<this>) ----------------------
+    # --- Error classification ------------------------------------------
     # Populated by the worker at ``_mark_backtest_failed`` time via
     # ``services/backtests/classifier.py``. Read back by the API's
     # ``_build_error_envelope`` helper, which returns ``None`` for non-failed
@@ -86,3 +113,10 @@ class Backtest(Base):
     # Relationships
     strategy: Mapped[Strategy] = relationship(lazy="selectin")  # noqa: F821
     creator: Mapped[User] = relationship(lazy="selectin")  # noqa: F821
+
+    __table_args__ = (
+        CheckConstraint(
+            "series_status IN ('ready', 'not_materialized', 'failed')",
+            name="ck_backtests_series_status",
+        ),
+    )

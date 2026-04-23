@@ -9,7 +9,7 @@
  * Otherwise, if NEXT_PUBLIC_MSAI_API_KEY is set, the API key is used.
  */
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8800";
 const API_KEY = process.env.NEXT_PUBLIC_MSAI_API_KEY || "";
 
 export class ApiError extends Error {
@@ -207,10 +207,43 @@ export interface BacktestMetrics {
   initial_cash?: number;
 }
 
+// ---------------------------------------------------------------------------
+// Canonical normalized series payload — mirror of backend SeriesPayload
+// ---------------------------------------------------------------------------
+
+export type SeriesStatus = "ready" | "not_materialized" | "failed";
+
+export interface SeriesDailyPoint {
+  /** ISO YYYY-MM-DD. */
+  date: string;
+  equity: number;
+  /** Non-positive by construction. */
+  drawdown: number;
+  daily_return: number;
+}
+
+export interface SeriesMonthlyReturn {
+  /** YYYY-MM (zero-padded). */
+  month: string;
+  pct: number;
+}
+
+export interface SeriesPayload {
+  daily: SeriesDailyPoint[];
+  monthly_returns: SeriesMonthlyReturn[];
+}
+
 export interface BacktestResultsResponse {
   id: string;
   metrics: BacktestMetrics | null;
   trade_count: number;
+  /** Canonical normalized series — ``null`` when ``series_status !== "ready"``. */
+  series: SeriesPayload | null;
+  series_status: SeriesStatus;
+  /** ``true`` when the "Full report" iframe tab should be enabled (derived
+   * server-side from ``Backtest.report_path is not None``). */
+  has_report: boolean;
+  // trades removed — use getBacktestTrades() for paginated fills
 }
 
 // =====================================================================
@@ -321,16 +354,75 @@ export interface EquityPoint {
   drawdown: number;
 }
 
+/**
+ * One individual Nautilus fill from a backtest — matches the backend
+ * ``BacktestTradeItem`` Pydantic model. The earlier shape (entry/exit
+ * pairs with ``holdingPeriod``) was a UI-only fabrication that never
+ * aligned with the backend's per-fill ``Trade`` row; this is the
+ * canonical per-fill payload that ``<TradeLog>`` renders directly.
+ */
 export interface BacktestTradeItem {
   id: string;
-  timestamp: string;
   instrument: string;
   side: "BUY" | "SELL";
   quantity: number;
-  entryPrice: number;
-  exitPrice: number;
+  price: number;
   pnl: number;
-  holdingPeriod: string;
+  commission: number;
+  /** ISO datetime (UTC). */
+  executed_at: string;
+}
+
+export interface BacktestTradesResponse {
+  items: BacktestTradeItem[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+/** Fetch a paginated slice of fills for a backtest. Backend clamps
+ *  ``page_size`` at 500 server-side; the default matches the UI's page size.
+ */
+export async function getBacktestTrades(
+  id: string,
+  params: { page: number; page_size?: number },
+  token?: string | null,
+): Promise<BacktestTradesResponse> {
+  const q = new URLSearchParams({
+    page: String(params.page),
+    page_size: String(params.page_size ?? 100),
+  });
+  return apiGet<BacktestTradesResponse>(
+    `/api/v1/backtests/${encodeURIComponent(id)}/trades?${q.toString()}`,
+    token,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Signed-URL report token
+// ---------------------------------------------------------------------------
+
+export interface BacktestReportTokenResponse {
+  /** Absolute API path (``/api/v1/...``) carrying an HMAC ``?token=...``
+   * query. Origin-qualified against ``NEXT_PUBLIC_API_URL`` by
+   * ``<ReportIframe>`` before use as iframe ``src``. */
+  signed_url: string;
+  /** ISO datetime. Tokens expire after
+   * ``settings.report_token_ttl_seconds`` (default 60s). */
+  expires_at: string;
+}
+
+/** Mint a short-lived HMAC-signed URL for the QuantStats iframe.
+ *  Always POST with an empty body (the handler takes no payload). */
+export async function getBacktestReportToken(
+  id: string,
+  token?: string | null,
+): Promise<BacktestReportTokenResponse> {
+  return apiPost<BacktestReportTokenResponse>(
+    `/api/v1/backtests/${encodeURIComponent(id)}/report-token`,
+    {},
+    token,
+  );
 }
 
 export interface MonthlyReturn {

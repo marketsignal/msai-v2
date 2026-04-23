@@ -204,3 +204,148 @@ class TestHistogram:
         h1 = registry.histogram("msai_dup", "dup", buckets=(1, 10))
         h2 = registry.histogram("msai_dup", "dup", buckets=(1, 10))
         assert h1 is h2
+
+    def test_histogram_empty_buckets_renders_only_inf(self) -> None:
+        """An empty ``buckets=()`` tuple is legal — the histogram
+        renders cleanly with only the mandatory ``+Inf`` bucket,
+        ``_sum``, and ``_count`` lines, no finite-bucket sample lines."""
+        registry = MetricsRegistry()
+        hist = registry.histogram("msai_empty_hist", "Empty buckets.", buckets=())
+        hist.observe(42)
+        hist.observe(100)
+
+        text = registry.render()
+        assert 'msai_empty_hist_bucket{le="+Inf"} 2' in text
+        assert "msai_empty_hist_sum 142.0" in text
+        assert "msai_empty_hist_count 2" in text
+        # No finite-bucket lines should appear.
+        lines = [line for line in text.split("\n") if "msai_empty_hist_bucket" in line]
+        assert len(lines) == 1
+        assert '{le="+Inf"}' in lines[0]
+
+    def test_histogram_negative_observation_lands_in_all_buckets(self) -> None:
+        """Negative observations are cumulative like any other: they
+        satisfy ``value <= upper`` for every bucket, including +Inf."""
+        registry = MetricsRegistry()
+        hist = registry.histogram("msai_neg_hist", "Neg obs.", buckets=(100,))
+        hist.observe(-5)
+
+        text = registry.render()
+        assert 'msai_neg_hist_bucket{le="100"} 1' in text
+        assert 'msai_neg_hist_bucket{le="+Inf"} 1' in text
+        assert "msai_neg_hist_count 1" in text
+        assert "msai_neg_hist_sum -5.0" in text
+
+    def test_histogram_rejects_nan_observation(self) -> None:
+        """NaN must raise — ``float('nan') <= x`` is False for every
+        bucket including +Inf, which would break the Prometheus
+        invariant ``+Inf bucket count == _count``."""
+        registry = MetricsRegistry()
+        hist = registry.histogram("msai_nan_hist", "NaN test.", buckets=(100,))
+        with pytest.raises(ValueError, match="rejected NaN"):
+            hist.observe(float("nan"))
+
+    def test_histogram_sum_matches_observed_values(self) -> None:
+        """The rendered ``_sum`` line must equal the exact sum of
+        observations (float representation)."""
+        registry = MetricsRegistry()
+        hist = registry.histogram("msai_sum_hist", "Sum test.", buckets=(1_000,))
+        values = [10, 25, 50, 125]
+        for v in values:
+            hist.observe(v)
+
+        text = registry.render()
+        expected_sum = float(sum(values))
+        assert f"msai_sum_hist_sum {expected_sum}" in text
+        assert "msai_sum_hist_count 4" in text
+
+    def test_histogram_type_conflict_raises(self) -> None:
+        """Registering the same name first as counter then as
+        histogram is a programmer error — raise ``TypeError``
+        rather than silently returning the wrong type."""
+        registry = MetricsRegistry()
+        registry.counter("msai_conflict_hist", "Conflict test.")
+        with pytest.raises(TypeError, match="already registered"):
+            registry.histogram("msai_conflict_hist", "Conflict test.", buckets=(1, 10))
+
+
+class TestBacktestResultsPayloadBytesHistogram:
+    """Canonical ``msai_backtest_results_payload_bytes`` histogram.
+
+    Verifies the pre-registered singleton in ``trading_metrics`` renders
+    with the expected bucket layout + name so the worker and API
+    observation sites can trust the global instance. Tests against the
+    public ``render()`` contract — never against private ``_count`` /
+    ``_buckets`` attrs.
+    """
+
+    def test_backtest_results_payload_bytes_histogram_defined(self) -> None:
+        from msai.services.observability.trading_metrics import (
+            msai_backtest_results_payload_bytes,
+        )
+
+        assert msai_backtest_results_payload_bytes is not None
+
+    def test_histogram_observe_shows_in_render(self) -> None:
+        from msai.services.observability.trading_metrics import (
+            msai_backtest_results_payload_bytes,
+        )
+
+        msai_backtest_results_payload_bytes.observe(50_000)
+        lines = msai_backtest_results_payload_bytes.render()
+        text = "\n".join(lines)
+        # Bucket bounds from the plan: 1KB / 10KB / 100KB / 1MB / 10MB.
+        # A 50_000-byte observation must land in the 100KB bucket (102400).
+        assert "msai_backtest_results_payload_bytes_bucket" in text
+        assert 'le="102400"' in text
+        assert "msai_backtest_results_payload_bytes_count" in text
+        assert "msai_backtest_results_payload_bytes_sum" in text
+
+    def test_histogram_registered_via_global_registry(self) -> None:
+        # Importing trading_metrics triggers the pre-registration as a
+        # side effect. Re-import inside the test so the assertion on the
+        # rendered HELP/TYPE lines is deterministic regardless of the
+        # order in which other tests imported the module.
+        from msai.services.observability import (
+            get_registry,
+            trading_metrics,  # noqa: F401
+        )
+
+        registry = get_registry()
+        render_text = registry.render()
+        assert "# HELP msai_backtest_results_payload_bytes" in render_text
+        assert "# TYPE msai_backtest_results_payload_bytes histogram" in render_text
+
+
+class TestBacktestTradesPageCounter:
+    """``msai_backtest_trades_page_count`` counter.
+
+    Labeled by ``page_size`` so operators can distinguish normal pagination
+    (``page_size=100``) from clamped-at-ceiling abuse (``page_size=500``).
+    """
+
+    def test_counter_registered_via_global_registry(self) -> None:
+        from msai.services.observability import (
+            get_registry,
+            trading_metrics,  # noqa: F401
+        )
+
+        registry = get_registry()
+        render_text = registry.render()
+        assert "# HELP msai_backtest_trades_page_count" in render_text
+        assert "# TYPE msai_backtest_trades_page_count counter" in render_text
+
+    def test_counter_labels_distinguish_page_sizes(self) -> None:
+        from msai.services.observability.trading_metrics import (
+            msai_backtest_trades_page_count,
+        )
+
+        msai_backtest_trades_page_count.labels(page_size="100").inc()
+        msai_backtest_trades_page_count.labels(page_size="100").inc()
+        msai_backtest_trades_page_count.labels(page_size="500").inc()
+
+        text = "\n".join(msai_backtest_trades_page_count.render())
+        # Distinct rows per label-value — verifies the counter isn't
+        # silently sharing state across labels.
+        assert 'page_size="100"' in text
+        assert 'page_size="500"' in text

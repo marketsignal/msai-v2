@@ -50,6 +50,7 @@ lock-free (dict access under the GIL).
 
 from __future__ import annotations
 
+import math
 import threading
 from typing import TYPE_CHECKING
 
@@ -200,6 +201,12 @@ class Histogram(_LabeledMetric):
         self._count: int = 0
 
     def observe(self, value: float) -> None:
+        # Reject NaN: ``float('nan') <= x`` is False for every upper
+        # bound including +Inf, so a silent accept would break the
+        # Prometheus invariant that ``+Inf bucket count == _count``.
+
+        if math.isnan(value):
+            raise ValueError("Histogram rejected NaN observation")
         with self._lock:
             self._sum += float(value)
             self._count += 1

@@ -10,7 +10,7 @@ from __future__ import annotations
 from os import cpu_count
 from pathlib import Path
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Local dev: .../backend/src/msai/core/config.py → parents[4] = repo root.
@@ -191,6 +191,31 @@ class Settings(BaseSettings):
     auto_heal_poll_interval_seconds: int = 10
     auto_heal_lock_ttl_seconds: int = 3000
 
+    # Signed-URL machinery for `/api/v1/backtests/{id}/report`. The backend
+    # mints short-lived HMAC tokens scoped to
+    # ``(backtest_id, user_sub, expires_at)`` so the iframe can load the
+    # report without handing a server-side API key to the frontend
+    # container. Rotate the secret on every production deploy —
+    # a token signed under an old secret stops validating immediately,
+    # which is the desired invalidation semantics.
+    report_signing_secret: str = Field(
+        default="dev-report-signing-secret-change-in-prod",
+        description=("HMAC secret for /backtests/{id}/report signed URLs. Rotate per prod deploy."),
+    )
+    # Max TTL of 300s (5 min) — signed URLs are meant for iframe-render
+    # use cases; longer TTLs turn them into long-lived bearer tokens in
+    # browser history. Enforce the ceiling at config load so operator
+    # error fails fast.
+    report_token_ttl_seconds: int = Field(
+        default=60,
+        ge=1,
+        le=300,
+        description=(
+            "TTL for signed report URLs. Short by design — "
+            "browser-history leakage harmless after expiry. Max 300s."
+        ),
+    )
+
     research_worker_jobs: int = 2
     research_timeout_seconds: int = 14400  # 4 hours
     research_max_parallelism: int = max(1, min(4, (cpu_count() or 1) - 1))
@@ -233,6 +258,31 @@ class Settings(BaseSettings):
         if isinstance(value, Path):
             return value
         return Path(str(value))
+
+    @model_validator(mode="after")
+    def _enforce_production_secrets(self) -> Settings:
+        """Fail fast in production if security-sensitive secrets are weak or defaulted.
+
+        HMAC with an empty key still produces verifiable tokens — an empty-string
+        secret silently turns the signed-URL machinery into a constant no-op. The
+        guard rejects three classes: the literal dev default, empty string, and
+        anything shorter than 32 characters (the `openssl rand -base64 48` output
+        is 64 chars; any reasonable rotation lands far above this floor).
+        """
+        if self.environment == "production":
+            secret = self.report_signing_secret
+            if secret == "dev-report-signing-secret-change-in-prod":
+                raise ValueError(
+                    "REPORT_SIGNING_SECRET must be set to a non-default value in production. "
+                    "Generate one with `openssl rand -base64 48` and set it in the environment."
+                )
+            if len(secret) < 32:
+                raise ValueError(
+                    "REPORT_SIGNING_SECRET must be at least 32 characters in production "
+                    "(an empty or short secret makes signed URLs forgeable). "
+                    "Generate one with `openssl rand -base64 48`."
+                )
+        return self
 
     @property
     def parquet_root(self) -> Path:

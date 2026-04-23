@@ -945,8 +945,10 @@ async def test_y3_backtest_auto_heal_columns_roundtrip(
     assert "timestamp" in shape["heal_started_at"][1]
     assert "varchar" in shape["heal_job_id"][1]
 
-    # Downgrade one step (drops the 4 columns), then re-upgrade.
-    _run_alembic(isolated_postgres_url_auto_heal, "downgrade", "-1")
+    # Downgrade past y3s4t5u6v7w8 (drops the 4 columns), then re-upgrade.
+    # Use an explicit revision target rather than ``-1`` so later migrations
+    # chained after y3 don't silently change what this "one step down" means.
+    _run_alembic(isolated_postgres_url_auto_heal, "downgrade", "x2r3s4t5u6v7")
 
     engine = create_async_engine(isolated_postgres_url_auto_heal)
     try:
@@ -963,3 +965,181 @@ async def test_y3_backtest_auto_heal_columns_roundtrip(
 
     # Re-upgrade must re-land the columns.
     _run_alembic_upgrade(isolated_postgres_url_auto_heal)
+
+
+# ---------------------------------------------------------------------------
+# Backtest series + series_status columns (z4x5y6z7a8b9):
+#   - series JSONB NULL (canonical daily-normalized payload)
+#   - series_status VARCHAR(32) NOT NULL DEFAULT 'not_materialized'
+#     with CHECK constraint limiting values to the 3-value Literal set.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def isolated_postgres_url_series() -> Iterator[str]:
+    """Dedicated container for the series columns migration test."""
+    from testcontainers.postgres import PostgresContainer
+
+    with PostgresContainer("postgres:16-alpine") as pg:
+        yield pg.get_connection_url().replace("psycopg2", "asyncpg")
+
+
+async def _fetch_series_columns(database_url: str) -> list[sa.Row]:
+    """Query ``information_schema`` for the 2 new series columns on
+    ``backtests``. Returns rows of (column_name, data_type, is_nullable,
+    column_default) sorted by column_name.
+
+    Used to assert real on-disk shape (NOT SQLAlchemy reflection) for both
+    the initial upgrade AND the re-upgrade after a round-trip.
+    """
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                sa.text(
+                    "SELECT column_name, data_type, is_nullable, column_default "
+                    "FROM information_schema.columns "
+                    "WHERE table_name = 'backtests' "
+                    "AND column_name IN ('series', 'series_status') "
+                    "ORDER BY column_name"
+                )
+            )
+            return list(result)
+    finally:
+        await engine.dispose()
+
+
+async def _fetch_series_status_check_constraint(database_url: str) -> str | None:
+    """Return the ``pg_get_constraintdef(oid)`` for ``ck_backtests_series_status``,
+    or ``None`` if the constraint doesn't exist.
+
+    Used to verify the CHECK invariant survives upgrade/downgrade/re-upgrade —
+    the column default alone doesn't stop a SQL UPDATE from poisoning reads.
+    """
+    engine = create_async_engine(database_url.replace("postgresql://", "postgresql+asyncpg://"))
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(
+                sa.text(
+                    "SELECT pg_get_constraintdef(oid) "
+                    "FROM pg_constraint "
+                    "WHERE conname = 'ck_backtests_series_status'"
+                )
+            )
+            row = result.first()
+            return row[0] if row is not None else None
+    finally:
+        await engine.dispose()
+
+
+def _assert_series_columns_present(rows: list[sa.Row]) -> None:
+    """Assert both series + series_status landed with correct types + constraints."""
+    assert len(rows) == 2, f"expected both series + series_status columns, got {rows}"
+
+    series = next(r for r in rows if r[0] == "series")
+    assert series[1] == "jsonb", f"series should be jsonb, got {series[1]}"
+    assert series[2] == "YES", f"series should be nullable, got is_nullable={series[2]}"
+    assert series[3] is None, f"series should have no default, got {series[3]}"
+
+    status_col = next(r for r in rows if r[0] == "series_status")
+    assert status_col[1] == "character varying", (
+        f"series_status should be varchar, got {status_col[1]}"
+    )
+    assert status_col[2] == "NO", (
+        f"series_status should be NOT NULL, got is_nullable={status_col[2]}"
+    )
+    assert "'not_materialized'" in (status_col[3] or ""), (
+        f"series_status should default to 'not_materialized', got {status_col[3]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_migration_z4x5y6z7a8b9_adds_series_columns(
+    isolated_postgres_url_series: str,
+) -> None:
+    """Migration z4x5y6z7a8b9 adds ``series`` JSONB NULL and
+    ``series_status`` VARCHAR(32) NOT NULL DEFAULT 'not_materialized'
+    on ``backtests``. Both are nullable-safe / metadata-only on Postgres 16
+    — no table rewrite, no backfill required.
+
+    Verify via information_schema so we assert the real on-disk shape,
+    not SQLAlchemy's reflected interpretation. Round-trips
+    upgrade -> downgrade -> re-upgrade (mirrors the sibling
+    ``test_y3_backtest_auto_heal_columns_roundtrip``).
+    """
+    # Upgrade to head (includes z4x5y6z7a8b9) and assert both columns present
+    _run_alembic_upgrade(isolated_postgres_url_series)
+    _assert_series_columns_present(await _fetch_series_columns(isolated_postgres_url_series))
+
+    # The CHECK constraint must exist after upgrade. Values outside the
+    # 3-value set are rejected at write-time instead of producing a 500
+    # at read-time through the API's Pydantic Literal narrowing.
+    check_def = await _fetch_series_status_check_constraint(isolated_postgres_url_series)
+    assert check_def is not None, "ck_backtests_series_status missing after upgrade"
+    for allowed in ("ready", "not_materialized", "failed"):
+        assert allowed in check_def, f"allowed value {allowed!r} missing from CHECK def {check_def}"
+
+    # Critical: attempt an actual rejecting INSERT. The metadata check
+    # above would pass even if the constraint was defined as
+    # ``CHECK (series_status IN (...) OR TRUE)`` or scoped to the wrong
+    # column. This end-to-end write exercises the real enforcement.
+    engine_reject = create_async_engine(
+        isolated_postgres_url_series.replace("postgresql://", "postgresql+asyncpg://"),
+    )
+    try:
+        # Seed the FK parent so the poisoned insert reaches the CHECK
+        # (FK violations fire before CHECKs and would mask the test).
+        async with engine_reject.begin() as seed_conn:
+            strategy_id_row = await seed_conn.execute(
+                sa.text(
+                    "INSERT INTO strategies "
+                    "(id, name, file_path, strategy_class, "
+                    "config_schema_status, created_at, updated_at) "
+                    "VALUES (gen_random_uuid(), 'ck-test', "
+                    "'/nonexistent.py', 'Test', "
+                    "'no_config_class', now(), now()) "
+                    "RETURNING id"
+                )
+            )
+            strategy_id = strategy_id_row.scalar_one()
+
+        # The poisoned INSERT must raise IntegrityError pointing at
+        # ``ck_backtests_series_status``.
+        with pytest.raises(sa.exc.IntegrityError) as excinfo:
+            async with engine_reject.begin() as reject_conn:
+                await reject_conn.execute(
+                    sa.text(
+                        "INSERT INTO backtests "
+                        "(id, strategy_id, strategy_code_hash, config, "
+                        "instruments, start_date, end_date, series_status) "
+                        "VALUES (gen_random_uuid(), :sid, :sch, "
+                        "'{}'::jsonb, ARRAY['x'], "
+                        "'2024-01-01'::date, '2024-01-02'::date, 'bogus')"
+                    ),
+                    {"sid": strategy_id, "sch": "x" * 64},
+                )
+        assert "ck_backtests_series_status" in str(excinfo.value), (
+            f"constraint name missing from IntegrityError: {excinfo.value}"
+        )
+    finally:
+        await engine_reject.dispose()
+
+    # Downgrade ONE step to y3s4t5u6v7w8 (immediate parent of z4x5y6z7a8b9)
+    # to drop both columns. Explicit revision target — NOT ``-1`` — so later
+    # migrations chained after z4 don't silently change what "one step" means.
+    _run_alembic(isolated_postgres_url_series, "downgrade", "y3s4t5u6v7w8")
+
+    rows_after_down = await _fetch_series_columns(isolated_postgres_url_series)
+    assert rows_after_down == [], (
+        f"series + series_status should be dropped after downgrade, got {rows_after_down}"
+    )
+    check_after_down = await _fetch_series_status_check_constraint(isolated_postgres_url_series)
+    assert check_after_down is None, (
+        f"ck_backtests_series_status should be dropped after downgrade, got {check_after_down}"
+    )
+
+    # Re-upgrade must re-land both columns and the constraint.
+    _run_alembic_upgrade(isolated_postgres_url_series)
+    _assert_series_columns_present(await _fetch_series_columns(isolated_postgres_url_series))
+    check_after_reup = await _fetch_series_status_check_constraint(isolated_postgres_url_series)
+    assert check_after_reup is not None, "ck_backtests_series_status missing after re-upgrade"
