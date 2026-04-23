@@ -97,6 +97,7 @@ module = [
     "structlog.*",
     "msal.*",
     "redis.*",
+    "azure.*",
     "sklearn.*",
     "testcontainers.*",
 ]

@@ -80,11 +80,11 @@ class AzureKeyVaultProvider:
             return self._client
 
         try:
-            from azure.core.exceptions import (  # type: ignore[import-untyped]
+            from azure.core.exceptions import (
                 ResourceNotFoundError,
             )
-            from azure.identity import DefaultAzureCredential  # type: ignore[import-untyped]
-            from azure.keyvault.secrets import SecretClient  # type: ignore[import-untyped]
+            from azure.identity import DefaultAzureCredential
+            from azure.keyvault.secrets import SecretClient
         except ImportError as exc:
             raise ImportError(
                 "Azure Key Vault dependencies are not installed. "
@@ -113,13 +113,13 @@ class AzureKeyVaultProvider:
 
         try:
             # SecretClient.get_secret returns a KeyVaultSecret with a .value attribute.
-            secret = client.get_secret(vault_key)  # type: ignore[union-attr]
+            secret = client.get_secret(vault_key)
         except Exception as exc:
             if isinstance(exc, self._not_found_error):  # type: ignore[arg-type]
                 raise KeyError(f"Secret not found in Azure Key Vault: {vault_key}") from exc
             raise
 
-        value: str | None = secret.value  # type: ignore[union-attr]
+        value: str | None = secret.value
         if value is None:
             raise KeyError(f"Secret has no value in Azure Key Vault: {vault_key}")
         return value

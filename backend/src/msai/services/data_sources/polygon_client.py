@@ -96,7 +96,7 @@ class PolygonClient:
                     url = next_url
                     params = {"apiKey": self.api_key}
                 else:
-                    url = ""  # type: ignore[assignment]
+                    url = ""
 
         if not all_results:
             return _empty_bars_df()

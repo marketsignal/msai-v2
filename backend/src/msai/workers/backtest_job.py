@@ -686,7 +686,7 @@ def _prepare_strategy_config(
     return prepared
 
 
-def _extract_returns_series(account_df: pd.DataFrame) -> pd.Series:  # type: ignore[type-arg]
+def _extract_returns_series(account_df: pd.DataFrame) -> pd.Series:
     """Pull a time-indexed returns series out of the Nautilus account report.
 
     Nautilus's :func:`generate_account_report` does not always include a
