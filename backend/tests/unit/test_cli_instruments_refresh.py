@@ -44,8 +44,15 @@ class TestSubAppWiring:
         """``msai instruments refresh --help`` documents both providers."""
         result = runner.invoke(app, ["instruments", "refresh", "--help"])
         assert result.exit_code == 0, result.output
-        # The command signature must document the provider choice.
-        assert "--provider" in result.output
+        # The command signature must document the provider choice. Strip ANSI
+        # color codes because Rich wraps option names in color sequences that
+        # would split "--provider" across codes (e.g. "\x1b[1;36m-\x1b[0m\x1b[1;36m-provider\x1b[0m")
+        # and break a naive substring match. Observed in CI where isatty
+        # detection differs from local dev shells.
+        import re
+
+        stripped = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "--provider" in stripped
 
 
 # ----------------------------------------------------------------------
