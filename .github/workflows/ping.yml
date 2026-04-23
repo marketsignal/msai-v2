@@ -1,0 +1,12 @@
+name: Ping
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "pong from ${GITHUB_REF}"

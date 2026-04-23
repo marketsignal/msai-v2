@@ -343,13 +343,10 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 
 ## Now
 
-- **No active workflow.** Last shipped: PR #41 "Backtest results: real charts + paginated trade log + in-app report iframe" (merged `330e56a` 2026-04-23). See "Done (cont'd 12)" for details.
-- **Follow-up candidates** (see `## Next — remaining deferred items`):
-  - Item #1: CI hardening (`.github/workflows/ci.yml` running 0s-duration post-flatten).
-  - Item #2: Symbol Onboarding UI/API/CLI (unblocked since PR #37 live-path wiring landed).
-  - Item #8: Databento catalog bootstrap for instrument registry (avoid manual SQL seed for equities).
-- **Uncommitted on main:** `frontend/playwright.config.ts` baseURL reverted `:3300` → `:3000` — leftover from the 2026-04-22 computer reset. Contradicts the 2026-04-21 decision (host-exposed Docker port for local runs). Revert when convenient.
-- **Stack:** main on `75c4c1e` (PR #41 merge at `330e56a` + this CONTINUITY cleanup); worktrees clean (all merged); dev compose volumes preserved via pins (see "Done cont'd 10"). **Docker daemon is down post-reset** — start Docker Desktop, then `docker compose -f docker-compose.dev.yml up -d` from `/Users/pablomarin/Code/msai-v2`, then `./scripts/restart-workers.sh` so `backtest-worker` + `job-watchdog` pick up the new `_materialize_series_payload` + signed-URL code.
+- **Active: `fix/ci-ping-probe` (quick-fix).** Branch off main (`75c4c1e`) adds a minimal `Ping` workflow + opens `ci.yml` triggers (`on: push:`, `on: pull_request:` with no branch filter + `workflow_dispatch:`). Purpose per Codex: isolate org-policy vs per-workflow-config as the cause of post-flatten 0s-duration CI runs. Decision gate after push: if `Ping` runs cleanly → config-only issue, proceed with broader CI hardening (items 3–8 of Next #1). If `Ping` also 0-seconds → escalate to org Actions policy (not an engineering fix here).
+- **Next after probe (Codex-ratified sequence):** #8 Databento catalog bootstrap → PRD/council for #2 Symbol Onboarding → #2 impl → #3 `instrument_cache` migration + `canonical_instrument_id()` removal.
+- **Uncommitted on main (unrelated to this fix):** `frontend/playwright.config.ts` baseURL reverted `:3300` → `:3000` — leftover from the 2026-04-22 computer reset. Revert when convenient.
+- **Stack:** main on `75c4c1e` (PR #41 merge at `330e56a` + this CONTINUITY cleanup); worktrees clean (all merged); dev compose volumes preserved via pins (see "Done cont'd 10"). Docker daemon confirmed up 2026-04-23 — still need `docker compose -f docker-compose.dev.yml up -d` from `/Users/pablomarin/Code/msai-v2` + `./scripts/restart-workers.sh` so `backtest-worker` + `job-watchdog` pick up the new `_materialize_series_payload` + signed-URL code before the next live/backtest run.
 
 ## Known issues surfaced this session (for follow-up — "no bugs left behind" tracker)
 
