@@ -8,9 +8,12 @@ before a strategy file is loaded into a backtest or live trading process.
 from __future__ import annotations
 
 import ast
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 from msai.core.logging import get_logger
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 log = get_logger(__name__)
 

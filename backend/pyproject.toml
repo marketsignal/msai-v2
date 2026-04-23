@@ -60,6 +60,19 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "TCH"]
 
+# TC001/TC002/TC003 move imports into `if TYPE_CHECKING:` blocks, which
+# breaks frameworks that evaluate annotations at runtime via get_type_hints().
+# Disabled in the directories where we rely on that: SQLAlchemy 2.0
+# `Mapped[...]` (models/), Pydantic field inspection (schemas/), FastAPI
+# path-param + Depends() resolution (api/), and their close-adjacent helpers
+# (core/database.py, core/auth.py).
+[tool.ruff.lint.per-file-ignores]
+"src/msai/models/*.py" = ["TC001", "TC002", "TC003"]
+"src/msai/schemas/*.py" = ["TC001", "TC002", "TC003"]
+"src/msai/api/*.py" = ["TC001", "TC002", "TC003"]
+"src/msai/core/auth.py" = ["TC003"]
+"src/msai/core/database.py" = ["TC003"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true

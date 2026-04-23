@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
@@ -21,12 +20,15 @@ from itertools import product
 from math import ceil
 from os import cpu_count
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from msai.core.config import settings
 from msai.services.nautilus.backtest_runner import BacktestResult, BacktestRunner
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = structlog.get_logger(__name__)
 

@@ -10,16 +10,19 @@ Every stage change creates an immutable audit trail row in graduation_stage_tran
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
-from uuid import UUID
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from msai.core.logging import get_logger
 from msai.models.graduation_candidate import GraduationCandidate
 from msai.models.graduation_stage_transition import GraduationStageTransition
 from msai.models.strategy import Strategy
+
+if TYPE_CHECKING:
+    from uuid import UUID
+
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 log = get_logger(__name__)
 
@@ -154,18 +157,14 @@ class GraduationService:
     ) -> list[GraduationCandidate]:
         """List candidates, optionally filtered by stage."""
         stmt = (
-            select(GraduationCandidate)
-            .order_by(GraduationCandidate.created_at.desc())
-            .limit(limit)
+            select(GraduationCandidate).order_by(GraduationCandidate.created_at.desc()).limit(limit)
         )
         if stage is not None:
             stmt = stmt.where(GraduationCandidate.stage == stage)
         result = await session.execute(stmt)
         return list(result.scalars().all())
 
-    async def get_candidate(
-        self, session: AsyncSession, candidate_id: UUID
-    ) -> GraduationCandidate:
+    async def get_candidate(self, session: AsyncSession, candidate_id: UUID) -> GraduationCandidate:
         """Get a single candidate by ID. Raises ValueError if not found."""
         candidate = await session.get(GraduationCandidate, candidate_id)
         if candidate is None:

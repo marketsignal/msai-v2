@@ -21,13 +21,14 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
-
-from arq.connections import ArqRedis
 
 from msai.core.config import settings
 from msai.core.logging import get_logger
+
+if TYPE_CHECKING:
+    from arq.connections import ArqRedis
 
 logger = get_logger(__name__)
 
@@ -48,6 +49,7 @@ class ComputeSlotUnavailableError(TimeoutError):
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 async def acquire_compute_slots(
     redis: ArqRedis,
@@ -155,6 +157,7 @@ async def describe_compute_slots(redis: ArqRedis) -> dict[str, Any]:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+
 async def _active_slot_usage(redis: ArqRedis) -> int:
     """Sum ``slot_count`` across all live leases, pruning stale entries."""
     leases = await _active_leases(redis)
@@ -185,11 +188,13 @@ async def _active_leases(redis: ArqRedis) -> list[dict[str, Any]]:
         await redis.srem(_ACTIVE_SET_KEY, *stale)
         logger.info("compute_slots_pruned_stale", stale_ids=stale)
 
-    leases.sort(key=lambda lse: (
-        str(lse.get("job_kind", "")),
-        str(lse.get("job_id", "")),
-        str(lse.get("lease_id", "")),
-    ))
+    leases.sort(
+        key=lambda lse: (
+            str(lse.get("job_kind", "")),
+            str(lse.get("job_id", "")),
+            str(lse.get("lease_id", "")),
+        )
+    )
     return leases
 
 

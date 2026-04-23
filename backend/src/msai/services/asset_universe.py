@@ -7,9 +7,7 @@ orphaned.
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import TYPE_CHECKING
-from uuid import UUID
 
 from sqlalchemy import select
 
@@ -17,9 +15,12 @@ from msai.core.logging import get_logger
 from msai.models.asset_universe import AssetUniverse
 
 if TYPE_CHECKING:
+    from datetime import datetime
+    from uuid import UUID
+
     from sqlalchemy.ext.asyncio import AsyncSession
 
-from msai.schemas.asset_universe import AssetUniverseCreate
+    from msai.schemas.asset_universe import AssetUniverseCreate
 
 log = get_logger(__name__)
 
