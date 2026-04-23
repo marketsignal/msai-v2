@@ -18,8 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from msai.core.logging import get_logger
 from msai.models.graduation_candidate import GraduationCandidate
-from msai.models.strategy import Strategy
 from msai.models.graduation_stage_transition import GraduationStageTransition
+from msai.models.strategy import Strategy
 
 log = get_logger(__name__)
 

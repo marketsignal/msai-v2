@@ -6,7 +6,8 @@ from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import BigInteger, ForeignKey, Index, String, func
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from msai.models.base import Base
@@ -40,4 +41,4 @@ class AuditLog(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     # Relationships
-    user: Mapped["User"] = relationship(lazy="selectin")  # noqa: F821
+    user: Mapped[User] = relationship(lazy="selectin")  # noqa: F821

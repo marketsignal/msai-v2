@@ -53,5 +53,5 @@ class PortfolioRun(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Relationships
-    portfolio: Mapped["Portfolio"] = relationship(lazy="selectin")  # noqa: F821
-    creator: Mapped["User"] = relationship(lazy="selectin")  # noqa: F821
+    portfolio: Mapped[Portfolio] = relationship(lazy="selectin")  # noqa: F821
+    creator: Mapped[User] = relationship(lazy="selectin")  # noqa: F821

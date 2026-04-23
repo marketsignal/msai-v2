@@ -62,7 +62,7 @@ class IBProbe:
             self._is_healthy = True
             log.debug("ib_gateway_healthy", host=self.host, port=self.port)
             return True
-        except (OSError, asyncio.TimeoutError):
+        except (TimeoutError, OSError):
             self._consecutive_failures += 1
             self._is_healthy = False
             if self._consecutive_failures >= _FAILURE_THRESHOLD:

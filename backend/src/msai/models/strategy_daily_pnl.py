@@ -54,5 +54,5 @@ class StrategyDailyPnl(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     # Relationships
-    strategy: Mapped["Strategy"] = relationship(lazy="selectin")  # noqa: F821
-    deployment: Mapped["LiveDeployment"] = relationship(lazy="selectin")  # noqa: F821
+    strategy: Mapped[Strategy] = relationship(lazy="selectin")  # noqa: F821
+    deployment: Mapped[LiveDeployment] = relationship(lazy="selectin")  # noqa: F821

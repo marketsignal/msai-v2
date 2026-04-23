@@ -13,7 +13,6 @@ from typing import Any
 
 import pandas as pd
 import pyarrow as pa
-import pyarrow.parquet as pq
 
 from msai.core.data_integrity import atomic_write_parquet, dedup_bars
 from msai.core.logging import get_logger

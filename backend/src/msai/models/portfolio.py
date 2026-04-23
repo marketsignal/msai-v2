@@ -38,4 +38,4 @@ class Portfolio(TimestampMixin, Base):
     )
 
     # Relationships
-    creator: Mapped["User"] = relationship(lazy="selectin")  # noqa: F821
+    creator: Mapped[User] = relationship(lazy="selectin")  # noqa: F821

@@ -44,7 +44,7 @@ class GraduationCandidate(TimestampMixin, Base):
     )
 
     # Relationships
-    strategy: Mapped["Strategy"] = relationship(lazy="selectin")  # noqa: F821
-    research_job: Mapped["ResearchJob"] = relationship(lazy="selectin")  # noqa: F821
-    deployment: Mapped["LiveDeployment"] = relationship(lazy="selectin")  # noqa: F821
-    promoter: Mapped["User"] = relationship(lazy="selectin")  # noqa: F821
+    strategy: Mapped[Strategy] = relationship(lazy="selectin")  # noqa: F821
+    research_job: Mapped[ResearchJob] = relationship(lazy="selectin")  # noqa: F821
+    deployment: Mapped[LiveDeployment] = relationship(lazy="selectin")  # noqa: F821
+    promoter: Mapped[User] = relationship(lazy="selectin")  # noqa: F821

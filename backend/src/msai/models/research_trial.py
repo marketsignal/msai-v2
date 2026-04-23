@@ -42,5 +42,5 @@ class ResearchTrial(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     # Relationships
-    research_job: Mapped["ResearchJob"] = relationship(lazy="selectin")  # noqa: F821
-    backtest: Mapped["Backtest"] = relationship(lazy="selectin")  # noqa: F821
+    research_job: Mapped[ResearchJob] = relationship(lazy="selectin")  # noqa: F821
+    backtest: Mapped[Backtest] = relationship(lazy="selectin")  # noqa: F821
