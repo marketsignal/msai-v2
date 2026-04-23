@@ -49,6 +49,7 @@ def setup_logging(environment: str) -> None:
     Log level is ``DEBUG`` (10) in development and ``INFO`` (20) in production.
     """
     is_dev: bool = environment.lower() == "development"
+    is_test: bool = environment.lower() == "test"
     log_level: int = logging.DEBUG if is_dev else logging.INFO
 
     shared_processors: list[structlog.types.Processor] = [
@@ -70,7 +71,10 @@ def setup_logging(environment: str) -> None:
         processors=[*shared_processors, renderer],
         wrapper_class=structlog.make_filtering_bound_logger(log_level),
         logger_factory=structlog.PrintLoggerFactory(),
-        cache_logger_on_first_use=True,
+        # Test envs disable the first-use cache so structlog.testing.capture_logs()
+        # can replace the processor chain on already-bound loggers. Production +
+        # dev keep caching enabled for the perf win.
+        cache_logger_on_first_use=not is_test,
         context_class=dict,
     )
 
