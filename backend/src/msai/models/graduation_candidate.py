@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from sqlalchemy import DateTime, ForeignKey, String, Text
@@ -10,6 +11,12 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from msai.models.base import Base, TimestampMixin
+
+if TYPE_CHECKING:
+    from msai.models.live_deployment import LiveDeployment
+    from msai.models.research_job import ResearchJob
+    from msai.models.strategy import Strategy
+    from msai.models.user import User
 
 
 class GraduationCandidate(TimestampMixin, Base):

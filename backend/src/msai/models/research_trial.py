@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from sqlalchemy import ForeignKey, Integer, Numeric, String, UniqueConstraint, func
@@ -10,6 +11,10 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from msai.models.base import Base
+
+if TYPE_CHECKING:
+    from msai.models.backtest import Backtest
+    from msai.models.research_job import ResearchJob
 
 
 class ResearchTrial(Base):
@@ -22,9 +27,7 @@ class ResearchTrial(Base):
 
     __tablename__ = "research_trials"
     __table_args__ = (
-        UniqueConstraint(
-            "research_job_id", "trial_number", name="uq_trial_job_number"
-        ),
+        UniqueConstraint("research_job_id", "trial_number", name="uq_trial_job_number"),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)

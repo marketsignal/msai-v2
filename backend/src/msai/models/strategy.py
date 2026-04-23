@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from sqlalchemy import ForeignKey, String, Text
@@ -9,6 +10,9 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from msai.models.base import Base, TimestampMixin
+
+if TYPE_CHECKING:
+    from msai.models.user import User
 
 
 class Strategy(TimestampMixin, Base):

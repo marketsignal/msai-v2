@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 from uuid import UUID
+
+if TYPE_CHECKING:
+    from msai.models.live_deployment import LiveDeployment
+    from msai.models.strategy import Strategy
 
 from sqlalchemy import (
     BigInteger,

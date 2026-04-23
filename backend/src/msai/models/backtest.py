@@ -6,8 +6,12 @@ from datetime import (  # noqa: TC003 — SQLAlchemy needs concrete types at Map
     date,
     datetime,
 )
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4  # noqa: TC003 — same reason
+
+if TYPE_CHECKING:
+    from msai.models.strategy import Strategy
+    from msai.models.user import User
 
 from sqlalchemy import (
     CheckConstraint,

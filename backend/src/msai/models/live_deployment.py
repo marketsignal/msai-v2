@@ -34,6 +34,8 @@ from msai.models.base import Base
 
 if TYPE_CHECKING:
     from msai.models.live_portfolio_revision import LivePortfolioRevision
+    from msai.models.strategy import Strategy
+    from msai.models.user import User
 
 
 class LiveDeployment(Base):

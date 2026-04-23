@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from sqlalchemy import DateTime, ForeignKey, SmallInteger, String, Text, func
@@ -10,6 +11,10 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from msai.models.base import Base
+
+if TYPE_CHECKING:
+    from msai.models.strategy import Strategy
+    from msai.models.user import User
 
 
 class ResearchJob(Base):
@@ -34,12 +39,8 @@ class ResearchJob(Base):
     best_config: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     best_metrics: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    started_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    completed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_by: Mapped[UUID | None] = mapped_column(
         ForeignKey("users.id"), index=True, nullable=True
     )
@@ -50,9 +51,7 @@ class ResearchJob(Base):
     queue_job_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     worker_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     attempt: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0)
-    heartbeat_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Relationships
     strategy: Mapped[Strategy] = relationship(lazy="selectin")  # noqa: F821
