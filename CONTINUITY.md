@@ -38,7 +38,7 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 - [x] State files updated — CONTINUITY.md checklist flipped through Phase 6.2c; `docs/CHANGELOG.md` [Unreleased] entry carries the full Phase 4 → Phase 6.2b narrative (backend waves W1–W10, frontend waves W11–W17, 7-iter code-review loop, simplify pass, verify-app, E2E PASS 5/6).
 - [x] Committed and pushed — `1b6a092` (36 files, +4694/-442) on `feat/backtest-results-charts-and-trades` pushed to origin. Branch now 3 commits ahead of main (`84de2cf` Phase 1-3 artifacts + `2178f29` Histogram primitive + `1b6a092` implementation + CHANGELOG).
 - [x] PR created — [PR #41](https://github.com/marketsignal/msai-v2/pull/41) "Backtest results: real charts + paginated trade log + in-app report iframe". Scrubbed `Task B10` reference from `.env.example` during staging per comment-hygiene rule.
-- [ ] PR reviews addressed
+- [x] PR reviews addressed — 1 iter. Codex found 1 P1 (`report_signer.py:92` — `payload_b64.encode("ascii")` outside the decode try/except, non-ASCII input raises `UnicodeEncodeError` → 500 instead of 401 `INVALID_TOKEN`). Verified via code trace: `isascii()` guard is cleanest fix (base64url alphabet is ASCII-only by definition). Fixed at `c96d68c` with regression test `test_verify_rejects_non_ascii_payload_as_malformed`. Replied to inline thread. All 10 signer tests + 24 integration tests pass; ruff + mypy --strict clean.
 - [ ] Branch finished
 
 ### Scope seed (to refine during PRD discuss)
