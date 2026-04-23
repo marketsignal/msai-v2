@@ -165,3 +165,14 @@ def test_verify_rejects_oversized_token() -> None:
     oversized = "a" * 5000 + "." + "0" * 64
     with pytest.raises(InvalidReportTokenError, match="oversized token"):
         verify_report_token(oversized, backtest_id=uuid4(), secret="s")
+
+
+def test_verify_rejects_non_ascii_payload_as_malformed() -> None:
+    """Non-ASCII in the payload segment would crash `str.encode('ascii')` with
+    UnicodeEncodeError, bubbling as a 500 instead of the intended 401. A
+    well-formed base64url payload is ASCII-only by definition, so non-ASCII
+    must fold into InvalidReportTokenError at the validation boundary.
+    """
+    non_ascii_token = "payload-é." + "0" * 64
+    with pytest.raises(InvalidReportTokenError, match="malformed token"):
+        verify_report_token(non_ascii_token, backtest_id=uuid4(), secret="s")

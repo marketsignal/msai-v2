@@ -87,6 +87,12 @@ def verify_report_token(
     except ValueError as e:
         raise InvalidReportTokenError("malformed token") from e
 
+    # base64url alphabet is ASCII-only; non-ASCII means malformed, not a
+    # crash path. Guard before `.encode("ascii")` so we return 401
+    # INVALID_TOKEN instead of bubbling UnicodeEncodeError as a 500.
+    if not payload_b64.isascii():
+        raise InvalidReportTokenError("malformed token")
+
     expected_sig = hmac.new(
         secret.encode("utf-8"),
         payload_b64.encode("ascii"),
