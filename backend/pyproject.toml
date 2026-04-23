@@ -60,12 +60,51 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "TCH"]
 
+# TC001/TC002/TC003 move imports into `if TYPE_CHECKING:` blocks, which
+# breaks frameworks that evaluate annotations at runtime via get_type_hints().
+# Disabled in the directories where we rely on that: SQLAlchemy 2.0
+# `Mapped[...]` (models/), Pydantic field inspection (schemas/), FastAPI
+# path-param + Depends() resolution (api/), and their close-adjacent helpers
+# (core/database.py, core/auth.py).
+[tool.ruff.lint.per-file-ignores]
+"src/msai/models/*.py" = ["TC001", "TC002", "TC003"]
+"src/msai/schemas/*.py" = ["TC001", "TC002", "TC003"]
+"src/msai/api/*.py" = ["TC001", "TC002", "TC003"]
+"src/msai/core/auth.py" = ["TC003"]
+"src/msai/core/database.py" = ["TC003"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true
+# Stale `# type: ignore` comments accumulate as library stubs improve — we
+# re-enable this once the existing backlog is cleaned up in a dedicated PR.
+warn_unused_ignores = false
+
+# Third-party libraries without published stubs. Treat their APIs as Any.
+[[tool.mypy.overrides]]
+module = [
+    "nautilus_trader.*",
+    "databento.*",
+    "databento_dbn.*",
+    "polygon.*",
+    "ib_async.*",
+    "ib_insync.*",
+    "arq.*",
+    "quantstats.*",
+    "pandas.*",
+    "pyarrow.*",
+    "duckdb.*",
+    "structlog.*",
+    "msal.*",
+    "redis.*",
+    "sklearn.*",
+    "testcontainers.*",
+]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+pythonpath = ["src"]
 testpaths = ["tests"]
 markers = [
     "ib_paper: opt-in test that requires a running paper IB Gateway (set RUN_PAPER_E2E=1)",

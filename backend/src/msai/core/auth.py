@@ -112,7 +112,10 @@ async def get_current_user(
     if validator is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication not configured. Set AZURE_TENANT_ID and AZURE_CLIENT_ID, or MSAI_API_KEY.",
+            detail=(
+                "Authentication not configured. "
+                "Set AZURE_TENANT_ID and AZURE_CLIENT_ID, or MSAI_API_KEY."
+            ),
             headers={"WWW-Authenticate": "Bearer"},
         )
 

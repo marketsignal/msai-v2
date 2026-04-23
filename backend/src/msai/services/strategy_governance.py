@@ -8,9 +8,12 @@ before a strategy file is loaded into a backtest or live trading process.
 from __future__ import annotations
 
 import ast
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 from msai.core.logging import get_logger
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 log = get_logger(__name__)
 
@@ -81,13 +84,10 @@ class StrategyGovernanceService:
                     top_module = alias.name.split(".")[0]
                     if top_module in self.BLOCKED_IMPORTS:
                         violations.append(f"Blocked import '{alias.name}' at line {node.lineno}")
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    top_module = node.module.split(".")[0]
-                    if top_module in self.BLOCKED_IMPORTS:
-                        violations.append(
-                            f"Blocked import from '{node.module}' at line {node.lineno}"
-                        )
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                top_module = node.module.split(".")[0]
+                if top_module in self.BLOCKED_IMPORTS:
+                    violations.append(f"Blocked import from '{node.module}' at line {node.lineno}")
         return violations
 
     def _check_dangerous_patterns(self, tree: ast.Module) -> list[str]:

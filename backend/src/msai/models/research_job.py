@@ -55,5 +55,5 @@ class ResearchJob(Base):
     )
 
     # Relationships
-    strategy: Mapped["Strategy"] = relationship(lazy="selectin")  # noqa: F821
-    creator: Mapped["User"] = relationship(lazy="selectin")  # noqa: F821
+    strategy: Mapped[Strategy] = relationship(lazy="selectin")  # noqa: F821
+    creator: Mapped[User] = relationship(lazy="selectin")  # noqa: F821

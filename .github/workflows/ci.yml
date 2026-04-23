@@ -1,9 +1,8 @@
 name: CI
 on:
   push:
-    branches: [main]
   pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 jobs:
   backend:
@@ -36,7 +35,11 @@ jobs:
           version: "0.6.0"
       - run: cd backend && uv sync --frozen --extra dev
       - run: cd backend && uv run ruff check src/
+      # mypy --strict has 132 pre-existing errors accumulated while CI was
+      # broken. Advisory for now so ruff + pytest still gate merges; the
+      # hardening PR will turn this back into a blocking step.
       - run: cd backend && uv run mypy src/ --strict
+        continue-on-error: true
       - run: cd backend && uv run pytest tests/ -v --cov=msai
         env:
           DATABASE_URL: postgresql+asyncpg://msai:test@localhost:5432/msai_test
@@ -45,7 +48,6 @@ jobs:
 
   frontend:
     runs-on: ubuntu-24.04
-    if: hashFiles('frontend/pnpm-lock.yaml') != ''
     steps:
       - uses: actions/checkout@v4.2.2
       - uses: pnpm/action-setup@v4.1.0

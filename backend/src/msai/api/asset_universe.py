@@ -80,7 +80,7 @@ async def disable_asset(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Asset {asset_id} not found",
-        )
+        ) from None
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

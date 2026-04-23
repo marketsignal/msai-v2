@@ -377,11 +377,11 @@ async def run_auto_heal(
             # ideal (equities have ~2/7 of calendar time in
             # weekends + holidays) but that's a follow-up; 7 days handles
             # the realistic worst case for month-spanning requests.
-            _COVERAGE_TOLERANCE_NS = 7 * 24 * 3600 * 1_000_000_000
+            coverage_tolerance_ns = 7 * 24 * 3600 * 1_000_000_000
             significant_gaps: list[tuple[str, list[tuple[int, int]]]] = []
             for inst_id, inst_gaps in gaps:
                 total_gap_ns = sum(end_ns - start_ns for start_ns, end_ns in inst_gaps)
-                if total_gap_ns > _COVERAGE_TOLERANCE_NS:
+                if total_gap_ns > coverage_tolerance_ns:
                     significant_gaps.append((inst_id, inst_gaps))
             if significant_gaps:
                 log.warning(

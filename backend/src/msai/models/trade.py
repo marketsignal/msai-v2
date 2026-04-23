@@ -83,6 +83,6 @@ class Trade(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     # Relationships
-    backtest: Mapped["Backtest | None"] = relationship(lazy="selectin")  # noqa: F821
-    deployment: Mapped["LiveDeployment | None"] = relationship(lazy="selectin")  # noqa: F821
-    strategy: Mapped["Strategy"] = relationship(lazy="selectin")  # noqa: F821
+    backtest: Mapped[Backtest | None] = relationship(lazy="selectin")  # noqa: F821
+    deployment: Mapped[LiveDeployment | None] = relationship(lazy="selectin")  # noqa: F821
+    strategy: Mapped[Strategy] = relationship(lazy="selectin")  # noqa: F821

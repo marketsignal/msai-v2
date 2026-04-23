@@ -7,6 +7,8 @@ or ib_async is not installed (e.g., running without the live profile).
 
 from __future__ import annotations
 
+import itertools as _itertools
+from contextlib import suppress
 from typing import Any
 
 from msai.core.logging import get_logger
@@ -24,8 +26,6 @@ except ImportError:
 # Incrementing client ID avoids collision when multiple workers
 # or concurrent requests connect simultaneously. IB rejects
 # duplicate client IDs on the same gateway.
-import itertools as _itertools
-
 _ACCOUNT_CLIENT_COUNTER = _itertools.count(start=900)
 
 _ZERO_SUMMARY: dict[str, float] = {
@@ -79,10 +79,8 @@ class IBAccountService:
             for item in tags:
                 key = tag_map.get(item.tag)
                 if key:
-                    try:
+                    with suppress(ValueError, TypeError):
                         result[key] = float(item.value)
-                    except (ValueError, TypeError):
-                        pass
             return result
         except Exception:
             log.warning("ib_account_summary_failed", host=self.host, port=self.port)

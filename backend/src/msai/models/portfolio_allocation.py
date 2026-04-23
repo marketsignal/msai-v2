@@ -39,5 +39,5 @@ class PortfolioAllocation(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     # Relationships
-    portfolio: Mapped["Portfolio"] = relationship(lazy="selectin")  # noqa: F821
-    candidate: Mapped["GraduationCandidate"] = relationship(lazy="selectin")  # noqa: F821
+    portfolio: Mapped[Portfolio] = relationship(lazy="selectin")  # noqa: F821
+    candidate: Mapped[GraduationCandidate] = relationship(lazy="selectin")  # noqa: F821

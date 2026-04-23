@@ -1,4 +1,4 @@
-"""GraduationCandidate model — a strategy configuration progressing through the graduation pipeline."""
+"""GraduationCandidate model — a strategy config moving through the graduation pipeline."""
 
 from __future__ import annotations
 
@@ -39,12 +39,10 @@ class GraduationCandidate(TimestampMixin, Base):
     promoted_by: Mapped[UUID | None] = mapped_column(
         ForeignKey("users.id"), index=True, nullable=True
     )
-    promoted_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    promoted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Relationships
-    strategy: Mapped["Strategy"] = relationship(lazy="selectin")  # noqa: F821
-    research_job: Mapped["ResearchJob"] = relationship(lazy="selectin")  # noqa: F821
-    deployment: Mapped["LiveDeployment"] = relationship(lazy="selectin")  # noqa: F821
-    promoter: Mapped["User"] = relationship(lazy="selectin")  # noqa: F821
+    strategy: Mapped[Strategy] = relationship(lazy="selectin")  # noqa: F821
+    research_job: Mapped[ResearchJob] = relationship(lazy="selectin")  # noqa: F821
+    deployment: Mapped[LiveDeployment] = relationship(lazy="selectin")  # noqa: F821
+    promoter: Mapped[User] = relationship(lazy="selectin")  # noqa: F821

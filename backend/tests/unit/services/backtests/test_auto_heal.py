@@ -436,7 +436,16 @@ async def test_coverage_still_missing_after_ingest_returns_partial_gap(
     monkeypatch: pytest.MonkeyPatch,
     fast_settings: None,
 ) -> None:
-    gaps = [("AAPL.NASDAQ", [(1_700_000_000_000_000_000, 1_700_000_060_000_000_000)])]
+    # 15-day gap — must exceed the 7-day COVERAGE_TOLERANCE in auto_heal.py so
+    # the partial-ingest path classifies this as COVERAGE_STILL_MISSING instead
+    # of being tolerated as a weekend/holiday edge gap.
+    fifteen_days_ns = 15 * 24 * 3600 * 1_000_000_000
+    gaps = [
+        (
+            "AAPL.NASDAQ",
+            [(1_700_000_000_000_000_000, 1_700_000_000_000_000_000 + fifteen_days_ns)],
+        )
+    ]
     _patch_common(
         monkeypatch,
         resolved_ids=["AAPL.NASDAQ", "MSFT.NASDAQ"],

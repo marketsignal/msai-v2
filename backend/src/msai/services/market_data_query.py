@@ -65,7 +65,9 @@ class MarketDataQuery:
             """
             result = con.execute(query, [parquet_glob, start, end])
             columns = [desc[0] for desc in result.description]
-            rows: list[dict[str, Any]] = [dict(zip(columns, row)) for row in result.fetchall()]
+            rows: list[dict[str, Any]] = [
+                dict(zip(columns, row, strict=True)) for row in result.fetchall()
+            ]
             return rows
         except duckdb.IOException:
             log.warning("duckdb_io_error", symbol=symbol, glob=parquet_glob)

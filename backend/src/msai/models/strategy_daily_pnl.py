@@ -32,17 +32,18 @@ class StrategyDailyPnl(Base):
 
     __tablename__ = "strategy_daily_pnl"
     __table_args__ = (
-        UniqueConstraint("strategy_id", "deployment_id", "date", name="uq_strategy_deployment_date"),
+        UniqueConstraint(
+            "strategy_id",
+            "deployment_id",
+            "date",
+            name="uq_strategy_deployment_date",
+        ),
         Index("ix_strategy_daily_pnl_strategy_date", "strategy_id", "date"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    strategy_id: Mapped[UUID] = mapped_column(
-        ForeignKey("strategies.id"), nullable=False
-    )
-    deployment_id: Mapped[UUID] = mapped_column(
-        ForeignKey("live_deployments.id"), nullable=False
-    )
+    strategy_id: Mapped[UUID] = mapped_column(ForeignKey("strategies.id"), nullable=False)
+    deployment_id: Mapped[UUID] = mapped_column(ForeignKey("live_deployments.id"), nullable=False)
     date: Mapped[date] = mapped_column(Date, nullable=False)
     pnl: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
     cumulative_pnl: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
@@ -54,5 +55,5 @@ class StrategyDailyPnl(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     # Relationships
-    strategy: Mapped["Strategy"] = relationship(lazy="selectin")  # noqa: F821
-    deployment: Mapped["LiveDeployment"] = relationship(lazy="selectin")  # noqa: F821
+    strategy: Mapped[Strategy] = relationship(lazy="selectin")  # noqa: F821
+    deployment: Mapped[LiveDeployment] = relationship(lazy="selectin")  # noqa: F821

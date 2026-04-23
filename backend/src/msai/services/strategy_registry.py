@@ -411,11 +411,11 @@ def _find_config_class(module: ModuleType) -> type | None:
     # ~every strategy file and has ``.parse``, so the naive fallback
     # would pick it up and emit an empty config schema.
     try:
-        from nautilus_trader.trading.config import StrategyConfig as _NautilusBase
+        from nautilus_trader.trading.config import StrategyConfig as NautilusBase  # noqa: N806
     except Exception:  # pragma: no cover — Nautilus not importable
-        _NautilusBase = None  # type: ignore[assignment]
+        NautilusBase = None  # type: ignore[assignment]  # noqa: N806
     if imported_fallback is not None and (
-        _NautilusBase is None or imported_fallback is not _NautilusBase
+        NautilusBase is None or imported_fallback is not NautilusBase
     ):
         return imported_fallback
     return None

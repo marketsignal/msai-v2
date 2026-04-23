@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
@@ -21,12 +20,15 @@ from itertools import product
 from math import ceil
 from os import cpu_count
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from msai.core.config import settings
 from msai.services.nautilus.backtest_runner import BacktestResult, BacktestRunner
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = structlog.get_logger(__name__)
 
@@ -67,10 +69,7 @@ def expand_parameter_grid(grid: dict[str, list[Any]]) -> list[dict[str, Any]]:
         if not candidates:
             raise ValueError(f"Parameter grid entry {key!r} cannot be empty")
 
-    return [
-        dict(zip(keys, combination, strict=True))
-        for combination in product(*values)
-    ]
+    return [dict(zip(keys, combination, strict=True)) for combination in product(*values)]
 
 
 def count_parameter_grid(grid: dict[str, list[Any]]) -> int:
@@ -322,11 +321,11 @@ def is_stage_eligible(
         return False
     metrics = result.get("metrics") or {}
     min_trade_threshold = scaled_min_trades(min_trades, stage_fraction)
-    if min_trade_threshold is not None and float(metrics.get("num_trades", 0.0)) < min_trade_threshold:
+    num_trades = float(metrics.get("num_trades", 0.0))
+    total_return = float(metrics.get("total_return", 0.0))
+    if min_trade_threshold is not None and num_trades < min_trade_threshold:
         return False
-    if require_positive_return and float(metrics.get("total_return", 0.0)) <= 0.0:
-        return False
-    return True
+    return not (require_positive_return and total_return <= 0.0)
 
 
 def build_prune_reason(
@@ -466,9 +465,7 @@ def generalization_gap(
     metric: str,
 ) -> float:
     """Compute the gap between in-sample and out-of-sample performance."""
-    return average_metric(in_sample_results, metric) - average_metric(
-        out_of_sample_results, metric
-    )
+    return average_metric(in_sample_results, metric) - average_metric(out_of_sample_results, metric)
 
 
 def stability_ratio(
@@ -665,9 +662,7 @@ class ResearchEngine:
                 results[candidate_index]["train_metrics"] = full_result.get("metrics")
                 results[candidate_index]["metrics"] = full_result.get("metrics")
                 results[candidate_index]["error"] = full_result.get("error")
-                results[candidate_index]["completed_full_run"] = (
-                    full_result.get("error") is None
-                )
+                results[candidate_index]["completed_full_run"] = full_result.get("error") is None
                 results[candidate_index]["selection_basis"] = "train"
 
         # Holdout evaluation
@@ -676,8 +671,7 @@ class ResearchEngine:
             holdout_candidates = [
                 i
                 for i in survivors
-                if results[i].get("error") is None
-                and bool(results[i].get("completed_full_run"))
+                if results[i].get("error") is None and bool(results[i].get("completed_full_run"))
             ]
             if holdout_candidates:
                 if progress_callback is not None:
@@ -685,8 +679,7 @@ class ResearchEngine:
                         {
                             "progress": 90,
                             "message": (
-                                f"Evaluating {len(holdout_candidates)} candidates "
-                                "on purged holdout"
+                                f"Evaluating {len(holdout_candidates)} candidates on purged holdout"
                             ),
                             "completed_trials": len(holdout_candidates),
                             "total_trials": len(results),
@@ -703,17 +696,11 @@ class ResearchEngine:
                 )
                 holdout_evaluated = len(holdout_results)
                 for candidate_index, holdout_result in holdout_results:
-                    results[candidate_index]["holdout_metrics"] = holdout_result.get(
-                        "metrics"
-                    )
-                    results[candidate_index]["holdout_error"] = holdout_result.get(
-                        "error"
-                    )
+                    results[candidate_index]["holdout_metrics"] = holdout_result.get("metrics")
+                    results[candidate_index]["holdout_error"] = holdout_result.get("error")
                     results[candidate_index]["selection_basis"] = "holdout"
                     if holdout_result.get("error") is None:
-                        results[candidate_index]["metrics"] = holdout_result.get(
-                            "metrics"
-                        )
+                        results[candidate_index]["metrics"] = holdout_result.get("metrics")
 
         # Rank and select best
         ranked_results = rank_results(results, objective=objective)
@@ -761,15 +748,11 @@ class ResearchEngine:
             },
             "summary": {
                 "total_runs": len(ranked_results),
-                "successful_runs": sum(
-                    1 for r in ranked_results if r.get("error") is None
-                ),
+                "successful_runs": sum(1 for r in ranked_results if r.get("error") is None),
                 "fully_evaluated_runs": sum(
                     1 for r in ranked_results if bool(r.get("completed_full_run"))
                 ),
-                "pruned_runs": sum(
-                    1 for r in ranked_results if bool(r.get("pruned"))
-                ),
+                "pruned_runs": sum(1 for r in ranked_results if bool(r.get("pruned"))),
                 "holdout_evaluated_runs": holdout_evaluated,
                 "best_result": best_result,
                 "full_period_result": full_period_result,
@@ -823,11 +806,8 @@ class ResearchEngine:
             if progress_callback is not None:
                 progress_callback(
                     {
-                        "progress": 10
-                        + int(80 * ((index - 1) / max(1, total_windows))),
-                        "message": (
-                            f"Running walk-forward window {index} of {total_windows}"
-                        ),
+                        "progress": 10 + int(80 * ((index - 1) / max(1, total_windows))),
+                        "message": (f"Running walk-forward window {index} of {total_windows}"),
                         "stage_index": index,
                         "stage_count": total_windows,
                         "completed_trials": index - 1,
@@ -902,9 +882,7 @@ class ResearchEngine:
             "successful_test_windows": len(out_of_sample_results),
             "avg_train_sharpe": average_metric(in_sample_results, "sharpe"),
             "avg_test_sharpe": average_metric(out_of_sample_results, "sharpe"),
-            "avg_test_total_return": average_metric(
-                out_of_sample_results, "total_return"
-            ),
+            "avg_test_total_return": average_metric(out_of_sample_results, "total_return"),
             "avg_test_win_rate": average_metric(out_of_sample_results, "win_rate"),
             "worst_test_drawdown": min_metric(out_of_sample_results, "max_drawdown"),
             "generalization_gap": generalization_gap(
@@ -1154,9 +1132,7 @@ class ResearchEngine:
                 ],
                 objective=objective,
             )
-            ranked_stage_indexes = [
-                int(r["candidate_index"]) for r in ranked_stage_pairs
-            ]
+            ranked_stage_indexes = [int(r["candidate_index"]) for r in ranked_stage_pairs]
 
             if stage_idx == len(stages):
                 survivors = ranked_stage_indexes
@@ -1170,9 +1146,7 @@ class ResearchEngine:
                     mark_candidate_pruned(
                         candidates[ci],
                         stage_index=stage_idx,
-                        reason=(
-                            f"Pruned by successive halving after stage {stage_idx}"
-                        ),
+                        reason=(f"Pruned by successive halving after stage {stage_idx}"),
                     )
                 survivors = next_survivors
 
@@ -1274,8 +1248,7 @@ class ResearchEngine:
             if progress_callback is not None:
                 progress_callback(
                     {
-                        "progress": 10
-                        + int(70 * (terminal_trials / max(1, target_trials))),
+                        "progress": 10 + int(70 * (terminal_trials / max(1, target_trials))),
                         "message": f"Optuna trial {terminal_trials + 1}/{target_trials}",
                         "completed_trials": terminal_trials,
                         "total_trials": target_trials,
@@ -1328,9 +1301,7 @@ class ResearchEngine:
                 study.tell(trial, state=TrialState.FAIL)
                 history[cache_key] = {"state": "fail", "value": None}
             else:
-                obj_val = extract_objective_value(
-                    candidate.get("metrics") or {}, objective
-                )
+                obj_val = extract_objective_value(candidate.get("metrics") or {}, objective)
                 study.tell(trial, obj_val)
                 history[cache_key] = {"state": "complete", "value": obj_val}
 
@@ -1383,19 +1354,13 @@ class ResearchEngine:
             },
             "summary": {
                 "total_runs": len(ranked_results),
-                "successful_runs": sum(
-                    1 for r in ranked_results if r.get("error") is None
-                ),
+                "successful_runs": sum(1 for r in ranked_results if r.get("error") is None),
                 "fully_evaluated_runs": sum(
                     1 for r in ranked_results if bool(r.get("completed_full_run"))
                 ),
-                "pruned_runs": sum(
-                    1 for r in ranked_results if bool(r.get("pruned"))
-                ),
+                "pruned_runs": sum(1 for r in ranked_results if bool(r.get("pruned"))),
                 "holdout_evaluated_runs": sum(
-                    1
-                    for r in ranked_results
-                    if r.get("holdout_metrics") is not None
+                    1 for r in ranked_results if r.get("holdout_metrics") is not None
                 ),
                 "best_result": best_result,
                 "full_period_result": full_period_result,

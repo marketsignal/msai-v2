@@ -13,7 +13,6 @@ from typing import Any
 
 import pandas as pd
 import pyarrow as pa
-import pyarrow.parquet as pq
 
 from msai.core.data_integrity import atomic_write_parquet, dedup_bars
 from msai.core.logging import get_logger
@@ -70,7 +69,8 @@ class ParquetStore:
             # Merge with existing data when the file already exists.
             if target.exists():
                 existing = pd.read_parquet(target)
-                group = dedup_bars(pd.concat([existing, group], ignore_index=True), key_columns=dedup_key)
+                merged = pd.concat([existing, group], ignore_index=True)
+                group = dedup_bars(merged, key_columns=dedup_key)
 
             table = pa.Table.from_pandas(group, preserve_index=False)
             last_checksum = atomic_write_parquet(table, target)

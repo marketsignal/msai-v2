@@ -12,6 +12,12 @@ import pytest
 from msai.core.auth import get_current_user
 from msai.main import app
 
+# Note: setup_logging() (called at msai.main import) disables
+# cache_logger_on_first_use when ENVIRONMENT=="test", which the CI job
+# sets and which tests expect. This lets structlog.testing.capture_logs()
+# swap in its own processor chain at any point during the test run,
+# regardless of which loggers have already been bound by earlier imports.
+
 _MOCK_CLAIMS: dict[str, Any] = {
     "sub": "test-user",
     "preferred_username": "test@example.com",

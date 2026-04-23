@@ -11,14 +11,17 @@ Designed to run as an arq cron job (see :mod:`msai.workers.settings`).
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from msai.core.config import settings
 from msai.core.database import async_session_factory
 from msai.core.logging import get_logger
 from msai.models.backtest import Backtest
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
 from msai.models.research_job import ResearchJob
 
 log = get_logger(__name__)
