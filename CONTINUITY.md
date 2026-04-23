@@ -314,6 +314,22 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 - **Drill-uncovered bug batch** (`e5afb7e`, "no bugs left behind"): (a) `ib_qualifier.py` futures use `%Y%m` so IB resolves holiday-adjusted expiry (Juneteenth ESM6 shift); (b) `_upsert_definition_and_alias` normalizes FX `raw_symbol` at storage boundary to slash form; (c) `/live/trades` accepts + applies `deployment_id: UUID` query filter. Each re-verified against the E2E path that surfaced it (feedback memory `feedback_rerun_e2e_after_bug_fixes.md`).
 - **Post-merge cleanup:** worktree removed, remote + local branch deleted, main ff'd to `29dbe9b`.
 
+## Done (cont'd 13) — CI unblock shipped (2026-04-23 / PR #42)
+
+- **Merged to main** at `8537ae2` (squash of 10 commits) — 43 files, +291 / −209. Started as a `/quick-fix` CI probe and escalated to `/fix-bug` mid-session after the probe surfaced drift that had been invisible while CI was broken. Codex consulted at the scope-growth decision point (`C > B >> A` — the reframe that sealed it: "this isn't a probe anymore, it's a bug-fix branch" once latent `F821`s in `main.py` were found).
+- **CI was broken since post-flatten.** `.github/workflows/ci.yml:47` used `hashFiles('frontend/pnpm-lock.yaml') != ''` at `jobs.<job_id>.if` level. GitHub Actions only allows `hashFiles()` in step-level contexts, so the workflow was rejected at parse time with 0s-duration runs. Invisible pre-flatten because the workflow lived under `claude-version/.github/workflows/` which GitHub didn't detect. Ping-workflow probe validated it was a per-workflow config issue, not org policy.
+- **What shipped:**
+  1. Parse bug fix in `ci.yml` (hashFiles guard removed).
+  2. **110 ruff errors cleaned across 13 rule categories** via per-site triage (no blanket `--unsafe-fixes`): 32 auto-safe (UP037 on SQLAlchemy models is safe under `from __future__ import annotations` — experimentally verified all model imports still resolve); 10 × B904 (`from exc` where detail surfaces the inner exception, else `from None`); 4 × SIM105 → `contextlib.suppress()`; 6 × E501 wrap; **3 × F821 latent defects in `main.py:91,95,98`** (`Any`/`StreamRegistry` referenced without import — saved only by `from __future__ import annotations`, would have blown up any `get_type_hints()` call); 44 × TC00x via `pyproject.toml` per-file-ignores for framework-introspected dirs (`models/`, `schemas/`, `api/`, `core/auth.py`, `core/database.py`) + safe TYPE_CHECKING moves in `services/` (experimentally confirmed that moving `datetime`/`UUID`/`Decimal` into TYPE_CHECKING breaks SQLAlchemy 2.0 `Mapped[...]` resolution at class construction).
+  3. **Mypy 147 → 132 errors** via stub-overrides for 16 untyped libs (nautilus, databento, pandas, arq, etc.); step marked `continue-on-error: true` so remaining 132 (real code drift) don't block merges. Deferred to dedicated cleanup PR.
+  4. **`pyproject.toml` pytest `pythonpath=["src"]`** — without this, CI's `uv run pytest tests/` fails with `ModuleNotFoundError: No module named 'msai'` before collecting a test.
+  5. **Stale test fixture fix** in `test_coverage_still_missing_after_ingest_returns_partial_gap` — broken on main since PR #40's 7-day coverage tolerance landed (60-second gap → 15-day gap so the partial-ingest path classifies as `COVERAGE_STILL_MISSING` instead of being tolerated).
+  6. **Two CI-env-only test fixes.** `setup_logging` now disables `cache_logger_on_first_use` when `ENVIRONMENT=test` (structlog's frozen-chain behavior was defeating `structlog.testing.capture_logs()` under CI's integration-before-unit test order). `test_refresh_help_documents_providers` strips ANSI codes before substring matching (CliRunner colors output differently in CI vs local shells).
+  7. **CI triggers opened** — feature-branch pushes + `workflow_dispatch` now get CI signal.
+- **Final CI state on branch:** ✅ frontend 59s · ✅ backend 6m29s (ruff clean + pytest 1703/1703 + mypy advisory) · ✅ ping 3s. Run `24822937903`.
+- **Tooling:** `actionlint` installed via `brew install actionlint` — would have caught the `hashFiles()` parse bug before the first push. Add as a pre-commit hook in the mypy-cleanup PR.
+- **Follow-up deferred:** mypy `--strict` cleanup — 132 remaining errors (31 × type-arg missing generic params on `dict`/`list`, 26 × name-defined forward refs, 11 × unused-ignore, 11 × attr-defined, 8 × valid-type, 8 × arg-type, 7 × int, 6 × no-any-return, plus misc). Once cleaned, remove `continue-on-error: true` from `ci.yml`.
+
 ## Done (cont'd 12) — Backtest results charts + paginated trade log + in-app report iframe shipped (2026-04-23 / PR #41)
 
 - **Merged to main** at `330e56a` (squash of 4 commits: `84de2cf` Phase 1-3 artifacts + `2178f29` Histogram primitive + `1b6a092` implementation + `c96d68c` post-review fix). Closes the "UI-RESULTS-01" follow-up Pablo flagged after the PR #40 SPY live demo.
@@ -343,18 +359,13 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 
 ## Now
 
-- **READY FOR PR: `fix/ci-ping-probe`** at `cdca1d2` (9 commits ahead of main). CI is **GREEN end-to-end** on the branch (run `24822937903`): ✅ frontend 59s · ✅ backend 6m29s (ruff clean + pytest 1703/1703 + mypy advisory). Escalated from `/quick-fix` → `/fix-bug` mid-session when the probe uncovered 110-error ruff drift + 147-error mypy drift + 2 CI-env test failures + a pytest pythonpath bug + a stale coverage-tolerance test fixture.
-- **What this PR ships:**
-  1. Fixes the post-flatten 0s-duration CI parse bug (`hashFiles()` at job-level `if:`).
-  2. Cleans up 110 ruff errors across 13 rule categories with per-site triage (NO blanket `--unsafe-fixes`); notably fixes 3 F821 latent defects in `main.py:91,95,98` (`Any`/`StreamRegistry` referenced without import).
-  3. Fixes 147 → 132 mypy errors via library-stub overrides; marks the mypy step `continue-on-error: true` to unblock merges while a dedicated mypy-cleanup PR lands (132 remaining are real code drift requiring days of triage).
-  4. Fixes the pytest `pythonpath=["src"]` gap that would have made every CI test run error before a single test collected.
-  5. Fixes a stale test fixture (`test_coverage_still_missing_after_ingest_returns_partial_gap`) that had been broken on main since PR #40 added a 7-day coverage tolerance.
-  6. Fixes two CI-env-only test failures: structlog `cache_logger_on_first_use=True` frozen chains defeating `capture_logs()` (fixed by making `setup_logging` test-env aware) + ANSI-wrapped `--provider` CLI help substring match (fixed with ANSI strip).
-  7. Opens CI triggers to feature-branch pushes + adds `workflow_dispatch`.
-- **Known follow-up (dedicated PR):** **mypy --strict cleanup** — 132 remaining errors. Categories: 31 × type-arg (missing generic params on `dict`/`list`), 26 × name-defined (forward refs), 11 × unused-ignore, 11 × attr-defined (nautilus/Cython attrs), 8 × valid-type, 8 × arg-type, 7 × int, 6 × no-any-return, plus misc. Once cleaned, remove `continue-on-error: true` from `ci.yml`.
-- **Tooling added this session:** `actionlint` installed via `brew install actionlint` — would have caught the `hashFiles()` parse bug before push. Worth adding as a pre-commit hook in the same mypy-cleanup PR.
-- **Next after merge (Codex-ratified sequence, unchanged):** #8 Databento catalog bootstrap → PRD/council for #2 Symbol Onboarding → #2 impl → mypy cleanup → #3 `instrument_cache` migration + `canonical_instrument_id()` removal.
+- **No active workflow.** Last shipped: PR #42 "ci: unblock CI — fix parse bug + ruff/pytest cleanup (mypy advisory)" merged squash at `8537ae2` on 2026-04-23. See "Done (cont'd 13)" for details.
+- **Stack:** main on `8537ae2` with PR #42 merged. Local branch + worktree cleanup done. Origin branch deleted. Dev compose stack should still be restarted from main when needed: `docker compose -f docker-compose.dev.yml up -d && ./scripts/restart-workers.sh`.
+- **Next (Codex-ratified sequence, updated post-PR-42):**
+  1. **Mypy `--strict` cleanup** — 132 pre-existing errors in `src/`. Once clean, remove `continue-on-error: true` from `.github/workflows/ci.yml`. Also add `actionlint` as a pre-commit hook in the same PR.
+  2. **#8 Databento catalog bootstrap** — unblock cold-start equity registration without IB Gateway.
+  3. **PRD/council for #2 Symbol Onboarding** — then implementation.
+  4. **#3 `instrument_cache` → registry migration** + `canonical_instrument_id()` removal.
 - **Uncommitted on main (unrelated to this fix):** `frontend/playwright.config.ts` baseURL reverted `:3300` → `:3000` — leftover from the 2026-04-22 computer reset. Revert when convenient.
 - **Stack:** main on `75c4c1e` (PR #41 merge at `330e56a` + this CONTINUITY cleanup); worktrees clean (all merged); dev compose volumes preserved via pins (see "Done cont'd 10"). Docker daemon confirmed up 2026-04-23 — still need `docker compose -f docker-compose.dev.yml up -d` from `/Users/pablomarin/Code/msai-v2` + `./scripts/restart-workers.sh` so `backtest-worker` + `job-watchdog` pick up the new `_materialize_series_payload` + signed-URL code before the next live/backtest run.
 
@@ -368,15 +379,15 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 
 ### High-priority
 
-1. **CI hardening** (new deferred item, follow-up PR). The workflow at `.github/workflows/ci.yml` was previously buried under `claude-version/.github/workflows/` which GitHub didn't detect. Post-flatten it ran for the first time and fails with 0s-duration / empty jobs — classic workflow-parse or policy rejection. Pre-existing bug; not introduced by the flatten. Fixed the known-broken pin in PR #36 (`astral-sh/setup-uv@v4.3.0` → `v7.3.0`); the remaining failure cause is not diagnosable without org-admin scope. Follow-up PR scope (prioritized):
-   1. Probe minimal `Ping` workflow to isolate org-policy vs per-workflow issue
-   2. `.github/dependabot.yml` — prevents this class of action-pin rot
-   3. `pytest-xdist -n auto` — free ~3x backend-test speedup
-   4. `--cov-fail-under=<baseline>` coverage floor
-   5. `on: push:` without branch filter — feature-branch pushes get CI feedback before PR opens
-   6. `workflow_dispatch` trigger — runs become manually re-triggerable
-   7. Optional docker-compose smoke test (`docker compose config --quiet` at minimum)
-   8. Security scanning — `pip-audit`, `npm audit`, Trivy on Dockerfiles
+1. ~~**CI hardening** — parse bug + ruff + pytest unblock~~ — **SHIPPED** as PR #42 (merged `8537ae2` 2026-04-23). See "Done (cont'd 13)". Remaining CI-hardening sub-items (moved to their own numbered backlog below in item 9).
+
+2. **CI follow-up backlog** (post-PR-42):
+   1. **Mypy `--strict` cleanup** (highest priority) — 132 remaining errors in `src/` (31 × type-arg, 26 × name-defined, 11 × unused-ignore, 11 × attr-defined, plus misc). Once clean, remove `continue-on-error: true` from `.github/workflows/ci.yml`. Also add `actionlint` as a pre-commit hook in the same PR.
+   2. `.github/dependabot.yml` — prevents the kind of action-pin rot that made the `setup-uv@v4.3.0` bug in PR #36 hard to notice.
+   3. `pytest-xdist -n auto` — free ~3x backend-test speedup.
+   4. `--cov-fail-under=<baseline>` coverage floor.
+   5. Optional docker-compose smoke test (`docker compose config --quiet` at minimum).
+   6. Security scanning — `pip-audit`, `npm audit`, Trivy on Dockerfiles.
 
 ### From PR #32 ("db-backed-strategy-registry") + PR #35 scope-outs
 
