@@ -10,36 +10,12 @@ from uuid import uuid4
 
 import pandas as pd
 import pytest
-import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from msai.core.database import get_db
 from msai.main import app
 from msai.models.backtest import Backtest
 from msai.models.trade import Trade
-
-# Reconfigure structlog without caching so structlog.testing.capture_logs()
-# can intercept the processor chain on loggers that were already bound at
-# module import time. `msai.main` calls setup_logging() with
-# cache_logger_on_first_use=True, which freezes the chain on first log
-# call and makes capture_logs() see an empty list in CI (order-dependent
-# test flakiness). See tests/unit/test_backtest_job.py and
-# tests/unit/services/backtests/test_auto_heal.py for the consumers.
-structlog.configure(
-    processors=[
-        structlog.contextvars.merge_contextvars,
-        structlog.processors.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.UnicodeDecoder(),
-        structlog.dev.ConsoleRenderer(colors=False),
-    ],
-    wrapper_class=structlog.make_filtering_bound_logger(10),
-    logger_factory=structlog.PrintLoggerFactory(),
-    cache_logger_on_first_use=False,
-    context_class=dict,
-)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable

@@ -8,9 +8,36 @@ from typing import Any
 
 import httpx
 import pytest
+import structlog
 
 from msai.core.auth import get_current_user
 from msai.main import app
+
+# Reconfigure structlog with cache_logger_on_first_use=False so
+# structlog.testing.capture_logs() can always intercept, regardless of
+# which logger has already been materialized by earlier imports. The
+# production setup_logging() in msai.core.logging uses cache=True for
+# perf; that freezes the processor chain on first log call and makes
+# capture_logs() see an empty buffer under CI's test-discovery order
+# (integration/ runs before unit/ alphabetically, so a backtest_job
+# log call in an integration test locks the chain before unit tests
+# get a chance to intercept). Runs once here in the top-level conftest
+# so it takes effect before ANY test (unit, integration, or e2e) runs.
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        structlog.processors.UnicodeDecoder(),
+        structlog.dev.ConsoleRenderer(colors=False),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(10),
+    logger_factory=structlog.PrintLoggerFactory(),
+    cache_logger_on_first_use=False,
+    context_class=dict,
+)
 
 _MOCK_CLAIMS: dict[str, Any] = {
     "sub": "test-user",
