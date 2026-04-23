@@ -51,9 +51,8 @@ venues) don't have a meaningful trading-hours window.
 
 from __future__ import annotations
 
-from typing import Any
-
 from datetime import datetime  # noqa: TC003 — required at runtime for SQLAlchemy Mapped[]
+from typing import Any
 
 from sqlalchemy import DateTime, Index, String
 from sqlalchemy.dialects.postgresql import JSONB

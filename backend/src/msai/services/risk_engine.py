@@ -9,9 +9,8 @@ reset (typically at the start of the next trading day).
 
 from __future__ import annotations
 
-from typing import Any
-
 from dataclasses import dataclass
+from typing import Any
 
 from msai.core.logging import get_logger
 

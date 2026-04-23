@@ -240,7 +240,7 @@ class DataIngestionService:
         else:
             payload = {"last_run_at": None, "recent_runs": []}
         payload.setdefault("recent_runs", [])
-        payload["storage_stats"] = MarketDataQuery(settings.data_root).get_storage_stats()
+        payload["storage_stats"] = MarketDataQuery(str(settings.data_root)).get_storage_stats()
         return payload
 
     # ------------------------------------------------------------------

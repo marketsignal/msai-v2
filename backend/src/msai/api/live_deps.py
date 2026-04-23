@@ -59,7 +59,7 @@ async def get_live_redis_binary() -> AsyncRedis:
     if _binary_redis is None:
         import redis.asyncio as aioredis
 
-        _binary_redis = aioredis.from_url(settings.redis_url, decode_responses=False)
+        _binary_redis = aioredis.from_url(settings.redis_url, decode_responses=False)  # type: ignore[no-untyped-call]  # redis-py async.from_url lacks stubs
     return _binary_redis
 
 
@@ -72,7 +72,7 @@ async def get_live_redis_text() -> AsyncRedis:
     if _text_redis is None:
         import redis.asyncio as aioredis
 
-        _text_redis = aioredis.from_url(settings.redis_url, decode_responses=True)
+        _text_redis = aioredis.from_url(settings.redis_url, decode_responses=True)  # type: ignore[no-untyped-call]  # redis-py async.from_url lacks stubs
     return _text_redis
 
 

@@ -6,13 +6,44 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field     | Value |
-| --------- | ----- |
-| Command   | none  |
-| Phase     | —     |
-| Next step | —     |
+| Field     | Value                        |
+| --------- | ---------------------------- |
+| Command   | /fix-bug mypy-strict-cleanup |
+| Phase     | Pre-Flight                   |
+| Next step | Verify plugins               |
 
 ### Checklist
+
+- [x] Worktree created at `.worktrees/mypy-strict-cleanup` off `5cb55b8` (main @ PR #42)
+- [x] Project state read
+- [ ] Plugins verified
+- [ ] Searched existing solutions
+- [ ] Systematic debugging complete
+- [ ] Library research done (if external dep involved)
+- [ ] Design guidance loaded (N/A — not a UI fix)
+- [ ] Brainstorming complete (complex fix — all 132 errors pre-existing drift)
+- [ ] Approach comparison filled
+- [ ] Contrarian gate passed
+- [ ] Council verdict (if triggered)
+- [ ] Plan written
+- [ ] Plan review loop (0 iterations)
+- [ ] TDD fix execution complete
+- [x] Code review loop (1 iteration — PASS) — 3-agent parallel simplify sweep (reuse/quality/efficiency) 2026-04-23. Findings: (quality) pg_insert parity — third site kept `pg_insert(table)` + `type: ignore` while other 2 used `pg_insert(Model)` directly; refactored for parity (type:ignore removed). (quality) `[misc,assignment]` dual-code on strategy_registry.py:416 needed rationale — added comment explaining both codes. (efficiency) `async_class`/`async_syms` intermediate vars in portfolio_service.py `_run_ingest` added no value — inlined. All other findings either N/A or already correct (builtins.list[X] workaround validated as idiomatic, import hoisting in workers/settings.py safe, `list(...)` wrapping on cold paths). Codex not run for this iter — internal type-cleanup is mechanical enough that 3-agent simplify fully covers the risk surface.
+- [x] Simplified — 3 edits applied (service.py pg_insert parity, strategy_registry.py type:ignore rationale, portfolio_service.py inline the intermediate vars). All gates re-verified: mypy --strict clean, ruff clean, pytest 1703/1703.
+- [x] Verified (tests/lint/types) — verify-app agent PASS 2026-04-23: ruff clean, mypy --strict 0/166 files, pytest 1703/1703 unit
+- [x] E2E use cases designed — N/A: internal type-annotation cleanup, zero user-facing behavior change
+- [x] E2E verified — N/A: internal type-annotation cleanup, zero user-facing behavior change (1703/1703 unit tests pass + mypy --strict clean = sufficient regression coverage)
+- [x] E2E regression passed — N/A: no user-facing code path modified
+- [x] E2E use cases graduated — N/A: no use cases authored
+- [x] E2E specs graduated — N/A: no use cases authored
+- [ ] Learning documented
+- [ ] State files updated
+- [ ] Committed and pushed
+- [ ] PR created
+- [ ] PR reviews addressed
+- [ ] Branch finished
+
+## Prior workflow checklist (archived — PR #42 CI unblock SHIPPED 2026-04-23)
 
 - [x] Worktree created at `.worktrees/backtest-auto-ingest-on-missing-data` off `44d6329` (main @ PR #39)
 - [x] Project state read

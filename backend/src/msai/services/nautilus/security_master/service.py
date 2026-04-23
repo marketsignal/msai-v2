@@ -737,7 +737,7 @@ class SecurityMaster:
 
         now = datetime.now(UTC)
         def_stmt = (
-            pg_insert(InstrumentDefinition.__table__)
+            pg_insert(InstrumentDefinition)
             .values(
                 raw_symbol=raw_symbol,
                 listing_venue=listing_venue,
@@ -795,7 +795,7 @@ class SecurityMaster:
         # Alias upsert — ON CONFLICT DO NOTHING since the uniqueness key
         # includes ``effective_from`` so a same-day re-upsert is a no-op.
         alias_stmt = (
-            pg_insert(InstrumentAlias.__table__)
+            pg_insert(InstrumentAlias)
             .values(
                 instrument_uid=instrument_uid,
                 alias_string=alias_string,
@@ -862,7 +862,7 @@ class SecurityMaster:
 
         ib_contract_dict = _ib_contract_to_dict(spec_to_ib_contract(spec))
 
-        stmt = pg_insert(table).values(
+        stmt = pg_insert(InstrumentCache).values(
             canonical_id=canonical_id,
             asset_class=spec.asset_class,
             venue=spec.venue,

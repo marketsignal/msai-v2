@@ -15,6 +15,7 @@ from msai.core.logging import get_logger
 from msai.models.asset_universe import AssetUniverse
 
 if TYPE_CHECKING:
+    import builtins
     from datetime import datetime
     from uuid import UUID
 
@@ -86,7 +87,7 @@ class AssetUniverseService:
         *,
         asset_class: str | None = None,
         enabled: bool | None = True,
-    ) -> list[AssetUniverse]:
+    ) -> builtins.list[AssetUniverse]:
         """List assets, optionally filtered by asset_class and enabled status.
 
         Args:
@@ -108,7 +109,7 @@ class AssetUniverseService:
         result = await session.execute(stmt)
         return list(result.scalars().all())
 
-    async def get_ingest_targets(self, session: AsyncSession) -> list[AssetUniverse]:
+    async def get_ingest_targets(self, session: AsyncSession) -> builtins.list[AssetUniverse]:
         """Get all enabled assets for daily ingestion.
 
         Convenience wrapper around :meth:`list` with ``enabled=True``.

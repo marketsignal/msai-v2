@@ -9,7 +9,7 @@ Azure Key Vault requires the optional ``azure`` dependency group::
 from __future__ import annotations
 
 import os
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 
 @runtime_checkable
@@ -67,10 +67,10 @@ class AzureKeyVaultProvider:
     def __init__(self, vault_url: str) -> None:
         self._vault_url = vault_url
         # Lazy-initialised on first call to get().
-        self._client: object | None = None
+        self._client: Any = None
         self._not_found_error: type[Exception] | None = None
 
-    def _ensure_azure(self) -> object:
+    def _ensure_azure(self) -> Any:
         """Import Azure SDK, create and cache the ``SecretClient`` on first use.
 
         Raises:

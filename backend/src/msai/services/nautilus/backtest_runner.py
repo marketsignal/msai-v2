@@ -637,8 +637,8 @@ def _derive_metrics_from_positions(positions_df: pd.DataFrame) -> dict[str, floa
     # would otherwise add EUR + USD numerics as if they were the
     # same unit, producing nonsense totals that can override a valid
     # account-derived metric.
-    pairs = [_money_to_float_with_currency(v) for v in closed["realized_pnl"].tolist()]
-    pairs = [p for p in pairs if p is not None]
+    raw_pairs = [_money_to_float_with_currency(v) for v in closed["realized_pnl"].tolist()]
+    pairs: list[tuple[float, str]] = [p for p in raw_pairs if p is not None]
     if not pairs:
         return None
 

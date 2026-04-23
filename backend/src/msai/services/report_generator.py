@@ -85,7 +85,7 @@ class ReportGenerator:
             with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w") as tmp:
                 tmp_path = tmp.name
 
-            qs.reports.html(
+            qs.reports.html(  # type: ignore[no-untyped-call]  # quantstats ships no stubs
                 returns,
                 benchmark=normalized_benchmark,
                 title=title,

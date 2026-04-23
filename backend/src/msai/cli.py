@@ -53,12 +53,14 @@ or the settings-level key — matches the backend's dual-mode auth in
 
 from __future__ import annotations
 
-from typing import Any
-
 import asyncio
 import json
 import os
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 import httpx
 import typer
@@ -639,9 +641,12 @@ def system_health() -> None:
     as ``ok: false``.
     """
 
-    def _parse_probe(response: httpx.Response, body_ok_fn) -> dict[str, object]:
+    def _parse_probe(
+        response: httpx.Response,
+        body_ok_fn: Callable[[Any], bool],
+    ) -> dict[str, object]:
         """Derive ``ok`` from the response body when needed."""
-        body: object | None = None
+        body: Any = None
         try:
             body = response.json()
         except ValueError:
@@ -653,7 +658,7 @@ def system_health() -> None:
             "body": body,
         }
 
-    probes: list[tuple[str, str, object]] = [
+    probes: list[tuple[str, str, Callable[[Any], bool]]] = [
         # label, path, body-ok predicate
         ("api", "/health", lambda _b: True),
         ("ready", "/ready", lambda _b: True),

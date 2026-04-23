@@ -796,7 +796,8 @@ def _pick_timestamp(row: dict[str, Any]) -> datetime:
             continue
         parsed = pd.to_datetime(raw, utc=True, errors="coerce")
         if not pd.isna(parsed):
-            return parsed.to_pydatetime()
+            py_dt: datetime = parsed.to_pydatetime()
+            return py_dt
     return datetime.now(UTC)
 
 
