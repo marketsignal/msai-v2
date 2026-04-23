@@ -4,6 +4,20 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-04-23 — CI probe + parse-bug fix (branch `fix/ci-ping-probe`) — DIAGNOSTIC COMPLETE, PAUSED FOR SCOPE DECISION
+
+**Context:** Per Codex-ratified sequencing, the plan was CI probe → #8 Databento bootstrap → #2 Symbol Onboarding → #3 `instrument_cache` migration. Probe scope: add minimal `Ping` workflow + open `ci.yml` triggers to feature branches + `workflow_dispatch`. Diagnostic question: is post-flatten 0s-duration CI an org-policy issue or a per-workflow config issue?
+
+**Findings:**
+
+- ✅ **Not org policy.** `Ping` runs cleanly on push to the branch (8s, success).
+- ✅ **Root cause identified + fixed.** `.github/workflows/ci.yml:47` used `hashFiles('frontend/pnpm-lock.yaml') != ''` at `jobs.<job_id>.if` level. Per GitHub Actions context rules, `hashFiles()` is only valid inside step-level contexts. The workflow failed at parse time with 0s-duration. Invisible pre-flatten because the workflow lived under `claude-version/.github/workflows/` which GitHub didn't detect. Guard removed; `frontend/pnpm-lock.yaml` is committed so the guard was unnecessary anyway.
+- ✅ **CI now parses and runs.** Frontend job: PASS (lint + build, 1m5s).
+- ❌ **Backend job: FAIL at `ruff check src/` step — 110 errors.** This is the accumulated drift Codex predicted: every recent PR claimed "ruff clean on PR-touched files" but CI was never running to enforce `src/` globally. Breakdown: 38 × TC003 (typing import placement), 21 × UP037 (quoted annotation), 10 × B904 (raise-without-from), 7 × F401 (unused import), 6 × E501 (line-too-long), 5 × TC002, 4 × SIM105, **3 × F821 undefined-name in `src/msai/main.py` (`Any`, `StreamRegistry` × 2)** — latent due to `from __future__ import annotations` but still real, plus 16 miscellaneous. 32 auto-fixable, 51 unsafe-fixable, ~27 need review.
+- **Paused for scope decision.** Three paths: (A) ship probe as-is + fix ruff in follow-up (main goes red between merges), (B) revert trigger-opening here so CI doesn't enforce until next PR (defers the value), (C) expand this PR into full `/fix-bug` CI cleanup (ruff + mypy + any test drift). Pending Pablo's call.
+
+**Actionlint installed via `brew install actionlint`** — would have caught the `hashFiles()` parse bug before push. Worth adding as a pre-commit hook in the full CI hardening PR.
+
 ### 2026-04-21 — Backtest results charts & trade log (branch `feat/backtest-results-charts-and-trades`) — PHASE 4 EXECUTION IN PROGRESS
 
 **What this PR will do:** Surface Pyfolio-style tear-sheet content (equity curve, drawdown, monthly-returns heatmap, paginated trade log + in-app QuantStats iframe) on every completed backtest's detail page, plus preserve the existing downloadable HTML report. Closes CONTINUITY #7 (UI-RESULTS-01) flagged by Pablo during the 2026-04-21 SPY live demo.
