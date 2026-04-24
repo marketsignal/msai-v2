@@ -529,7 +529,9 @@ class DatabentoBootstrapService:
             else:
                 outcome = BootstrapOutcome.ALIAS_ROTATED
 
-            live_qualified = await self._check_live_qualified(session, raw_symbol)
+            live_qualified = await self._check_live_qualified(
+                session, raw_symbol, derived_asset_class
+            )
             await session.commit()
 
         return BootstrapResult(
@@ -680,7 +682,7 @@ class DatabentoBootstrapService:
             else:
                 outcome = BootstrapOutcome.ALIAS_ROTATED
 
-            live_qualified = await self._check_live_qualified(session, symbol)
+            live_qualified = await self._check_live_qualified(session, symbol, "futures")
 
         return BootstrapResult(
             symbol=symbol,
@@ -720,8 +722,16 @@ class DatabentoBootstrapService:
         return (await session.execute(stmt)).scalar_one_or_none()
 
     @staticmethod
-    async def _check_live_qualified(session: AsyncSession, raw_symbol: str) -> bool:
-        """True iff an active interactive_brokers alias exists for this raw_symbol."""
+    async def _check_live_qualified(
+        session: AsyncSession, raw_symbol: str, asset_class: str
+    ) -> bool:
+        """True iff an active interactive_brokers alias exists for this
+        ``(raw_symbol, asset_class)`` pair.
+
+        Filtering on ``asset_class`` is essential for cross-asset-class
+        symbol collisions: a futures ``ES`` IB alias must not flag an
+        equity ``ES`` bootstrap as live-qualified.
+        """
         from sqlalchemy import select
 
         from msai.models.instrument_alias import InstrumentAlias
@@ -735,6 +745,7 @@ class DatabentoBootstrapService:
             )
             .where(
                 InstrumentDefinition.raw_symbol == raw_symbol,
+                InstrumentDefinition.asset_class == asset_class,
                 InstrumentAlias.provider == "interactive_brokers",
                 InstrumentAlias.effective_to.is_(None),
             )

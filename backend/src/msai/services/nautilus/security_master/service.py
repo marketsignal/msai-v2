@@ -791,19 +791,26 @@ class SecurityMaster:
             {"k": compute_advisory_lock_key(provider, raw_symbol, asset_class)},
         )
 
-        # Divergence detection. When provider="interactive_brokers" overwrites
-        # a prior Databento-authored active alias with a different venue, emit
-        # the divergence counter + structured log. This must run BEFORE the
-        # definition UPSERT so the read sees the pre-mutation venue. Alias
-        # normalization ensures this only fires on REAL migrations (e.g. SPY
-        # moves ARCA→BATS), not notation-only MIC-vs-exchange-name differences.
+        # Divergence detection. Fires only on an IB venue TRANSITION that
+        # disagrees with the prior Databento-authored venue — i.e. this
+        # refresh actually changed IB's active alias AND the new IB venue
+        # differs from the Databento-authored one. Without the IB-side
+        # transition check the counter would re-fire on every idempotent
+        # refresh after a real migration (e.g. Databento=ARCA, IB=BATS
+        # repeated refresh keeps incrementing the metric), inflating
+        # counts and obscuring real migration events.
+        #
+        # Runs BEFORE the UPSERT so the reads see pre-mutation state;
+        # alias normalization ensures the Databento comparison only
+        # fires on REAL migrations, not notation-only MIC-vs-exchange-name
+        # differences.
         if provider == "interactive_brokers":
             from msai.services.observability.trading_metrics import (
                 REGISTRY_VENUE_DIVERGENCE_TOTAL,
             )
 
-            prior_result = await self._db.execute(
-                select(InstrumentAlias.alias_string)
+            prior_rows = await self._db.execute(
+                select(InstrumentAlias.alias_string, InstrumentAlias.provider)
                 .join(
                     InstrumentDefinition,
                     InstrumentDefinition.instrument_uid == InstrumentAlias.instrument_uid,
@@ -811,28 +818,50 @@ class SecurityMaster:
                 .where(
                     InstrumentDefinition.raw_symbol == raw_symbol,
                     InstrumentDefinition.asset_class == asset_class,
-                    InstrumentAlias.provider == "databento",
+                    InstrumentAlias.provider.in_(("databento", "interactive_brokers")),
                     InstrumentAlias.effective_to.is_(None),
                 )
-                .limit(1)
             )
-            prior_alias_string = prior_result.scalar_one_or_none()
-            if prior_alias_string is not None and "." in prior_alias_string and "." in alias_string:
-                prior_venue = prior_alias_string.rsplit(".", 1)[1]
-                new_venue = alias_string.rsplit(".", 1)[1]
-                if prior_venue != new_venue:
+            prior_databento_alias: str | None = None
+            prior_ib_alias: str | None = None
+            for alias_row, provider_row in prior_rows.all():
+                if provider_row == "databento":
+                    prior_databento_alias = alias_row
+                elif provider_row == "interactive_brokers":
+                    prior_ib_alias = alias_row
+
+            if (
+                prior_databento_alias is not None
+                and "." in prior_databento_alias
+                and "." in alias_string
+            ):
+                prior_databento_venue = prior_databento_alias.rsplit(".", 1)[1]
+                new_ib_venue = alias_string.rsplit(".", 1)[1]
+                prior_ib_venue = (
+                    prior_ib_alias.rsplit(".", 1)[1]
+                    if prior_ib_alias is not None and "." in prior_ib_alias
+                    else None
+                )
+                # Only fire when (a) the new IB venue disagrees with the
+                # Databento authority AND (b) this refresh actually changed
+                # IB's own alias — a repeated no-op refresh (prior_ib_venue
+                # == new_ib_venue) must NOT re-increment.
+                is_migration = prior_databento_venue != new_ib_venue
+                ib_transitioned = prior_ib_venue != new_ib_venue
+                if is_migration and ib_transitioned:
                     REGISTRY_VENUE_DIVERGENCE_TOTAL.labels(
-                        databento_venue=prior_venue,
-                        ib_venue=new_venue,
+                        databento_venue=prior_databento_venue,
+                        ib_venue=new_ib_venue,
                     ).inc()
                     log.warning(
                         "registry_bootstrap_divergence",
                         raw_symbol=raw_symbol,
                         asset_class=asset_class,
                         previous_provider="databento",
-                        previous_venue=prior_venue,
+                        previous_venue=prior_databento_venue,
                         new_provider="interactive_brokers",
-                        new_venue=new_venue,
+                        new_venue=new_ib_venue,
+                        prior_ib_venue=prior_ib_venue,
                     )
 
         now = datetime.now(UTC)

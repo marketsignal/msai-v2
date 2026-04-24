@@ -99,6 +99,47 @@ async def test_live_qualified_true_when_ib_alias_exists(session_factory, mock_da
 
 
 @pytest.mark.asyncio
+async def test_live_qualified_false_when_ib_alias_is_wrong_asset_class(
+    session_factory, mock_databento
+):
+    """Cross-asset-class symbol collision regression (Codex P2-1).
+
+    If an IB alias exists for ``ES`` under ``asset_class=futures`` but
+    we bootstrap ``ES`` as an equity via Databento, ``live_qualified``
+    must stay ``False`` — the futures IB alias does not qualify the
+    equity for live trading."""
+    from msai.services.nautilus.security_master.service import SecurityMaster
+
+    svc = DatabentoBootstrapService(
+        session_factory=session_factory, databento_client=mock_databento
+    )
+
+    # ARRANGE: seed an IB alias under a DIFFERENT asset_class (futures)
+    # for an AAPL raw_symbol that we'll bootstrap as equity.
+    async with session_factory() as session:
+        sm = SecurityMaster(db=session, databento_client=None)
+        await sm._upsert_definition_and_alias(
+            raw_symbol="AAPL",
+            listing_venue="CME",
+            routing_venue="CME",
+            asset_class="futures",  # <-- wrong asset class for the equity bootstrap
+            alias_string="AAPL.CME",
+            provider="interactive_brokers",
+            venue_format="exchange_name",
+        )
+        await session.commit()
+
+    # ACT
+    results = await svc.bootstrap(symbols=["AAPL"], asset_class_override=None, exact_ids=None)
+
+    # VERIFY: live_qualified must be FALSE — the futures IB alias does
+    # NOT qualify the equity bootstrap for live trading.
+    assert results[0].registered is True
+    assert results[0].asset_class == "equity"
+    assert results[0].live_qualified is False
+
+
+@pytest.mark.asyncio
 async def test_ambiguous_then_exact_id_resolves_to_single_candidate(
     session_factory,
     mock_databento,
