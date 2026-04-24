@@ -1143,3 +1143,166 @@ async def test_migration_z4x5y6z7a8b9_adds_series_columns(
     _assert_series_columns_present(await _fetch_series_columns(isolated_postgres_url_series))
     check_after_reup = await _fetch_series_status_check_constraint(isolated_postgres_url_series)
     assert check_after_reup is not None, "ck_backtests_series_status missing after re-upgrade"
+
+
+# ---------------------------------------------------------------------------
+# Databento-registry-bootstrap T3:
+# a5b6c7d8e9f0 adds ``source_venue_raw VARCHAR(64) NULL`` to
+# instrument_aliases. This column preserves the source-provider verbatim
+# venue (e.g. Databento MIC code "XNAS") alongside the normalized
+# ``alias_string`` so venue-provenance isn't lost when the write-side
+# normalizer converts to registry exchange-name convention.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_source_venue_raw_round_trip(isolated_postgres_url: str) -> None:
+    """Upgrade from parent z4x5y6z7a8b9 → a5b6c7d8e9f0 adds source_venue_raw
+    (nullable String(64)); downgrade removes it cleanly.
+
+    Ensures deterministic start state by explicitly downgrading to the
+    parent first (the module-scoped Postgres container is shared with
+    tests that push to head, so a plain ``upgrade`` to a prior revision
+    would no-op)."""
+    _run_alembic(isolated_postgres_url, "downgrade", "z4x5y6z7a8b9")
+
+    engine = create_async_engine(isolated_postgres_url)
+    try:
+        async with engine.connect() as conn:
+
+            def _cols(sync_conn: object) -> dict[str, dict[str, object]]:
+                return {c["name"]: c for c in inspect(sync_conn).get_columns("instrument_aliases")}
+
+            before = await conn.run_sync(_cols)
+        assert "source_venue_raw" not in before
+    finally:
+        await engine.dispose()
+
+    _run_alembic_upgrade(isolated_postgres_url, target="a5b6c7d8e9f0")
+
+    engine = create_async_engine(isolated_postgres_url)
+    try:
+        async with engine.connect() as conn:
+
+            def _cols(sync_conn: object) -> dict[str, dict[str, object]]:
+                return {c["name"]: c for c in inspect(sync_conn).get_columns("instrument_aliases")}
+
+            after = await conn.run_sync(_cols)
+        assert "source_venue_raw" in after
+        assert after["source_venue_raw"]["nullable"] is True
+        assert str(after["source_venue_raw"]["type"]).startswith("VARCHAR(64)")
+    finally:
+        await engine.dispose()
+
+    _run_alembic(isolated_postgres_url, "downgrade", "z4x5y6z7a8b9")
+
+    engine = create_async_engine(isolated_postgres_url)
+    try:
+        async with engine.connect() as conn:
+
+            def _cols(sync_conn: object) -> dict[str, dict[str, object]]:
+                return {c["name"]: c for c in inspect(sync_conn).get_columns("instrument_aliases")}
+
+            after_down = await conn.run_sync(_cols)
+        assert "source_venue_raw" not in after_down
+    finally:
+        await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# b6c7d8e9f0a1 relaxes ck_instrument_aliases_effective_window from strict
+# `effective_to > effective_from` to `effective_to >= effective_from`, which
+# admits same-calendar-day rotations (closing UPDATE stamps
+# effective_to=today on a row whose effective_from is also today).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_effective_window_check_relaxation_round_trip(
+    isolated_postgres_url: str,
+) -> None:
+    """At ``b6c7d8e9f0a1`` (head on this branch) the CHECK admits zero-width
+    windows; the downgrade restores strict ``>`` and rejects them."""
+    from sqlalchemy import text as _text
+
+    _run_alembic_upgrade(isolated_postgres_url, target="b6c7d8e9f0a1")
+
+    engine = create_async_engine(isolated_postgres_url)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                _text(
+                    "INSERT INTO instrument_definitions "
+                    "(instrument_uid, raw_symbol, listing_venue, routing_venue, "
+                    "asset_class, provider) "
+                    "VALUES (gen_random_uuid(), 'CHK_RELAX', 'CME', 'CME', "
+                    "'futures', 'interactive_brokers')"
+                )
+            )
+            row = await conn.execute(
+                _text(
+                    "SELECT instrument_uid FROM instrument_definitions "
+                    "WHERE raw_symbol = 'CHK_RELAX'"
+                )
+            )
+            uid = row.scalar_one()
+            # Zero-width window must be accepted post-relaxation.
+            await conn.execute(
+                _text(
+                    "INSERT INTO instrument_aliases "
+                    "(id, instrument_uid, alias_string, venue_format, provider, "
+                    "effective_from, effective_to) "
+                    "VALUES (gen_random_uuid(), :uid, 'CHK_RELAX.CME', "
+                    "'exchange_name', 'interactive_brokers', "
+                    "'2026-06-01', '2026-06-01')"
+                ),
+                {"uid": uid},
+            )
+    finally:
+        await engine.dispose()
+
+    # Downgrade is self-cleaning: it deletes any zero-width rows before
+    # re-creating the strict CHECK. No manual cleanup needed.
+    _run_alembic(isolated_postgres_url, "downgrade", "a5b6c7d8e9f0")
+
+    engine = create_async_engine(isolated_postgres_url)
+    try:
+        async with engine.begin() as conn:
+            row = await conn.execute(
+                _text(
+                    "SELECT instrument_uid FROM instrument_definitions "
+                    "WHERE raw_symbol = 'CHK_RELAX'"
+                )
+            )
+            uid = row.scalar_one()
+
+            # After downgrade, fresh zero-width inserts must fail under the
+            # restored strict `effective_to > effective_from`. SQLAlchemy
+            # wraps asyncpg's CheckViolationError in sa.exc.IntegrityError.
+            with pytest.raises(
+                sa.exc.IntegrityError, match="ck_instrument_aliases_effective_window"
+            ):
+                await conn.execute(
+                    _text(
+                        "INSERT INTO instrument_aliases "
+                        "(id, instrument_uid, alias_string, venue_format, provider, "
+                        "effective_from, effective_to) "
+                        "VALUES (gen_random_uuid(), :uid, 'CHK_RELAX_STRICT.CME', "
+                        "'exchange_name', 'interactive_brokers', "
+                        "'2026-07-01', '2026-07-01')"
+                    ),
+                    {"uid": uid},
+                )
+    finally:
+        await engine.dispose()
+
+    # Cleanup + restore head for next test.
+    engine = create_async_engine(isolated_postgres_url)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                _text("DELETE FROM instrument_definitions WHERE raw_symbol = 'CHK_RELAX'")
+            )
+    finally:
+        await engine.dispose()
+    _run_alembic_upgrade(isolated_postgres_url, target="head")

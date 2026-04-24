@@ -85,11 +85,30 @@ _REGISTRY_TO_INGEST_ASSET_CLASS: dict[str, str] = {
     # so the operator sees the raw value rather than a silent coerce.
     "index": "index",
 }
-"""[iter-2 P1-a] Registry/spec-taxonomy (``InstrumentSpec.asset_class``)
+"""Registry/spec-taxonomy (``InstrumentSpec.asset_class``)
 → ingest / Parquet-storage taxonomy. Used by
 :meth:`SecurityMaster.asset_class_for_alias` — keep module-level so
 callers can inspect the mapping for testing + telemetry without
 instantiating a SecurityMaster."""
+
+
+def compute_advisory_lock_key(provider: str, raw_symbol: str, asset_class: str) -> int:
+    """Postgres ``int8`` advisory-lock key derived from a stable blake2b digest.
+
+    Shared between ``_upsert_definition_and_alias`` and the bootstrap
+    orchestrator so both paths converge on the same lock when the
+    orchestrator pre-acquires before its pre-state SELECT and the upsert
+    re-acquires reentrantly. ``blake2b`` (not Python's built-in ``hash()``)
+    because ``PYTHONHASHSEED`` is per-process randomized and would drift
+    the key across worker restarts.
+    """
+    import hashlib  # noqa: PLC0415
+
+    digest = hashlib.blake2b(
+        f"{provider}:{raw_symbol}:{asset_class}".encode(),
+        digest_size=8,
+    ).digest()
+    return int.from_bytes(digest, "big", signed=False) & 0x7FFFFFFFFFFFFFFF
 
 
 _ROLL_SENSITIVE_ROOTS: frozenset[str] = frozenset({"ES"})
@@ -592,7 +611,7 @@ class SecurityMaster:
         ``DataIngestionService._resolve_plan`` the Parquet writes go
         to the wrong directory (e.g. ``data/parquet/equity/``) while
         the catalog reader expects ``data/parquet/stocks/``, producing
-        a perpetual auto-heal loop. [iter-2 P1-a.]
+        a perpetual auto-heal loop.
 
         Returns ``None`` if the alias shape is unknown — callers fall
         back to the shape heuristic in
@@ -701,6 +720,7 @@ class SecurityMaster:
         alias_string: str,
         provider: str = "interactive_brokers",
         venue_format: str = "exchange_name",
+        source_venue_raw: str | None = None,
     ) -> None:
         """Idempotent upsert: one :class:`InstrumentDefinition` row +
         one active :class:`InstrumentAlias` row.
@@ -724,8 +744,13 @@ class SecurityMaster:
         collide on the unique constraints. Mirrors the pattern in
         :meth:`_write_cache`.
         """
+        from sqlalchemy import text
+
         from msai.models.instrument_alias import InstrumentAlias
         from msai.models.instrument_definition import InstrumentDefinition
+        from msai.services.nautilus.security_master.venue_normalization import (
+            normalize_alias_for_registry,
+        )
 
         # FX raw_symbol invariant: registry stores BASE/QUOTE slash form.
         # IB's localSymbol for CASH pairs is dot form ("EUR.USD"); the
@@ -734,6 +759,110 @@ class SecurityMaster:
         # storage boundary so neither side drifts.
         if asset_class == "fx" and "/" not in raw_symbol and raw_symbol.count(".") == 1:
             raw_symbol = raw_symbol.replace(".", "/")
+
+        # Preserve raw Databento venue as provenance when normalizing MIC
+        # aliases. If caller omits source_venue_raw and the alias is in MIC
+        # form (venue_format="mic_code"), auto-derive from the PRE-normalization
+        # alias_string. Continuous-futures aliases (venue_format="databento_continuous")
+        # are already in exchange-name form and don't need provenance capture.
+        if (
+            provider == "databento"
+            and venue_format == "mic_code"
+            and source_venue_raw is None
+            and "." in alias_string
+        ):
+            source_venue_raw = alias_string.rsplit(".", 1)[1]
+
+        # Normalize Databento MIC → exchange-name at the write boundary so
+        # the registry has ONE canonical alias convention. Only applies when
+        # the caller explicitly flagged the alias as MIC form. IB aliases
+        # (exchange_name) and continuous-futures (databento_continuous) pass
+        # through unchanged. Unknown MICs raise UnknownDatabentoVenueError
+        # (bootstrap service surfaces as outcome=unmapped_venue).
+        if venue_format == "mic_code":
+            alias_string = normalize_alias_for_registry(provider, alias_string)
+
+        # Advisory lock serializes concurrent upserts on the same
+        # (provider, raw_symbol, asset_class) across workers/processes.
+        # Reentrant for the same session, so orchestrators that pre-acquire
+        # the same key (bootstrap service) re-acquire here as a no-op.
+        await self._db.execute(
+            text("SELECT pg_advisory_xact_lock(:k)"),
+            {"k": compute_advisory_lock_key(provider, raw_symbol, asset_class)},
+        )
+
+        # Divergence detection. Fires only on an IB venue TRANSITION that
+        # disagrees with the prior Databento-authored venue — i.e. this
+        # refresh actually changed IB's active alias AND the new IB venue
+        # differs from the Databento-authored one. Without the IB-side
+        # transition check the counter would re-fire on every idempotent
+        # refresh after a real migration (e.g. Databento=ARCA, IB=BATS
+        # repeated refresh keeps incrementing the metric), inflating
+        # counts and obscuring real migration events.
+        #
+        # Runs BEFORE the UPSERT so the reads see pre-mutation state;
+        # alias normalization ensures the Databento comparison only
+        # fires on REAL migrations, not notation-only MIC-vs-exchange-name
+        # differences.
+        if provider == "interactive_brokers":
+            from msai.services.observability.trading_metrics import (
+                REGISTRY_VENUE_DIVERGENCE_TOTAL,
+            )
+
+            prior_rows = await self._db.execute(
+                select(InstrumentAlias.alias_string, InstrumentAlias.provider)
+                .join(
+                    InstrumentDefinition,
+                    InstrumentDefinition.instrument_uid == InstrumentAlias.instrument_uid,
+                )
+                .where(
+                    InstrumentDefinition.raw_symbol == raw_symbol,
+                    InstrumentDefinition.asset_class == asset_class,
+                    InstrumentAlias.provider.in_(("databento", "interactive_brokers")),
+                    InstrumentAlias.effective_to.is_(None),
+                )
+            )
+            prior_databento_alias: str | None = None
+            prior_ib_alias: str | None = None
+            for alias_row, provider_row in prior_rows.all():
+                if provider_row == "databento":
+                    prior_databento_alias = alias_row
+                elif provider_row == "interactive_brokers":
+                    prior_ib_alias = alias_row
+
+            if (
+                prior_databento_alias is not None
+                and "." in prior_databento_alias
+                and "." in alias_string
+            ):
+                prior_databento_venue = prior_databento_alias.rsplit(".", 1)[1]
+                new_ib_venue = alias_string.rsplit(".", 1)[1]
+                prior_ib_venue = (
+                    prior_ib_alias.rsplit(".", 1)[1]
+                    if prior_ib_alias is not None and "." in prior_ib_alias
+                    else None
+                )
+                # Only fire when (a) the new IB venue disagrees with the
+                # Databento authority AND (b) this refresh actually changed
+                # IB's own alias — a repeated no-op refresh (prior_ib_venue
+                # == new_ib_venue) must NOT re-increment.
+                is_migration = prior_databento_venue != new_ib_venue
+                ib_transitioned = prior_ib_venue != new_ib_venue
+                if is_migration and ib_transitioned:
+                    REGISTRY_VENUE_DIVERGENCE_TOTAL.labels(
+                        databento_venue=prior_databento_venue,
+                        ib_venue=new_ib_venue,
+                    ).inc()
+                    log.warning(
+                        "registry_bootstrap_divergence",
+                        raw_symbol=raw_symbol,
+                        asset_class=asset_class,
+                        previous_provider="databento",
+                        previous_venue=prior_databento_venue,
+                        new_provider="interactive_brokers",
+                        new_venue=new_ib_venue,
+                        prior_ib_venue=prior_ib_venue,
+                    )
 
         now = datetime.now(UTC)
         def_stmt = (
@@ -802,6 +931,7 @@ class SecurityMaster:
                 venue_format=venue_format,
                 provider=provider,
                 effective_from=today,
+                source_venue_raw=source_venue_raw,
             )
             .on_conflict_do_nothing(
                 constraint="uq_instrument_aliases_string_provider_from",

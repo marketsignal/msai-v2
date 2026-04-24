@@ -35,3 +35,15 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """
     async with async_session_factory() as session:
         yield session
+
+
+def get_session_factory() -> async_sessionmaker[AsyncSession]:
+    """FastAPI dependency returning the module-level ``async_session_factory``.
+
+    Wrapping the instance in a callable lets endpoints that need
+    session-per-subtask ownership get the factory injected via
+    ``Depends(get_session_factory)`` and be overridable from tests
+    (``app.dependency_overrides[get_session_factory] = lambda:
+    test_factory``). Mirrors the ``get_db`` pattern one level up.
+    """
+    return async_session_factory

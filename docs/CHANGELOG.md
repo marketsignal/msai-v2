@@ -4,6 +4,64 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-04-23 — Databento registry bootstrap for equities/ETFs/futures (branch `feat/databento-registry-bootstrap`) — PHASE 5 COMPLETE, READY TO COMMIT
+
+**Status:** All Phase 4 + Phase 5 gates closed. Shipped state below updated with Phase 5 additions: code-review loop (2 iter), simplify pass, verify-app PASS, E2E 3/6 PASS + 1 FAIL_STALE + 2 SKIPPED_INFRA, 6 UCs graduated. 2 known concerns resolved (same-day CHECK relaxation via migration `b6c7d8e9f0a1`; conftest ruff cleanup). 1 FAIL_BUG surfaced by verify-e2e agent + fixed in-branch: Databento nightly-window date-range probe (`start=today` failed 4xx during pre-publication window; fixed to `start=today-7d, end=today-1d`).
+
+**Phase 5 additions:**
+
+- **Migration `b6c7d8e9f0a1` (new):** relax `ck_instrument_aliases_effective_window` from strict `>` to `>=` so same-calendar-day alias rotations no longer 500. Zero-width `[today, today)` audit rows are semantically correct (half-open interval contains no dates → never selected as active). Downgrade self-cleans by DELETE'ing zero-width rows before re-adding the strict CHECK.
+- **Code review iter-1 landed:** path-traversal fix via `_safe_filename(symbol)` sha1 digest; `asyncio.gather(..., return_exceptions=True)` + synthetic `UPSTREAM_ERROR` materialization (CancelledError/KeyboardInterrupt/SystemExit re-raised); `SQLAlchemyError` explicit rollback in `_upsert_and_classify` + continuous-futures; continuous-futures `except Exception` → 5 discrete typed handlers; classification race fixed (orchestrator pre-acquires `pg_advisory_xact_lock` before pre-state SELECT); `_extract_venue` fail-loud; `_pick_highest_severity` outcome ranking (UNAUTHORIZED > RATE_LIMITED > UPSTREAM_ERROR); `BootstrapResult` → `@dataclass(frozen=True, slots=True)` with `__post_init__` invariants; `BootstrapResultItem` `model_validator(mode="after")` enforcing registered↔outcome + failed⇒¬live_qualified + failed⇒¬backtest_data_available + failed⇒canonical_id=None + ambiguous⇒≥2 candidates. Pre-existing `test_databento_fetch_definition.py` migrated to typed `DatabentoUpstreamError` + fake-SDK `databento.common.error` submodule. Comment scrub across 12 source files (~20 P1 violations: dates, OQ-/US-/T-N IDs, council names, iter-N references). 7 new tests: UNMAPPED_VENUE outcome, UPSTREAM_ERROR all-datasets, RATE_LIMITED no-fallback, severity-ranking tie-break, gather-preserves-partial-progress, DATABENTO_NOT_CONFIGURED API 500, tenacity 5xx exhaustion, `live_qualified=true` two-step graduation, exact_id forwarded kwarg regression.
+- **Code review iter-2 landed:** test-pollution fix on `_install_fake_databento` via snapshot-tuple restore pattern (iter-1 helper dropped submodules instead of restoring originals, breaking sibling tests that imported `BentoClientError` class at module-load — Codex caught this); continuous-futures lock-and-classify race mirrored from equity path; remaining comment scrub items in `cli.py` + `service.py`. User ratified "1 P1 acceptable" at iter-2; loop closed.
+- **Simplify pass landed (3 fixes):** `compute_advisory_lock_key(provider, raw_symbol, asset_class) -> int` extracted to `service.py` as shared module-level helper — both `_upsert_definition_and_alias` and `DatabentoBootstrapService._upsert_and_classify` / `_bootstrap_continuous_future` import + call it (closes drift hazard where two byte-identical blake2b copies had to stay in sync by comment); deleted dup `_CONTINUOUS_FUTURES_RE` + `_is_continuous_futures` in favor of `is_databento_continuous_pattern` at `continuous_futures.py:38`; `api/instruments.py` uses shared `_error_response` helper from `api/backtests.py:92` (matches PR #41 canonical error-envelope rule). ~60 LOC deleted.
+- **verify-app PASS:** 2054/2054 effective pass, 10 skipped, 16 xfailed. 2 failures on `test_backtest_job.py::test_materialize_series_payload_*` are pre-existing flakes from PR #41 (documented in CONTINUITY "Done cont'd 12") — both pass in isolation on this branch AND on main. No regressions.
+- **E2E PASS (after mid-run FAIL_BUG fix):** verify-e2e agent ran 6 UCs. FAIL_BUG found: bootstrap probed Databento with `start=today_utc_midnight` which fails HTTP 422 `data_start_after_available_end` during nightly window before Databento's daily publication (observed at 00:38 UTC still failing). ALL 3 equity datasets failed identically, blocking all executable UCs. Fix at `databento_bootstrap.py`: probe 7-day historical window ending yesterday — definition-schema records describe current contract metadata so any recent snapshot contains the symbol. Continuous-futures path updated analogously to `start=(today-1d)`. Re-verified live: UC-001 AAPL PASS (`canonical_id="AAPL.NASDAQ"`), UC-002 SPY CLI PASS (exit 0, JSON `summary.failed=0`), UC-004 idempotency PASS (`outcome=noop` on second call). UC-003 FAIL_STALE (BRK.B no longer ambiguous in real Databento — ambiguity path covered by unit tests). UC-005 SKIPPED_INFRA (`RUN_PAPER_E2E=1` opt-in). UC-006 SKIPPED_INFRA (IB Gateway container not active).
+- **6 UCs graduated** to `tests/e2e/use-cases/instruments/databento-registry-bootstrap.md` with real Databento response shapes + container-compatible `python -m msai.cli instruments bootstrap ...` invocation.
+
+---
+
+#### Original Phase 4 narrative
+
+**Goal:** Ship an on-demand Databento path for populating the instrument registry (`POST /api/v1/instruments/bootstrap` + `msai instruments bootstrap` CLI) so cold-start environments can register equity/ETF/futures symbols without an IB Gateway dependency. Databento-bootstrapped rows are backtest-discoverable only; live graduation still requires an explicit `instruments refresh --provider interactive_brokers` second step.
+
+**Scope council verdict** (2026-04-23, 5 advisors + Codex xhigh chairman): `1b + 2b + 3a + 4a` — arbitrary on-demand CLI/API, equities+ETFs+futures (NO options; NO Forex — Databento Spot FX is "Coming soon"; NO cash indexes — use ETF/futures proxies), Databento as peer provider (not replacement), metered-mindful rate limiting. 7 blocking constraints locked in. Decision doc: `docs/decisions/databento-registry-bootstrap.md`.
+
+**Venue-normalization sub-council** (2026-04-23): Option A (normalize MIC→exchange-name at write boundary) with 3 blocking constraints — (1) closed MIC map + fail-loud on unknown, (2) named helper `normalize_alias_for_registry`, (3) preserve raw Databento venue via additive `source_venue_raw` column.
+
+**Plan review loop:** 3 iterations, productive convergence trajectory 42 → 21 → 9 findings. All 72 combined P0/P1/P2 findings addressed in v3 plan revisions.
+
+**Shipped — new source files (6):**
+
+- `services/nautilus/security_master/venue_normalization.py` — `normalize_alias_for_registry` + closed MIC→exchange-name map (16 entries including `EPRL→PEARL`) + `UnknownDatabentoVenueError` fail-loud.
+- `services/nautilus/security_master/databento_bootstrap.py` — `DatabentoBootstrapService` orchestrator. Session-per-symbol via `async_sessionmaker` (safe for `asyncio.gather`). `max_concurrent=3` hard cap. Tiered `XNAS.ITCH → XNYS.PILLAR → ARCX.PILLAR` fallback for equities. Continuous-futures delegated to `SecurityMaster.resolve_for_backtest`. 8 outcome types (CREATED/NOOP/ALIAS_ROTATED/AMBIGUOUS/UPSTREAM_ERROR/UNAUTHORIZED/UNMAPPED_VENUE/RATE_LIMITED).
+- `services/data_sources/databento_errors.py` — typed `DatabentoError` hierarchy (`Unauthorized` / `RateLimited` / `Upstream`) carrying `http_status` + `dataset`.
+- `schemas/instrument_bootstrap.py` — Pydantic v2 `BootstrapRequest` (`asset_class_override: Literal["equity","futures","fx","option"]` matching DB CHECK taxonomy, `max_concurrent: Field(ge=1, le=3)`, `exact_ids: dict[str, str]` alias-string semantics), `BootstrapResultItem`, `BootstrapResponse`, `build_bootstrap_response` helper.
+- `api/instruments.py` — FastAPI router `POST /api/v1/instruments/bootstrap` with 200/207/422 status contract (200 all-success, 207 mixed, 422 all-failed).
+- `alembic/versions/a5b6c7d8e9f0_add_source_venue_raw_to_instrument_aliases.py` — additive `source_venue_raw String(64) NULL` migration chained off `z4x5y6z7a8b9`.
+
+**Shipped — modified source files (8):**
+
+- `services/data_sources/databento_client.py` — tenacity retry via `asyncio.to_thread` (3 attempts, exponential 1-9s, retry on 429/5xx only, 401/403 fail fast); typed-error classification on final raise; ambiguity detection with dedup-by-id; `exact_id: str | None` kwarg pre-filters BEFORE ambiguity raise.
+- `services/nautilus/security_master/service.py::_upsert_definition_and_alias` — `source_venue_raw` kwarg with auto-derive from pre-normalization alias; `normalize_alias_for_registry` call gated on `venue_format=="mic_code"` (implementer-corrected from plan's `provider=="databento"` to preserve continuous-futures path which uses `provider="databento"` + `venue_format="databento_continuous"` with already-exchange-name aliases like `ES.Z.0.CME`); `pg_advisory_xact_lock` keyed on `blake2b` digest (NOT Python `hash()` — process-seed randomized, drifts across workers); pre-upsert venue-divergence detection on IB-refresh path (fires only on real migrations post-normalization).
+- `services/observability/trading_metrics.py` — 3 new counters (`msai_databento_api_calls_total{endpoint,outcome}`, `msai_registry_bootstrap_total{provider,asset_class,outcome}`, `msai_registry_venue_divergence_total{databento_venue,ib_venue}`) + 1 histogram (`msai_registry_bootstrap_duration_ms` with int-typed buckets `(100, 500, 1k, 2k, 5k, 10k, 30k)` matching project pattern).
+- `core/database.py` — `get_session_factory()` FastAPI dependency wrapper around existing `async_session_factory`.
+- `cli.py` — `instruments bootstrap` subcommand bypassing `_api_call` (which auto-fails on non-2xx — lethal for the 207 common case) with direct `httpx.request` accepting status ∈ {200, 207, 422}; Typer-native `StrEnum` for `--asset-class`; `--exact-id SYMBOL:ALIAS_STRING` repeatable flag.
+- `main.py` — register `instruments_router`.
+- `models/instrument_alias.py` — `source_venue_raw: Mapped[str | None]` column (nullable, additive).
+- `pyproject.toml` — add `tenacity>=9.1.0,<10` dependency.
+
+**Test counts (52 total, 0 regressions):**
+
+- Unit: `test_venue_normalization.py` (9) · `test_databento_client_retry.py` (4) · `test_databento_client_ambiguity.py` (5) · `test_schemas_instrument_bootstrap.py` (10) · `test_cli_instruments_bootstrap.py` (6) · `test_databento_bootstrap_equities.py` (5) · `test_databento_bootstrap_metrics.py` (1)
+- Integration: `test_security_master_advisory_lock.py` (2) · `test_security_master_databento_bootstrap.py` (3) · `test_registry_venue_divergence.py` (2) · `test_api_instruments_bootstrap.py` (5)
+- Regression: 43 pre-existing security_master unit + integration tests — all still PASS.
+- ruff clean + mypy `--strict` clean on every PR-touched file.
+
+**Known concerns flagged for Phase 5 resolution:**
+
+1. **Same-day alias rotation** — `ck_instrument_aliases_effective_window` strict-inequality CHECK (`effective_to > effective_from`) crashes the `ALIAS_ROTATED` outcome when both dates are `today`. T10 integration test sidestepped via `freezegun`. Production rotations via bootstrap will 500 on a real-life same-day venue migration unless the CHECK is relaxed to `>=` with a zero-window guard, OR `effective_to` is stamped at timestamp precision, OR PRD US-005 is amended to document next-day-only rotation semantics.
+2. **T0 `conftest_databento.py` ruff nits** — 7 pre-existing I001/TC003/E501 surfaced by T12 subagent's wider ruff scope (module import ordering, type-check-only imports, line length). Clean up in Phase 5 polish pass.
+
 ### 2026-04-23 — Mypy --strict cleanup (branch `fix/mypy-strict-cleanup`) — MYPY NOW A BLOCKING CI GATE
 
 **Context:** PR #42 unblocked CI end-to-end but left `mypy --strict` with `continue-on-error: true` because 132 pre-existing errors accumulated while CI was broken. Per Codex-ratified sequencing, this cleanup was scheduled before #8 Databento bootstrap so the remaining CI gate could start blocking.

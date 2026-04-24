@@ -773,15 +773,15 @@ def instruments_refresh(
         # root admits three shapes: bare (``AAPL``), stable dotted
         # (``AAPL.NASDAQ``, ``ES.CME``), and the concrete canonical
         # form that canonical_instrument_id produces (``ESM6.CME``
-        # for today's front-month ES). PRD US-006: operators must
-        # be able to feed the CLI's own ``resolved`` output back in
-        # as a re-run. Exact membership avoids the permissive-strip
+        # for today's front-month ES). Operators must be able to feed
+        # the CLI's own ``resolved`` output back in as a re-run.
+        # Exact membership avoids the permissive-strip
         # trap (e.g. ``SPY.NASDAQ`` silently normalizing to ``SPY``
         # via generic suffix stripping).
         known = phase_1_paper_symbols()
         # Mirror the compatibility surface canonical_instrument_id
         # already accepts so the pre-warm CLI isn't narrower than
-        # SecurityMaster.resolve_for_live (iter-4/iter-6 review):
+        # SecurityMaster.resolve_for_live:
         #
         # - ``ES.XCME`` — legacy MIC, pre-venue-rename configs
         # - ``EUR`` — bare shorthand for ``EUR/USD``
@@ -944,10 +944,9 @@ async def _run_ib_resolve_for_live(symbol_list: list[str]) -> list[str]:
     7. ``try/finally`` teardown: ``await client._stop_async()``
        DIRECTLY. The public ``client.stop()`` only schedules
        ``_stop_async`` as a task; awaiting it ourselves guarantees
-       the TCP disconnect completes before the process exits (US-005:
-       re-run within 60s without leaving a zombie ``client_id``
-       slot). FSM state doesn't matter because we're exiting
-       immediately.
+       the TCP disconnect completes before the process exits — a re-run
+       within 60s needs no zombie ``client_id`` slot. FSM state doesn't
+       matter because we're exiting immediately.
     """
     import os
 
@@ -1022,10 +1021,9 @@ async def _run_ib_resolve_for_live(symbol_list: list[str]) -> list[str]:
         qualifier = IBQualifier(provider)
 
         # Commit per symbol so a mid-batch failure preserves the
-        # already-qualified rows (PRD US-001 edge case: "rows for
-        # symbols already qualified are committed; idempotent re-run
-        # recovers"). A single batched commit would roll back symbol
-        # 1's flushed rows when symbol 2 fails.
+        # already-qualified rows — idempotent re-run picks up where the
+        # batch stopped. A single batched commit would roll back
+        # symbol 1's flushed rows when symbol 2 fails.
         resolved: list[str] = []
         async with async_session_factory() as session:
             sm = SecurityMaster(qualifier=qualifier, db=session)
@@ -1047,6 +1045,124 @@ async def _run_ib_resolve_for_live(symbol_list: list[str]) -> list[str]:
             await client._stop_async()
         except Exception:  # pragma: no cover — best-effort teardown
             log.warning("ib_refresh_teardown_error", exc_info=True)
+
+
+from enum import StrEnum  # noqa: E402 -- used only by _AssetClassChoice below
+
+
+class _AssetClassChoice(StrEnum):
+    """Typer-native choice constraint for --asset-class. Matches the
+    registry DB taxonomy (ck_instrument_definitions_asset_class)."""
+
+    equity = "equity"
+    futures = "futures"
+    fx = "fx"
+    option = "option"
+
+
+@instruments_app.command("bootstrap")
+def instruments_bootstrap(
+    provider: str = typer.Option(..., "--provider", help="Provider: 'databento'"),
+    symbols: str = typer.Option(
+        ...,
+        "--symbols",
+        help="Comma-separated symbols (e.g. AAPL,SPY,ES.n.0)",
+    ),
+    asset_class: _AssetClassChoice | None = typer.Option(  # noqa: B008 -- Typer pattern
+        None,
+        "--asset-class",
+        help="Override auto-detection (registry taxonomy: equity|futures|fx|option)",
+    ),
+    max_concurrent: int = typer.Option(3, "--max-concurrent", min=1, max=3),
+    exact_id: list[str] = typer.Option(  # noqa: B008 -- Typer pattern
+        [],
+        "--exact-id",
+        help="Disambiguation: SYMBOL:ALIAS_STRING (repeatable). Value is a "
+        "canonical alias_string from a prior ambiguity 422's candidates.",
+    ),
+) -> None:
+    """Bootstrap equity/ETF/futures symbols into the registry via Databento.
+
+    Registers symbols as backtest-discoverable. Does NOT qualify live IB
+    instruments — run `msai instruments refresh --provider interactive_brokers`
+    before live deployment.
+    """
+    if provider != "databento":
+        _fail(
+            f"Unsupported provider {provider!r} for bootstrap. Supported: databento. "
+            "For IB qualification use `msai instruments refresh --provider interactive_brokers`."
+        )
+
+    symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
+    if not symbol_list:
+        _fail("no symbols provided")
+
+    # exact_ids value is a canonical alias_string (e.g., "BRK.B.XNYS")
+    # from a prior ambiguity 422's candidates[] — NOT a numeric instrument_id.
+    exact_ids: dict[str, str] = {}
+    for pair in exact_id:
+        sym, sep, alias_str = pair.rpartition(":")
+        if not sep or not sym or not alias_str:
+            _fail(f"--exact-id expects SYMBOL:ALIAS_STRING format, got {pair!r}")
+        exact_ids[sym] = alias_str
+
+    body: dict[str, Any] = {
+        "provider": provider,
+        "symbols": symbol_list,
+        "max_concurrent": max_concurrent,
+    }
+    if asset_class is not None:
+        body["asset_class_override"] = asset_class.value  # Enum → string for JSON
+    if exact_ids:
+        body["exact_ids"] = exact_ids
+
+    # Bypass _api_call because it _fail()s on any non-2xx — bootstrap's 207
+    # Multi-Status partial-success is the dominant mixed-batch case.
+    url = f"{_api_base()}/api/v1/instruments/bootstrap"
+    try:
+        response = httpx.request(
+            "POST",
+            url,
+            json=body,
+            headers=_api_headers(),
+            timeout=60.0,
+        )
+    except httpx.ConnectError:
+        _fail(f"Connection refused — is the backend running at {_api_base()}?")
+    except httpx.RequestError as exc:
+        _fail(f"Request failed: {type(exc).__name__}: {exc}")
+
+    if response.status_code not in (200, 207, 422):
+        _fail(f"API error ({response.status_code}): {response.text}")
+
+    payload = response.json()
+
+    # Human-readable per-symbol summary on stderr.
+    for item in payload.get("results", []):
+        sym = item["symbol"]
+        out = item["outcome"]
+        msg = f"{sym} → {out}"
+        if item.get("canonical_id"):
+            msg += f" ({item['canonical_id']})"
+        if item.get("diagnostics"):
+            msg += f" [{item['diagnostics']}]"
+        typer.echo(msg, err=True)
+
+    summary = payload.get("summary", {})
+    typer.echo(
+        f"\nSummary: {summary.get('total', 0)} total · "
+        f"{summary.get('created', 0)} created · "
+        f"{summary.get('noop', 0)} noop · "
+        f"{summary.get('alias_rotated', 0)} rotated · "
+        f"{summary.get('failed', 0)} failed",
+        err=True,
+    )
+
+    # Structured JSON on stdout (house style matches `_emit_json`).
+    _emit_json(payload)
+
+    if summary.get("failed", 0) > 0 or response.status_code != 200:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

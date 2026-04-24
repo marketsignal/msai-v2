@@ -51,24 +51,88 @@ def _make_mock_databento_module() -> ModuleType:
     mock_historical_instance.timeseries.get_range.side_effect = _write_stub
 
     mock_module = ModuleType("databento")
+    # Mark as a package so `from databento.common.error import ...` resolves.
+    mock_module.__path__ = []  # type: ignore[attr-defined]
     mock_module.Historical = MagicMock(return_value=mock_historical_instance)  # type: ignore[attr-defined]
 
     return mock_module
 
 
-def _install_fake_databento() -> ModuleType:
-    """Install the fake ``databento`` module and return the installed instance."""
+def _make_mock_databento_common_error_module() -> ModuleType:
+    """Fake ``databento.common.error`` exposing the two retryable-classification
+    base classes the production code now imports for tenacity retry gating."""
+
+    class _BentoClientError(Exception):
+        def __init__(self, message: str = "", http_status: int | None = None) -> None:
+            super().__init__(message)
+            self.http_status = http_status
+
+    class _BentoServerError(Exception):
+        def __init__(self, message: str = "", http_status: int | None = None) -> None:
+            super().__init__(message)
+            self.http_status = http_status
+
+    mod = ModuleType("databento.common.error")
+    mod.BentoClientError = _BentoClientError  # type: ignore[attr-defined]
+    mod.BentoServerError = _BentoServerError  # type: ignore[attr-defined]
+    return mod
+
+
+def _install_fake_databento() -> tuple[
+    ModuleType, ModuleType | None, ModuleType | None, ModuleType | None
+]:
+    """Install the fake ``databento`` module (and its ``common.error`` sub-module).
+
+    Returns a 4-tuple of the installed fake plus snapshots of whatever
+    was at ``databento`` / ``databento.common`` / ``databento.common.error``
+    BEFORE install, so ``_restore_databento`` can put them back exactly.
+    Dropping the submodules instead of restoring breaks sibling tests
+    that imported ``BentoClientError`` at module-load time: the real SDK
+    re-imports a NEW class and stale `isinstance` checks fail.
+    """
+    original_databento = sys.modules.get("databento")
+    original_common = sys.modules.get("databento.common")
+    original_common_error = sys.modules.get("databento.common.error")
+
     mock_module = _make_mock_databento_module()
     sys.modules["databento"] = mock_module
-    return mock_module
+    sys.modules["databento.common"] = ModuleType("databento.common")
+    sys.modules["databento.common.error"] = _make_mock_databento_common_error_module()
+    return mock_module, original_databento, original_common, original_common_error
 
 
-def _restore_databento(original: ModuleType | None) -> None:
-    """Restore the real ``databento`` module (or remove the fake)."""
-    if original is not None:
-        sys.modules["databento"] = original
+def _restore_databento(
+    snapshot: tuple[ModuleType, ModuleType | None, ModuleType | None, ModuleType | None]
+    | ModuleType
+    | None,
+) -> None:
+    """Restore the real ``databento`` module graph from a snapshot tuple.
+
+    Backwards-compatible with the legacy single-argument shape for any
+    callers still passing the old ``original = sys.modules.get(...)``
+    form — in that case ``databento.common*`` are simply dropped.
+    """
+    if isinstance(snapshot, tuple):
+        _, orig_db, orig_common, orig_common_error = snapshot
+        _reinstate("databento.common.error", orig_common_error)
+        _reinstate("databento.common", orig_common)
+        _reinstate("databento", orig_db)
+        return
+
+    # Legacy single-argument form.
+    sys.modules.pop("databento.common.error", None)
+    sys.modules.pop("databento.common", None)
+    if snapshot is not None:
+        sys.modules["databento"] = snapshot
     else:
         sys.modules.pop("databento", None)
+
+
+def _reinstate(name: str, mod: ModuleType | None) -> None:
+    if mod is not None:
+        sys.modules[name] = mod
+    else:
+        sys.modules.pop(name, None)
 
 
 # ---------------------------------------------------------------------------
@@ -94,8 +158,7 @@ class TestFetchDefinitionInstruments:
         client = DatabentoClient(api_key="test_key")
         target = tmp_path / "GLBX.MDP3" / "ES" / "2024-01-01_2024-12-31.definition.dbn.zst"
 
-        original = sys.modules.get("databento")
-        _install_fake_databento()
+        _snapshot = _install_fake_databento()
         try:
             # Act
             with patch(
@@ -110,7 +173,7 @@ class TestFetchDefinitionInstruments:
                     target_path=target,
                 )
         finally:
-            _restore_databento(original)
+            _restore_databento(_snapshot)
 
         # Assert
         mock_loader.from_dbn_file.assert_called_once()
@@ -132,8 +195,7 @@ class TestFetchDefinitionInstruments:
         target = missing_dir / "ES.definition.dbn.zst"
         assert not missing_dir.exists()
 
-        original = sys.modules.get("databento")
-        _install_fake_databento()
+        _snapshot = _install_fake_databento()
         try:
             # Act
             with patch(
@@ -148,7 +210,7 @@ class TestFetchDefinitionInstruments:
                     target_path=target,
                 )
         finally:
-            _restore_databento(original)
+            _restore_databento(_snapshot)
 
         # Assert
         assert missing_dir.exists()
@@ -174,8 +236,8 @@ class TestFetchDefinitionInstruments:
         target.write_bytes(b"stale")
         assert target.exists()
 
-        original = sys.modules.get("databento")
-        mock_module = _install_fake_databento()
+        mock_module, *_orig = _install_fake_databento()
+        _snapshot = (mock_module, *_orig)
         try:
             # Act
             with patch(
@@ -190,7 +252,7 @@ class TestFetchDefinitionInstruments:
                     target_path=target,
                 )
         finally:
-            _restore_databento(original)
+            _restore_databento(_snapshot)
 
         # Assert — the target file exists (replaced by the rename) and the
         # sibling ``.tmp`` path has been consumed by the rename.
@@ -206,22 +268,26 @@ class TestFetchDefinitionInstruments:
         """Atomic-rename semantics: if the SDK raises, the prior good file
         is preserved (no ``unlink`` before the download) and the ``.tmp``
         sibling is cleaned up.
+
+        Non-retryable ``RuntimeError`` from the SDK is wrapped in
+        ``DatabentoUpstreamError`` by the tenacity-retry glue (see
+        ``databento_client.py`` ``except Exception`` branch).
         """
+        from msai.services.data_sources.databento_errors import DatabentoUpstreamError
+
         # Arrange
         client = DatabentoClient(api_key="test_key")
         target = tmp_path / "ES.definition.dbn.zst"
         target.write_bytes(b"prior-good")
 
-        mock_module = ModuleType("databento")
-        mock_historical_instance = MagicMock()
-        mock_historical_instance.timeseries.get_range.side_effect = RuntimeError("boom")
-        mock_module.Historical = MagicMock(return_value=mock_historical_instance)  # type: ignore[attr-defined]
-
-        original = sys.modules.get("databento")
-        sys.modules["databento"] = mock_module
+        _snapshot = _install_fake_databento()
+        # Replace the stub with a raising side-effect.
+        sys.modules["databento"].Historical.return_value.timeseries.get_range.side_effect = (  # type: ignore[attr-defined]
+            RuntimeError("boom")
+        )
         try:
             # Act / Assert
-            with pytest.raises(RuntimeError, match="Databento definition request failed"):
+            with pytest.raises(DatabentoUpstreamError, match="Databento unexpected error"):
                 await client.fetch_definition_instruments(
                     "ES.c.0",
                     "2024-01-01",
@@ -230,7 +296,7 @@ class TestFetchDefinitionInstruments:
                     target_path=target,
                 )
         finally:
-            _restore_databento(original)
+            _restore_databento(_snapshot)
 
         # Prior good file is untouched; tmp path was cleaned up.
         assert target.read_bytes() == b"prior-good"
@@ -240,18 +306,24 @@ class TestFetchDefinitionInstruments:
         self,
         tmp_path: Path,
     ) -> None:
-        """Decoded iterable is materialized into a list (Nautilus typing)."""
+        """Decoded iterable is materialized into a list (Nautilus typing).
+
+        Both sentinels share the same ``id.value`` so dedup collapses
+        them to one — avoids tripping the ambiguity guard while still
+        verifying the iterator-to-list materialization.
+        """
         # Arrange
         sentinel_a = MagicMock(name="InstrumentA")
+        sentinel_a.id.value = "ESH6.CME"
         sentinel_b = MagicMock(name="InstrumentB")
+        sentinel_b.id.value = "ESH6.CME"
         mock_loader = MagicMock()
         mock_loader.from_dbn_file.return_value = iter([sentinel_a, sentinel_b])
 
         client = DatabentoClient(api_key="test_key")
         target = tmp_path / "ES.definition.dbn.zst"
 
-        original = sys.modules.get("databento")
-        _install_fake_databento()
+        _snapshot = _install_fake_databento()
         try:
             # Act
             with patch(
@@ -266,10 +338,11 @@ class TestFetchDefinitionInstruments:
                     target_path=target,
                 )
         finally:
-            _restore_databento(original)
+            _restore_databento(_snapshot)
 
-        # Assert
-        assert result == [sentinel_a, sentinel_b]
+        # Assert: dedup collapses the two same-id sentinels to one.
+        assert len(result) == 1
+        assert result[0] is sentinel_a
 
     async def test_passes_dataset_and_definition_schema_to_sdk(
         self,
@@ -285,8 +358,8 @@ class TestFetchDefinitionInstruments:
         client = DatabentoClient(api_key="test_key")
         target = tmp_path / "ES.definition.dbn.zst"
 
-        original = sys.modules.get("databento")
-        mock_module = _install_fake_databento()
+        mock_module, *_orig = _install_fake_databento()
+        _snapshot = (mock_module, *_orig)
         try:
             # Act
             with patch(
@@ -301,7 +374,7 @@ class TestFetchDefinitionInstruments:
                     target_path=target,
                 )
         finally:
-            _restore_databento(original)
+            _restore_databento(_snapshot)
 
         # Assert — the SDK receives the sibling ``.tmp`` path (atomic download),
         # NOT the final ``target`` path. A successful rename promotes .tmp to
@@ -334,21 +407,20 @@ class TestFetchDefinitionInstruments:
             )
 
     async def test_raises_on_databento_sdk_error(self, tmp_path: Path) -> None:
-        """SDK errors are wrapped in a ``RuntimeError`` with context."""
+        """Non-retryable SDK errors are wrapped in ``DatabentoUpstreamError``."""
+        from msai.services.data_sources.databento_errors import DatabentoUpstreamError
+
         # Arrange
         client = DatabentoClient(api_key="test_key")
         target = tmp_path / "ES.definition.dbn.zst"
 
-        mock_module = ModuleType("databento")
-        mock_historical_instance = MagicMock()
-        mock_historical_instance.timeseries.get_range.side_effect = RuntimeError("boom")
-        mock_module.Historical = MagicMock(return_value=mock_historical_instance)  # type: ignore[attr-defined]
-
-        original = sys.modules.get("databento")
-        sys.modules["databento"] = mock_module
+        _snapshot = _install_fake_databento()
+        sys.modules["databento"].Historical.return_value.timeseries.get_range.side_effect = (  # type: ignore[attr-defined]
+            RuntimeError("boom")
+        )
         try:
             # Act / Assert
-            with pytest.raises(RuntimeError, match="Databento definition request failed"):
+            with pytest.raises(DatabentoUpstreamError, match="Databento unexpected error"):
                 await client.fetch_definition_instruments(
                     "ES.c.0",
                     "2024-01-01",
@@ -357,4 +429,4 @@ class TestFetchDefinitionInstruments:
                     target_path=target,
                 )
         finally:
-            _restore_databento(original)
+            _restore_databento(_snapshot)
