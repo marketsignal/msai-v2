@@ -166,8 +166,9 @@ async def test_effective_window_check_rejects_inverted_window(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """``ck_instrument_aliases_effective_window`` rejects an alias row whose
-    ``effective_to`` is on/before ``effective_from``. ``NULL`` for
-    ``effective_to`` (the active-alias case) is allowed.
+    ``effective_to`` is strictly BEFORE ``effective_from``. ``NULL`` (active
+    alias) and zero-width ``effective_to == effective_from`` (same-day
+    rotation audit row) are both allowed.
     """
     async with session_factory() as session:
         idef = InstrumentDefinition(
@@ -194,15 +195,32 @@ async def test_effective_window_check_rejects_inverted_window(
         await session.commit()
 
     async with session_factory() as session:
-        # Inverted window — effective_to == effective_from — must fail.
+        # Zero-width window — effective_to == effective_from — allowed.
+        # Represents a same-day rotation where an alias was superseded on
+        # the same calendar day it was seeded; semantically the half-open
+        # interval [F, F) contains no dates, so the row is never active.
         session.add(
             InstrumentAlias(
                 instrument_uid=uid,
-                alias_string="ESM6.CME",
+                alias_string="ESU6.CME",
                 venue_format="exchange_name",
                 provider="interactive_brokers",
                 effective_from=date(2026, 6, 1),
                 effective_to=date(2026, 6, 1),
+            )
+        )
+        await session.commit()
+
+    async with session_factory() as session:
+        # Strictly inverted window — effective_to < effective_from — must fail.
+        session.add(
+            InstrumentAlias(
+                instrument_uid=uid,
+                alias_string="ESZ6.CME",
+                venue_format="exchange_name",
+                provider="interactive_brokers",
+                effective_from=date(2026, 12, 1),
+                effective_to=date(2026, 11, 30),
             )
         )
         with pytest.raises(IntegrityError):

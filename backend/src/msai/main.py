@@ -37,6 +37,7 @@ from msai.api.backtests import (
     router as backtests_router,
 )
 from msai.api.graduation import router as graduation_router
+from msai.api.instruments import router as instruments_router
 from msai.api.live import router as live_router
 from msai.api.market_data import router as market_data_router
 from msai.api.portfolio import router as portfolio_router
@@ -274,6 +275,7 @@ app.include_router(portfolio_router)
 app.include_router(live_portfolios_router)
 app.include_router(strategy_templates_router)
 app.include_router(alerts_router)
+app.include_router(instruments_router)
 
 
 # ---------------------------------------------------------------------------

@@ -39,7 +39,7 @@ class InstrumentAlias(Base):
             name="ck_instrument_aliases_venue_format",
         ),
         CheckConstraint(
-            "effective_to IS NULL OR effective_to > effective_from",
+            "effective_to IS NULL OR effective_to >= effective_from",
             name="ck_instrument_aliases_effective_window",
         ),
         UniqueConstraint(
@@ -50,14 +50,10 @@ class InstrumentAlias(Base):
         ),
     )
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        Uuid(), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True, default=uuid.uuid4)
     instrument_uid: Mapped[uuid.UUID] = mapped_column(
         Uuid(),
-        ForeignKey(
-            "instrument_definitions.instrument_uid", ondelete="CASCADE"
-        ),
+        ForeignKey("instrument_definitions.instrument_uid", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
@@ -67,6 +63,11 @@ class InstrumentAlias(Base):
     # ``'databento_continuous'`` (20 chars). Leaving headroom for future
     # venue formats (e.g. ``'mic_code_with_segment'``).
     venue_format: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Source-provider verbatim venue (Databento MIC code like "XNAS" before
+    # normalization to exchange-name). Nullable because IB writes don't need
+    # it (IB already emits exchange-name). Populated for provider="databento"
+    # writes via normalize_alias_for_registry().
+    source_venue_raw: Mapped[str | None] = mapped_column(String(64), nullable=True)
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
     effective_from: Mapped[date] = mapped_column(Date, nullable=False)
     effective_to: Mapped[date | None] = mapped_column(Date, nullable=True)

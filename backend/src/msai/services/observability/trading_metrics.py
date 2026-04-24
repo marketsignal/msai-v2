@@ -67,3 +67,38 @@ msai_backtest_trades_page_count = _r.counter(
     "msai_backtest_trades_page_count",
     "Count of GET /api/v1/backtests/{id}/trades requests, labeled by page_size.",
 )
+
+# --- Databento registry bootstrap observability ---
+
+# Databento API call outcomes
+DATABENTO_API_CALLS_TOTAL = _r.counter(
+    "msai_databento_api_calls_total",
+    "Databento API calls partitioned by endpoint and outcome. "
+    "Outcomes: success, rate_limited_recovered, rate_limited_failed, "
+    "unauthorized, upstream_error.",
+)
+
+# Registry bootstrap outcomes (per-symbol)
+REGISTRY_BOOTSTRAP_TOTAL = _r.counter(
+    "msai_registry_bootstrap_total",
+    "Registry bootstrap outcomes partitioned by provider, asset_class, outcome.",
+)
+
+# Bootstrap latency histogram (1 symbol end-to-end), milliseconds.
+_BOOTSTRAP_BUCKETS_MS: tuple[int, ...] = (100, 500, 1_000, 2_000, 5_000, 10_000, 30_000)
+REGISTRY_BOOTSTRAP_DURATION_MS = _r.histogram(
+    "msai_registry_bootstrap_duration_ms",
+    "End-to-end latency per bootstrap operation (1 symbol), in milliseconds.",
+    buckets=_BOOTSTRAP_BUCKETS_MS,
+)
+
+# Divergence counter. Fires when IB refresh writes an alias whose venue
+# differs from a prior Databento-authored alias for the same instrument
+# definition. Real-migration-only semantics enforced by alias normalization
+# (notation-only diffs like XNAS vs NASDAQ do NOT fire).
+REGISTRY_VENUE_DIVERGENCE_TOTAL = _r.counter(
+    "msai_registry_venue_divergence_total",
+    "Fires when IB refresh writes an alias whose venue differs from a prior "
+    "Databento-authored alias for the same instrument definition. "
+    "Labels applied at increment time: databento_venue, ib_venue.",
+)
