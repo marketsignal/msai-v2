@@ -33,6 +33,8 @@ dependencies = [
     "optuna>=4.4.0",
     "jinja2>=3.0",
     "tenacity>=9.1.0,<10",
+    "pyyaml>=6.0.2,<7",
+    "python-dateutil>=2.9.0",
 ]
 
 [project.optional-dependencies]
@@ -71,8 +73,12 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "TCH"]
 "src/msai/models/*.py" = ["TC001", "TC002", "TC003"]
 "src/msai/schemas/*.py" = ["TC001", "TC002", "TC003"]
 "src/msai/api/*.py" = ["TC001", "TC002", "TC003"]
+"src/msai/services/symbol_onboarding/*.py" = ["TC003"]
 "src/msai/core/auth.py" = ["TC003"]
 "src/msai/core/database.py" = ["TC003"]
+"src/msai/cli*.py" = ["TC003", "B008"]
+"tests/unit/services/symbol_onboarding/*.py" = ["TC003"]
+"tests/unit/cli/*.py" = ["TC003"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -101,6 +107,8 @@ module = [
     "azure.*",
     "sklearn.*",
     "testcontainers.*",
+    "yaml.*",
+    "dateutil.*",
 ]
 ignore_missing_imports = true
 

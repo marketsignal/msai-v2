@@ -14,7 +14,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Any
+from typing import Any, Literal
 
 import pandas as pd
 
@@ -326,6 +326,68 @@ class DataIngestionService:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class IngestResult:
+    """Structured outcome of an in-process ingest run.
+
+    Returned by :func:`ingest_symbols` so callers (notably the symbol-onboarding
+    orchestrator) can introspect what landed in Parquet without re-parsing the
+    raw ``ingest_historical`` payload shape.
+    """
+
+    bars_written: int
+    symbols_covered: list[str]
+    empty_symbols: list[str]
+    # Default ``"none"`` is the honest default — the helper does not
+    # actually inspect Parquet to determine coverage. Callers that need
+    # an authoritative coverage status must run ``compute_coverage``
+    # separately. A previous default of ``"full"`` was a footgun.
+    coverage_status: Literal["full", "gapped", "none"] = "none"
+
+
+def _build_default_service() -> DataIngestionService:
+    """Construct a :class:`DataIngestionService` with default settings-bound clients."""
+    return DataIngestionService(ParquetStore(str(settings.parquet_root)))
+
+
+async def ingest_symbols(
+    asset_class_ingest: str,
+    symbols: list[str],
+    start: str,
+    end: str,
+    *,
+    provider: str = "auto",
+    dataset: str | None = None,
+    schema: str | None = None,
+) -> IngestResult:
+    """Reusable in-process ingest helper.
+
+    Called directly by the symbol-onboarding orchestrator (no arq round
+    trip — see ``docs/plans/2026-04-24-symbol-onboarding.md`` T6 for the
+    deadlock rationale). ``asset_class_ingest`` is the INGEST taxonomy
+    (``stocks|futures|forex|option``).
+    """
+    service = _build_default_service()
+    stats = await service.ingest_historical(
+        asset_class_ingest,
+        symbols,
+        start,
+        end,
+        provider=provider,
+        dataset=dataset,
+        schema=schema,
+    )
+    ingested = stats.get("ingested", {}) or {}
+    bars_written = sum(int(d.get("bars", 0)) for d in ingested.values())
+    symbols_covered = [k for k, d in ingested.items() if int(d.get("bars", 0)) > 0]
+    empty_symbols = list(stats.get("empty_symbols", []) or [])
+    return IngestResult(
+        bars_written=bars_written,
+        symbols_covered=symbols_covered,
+        empty_symbols=empty_symbols,
+    )
+
+
 async def run_ingest(
     ctx: dict[str, Any],
     asset_class: str,
@@ -336,15 +398,14 @@ async def run_ingest(
     dataset: str | None = None,
     schema: str | None = None,
 ) -> None:
-    """arq-compatible entry point for data ingestion jobs.
+    """arq-compatible thin wrapper over :func:`ingest_symbols`.
 
-    Instantiates the service with default clients from settings and runs
-    historical ingestion. On failure, logs the error and re-raises.
+    Returns ``None`` to preserve the arq wire format expected by registered
+    consumers (worker registration, ``run_auto_heal`` enqueue path).
     """
     _ = ctx
-    service = DataIngestionService(ParquetStore(str(settings.parquet_root)))
     try:
-        await service.ingest_historical(
+        await ingest_symbols(
             asset_class,
             symbols,
             start,
@@ -354,7 +415,7 @@ async def run_ingest(
             schema=schema,
         )
     except Exception:
-        log.error(
+        log.exception(
             "ingest_failed",
             asset_class=asset_class,
             provider=provider,

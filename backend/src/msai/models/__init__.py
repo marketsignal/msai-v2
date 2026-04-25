@@ -27,6 +27,7 @@ from msai.models.research_job import ResearchJob
 from msai.models.research_trial import ResearchTrial
 from msai.models.strategy import Strategy
 from msai.models.strategy_daily_pnl import StrategyDailyPnl
+from msai.models.symbol_onboarding_run import SymbolOnboardingRun, SymbolOnboardingRunStatus
 from msai.models.trade import Trade
 from msai.models.user import User
 
@@ -54,6 +55,8 @@ __all__ = [
     "ResearchTrial",
     "Strategy",
     "StrategyDailyPnl",
+    "SymbolOnboardingRun",
+    "SymbolOnboardingRunStatus",
     "Trade",
     "User",
 ]

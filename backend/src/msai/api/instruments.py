@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
-from msai.api.backtests import _error_response
+from msai.api._common import error_response
 from msai.core.auth import get_current_user
 from msai.core.database import get_session_factory
 from msai.schemas.instrument_bootstrap import (
@@ -53,7 +53,7 @@ async def bootstrap_instruments(
     """Bootstrap a batch of symbols into the registry via Databento."""
     databento_client = DatabentoClient()
     if not databento_client.api_key:
-        return _error_response(
+        return error_response(
             500,
             "DATABENTO_NOT_CONFIGURED",
             "DATABENTO_API_KEY environment variable not set on server",

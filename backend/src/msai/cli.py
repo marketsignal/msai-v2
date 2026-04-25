@@ -1165,5 +1165,12 @@ def instruments_bootstrap(
         raise typer.Exit(code=1)
 
 
+# Register the symbols sub-app at module load time (after defining _api_call).
+# Import here to avoid circular dependency.
+from msai.cli_symbols import app as symbols_app  # noqa: E402
+
+app.add_typer(symbols_app, name="symbols")
+
+
 if __name__ == "__main__":
     app()

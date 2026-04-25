@@ -28,7 +28,6 @@ if TYPE_CHECKING:
 
 from msai.api.account import router as account_router
 from msai.api.alerts import router as alerts_router
-from msai.api.asset_universe import router as universe_router
 from msai.api.auth import router as auth_router
 from msai.api.backtests import (
     StrategyConfigValidationError,
@@ -45,6 +44,7 @@ from msai.api.portfolios import router as live_portfolios_router
 from msai.api.research import router as research_router
 from msai.api.strategies import router as strategies_router
 from msai.api.strategy_templates import router as strategy_templates_router
+from msai.api.symbol_onboarding import router as symbol_onboarding_router
 from msai.api.websocket import live_stream
 from msai.core.auth import _API_KEY_CLAIMS, init_validator
 from msai.core.config import settings
@@ -268,7 +268,7 @@ app.include_router(backtests_router)
 app.include_router(market_data_router)
 app.include_router(live_router)
 app.include_router(account_router)
-app.include_router(universe_router)
+app.include_router(symbol_onboarding_router)
 app.include_router(research_router)
 app.include_router(graduation_router)
 app.include_router(portfolio_router)
