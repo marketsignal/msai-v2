@@ -22,7 +22,7 @@ def upgrade() -> None:
     op.create_table(
         "symbol_onboarding_runs",
         sa.Column("id", sa.Uuid(), primary_key=True),
-        sa.Column("watchlist_name", sa.String(128), nullable=False, index=True),
+        sa.Column("watchlist_name", sa.String(128), nullable=False),
         sa.Column("status", sa.String(32), nullable=False, server_default="pending"),
         sa.Column("symbol_states", JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
         sa.Column(
@@ -59,6 +59,11 @@ def upgrade() -> None:
         ),
     )
     op.create_index(
+        "ix_symbol_onboarding_runs_watchlist_name",
+        "symbol_onboarding_runs",
+        ["watchlist_name"],
+    )
+    op.create_index(
         "ix_symbol_onboarding_runs_created_at",
         "symbol_onboarding_runs",
         ["created_at"],
@@ -78,6 +83,10 @@ def downgrade() -> None:
     )
     op.drop_index(
         "ix_symbol_onboarding_runs_created_at",
+        table_name="symbol_onboarding_runs",
+    )
+    op.drop_index(
+        "ix_symbol_onboarding_runs_watchlist_name",
         table_name="symbol_onboarding_runs",
     )
     op.drop_table("symbol_onboarding_runs")

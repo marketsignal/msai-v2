@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from arq import Retry
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
@@ -69,8 +70,12 @@ async def run_symbol_onboarding(ctx: dict[str, Any], *, run_id: str) -> dict[str
                 )
             ).scalar_one_or_none()
             if row is None:
-                bound.error("symbol_onboarding_worker_run_missing")
-                return {"status": "missing", "run_id": str(uid)}
+                # Race window: API enqueues the arq job BEFORE committing the
+                # row (council-pinned ordering). Worker can pick up the job
+                # before the row is visible — requeue with backoff so the
+                # transactional write window has time to commit.
+                bound.warning("symbol_onboarding_worker_run_missing_requeue")
+                raise Retry(defer=2)
             row.status = SymbolOnboardingRunStatus.IN_PROGRESS
             row.started_at = datetime.now(UTC)
             specs = _hydrate_specs(row.symbol_states)
@@ -122,6 +127,10 @@ async def run_symbol_onboarding(ctx: dict[str, Any], *, run_id: str) -> dict[str
         )
         return {"status": terminal.value, "run_id": str(uid)}
 
+    except Retry:
+        # arq retry signal — not a failure. Let arq see it untouched so the
+        # job is requeued with the configured backoff.
+        raise
     except Exception as exc:
         # Systemic short-circuit: best-effort sync run row to FAILED before
         # re-raising so arq's retry/DLQ machinery sees the original exception.

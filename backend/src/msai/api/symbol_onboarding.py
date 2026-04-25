@@ -14,7 +14,7 @@ import asyncio
 from datetime import date as _date
 from decimal import Decimal
 from pathlib import Path as _FsPath
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
 import redis.exceptions as redis_exceptions
@@ -51,10 +51,25 @@ from msai.services.nautilus.security_master.service import (
 )
 from msai.services.symbol_onboarding import normalize_asset_class_for_ingest
 from msai.services.symbol_onboarding.cost_estimator import (
+    UnpriceableAssetClassError,
     estimate_cost,
 )
 from msai.services.symbol_onboarding.coverage import compute_coverage
 from msai.services.symbol_onboarding.manifest import ParsedManifest
+
+# Asset classes the readiness endpoint accepts. Restricted to the registry
+# taxonomy so unsupported values produce a FastAPI 422 instead of bubbling
+# into the SecurityMaster as a ValueError.
+ReadinessAssetClass = Literal["equity", "futures", "fx", "option"]
+
+
+def _unpriceable_response(exc: UnpriceableAssetClassError) -> JSONResponse:
+    return error_response(
+        status_code=422,
+        code="UNPRICEABLE_ASSET_CLASS",
+        message=str(exc),
+    )
+
 
 # Narrow exception set treated as "queue unavailable" (HTTP 503). Anything
 # outside this set propagates as a 500 so programmer errors don't silently
@@ -96,7 +111,7 @@ def _get_databento_client() -> Any:
 async def onboard_dry_run(
     request: OnboardRequest,
     _user: Any = Depends(get_current_user),  # noqa: B008
-) -> DryRunResponse:
+) -> DryRunResponse | JSONResponse:
     """Pure preflight — no DB write, no job enqueue.
 
     Returns Databento cost estimate for the batch. Does NOT check live
@@ -116,10 +131,14 @@ async def onboard_dry_run(
     - ``breakdown[]`` — per-symbol line items.
 
     **Errors:**
-    - 422 Unprocessable Entity — invalid schema or >100 symbols.
+    - 422 Unprocessable Entity — invalid schema, >100 symbols, or an
+      asset class with no Databento dataset mapping.
     - 401 Unauthorized — JWT missing or invalid.
     """
-    estimate = await _compute_cost_estimate(request)
+    try:
+        estimate = await _compute_cost_estimate(request)
+    except UnpriceableAssetClassError as exc:
+        return _unpriceable_response(exc)
     return DryRunResponse(
         watchlist_name=request.watchlist_name,
         estimated_cost_usd=Decimal(str(estimate.total_usd)),
@@ -322,7 +341,10 @@ async def onboard(
     """
     estimated_cost: Decimal | None = None
     if request.cost_ceiling_usd is not None:
-        estimate = await _compute_cost_estimate(request)
+        try:
+            estimate = await _compute_cost_estimate(request)
+        except UnpriceableAssetClassError as exc:
+            return _unpriceable_response(exc)
         estimated_cost = Decimal(str(estimate.total_usd))
         if estimated_cost > request.cost_ceiling_usd:
             return error_response(
@@ -535,7 +557,7 @@ def _suggest_next_action(entry: dict[str, Any]) -> str | None:
 @router.get("/readiness", response_model=ReadinessResponse)
 async def readiness(
     symbol: str = Query(..., min_length=1, max_length=20),  # noqa: B008
-    asset_class: str = Query(..., min_length=1, max_length=32),  # noqa: B008
+    asset_class: ReadinessAssetClass = Query(...),  # noqa: B008
     start: _date | None = Query(default=None),  # noqa: B008
     end: _date | None = Query(default=None),  # noqa: B008
     _user: Any = Depends(get_current_user),  # noqa: B008
@@ -569,8 +591,8 @@ async def readiness(
             status_code=422,
             code="AMBIGUOUS_INSTRUMENT",
             message=(
-                f"Symbol {symbol!r} ambiguous across "
-                f"{len(exc.asset_classes)} definitions; use exact instrument id."
+                f"Symbol {symbol!r} matches {len(exc.asset_classes)} asset classes "
+                f"({sorted(exc.asset_classes)}); pin asset_class explicitly."
             ),
         )
     if resolution.instrument_uid is None:

@@ -6,6 +6,7 @@ from textwrap import dedent
 
 import pytest
 
+from msai.schemas.symbol_onboarding import OnboardSymbolSpec
 from msai.services.symbol_onboarding.manifest import (
     ManifestParseError,
     ParsedManifest,
@@ -141,7 +142,5 @@ def test_merge_manifests_keeps_distinct_asset_classes_separate() -> None:
     assert len(merged.symbols) == 2
 
 
-def _spec(symbol: str, asset_class: str, start: date, end: date) -> None:
-    from msai.schemas.symbol_onboarding import OnboardSymbolSpec
-
+def _spec(symbol: str, asset_class: str, start: date, end: date) -> OnboardSymbolSpec:
     return OnboardSymbolSpec(symbol=symbol, asset_class=asset_class, start=start, end=end)

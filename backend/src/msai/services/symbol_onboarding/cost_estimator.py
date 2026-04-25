@@ -18,12 +18,37 @@ from msai.services.nautilus.security_master.continuous_futures import (
 
 log = structlog.get_logger(__name__)
 
-__all__ = ["CostEstimate", "CostLine", "estimate_cost"]
+__all__ = [
+    "CostEstimate",
+    "CostLine",
+    "UnpriceableAssetClassError",
+    "estimate_cost",
+]
 
 _ASSET_TO_DATASET: dict[str, str] = {
     "equity": "XNAS.ITCH",
     "futures": "GLBX.MDP3",
 }
+
+
+class UnpriceableAssetClassError(ValueError):
+    """Raised when a manifest references an asset class that has no
+    Databento dataset mapped for cost estimation.
+
+    Lifting this from a silent ``log.warning + continue`` to a typed
+    raise keeps the cost-ceiling enforcement structurally sound — without
+    it, a request with N pricable + M unpricable symbols would silently
+    estimate only the N pricable lines and slip past ``cost_ceiling_usd``
+    when the M unpricable symbols actually run.
+    """
+
+    def __init__(self, symbol: str, asset_class: str) -> None:
+        self.symbol = symbol
+        self.asset_class = asset_class
+        super().__init__(
+            f"asset_class={asset_class!r} (symbol={symbol!r}) has no Databento "
+            "dataset mapping; v1 cost estimator supports only equity + futures."
+        )
 
 
 class _DatabentoMetadataProto(Protocol):
@@ -80,12 +105,10 @@ async def estimate_cost(
     for spec in manifest.symbols:
         dataset = _ASSET_TO_DATASET.get(spec.asset_class)
         if dataset is None:
-            log.warning(
-                "cost_estimator_unmapped_asset_class",
-                asset_class=spec.asset_class,
-                symbol=spec.symbol,
-            )
-            continue
+            # Fail loud rather than silently dropping the symbol from the
+            # estimate — the API layer catches this and returns 422 so
+            # cost_ceiling_usd enforcement stays structurally correct.
+            raise UnpriceableAssetClassError(spec.symbol, spec.asset_class)
         buckets[(dataset, spec.start, spec.end)].append(spec)
 
     breakdown: list[CostLine] = []

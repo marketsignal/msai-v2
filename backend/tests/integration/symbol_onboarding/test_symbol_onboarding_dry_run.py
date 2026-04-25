@@ -63,10 +63,16 @@ async def test_dry_run_happy_path(
         ],
     }
     fake_estimate = _fake_estimate_high_confidence()
-    with patch(
-        "msai.api.symbol_onboarding.estimate_cost",
-        new_callable=AsyncMock,
-        return_value=fake_estimate,
+    with (
+        patch(
+            "msai.api.symbol_onboarding.estimate_cost",
+            new_callable=AsyncMock,
+            return_value=fake_estimate,
+        ),
+        patch(
+            "msai.api.symbol_onboarding._get_databento_client",
+            return_value=object(),
+        ),
     ):
         resp = await client.post(
             "/api/v1/symbols/onboard/dry-run",
@@ -194,10 +200,16 @@ async def test_dry_run_multiple_symbols(
             basis="databento.metadata.get_cost (1m OHLCV)",
         )
 
-    with patch(
-        "msai.api.symbol_onboarding.estimate_cost",
-        new_callable=AsyncMock,
-        return_value=_fake_multi_estimate(),
+    with (
+        patch(
+            "msai.api.symbol_onboarding.estimate_cost",
+            new_callable=AsyncMock,
+            return_value=_fake_multi_estimate(),
+        ),
+        patch(
+            "msai.api.symbol_onboarding._get_databento_client",
+            return_value=object(),
+        ),
     ):
         resp = await client.post(
             "/api/v1/symbols/onboard/dry-run",

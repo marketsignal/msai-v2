@@ -1,5 +1,4 @@
-name: example-core-equities
+watchlist_name: example-core-equities
 symbols:
-  - { symbol: SPY,    asset_class: equity, start: 2024-01-01, end: 2024-12-31 }
-  - { symbol: AAPL,   asset_class: equity, start: trailing_1y }
-request_live_qualification: false
+  - { symbol: SPY, asset_class: equity, start: 2024-01-01, end: 2024-12-31 }
+  - { symbol: AAPL, asset_class: equity, window: trailing_5y }
