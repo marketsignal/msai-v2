@@ -73,8 +73,10 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "TCH"]
 "src/msai/models/*.py" = ["TC001", "TC002", "TC003"]
 "src/msai/schemas/*.py" = ["TC001", "TC002", "TC003"]
 "src/msai/api/*.py" = ["TC001", "TC002", "TC003"]
+"src/msai/services/symbol_onboarding/*.py" = ["TC003"]
 "src/msai/core/auth.py" = ["TC003"]
 "src/msai/core/database.py" = ["TC003"]
+"tests/unit/services/symbol_onboarding/*.py" = ["TC003"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -103,6 +105,8 @@ module = [
     "azure.*",
     "sklearn.*",
     "testcontainers.*",
+    "yaml.*",
+    "dateutil.*",
 ]
 ignore_missing_imports = true
 
