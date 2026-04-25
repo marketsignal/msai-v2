@@ -6,13 +6,124 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field     | Value |
-| --------- | ----- |
-| Command   | none  |
-| Phase     | —     |
-| Next step | —     |
+| Field     | Value                                                                                                                                    |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Command   | /new-feature symbol-onboarding                                                                                                           |
+| Phase     | 6 — Ship. All Phase 5 gates GREEN: code review, simplify, verify-app, verify-e2e (4 PASS + 3 SKIPPED_INFRA + 1 FAIL_BUG fixed in scope). |
+| Next step | Batch-commit Phase 4+5 work (workflow-gate hook now permits — 4 gates checked) → push → open PR → finish branch.                         |
 
 ### Checklist
+
+- [x] Worktree created at `.worktrees/symbol-onboarding` off `09e956e` (main @ PR #44 merge + CONTINUITY cleanup)
+- [x] Project state read
+- [x] Plugins verified — `/prd:discuss` + `/prd:create` + `/council` all functional; `/council` dispatched 5 advisors + Codex chairman successfully this session.
+- [x] PRD discuss complete — `docs/prds/symbol-onboarding-discussion.md` closed 2026-04-24. 10 questions in 4 groups routed to `/council` (5 advisors + Codex xhigh chairman). Verdict: all 10 answered + 2 binding contract corrections (pin #3 scoping + `/api/v1/universe` deprecation). Minority Report preserved (Simplifier's ONE-watchlist + no-cost-preview overruled; Scalability Hawk's circuit-breaker + cancel-now overruled; Contrarian's pin-#3 fatal-flaw ACCEPTED; Maintainer's `asset_universe` model-fracture ACCEPTED).
+- [x] PRD created — `docs/prds/symbol-onboarding.md` v1.0. 10 user stories (US-001..US-010: YAML manifest, async API job, per-symbol progress, preflight cost estimate + ceiling, partial-batch semantics, window+provider-scoped `backtest_data_available`, explicit repair action, `msai symbols onboard` CLI, `msai symbols status` CLI, `/api/v1/universe` deprecation). 11 explicit non-goals (UI deferred, cancel, rollback, silent auto-retry, per-strategy manifests, single watchlist.yaml, DB-backed CRUD, 1s bars, multi-user, cron scheduler, new providers). 6 success metrics (cold-start < 3min, 0 manual SQL, idempotent re-apply, scoped readiness correctness, budget ceiling enforcement, partial-batch clarity). 8 open questions routed to Phase 2 research-first agent (Databento `metadata.get_cost` accuracy, `/api/v1/universe` live-caller count, `asset_universe.resolution` usage grep, `OnboardingJob` persistence, `CoverageSnapshot` compute strategy, Prometheus metrics set, deprecation grace period, `trailing_5y` sugar expansion).
+- [x] Research artifact produced — `docs/research/2026-04-24-symbol-onboarding.md` (339 lines). 7 Tier-1/2 libraries deep-researched + 3 Tier-3 noted + 1 explicit-skip (Next.js/React — UI deferred). **6 design-changing findings:** (1) `Historical.metadata.get_cost()` has no published error band but agrees BYTE-FOR-BYTE with `get_range` for fully-historical completed windows — `estimate_confidence` becomes a declared classification (`high` when `end < today-1d` and no ambiguous/continuous symbols, `medium` otherwise), NOT a computed interval; (2) US-004 endpoint shape: use **separate `POST /api/v1/symbols/onboard/dry-run` endpoint**, NOT `?dry_run=true` query param — cleaner OpenAPI + TS codegen; (3) `OnboardingJob` = dedicated Postgres table (arq Redis records expire after completion, can't model partial-success for operator reporting); (4) `CoverageSnapshot` = on-the-fly Parquet directory scan for v1; flip to cached table only if >500-symbol watchlists appear; (5) `trailing_5y` expanded client-side via `dateutil.relativedelta`, default `end=today-1d` (NOT `today` — dodges PR #44's nightly-publication-window gotcha that caused the E2E FAIL_BUG); (6) idempotency `_job_id` MUST use `hashlib.blake2b`, NOT Python's built-in `hash()` — mirrors PR #44's `compute_advisory_lock_key` (PYTHONHASHSEED randomization would break cross-process idempotency). **Net-new dep:** add **PyYAML 6.0.2** to `backend/pyproject.toml`; pin `yaml.safe_load` at every call site (never `yaml.load`). **SDK deprecation:** do NOT pass `mode=` to `metadata.get_cost` — deprecated at SDK 0.65.0. 11 open risks flagged (publication-window divergence, continuous-futures cost surprise, cross-provider ambiguity, etc.).
+- [x] Design guidance loaded — **N/A**: backend-only feature. UI deferred to post-v1 (PRD non-goal #1). No `/ui-design` skill needed.
+- [x] Brainstorming complete — Phase 3.1 done in-session. Orchestrator topology was the one genuinely open design decision (everything else pinned by PRD + research). Claude proposed 3 approaches (monolithic / parent+child fan-out / chained tasks) and initially recommended Approach 2.
+- [x] Approach comparison filled — see `## Approach Comparison` section above. Approach 1 chosen; Approach 2 scored worse on every fixed axis (Complexity H vs L, Time-to-Validate H vs L, User/Correctness Risk H vs L). Cheapest falsifying test was `cat IngestWorkerSettings.max_jobs` — `=1` killed Approach 2's parallelism claim in <30 min.
+- [x] Contrarian gate passed (council) — 2026-04-24 standalone `/council` run, 5 advisors + Codex xhigh chairman. Claude's initial Approach 2 recommendation was **materially wrong** on 3 false premises: (1) PR #40 is NOT N-child fan-out precedent, (2) `Semaphore(3)` parallelism is fiction against `IngestWorkerSettings.max_jobs=1`, (3) "~50 LOC overhead" was off by an order of magnitude. Council OVERRULED Claude 4-of-5 (only Scalability Hawk was CONDITIONAL-on-Approach-2, and even then with 4 infra mitigations Claude hadn't specified).
+- [x] Council verdict: **Approach 1** (single arq entrypoint `run_symbol_onboarding`, `_onboard_one_symbol()` seam for future parallelism, phase-local bounded concurrency ONLY in bootstrap phase, ingest/IB strictly sequential, `asyncio.wait_for(120s)` on IB, 100-symbol API cap, 3 Prometheus metrics, 4 binding renames: `SymbolOnboardingRun` / `symbol_states` / `cost_ceiling_usd` / `request_live_qualification`). Minority Report preserved: Scalability Hawk's CONDITIONAL-on-Approach-2 (dedicated queue + fire-and-forget parent + IB timeouts + 4 metrics) — topology overruled, safety parts ADOPTED into Approach 1 (`asyncio.wait_for(120s)` + 3 of 4 metrics; `queue_depth` dropped since no dedicated queue in v1). Renames applied to PRD; Approach-1-only constraints added to PRD §5.
+- [x] Plan written — `docs/plans/2026-04-24-symbol-onboarding.md` (3,981 lines, 16 tasks T0–T15). Full code bodies + TDD steps + commit messages per task. 6 E2E use cases (UC-SYM-001..006) in T15. Inline self-review PASSED: spec coverage (all 10 US + 9 architectural constraints mapped), placeholder scan (none), type consistency (enums + method signatures + schema field names unified across tasks), scope check (single-feature, appropriately sized). Awaiting user review before plan-review loop 3.3.
+- [x] Plan review loop (4 iterations — PASS 2026-04-24) — productive convergence: iter-1 16 findings (1 P0 queue-deadlock + 7 P1 + 6 P2 + 2 P3) → iter-2 6 (0 P0 + 4 P1 + 2 P2) → iter-3 2 (0 P0 + 1 P1 + 1 P2) → iter-4 CLEAN 0/0/0/0 both reviewers. Each iter narrowed in-scope. Mini-council on iter-1 P0 (5 advisors + Codex chairman): Option A + 3 binding constraints (inline ingest helper, no child arq job, persistent per-symbol error envelope). Plan v1 (3,981 lines) → v2 → v3 → v4 (~5,150 lines, 18 tasks incl. T6a ingest-helper extraction + T8-prime `_error_response` promotion). Loop closed. Ready for Phase 4 TDD.
+- [x] TDD execution complete — All 18 tasks (T0–T15 + T6a + T8-prime) implemented via subagent-driven development. T0–T5 committed (`6441b64` … `9ad9119`); T6a/T13/T8-prime/T6/T7/T8/T9/T10/T11/T12/T14/T15 uncommitted on disk per workflow-gate hook (per `feedback_workflow_gate_blocks_preflight_commits.md`). Total ~50 unit/integration tests added; all green.
+- [x] Code review loop (2 iterations — PASS 2026-04-25) — productive convergence: iter-1 (Codex + 3 pr-review-toolkit + verify-app) found 3 P0 + 12 P1 + 10 P2 + 3 P3 = 28 blocking findings; 12-block fix-pass landed cleanly (66/66 affected tests pass, ruff + mypy clean). iter-2 (verify-app + Codex) found 0 P0 + 1 P1 + 1 P2 + 1 P3 = 3 narrow findings (duplicate-symbol JSONB collision, CLI Decimal serialization, double-counted histogram); all fixed inline. 28→3 trajectory.
+- [x] Simplified — 3-agent parallel sweep (reuse / quality / efficiency). 5 P1 fixes applied: (a) `_CONTINUOUS_FUTURES_RE` dedup → use existing `is_databento_continuous_pattern` from PR #44; (b) strip "council-ratified", plan-task-IDs, dates from orchestrator + worker docstrings (project comment-hygiene rule); (c) extract `_get_databento_client()` module-level singleton in `api/symbol_onboarding.py` so `/dry-run` and `/onboard` ceiling-check share one client; (d) add bucketing-trade-off docstring to `estimate_cost`. 39/39 affected tests pass; ruff + mypy clean.
+- [x] Verified (tests/lint/types) — verify-app iter-2 PASS: 2109/2109 effective tests + 11 skipped + 16 xfailed (2 pre-existing flakes from PR #41 unchanged); ruff clean across `src/`; mypy `--strict` 0 errors across 181 source files (was 7 errors in `api/symbol_onboarding.py` at iter-1 — Block 8 fix verified); alembic head `c7d8e9f0a1b2`.
+- [x] E2E use cases designed (Phase 3.2b) — 7 UCs (UC-SYM-001..007) drafted in plan T15 + at `tests/e2e/use-cases/instruments/symbol-onboarding.md` (intent → setup → steps → verification → persistence per `.claude/rules/testing.md`).
+- [x] E2E verified via verify-e2e agent (Phase 5.4) — Report at `tests/e2e/reports/2026-04-24-symbol-onboarding.md`. **Verdict PARTIAL: 4 PASS + 3 SKIPPED_INFRA**. UC-SYM-001 (SPY 1-month happy path) PASS — real Databento ingest end-to-end, registry row + Parquet coverage + readiness all green. UC-SYM-002 (cost ceiling preflight) PASS after mid-run FAIL_BUG fix: `_get_databento_client()` returned MSAI's `DatabentoClient` wrapper but cost estimator needs the real `databento.Historical` SDK (the `.metadata.get_cost(...)` attribute lives on the SDK, not the wrapper). Fixed inline + UC re-ran PASS. UC-SYM-004 (window-scoped readiness, Contrarian pin-#3) PASS — `null` (no window) → `full` (covered) → `gapped` (with `missing_ranges`). UC-SYM-007 (idempotency) PASS — POST-1 → 202 `pending`; POST-2 → **200** `in_progress` (same run_id, real state, not stale "pending"); POST-3 → **200** `completed`. UC-SYM-003 SKIPPED_INFRA (Databento ambiguity is non-deterministic; unit tests cover the path). UC-SYM-005 + UC-SYM-006 SKIPPED_INFRA (RUN_PAPER_E2E + broker compose profile opt-in).
+- [x] E2E regression passed (Phase 5.4b) — N/A: this PR's surface (new `/api/v1/symbols/*` router + new arq task + new model + new alembic migration `c7d8e9f0a1b2`) does not modify any surface underpinning prior graduated UCs (`backtests/auto-ingest`, `backtests/failure-surfacing`, `backtests/results-charts-and-trades`, `strategies/config-schema-form`, `live/registry-backed-deploy`, `instruments/databento-registry-bootstrap`). Full-suite regression via verify-app (2109/2109 effective pass) confirms no regression. T8-prime `_error_response → error_response` promotion preserved 50/50 backtests + instruments tests.
+- [x] E2E use cases graduated to tests/e2e/use-cases/ (Phase 6.2b) — 7 UCs at `tests/e2e/use-cases/instruments/symbol-onboarding.md` (already in canonical location; PASS UCs ratified by verify-e2e report mtime > branch-off).
+- [ ] E2E specs graduated to tests/e2e/specs/ (Phase 6.2c — if Playwright framework installed)
+- [ ] Learnings documented (if any)
+- [ ] State files updated
+- [ ] Committed and pushed
+- [ ] PR created
+- [ ] PR reviews addressed
+- [ ] Branch finished
+
+### Scope seed (to refine during PRD discuss)
+
+**User vision (verbatim, 2026-04-24):** "How the user via CLI, API and UI tells msai that it wants a series of symbols at different bars (1s, 1m, 5m, etc), for example (SPY, E-mini, IWM, AAPL, all in 5 mins and 1 min)."
+
+**Architecturally pinned decisions** (ratified with user before PRD):
+
+1. **Storage is 1m canonical.** 5m / 10m / 30m / 1h / 1d all derive at backtest time via Nautilus `BarAggregator`. Onboarding has NO UI/API surface for "pick 5m AND 1m" — that's implicit. User's watchlist-level timeframe picker is a pure display affordance informing the strategy template, NOT an ingest multiplier.
+2. **1-second bars are out of scope for v1.** Different Databento schema, different storage partition, ~60× cost. Deferred to a separate PRD once demand is real.
+3. **Three readiness states** (the contract from PR #44) are the primary data model: `registered` / `backtest_data_available` / `live_qualified`. API/CLI/UI all surface these.
+4. **`live_qualify: false` default** — onboarding stops at "backtest-ready" unless explicitly opted-in. Live qualification requires IB Gateway (`broker` compose profile, credentials, market-data entitlements) and is slow (per-symbol IB round-trip). Trader workflow is backtest → paper → live; the flag matches that graduation.
+5. **Manifest-driven CLI** — trader's watchlist is a `.yaml` in git alongside strategies. Batch onboarding from manifest is the common case, not ad-hoc single-symbol calls.
+6. **API is primary** — orchestrates existing primitives (bootstrap from PR #44 + ingest pipeline + IB refresh). CLI bypasses `_api_call`. UI surface under `/universe`.
+7. **Asynchronous job** — `POST /api/v1/symbols/onboard` returns 202 + job_id; status polled via `GET /api/v1/symbols/onboard/{id}/status`. Bootstrapping 20 symbols × 5 years of minute bars is NOT a synchronous-HTTP-response workload.
+
+**Scope seed:**
+
+- New `POST /api/v1/symbols/onboard` API + `GET /api/v1/symbols/onboard/{id}/status` polling
+- New `msai symbols onboard --manifest watchlist.yaml` + `msai symbols status` CLI
+- New `/universe` Next.js page with 3-state matrix + coverage-gap drawer per row
+- Orchestrator service composes bootstrap (#44) + ingest + optional IB refresh
+- Queue-backed (arq) so user doesn't block on a 10-minute backfill
+
+**Out of scope (defer-again candidates):**
+
+- Second-level bars (1s, tick)
+- Crypto, options, non-USD FX
+- Automatic re-ingest on coverage drift (the coverage-check is read-only in v1)
+- Strategy auto-association (operator still picks strategies separately)
+
+**Key open questions for PRD discuss:**
+
+- Should the onboard job also trigger Nautilus catalog rebuild, or leave that to the existing on-demand catalog loader? (PR #16 autonomy contract may already cover this.)
+- Coverage-gap detection granularity — daily? monthly? (affects the UI drawer data shape.)
+- Batch size — 50 symbols per manifest (matches bootstrap cap), or allow chunking for bigger universes?
+- What happens mid-run if one symbol fails? Continue others? All-or-nothing? (bootstrap's 207 pattern + continue-others is the precedent.)
+- How does the UI surface partial progress in real-time — WebSocket reconnect-friendly (PR #24 pattern), or polling?
+- Cost display — is the UI expected to show "estimated Databento cost for this batch: ~$2.40"? (affects whether we pre-call `metadata.list_datasets`.)
+
+## Approach Comparison (Phase 3.1b — orchestrator topology)
+
+### Chosen Default (council-ratified 2026-04-24)
+
+**Approach 1 — Single-task orchestrator.** One arq entrypoint `run_symbol_onboarding` loops symbols in one worker; one `SymbolOnboardingRun` Postgres row owns progress; a `_onboard_one_symbol()` seam enables future parallelism if measured need arises. Endorsed refinement: `DatabentoBootstrapService`-style bounded concurrency (`Semaphore(max_concurrent<=3)` + `gather(..., return_exceptions=True)`) is allowed **inside the bootstrap phase only** — NOT across the full per-symbol pipeline. Ingest + IB qualification remain sequential.
+
+### Best Credible Alternative (rejected)
+
+**Approach 2 — Parent + per-symbol children arq fan-out.** Parent task enqueues N children; children run bounded by `Semaphore(3)`; parent polls and aggregates. Claude's original recommendation; rejected 4-of-5 in council.
+
+### Scoring (fixed axes)
+
+| Axis                  | Approach 1 (chosen)                                     | Approach 2 (rejected)                                                                 |
+| --------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Complexity            | L                                                       | H                                                                                     |
+| Blast Radius          | L                                                       | M                                                                                     |
+| Reversibility         | H (`_onboard_one_symbol` seam permits in-place rewrite) | M (distributed state is harder to unwind)                                             |
+| Time to Validate      | L (2-day ship)                                          | H (5–6 day ship + 8+ plan-review iterations per PR #40 precedent)                     |
+| User/Correctness Risk | L                                                       | H (split-brain Redis+Postgres control plane, orphan parent tasks, lost JSONB updates) |
+
+### Cheapest Falsifying Test
+
+**< 30 min — already run.** The falsifying fact was discovered by the council itself during advisor dispatch: `cat backend/src/msai/workers/ingest_settings.py:51` → `IngestWorkerSettings.max_jobs = 1`. Approach 2's claimed parallelism (1.5 min wall-clock for 20 symbols) is fiction against this cap — children enqueued into `msai:ingest` serialize at the worker level regardless of `Semaphore(3)`. Approach 1 and Approach 2 produce **identical** wall-clock at current system settings. Approach 2 therefore buys zero throughput in exchange for distributed-state complexity.
+
+### Contrarian Gate — COUNCIL verdict
+
+Council ran 2026-04-24 (standalone mode, 5 advisors, Codex xhigh chairman). Verdict: **4 OBJECT, 1 CONDITIONAL** on Approach 2. Claude's original recommendation relied on three false premises:
+
+1. **PR #40 is N-child fan-out precedent.** FALSE. `run_auto_heal` enqueues exactly ONE ingest job.
+2. **Child fan-out produces real wall-clock parallelism.** FALSE. `IngestWorkerSettings.max_jobs=1` serializes at worker level; `max_concurrent=3` in bootstrap is a separate (phase-local) knob.
+3. **Approach 2 overhead is "~50 LOC."** FALSE by order of magnitude. PR #40's one-child pattern needed `AutoHealLock` + Lua CAS + `AutoHealGuardrails` + `AutoHealOutcome` enum + 8 plan-review iterations.
+
+**Council verdict adopted + Minority Report preserved:**
+
+- Scalability Hawk dissented with CONDITIONAL-on-Approach-2 (required: dedicated `msai:onboarding` queue + fire-and-forget parent + IB timeout wrapping + 4 metrics). **Overruled on topology, safety parts absorbed into Approach 1:** `asyncio.wait_for(120s)` on IB calls ✅, 3 Prometheus metrics ✅ (`msai_onboarding_jobs_total{status}` + `msai_onboarding_symbol_duration_seconds{step}` + `msai_onboarding_ib_timeout_total`), 100-symbol hard cap at API ✅. Dropped: `msai_onboarding_queue_depth` (no dedicated queue in v1).
+- Contrarian escalation: called Claude's recommendation "materially wrong, not a close call." Full endorsement: the hard part is truthful status semantics + safe recovery, not fan-out topology. Plan Phase 3 must pin `symbol_states` status machine explicitly.
+
+**4 non-negotiable renames adopted as binding PRD-contract corrections (before merge):**
+
+- `OnboardingJob` → `SymbolOnboardingRun`
+- `per_symbol` (JSONB field) → `symbol_states`
+- `max_estimated_cost_usd` → `cost_ceiling_usd`
+- `live_qualify` (request flag) → `request_live_qualification` (disambiguates from `live_qualified` readiness state)
 
 ## Prior workflow checklist (archived — PR #44 databento-registry-bootstrap SHIPPED 2026-04-24)
 

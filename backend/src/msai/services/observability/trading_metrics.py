@@ -102,3 +102,30 @@ REGISTRY_VENUE_DIVERGENCE_TOTAL = _r.counter(
     "Databento-authored alias for the same instrument definition. "
     "Labels applied at increment time: databento_venue, ib_venue.",
 )
+
+# --- Symbol onboarding observability ---
+
+# Run-level outcome counter. Labeled by terminal status at increment time.
+onboarding_jobs_total = _r.counter(
+    "msai_onboarding_jobs_total",
+    "Symbol-onboarding runs by terminal status. "
+    "Labels applied at increment time: status (completed | "
+    "completed_with_failures | failed).",
+)
+
+# Per-symbol per-phase duration in seconds. Unlabeled — the project's
+# hand-rolled Histogram primitive (services/observability/metrics.py)
+# does not yet support labeled observations. Per-step breakdown lives
+# in the structured ``symbol_onboarding_step_completed`` log event.
+_ONBOARDING_BUCKETS_S: tuple[int, ...] = (1, 5, 15, 30, 60, 120, 300, 600)
+onboarding_symbol_duration_seconds = _r.histogram(
+    "msai_onboarding_symbol_duration_seconds",
+    "Per-symbol end-to-end onboarding duration in seconds.",
+    buckets=_ONBOARDING_BUCKETS_S,
+)
+
+# IB-qualification timeout counter (council-mandated SLA guardrail).
+onboarding_ib_timeout_total = _r.counter(
+    "msai_onboarding_ib_timeout_total",
+    "Count of IB qualification phases that exceeded the configured timeout.",
+)

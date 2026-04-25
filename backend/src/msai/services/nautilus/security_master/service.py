@@ -39,6 +39,8 @@ Bulk resolve semantics:
 
 from __future__ import annotations
 
+import uuid  # noqa: TC003 — used in dataclass field annotation evaluated at runtime
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -111,6 +113,20 @@ def compute_advisory_lock_key(provider: str, raw_symbol: str, asset_class: str) 
     return int.from_bytes(digest, "big", signed=False) & 0x7FFFFFFFFFFFFFFF
 
 
+def compute_blake2b_digest_key(*parts: str) -> int:
+    """blake2b digest of arbitrary string parts, rendered as a positive int.
+
+    Shared primitive with :func:`compute_advisory_lock_key` but accepts any
+    number of string parts (joined with a null separator). Used by callers
+    that need a deterministic fingerprint of a composite key (e.g. the
+    symbol-onboarding ``job_id_digest``).
+    """
+    import hashlib  # noqa: PLC0415
+
+    digest = hashlib.blake2b("\x00".join(parts).encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big", signed=False) & 0x7FFFFFFFFFFFFFFF
+
+
 _ROLL_SENSITIVE_ROOTS: frozenset[str] = frozenset({"ES"})
 """Raw symbols whose canonical alias changes over time (quarterly
 futures roll). For these, ``resolve_for_live``'s warm path B compares
@@ -127,6 +143,30 @@ class DatabentoDefinitionMissing(Exception):  # noqa: N818 — spec-mandated nam
     Backtests are fail-loud on cold-miss — the error carries the original
     symbol and an operator hint pointing to ``msai instruments refresh``.
     """
+
+
+@dataclass(frozen=True, slots=True)
+class AliasResolution:
+    """Aggregate readiness view for one (symbol, asset_class) lookup.
+
+    Built from the union of all active alias rows for a single
+    ``instrument_uid``. Distinct from :meth:`SecurityMaster.resolve_for_backtest`
+    and :meth:`SecurityMaster.lookup_for_live`, which return scalar alias
+    strings or live contract specs respectively — this aggregator powers
+    the three-state readiness contract (``registered`` /
+    ``backtest_data_available`` / ``live_qualified``) surfaced by the
+    Symbol Onboarding readiness endpoint.
+    """
+
+    instrument_uid: uuid.UUID | None
+    primary_provider: str  # e.g. "databento"; empty string when unregistered
+    has_ib_alias: bool
+    ingest_asset_class: str  # registry-taxonomy value passed in by caller
+
+    def coverage_summary_hint(self) -> str | None:
+        if self.instrument_uid is None:
+            return None
+        return f"Registered via {self.primary_provider}; live-qualified: {self.has_ib_alias}"
 
 
 class SecurityMaster:
@@ -635,6 +675,103 @@ class SecurityMaster:
         # Unknown taxonomy passes through unchanged — operator can still
         # see it and decide; tests parametrize each known key.
         return _REGISTRY_TO_INGEST_ASSET_CLASS.get(registry_taxon, registry_taxon)
+
+    async def find_active_aliases(
+        self,
+        *,
+        symbol: str,
+        asset_class: str,
+        as_of_date: date,
+    ) -> AliasResolution:
+        """Aggregate readiness view for a ``(symbol, asset_class)`` pair.
+
+        Selects all active :class:`InstrumentAlias` rows (``effective_from
+        <= as_of_date AND (effective_to IS NULL OR effective_to >
+        as_of_date)``) that share the same ``raw_symbol`` and that hang
+        off an :class:`InstrumentDefinition` with the requested
+        ``asset_class``.
+
+        ``asset_class`` is the registry/user-facing taxonomy
+        (``equity`` | ``futures`` | ``fx`` | ``option`` | ``crypto``) per
+        the ``ck_instrument_definitions_asset_class`` CHECK.
+
+        ``as_of_date`` is required (no implicit ``date.today()``) so the
+        caller owns the time-zone decision — same discipline as
+        :meth:`InstrumentRegistry.find_by_alias` after PR #37.
+
+        Raises :class:`AmbiguousSymbolError` when more than one
+        :class:`InstrumentDefinition` row matches (same raw_symbol and
+        asset_class but different ``instrument_uid`` across providers).
+        Returns an :class:`AliasResolution` with ``instrument_uid=None``
+        when no row matches — caller turns that into HTTP 404.
+
+        Provider-preference policy: ``databento`` >
+        ``interactive_brokers`` > anything else (deterministic fallback
+        to the lexicographically-first remaining provider). The
+        ``has_ib_alias`` flag is independent and reflects whether ANY
+        active alias row carries ``provider="interactive_brokers"`` —
+        that is the live-qualification signal for the Symbol Onboarding
+        readiness contract.
+        """
+        from msai.models.instrument_alias import InstrumentAlias
+        from msai.models.instrument_definition import InstrumentDefinition
+        from msai.services.nautilus.security_master.registry import (
+            AmbiguousSymbolError,
+        )
+
+        rows = (
+            (
+                await self._db.execute(
+                    select(InstrumentAlias)
+                    .join(
+                        InstrumentDefinition,
+                        InstrumentDefinition.instrument_uid == InstrumentAlias.instrument_uid,
+                    )
+                    .where(InstrumentDefinition.raw_symbol == symbol)
+                    .where(InstrumentDefinition.asset_class == asset_class)
+                    .where(InstrumentAlias.effective_from <= as_of_date)
+                    .where(
+                        (InstrumentAlias.effective_to.is_(None))
+                        | (InstrumentAlias.effective_to > as_of_date)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        if not rows:
+            return AliasResolution(
+                instrument_uid=None,
+                primary_provider="",
+                has_ib_alias=False,
+                ingest_asset_class=asset_class,
+            )
+
+        uids = {r.instrument_uid for r in rows}
+        if len(uids) > 1:
+            sorted_providers = sorted({r.provider for r in rows})
+            raise AmbiguousSymbolError(
+                symbol=symbol,
+                provider=sorted_providers[0] if sorted_providers else "",
+                asset_classes=[asset_class],
+            )
+        instrument_uid = next(iter(uids))
+        provider_set = {r.provider for r in rows}
+        has_ib = "interactive_brokers" in provider_set
+        if "databento" in provider_set:
+            primary = "databento"
+        elif has_ib:
+            primary = "interactive_brokers"
+        else:
+            primary = sorted(provider_set)[0]
+
+        return AliasResolution(
+            instrument_uid=instrument_uid,
+            primary_provider=primary,
+            has_ib_alias=has_ib,
+            ingest_asset_class=asset_class,
+        )
 
     def _spec_from_canonical(
         self,

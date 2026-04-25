@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -13,11 +12,13 @@ if TYPE_CHECKING:
     from msai.schemas.symbol_onboarding import OnboardSymbolSpec
     from msai.services.symbol_onboarding.manifest import ParsedManifest
 
+from msai.services.nautilus.security_master.continuous_futures import (
+    is_databento_continuous_pattern,
+)
+
 log = structlog.get_logger(__name__)
 
 __all__ = ["CostEstimate", "CostLine", "estimate_cost"]
-
-_CONTINUOUS_FUTURES_RE = re.compile(r"^[A-Z]+\.(?:n|c)\.\d+$")
 
 _ASSET_TO_DATASET: dict[str, str] = {
     "equity": "XNAS.ITCH",
@@ -65,6 +66,14 @@ async def estimate_cost(
     client: _DatabentoClientProto,
     today: date | None = None,
 ) -> CostEstimate:
+    """Estimate Databento cost for a watchlist.
+
+    Bucketing trade-off: symbols are grouped by ``(dataset, start, end)`` so
+    each bucket needs ONE ``metadata.get_cost`` call rather than per-symbol.
+    Worst case (every symbol on a different dataset and window) collapses to
+    one call per symbol; the common case (same dataset, same window across
+    the watchlist) collapses to one call total.
+    """
     today = today or date.today()
 
     buckets: dict[tuple[str, date, date], list[OnboardSymbolSpec]] = defaultdict(list)
@@ -149,6 +158,6 @@ def _classify_confidence(
     for spec in manifest.symbols:
         if spec.end >= cutoff:
             return "medium"
-        if _CONTINUOUS_FUTURES_RE.match(spec.symbol):
+        if is_databento_continuous_pattern(spec.symbol):
             return "medium"
     return "high"

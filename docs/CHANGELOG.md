@@ -4,6 +4,44 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-04-24 — Symbol Onboarding (branch `feat/symbol-onboarding`) — PHASE 4 IN PROGRESS (13/18 tasks)
+
+**Goal:** Operator-facing API + CLI for declaring "onboard these symbols at these windows" and having the system orchestrate bootstrap → ingest → coverage check → optional IB qualification end-to-end. Driven by a YAML watchlist manifest in git. Replaces the manual SQL-seed + per-symbol `instruments refresh` ritual; closes PR #44 backlog item #2.
+
+**Council verdict** (2026-04-24, standalone `/council` 5-advisor + Codex xhigh chairman): **Approach 1** — single arq entrypoint `run_symbol_onboarding`, `_onboard_one_symbol()` seam, phase-local bounded concurrency only in bootstrap phase, sequential ingest/IB. 4 binding renames adopted (`SymbolOnboardingRun` / `symbol_states` / `cost_ceiling_usd` / `request_live_qualification`).
+
+**Mini-council on iter-1 P0 (queue self-deadlock):** Option A + 3 binding constraints — extract `ingest_symbols(...)` async helper from `run_ingest`; orchestrator calls it directly in-process (no child arq job); `IngestWorkerSettings` unchanged. Plan-review trajectory: iter-1 16 findings → iter-2 6 → iter-3 2 → iter-4 CLEAN both reviewers. Plan grew 3,981 → 5,150 lines (18 tasks: T0–T15 + T6a + T8-prime).
+
+**Phase 4 progress (13/18 tasks complete; T0–T5 committed, T6a–T9 uncommitted on disk per workflow-gate hook):**
+
+- **T0–T5 committed** (`6441b64` … `9ad9119`): pyproject deps + conftest fixtures + watchlists scaffold; `SymbolOnboardingRun` model + alembic migration `c7d8e9f0a1b2` (plural table, `updated_at`, `job_id_digest` unique-indexed, `cost_ceiling_usd Numeric(12,2)`); Pydantic V2 schemas with cross-field invariants + canonical enum vocabularies (`SymbolStatus`, `SymbolStepStatus`, `RunStatus`); manifest parser with `trailing_5y` sugar (default `end=today-1d`) + cross-watchlist dedup + `normalize_asset_class_for_ingest` translation seam; Databento cost estimator with declared confidence classification + per-bucket `metadata.get_cost`; on-the-fly Parquet coverage scanner with 7-day trailing-edge tolerance.
+- **T6a, T13, T8-prime, T6, T7, T8, T9 uncommitted** (workflow-gate hook blocks Phase 4 commits per project policy):
+  - **T6a:** `ingest_symbols(...)` extracted from `run_ingest` (3-line shim retained for arq wire compat); `IngestResult` dataclass with `bars_written`/`symbols_covered`/`empty_symbols`/`coverage_status`; 4 unit tests including delegation contract test.
+  - **T13:** 3 Prometheus metrics (`msai_onboarding_jobs_total{status}` Counter, `msai_onboarding_symbol_duration_seconds` Histogram unlabeled — project's hand-rolled primitive doesn't support labels; per-step granularity in `symbol_onboarding_step_completed` structured log; `msai_onboarding_ib_timeout_total` Counter).
+  - **T8-prime:** `_error_response` promoted to `api/_common.py::error_response`; 11 call sites in `api/backtests.py` + 1 in `api/instruments.py` swapped; 50 regression tests still pass.
+  - **T6:** `_onboard_one_symbol` orchestrator (4-phase: bootstrap via `DatabentoBootstrapService.bootstrap(symbols=[...], asset_class_override=..., exact_ids=None)` batch API → ingest in-process via `ingest_symbols(...)` → coverage via `compute_coverage(...)` → optional IB qualify with `asyncio.wait_for(120s)` and `onboarding_ib_timeout_total.inc()` on timeout); per-phase JSONB persistence under `SELECT FOR UPDATE` row lock.
+  - **T7:** `run_symbol_onboarding` arq task registered on `IngestWorkerSettings.functions` (single-queue per council); council-pinned terminal-status semantics (`failed` reserved for outer try/except systemic short-circuit only; all-per-symbol-failed → `completed_with_failures`); 3 integration tests pass.
+  - **T8:** `POST /api/v1/symbols/onboard/dry-run` preflight cost estimate; pure read, no DB write, no enqueue; 2 tests pass.
+  - **T9:** `POST /onboard` + `GET /onboard/{run_id}/status` + `POST /onboard/{run_id}/repair` with **full council-pinned idempotency** via shared `_enqueue_and_persist_run` helper (`SELECT FOR UPDATE` digest → fast-path 200 → enqueue first → 100ms backoff re-SELECT on `None` return → 409 `DUPLICATE_IN_FLIGHT` else commit on success → 202; Redis-down → 503 `QUEUE_UNAVAILABLE` zero-row guarantee). Dedup branches return `JSONResponse(status_code=200)` to override decorator's 202 default. Both `/onboard` and `/repair` route through the same helper. New `compute_blake2b_digest_key(*parts)` sibling to `compute_advisory_lock_key` in `security_master/service.py`. 7/7 integration tests pass after sentinel-vs-default fix in `_make_pool` test helper (initial `enqueue_returns=None` was misinterpreted as "use default mock job" instead of "return None"; fixed via `_DEFAULT_JOB = object()` sentinel).
+
+**Remaining (T10–T15):**
+
+- T10 `GET /readiness` window-scoped + new `find_active_aliases` aggregator (~60 LOC of SQL — honest-scoped new code, NOT a wrapper over existing `resolve_for_backtest`/`lookup_for_live`)
+- T11 wire router into `main.py` + drop `asset_universe` import
+- T12 `msai symbols` CLI sub-app (onboard/status/repair, --dry-run, --watch)
+- T14 delete `api/asset_universe.py` + prune route tests
+- T15 integration failure-path tests + 6 E2E use cases (UC-SYM-001..006)
+
+**Phase 5 gates pending:** code review loop (Codex + pr-review-toolkit), simplify pass, verify-app, verify-e2e on live stack.
+
+**Known concerns to address before Phase 5:**
+
+1. `tmp_parquet_root` fixture (T0) is broken — `PosixPath.seed = ...` raises `AttributeError` because `Path` is slotted. Tests work around it with `tmp_path` directly. Needs wrapper class fix.
+2. `_default_ib_service()` (T6) raises `NotImplementedError` — no `ib_provider_factory.get_interactive_brokers_instrument_provider` exists in the repo by that exact name. Live-qualification path needs wiring during Phase 5 alongside the broker compose profile.
+3. T13 histogram is unlabeled — per-step granularity moved to `symbol_onboarding_step_completed` structured log events instead.
+
+---
+
 ### 2026-04-23 — Databento registry bootstrap for equities/ETFs/futures (branch `feat/databento-registry-bootstrap`) — PHASE 5 COMPLETE, READY TO COMMIT
 
 **Status:** All Phase 4 + Phase 5 gates closed. Shipped state below updated with Phase 5 additions: code-review loop (2 iter), simplify pass, verify-app PASS, E2E 3/6 PASS + 1 FAIL_STALE + 2 SKIPPED_INFRA, 6 UCs graduated. 2 known concerns resolved (same-day CHECK relaxation via migration `b6c7d8e9f0a1`; conftest ruff cleanup). 1 FAIL_BUG surfaced by verify-e2e agent + fixed in-branch: Databento nightly-window date-range probe (`start=today` failed 4xx during pre-publication window; fixed to `start=today-7d, end=today-1d`).

@@ -76,7 +76,9 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "TCH"]
 "src/msai/services/symbol_onboarding/*.py" = ["TC003"]
 "src/msai/core/auth.py" = ["TC003"]
 "src/msai/core/database.py" = ["TC003"]
+"src/msai/cli*.py" = ["TC003", "B008"]
 "tests/unit/services/symbol_onboarding/*.py" = ["TC003"]
+"tests/unit/cli/*.py" = ["TC003"]
 
 [tool.mypy]
 python_version = "3.12"

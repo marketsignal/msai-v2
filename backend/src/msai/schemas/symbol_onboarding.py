@@ -85,6 +85,22 @@ class OnboardRequest(BaseModel):
     request_live_qualification: bool = False
     cost_ceiling_usd: Decimal | None = Field(default=None, max_digits=12, decimal_places=2, ge=0)
 
+    @model_validator(mode="after")
+    def _symbols_unique_per_asset_class(self) -> OnboardRequest:
+        # The handler keys ``symbol_states`` JSONB by ``spec.symbol``; duplicate
+        # (symbol, asset_class) entries would silently overwrite. Reject up front
+        # so the request shape matches the persisted state shape one-to-one.
+        seen: set[tuple[str, str]] = set()
+        for spec in self.symbols:
+            key = (spec.symbol, spec.asset_class)
+            if key in seen:
+                raise ValueError(
+                    f"Duplicate symbol/asset_class entry: {spec.symbol}/{spec.asset_class}. "
+                    "Each (symbol, asset_class) tuple may appear at most once per request."
+                )
+            seen.add(key)
+        return self
+
 
 class SymbolStateRow(BaseModel):
     """Per-symbol progress state as it appears in ``status`` responses."""

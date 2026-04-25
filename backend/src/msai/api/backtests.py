@@ -19,6 +19,7 @@ from sqlalchemy import func, select
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+from msai.api._common import error_response
 from msai.core.auth import get_current_user, get_current_user_or_none
 from msai.core.config import settings
 from msai.core.database import get_db
@@ -87,20 +88,6 @@ class StrategyConfigValidationError(Exception):
                 "details": [{"field": self.field, "message": self.message}],
             }
         }
-
-
-def _error_response(status_code: int, code: str, message: str) -> JSONResponse:
-    """Build the canonical ``{"error": {"code", "message"}}`` JSONResponse.
-
-    Every error path in this router uses ``JSONResponse`` (not
-    ``HTTPException``) because FastAPI wraps ``HTTPException.detail`` under
-    ``{"detail": ...}`` while ``.claude/rules/api-design.md`` requires the
-    envelope at top-level.
-    """
-    return JSONResponse(
-        status_code=status_code,
-        content={"error": {"code": code, "message": message}},
-    )
 
 
 @lru_cache(maxsize=1)
@@ -458,7 +445,7 @@ async def get_backtest_results(
     backtest: Backtest | None = result.scalar_one_or_none()
 
     if backtest is None:
-        return _error_response(
+        return error_response(
             status.HTTP_404_NOT_FOUND,
             "NOT_FOUND",
             f"Backtest {job_id} not found",
@@ -541,7 +528,7 @@ async def get_backtest_trades(
 
     exists_result = await db.execute(select(Backtest.id).where(Backtest.id == job_id))
     if exists_result.scalar_one_or_none() is None:
-        return _error_response(
+        return error_response(
             status.HTTP_404_NOT_FOUND,
             "NOT_FOUND",
             f"Backtest {job_id} not found",
@@ -609,7 +596,7 @@ async def mint_backtest_report_token(
     result = await db.execute(select(Backtest).where(Backtest.id == job_id))
     backtest: Backtest | None = result.scalar_one_or_none()
     if backtest is None:
-        return _error_response(
+        return error_response(
             status.HTTP_404_NOT_FOUND,
             "NOT_FOUND",
             f"Backtest {job_id} not found",
@@ -618,7 +605,7 @@ async def mint_backtest_report_token(
     # mint here rather than handing out a signed URL the downstream GET
     # will refuse. Keeps the UI's "Full report" tab honest.
     if not _report_is_deliverable(backtest.report_path):
-        return _error_response(
+        return error_response(
             status.HTTP_404_NOT_FOUND,
             "NO_REPORT",
             "Report not available",
@@ -667,7 +654,7 @@ async def get_backtest_report(
                 secret=settings.report_signing_secret,
             )
         except InvalidReportTokenError as exc:
-            return _error_response(
+            return error_response(
                 status.HTTP_401_UNAUTHORIZED,
                 "INVALID_TOKEN",
                 str(exc),
@@ -684,7 +671,7 @@ async def get_backtest_report(
                 session_sub=claims.get("sub"),
                 token_user_sub=token_claims.user_sub,
             )
-            return _error_response(
+            return error_response(
                 status.HTTP_403_FORBIDDEN,
                 "TOKEN_SUB_MISMATCH",
                 "Report token was not minted for this session",
@@ -696,7 +683,7 @@ async def get_backtest_report(
             token_user_sub=token_claims.user_sub,
         )
     elif claims is None:
-        return _error_response(
+        return error_response(
             status.HTTP_401_UNAUTHORIZED,
             "UNAUTHENTICATED",
             "Missing auth",
@@ -706,14 +693,14 @@ async def get_backtest_report(
     backtest: Backtest | None = result.scalar_one_or_none()
 
     if backtest is None:
-        return _error_response(
+        return error_response(
             status.HTTP_404_NOT_FOUND,
             "NOT_FOUND",
             f"Backtest {job_id} not found",
         )
 
     if backtest.report_path is None:
-        return _error_response(
+        return error_response(
             status.HTTP_404_NOT_FOUND,
             "NO_REPORT",
             f"No report available for backtest {job_id}",
@@ -725,14 +712,14 @@ async def get_backtest_report(
     report_file = Path(backtest.report_path).resolve()
     expected_dir = (Path(settings.data_root) / "reports").resolve()
     if not report_file.is_relative_to(expected_dir):
-        return _error_response(
+        return error_response(
             status.HTTP_403_FORBIDDEN,
             "FORBIDDEN",
             "Invalid report path",
         )
 
     if not report_file.is_file():
-        return _error_response(
+        return error_response(
             status.HTTP_404_NOT_FOUND,
             "REPORT_FILE_MISSING",
             f"Report file not found on disk for backtest {job_id}",

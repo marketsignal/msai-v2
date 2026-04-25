@@ -21,6 +21,7 @@ from msai.core.config import settings
 from msai.core.queue import _parse_redis_url
 from msai.workers.nightly_ingest import run_nightly_ingest
 from msai.workers.settings import run_ingest
+from msai.workers.symbol_onboarding_job import run_symbol_onboarding
 
 if TYPE_CHECKING:
     from arq.connections import RedisSettings
@@ -34,9 +35,9 @@ asyncio.set_event_loop_policy(None)
 class IngestWorkerSettings:
     """arq worker configuration for ``arq msai.workers.ingest_settings.IngestWorkerSettings``.
 
-    Registers both the nightly cron ingest and on-demand ingest jobs so
-    the dedicated ``msai:ingest`` queue has consumers for both paths.
-    Isolating these from the backtest worker (``max_jobs=2``) prevents
+    Registers the nightly cron ingest, on-demand ingest, and symbol-onboarding
+    jobs so the dedicated ``msai:ingest`` queue has consumers for all three
+    paths. Isolating these from the backtest worker (``max_jobs=2``) prevents
     ingest-vs-backtest starvation -- see
     ``docs/research/2026-04-21-backtest-auto-ingest-on-missing-data.md`` §3.
     ``run_ingest`` remains registered on the default-queue
@@ -45,7 +46,7 @@ class IngestWorkerSettings:
     queue drains.
     """
 
-    functions = [run_nightly_ingest, run_ingest]
+    functions = [run_nightly_ingest, run_ingest, run_symbol_onboarding]
     redis_settings: RedisSettings = _parse_redis_url(settings.redis_url)
     queue_name: str = "msai:ingest"
     max_jobs: int = 1
