@@ -1306,3 +1306,63 @@ async def test_effective_window_check_relaxation_round_trip(
     finally:
         await engine.dispose()
     _run_alembic_upgrade(isolated_postgres_url, target="head")
+
+
+@pytest.mark.asyncio
+async def test_symbol_onboarding_runs_roundtrip(isolated_postgres_url: str) -> None:
+    """Migration c7d8e9f0a1b2 adds the symbol_onboarding_runs table with all
+    council-pinned columns. Downgrade removes it cleanly."""
+    # Bring DB to the parent revision (PR #44 head) regardless of starting
+    # state. The module-scoped container may be empty (this test runs first)
+    # or already at head (another test ran first); going up to head and then
+    # downgrading covers both.
+    _run_alembic_upgrade(isolated_postgres_url, target="head")
+    _run_alembic(isolated_postgres_url, "downgrade", "b6c7d8e9f0a1")
+
+    engine = create_async_engine(isolated_postgres_url)
+    try:
+        async with engine.connect() as conn:
+            before = await conn.run_sync(lambda s: inspect(s).get_table_names())
+        assert "symbol_onboarding_runs" not in before
+    finally:
+        await engine.dispose()
+
+    _run_alembic_upgrade(isolated_postgres_url, target="c7d8e9f0a1b2")
+
+    engine = create_async_engine(isolated_postgres_url)
+    try:
+        async with engine.connect() as conn:
+
+            def _cols(sync_conn: object) -> dict[str, dict[str, object]]:
+                return {
+                    c["name"]: c for c in inspect(sync_conn).get_columns("symbol_onboarding_runs")
+                }
+
+            cols = await conn.run_sync(_cols)
+        assert "id" in cols
+        assert "watchlist_name" in cols
+        assert "status" in cols
+        assert "symbol_states" in cols
+        assert "cost_ceiling_usd" in cols
+        assert "estimated_cost_usd" in cols
+        assert "request_live_qualification" in cols
+        assert "job_id_digest" in cols  # idempotency key digest, unique
+        assert "created_at" in cols
+        assert "updated_at" in cols
+        assert "started_at" in cols
+        assert "completed_at" in cols
+        assert str(cols["symbol_states"]["type"]).upper().startswith("JSONB")
+    finally:
+        await engine.dispose()
+
+    _run_alembic(isolated_postgres_url, "downgrade", "b6c7d8e9f0a1")
+
+    engine = create_async_engine(isolated_postgres_url)
+    try:
+        async with engine.connect() as conn:
+            after_down = await conn.run_sync(lambda s: inspect(s).get_table_names())
+        assert "symbol_onboarding_runs" not in after_down
+    finally:
+        await engine.dispose()
+    # Restore head.
+    _run_alembic_upgrade(isolated_postgres_url, target="head")
