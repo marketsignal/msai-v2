@@ -6,13 +6,13 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 
 ## Workflow
 
-| Field     | Value                                                                                                                                    |
-| --------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| Command   | /new-feature symbol-onboarding                                                                                                           |
-| Phase     | 6 — Ship. All Phase 5 gates GREEN: code review, simplify, verify-app, verify-e2e (4 PASS + 3 SKIPPED_INFRA + 1 FAIL_BUG fixed in scope). |
-| Next step | Batch-commit Phase 4+5 work (workflow-gate hook now permits — 4 gates checked) → push → open PR → finish branch.                         |
+| Field     | Value |
+| --------- | ----- |
+| Command   | none  |
+| Phase     | —     |
+| Next step | —     |
 
-### Checklist
+## Prior workflow checklist (archived — PR #45 symbol-onboarding SHIPPED 2026-04-25)
 
 - [x] Worktree created at `.worktrees/symbol-onboarding` off `09e956e` (main @ PR #44 merge + CONTINUITY cleanup)
 - [x] Project state read
@@ -35,15 +35,15 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 - [x] E2E verified via verify-e2e agent (Phase 5.4) — Report at `tests/e2e/reports/2026-04-24-symbol-onboarding.md`. **Verdict PARTIAL: 4 PASS + 3 SKIPPED_INFRA**. UC-SYM-001 (SPY 1-month happy path) PASS — real Databento ingest end-to-end, registry row + Parquet coverage + readiness all green. UC-SYM-002 (cost ceiling preflight) PASS after mid-run FAIL_BUG fix: `_get_databento_client()` returned MSAI's `DatabentoClient` wrapper but cost estimator needs the real `databento.Historical` SDK (the `.metadata.get_cost(...)` attribute lives on the SDK, not the wrapper). Fixed inline + UC re-ran PASS. UC-SYM-004 (window-scoped readiness, Contrarian pin-#3) PASS — `null` (no window) → `full` (covered) → `gapped` (with `missing_ranges`). UC-SYM-007 (idempotency) PASS — POST-1 → 202 `pending`; POST-2 → **200** `in_progress` (same run_id, real state, not stale "pending"); POST-3 → **200** `completed`. UC-SYM-003 SKIPPED_INFRA (Databento ambiguity is non-deterministic; unit tests cover the path). UC-SYM-005 + UC-SYM-006 SKIPPED_INFRA (RUN_PAPER_E2E + broker compose profile opt-in).
 - [x] E2E regression passed (Phase 5.4b) — N/A: this PR's surface (new `/api/v1/symbols/*` router + new arq task + new model + new alembic migration `c7d8e9f0a1b2`) does not modify any surface underpinning prior graduated UCs (`backtests/auto-ingest`, `backtests/failure-surfacing`, `backtests/results-charts-and-trades`, `strategies/config-schema-form`, `live/registry-backed-deploy`, `instruments/databento-registry-bootstrap`). Full-suite regression via verify-app (2109/2109 effective pass) confirms no regression. T8-prime `_error_response → error_response` promotion preserved 50/50 backtests + instruments tests.
 - [x] E2E use cases graduated to tests/e2e/use-cases/ (Phase 6.2b) — 7 UCs at `tests/e2e/use-cases/instruments/symbol-onboarding.md` (already in canonical location; PASS UCs ratified by verify-e2e report mtime > branch-off).
-- [ ] E2E specs graduated to tests/e2e/specs/ (Phase 6.2c — if Playwright framework installed)
-- [ ] Learnings documented (if any)
-- [ ] State files updated
-- [ ] Committed and pushed
-- [ ] PR created
-- [ ] PR reviews addressed
-- [ ] Branch finished
+- [x] E2E specs graduated to tests/e2e/specs/ — N/A: backend-only feature (UI deferred per PRD non-goal #1).
+- [x] Learnings documented — saved to auto-memory (`feedback_colocate_imports_with_usage_in_edits.md`).
+- [x] State files updated — CONTINUITY checklist + CHANGELOG carry the full Phase 4 → Phase 6.2b narrative.
+- [x] Committed and pushed — squash-merged at `3bd22bd` (57 files, +11867/-465).
+- [x] PR created — [PR #45](https://github.com/marketsignal/msai-v2/pull/45) "Symbol Onboarding: API + CLI + arq orchestrator".
+- [x] PR reviews addressed — squash-merged 2026-04-25 12:21 UTC.
+- [x] Branch finished — worktree removed, remote + local branch deleted, main ff'd to `3bd22bd`.
 
-### Scope seed (to refine during PRD discuss)
+### Scope seed (refined during PRD discuss)
 
 **User vision (verbatim, 2026-04-24):** "How the user via CLI, API and UI tells msai that it wants a series of symbols at different bars (1s, 1m, 5m, etc), for example (SPY, E-mini, IWM, AAPL, all in 5 mins and 1 min)."
 
@@ -458,6 +458,28 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 - **Drill-uncovered bug batch** (`e5afb7e`, "no bugs left behind"): (a) `ib_qualifier.py` futures use `%Y%m` so IB resolves holiday-adjusted expiry (Juneteenth ESM6 shift); (b) `_upsert_definition_and_alias` normalizes FX `raw_symbol` at storage boundary to slash form; (c) `/live/trades` accepts + applies `deployment_id: UUID` query filter. Each re-verified against the E2E path that surfaced it (feedback memory `feedback_rerun_e2e_after_bug_fixes.md`).
 - **Post-merge cleanup:** worktree removed, remote + local branch deleted, main ff'd to `29dbe9b`.
 
+## Done (cont'd 16) — Symbol Onboarding shipped (2026-04-25 / PR #45)
+
+- **Merged to main** at `3bd22bd` — squash of the `feat/symbol-onboarding` branch (57 files, +11,867/-465). Closes PR #44 backlog item #2: operator-facing surface for declaring "onboard symbols X..N for windows W..W'" via YAML watchlist manifest, replacing the manual SQL-seed + per-symbol `instruments refresh` ritual.
+- **What shipped:**
+  - **5 new HTTP endpoints under `/api/v1/symbols/`**: `POST /onboard/dry-run`, `POST /onboard`, `GET /onboard/{run_id}/status`, `POST /onboard/{run_id}/repair`, `GET /readiness`. Full council-pinned idempotency contract: `SELECT FOR UPDATE` digest → fast-path 200 → enqueue first → 100ms backoff re-SELECT on `None` → 409 `DUPLICATE_IN_FLIGHT` → commit + 202; Redis-down → 503 `QUEUE_UNAVAILABLE` zero-row guarantee.
+  - **`msai symbols onboard|status|repair` CLI** with `--dry-run`, `--watch`, and Decimal-precision-validated `--cost-ceiling-usd`.
+  - **arq task `run_symbol_onboarding`** — sequential on existing `msai:ingest` queue (no fan-out per council Approach 1). In-process `ingest_symbols(...)` helper extracted from `run_ingest` (T6a).
+  - **`SymbolOnboardingRun` table + Alembic `c7d8e9f0a1b2`** — plural table, `updated_at`, `job_id_digest` unique-indexed (blake2b not Python `hash()` — research finding #6 echoes PR #44's `compute_advisory_lock_key`), `cost_ceiling_usd Numeric(12,2)`.
+  - **4-phase per-symbol pipeline** — bootstrap → ingest → coverage → optional IB qualify (with `asyncio.wait_for(120s)` from Scalability Hawk's adopted minority report) — and persistent per-symbol error envelope (T8-prime promotes `_error_response` → shared `error_response`).
+  - **3 Prometheus metrics**: `msai_onboarding_jobs_total{status}` + `msai_onboarding_symbol_duration_seconds{step}` + `msai_onboarding_ib_timeout_total`.
+  - **DELETE `/api/v1/universe`** (superseded — Maintainer's binding objection from iter-1 council).
+  - **`watchlists/` directory** with `README.md` + `example-core-equities.yaml` template; PyYAML 6.0.2 declared dep, `yaml.safe_load` pinned at every call site.
+- **Council verdict** (standalone /council 2026-04-24, 5 advisors + Codex xhigh chairman): **Approach 1** (single arq entrypoint, `_onboard_one_symbol()` seam, phase-local bounded concurrency only in bootstrap, ingest/IB strictly sequential, 100-symbol API cap, 4 binding renames: `SymbolOnboardingRun` / `symbol_states` / `cost_ceiling_usd` / `request_live_qualification`). Claude's initial Approach 2 recommendation was OVERRULED 4-of-5 on three false premises (PR #40 not N-child fan-out precedent, `IngestWorkerSettings.max_jobs=1` defeats `Semaphore(3)` parallelism claim, "~50 LOC overhead" off by an order of magnitude). Minority Report preserved: Scalability Hawk's safety parts (IB timeout + 3 of 4 metrics) ADOPTED into Approach 1; Contrarian's pin-#3 fatal-flaw + Maintainer's `asset_universe` model-fracture also ACCEPTED. Decision: ratified in `docs/prds/symbol-onboarding-discussion.md` + Approach Comparison block in archived checklist above.
+- **Quality trail:**
+  - Plan-review loop 4 iters (16 → 6 → 2 → CLEAN). Mini-council on iter-1 P0 queue self-deadlock: Option A + 3 binding constraints (inline ingest helper, no child arq job, persistent per-symbol error envelope). Plan v1 (3,981 lines) → v4 (~5,150 lines, 18 tasks).
+  - Code-review loop 2 iters (Codex + 3 pr-review-toolkit + verify-app): iter-1 28 findings (3 P0 + 12 P1 + 10 P2 + 3 P3) → 12-block fix-pass landed cleanly → iter-2 3 narrow findings (duplicate-symbol JSONB collision, CLI Decimal serialization, double-counted histogram) all fixed inline.
+  - Simplify pass: 5 P1 fixes — `_CONTINUOUS_FUTURES_RE` deduped via `is_databento_continuous_pattern` (PR #44 reuse), docstring artifact scrub, module-level `_get_databento_client()` singleton shared between `/dry-run` and `/onboard`, bucketing-trade-off docstring on `estimate_cost`.
+  - verify-app: 2109/2109 effective tests + 11 skipped + 16 xfailed (2 pre-existing flakes from PR #41 unchanged); ruff clean across `src/`; mypy `--strict` 0 errors across 181 source files; alembic head `c7d8e9f0a1b2`.
+  - **E2E PASS 4/7 + 3 SKIPPED_INFRA + 1 FAIL_BUG fixed in scope.** UC-SYM-001 (SPY 1-month happy path) PASS — real Databento ingest end-to-end. UC-SYM-002 (cost ceiling preflight) PASS after mid-run FAIL_BUG fix: `_get_databento_client()` returned MSAI's `DatabentoClient` wrapper but cost estimator needs the real `databento.Historical` SDK directly (the `.metadata.get_cost(...)` attribute lives on the SDK, not the wrapper). Fixed inline + re-ran PASS. UC-SYM-004 (window-scoped readiness, Contrarian pin-#3) PASS — `null` (no window) → `full` (covered) → `gapped` (with `missing_ranges`). UC-SYM-007 (idempotency) PASS — POST-1 → 202 `pending`; POST-2 → **200** `in_progress` (same run_id, real state, not stale "pending"); POST-3 → **200** `completed`. UC-SYM-003/005/006 SKIPPED_INFRA. 7 UCs graduated at `tests/e2e/use-cases/instruments/symbol-onboarding.md`.
+- **New learning saved to auto memory:** [`feedback_colocate_imports_with_usage_in_edits.md`](feedback_colocate_imports_with_usage_in_edits.md) — PostToolUse ruff formatter strips "unused" imports between subagent edits. When adding `from foo import bar`, include at least one `bar()` usage in the SAME Edit call. Bit T13/T14 subagents during Phase 4.
+- **Post-merge cleanup:** worktree removed, remote + local branch deleted, main ff'd to `3bd22bd`.
+
 ## Done (cont'd 15) — Databento registry bootstrap shipped (2026-04-24 / PR #44)
 
 - **Merged to main** at `b71aad3` — squash of 2 commits on `feat/databento-registry-bootstrap` (`7a6b17a` implementation + `cd67010` post-PR Codex P2 fixes). 38 files changed, ~7600 insertions. Closes backlog item #8 (Databento-catalog-seeded cold-start registration) from the post-PR-43 backlog.
@@ -545,13 +567,15 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 
 ## Now
 
-- **No active workflow.** Last shipped: **PR #44 "Databento registry bootstrap for equities/ETFs/futures"** squash-merged to main at `b71aad3` on 2026-04-24. See "Done (cont'd 15)" below.
-- **Stack:** main on `b71aad3`. Local branch + worktree cleanup done. Origin branch deleted. Dev compose stack: `docker compose -f docker-compose.dev.yml up -d && ./scripts/restart-workers.sh` from the repo root when needed.
-- **Next (post-#44 ratified backlog):**
-  1. **PRD/council for #2 Symbol Onboarding** — now fully unblocked (Databento bootstrap ships the plumbing; Symbol Onboarding is the user-facing surface on top).
-  2. **#3 `instrument_cache` → registry migration** + `canonical_instrument_id()` removal.
-  3. **Remaining CI-hardening backlog** — dependabot, pytest-xdist, coverage floor, compose smoke, security scans.
-- **Uncommitted on main (unrelated):** `frontend/playwright.config.ts` baseURL reverted `:3300` → `:3000` — leftover from the 2026-04-22 computer reset. Revert when convenient.
+- **No active workflow.** Last shipped: **PR #45 "Symbol Onboarding: API + CLI + arq orchestrator"** squash-merged to main at `3bd22bd` on 2026-04-25. See "Done (cont'd 16)" below.
+- **Stack:** main on `3bd22bd`. Local branch + worktree cleanup done. Origin branch deleted. Dev compose stack: `docker compose -f docker-compose.dev.yml up -d && ./scripts/restart-workers.sh` from the repo root when needed (worker container restart required to pick up the new `run_symbol_onboarding` arq task + `ingest_symbols` helper).
+- **Next (post-#45 ratified backlog):**
+  1. **#3 `instrument_cache` → registry migration** + `canonical_instrument_id()` removal.
+  2. **Remaining CI-hardening backlog** — dependabot, pytest-xdist, coverage floor, compose smoke, security scans.
+  3. **UI surface for Symbol Onboarding** (deferred per PR #45 PRD non-goal #1) — `/universe` page consuming the now-shipped `/api/v1/symbols/*` endpoints. Separate PRD.
+- **Uncommitted on main (unrelated):**
+  - `frontend/playwright.config.ts` baseURL reverted `:3300` → `:3000` — leftover from the 2026-04-22 computer reset. Revert when convenient.
+  - `backend/tests/unit/observability/test_onboarding_metrics.py` — small dedicated unit test for the 3 onboarding metrics shipped in PR #45 (currently exercised only by the integration suite). Stage + commit as a follow-up if desired.
 
 ## Known issues surfaced this session (for follow-up — "no bugs left behind" tracker)
 
@@ -575,7 +599,7 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 
 ### From PR #32 ("db-backed-strategy-registry") + PR #35 scope-outs
 
-2. **Symbol Onboarding UI/API/CLI** — user-facing surfaces to declare "add symbol X of asset class Y (equity/ETF/FX/future)" with the system auto-triggering historical ingest + registry refresh + portfolio-bootstrap helpers. Now unblocked since PR #37 shipped the live-path wiring. Scope sketch: new `/api/v1/instruments/` CRUD with explicit `asset_class` field + matching CLI sub-app + frontend form + verify `msai ingest` parity across all 4 asset classes. Separate PRD + council required before starting.
+2. ~~**Symbol Onboarding UI/API/CLI**~~ — **API + CLI SHIPPED** as PR #45 (merged `3bd22bd` 2026-04-25). UI surface deferred per PRD non-goal #1 (separate PRD when prioritized). See "Done (cont'd 16)".
 3. **`instrument_cache` → registry migration.** Legacy `instrument_cache` table coexists with the new registry, not migrated yet. Skeleton at `docs/plans/2026-04-17-db-backed-strategy-registry.md` §"InstrumentCache → Registry Migration".
 4. ~~**Strategy config-schema extraction**~~ — **SHIPPED** as PR #38 (merged `663004c` 2026-04-20). Backend exposes `config_schema` + `config_defaults` via `/api/v1/strategies/{id}`; frontend auto-generates typed backtest forms.
 5. **Remove `canonical_instrument_id()`** — Pablo override (2026-04-20): skip the council-suggested "one clean paper week" wait and schedule alongside items 3+4. Non-goal of PR #37 but ready to delete once verified no live deploys hit the legacy path.
@@ -588,7 +612,7 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 
 7. ~~**Backtest results UI: real charts + trade log**~~ — **SHIPPED** as PR #41 (merged `330e56a` 2026-04-23). `/results` now returns `series` (daily equity/drawdown + monthly returns); paginated `/trades` wired through to `<TradeLog>`; in-app QuantStats iframe via signed-URL flow. See "Done (cont'd 12)".
 
-8. **Instrument-registry seed from Databento catalog** (follow-up PR). During PR #40 live demo, registry had only `ES.n.0.XCME` — stocks had to be inserted manually via SQL. A bootstrap script that queries Databento's `list_symbols` for XNAS.ITCH + GLBX.MDP3 + seeds the registry with the top-N most-liquid instruments would unblock cold-start deployments and remove the IB-Gateway-required step for equity registration.
+8. ~~**Instrument-registry seed from Databento catalog**~~ — **SHIPPED** as PR #44 (merged `b71aad3` 2026-04-24). `POST /api/v1/instruments/bootstrap` + `msai instruments bootstrap` removes the IB-Gateway-required step for equity registration. PR #45 then layered the operator-facing `/api/v1/symbols/onboard` watchlist surface on top. See "Done (cont'd 15)" + "Done (cont'd 16)".
 
 ### PR #35 documented known limitations
 
