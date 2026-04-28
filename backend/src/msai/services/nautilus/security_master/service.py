@@ -140,6 +140,17 @@ class DatabentoDefinitionMissing(Exception):  # noqa: N818 — spec-mandated nam
     """
 
 
+class DatabentoClientUnavailableError(LookupError):
+    """Raised when :meth:`SecurityMaster._resolve_databento_continuous`
+    needs to synthesize a continuous-futures alias on cold-miss but the
+    :class:`SecurityMaster` was constructed without a ``DatabentoClient``.
+
+    Subclasses :class:`LookupError` for symmetry with the IB-side
+    :class:`IBContractNotFoundError` — both signal "the upstream provider
+    cannot resolve this symbol right now".
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class AliasResolution:
     """Aggregate readiness view for one (symbol, asset_class) lookup.
@@ -522,8 +533,9 @@ class SecurityMaster:
         raising :class:`IntegrityError`.
 
         Raises:
-            ValueError: ``self._databento`` is ``None`` on cold-miss —
-                cannot fetch the definition payload.
+            DatabentoClientUnavailableError: ``self._databento`` is
+                ``None`` on cold-miss — cannot fetch the definition
+                payload.
         """
         from msai.services.nautilus.security_master.registry import (
             InstrumentRegistry,
@@ -541,7 +553,7 @@ class SecurityMaster:
 
         # Step 2 — cold path. Databento client is required.
         if self._databento is None:
-            raise ValueError(
+            raise DatabentoClientUnavailableError(
                 f"DatabentoClient required to synthesize continuous {sym!r} "
                 "on cold-miss — construct SecurityMaster with "
                 "databento_client=... or pre-warm the registry via "

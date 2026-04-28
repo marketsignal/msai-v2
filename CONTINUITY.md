@@ -628,7 +628,7 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 - **Next (post-#46 ratified backlog):**
   1. **Remaining CI-hardening backlog** — dependabot, pytest-xdist, coverage floor, compose smoke, security scans (per "Next — remaining deferred items" §2 below).
   2. **UI surface for Symbol Onboarding** (deferred per PR #45 PRD non-goal #1) — `/universe` page consuming the now-shipped `/api/v1/symbols/*` endpoints. Separate PRD.
-  3. **PR #46 follow-up nits** (deferable): code-reviewer iter-3 P3 (alembic comment at `e2f3g4h5i6j7_drop_instrument_cache.py:263` describes close-prior window without cross-referencing PR #44's same-day zero-width semantics — non-blocking docstring polish). type-design-analyzer iter-3 P3 (`_resolve_databento_continuous` raises plain `ValueError` — could be `DatabentoClientUnavailableError(LookupError)` for consistency with `IBContractNotFoundError` post-PR-#46).
+  3. **PR #46 follow-up nit** (deferable): type-design-analyzer iter-3 P3 (`_resolve_databento_continuous` raises plain `ValueError` — could be `DatabentoClientUnavailableError(LookupError)` for consistency with `IBContractNotFoundError` post-PR-#46).
 - **Uncommitted on main (unrelated, pre-dating worktree):**
   - `frontend/playwright.config.ts` baseURL reverted `:3300` → `:3000` — leftover from 2026-04-22 computer reset. Revert when convenient.
   - `backend/tests/unit/observability/test_onboarding_metrics.py` — small dedicated unit test for the 3 onboarding metrics shipped in PR #45 (currently exercised only by integration). Stage + commit as a follow-up if desired.

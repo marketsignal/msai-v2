@@ -5,7 +5,9 @@ Exercises the four paths of the registry-backed backtest resolve:
 - Empty registry + bare ticker → ``DatabentoDefinitionMissing`` (operator
   hasn't run ``msai instruments refresh`` yet).
 - ``.Z.N`` continuous pattern with no ``DatabentoClient`` configured →
-  ``ValueError`` (cold-miss requires the Databento fetch).
+  ``DatabentoClientUnavailableError`` (cold-miss requires the Databento
+  fetch). Subclasses ``LookupError`` for symmetry with
+  :class:`IBContractNotFoundError`.
 - ``.Z.N`` happy path — mocked ``DatabentoClient.fetch_definition_instruments``
   + mocked ``resolved_databento_definition`` → synthesis path upserts a
   definition + active alias via the shared
@@ -33,6 +35,7 @@ from msai.services.nautilus.security_master.continuous_futures import (
     ResolvedInstrumentDefinition,
 )
 from msai.services.nautilus.security_master.service import (
+    DatabentoClientUnavailableError,
     DatabentoDefinitionMissing,
     SecurityMaster,
 )
@@ -88,21 +91,26 @@ async def test_resolve_for_backtest_raises_on_empty_registry(
 async def test_resolve_for_backtest_continuous_requires_databento_client(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """``.Z.N`` cold-miss + ``databento_client=None`` → ValueError.
+    """``.Z.N`` cold-miss + ``databento_client=None`` → typed exception.
 
     The continuous-futures synthesis path needs a live
     :class:`DatabentoClient` to download the ``.definition.dbn.zst`` file.
     Constructing the :class:`SecurityMaster` with ``databento_client=None``
-    and requesting a ``.Z.N`` symbol must fail with a clear error rather
-    than silently dereferencing ``None``.
+    and requesting a ``.Z.N`` symbol must raise
+    :class:`DatabentoClientUnavailableError` (subclass of ``LookupError``,
+    symmetric with :class:`IBContractNotFoundError`) rather than silently
+    dereferencing ``None``.
     """
     async with session_factory() as session:
         sm = SecurityMaster(db=session, databento_client=None)
 
-        with pytest.raises(ValueError, match="DatabentoClient required"):
-            await sm.resolve_for_backtest(
-                ["ES.Z.0"], start="2024-01-01", end="2024-03-01"
-            )
+        with pytest.raises(DatabentoClientUnavailableError, match="DatabentoClient required"):
+            await sm.resolve_for_backtest(["ES.Z.0"], start="2024-01-01", end="2024-03-01")
+
+        # Symmetry contract: subclass of LookupError so cross-provider
+        # cold-miss handlers can catch the IB + Databento side together.
+        with pytest.raises(LookupError):
+            await sm.resolve_for_backtest(["ES.Z.0"], start="2024-01-01", end="2024-03-01")
 
 
 @pytest.mark.asyncio
@@ -129,9 +137,7 @@ async def test_resolve_for_backtest_continuous_happy_path(
     async with session_factory() as session:
         fake_instruments = [MagicMock()]  # sentinel — opaque to the SUT
         mock_databento = MagicMock()
-        mock_databento.fetch_definition_instruments = AsyncMock(
-            return_value=fake_instruments
-        )
+        mock_databento.fetch_definition_instruments = AsyncMock(return_value=fake_instruments)
 
         sm = SecurityMaster(db=session, databento_client=mock_databento)
 
@@ -155,14 +161,11 @@ async def test_resolve_for_backtest_continuous_happy_path(
         )
 
         with patch(
-            "msai.services.nautilus.security_master.service"
-            ".resolved_databento_definition",
+            "msai.services.nautilus.security_master.service.resolved_databento_definition",
             return_value=resolved,
         ) as mock_resolved:
             # Act
-            ids = await sm.resolve_for_backtest(
-                ["ES.Z.0"], start="2024-01-01", end="2024-03-01"
-            )
+            ids = await sm.resolve_for_backtest(["ES.Z.0"], start="2024-01-01", end="2024-03-01")
 
         # Assert — return value
         assert ids == ["ES.Z.0.CME"]
@@ -270,9 +273,7 @@ async def test_resolve_for_backtest_dotted_alias_honors_start_date(
         await _seed_aapl_with_venue_swap(session)
         sm = SecurityMaster(db=session, databento_client=None)
 
-        ids = await sm.resolve_for_backtest(
-            ["AAPL.NASDAQ"], start="2022-06-01", end="2022-12-31"
-        )
+        ids = await sm.resolve_for_backtest(["AAPL.NASDAQ"], start="2022-06-01", end="2022-12-31")
 
         assert ids == ["AAPL.NASDAQ"]
 
@@ -294,9 +295,7 @@ async def test_resolve_for_backtest_bare_ticker_honors_start_date(
         await _seed_aapl_with_venue_swap(session)
         sm = SecurityMaster(db=session, databento_client=None)
 
-        ids = await sm.resolve_for_backtest(
-            ["AAPL"], start="2022-06-01", end="2022-12-31"
-        )
+        ids = await sm.resolve_for_backtest(["AAPL"], start="2022-06-01", end="2022-12-31")
 
         assert ids == ["AAPL.NASDAQ"]
 
