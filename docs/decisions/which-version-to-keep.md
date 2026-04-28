@@ -227,7 +227,11 @@ Executing now on branch `feat/playwright-e2e-port` (branch name is historical �
 
 ## Follow-ups (not blocking)
 
-- **Architecture-governance review (2026-10-19, 6-month cadence)** — revisit: (a) does claude's multi-login gateway fabric earn its complexity against actual multi-account operational load? (b) is the instrument registry + alias windowing justified by live-path usage (CONTINUITY Next #1) or still scope creep? Decision author: whoever is operating the stack then.
+- **Architecture-governance review (2026-10-19, 6-month cadence)** — narrowed scope, see ratifications below:
+  - ~~(a) does claude's multi-login gateway fabric earn its complexity against actual multi-account operational load?~~ — **RATIFIED BY PABLO 2026-04-28: keep.** Design intent confirmed: 7–9 concurrent IB accounts, one per portfolio, all live in real-time. The multi-login fabric is load-bearing by design and cannot collapse to single-login. Removed from review scope.
+  - (b) is the instrument registry + alias windowing justified by live-path usage (CONTINUITY Next #1) or still scope creep? — **OPEN.** Pablo's view: defer to council using the latest code as evidence (post PR #37 live-path wiring + PR #45 onboarding + PR #46 registry-as-sole-source-of-truth). Council can answer this earlier than 2026-10-19 if desired.
+  - (c) supervisor complexity (heartbeat-before-`node.build()`, watchdog vs HeartbeatMonitor authority split, projection Redis-Streams/PEL/DLQ) — **OPEN.** Same — defer to council with current code + incident history as evidence.
+- Decision author: whoever is operating the stack then (Pablo unless delegated).
 - **Playwright regression coverage** — none shipped. Future feature work that changes user-facing behavior should author claude-native specs in `tests/e2e/specs/` using `getByTestId` — don't re-litigate the codex port.
 
 ---

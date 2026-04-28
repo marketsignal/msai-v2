@@ -489,6 +489,12 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 - **Drill-uncovered bug batch** (`e5afb7e`, "no bugs left behind"): (a) `ib_qualifier.py` futures use `%Y%m` so IB resolves holiday-adjusted expiry (Juneteenth ESM6 shift); (b) `_upsert_definition_and_alias` normalizes FX `raw_symbol` at storage boundary to slash form; (c) `/live/trades` accepts + applies `deployment_id: UUID` query filter. Each re-verified against the E2E path that surfaced it (feedback memory `feedback_rerun_e2e_after_bug_fixes.md`).
 - **Post-merge cleanup:** worktree removed, remote + local branch deleted, main ff'd to `29dbe9b`.
 
+## Done (cont'd 18) — Quick-fix + architecture-governance ratification (2026-04-28)
+
+- **Quick-fix `102af26`** committed direct-to-main: `SecurityMaster._resolve_databento_continuous` cold-miss now raises typed `DatabentoClientUnavailableError(LookupError)` instead of plain `ValueError`. Symmetric with `IBContractNotFoundError(LookupError)` shipped in PR #46 — cross-provider cold-miss handlers can catch both via `except LookupError`. New exception class colocated with `DatabentoDefinitionMissing` in `service.py`. Test file updated + `LookupError` symmetry-contract assertion added. verify-app PASS (targeted test green, ruff + mypy --strict clean). Closes the type-design-analyzer iter-3 P3 from PR #46 review. Also drops the alembic-comment iter-3 P3 from the same list (already cross-references PR #44 — hairsplitting).
+- **Bug-tracker hygiene `775f138`** (earlier same day): all 3 entries in the "Known issues" tracker (BE-01 Databento `FuturesContract.to_dict()` signature, FE-01 frontend Tailwind imports, IB-REGISTRY-01 manual SQL workaround for IB refresh) marked STALE — verified against latest code. Live-checked via `msai instruments refresh --provider databento --symbols ES.n.0` (`{"resolved": ["ES.n.0.XCME"]}`) + curl on `/3300` (Tailwind classes load) + cross-reference to PR #44 + #45 + #46 collectively replacing the workaround.
+- **Architecture-governance review narrowed** — Pablo ratified item (a) multi-login gateway fabric: load-bearing by design (7–9 concurrent IB accounts, one per portfolio, real-time). Removed from the 2026-10-19 review scope. Items (b) instrument registry justification + (c) supervisor complexity (heartbeat-before-`node.build()`, watchdog/HeartbeatMonitor authority split, projection Redis-Streams/PEL/DLQ) deferred to council with current code as evidence — can fire any time before 2026-10-19. Recorded in `docs/decisions/which-version-to-keep.md` + `## Next` item #4.
+
 ## Done (cont'd 17) — instrument-cache → registry migration shipped (2026-04-27 / PR #46)
 
 - **Merged to main** at `f84bd38` — squash of `feat/instrument-cache-registry-migration` (47 files, +8,713/-2,646; +107/-5 fix commit on top). Closes backlog items #3 (`instrument_cache → registry migration`) + #5 (full `canonical_instrument_id()` removal). Internal-mechanics work in service of the ratified Symbol Onboarding PRD's runtime correctness.
@@ -623,12 +629,13 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 
 ## Now
 
-- **No active workflow.** Last shipped: **PR #46 "Instrument cache → registry migration + canonical_instrument_id() removal"** squash-merged to main at `f84bd38` on 2026-04-27. See "Done (cont'd 17)" below.
-- **Stack:** main on `f84bd38`. Local branch + worktree cleanup done. Origin branch deleted. Dev compose stack: `docker compose -f docker-compose.dev.yml up -d && ./scripts/restart-workers.sh` from the repo root when needed (worker container restart required to pick up the new registry-only `SecurityMaster` resolve paths + `MarketHoursService.prime` rewire).
+- **No active workflow.** Last shipped: quick-fix `102af26` "typed `DatabentoClientUnavailableError` on continuous-futures cold-miss" — direct-to-main 2026-04-28, closes the last PR #46 P3 follow-up nit. Most recent feature: **PR #46 "Instrument cache → registry migration + canonical_instrument_id() removal"** squash-merged to main at `f84bd38` on 2026-04-27. See "Done (cont'd 17)" below.
+- **Stack:** main on `102af26`. Local branch + worktree cleanup done. Origin branches deleted. Dev compose stack: `docker compose -f docker-compose.dev.yml up -d && ./scripts/restart-workers.sh` from the repo root when needed.
+- **Open architectural question (deferred to council):** items (b) instrument registry justification + (c) supervisor-complexity self-infliction from the 2026-04-19 minority report — see CONTINUITY Next #4 + `docs/decisions/which-version-to-keep.md` Follow-ups. Pablo ratified item (a) multi-login gateway fabric on 2026-04-28 (load-bearing by design — 7–9 concurrent IB accounts per portfolio); narrowed review scope persisted to both files. Council can run on (b)+(c) at any time, latest by 2026-10-19 cadence.
 - **Next (post-#46 ratified backlog):**
-  1. **Remaining CI-hardening backlog** — dependabot, pytest-xdist, coverage floor, compose smoke, security scans (per "Next — remaining deferred items" §2 below).
-  2. **UI surface for Symbol Onboarding** (deferred per PR #45 PRD non-goal #1) — `/universe` page consuming the now-shipped `/api/v1/symbols/*` endpoints. Separate PRD.
-  3. **PR #46 follow-up nit** (deferable): type-design-analyzer iter-3 P3 (`_resolve_databento_continuous` raises plain `ValueError` — could be `DatabentoClientUnavailableError(LookupError)` for consistency with `IBContractNotFoundError` post-PR-#46).
+  1. **UI surface for Symbol Onboarding** (deferred per PR #45 PRD non-goal #1) — `/universe` page consuming the now-shipped `/api/v1/symbols/*` endpoints. Separate PRD.
+  2. **CI-hardening backlog** — dependabot, pytest-xdist, coverage floor, compose smoke, security scans (per "Next — remaining deferred items" §2 below).
+  3. **Architectural-governance council** — fire `/council` on items (b)+(c) when ready (Pablo's call on timing).
 - **Uncommitted on main (unrelated, pre-dating worktree):**
   - `frontend/playwright.config.ts` baseURL reverted `:3300` → `:3000` — leftover from 2026-04-22 computer reset. Revert when convenient.
   - `backend/tests/unit/observability/test_onboarding_metrics.py` — small dedicated unit test for the 3 onboarding metrics shipped in PR #45 (currently exercised only by integration). Stage + commit as a follow-up if desired.
@@ -662,7 +669,7 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 
 ### From PR #36 postscript
 
-6. **Architecture-governance review (2026-10-19, 6-month cadence)** — revisit the Contrarian's minority report in `docs/decisions/which-version-to-keep.md`: (a) does the multi-login gateway fabric earn its complexity against actual multi-account operational load? (b) is the instrument registry + alias windowing justified by live-path usage or still scope creep?
+6. **Architecture-governance review (2026-10-19, 6-month cadence — narrowed)** — revisit the Contrarian's minority report in `docs/decisions/which-version-to-keep.md`. Item (a) multi-login gateway fabric: **RATIFIED 2026-04-28** — Pablo confirmed 7–9 concurrent IB accounts (one per portfolio) is the design intent; multi-login is load-bearing, not scope creep. Item (b) instrument registry + alias windowing: defer to council using latest code as evidence (post PR #37 + #45 + #46 — registry is now sole source of truth for backtest + live + onboarding). Item (c) supervisor complexity: defer to council with current code + incident history. Council can run earlier than 2026-10-19 if Pablo asks.
 
 ### From PR #40 ("backtest-auto-ingest-on-missing-data") scope-outs — Pablo live-demo flags 2026-04-21
 
