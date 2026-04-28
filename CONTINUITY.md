@@ -38,8 +38,8 @@ First real backtest — ingest market data and run EMA Cross strategy on real AA
 - [x] E2E specs graduated to tests/e2e/specs/ (Phase 6.2c — if Playwright framework installed) — **N/A**: backend-only feature (no UI surface). The 6 UCs remain executable via verify-e2e agent + operator drill for richer UC-ICR-006 paper-deploy variant.
 - [x] Learnings documented — saved to auto-memory: [`feedback_alias_windowing_must_use_exchange_local_today.md`](feedback_alias_windowing_must_use_exchange_local_today.md). Drill-caught bug: `service.py:_upsert_definition_and_alias:980` was using `now.date()` (UTC) for alias `effective_from`. Resolver evaluates `as_of_date = exchange_local_today()` (Chicago). Late-Central-hours boundary made freshly-refreshed aliases temporarily invisible. Fixed inline; mirrors F6's UTC-dodge design.
 - [x] State files updated — CONTINUITY checklist + Now section + CHANGELOG `[Unreleased]` + E2E report (`tests/e2e/reports/2026-04-27-instrument-cache-registry-migration.md`) all reflect Phase 5 + drill state.
-- [ ] Committed and pushed
-- [ ] PR created
+- [x] Committed and pushed — `4d62d2e` (47 files, +8713/-2646) on `feat/instrument-cache-registry-migration` pushed to origin.
+- [x] PR created — [PR #46](https://github.com/marketsignal/msai-v2/pull/46) "Instrument cache → registry migration + canonical_instrument_id() removal".
 - [ ] PR reviews addressed
 - [ ] Branch finished
 

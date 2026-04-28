@@ -148,3 +148,89 @@ async def test_prime_fail_open_on_null_trading_hours(session: AsyncSession) -> N
 
     sunday_3am_utc = datetime(2026, 4, 26, 3, 0, tzinfo=UTC)
     assert svc.is_in_rth("EUR/USD.IDEALPRO", sunday_3am_utc) is True
+
+
+@pytest.mark.asyncio
+async def test_prime_filters_by_ib_provider_when_databento_alias_shares_canonical_id(
+    session: AsyncSession,
+) -> None:
+    """Both Databento and IB aliases for the same canonical_id must
+    deterministically resolve to the IB row's trading_hours. Without
+    the provider filter, result-order non-determinism could cache the
+    Databento row's NULL trading_hours and silently fail-open every
+    market-hours check.
+    """
+    # Arrange — IB definition with populated NYSE-style trading hours
+    aapl_ib_uid = uuid4()
+    aapl_databento_uid = uuid4()
+    session.add(
+        InstrumentDefinition(
+            instrument_uid=aapl_ib_uid,
+            raw_symbol="AAPL",
+            provider="interactive_brokers",
+            asset_class="equity",
+            listing_venue="NASDAQ",
+            routing_venue="SMART",
+            lifecycle_state="active",
+            trading_hours={
+                "timezone": "America/New_York",
+                "rth": [{"day": "MON", "open": "09:30", "close": "16:00"}],
+                "eth": [{"day": "MON", "open": "04:00", "close": "20:00"}],
+            },
+        )
+    )
+    session.add(
+        InstrumentDefinition(
+            instrument_uid=aapl_databento_uid,
+            raw_symbol="AAPL",
+            provider="databento",
+            asset_class="equity",
+            listing_venue="XNAS",
+            routing_venue="SMART",
+            lifecycle_state="active",
+            trading_hours=None,  # Databento rows don't carry IB-style hours
+        )
+    )
+    # Same alias_string (AAPL.NASDAQ) under TWO providers — pre-PR-#44
+    # this state is realistic: PR #44's bootstrap landed Databento aliases
+    # on the exchange-name suffix, and PR #37's IB refresh landed an IB
+    # alias with the same string.
+    session.add(
+        InstrumentAlias(
+            id=uuid4(),
+            instrument_uid=aapl_ib_uid,
+            alias_string="AAPL.NASDAQ",
+            venue_format="exchange_name",
+            provider="interactive_brokers",
+            effective_from=date(2026, 1, 1),
+            effective_to=None,
+        )
+    )
+    session.add(
+        InstrumentAlias(
+            id=uuid4(),
+            instrument_uid=aapl_databento_uid,
+            alias_string="AAPL.NASDAQ",
+            venue_format="exchange_name",
+            provider="databento",
+            effective_from=date(2026, 1, 1),
+            effective_to=None,
+        )
+    )
+    await session.commit()
+
+    # Act
+    svc = MarketHoursService()
+    await svc.prime(session, ["AAPL.NASDAQ"])
+
+    # Assert — the IB row's trading_hours wins (NYSE RTH); Databento's
+    # NULL is filtered out by the provider gate.
+    monday_10am_et = datetime(2026, 4, 27, 14, 0, tzinfo=UTC)  # 10:00 ET
+    monday_3am_et = datetime(2026, 4, 27, 7, 0, tzinfo=UTC)  # 03:00 ET
+    assert svc.is_in_rth("AAPL.NASDAQ", monday_10am_et) is True, (
+        "Should resolve to IB row → 10:00 ET is within NYSE RTH"
+    )
+    assert svc.is_in_rth("AAPL.NASDAQ", monday_3am_et) is False, (
+        "Should resolve to IB row → 03:00 ET is outside NYSE RTH "
+        "(if Databento's NULL won, this would fail-open True)"
+    )

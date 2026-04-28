@@ -1114,12 +1114,22 @@ async def _run_ib_resolve_for_live(contracts: list[IBContract]) -> list[str]:
                     alias_str = str(instrument.id)
                     routing_venue = instrument.id.venue.value
                     listing_venue = qualifier.listing_venue_for(instrument)
+                    # Extract trading_hours from the qualifier provider's
+                    # ContractDetails so first-time IB symbols seeded by
+                    # ``msai instruments refresh`` carry their RTH/ETH
+                    # schedule into ``instrument_definitions.trading_hours``.
+                    # Without this, MarketHoursService.is_in_rth/eth fails
+                    # open on NULL → bypasses intended gating until another
+                    # path backfills hours. The pre-PR resolve_for_live
+                    # path did this; the new CLI loop must too.
+                    trading_hours = sm._trading_hours_for(canonical_id=alias_str)
                     await sm._upsert_definition_and_alias(
                         raw_symbol=instrument.raw_symbol.value,
                         listing_venue=listing_venue,
                         routing_venue=routing_venue,
                         asset_class=SecurityMaster._asset_class_for_instrument(instrument),
                         alias_string=alias_str,
+                        trading_hours=trading_hours,
                     )
                     await session.commit()
                     resolved.append(alias_str)

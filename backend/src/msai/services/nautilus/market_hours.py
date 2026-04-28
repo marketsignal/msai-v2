@@ -161,9 +161,14 @@ class MarketHoursService:
 
         # Join: alias_string IN (canonical_ids) → instrument_uid → trading_hours.
         # Restrict to the active alias (effective_to IS NULL) so historical
-        # rolls don't leak. Multiple providers may map the same alias_string;
-        # first-wins since trading_hours is the same instrument regardless of
-        # provider.
+        # rolls don't leak. Filter by ``provider="interactive_brokers"``:
+        # IB is the trading-hours source of truth (extracted from
+        # ``ContractDetails.tradingHours`` at refresh time); Databento aliases
+        # that share the same ``alias_string`` carry ``trading_hours = NULL``
+        # because Databento's symbology doesn't expose RTH/ETH windows.
+        # Without this filter, result-order non-determinism between IB and
+        # Databento alias rows for the same canonical_id could cache NULL
+        # and silently fail-open every market-hours check.
         stmt = (
             select(InstrumentAlias.alias_string, InstrumentDefinition.trading_hours)
             .join(
@@ -172,6 +177,7 @@ class MarketHoursService:
             )
             .where(InstrumentAlias.alias_string.in_(canonical_ids))
             .where(InstrumentAlias.effective_to.is_(None))
+            .where(InstrumentAlias.provider == "interactive_brokers")
         )
         result = await session.execute(stmt)
         seen: set[str] = set()
