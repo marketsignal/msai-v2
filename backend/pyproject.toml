@@ -80,6 +80,16 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "TCH"]
 "tests/unit/services/symbol_onboarding/*.py" = ["TC003"]
 "tests/unit/cli/*.py" = ["TC003"]
 
+# Belt-and-suspenders against the structural-guard test in
+# tests/unit/structure/test_canonical_instrument_id_runtime_isolation.py.
+# The AST walker is the source of truth; this catches imports earlier in
+# the dev loop with a clear remediation pointer.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"msai.models.instrument_cache" = { msg = "Use msai.models.{InstrumentDefinition, InstrumentAlias} — the registry is the single source of truth for instrument metadata." }
+"msai.services.nautilus.live_instrument_bootstrap.canonical_instrument_id" = { msg = "Use live_resolver.lookup_for_live(...) for runtime resolution, or the per-asset-class IBContract factories at cli.py:_build_ib_contract_for_symbol for IB seeding." }
+"msai.services.nautilus.instruments.canonical_instrument_id" = { msg = "Use resolve_instrument(symbol, venue=...).id directly." }
+"msai.services.nautilus.security_master.service.SecurityMaster.resolve_for_live" = { msg = "Use live_resolver.lookup_for_live(...) directly. live_supervisor/__main__.py is the canonical caller." }
+
 [tool.mypy]
 python_version = "3.12"
 strict = true

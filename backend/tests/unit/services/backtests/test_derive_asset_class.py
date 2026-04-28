@@ -76,7 +76,7 @@ class TestDeriveAssetClassAsync:
         # The registry MUST win even if the shape would disagree.
         fake_master = MagicMock()
         fake_master.resolve_for_backtest = AsyncMock(return_value=["ESM6.CME"])
-        fake_master.asset_class_for_alias = MagicMock(return_value="futures")
+        fake_master.asset_class_for_alias = AsyncMock(return_value="futures")
 
         fake_db = MagicMock()
 
@@ -92,7 +92,7 @@ class TestDeriveAssetClassAsync:
 
         assert result == "futures"
         fake_master.resolve_for_backtest.assert_awaited_once()
-        fake_master.asset_class_for_alias.assert_called_once_with("ESM6.CME")
+        fake_master.asset_class_for_alias.assert_awaited_once_with("ESM6.CME")
 
     async def test_db_none_falls_back_to_shape(self) -> None:
         # No DB session → skip registry, use shape heuristic directly.
@@ -102,28 +102,38 @@ class TestDeriveAssetClassAsync:
     async def test_registry_exception_falls_back_to_shape(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        # A registry failure must never kill auto-heal. Log with exc_info
-        # and fall back to the shape heuristic.
+        # A DB failure must never kill auto-heal. Log with exc_info,
+        # roll back the session so it's reusable, then fall back to the
+        # shape heuristic.
+        from sqlalchemy.exc import OperationalError
+
         fake_master = MagicMock()
-        fake_master.resolve_for_backtest = AsyncMock(side_effect=RuntimeError("registry offline"))
+        fake_master.resolve_for_backtest = AsyncMock(
+            side_effect=OperationalError("SELECT", {}, Exception("registry offline"))
+        )
 
         from msai.services.nautilus.security_master import service as sm_module
 
         original_ctor = sm_module.SecurityMaster
         sm_module.SecurityMaster = MagicMock(return_value=fake_master)  # type: ignore[misc]
+        fake_db = MagicMock()
+        fake_db.rollback = AsyncMock()
         try:
-            result = await derive_asset_class(["ES.n.0"], start=date(2024, 1, 1), db=MagicMock())
+            result = await derive_asset_class(["ES.n.0"], start=date(2024, 1, 1), db=fake_db)
         finally:
             sm_module.SecurityMaster = original_ctor  # type: ignore[misc]
 
         assert result == "futures"  # shape fallback
+        # The poisoned-session contagion guard MUST roll back so the
+        # caller's session is reusable.
+        fake_db.rollback.assert_awaited_once()
         # structlog writes to stdout; verify warning + exc_info made it out.
         captured = capsys.readouterr()
         combined = captured.out + captured.err
         assert "asset_class_registry_lookup_failed" in combined
         assert "warning" in combined.lower()
         # exc_info=True should include the traceback.
-        assert "RuntimeError" in combined
+        assert "OperationalError" in combined
         assert "registry offline" in combined
 
     async def test_empty_list_returns_none_without_touching_registry(self) -> None:
@@ -149,10 +159,11 @@ class TestDeriveAssetClassAsync:
 class TestAssetClassForAlias:
     """``SecurityMaster.asset_class_for_alias`` — registry → ingest taxonomy.
 
-    Iter-2 P1-a: the public method MUST translate the registry's
-    ``InstrumentSpec.asset_class`` values (``"equity"``, ``"future"``,
-    ``"option"``, ``"forex"``) to the ingest / Parquet-storage taxonomy
-    (``"stocks"``, ``"futures"``, ``"options"``, ``"forex"``).
+    The method MUST translate the registry's ``asset_class`` taxonomy
+    (``equity`` / ``futures`` / ``fx`` / ``option`` / ``crypto`` per the
+    ``ck_instrument_definitions_asset_class`` CHECK) to the ingest /
+    Parquet-storage taxonomy (``stocks`` / ``futures`` / ``options`` /
+    ``forex`` / ``crypto``).
 
     Without this mapping, writes land under ``data/parquet/equity/`` while
     the catalog reader expects ``data/parquet/stocks/`` — the auto-heal
@@ -160,32 +171,114 @@ class TestAssetClassForAlias:
     """
 
     @pytest.mark.parametrize(
-        ("alias", "expected"),
+        ("registry_asset_class", "expected"),
         [
-            ("AAPL.NASDAQ", "stocks"),  # equity → stocks
-            ("SPY.ARCA", "stocks"),
-            ("ESM6.CME", "futures"),  # future → futures
-            ("EUR/USD.IDEALPRO", "forex"),  # forex stays forex
+            ("equity", "stocks"),
+            ("futures", "futures"),
+            ("option", "options"),
+            ("fx", "forex"),
+            ("crypto", "crypto"),
         ],
     )
-    def test_registry_taxonomy_translates_to_ingest_taxonomy(
-        self, alias: str, expected: str
+    async def test_registry_taxonomy_translates_to_ingest_taxonomy(
+        self, registry_asset_class: str, expected: str
     ) -> None:
+        from msai.services.nautilus.security_master import registry as registry_mod
         from msai.services.nautilus.security_master.service import SecurityMaster
 
-        # Build a SecurityMaster with mocked deps; we only exercise the
-        # pure-function path through ``_spec_from_canonical``.
-        master = SecurityMaster.__new__(SecurityMaster)
-        assert master.asset_class_for_alias(alias) == expected
+        # Use the canonical constructor (AsyncMock for qualifier is harmless —
+        # this test path never invokes it). Avoids the brittle ``__new__``
+        # bypass that would silently break if the constructor adds invariants.
+        master = SecurityMaster(qualifier=AsyncMock(), db=MagicMock())
 
-    def test_unknown_venue_returns_none(self) -> None:
+        fake_idef = MagicMock()
+        fake_idef.asset_class = registry_asset_class
+
+        fake_registry = MagicMock()
+        fake_registry.find_by_alias = AsyncMock(return_value=fake_idef)
+
+        original_ctor = registry_mod.InstrumentRegistry
+        registry_mod.InstrumentRegistry = MagicMock(return_value=fake_registry)  # type: ignore[misc]
+        try:
+            result = await master.asset_class_for_alias("FOO.BAR")
+        finally:
+            registry_mod.InstrumentRegistry = original_ctor  # type: ignore[misc]
+
+        assert result == expected
+        fake_registry.find_by_alias.assert_awaited_once()
+
+    async def test_registry_miss_returns_none(self) -> None:
+        from msai.services.nautilus.security_master import registry as registry_mod
         from msai.services.nautilus.security_master.service import SecurityMaster
 
-        master = SecurityMaster.__new__(SecurityMaster)
-        assert master.asset_class_for_alias("FOO.UNKNOWN_VENUE") is None
+        master = SecurityMaster(qualifier=AsyncMock(), db=MagicMock())
 
-    def test_empty_alias_returns_none(self) -> None:
+        fake_registry = MagicMock()
+        fake_registry.find_by_alias = AsyncMock(return_value=None)
+
+        original_ctor = registry_mod.InstrumentRegistry
+        registry_mod.InstrumentRegistry = MagicMock(return_value=fake_registry)  # type: ignore[misc]
+        try:
+            result = await master.asset_class_for_alias("FOO.UNKNOWN_VENUE")
+        finally:
+            registry_mod.InstrumentRegistry = original_ctor  # type: ignore[misc]
+
+        assert result is None
+
+    async def test_registry_exception_returns_none(self) -> None:
+        # A DB hiccup must never kill auto-heal — log + return None so
+        # the caller falls through to the shape heuristic. The catch is
+        # narrowed to ``(SQLAlchemyError, AmbiguousSymbolError)`` so
+        # programmer errors propagate; raise the right type here.
+        from sqlalchemy.exc import OperationalError
+
+        from msai.services.nautilus.security_master import registry as registry_mod
         from msai.services.nautilus.security_master.service import SecurityMaster
 
-        master = SecurityMaster.__new__(SecurityMaster)
-        assert master.asset_class_for_alias("") is None
+        master = SecurityMaster(qualifier=AsyncMock(), db=MagicMock())
+
+        fake_registry = MagicMock()
+        fake_registry.find_by_alias = AsyncMock(
+            side_effect=OperationalError("SELECT", {}, Exception("DB offline"))
+        )
+
+        original_ctor = registry_mod.InstrumentRegistry
+        registry_mod.InstrumentRegistry = MagicMock(return_value=fake_registry)  # type: ignore[misc]
+        try:
+            result = await master.asset_class_for_alias("FOO.BAR")
+        finally:
+            registry_mod.InstrumentRegistry = original_ctor  # type: ignore[misc]
+
+        assert result is None
+
+    async def test_unrecognized_registry_taxonomy_returns_none(self) -> None:
+        # If the registry row carries an asset_class outside the known
+        # set (shouldn't happen given the CHECK constraint, but defend
+        # against future taxonomy expansion), fall through to None so
+        # the caller can decide via the shape heuristic.
+        from msai.services.nautilus.security_master import registry as registry_mod
+        from msai.services.nautilus.security_master.service import SecurityMaster
+
+        master = SecurityMaster(qualifier=AsyncMock(), db=MagicMock())
+
+        fake_idef = MagicMock()
+        fake_idef.asset_class = "unknown_taxonomy"
+
+        fake_registry = MagicMock()
+        fake_registry.find_by_alias = AsyncMock(return_value=fake_idef)
+
+        original_ctor = registry_mod.InstrumentRegistry
+        registry_mod.InstrumentRegistry = MagicMock(return_value=fake_registry)  # type: ignore[misc]
+        try:
+            result = await master.asset_class_for_alias("FOO.BAR")
+        finally:
+            registry_mod.InstrumentRegistry = original_ctor  # type: ignore[misc]
+
+        assert result is None
+
+    async def test_empty_alias_returns_none(self) -> None:
+        from msai.services.nautilus.security_master.service import SecurityMaster
+
+        master = SecurityMaster(qualifier=AsyncMock(), db=MagicMock())
+        # ``_db`` is irrelevant on the empty-string fast-path.
+        assert await master.asset_class_for_alias("") is None

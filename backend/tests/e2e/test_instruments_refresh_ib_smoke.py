@@ -14,8 +14,8 @@ Verifies the three things mocks can't:
 2. Idempotent re-run: two back-to-back CLI invocations produce the
    same row count in ``instrument_definitions`` +
    ``instrument_aliases``.
-3. Warm resolve: after refresh, ``SecurityMaster.resolve_for_live``
-   returns without touching IB.
+3. Warm resolve: after refresh, :func:`live_resolver.lookup_for_live`
+   returns from the registry without touching IB.
 """
 
 from __future__ import annotations
@@ -142,21 +142,22 @@ async def test_refresh_is_idempotent_on_second_run() -> None:
 
 
 async def test_warm_resolve_does_not_touch_ib() -> None:
-    """After a successful refresh, resolve_for_live returns from the
+    """After a successful refresh, ``lookup_for_live`` returns from the
     registry without spawning a new IB client (warm-path proof — PRD
     US-001 post-condition, US-002 persistence check).
     """
     prewarm = _invoke_refresh("AAPL")
     assert prewarm.returncode == 0
 
-    # Now call resolve_for_live with NO qualifier — SecurityMaster
-    # must resolve from the DB only. If it tries to touch IB, it'll
-    # raise because qualifier is None.
+    # Call lookup_for_live directly — registry-only by design (no IB
+    # round-trip is possible from this primitive).
     from msai.core.database import async_session_factory
-    from msai.services.nautilus.security_master.service import SecurityMaster
+    from msai.services.nautilus.live_instrument_bootstrap import exchange_local_today
+    from msai.services.nautilus.security_master.live_resolver import lookup_for_live
 
     async with async_session_factory() as session:
-        sm = SecurityMaster(qualifier=None, db=session)
-        resolved = await sm.resolve_for_live(["AAPL"])
+        resolved = await lookup_for_live(
+            ["AAPL"], as_of_date=exchange_local_today(), session=session
+        )
         assert len(resolved) == 1
-        assert "AAPL" in resolved[0]
+        assert "AAPL" in resolved[0].canonical_id

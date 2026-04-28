@@ -24,6 +24,11 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from msai.services.nautilus.security_master.types import (
+        Provider,
+        RegistryAssetClass,
+    )
+
 
 class RegistryDefinitionNotFoundError(Exception):
     """Raised when a requested symbol has no matching registry row."""
@@ -48,7 +53,7 @@ class AmbiguousSymbolError(Exception):
     def __init__(
         self,
         symbol: str,
-        provider: str,
+        provider: Provider,
         asset_classes: list[str],
     ) -> None:
         self.symbol = symbol
@@ -69,7 +74,7 @@ class InstrumentRegistry:
         self,
         alias_string: str,
         *,
-        provider: str,
+        provider: Provider,
         as_of_date: date,
     ) -> InstrumentDefinition | None:
         """Return the definition whose alias is active on ``as_of_date``.
@@ -111,12 +116,52 @@ class InstrumentRegistry:
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
 
+    async def find_by_aliases_bulk(
+        self,
+        alias_strings: list[str],
+        *,
+        provider: Provider,
+        as_of_date: date,
+    ) -> dict[str, InstrumentDefinition]:
+        """Return a dict mapping ``alias_string`` → :class:`InstrumentDefinition`
+        for every alias in ``alias_strings`` that has an active row at
+        ``as_of_date`` under ``provider``.
+
+        Misses are absent from the dict (NOT mapped to ``None``), so callers
+        can use ``alias_string in result`` for warm-hit membership checks.
+
+        One SELECT for the entire batch — bounded by the input size.
+        """
+        if not alias_strings:
+            return {}
+        stmt = (
+            select(InstrumentAlias, InstrumentDefinition)
+            .join(
+                InstrumentDefinition,
+                InstrumentAlias.instrument_uid == InstrumentDefinition.instrument_uid,
+            )
+            .where(InstrumentAlias.alias_string.in_(alias_strings))
+            .where(InstrumentAlias.provider == provider)
+            .where(InstrumentAlias.effective_from <= as_of_date)
+            .where(
+                or_(
+                    InstrumentAlias.effective_to.is_(None),
+                    InstrumentAlias.effective_to > as_of_date,
+                )
+            )
+        )
+        rows = await self.session.execute(stmt)
+        out: dict[str, InstrumentDefinition] = {}
+        for alias, idef in rows:
+            out[alias.alias_string] = idef
+        return out
+
     async def find_by_raw_symbol(
         self,
         raw_symbol: str,
         *,
-        provider: str,
-        asset_class: str | None = None,
+        provider: Provider,
+        asset_class: RegistryAssetClass | None = None,
     ) -> InstrumentDefinition | None:
         """Return the definition for ``raw_symbol`` under ``provider`` (and
         optional ``asset_class``). Returns ``None`` on miss. Callers MUST
@@ -154,7 +199,7 @@ class InstrumentRegistry:
         self,
         alias_string: str,
         *,
-        provider: str,
+        provider: Provider,
         as_of_date: date,
     ) -> InstrumentDefinition:
         """Thin wrapper over :meth:`find_by_alias` that raises when the

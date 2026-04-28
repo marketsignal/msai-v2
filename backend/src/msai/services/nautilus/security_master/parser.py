@@ -1,26 +1,25 @@
-"""Trading-hours extractor + Nautilus instrument passthrough
-(Phase 2 task 2.4).
+"""Trading-hours extractor + Nautilus instrument passthrough.
 
 Nautilus's :class:`InteractiveBrokersInstrumentProvider` already
 handles the heavy lifting of converting IB ``ContractDetails`` into
 Nautilus ``Equity`` / ``FuturesContract`` / ``OptionContract`` /
 ``CurrencyPair`` objects via its internal ``parse_instrument``
 function. Per the "use Nautilus API, never reinvent" rule, this
-module does NOT wrap that path — :class:`IBQualifier` (task 2.3)
-already returns the parsed ``Instrument`` straight from the provider.
+module does NOT wrap that path — :class:`IBQualifier` already
+returns the parsed ``Instrument`` straight from the provider.
 
 What this module OWNS:
 
 - :func:`extract_trading_hours` — pure function that parses IB's
   ``tradingHours`` / ``liquidHours`` strings plus ``timeZoneId``
-  into the JSONB schema documented on the ``InstrumentCache`` model
-  (see ``msai/models/instrument_cache.py`` module docstring).
+  into the JSONB schema persisted on
+  ``instrument_definitions.trading_hours``.
 
 - :func:`nautilus_instrument_to_cache_json` — serializes a Nautilus
-  ``Instrument`` object into a JSONB-compatible dict for the
-  ``nautilus_instrument_json`` column. Uses Nautilus's built-in
-  ``to_dict`` classmethod (``Instrument`` and all its subclasses
-  have ``to_dict()`` / ``from_dict()``).
+  ``Instrument`` object into a JSONB-compatible dict for downstream
+  consumers (continuous-futures payloads, audit logs). Uses
+  Nautilus's built-in ``to_dict`` classmethod (``Instrument`` and
+  all its subclasses have ``to_dict()`` / ``from_dict()``).
 
 IB trading-hours format reference:
 
@@ -68,8 +67,9 @@ _DAY_OF_WEEK_CODES: dict[int, str] = {
 }
 """Python's ``date.weekday()`` returns 0=Monday → 6=Sunday. This
 maps that integer to the uppercase three-letter code used in the
-``trading_hours`` JSONB schema so downstream consumers (Phase 4's
-market-hours guard) can match day names directly."""
+``trading_hours`` JSONB schema so downstream consumers (the
+market-hours guard at :class:`MarketHoursService`) can match day
+names directly."""
 
 
 def _parse_ib_hours_string(hours: str) -> list[dict[str, str]]:

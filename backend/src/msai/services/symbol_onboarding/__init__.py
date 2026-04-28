@@ -2,27 +2,23 @@
 
 Also exports ``normalize_asset_class_for_ingest`` — a single translation
 seam from the user-facing/registry taxonomy (``equity | futures | fx |
-option``; used by ``OnboardSymbolSpec.asset_class``) to the ingest /
-Parquet storage taxonomy (``stocks | futures | forex | option``; used
-by ``DataIngestionService.ingest_historical`` and the Parquet directory
-layout ``{DATA_ROOT}/parquet/{asset_class}/{symbol}/...``).
+option | crypto``; used by ``OnboardSymbolSpec.asset_class``) to the
+ingest / Parquet storage taxonomy (``stocks | futures | forex |
+options | crypto``; used by ``DataIngestionService.ingest_historical``
+and the Parquet directory layout
+``{DATA_ROOT}/parquet/{asset_class}/{symbol}/...``).
 
-Keep this in ONE place. Callers that cross the boundary (orchestrator,
-cost estimator, coverage scanner) import this helper; they do not
-hard-code either vocabulary.
+The map itself lives at
+:data:`msai.services.nautilus.security_master.types.REGISTRY_TO_INGEST_ASSET_CLASS`
+so this module and :class:`SecurityMaster` cannot drift on the option/options
+key — drift would silently route Parquet writes to two different directories.
 """
 
 from __future__ import annotations
 
+from msai.services.nautilus.security_master.types import REGISTRY_TO_INGEST_ASSET_CLASS
+
 __all__ = ["normalize_asset_class_for_ingest"]
-
-
-_REGISTRY_TO_INGEST: dict[str, str] = {
-    "equity": "stocks",
-    "futures": "futures",
-    "fx": "forex",
-    "option": "option",
-}
 
 
 def normalize_asset_class_for_ingest(registry_asset_class: str) -> str:
@@ -32,9 +28,9 @@ def normalize_asset_class_for_ingest(registry_asset_class: str) -> str:
     asset class doesn't silently route to the wrong provider.
     """
     try:
-        return _REGISTRY_TO_INGEST[registry_asset_class]
+        return REGISTRY_TO_INGEST_ASSET_CLASS[registry_asset_class]  # type: ignore[index]
     except KeyError as exc:
         raise ValueError(
             f"Unknown registry asset_class {registry_asset_class!r}; "
-            f"expected one of {sorted(_REGISTRY_TO_INGEST)}"
+            f"expected one of {sorted(REGISTRY_TO_INGEST_ASSET_CLASS)}"
         ) from exc

@@ -17,9 +17,8 @@ import pytest
 
 from msai.services.nautilus.live_instrument_bootstrap import (
     PHASE_1_PAPER_SYMBOLS,
-    _current_quarterly_expiry,
     build_ib_instrument_provider_config,
-    canonical_instrument_id,
+    current_quarterly_expiry,
 )
 
 
@@ -144,135 +143,73 @@ class TestESFuturesContract:
 
 
 class TestCurrentQuarterlyExpiry:
-    """``_current_quarterly_expiry(today)`` returns the next quarterly
+    """``current_quarterly_expiry(today)`` returns the next quarterly
     futures expiry (Mar/Jun/Sep/Dec) as ``YYYYMM`` — whose 3rd Friday
     is on or after ``today``. Used for ES, NQ, RTY, YM.
     """
 
     def test_before_june_expiry_returns_june(self) -> None:
         # April 15, 2026 — June 19, 2026 (3rd Friday) is the next expiry
-        assert _current_quarterly_expiry(date(2026, 4, 15)) == "202606"
+        assert current_quarterly_expiry(date(2026, 4, 15)) == "202606"
 
     def test_day_before_march_expiry_still_march(self) -> None:
         # 3rd Friday of March 2026 is March 20; March 19 still tradable
-        assert _current_quarterly_expiry(date(2026, 3, 19)) == "202603"
+        assert current_quarterly_expiry(date(2026, 3, 19)) == "202603"
 
     def test_on_march_expiry_day_rolls_to_june(self) -> None:
         # March 20, 2026 is the 3rd Friday. ES last-trades the Thursday
         # before (March 19), so on March 20 the March contract is
         # already expired — roll to June.
-        assert _current_quarterly_expiry(date(2026, 3, 20)) == "202606"
+        assert current_quarterly_expiry(date(2026, 3, 20)) == "202606"
 
     def test_day_after_march_expiry_returns_june(self) -> None:
         # March 21, 2026 — March already expired, next is June
-        assert _current_quarterly_expiry(date(2026, 3, 21)) == "202606"
+        assert current_quarterly_expiry(date(2026, 3, 21)) == "202606"
 
     def test_early_in_quarter_month_still_that_quarter(self) -> None:
         # June 1, 2026 — still June (expiry is June 19)
-        assert _current_quarterly_expiry(date(2026, 6, 1)) == "202606"
+        assert current_quarterly_expiry(date(2026, 6, 1)) == "202606"
 
     def test_late_december_rolls_to_next_year_march(self) -> None:
         # December 20, 2026 — December already expired (3rd Fri = Dec 18)
-        assert _current_quarterly_expiry(date(2026, 12, 20)) == "202703"
+        assert current_quarterly_expiry(date(2026, 12, 20)) == "202703"
 
     def test_january_in_new_year_returns_march(self) -> None:
         # January 15, 2027 — March 2027 is the next quarterly expiry
-        assert _current_quarterly_expiry(date(2027, 1, 15)) == "202703"
+        assert current_quarterly_expiry(date(2027, 1, 15)) == "202703"
 
     def test_non_quarterly_month_returns_next_quarterly(self) -> None:
         # February, April, May, etc. — return the next quarterly month
-        assert _current_quarterly_expiry(date(2026, 2, 1)) == "202603"
-        assert _current_quarterly_expiry(date(2026, 5, 1)) == "202606"
-        assert _current_quarterly_expiry(date(2026, 7, 1)) == "202609"
-        assert _current_quarterly_expiry(date(2026, 10, 1)) == "202612"
+        assert current_quarterly_expiry(date(2026, 2, 1)) == "202603"
+        assert current_quarterly_expiry(date(2026, 5, 1)) == "202606"
+        assert current_quarterly_expiry(date(2026, 7, 1)) == "202609"
+        assert current_quarterly_expiry(date(2026, 10, 1)) == "202612"
 
     def test_result_is_6_digit_string(self) -> None:
-        result = _current_quarterly_expiry(date(2026, 4, 15))
+        result = current_quarterly_expiry(date(2026, 4, 15))
         assert isinstance(result, str)
         assert len(result) == 6
         assert result.isdigit()
 
 
-class TestCanonicalInstrumentId:
-    """``canonical_instrument_id`` maps user-facing symbols/IDs to the
-    concrete Nautilus instrument_id that will exist in the cache after
-    ``build_ib_instrument_provider_config`` preloads the matching
-    IBContract. Identity for stocks/ETF/FX, front-month lookup for
-    futures.
-    """
+def test_canonical_instrument_id_is_not_importable() -> None:
+    """canonical_instrument_id is deleted from live_instrument_bootstrap.py.
+    CLI seeding now uses per-asset-class IBContract factories at
+    cli.py:_build_ib_contract_for_symbol."""
+    import msai.services.nautilus.live_instrument_bootstrap as mod
 
-    def test_es_deterministic_with_today_param(self) -> None:
-        """Passing an explicit ``today`` makes ES canonicalization
-        deterministic — no wall-clock dependency. April 15, 2026 →
-        June 2026 contract ``ESM6.CME`` (IB_SIMPLIFIED uses ``CME``
-        verbatim, not the ISO MIC ``XCME``)."""
-        assert canonical_instrument_id("ES.CME", today=date(2026, 4, 15)) == "ESM6.CME"
+    assert not hasattr(mod, "canonical_instrument_id"), (
+        "canonical_instrument_id must be deleted — CLI uses IBContract "
+        "factories now (see cli.py:_build_ib_contract_for_symbol)."
+    )
 
-    def test_es_rolls_to_september_after_june_expiry(self) -> None:
-        """June 20, 2026 (day after 3rd Friday) rolls to September."""
-        assert canonical_instrument_id("ES", today=date(2026, 6, 20)) == "ESU6.CME"
 
-    def test_es_december_maps_to_z_code(self) -> None:
-        assert canonical_instrument_id("ES.CME", today=date(2026, 10, 1)) == "ESZ6.CME"
+def test_es_front_month_local_symbol_is_deleted() -> None:
+    """_es_front_month_local_symbol was only called by canonical_instrument_id.
+    Both deleted."""
+    import msai.services.nautilus.live_instrument_bootstrap as mod
 
-    def test_es_march_maps_to_h_code_next_year(self) -> None:
-        assert canonical_instrument_id("ES", today=date(2027, 1, 15)) == "ESH7.CME"
-
-    def test_es_legacy_xcme_input_still_accepted(self) -> None:
-        """Legacy MIC-style input (``ES.XCME``) still accepted — the
-        root extraction splits on ``.`` so the venue is ignored. Output
-        is always ``.CME`` (IB_SIMPLIFIED venue)."""
-        assert canonical_instrument_id("ES.XCME", today=date(2026, 4, 15)) == "ESM6.CME"  # legacy accept
-
-    def test_aapl_round_trips_identity(self) -> None:
-        assert canonical_instrument_id("AAPL") == "AAPL.NASDAQ"
-        assert canonical_instrument_id("AAPL.NASDAQ") == "AAPL.NASDAQ"
-
-    def test_msft_round_trips_identity(self) -> None:
-        assert canonical_instrument_id("MSFT") == "MSFT.NASDAQ"
-        assert canonical_instrument_id("MSFT.NASDAQ") == "MSFT.NASDAQ"
-
-    def test_spy_maps_to_arca(self) -> None:
-        assert canonical_instrument_id("SPY") == "SPY.ARCA"
-        assert canonical_instrument_id("SPY.ARCA") == "SPY.ARCA"
-
-    def test_eur_usd_maps_to_idealpro(self) -> None:
-        assert canonical_instrument_id("EUR/USD") == "EUR/USD.IDEALPRO"
-        assert canonical_instrument_id("EUR/USD.IDEALPRO") == "EUR/USD.IDEALPRO"
-
-    def test_es_maps_to_front_month_with_cme_venue(self) -> None:
-        """ES is the interesting case — user writes ``ES.CME`` but
-        Nautilus registers the concrete month (``ESM6.CME`` this
-        quarter) because the IB adapter parses ``localSymbol``.
-        Venue stays ``CME`` (IB_SIMPLIFIED, verified live 2026-04-16)."""
-        result = canonical_instrument_id("ES.CME")
-        # Format: ES{MonthCode}{YearLastDigit}.CME
-        assert result.endswith(".CME")
-        assert result.startswith("ES")
-        # Month code is H/M/U/Z (quarterly); year digit is 0-9
-        assert len(result) == len("ESM6.CME")
-        month_code = result[2]
-        assert month_code in {"H", "M", "U", "Z"}
-        year_digit = result[3]
-        assert year_digit.isdigit()
-
-    def test_es_from_bare_symbol_matches_full_id(self) -> None:
-        """Accepts either bare root (``"ES"``) or full id (``"ES.CME"``)
-        — operator input may arrive either way."""
-        assert canonical_instrument_id("ES") == canonical_instrument_id("ES.CME")
-
-    def test_unknown_symbol_raises(self) -> None:
-        with pytest.raises(ValueError, match="Unknown instrument root"):
-            canonical_instrument_id("XYZ")
-
-    def test_unknown_symbol_lists_supported_in_message(self) -> None:
-        """The error message must cite the supported roots so operators
-        can fix typos without grepping the source."""
-        with pytest.raises(ValueError) as exc_info:
-            canonical_instrument_id("XYZ.NASDAQ")
-        msg = str(exc_info.value)
-        assert "AAPL" in msg
-        assert "ES" in msg
+    assert not hasattr(mod, "_es_front_month_local_symbol")
 
 
 class TestPhaseOneSymbolsFreshPerCall:
@@ -293,18 +230,3 @@ class TestPhaseOneSymbolsFreshPerCall:
         assert es_1.lastTradeDateOrContractMonth == es_2.lastTradeDateOrContractMonth
         # But different object instances — proves regeneration
         assert es_1 is not es_2
-
-    def test_today_param_agrees_between_canonical_and_provider(self) -> None:
-        """Critical invariant: when the same ``today`` is passed to both
-        ``canonical_instrument_id`` and ``build_ib_instrument_provider_config``,
-        the resulting Nautilus id and the IB contract expiry must
-        reference the SAME quarterly contract. This is what prevents
-        the supervisor/subprocess midnight-on-roll-day race."""
-        shared_today = date(2026, 6, 20)  # day after June expiry
-        canonical = canonical_instrument_id("ES.CME", today=shared_today)
-        config = build_ib_instrument_provider_config(["ES"], today=shared_today)
-        es_contract = next(iter(config.load_contracts))
-        # canonical should be ESU6.CME (September)
-        assert canonical == "ESU6.CME"
-        # Contract expiry should also be 202609
-        assert es_contract.lastTradeDateOrContractMonth == "202609"

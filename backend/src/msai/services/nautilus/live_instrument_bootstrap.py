@@ -25,9 +25,8 @@ replaces this with the full SecurityMaster lookup driven by the
     The front-month rollover + provider-config helpers here remain
     load-bearing for:
     (1) the live-supervisor payload factory,
-    (2) ``live_node_config.build_ib_instrument_provider_config``,
-    (3) ``SecurityMaster.resolve_for_live``'s cold-miss fallback.
-    All three migrate to registry-driven resolution in the follow-up
+    (2) ``live_node_config.build_ib_instrument_provider_config``.
+    Both migrate to registry-driven resolution in the follow-up
     live-wiring PR.
 """
 
@@ -63,10 +62,9 @@ def exchange_local_today() -> date:
     """Return the current date in CME's exchange-local timezone.
 
     Public so callers (e.g., the live-supervisor) can compute the date
-    ONCE per spawn and thread it through both
-    :func:`canonical_instrument_id` and :func:`phase_1_paper_symbols`
-    — guaranteeing they agree even if a quarterly roll happens in the
-    middle of provisioning a deployment.
+    ONCE per spawn and thread it through :func:`phase_1_paper_symbols`
+    — guaranteeing the futures front-month is stable even if a
+    quarterly roll happens in the middle of provisioning a deployment.
     """
     return datetime.now(_CME_TZ).date()
 
@@ -75,16 +73,16 @@ def third_friday_of(year: int, month: int) -> date:
     """Return the third Friday of ``(year, month)`` — the CME monthly
     futures expiration convention.
 
-    Public so both :func:`_current_quarterly_expiry` (below) and
-    :meth:`SecurityMaster._spec_from_canonical` can reuse the same
-    arithmetic without re-implementing it.
+    Public so both :func:`current_quarterly_expiry` (below) and CLI
+    quarterly-futures factories can reuse the same arithmetic without
+    re-implementing it.
     """
     first = date(year, month, 1)
     first_friday_offset = (4 - first.weekday()) % 7
     return first + timedelta(days=first_friday_offset + 14)
 
 
-def _current_quarterly_expiry(today: date) -> str:
+def current_quarterly_expiry(today: date) -> str:
     """Return the next quarterly futures expiry as ``YYYYMM``.
 
     Used for CME E-mini index futures (ES, NQ, RTY, YM) which all expire
@@ -127,71 +125,6 @@ def _current_quarterly_expiry(today: date) -> str:
 # derive its ``InstrumentId``, so we need to compute the same string
 # here to match what the cache will hold after IB resolves the contract.
 _FUT_MONTH_CODES: dict[int, str] = {3: "H", 6: "M", 9: "U", 12: "Z"}
-
-
-def _es_front_month_local_symbol(today: date) -> str:
-    """Return the IB localSymbol for the ES front-month contract.
-
-    Matches what IB returns when resolving our ``FUT ES CME USD`` contract
-    with ``lastTradeDateOrContractMonth`` set to the output of
-    :func:`_current_quarterly_expiry`. Verified 2026-04-15 against paper
-    IB Gateway: June 2026 → ``ESM6``.
-    """
-    expiry = _current_quarterly_expiry(today)
-    year = int(expiry[:4])
-    month = int(expiry[4:])
-    return f"ES{_FUT_MONTH_CODES[month]}{year % 10}"
-
-
-def canonical_instrument_id(
-    user_instrument_id: str,
-    *,
-    today: date | None = None,
-) -> str:
-    """Map a user-facing instrument_id to the concrete Nautilus
-    instrument_id that will exist in the cache after
-    :func:`build_ib_instrument_provider_config` preloads the matching
-    IBContract.
-
-    For stocks/ETFs/FX, the user-facing id is already canonical
-    (``AAPL.NASDAQ``, ``EUR/USD.IDEALPRO``). For futures, the user writes
-    ``ES.CME`` (stable across quarterly rolls) but Nautilus registers
-    the instrument under the concrete month derived from IB's
-    ``localSymbol`` (``ESM6.CME`` this quarter). Without this mapping
-    the strategy subscribes to ``ES.CME`` while only ``ESM6.CME``
-    exists — zero bar events fire.
-
-    The venue suffix for futures is ``CME`` (IB's native name) —
-    ``IB_SIMPLIFIED`` symbology uses IB's exchange strings verbatim, not
-    the ISO MIC (``XCME``). Live-verified 2026-04-16: Nautilus
-    registered our ``FUT ES CME`` contract as ``ESM6.CME``.
-
-    Accepts either a bare symbol (``"ES"``) or a full instrument_id
-    (``"ES.CME"`` or ``"ES.XCME"`` — legacy MIC accepted for input only).
-
-    Args:
-        user_instrument_id: Operator-facing symbol or id.
-        today: Exchange-local date to use for futures rollover. Callers
-            that also invoke :func:`phase_1_paper_symbols` in the same
-            spawn should pass the same ``today`` value to both to avoid
-            a midnight-on-roll-day race.
-
-    Raises:
-        ValueError: Unknown root symbol — Phase 1 has a closed universe.
-    """
-    root = user_instrument_id.split(".")[0]
-    if root in {"AAPL", "MSFT"}:
-        return f"{root}.NASDAQ"
-    if root == "SPY":
-        return "SPY.ARCA"
-    if root in {"EUR/USD", "EUR"}:
-        return "EUR/USD.IDEALPRO"
-    if root == "ES":
-        resolved_today = today if today is not None else exchange_local_today()
-        return f"{_es_front_month_local_symbol(resolved_today)}.CME"
-    raise ValueError(
-        f"Unknown instrument root '{root}' — Phase 1 paper symbols: AAPL, MSFT, SPY, EUR/USD, ES"
-    )
 
 
 # Stable Phase 1 universe — stocks, ETF, and FX contracts don't depend
@@ -245,9 +178,9 @@ def phase_1_paper_symbols(*, today: date | None = None) -> dict[str, IBContract]
 
     Args:
         today: Exchange-local date to use for the futures front-month
-            lookup. Callers that also invoke
-            :func:`canonical_instrument_id` in the same spawn should
-            pass the same ``today`` value to both.
+            lookup. Callers should compute the date once per spawn (via
+            :func:`exchange_local_today`) and thread the same value
+            through any subsequent symbol-resolution calls.
     """
     resolved_today = today if today is not None else exchange_local_today()
     return {
@@ -260,7 +193,7 @@ def phase_1_paper_symbols(*, today: date | None = None) -> dict[str, IBContract]
             secType="FUT",
             symbol="ES",
             exchange="CME",
-            lastTradeDateOrContractMonth=_current_quarterly_expiry(resolved_today),
+            lastTradeDateOrContractMonth=current_quarterly_expiry(resolved_today),
             currency="USD",
         ),
     }

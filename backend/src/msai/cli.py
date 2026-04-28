@@ -61,6 +61,9 @@ from urllib.parse import quote
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from datetime import date
+
+    from nautilus_trader.adapters.interactive_brokers.common import IBContract
 
 import httpx
 import typer
@@ -694,6 +697,91 @@ def system_health() -> None:
 # ======================================================================
 
 
+# v1 closed quarterly CME E-mini set — the only futures roots whose
+# third-Friday-of-March/June/September/December schedule
+# ``current_quarterly_expiry`` correctly handles (see
+# live_instrument_bootstrap.py). CL/GC/ZB/etc. follow different expiry
+# cycles + venues; they need operator-specified exchange + expiry that
+# the v1 CLI does not yet surface.
+_FUT_QUARTERLY_ROOTS: frozenset[str] = frozenset({"ES", "NQ", "RTY", "YM"})
+
+
+def _build_ib_contract_for_symbol(
+    symbol: str,
+    *,
+    asset_class: str,
+    today: date,
+    primary_exchange: str = "NASDAQ",
+) -> IBContract:
+    """Build an IBContract for an operator-supplied symbol + asset class.
+
+    Per-asset-class normalization replaces the closed-universe
+    canonical_instrument_id() helper. IB's qualifier resolves the
+    canonical alias (``AAPL.NASDAQ``, ``ESM6.CME``, ``EUR/USD.IDEALPRO``)
+    at qualification time — the CLI doesn't pre-canonicalize.
+
+    Args:
+        symbol: Operator-facing root symbol (e.g. ``"AAPL"``, ``"ES"``,
+            ``"EUR/USD"``). FX takes ``"BASE/QUOTE"`` form; STK/FUT take
+            the bare root.
+        asset_class: One of ``"stk"`` (equity/ETF), ``"fut"`` (CME E-mini
+            quarterly futures — closed set ``{ES, NQ, RTY, YM}``),
+            ``"cash"`` (forex).
+        today: Used by ``"fut"`` to derive quarterly expiry via
+            :func:`current_quarterly_expiry`.
+        primary_exchange: STK ``primaryExchange`` for SMART routing
+            disambiguation. NASDAQ-listed (AAPL/MSFT) is the default;
+            ARCA-listed ETFs (SPY/VTI) need ``"ARCA"``; NYSE-listed
+            stocks need ``"NYSE"``. Ignored for FUT/CASH.
+
+    Raises:
+        ValueError: ``asset_class`` is not in the supported set, OR
+            ``"fut"`` symbol is not in the v1 closed quarterly set.
+    """
+    from nautilus_trader.adapters.interactive_brokers.common import IBContract
+
+    from msai.services.nautilus.live_instrument_bootstrap import (
+        current_quarterly_expiry,
+    )
+
+    if asset_class == "stk":
+        return IBContract(
+            secType="STK",
+            symbol=symbol,
+            exchange="SMART",
+            primaryExchange=primary_exchange,
+            currency="USD",
+        )
+    if asset_class == "fut":
+        if symbol not in _FUT_QUARTERLY_ROOTS:
+            raise ValueError(
+                f"--asset-class fut: v1 supports the closed CME E-mini "
+                f"quarterly set {sorted(_FUT_QUARTERLY_ROOTS)!r}; got "
+                f"{symbol!r}. Other futures (CL/NYMEX, GC/COMEX, etc.) "
+                f"need exchange + expiry overrides that v1 does not "
+                f"surface — schedule a follow-up CLI flag."
+            )
+        return IBContract(
+            secType="FUT",
+            symbol=symbol,
+            exchange="CME",
+            lastTradeDateOrContractMonth=current_quarterly_expiry(today),
+            currency="USD",
+        )
+    if asset_class == "cash":
+        if "/" in symbol:
+            base, quote_sym = symbol.split("/", 1)
+        else:
+            base, quote_sym = symbol, "USD"
+        return IBContract(
+            secType="CASH",
+            symbol=base,
+            exchange="IDEALPRO",
+            currency=quote_sym,
+        )
+    raise ValueError(f"Unknown asset class {asset_class!r} — supported: stk, fut, cash.")
+
+
 @instruments_app.command("refresh")
 def instruments_refresh(
     symbols: str = typer.Option(
@@ -710,6 +798,26 @@ def instruments_refresh(
             "``interactive_brokers`` (short-lived IB Gateway client; "
             "uses ``IB_INSTRUMENT_CLIENT_ID=999`` by default — see "
             "nautilus.md gotcha #3 for the collision contract)."
+        ),
+    ),
+    asset_class: str = typer.Option(
+        "stk",
+        "--asset-class",
+        help=(
+            "Asset class for IB qualification: ``stk`` (equity/ETF, "
+            "default), ``fut`` (CME E-mini quarterly: ES/NQ/RTY/YM), "
+            "``cash`` (forex). Ignored when --provider databento."
+        ),
+    ),
+    primary_exchange: str = typer.Option(
+        "NASDAQ",
+        "--primary-exchange",
+        help=(
+            "STK ``primaryExchange`` for SMART routing disambiguation. "
+            "NASDAQ-listed (AAPL/MSFT) is the default; ARCA-listed "
+            "ETFs (SPY/VTI) need ``--primary-exchange ARCA``; "
+            "NYSE-listed stocks need ``--primary-exchange NYSE``. "
+            "Ignored for FUT/CASH."
         ),
     ),
     start: str = typer.Option(
@@ -738,12 +846,10 @@ def instruments_refresh(
       succeeds on the ``.Z.N`` continuous-futures path by downloading
       the Databento ``definition`` payload and upserting the registry
       row.
-    * Live resolve (:meth:`SecurityMaster.resolve_for_live`) — for
+    * Live resolve via :func:`live_resolver.lookup_for_live` — for
       ``--provider interactive_brokers`` — connects a short-lived
       Nautilus IB client, qualifies each requested symbol against IB
-      Gateway, upserts registry rows, then disconnects. Day-1 scope
-      is the closed universe ``resolve_for_live`` supports today:
-      ``AAPL``, ``MSFT``, ``SPY``, ``EUR/USD``, ``ES``.
+      Gateway, upserts registry rows, then disconnects.
 
     Settings read (for ``--provider interactive_brokers``):
 
@@ -764,62 +870,29 @@ def instruments_refresh(
         _fail("no symbols provided")
 
     if provider == "interactive_brokers":
+        # Per-asset-class IBContract factories — IB resolves canonical
+        # aliases at qualification time. No closed-universe map.
+        if asset_class not in {"stk", "fut", "cash"}:
+            _fail(f"--asset-class {asset_class!r} is not supported. Use one of: stk, fut, cash.")
+
         from msai.services.nautilus.live_instrument_bootstrap import (
-            canonical_instrument_id,
-            phase_1_paper_symbols,
+            exchange_local_today,
         )
 
-        # Build an exact accepted-alias set per supported root. Each
-        # root admits three shapes: bare (``AAPL``), stable dotted
-        # (``AAPL.NASDAQ``, ``ES.CME``), and the concrete canonical
-        # form that canonical_instrument_id produces (``ESM6.CME``
-        # for today's front-month ES). Operators must be able to feed
-        # the CLI's own ``resolved`` output back in as a re-run.
-        # Exact membership avoids the permissive-strip
-        # trap (e.g. ``SPY.NASDAQ`` silently normalizing to ``SPY``
-        # via generic suffix stripping).
-        known = phase_1_paper_symbols()
-        # Mirror the compatibility surface canonical_instrument_id
-        # already accepts so the pre-warm CLI isn't narrower than
-        # SecurityMaster.resolve_for_live:
-        #
-        # - ``ES.XCME`` — legacy MIC, pre-venue-rename configs
-        # - ``EUR`` — bare shorthand for ``EUR/USD``
-        #
-        # Values are EXTRA aliases beyond {root, canonical, stable}.
-        # Bare-shorthand entries (no dot) also admit the shorthand +
-        # current-venue dotted form.
-        legacy_aliases_by_root: dict[str, tuple[str, ...]] = {
-            "ES": ("ES.XCME",),
-            "EUR/USD": ("EUR",),
-        }
-        accepted: dict[str, str] = {}
-        for root in known:
-            accepted[root] = root
-            canonical = canonical_instrument_id(root)
-            accepted[canonical] = root
-            canonical_venue = canonical.rsplit(".", 1)[1]
-            accepted[f"{root}.{canonical_venue}"] = root
-            for legacy in legacy_aliases_by_root.get(root, ()):
-                accepted[legacy] = root
-                if "." not in legacy:
-                    accepted[f"{legacy}.{canonical_venue}"] = root
-
-        normalized: list[str] = []
-        unknown: list[str] = []
-        for s in symbol_list:
-            if s in accepted:
-                normalized.append(accepted[s])
-            else:
-                unknown.append(s)
-        if unknown:
-            _fail(
-                f"symbol(s) {unknown} not in the closed universe for "
-                f"--provider interactive_brokers. Supported inputs: "
-                f"{sorted(accepted)}. Options outside this list "
-                f"require the live-path wiring PR (follow-up)."
-            )
-        symbol_list = normalized
+        today = exchange_local_today()
+        contracts: list[IBContract] = []
+        for sym in symbol_list:
+            try:
+                contracts.append(
+                    _build_ib_contract_for_symbol(
+                        sym,
+                        asset_class=asset_class,
+                        today=today,
+                        primary_exchange=primary_exchange,
+                    )
+                )
+            except ValueError as exc:
+                _fail(str(exc))
 
         # Port/account mode consistency (gotcha #6 guard). Runs BEFORE
         # any IB connection so a misconfigured operator can't even
@@ -844,6 +917,7 @@ def instruments_refresh(
             f"Pre-warming IB registry: host={settings.ib_host} "
             f"port={settings.ib_port} "
             f"account={settings.ib_account_id.strip()} "
+            f"asset_class={asset_class} "
             f"client_id={settings.ib_instrument_client_id} "
             f"connect_timeout={settings.ib_connect_timeout_seconds}s "
             f"request_timeout={settings.ib_request_timeout_seconds}s",
@@ -851,10 +925,10 @@ def instruments_refresh(
         )
 
         try:
-            resolved = asyncio.run(_run_ib_resolve_for_live(symbol_list))
+            resolved = asyncio.run(_run_ib_resolve_for_live(contracts))
         except _IBGatewayUnreachableError as exc:
             _fail(str(exc))
-        _emit_json({"provider": provider, "resolved": resolved})
+        _emit_json({"provider": provider, "asset_class": asset_class, "resolved": resolved})
         return
 
     if provider != "databento":
@@ -915,9 +989,9 @@ class _IBGatewayUnreachableError(RuntimeError):
     """
 
 
-async def _run_ib_resolve_for_live(symbol_list: list[str]) -> list[str]:
-    """Short-lived Nautilus IB client lifecycle wrapping
-    :meth:`SecurityMaster.resolve_for_live`.
+async def _run_ib_resolve_for_live(contracts: list[IBContract]) -> list[str]:
+    """Short-lived Nautilus IB client lifecycle wrapping per-contract
+    qualification + registry upsert.
 
     Lifecycle:
 
@@ -939,8 +1013,10 @@ async def _run_ib_resolve_for_live(symbol_list: list[str]) -> list[str]:
        ready" false-negative.
     5. ``get_cached_interactive_brokers_instrument_provider`` → wrap
        in the existing :class:`IBQualifier`.
-    6. ``SecurityMaster.resolve_for_live(symbols)`` + commit. Upserts
-       rows into ``instrument_definitions`` + ``instrument_aliases``.
+    6. For each contract: ``qualifier.qualify_contract(contract)`` →
+       extract canonical alias + venue/asset_class metadata → upsert
+       via ``SecurityMaster._upsert_definition_and_alias``. Commit
+       per contract so a mid-batch failure preserves earlier rows.
     7. ``try/finally`` teardown: ``await client._stop_async()``
        DIRECTLY. The public ``client.stop()`` only schedules
        ``_stop_async`` as a task; awaiting it ourselves guarantees
@@ -957,6 +1033,10 @@ async def _run_ib_resolve_for_live(symbol_list: list[str]) -> list[str]:
 
     # Import Nautilus only inside the function so the CLI module stays
     # importable on machines without the IB extras (ruff / mypy in CI).
+    from nautilus_trader.adapters.interactive_brokers.config import (
+        InteractiveBrokersInstrumentProviderConfig,
+        SymbologyMethod,
+    )
     from nautilus_trader.adapters.interactive_brokers.factories import (
         get_cached_ib_client,
         get_cached_interactive_brokers_instrument_provider,
@@ -968,9 +1048,6 @@ async def _run_ib_resolve_for_live(symbol_list: list[str]) -> list[str]:
     )
     from nautilus_trader.model.identifiers import TraderId
 
-    from msai.services.nautilus.live_instrument_bootstrap import (
-        build_ib_instrument_provider_config,
-    )
     from msai.services.nautilus.security_master.ib_qualifier import IBQualifier
 
     clock = LiveClock()
@@ -1012,7 +1089,11 @@ async def _run_ib_resolve_for_live(symbol_list: list[str]) -> list[str]:
                 f"not colliding with an active subprocess."
             ) from exc
 
-        provider_cfg = build_ib_instrument_provider_config(symbol_list)
+        provider_cfg = InteractiveBrokersInstrumentProviderConfig(
+            symbology_method=SymbologyMethod.IB_SIMPLIFIED,
+            load_contracts=frozenset(contracts),
+            cache_validity_days=1,
+        )
         provider = get_cached_interactive_brokers_instrument_provider(
             client=client,
             clock=clock,
@@ -1020,19 +1101,40 @@ async def _run_ib_resolve_for_live(symbol_list: list[str]) -> list[str]:
         )
         qualifier = IBQualifier(provider)
 
-        # Commit per symbol so a mid-batch failure preserves the
+        # Commit per contract so a mid-batch failure preserves the
         # already-qualified rows — idempotent re-run picks up where the
         # batch stopped. A single batched commit would roll back
-        # symbol 1's flushed rows when symbol 2 fails.
+        # contract 1's flushed rows when contract 2 fails.
         resolved: list[str] = []
         async with async_session_factory() as session:
             sm = SecurityMaster(qualifier=qualifier, db=session)
-            for sym in symbol_list:
+            for contract in contracts:
                 try:
-                    resolved.extend(await sm.resolve_for_live([sym]))
+                    instrument = await qualifier.qualify_contract(contract)
+                    alias_str = str(instrument.id)
+                    routing_venue = instrument.id.venue.value
+                    listing_venue = qualifier.listing_venue_for(instrument)
+                    await sm._upsert_definition_and_alias(
+                        raw_symbol=instrument.raw_symbol.value,
+                        listing_venue=listing_venue,
+                        routing_venue=routing_venue,
+                        asset_class=SecurityMaster._asset_class_for_instrument(instrument),
+                        alias_string=alias_str,
+                    )
                     await session.commit()
-                except Exception:
+                    resolved.append(alias_str)
+                except Exception as exc:
                     await session.rollback()
+                    if resolved:
+                        # Operator visibility — without this, the CLI
+                        # error obscures which symbols already landed in
+                        # the registry (their per-contract commits stuck
+                        # before this rollback).
+                        typer.echo(
+                            f"Already-qualified symbols (registry rows committed): "
+                            f"{resolved!r}; failure on contract={contract!r}: {exc}",
+                            err=True,
+                        )
                     raise
 
         return resolved
