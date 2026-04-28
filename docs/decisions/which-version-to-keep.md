@@ -227,11 +227,10 @@ Executing now on branch `feat/playwright-e2e-port` (branch name is historical �
 
 ## Follow-ups (not blocking)
 
-- **Architecture-governance review (2026-10-19, 6-month cadence)** — narrowed scope, see ratifications below:
-  - ~~(a) does claude's multi-login gateway fabric earn its complexity against actual multi-account operational load?~~ — **RATIFIED BY PABLO 2026-04-28: keep.** Design intent confirmed: 7–9 concurrent IB accounts, one per portfolio, all live in real-time. The multi-login fabric is load-bearing by design and cannot collapse to single-login. Removed from review scope.
-  - (b) is the instrument registry + alias windowing justified by live-path usage (CONTINUITY Next #1) or still scope creep? — **OPEN.** Pablo's view: defer to council using the latest code as evidence (post PR #37 live-path wiring + PR #45 onboarding + PR #46 registry-as-sole-source-of-truth). Council can answer this earlier than 2026-10-19 if desired.
-  - (c) supervisor complexity (heartbeat-before-`node.build()`, watchdog vs HeartbeatMonitor authority split, projection Redis-Streams/PEL/DLQ) — **OPEN.** Same — defer to council with current code + incident history as evidence.
-- Decision author: whoever is operating the stack then (Pablo unless delegated).
+- ~~**Architecture-governance review (2026-10-19, 6-month cadence)**~~ — **CLOSED 2026-04-28.**
+  - **(a) Multi-login gateway fabric** — RATIFIED by Pablo: 7–9 concurrent IB accounts (one per portfolio, real-time) is the design intent. Multi-login is load-bearing by design.
+  - **(b) Instrument registry + alias windowing** + **(c) supervisor complexity** — Council fired early on 2026-04-28 (5 advisors: Live-Trading Safety Officer, Symbol-Onboarding Contract Steward, Original-PRD Steward, Maintainer, Simplifier/Contrarian — Codex CLI unavailable so Maintainer + Simplifier ran on Claude with explicit dissent framing; user-as-chairman). **Verdicts:** Q-B1 unanimous "registry stays" with 3 CONDITIONAL flagging `databento_bootstrap.py` + `continuous_futures.py` as anticipatory engineering and `service.py` 1,083 LOC as splittable maintainability debt. Q-C1: supervisor + 4-layer kill-all unanimously APPROVED; projection PEL/DLQ flagged by 2 advisors as having zero production firing evidence (named falsifiable shrink targets if `msai_projection_dlq_total` and `XAUTOCLAIM` recovery don't fire by 2026-10-19). **Pablo's chairman ruling:** do not impose the falsifiable gate or land the Maintainer tidy now. Respond to actual problems if/when they manifest, not anticipated ones. The minority CONDITIONAL is filed but not actioned. Council content remains in chat history + `git log 4ee17d5..` if anyone wants the substance later.
+  - Future re-review trigger: an actual production incident in any of these subsystems, or a performance/maintainability complaint that traces back to one of the flagged areas. No calendar cadence.
 - **Playwright regression coverage** — none shipped. Future feature work that changes user-facing behavior should author claude-native specs in `tests/e2e/specs/` using `getByTestId` — don't re-litigate the codex port.
 
 ---

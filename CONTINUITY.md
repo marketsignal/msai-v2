@@ -669,7 +669,7 @@ Cleanup of 30 failures + 78 errors that were pre-existing on main, all rooted in
 
 ### From PR #36 postscript
 
-6. **Architecture-governance review (2026-10-19, 6-month cadence — narrowed)** — revisit the Contrarian's minority report in `docs/decisions/which-version-to-keep.md`. Item (a) multi-login gateway fabric: **RATIFIED 2026-04-28** — Pablo confirmed 7–9 concurrent IB accounts (one per portfolio) is the design intent; multi-login is load-bearing, not scope creep. Item (b) instrument registry + alias windowing: defer to council using latest code as evidence (post PR #37 + #45 + #46 — registry is now sole source of truth for backtest + live + onboarding). Item (c) supervisor complexity: defer to council with current code + incident history. Council can run earlier than 2026-10-19 if Pablo asks.
+6. ~~**Architecture-governance review**~~ — **CLOSED 2026-04-28.** Item (a) multi-login fabric ratified by Pablo. Items (b) registry + (c) supervisor: council fired early on 2026-04-28; majority APPROVE with minority CONDITIONAL on falsifiable 6-month operational gates. Pablo's call: do not impose the gate or land the Maintainer tidy now — respond to actual problems if/when they manifest, not anticipated ones. Decision-doc Follow-ups updated to reflect closure. Council outputs preserved in chat history + `git log 4ee17d5..` for future reference if needed.
 
 ### From PR #40 ("backtest-auto-ingest-on-missing-data") scope-outs — Pablo live-demo flags 2026-04-21
 
