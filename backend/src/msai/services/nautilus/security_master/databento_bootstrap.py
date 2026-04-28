@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from msai.services.data_sources.databento_client import DatabentoClient
+    from msai.services.nautilus.security_master.types import RegistryAssetClass
 
 log = get_logger(__name__)
 
@@ -383,10 +384,17 @@ class DatabentoBootstrapService:
                     if hasattr(inst, "raw_symbol") and hasattr(inst.raw_symbol, "value")
                     else symbol
                 )
-                derived_asset_class = (
+                # ``asset_class_override`` enters as ``str | None`` from the
+                # API boundary but the Pydantic schema constrains it to a
+                # subset of :data:`RegistryAssetClass`; ``asset_class_for_instrument_type``
+                # already returns ``RegistryAssetClass``. Cast at the
+                # assembly point so ``_upsert_and_classify`` sees the
+                # narrowed Literal.
+                derived_asset_class = cast(
+                    "RegistryAssetClass",
                     asset_class_override
                     if asset_class_override is not None
-                    else asset_class_for_instrument_type(inst.__class__.__name__)
+                    else asset_class_for_instrument_type(inst.__class__.__name__),
                 )
                 try:
                     listing_venue = _extract_venue(alias_string)
@@ -438,7 +446,7 @@ class DatabentoBootstrapService:
         raw_symbol: str,
         alias_string: str,
         listing_venue: str,
-        derived_asset_class: str,
+        derived_asset_class: RegistryAssetClass,
         dataset: str,
         venue_format: str,
         sm_factory: Callable[[AsyncSession], Any],

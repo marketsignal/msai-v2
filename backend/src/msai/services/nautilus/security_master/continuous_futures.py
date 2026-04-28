@@ -32,6 +32,9 @@ if TYPE_CHECKING:
 
     from nautilus_trader.model.instruments import Instrument
 
+    from msai.services.nautilus.security_master.types import RegistryAssetClass
+
+
 _DATABENTO_CONTINUOUS_SYMBOL = re.compile(r"^[A-Za-z0-9_/-]+\.[A-Za-z]\.\d+$")
 
 
@@ -65,7 +68,7 @@ class ResolvedInstrumentDefinition:
     raw_symbol: str
     listing_venue: str
     routing_venue: str
-    asset_class: str
+    asset_class: RegistryAssetClass
     provider: str
     contract_details: dict[str, Any]
 
@@ -85,9 +88,7 @@ def resolved_databento_definition(
     Picks the instrument with the latest ``ts_init`` / ``ts_event`` as the
     representative.
     """
-    matching = [
-        inst for inst in instruments if inst.raw_symbol.value == raw_symbol
-    ]
+    matching = [inst for inst in instruments if inst.raw_symbol.value == raw_symbol]
     if not matching and is_databento_continuous_pattern(raw_symbol):
         matching = instruments
     if not matching:
@@ -134,7 +135,7 @@ def resolved_databento_definition(
     )
 
 
-def asset_class_for_instrument_type(instrument_type: str) -> str:
+def asset_class_for_instrument_type(instrument_type: str) -> RegistryAssetClass:
     """Map a Nautilus instrument-type name (the runtime ``__class__.__name__``)
     to the registry's ``asset_class`` column value.
 
@@ -184,5 +185,3 @@ def continuous_needs_refresh_for_window(
     if cached_start is None or cached_end is None:
         return True
     return requested_start < cached_start or requested_end > cached_end
-
-

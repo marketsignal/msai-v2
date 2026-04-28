@@ -30,16 +30,14 @@ The dedicated container here guarantees the advertised
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 import sqlalchemy as sa
 from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import create_async_engine
+
+from tests.integration._alembic_subprocess import run_alembic as _run_alembic
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -56,40 +54,6 @@ def isolated_postgres_url() -> Iterator[str]:
     with PostgresContainer("postgres:16-alpine") as pg:
         url = pg.get_connection_url().replace("psycopg2", "asyncpg")
         yield url
-
-
-def _run_alembic(
-    database_url: str,
-    *args: str,
-    extra_env: dict[str, str] | None = None,
-) -> None:
-    """Run an arbitrary ``alembic`` subcommand as a subprocess.
-
-    The project's ``alembic/env.py`` reads ``settings.database_url`` which
-    in turn reads the ``DATABASE_URL`` env var, so setting it in the
-    subprocess env is sufficient to override the default. ``extra_env``
-    lets callers override other pydantic-settings fields (e.g.
-    ``STRATEGIES_ROOT``, ``IB_ACCOUNT_ID``) the same way.
-    """
-    backend_root = Path(__file__).resolve().parents[2]
-    env = os.environ.copy()
-    env["DATABASE_URL"] = database_url
-    if extra_env:
-        env.update(extra_env)
-    result = subprocess.run(
-        [sys.executable, "-m", "alembic", *args],
-        cwd=backend_root,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    if result.returncode != 0:
-        raise AssertionError(
-            f"alembic {' '.join(args)} failed (exit {result.returncode})\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
-        )
 
 
 def _run_alembic_upgrade(

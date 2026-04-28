@@ -31,6 +31,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from msai.models import Base
 from msai.models.instrument_alias import InstrumentAlias
 from msai.models.instrument_definition import InstrumentDefinition
+from msai.services.nautilus.live_instrument_bootstrap import exchange_local_today
+from msai.services.nautilus.security_master.live_resolver import lookup_for_live
 from msai.services.nautilus.security_master.service import SecurityMaster
 
 if TYPE_CHECKING:
@@ -95,9 +97,7 @@ async def test_resolve_live_and_backtest_return_identical_ids(
             )
         await session.flush()
         for row in (await session.execute(select(InstrumentDefinition))).scalars():
-            alias_string = (
-                "AAPL.NASDAQ" if row.raw_symbol == "AAPL" else "ESM6.CME"
-            )
+            alias_string = "AAPL.NASDAQ" if row.raw_symbol == "AAPL" else "ESM6.CME"
             session.add(
                 InstrumentAlias(
                     instrument_uid=row.instrument_uid,
@@ -111,15 +111,18 @@ async def test_resolve_live_and_backtest_return_identical_ids(
         # Expire all cached attributes so the next SELECT re-fires ``selectin``
         # against the now-committed aliases. Without this, the definition
         # instances carry the pre-alias (empty) collection from the SELECT
-        # above, and ``resolve_for_*`` sees idef.aliases == [] from identity
-        # map caching — not a DB state issue, a session state issue.
+        # above, and ``resolve_for_backtest`` sees idef.aliases == [] from
+        # identity-map caching — not a DB state issue, a session state issue.
         session.expire_all()
 
         mock_qualifier = MagicMock()
         mock_qualifier.qualify = AsyncMock()
         sm = SecurityMaster(qualifier=mock_qualifier, db=session)
         backtest_ids = await sm.resolve_for_backtest(["AAPL", "ES"])
-        live_ids = await sm.resolve_for_live(["AAPL", "ES"])
+        resolved = await lookup_for_live(
+            ["AAPL", "ES"], as_of_date=exchange_local_today(), session=session
+        )
+        live_ids = [r.canonical_id for r in resolved]
 
     assert live_ids == backtest_ids, (
         f"PRD US-001 parity violation: live={live_ids!r} vs backtest={backtest_ids!r}"

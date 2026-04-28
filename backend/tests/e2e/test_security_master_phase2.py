@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import os
 import tracemalloc
-from datetime import date
 from pathlib import Path
 
 import pytest
@@ -108,37 +107,35 @@ def _build_security_master():  # type: ignore[no-untyped-def]
 async def test_phase2_full_security_master_lifecycle() -> None:
     """End-to-end Phase 2 harness:
 
-    1. Resolve AAPL.NASDAQ, ESM5.CME, EUR/USD.IDEALPRO via
-       SecurityMaster against a real paper IB Gateway.
-    2. Verify each resolved instrument has the right Nautilus
-       type and the cache row landed in instrument_cache.
+    1. Resolve AAPL.NASDAQ + EUR/USD.IDEALPRO via ``SecurityMaster.bulk_resolve``
+       (equity + forex) and ESM5.CME via ``live_resolver.lookup_for_live``
+       (futures — registry-only path; ``_build_instrument_from_spec`` does
+       not synthesize Nautilus ``FuturesContract`` instances in v1).
+    2. Verify each resolved instrument has the right Nautilus type
+       and the registry rows landed.
     3. Run a 1-day backtest of the EMA cross strategy on AAPL
        through the streaming catalog builder.
     4. Run the parity validation harness (determinism +
        config round-trip).
     5. Verify peak memory ≤ 500 MB across the full pipeline.
     """
+    from msai.core.database import async_session_factory
+    from msai.services.nautilus.live_instrument_bootstrap import exchange_local_today
+    from msai.services.nautilus.security_master.live_resolver import lookup_for_live
+    from msai.services.nautilus.security_master.specs import InstrumentSpec
+
     master = _build_security_master()  # may pytest.skip if IB unavailable
 
-    # The actual harness body lives behind the
-    # bootstrap-required guard above. When the gate condition
-    # is met (real paper IB + bootstrapped client), the test
-    # walks the steps below. Documented here so the operator
-    # knows what the gated path will execute.
-    from datetime import date as _date  # noqa: F401
+    # The actual harness body lives behind the bootstrap-required
+    # guard above. When the gate condition is met (real paper IB +
+    # bootstrapped client), the test walks the steps below.
+    # Documented here so the operator knows what the gated path
+    # will execute.
 
-    from msai.services.nautilus.security_master.specs import InstrumentSpec  # noqa: F401
-
-    # Step 1: resolve three asset classes — bytecode unreachable
-    # in CI but documents the expected gated path.
-    specs = [
+    # Step 1a: equity + forex via bulk_resolve (cold-miss + qualify
+    # writes registry rows).
+    equity_forex_specs = [
         InstrumentSpec(asset_class="equity", symbol="AAPL", venue="NASDAQ"),
-        InstrumentSpec(
-            asset_class="future",
-            symbol="ES",
-            venue="CME",
-            expiry=date(2025, 6, 20),
-        ),
         InstrumentSpec(
             asset_class="forex",
             symbol="EUR",
@@ -149,12 +146,24 @@ async def test_phase2_full_security_master_lifecycle() -> None:
 
     tracemalloc.start()
     try:
-        instruments = await master.bulk_resolve(specs)
+        equity_forex_instruments = await master.bulk_resolve(equity_forex_specs)
+
+        # Step 1b: futures via lookup_for_live — registry-only. The ES
+        # row must already exist in the registry (operator pre-warms via
+        # ``msai instruments refresh --provider interactive_brokers
+        # --symbols ES``). _build_instrument_from_spec raises
+        # NotImplementedError for asset_class="future" in v1.
+        async with async_session_factory() as session:
+            futures_resolved = await lookup_for_live(
+                ["ES"], as_of_date=exchange_local_today(), session=session
+            )
+
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
 
-    assert len(instruments) == 3
+    assert len(equity_forex_instruments) == 2
+    assert len(futures_resolved) == 1
     peak_mb = peak / (1024 * 1024)
     assert peak_mb < PEAK_MEMORY_BUDGET_MB, (
         f"security master peak memory was {peak_mb:.1f} MB (> {PEAK_MEMORY_BUDGET_MB} MB budget)"

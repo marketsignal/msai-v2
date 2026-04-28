@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
     from msai.models.instrument_alias import InstrumentAlias
     from msai.models.instrument_definition import InstrumentDefinition
+    from msai.services.nautilus.security_master.types import Provider
 
 _log = structlog.get_logger(__name__)
 # Sibling stdlib logger used only for the ``_fire_alert_bounded`` timeout /
@@ -400,7 +401,7 @@ def _parse_futures_expiry(
 def _pick_active_alias(
     idef: InstrumentDefinition,
     *,
-    provider: str,
+    provider: Provider,
     as_of_date: date,
     caller_symbol: str,
 ) -> InstrumentAlias | None:
@@ -448,7 +449,7 @@ async def lookup_for_live(
     *,
     as_of_date: date,
     session: AsyncSession,
-    provider: str = "interactive_brokers",
+    provider: Provider = "interactive_brokers",
 ) -> list[ResolvedInstrument]:
     """Pure-read registry resolver for the live-start critical path.
 

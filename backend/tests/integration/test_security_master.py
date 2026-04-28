@@ -1,21 +1,27 @@
-"""Integration tests for :class:`SecurityMaster` (Phase 2 task 2.5).
+"""Integration tests for :class:`SecurityMaster`.
 
-Uses a testcontainer Postgres for the cache layer and a stub
+Uses a testcontainer Postgres for the registry layer and a stub
 qualifier for the IB side. Does NOT touch a real IB connection.
+
+Cache-layer tests (legacy ``InstrumentCache``-backed paths) were removed
+when ``resolve``/``bulk_resolve`` were rewired to be registry-only and
+the ``instrument_cache`` table was dropped.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
-from unittest.mock import MagicMock
+from datetime import date
+from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from msai.models import Base, InstrumentCache
+from msai.models import Base
+from msai.models.instrument_alias import InstrumentAlias
+from msai.models.instrument_definition import InstrumentDefinition
 from msai.services.nautilus.security_master.service import SecurityMaster
 from msai.services.nautilus.security_master.specs import InstrumentSpec
 
@@ -59,260 +65,343 @@ async def session(
         yield s
 
 
-class _StubQualifier:
-    """Stub :class:`IBQualifier` that returns canned Nautilus-ish
-    ``Instrument`` stand-ins for each spec. The stand-in is a
-    ``MagicMock`` with the ``to_dict`` classmethod returning a
-    deterministic dict keyed by canonical_id.
-
-    We don't return real Nautilus ``Instrument`` objects because
-    constructing one requires a live IB contract details blob.
-    Instead the stub satisfies the contract
-    :meth:`SecurityMaster._write_cache` depends on:
-    ``instrument.to_dict(instrument) → dict``.
-    """
-
-    def __init__(self) -> None:
-        self.qualify_calls: list[InstrumentSpec] = []
-        # Expose an empty ``contract_details`` dict under the
-        # ``_provider`` attribute so the service's
-        # ``_trading_hours_for`` helper finds "nothing" and
-        # writes NULL — matches the Phase 2 test contract.
-        self._provider = MagicMock()
-        self._provider.contract_details = {}
-
-    async def qualify(self, spec: InstrumentSpec) -> Any:
-        self.qualify_calls.append(spec)
-        mock_instrument = MagicMock()
-        # ``to_dict(cls, obj)`` is called as ``instrument.to_dict(instrument)``
-        # in the service (because Nautilus's ``Instrument.to_dict`` is a
-        # classmethod on the base). We stub it as a normal method on
-        # the mock so ``MagicMock.to_dict(mock_instrument)`` returns
-        # the expected dict.
-        canon = spec.canonical_id()
-        mock_instrument.to_dict = MagicMock(
-            return_value={
-                "type": "Equity",
-                "instrument_id": canon,
-                "raw_symbol": spec.symbol,
-            }
-        )
-        return mock_instrument
-
-
 # ---------------------------------------------------------------------------
-# resolve()
+# Registry-only resolve / bulk_resolve
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_resolve_cache_miss_qualifies_writes_and_returns(
+async def test_resolve_with_registry_warm_hit_does_not_call_qualifier(
     session: AsyncSession,
 ) -> None:
-    """Happy-path cache miss: the spec isn't in the cache, so
-    ``resolve`` calls the qualifier, writes the row, and returns
-    the instrument.
+    """resolve(spec) should NOT call IBQualifier when the registry has
+    an active alias for the spec's canonical_id."""
+    aapl_uid = uuid4()
+    session.add(
+        InstrumentDefinition(
+            instrument_uid=aapl_uid,
+            raw_symbol="AAPL",
+            provider="interactive_brokers",
+            asset_class="equity",
+            listing_venue="NASDAQ",
+            routing_venue="SMART",
+            lifecycle_state="active",
+            trading_hours={"timezone": "America/New_York", "rth": [], "eth": []},
+        )
+    )
+    session.add(
+        InstrumentAlias(
+            id=uuid4(),
+            instrument_uid=aapl_uid,
+            alias_string="AAPL.NASDAQ",
+            venue_format="exchange_name",
+            provider="interactive_brokers",
+            effective_from=date(2026, 1, 1),
+            effective_to=None,
+        )
+    )
+    await session.commit()
 
-    The stub's ``to_dict`` output isn't a real Nautilus Equity
-    schema, so a SECOND ``resolve`` (which tries to deserialize
-    via ``Equity.from_dict``) will raise. We verify the first
-    call succeeded AND the cache row was written AND the second
-    call did NOT re-qualify (cache hit short-circuit). We
-    deliberately wrap the second call in a suppress block because
-    the cache-hit path is what we're asserting, not the
-    deserialization contract (which production's real
-    ``to_dict`` fulfils).
-    """
-    import contextlib
+    qualifier = AsyncMock()
+    qualifier.qualify = AsyncMock(side_effect=AssertionError("qualifier should not be called"))
 
-    qualifier = _StubQualifier()
-    master = SecurityMaster(qualifier=qualifier, db=session)  # type: ignore[arg-type]
-
+    sm = SecurityMaster(qualifier=qualifier, db=session)
     spec = InstrumentSpec(asset_class="equity", symbol="AAPL", venue="NASDAQ")
-    first = await master.resolve(spec)
 
-    assert first is not None
-    assert len(qualifier.qualify_calls) == 1
+    instrument = await sm.resolve(spec)
 
-    # Row was written
-    row = (
-        await session.execute(
-            select(InstrumentCache).where(InstrumentCache.canonical_id == "AAPL.NASDAQ")
-        )
-    ).scalar_one()
-    assert row.asset_class == "equity"
-    assert row.venue == "NASDAQ"
-    assert row.nautilus_instrument_json["instrument_id"] == "AAPL.NASDAQ"
-
-    # Second resolve hits the cache — qualifier is NOT called again.
-    # The stub's ``to_dict`` shape doesn't satisfy Equity.from_dict,
-    # so deserialization will raise; we catch that and assert the
-    # cache path WAS taken by checking qualifier call count.
-    with contextlib.suppress(Exception):
-        await master.resolve(spec)
-    assert len(qualifier.qualify_calls) == 1
+    assert str(instrument.id) == "AAPL.NASDAQ"
+    qualifier.qualify.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_resolve_cache_hit_does_not_call_qualifier(
+async def test_resolve_cold_miss_qualifies_and_upserts_registry(
     session: AsyncSession,
 ) -> None:
-    """Pre-seed a cache row directly, then resolve. The qualifier
-    must NOT be called (we return the cached instrument)."""
-    # Pre-seed
-    session.add(
-        InstrumentCache(
-            canonical_id="MSFT.NASDAQ",
-            asset_class="equity",
-            venue="NASDAQ",
-            ib_contract_json={"secType": "STK", "symbol": "MSFT"},
-            nautilus_instrument_json={
-                "type": "Equity",
-                "instrument_id": "MSFT.NASDAQ",
-                "raw_symbol": "MSFT",
-            },
-            trading_hours=None,
-            last_refreshed_at=datetime.now(UTC),
-        )
+    """resolve(spec) on registry miss → qualify via IB → upsert registry → return."""
+    from nautilus_trader.test_kit.providers import (  # noqa: PLC0415
+        TestInstrumentProvider as _TestProv,
     )
+
+    from msai.services.nautilus.security_master.registry import (  # noqa: PLC0415
+        InstrumentRegistry as _Registry,
+    )
+
+    qualifier = AsyncMock()
+    fake_aapl = _TestProv.equity(symbol="AAPL", venue="NASDAQ")
+    qualifier.qualify = AsyncMock(return_value=fake_aapl)
+    qualifier._provider = MagicMock(contract_details={})
+    # ``listing_venue_for`` is a sync helper now — wire a real-shaped return
+    # value so the AsyncMock auto-spec doesn't return a coroutine that lands
+    # in the SQL parameter list.
+    qualifier.listing_venue_for = MagicMock(return_value="NASDAQ")
+
+    sm = SecurityMaster(qualifier=qualifier, db=session)
+    spec = InstrumentSpec(asset_class="equity", symbol="AAPL", venue="NASDAQ")
+
+    instrument = await sm.resolve(spec)
     await session.commit()
 
-    qualifier = _StubQualifier()
-    master = SecurityMaster(qualifier=qualifier, db=session)  # type: ignore[arg-type]
+    qualifier.qualify.assert_called_once_with(spec)
+    assert str(instrument.id) == "AAPL.NASDAQ"
+    registry = _Registry(session)
+    # The upsert stamps ``effective_from = datetime.now(UTC).date()``; query
+    # at that same UTC date so the alias-window predicate
+    # (``effective_from <= as_of_date``) holds even when this test is run
+    # during the local-vs-UTC midnight gap.
+    from datetime import UTC as _UTC  # noqa: PLC0415
+    from datetime import datetime as _dt  # noqa: PLC0415
 
-    # Resolve — must hit the cache. We expect Nautilus's
-    # ``Instrument.from_dict`` to raise on our fake dict (it
-    # doesn't have the full Nautilus schema), so catch it to
-    # verify the cache path WAS taken rather than relying on a
-    # successful deserialization.
-    spec = InstrumentSpec(asset_class="equity", symbol="MSFT", venue="NASDAQ")
-    with pytest.raises(Exception):  # noqa: B017,BLE001 — Nautilus from_dict rejects our stub
-        await master.resolve(spec)
-
-    # Critical assertion: the qualifier was NOT called (cache hit
-    # short-circuited before touching IB).
-    assert len(qualifier.qualify_calls) == 0
-
-
-# ---------------------------------------------------------------------------
-# bulk_resolve()
-# ---------------------------------------------------------------------------
+    today_utc = _dt.now(_UTC).date()
+    found = await registry.find_by_alias(
+        "AAPL.NASDAQ", provider="interactive_brokers", as_of_date=today_utc
+    )
+    assert found is not None
 
 
 @pytest.mark.asyncio
-async def test_bulk_resolve_only_qualifies_missing_specs(
-    session: AsyncSession,
-) -> None:
-    """Mixed cache hit + miss: the bulk resolve should fetch the
-    hit rows in one SELECT and only call the qualifier for the
-    misses. The whole point of the cache is minimizing IB
-    ``reqContractDetails`` calls."""
-    # Pre-seed AAPL only
-    session.add(
-        InstrumentCache(
-            canonical_id="AAPL.NASDAQ",
-            asset_class="equity",
-            venue="NASDAQ",
-            ib_contract_json={"secType": "STK"},
-            nautilus_instrument_json={
-                "type": "Equity",
-                "instrument_id": "AAPL.NASDAQ",
-                "raw_symbol": "AAPL",
-            },
-            trading_hours=None,
-            last_refreshed_at=datetime.now(UTC),
-        )
-    )
-    await session.commit()
-
-    qualifier = _StubQualifier()
-    master = SecurityMaster(qualifier=qualifier, db=session)  # type: ignore[arg-type]
-
-    specs = [
-        InstrumentSpec(asset_class="equity", symbol="AAPL", venue="NASDAQ"),  # hit
-        InstrumentSpec(asset_class="equity", symbol="MSFT", venue="NASDAQ"),  # miss
-        InstrumentSpec(asset_class="equity", symbol="GOOG", venue="NASDAQ"),  # miss
-    ]
-    # AAPL will raise inside from_dict (our stub JSON), so wrap the
-    # call and inspect call counts before the exception propagates.
-    import contextlib
-
-    with contextlib.suppress(Exception):  # noqa: BLE001 — from_dict on stub dict is expected
-        await master.bulk_resolve(specs)
-
-    # Qualifier should have been called for MSFT at most (we raise
-    # on AAPL's from_dict before reaching MSFT, so call count may
-    # be 0 or 1 depending on iteration order). The important
-    # assertion: qualifier was NOT called for AAPL (the cached one).
-    called_symbols = [s.symbol for s in qualifier.qualify_calls]
-    assert "AAPL" not in called_symbols
+async def test_resolve_cold_miss_without_qualifier_raises(session: AsyncSession) -> None:
+    sm = SecurityMaster(qualifier=None, db=session)
+    spec = InstrumentSpec(asset_class="equity", symbol="AAPL", venue="NASDAQ")
+    with pytest.raises(ValueError, match="requires an IBQualifier"):
+        await sm.resolve(spec)
 
 
 @pytest.mark.asyncio
 async def test_bulk_resolve_empty_input_returns_empty_list(
     session: AsyncSession,
 ) -> None:
-    master = SecurityMaster(qualifier=_StubQualifier(), db=session)  # type: ignore[arg-type]
+    master = SecurityMaster(qualifier=AsyncMock(), db=session)
     assert await master.bulk_resolve([]) == []
 
 
 @pytest.mark.asyncio
-async def test_bulk_resolve_all_misses_qualifies_each(
-    session: AsyncSession,
-) -> None:
-    """Cold cache: every spec misses, so the qualifier is called
-    once per spec."""
-    qualifier = _StubQualifier()
-    master = SecurityMaster(qualifier=qualifier, db=session)  # type: ignore[arg-type]
+async def test_bulk_resolve_one_select_for_warm_batch(session: AsyncSession) -> None:
+    """bulk_resolve issues one SELECT for warm-hit aliases and never
+    calls the qualifier when every spec is warm."""
+    for raw in ("AAPL", "MSFT"):
+        uid = uuid4()
+        session.add(
+            InstrumentDefinition(
+                instrument_uid=uid,
+                raw_symbol=raw,
+                provider="interactive_brokers",
+                asset_class="equity",
+                listing_venue="NASDAQ",
+                routing_venue="SMART",
+                lifecycle_state="active",
+            )
+        )
+        session.add(
+            InstrumentAlias(
+                id=uuid4(),
+                instrument_uid=uid,
+                alias_string=f"{raw}.NASDAQ",
+                venue_format="exchange_name",
+                provider="interactive_brokers",
+                effective_from=date(2026, 1, 1),
+                effective_to=None,
+            )
+        )
+    await session.commit()
 
+    qualifier = AsyncMock()
+    qualifier.qualify = AsyncMock(side_effect=AssertionError("not called for warm hits"))
+
+    sm = SecurityMaster(qualifier=qualifier, db=session)
     specs = [
         InstrumentSpec(asset_class="equity", symbol="AAPL", venue="NASDAQ"),
         InstrumentSpec(asset_class="equity", symbol="MSFT", venue="NASDAQ"),
-        InstrumentSpec(asset_class="equity", symbol="GOOG", venue="NASDAQ"),
     ]
-    import contextlib
-
-    with contextlib.suppress(Exception):  # noqa: BLE001 — from_dict on stub dict is expected
-        await master.bulk_resolve(specs)
-
-    # All three specs miss the cache → qualifier is called for
-    # each. Because ``resolve`` writes the cache row BEFORE the
-    # from_dict call that raises on our stub, the resolve path
-    # still completes the miss write for every spec. Order is
-    # preserved via ``zip(specs, ...)``.
-    called = [s.symbol for s in qualifier.qualify_calls]
-    assert called == ["AAPL", "MSFT", "GOOG"]
+    results = await sm.bulk_resolve(specs)
+    assert [str(r.id) for r in results] == ["AAPL.NASDAQ", "MSFT.NASDAQ"]
+    qualifier.qualify.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# refresh() — not yet implemented
+# bulk_resolve — warm-hit on non-equity-fx asset_class delegates to qualifier
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_refresh_is_not_implemented_for_phase2(
+async def test_bulk_resolve_warm_hit_futures_delegates_to_qualifier(
     session: AsyncSession,
 ) -> None:
-    """Phase 2 exposes ``refresh`` as a hook; the background
-    scheduler lands in Phase 4. Ensure we fail loud rather than
-    silently succeeding with stale data."""
-    master = SecurityMaster(qualifier=_StubQualifier(), db=session)  # type: ignore[arg-type]
-    with pytest.raises(NotImplementedError, match="Phase 4"):
-        await master.refresh("AAPL.NASDAQ")
+    """A warm hit on a futures definition cannot be served from spec alone
+    (``_build_instrument_from_spec`` only supports equity / forex). The
+    resolver MUST delegate to the IB qualifier so the IB provider IS the
+    runtime source of truth for futures contract details — the registry
+    row only confirms the alias is operator-blessed, not the full
+    instrument shape."""
+    from datetime import date as _date  # noqa: PLC0415
+
+    from nautilus_trader.test_kit.providers import (  # noqa: PLC0415
+        TestInstrumentProvider as _TestProv,
+    )
+
+    es_uid = uuid4()
+    session.add(
+        InstrumentDefinition(
+            instrument_uid=es_uid,
+            raw_symbol="ES",
+            provider="interactive_brokers",
+            asset_class="futures",
+            listing_venue="CME",
+            routing_venue="CME",
+            lifecycle_state="active",
+        )
+    )
+    session.add(
+        InstrumentAlias(
+            id=uuid4(),
+            instrument_uid=es_uid,
+            alias_string="ESM6.CME",
+            venue_format="exchange_name",
+            provider="interactive_brokers",
+            effective_from=_date(2026, 1, 1),
+            effective_to=None,
+        )
+    )
+    await session.commit()
+
+    qualifier = AsyncMock()
+    fake_es = _TestProv.equity(symbol="ES", venue="CME")  # shape-only stand-in
+    qualifier.qualify = AsyncMock(return_value=fake_es)
+    qualifier._provider = MagicMock(contract_details={})
+    qualifier.listing_venue_for = MagicMock(return_value="CME")
+
+    sm = SecurityMaster(qualifier=qualifier, db=session)
+    spec = InstrumentSpec(
+        asset_class="future",
+        symbol="ES",
+        venue="CME",
+        expiry=date(2026, 6, 19),
+    )
+
+    results = await sm.bulk_resolve([spec])
+    await session.commit()
+
+    # Critical: warm-hit-futures DELEGATED to qualifier (not crashed via
+    # ``_build_instrument_from_spec`` NotImplementedError).
+    qualifier.qualify.assert_called_once_with(spec)
+    assert len(results) == 1
 
 
 # ---------------------------------------------------------------------------
-# Cache validity threshold
+# _build_instrument_from_spec NotImplementedError for unsupported asset classes
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("asset_class", "kwargs"),
+    [
+        (
+            "future",
+            {"symbol": "ES", "venue": "CME", "expiry": date(2026, 6, 19)},
+        ),
+        (
+            "option",
+            {
+                "symbol": "AAPL",
+                "venue": "SMART",
+                "expiry": date(2026, 6, 19),
+                "strike": __import__("decimal").Decimal("150"),
+                "right": "C",
+                "underlying": "AAPL",
+            },
+        ),
+        ("index", {"symbol": "^SPX", "venue": "CBOE"}),
+    ],
+)
 @pytest.mark.asyncio
-async def test_cache_validity_default_is_30_days(
+async def test_build_instrument_from_spec_raises_for_unsupported_asset_class(
     session: AsyncSession,
+    asset_class: str,
+    kwargs: dict[str, object],
 ) -> None:
-    """Regression guard: the default staleness threshold must be
-    30 days. Longer defaults risk serving stale contract details
-    that IB has already changed (rare but possible — e.g. a
-    corporate action changes the ticker)."""
-    master = SecurityMaster(qualifier=_StubQualifier(), db=session)  # type: ignore[arg-type]
-    assert master._cache_validity == timedelta(days=30)
+    """v1 spec-build covers equity + forex only. Future / option / index
+    must raise :class:`NotImplementedError` pointing operators at
+    ``live_resolver.lookup_for_live`` — that's the canonical primitive
+    when a Nautilus :class:`Instrument` for those asset classes is needed
+    without a live IB connection."""
+    sm = SecurityMaster(qualifier=AsyncMock(), db=session)
+    spec = InstrumentSpec(asset_class=asset_class, **kwargs)  # type: ignore[arg-type]
+
+    with pytest.raises(NotImplementedError, match=r"lookup_for_live"):
+        sm._build_instrument_from_spec(spec)
+
+
+# ---------------------------------------------------------------------------
+# _upsert_definition_and_alias — trading_hours COALESCE 4-cell matrix
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("existing_hours", "incoming_hours", "expected_hours"),
+    [
+        # Existing NULL + new populated → UPDATE to new
+        (None, {"timezone": "America/New_York"}, {"timezone": "America/New_York"}),
+        # Existing populated + new NULL → KEEP existing (the COALESCE rationale —
+        # a writer without IB contract details must NOT clobber prior data).
+        (
+            {"timezone": "America/New_York"},
+            None,
+            {"timezone": "America/New_York"},
+        ),
+        # Both populated → new wins (excluded.trading_hours overrides COALESCE).
+        (
+            {"timezone": "America/New_York"},
+            {"timezone": "America/Chicago"},
+            {"timezone": "America/Chicago"},
+        ),
+        # Both NULL → no-op.
+        (None, None, None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_upsert_trading_hours_coalesce_matrix(
+    session: AsyncSession,
+    existing_hours: dict[str, str] | None,
+    incoming_hours: dict[str, str] | None,
+    expected_hours: dict[str, str] | None,
+) -> None:
+    """Pin the 4-cell COALESCE matrix on ``trading_hours`` so an idempotent
+    re-upsert from a writer without IB contract details (``incoming=NULL``)
+    can never clobber a prior populated row.
+    """
+    from sqlalchemy import select as _select  # noqa: PLC0415
+
+    sm = SecurityMaster(qualifier=AsyncMock(), db=session)
+
+    # Seed first via upsert with existing_hours.
+    await sm._upsert_definition_and_alias(
+        raw_symbol="ZZZZ",
+        listing_venue="NASDAQ",
+        routing_venue="SMART",
+        asset_class="equity",
+        alias_string="ZZZZ.NASDAQ",
+        trading_hours=existing_hours,
+    )
+    await session.commit()
+
+    # Re-upsert with incoming_hours.
+    await sm._upsert_definition_and_alias(
+        raw_symbol="ZZZZ",
+        listing_venue="NASDAQ",
+        routing_venue="SMART",
+        asset_class="equity",
+        alias_string="ZZZZ.NASDAQ",
+        trading_hours=incoming_hours,
+    )
+    await session.commit()
+
+    row = (
+        await session.execute(
+            _select(InstrumentDefinition).where(
+                InstrumentDefinition.raw_symbol == "ZZZZ",
+                InstrumentDefinition.provider == "interactive_brokers",
+                InstrumentDefinition.asset_class == "equity",
+            )
+        )
+    ).scalar_one()
+    assert row.trading_hours == expected_hours

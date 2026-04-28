@@ -1,4 +1,4 @@
-"""IB qualification adapter (Phase 2 task 2.3).
+"""IB qualification adapter.
 
 Thin wrapper that converts an :class:`InstrumentSpec` into the
 Nautilus ``IBContract`` struct and delegates the actual IB round-trip
@@ -21,9 +21,9 @@ What this module owns:
    ≤50 msg/sec limit and handles reconciliation with IB's
    ``reqContractDetails`` response.
 
-Production wiring: the :class:`SecurityMaster` service (Task 2.5)
-constructs a short-lived ``InteractiveBrokersInstrumentProvider``
-bound to an isolated ``InteractiveBrokersClient`` and passes it to
+Production wiring: the :class:`SecurityMaster` service constructs a
+short-lived ``InteractiveBrokersInstrumentProvider`` bound to an
+isolated ``InteractiveBrokersClient`` and passes it to
 ``IBQualifier``. The provider lives only as long as the qualification
 call — it's NOT the same provider the live ``TradingNode`` uses
 (gotcha #3: sharing a provider across connections can leak ``conId``
@@ -32,9 +32,8 @@ state).
 Not yet implemented here: options chain loading, continuous futures
 front-month resolution. Those hit different Nautilus methods
 (``get_options_chain``, ``CONTFUT`` secType on the contract) and
-are covered by Task 2.12 (multi-asset). The Phase 2 acceptance only
-requires equity + fixed-month futures + forex, which all go through
-``get_instrument``.
+are covered by the multi-asset path. Equity + fixed-month futures +
+forex all go through ``get_instrument``.
 """
 
 from __future__ import annotations
@@ -50,6 +49,18 @@ if TYPE_CHECKING:
     from nautilus_trader.model.instruments import Instrument
 
     from msai.services.nautilus.security_master.specs import InstrumentSpec
+
+
+class IBContractNotFoundError(LookupError):
+    """Raised when :class:`InteractiveBrokersInstrumentProvider` returns
+    ``None`` for a qualified contract.
+
+    The input was well-formed but IB has no matching instrument — wrong
+    expiry month, holiday-shifted expiry, unsupported sec_type, or
+    insufficient market-data entitlement on the trading account. Inherits
+    :class:`LookupError` so callers can discriminate "no such contract"
+    from generic :class:`ValueError` programmer-input errors.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -184,18 +195,61 @@ class IBQualifier:
         self._provider = provider
 
     async def qualify(self, spec: InstrumentSpec) -> Instrument:
-        """Qualify a single spec. Raises ``ValueError`` if the
-        provider cannot find a matching contract (propagated from
+        """Qualify a single spec. Raises :class:`IBContractNotFoundError`
+        when the provider has no matching contract (propagated from
         Nautilus's ``get_instrument``)."""
         contract = spec_to_ib_contract(spec)
         instrument = await self._provider.get_instrument(contract)
         if instrument is None:
-            raise ValueError(
+            raise IBContractNotFoundError(
                 f"Nautilus provider returned None for spec {spec!r} "
                 f"(contract={contract!r}) — check filter_sec_types or "
                 "IB contract definition"
             )
         return instrument
+
+    async def qualify_contract(self, contract: IBContract) -> Instrument:
+        """Qualify a pre-built ``IBContract`` directly — for callers that
+        already have the contract shape (e.g. CLI's per-asset-class
+        factories) and don't need to go through :class:`InstrumentSpec`.
+
+        Delegates to ``self._provider.get_instrument(contract)`` (same path
+        :meth:`qualify` uses internally after spec→contract translation).
+        Raises :class:`IBContractNotFoundError` on provider miss with the
+        same message shape as :meth:`qualify`.
+        """
+        instrument = await self._provider.get_instrument(contract)
+        if instrument is None:
+            raise IBContractNotFoundError(
+                f"Nautilus provider returned None for contract {contract!r} — "
+                "check filter_sec_types or IB contract definition"
+            )
+        return instrument
+
+    def listing_venue_for(self, instrument: Instrument) -> str:
+        """Extract the listing exchange from the qualified instrument's
+        IB contract details.
+
+        Falls back to the routing venue (``instrument.id.venue``) when the
+        provider has no ``contract_details`` for this instrument (e.g.
+        forex), no ``contract`` payload, or an empty ``primaryExchange``.
+        Centralizes the lookup so :class:`SecurityMaster` and the CLI's
+        per-asset-class refresh loop don't reach into ``self._provider``
+        from outside this module.
+        """
+        routing_venue: str = str(instrument.id.venue.value)
+        if self._provider is None:
+            return routing_venue
+        details = self._provider.contract_details.get(instrument.id)
+        if details is None:
+            return routing_venue
+        contract = getattr(details, "contract", None)
+        if contract is None:
+            return routing_venue
+        primary = getattr(contract, "primaryExchange", None) or None
+        if primary:
+            return str(primary)
+        return routing_venue
 
     async def qualify_many(self, specs: list[InstrumentSpec]) -> list[Instrument]:
         """Qualify a batch of specs in order.

@@ -15,6 +15,7 @@ registry.  It has two provider paths:
 
 from __future__ import annotations
 
+from datetime import date
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -26,6 +27,111 @@ from msai.cli import app
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
+
+
+# ----------------------------------------------------------------------
+# _build_ib_contract_for_symbol — per-asset-class factories
+# ----------------------------------------------------------------------
+
+
+class TestBuildIBContractForSymbol:
+    """Per-asset-class IBContract factories replace the closed-universe
+    canonical_instrument_id() map. STK / FUT / CASH are the v1 scope;
+    FUT is restricted to the closed CME E-mini quarterly set
+    {ES, NQ, RTY, YM} because ``current_quarterly_expiry`` is only
+    correct for that cycle (CL/GC/ZB use different cycles and venues
+    and need operator overrides v1 doesn't surface)."""
+
+    def test_build_ib_contract_for_stk(self) -> None:
+        """STK factory builds a SMART-routed equity contract."""
+        from msai.cli import _build_ib_contract_for_symbol
+
+        contract = _build_ib_contract_for_symbol("AAPL", asset_class="stk", today=date(2026, 4, 27))
+        assert contract.secType == "STK"
+        assert contract.symbol == "AAPL"
+        assert contract.exchange == "SMART"
+        assert contract.primaryExchange == "NASDAQ"
+        assert contract.currency == "USD"
+
+    def test_build_ib_contract_for_stk_with_arca_override(self) -> None:
+        """ETFs like SPY/VTI need ``--primary-exchange ARCA``."""
+        from msai.cli import _build_ib_contract_for_symbol
+
+        contract = _build_ib_contract_for_symbol(
+            "SPY",
+            asset_class="stk",
+            today=date(2026, 4, 27),
+            primary_exchange="ARCA",
+        )
+        assert contract.secType == "STK"
+        assert contract.symbol == "SPY"
+        assert contract.exchange == "SMART"
+        assert contract.primaryExchange == "ARCA"
+        assert contract.currency == "USD"
+
+    def test_build_ib_contract_for_fut(self) -> None:
+        """FUT factory builds a CME futures contract with quarterly expiry.
+        On 2026-04-27, the next quarterly expiry is 2026-06 (third
+        Friday is 2026-06-19)."""
+        from msai.cli import _build_ib_contract_for_symbol
+
+        contract = _build_ib_contract_for_symbol("ES", asset_class="fut", today=date(2026, 4, 27))
+        assert contract.secType == "FUT"
+        assert contract.symbol == "ES"
+        assert contract.exchange == "CME"
+        # YYYYMM lets IB resolve the holiday-adjusted last-trade date.
+        assert contract.lastTradeDateOrContractMonth == "202606"
+        assert contract.currency == "USD"
+
+    def test_build_ib_contract_for_cash(self) -> None:
+        """CASH factory builds an IDEALPRO forex contract; BASE/QUOTE
+        splits into symbol=base, currency=quote."""
+        from msai.cli import _build_ib_contract_for_symbol
+
+        contract = _build_ib_contract_for_symbol(
+            "EUR/USD", asset_class="cash", today=date(2026, 4, 27)
+        )
+        assert contract.secType == "CASH"
+        assert contract.symbol == "EUR"
+        assert contract.exchange == "IDEALPRO"
+        assert contract.currency == "USD"
+
+    def test_build_ib_contract_for_cash_no_slash_defaults_quote_usd(self) -> None:
+        """A bare base symbol (no slash) defaults the quote to USD."""
+        from msai.cli import _build_ib_contract_for_symbol
+
+        contract = _build_ib_contract_for_symbol("EUR", asset_class="cash", today=date(2026, 4, 27))
+        assert contract.symbol == "EUR"
+        assert contract.currency == "USD"
+
+    def test_build_ib_contract_unknown_asset_class_raises(self) -> None:
+        """Unknown asset_class raises ValueError naming the supported set."""
+        from msai.cli import _build_ib_contract_for_symbol
+
+        with pytest.raises(ValueError, match="Unknown asset class"):
+            _build_ib_contract_for_symbol("XYZ", asset_class="bogus", today=date(2026, 4, 27))
+
+    def test_build_ib_contract_unsupported_fut_root_raises(self) -> None:
+        """v1 rejects non-CME-quarterly futures roots (CL, GC, ZB, etc.)
+        because ``current_quarterly_expiry`` is only correct for the
+        ES/NQ/RTY/YM cycle."""
+        from msai.cli import _build_ib_contract_for_symbol
+
+        with pytest.raises(ValueError, match=r"v1 supports.*ES.*NQ.*RTY.*YM"):
+            _build_ib_contract_for_symbol("CL", asset_class="fut", today=date(2026, 4, 27))
+
+    def test_build_ib_contract_for_all_supported_fut_roots(self) -> None:
+        """ES, NQ, RTY, YM all build successfully — the v1 closed
+        quarterly CME E-mini set."""
+        from msai.cli import _build_ib_contract_for_symbol
+
+        for root in ("ES", "NQ", "RTY", "YM"):
+            contract = _build_ib_contract_for_symbol(
+                root, asset_class="fut", today=date(2026, 4, 27)
+            )
+            assert contract.secType == "FUT"
+            assert contract.symbol == root
+            assert contract.exchange == "CME"
 
 
 # ----------------------------------------------------------------------
@@ -175,37 +281,29 @@ class TestRefreshDatabento:
 # ----------------------------------------------------------------------
 
 
-def _accepted_alias_cases() -> list[str]:
-    """Build the accept-list dynamically so ES's month-qualified
-    alias follows today's canonical (doesn't rot on quarterly roll)."""
-    from msai.services.nautilus.live_instrument_bootstrap import (
-        canonical_instrument_id,
-    )
+def test_cli_instruments_refresh_accepts_asset_class_flag(runner: CliRunner) -> None:
+    """The CLI exposes ``--asset-class`` and surfaces it in --help."""
+    result = runner.invoke(app, ["instruments", "refresh", "--help"])
+    assert result.exit_code == 0, result.output
+    # Strip ANSI color codes — Rich wraps option names in color sequences.
+    import re
 
-    return [
-        "AAPL.NASDAQ",  # equity dotted alias
-        "EUR/USD.IDEALPRO",  # FX dotted alias
-        "ES.CME",  # bare-root futures dotted alias
-        canonical_instrument_id("ES"),  # CLI's own ES output (today's FM)
-        "ES.XCME",  # legacy MIC — still accepted for backwards compat
-        "EUR",  # FX shorthand — still accepted by canonical_instrument_id
-        "EUR.IDEALPRO",  # FX shorthand + current venue
-    ]
+    stripped = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+    assert "--asset-class" in stripped
 
 
-@pytest.mark.parametrize("symbol", _accepted_alias_cases())
-def test_ib_provider_accepts_dotted_and_futures_aliases(
-    symbol: str,
-    monkeypatch: pytest.MonkeyPatch,
-    runner: CliRunner,
+def test_cli_instruments_refresh_builds_contracts_for_supported_fut_roots(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner
 ) -> None:
-    """PRD US-006: operators must be able to feed the CLI's own
-    ``resolved`` output back in as a re-run. That output contains
-    dotted aliases for equity/FX AND month-qualified futures aliases.
-    Preflight must accept all shapes in ``_accepted_alias_cases``.
+    """``--asset-class fut --symbols ES,NQ`` builds two CME FUT contracts
+    and threads them through ``_run_ib_resolve_for_live`` as
+    ``list[IBContract]`` (not ``list[str]``).
 
-    Stubs ``_run_ib_resolve_for_live`` so we don't block on a real
-    IB connect attempt (preflight-only assertion).
+    v1 scopes FUT to the closed quarterly CME E-mini set (ES, NQ, RTY, YM)
+    because ``current_quarterly_expiry`` is only correct for that cycle
+    (live_instrument_bootstrap.py:87-93). Other futures roots
+    (e.g. CL/NYMEX, GC/COMEX, ZB/CBOT) require operator overrides v1
+    does not surface — ``_build_ib_contract_for_symbol`` rejects them.
     """
     import msai.cli as cli_mod
     from msai.core.config import Settings
@@ -214,81 +312,121 @@ def test_ib_provider_accepts_dotted_and_futures_aliases(
     monkeypatch.setenv("IB_ACCOUNT_ID", "DU1234567")
     monkeypatch.setattr(cli_mod, "settings", Settings())
 
-    with patch.object(
-        cli_mod,
-        "_run_ib_resolve_for_live",
-        new=AsyncMock(return_value=["stub"]),
-    ):
-        result = runner.invoke(
-            app,
-            [
-                "instruments",
-                "refresh",
-                "--symbols",
-                symbol,
-                "--provider",
-                "interactive_brokers",
-            ],
-        )
-    # Preflight must NOT reject (unknown-symbol branch).
-    combined = (result.stderr or "") + (result.stdout or "") + result.output
-    assert "not in the closed universe" not in combined, combined
+    captured_contracts: list = []
+
+    async def fake_run_ib_resolve_for_live(contracts):  # type: ignore[no-untyped-def]
+        captured_contracts.extend(contracts)
+        return ["ESM6.CME", "NQM6.CME"]
+
+    monkeypatch.setattr(cli_mod, "_run_ib_resolve_for_live", fake_run_ib_resolve_for_live)
+
+    result = runner.invoke(
+        app,
+        [
+            "instruments",
+            "refresh",
+            "--provider",
+            "interactive_brokers",
+            "--symbols",
+            "ES,NQ",
+            "--asset-class",
+            "fut",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert len(captured_contracts) == 2
+    assert all(c.secType == "FUT" and c.exchange == "CME" for c in captured_contracts)
+    assert {c.symbol for c in captured_contracts} == {"ES", "NQ"}
 
 
-@pytest.mark.parametrize(
-    "symbol",
-    [
-        "SPY.NASDAQ",  # known root, wrong venue — exact match fails
-        "AAPLXX.NASDAQ",  # unknown root with known venue
-        "ESM6",  # month-qualified futures without venue — ambiguous input
-        "ES.NASDAQ",  # futures with wrong venue
-    ],
-)
-def test_ib_provider_rejects_malformed_aliases(
-    symbol: str,
-    runner: CliRunner,
+def test_cli_instruments_refresh_rejects_unsupported_fut_root(runner: CliRunner) -> None:
+    """v1 rejects non-CME-quarterly futures roots (CL, GC, ZB, etc.)
+    at the factory boundary — error message names the supported set."""
+    from msai.cli import _build_ib_contract_for_symbol
+
+    with pytest.raises(ValueError, match=r"v1 supports.*ES.*NQ.*RTY.*YM"):
+        _build_ib_contract_for_symbol("CL", asset_class="fut", today=date(2026, 4, 27))
+
+
+def test_cli_instruments_refresh_default_asset_class_is_stk(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner
 ) -> None:
-    """Preflight uses exact-match on the accepted-alias set, not
-    permissive suffix stripping — inputs that would previously slip
-    through (e.g. ``SPY.NASDAQ`` masquerading as bare ``SPY``, or
-    ``AAPLXX.NASDAQ`` getting silently normalized to ``AAPL``) must
-    be rejected.
-    """
+    """No ``--asset-class`` flag → defaults to STK; ``--symbols AAPL,MSFT``
+    builds two SMART-routed equity contracts with primaryExchange=NASDAQ."""
+    import msai.cli as cli_mod
+    from msai.core.config import Settings
+
+    monkeypatch.setenv("IB_PORT", "4002")
+    monkeypatch.setenv("IB_ACCOUNT_ID", "DU1234567")
+    monkeypatch.setattr(cli_mod, "settings", Settings())
+
+    captured_contracts: list = []
+
+    async def fake_run_ib_resolve_for_live(contracts):  # type: ignore[no-untyped-def]
+        captured_contracts.extend(contracts)
+        return ["AAPL.NASDAQ", "MSFT.NASDAQ"]
+
+    monkeypatch.setattr(cli_mod, "_run_ib_resolve_for_live", fake_run_ib_resolve_for_live)
+
     result = runner.invoke(
         app,
         [
             "instruments",
             "refresh",
-            "--symbols",
-            symbol,
             "--provider",
             "interactive_brokers",
+            "--symbols",
+            "AAPL,MSFT",
         ],
     )
-    assert result.exit_code != 0
-    combined = (result.stderr or "") + (result.stdout or "") + result.output
-    assert "not in the closed universe" in combined, combined
+    assert result.exit_code == 0, result.output
+    assert len(captured_contracts) == 2
+    assert all(
+        c.secType == "STK"
+        and c.exchange == "SMART"
+        and c.primaryExchange == "NASDAQ"
+        and c.currency == "USD"
+        for c in captured_contracts
+    )
 
 
-def test_ib_provider_rejects_unknown_symbol(runner: CliRunner) -> None:
-    """Symbols outside PHASE_1_PAPER_SYMBOLS are rejected in preflight,
-    before any IB connection is attempted."""
+def test_cli_instruments_refresh_primary_exchange_override(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner
+) -> None:
+    """``--primary-exchange ARCA`` flows through to the STK contract;
+    needed for ETFs like SPY/VTI listed on ARCA."""
+    import msai.cli as cli_mod
+    from msai.core.config import Settings
+
+    monkeypatch.setenv("IB_PORT", "4002")
+    monkeypatch.setenv("IB_ACCOUNT_ID", "DU1234567")
+    monkeypatch.setattr(cli_mod, "settings", Settings())
+
+    captured_contracts: list = []
+
+    async def fake_run_ib_resolve_for_live(contracts):  # type: ignore[no-untyped-def]
+        captured_contracts.extend(contracts)
+        return ["SPY.ARCA"]
+
+    monkeypatch.setattr(cli_mod, "_run_ib_resolve_for_live", fake_run_ib_resolve_for_live)
+
     result = runner.invoke(
         app,
         [
             "instruments",
             "refresh",
-            "--symbols",
-            "NVDA",
             "--provider",
             "interactive_brokers",
+            "--symbols",
+            "SPY",
+            "--primary-exchange",
+            "ARCA",
         ],
     )
-    assert result.exit_code != 0
-    combined = (result.stderr or "") + (result.stdout or "") + result.output
-    # Error names the unknown symbol AND the closed universe
-    assert "NVDA" in combined
-    assert "AAPL" in combined  # a symbol from PHASE_1_PAPER_SYMBOLS
+    assert result.exit_code == 0, result.output
+    assert len(captured_contracts) == 1
+    assert captured_contracts[0].symbol == "SPY"
+    assert captured_contracts[0].primaryExchange == "ARCA"
 
 
 def test_ib_provider_rejects_port_account_mismatch(
@@ -344,156 +482,73 @@ def _ib_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli_mod, "settings", Settings())
 
 
-def test_ib_provider_per_symbol_commit_preserves_earlier_successes(
+def test_ib_provider_failure_in_run_ib_resolve_for_live_exits_nonzero(
     _ib_env: None,
     runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """PRD US-001 edge case: 'Mid-batch qualification failure (symbol
-    #2/5) → Exit non-zero; rows for symbols already qualified are
-    committed (idempotent re-run recovers).'
+    """PRD US-001 edge case: 'Mid-batch qualification failure → Exit
+    non-zero.'
 
-    CLI loops symbol-by-symbol and commits each. A failure on symbol
-    2 rolls back only the failed symbol's session state; symbol 1's
-    commit is durable. Verified here by counting session.commit() calls.
+    Stubs ``_run_ib_resolve_for_live`` at the function boundary to raise.
+    Per-symbol commit/rollback discipline is enforced INSIDE
+    ``_run_ib_resolve_for_live`` (it owns the session lifecycle now);
+    that body's commit/rollback semantics are exercised by the gated
+    paper-IB smoke test ``test_instruments_refresh_ib_smoke.py``.
     """
-    mock_client = MagicMock()
-    mock_client._is_client_ready = MagicMock()
-    mock_client._is_client_ready.wait = AsyncMock(return_value=None)
-    mock_client._stop_async = AsyncMock(return_value=None)
+    import msai.cli as cli_mod
 
-    # resolve_for_live succeeds on AAPL, fails on MSFT.
-    call_count = {"n": 0}
+    async def fake_run_ib_resolve_for_live(contracts):  # type: ignore[no-untyped-def]
+        raise RuntimeError("simulated IB failure")
 
-    async def _fake_resolve(self, symbols: list[str]) -> list[str]:
-        call_count["n"] += 1
-        if call_count["n"] == 2:
-            raise RuntimeError("simulated IB failure on symbol #2")
-        return [f"{s}.NASDAQ" for s in symbols]
+    monkeypatch.setattr(cli_mod, "_run_ib_resolve_for_live", fake_run_ib_resolve_for_live)
 
-    fake_session = MagicMock()
-    fake_session.commit = AsyncMock()
-    fake_session.rollback = AsyncMock()
-    fake_session_cm = MagicMock()
-    fake_session_cm.__aenter__ = AsyncMock(return_value=fake_session)
-    fake_session_cm.__aexit__ = AsyncMock(return_value=None)
+    result = runner.invoke(
+        app,
+        [
+            "instruments",
+            "refresh",
+            "--symbols",
+            "AAPL,MSFT",
+            "--provider",
+            "interactive_brokers",
+        ],
+    )
 
-    with (
-        patch(
-            "nautilus_trader.adapters.interactive_brokers.factories.get_cached_ib_client",
-            return_value=mock_client,
-        ),
-        patch(
-            "nautilus_trader.adapters.interactive_brokers.factories."
-            "get_cached_interactive_brokers_instrument_provider",
-            return_value=MagicMock(),
-        ),
-        patch(
-            "msai.services.nautilus.security_master.service.SecurityMaster.resolve_for_live",
-            _fake_resolve,
-        ),
-        patch("msai.cli.async_session_factory", return_value=fake_session_cm),
-    ):
-        result = runner.invoke(
-            app,
-            [
-                "instruments",
-                "refresh",
-                "--symbols",
-                "AAPL,MSFT",
-                "--provider",
-                "interactive_brokers",
-            ],
-        )
-
-    # Exit non-zero (symbol 2 failed).
     assert result.exit_code != 0
-    # But: symbol 1's success was committed (1 commit), symbol 2's
-    # rollback fired once (for the failed call).
-    assert fake_session.commit.await_count == 1
-    assert fake_session.rollback.await_count == 1
 
 
-def test_ib_provider_happy_path_calls_factory_and_resolve(
+def test_ib_provider_happy_path_emits_resolved_canonicals(
     _ib_env: None,
     runner: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AAPL qualifies via the mocked factory chain + IBQualifier, then
-    SecurityMaster.resolve_for_live commits. Exit 0. Asserts:
-    - CORRECT factory kwargs (host, port, client_id, request_timeout_secs)
-    - client.start() is NOT called (factory already starts the client)
-    - client.stop() is NOT called (we await _stop_async directly)
-    - _stop_async IS awaited in finally (even on failure).
-    """
-    # Mock the factory chain
-    mock_client = MagicMock()
-    mock_client._is_client_ready = MagicMock()
-    mock_client._is_client_ready.wait = AsyncMock(return_value=None)
-    mock_client.start = MagicMock()
-    mock_client.stop = MagicMock()
-    mock_client._stop_async = AsyncMock(return_value=None)
+    """Happy path: AAPL flows through the CLI's IB branch and the
+    resolved canonicals are emitted. ``_run_ib_resolve_for_live`` is
+    stubbed at the function boundary; factory + lifecycle assertions
+    are covered by ``test_ib_provider_dead_gateway_times_out_with_operator_hint``
+    which exercises the real factory."""
+    import msai.cli as cli_mod
 
-    mock_provider = MagicMock()
+    async def fake_run_ib_resolve_for_live(contracts):  # type: ignore[no-untyped-def]
+        return [f"{c.symbol}.NASDAQ" for c in contracts]
 
-    mock_get_client = MagicMock(return_value=mock_client)
-    mock_get_provider = MagicMock(return_value=mock_provider)
+    monkeypatch.setattr(cli_mod, "_run_ib_resolve_for_live", fake_run_ib_resolve_for_live)
 
-    # Mock SecurityMaster.resolve_for_live so the test doesn't hit a DB.
-    async def _fake_resolve(self, symbols: list[str]) -> list[str]:
-        return [f"{s}.NASDAQ" for s in symbols]
-
-    fake_session = MagicMock()
-    fake_session.commit = AsyncMock()
-    fake_session.rollback = AsyncMock()
-    fake_session_cm = MagicMock()
-    fake_session_cm.__aenter__ = AsyncMock(return_value=fake_session)
-    fake_session_cm.__aexit__ = AsyncMock(return_value=None)
-
-    with (
-        patch(
-            "nautilus_trader.adapters.interactive_brokers.factories.get_cached_ib_client",
-            mock_get_client,
-        ),
-        patch(
-            "nautilus_trader.adapters.interactive_brokers.factories."
-            "get_cached_interactive_brokers_instrument_provider",
-            mock_get_provider,
-        ),
-        patch(
-            "msai.services.nautilus.security_master.service.SecurityMaster.resolve_for_live",
-            _fake_resolve,
-        ),
-        patch("msai.cli.async_session_factory", return_value=fake_session_cm),
-    ):
-        result = runner.invoke(
-            app,
-            [
-                "instruments",
-                "refresh",
-                "--symbols",
-                "AAPL",
-                "--provider",
-                "interactive_brokers",
-            ],
-        )
+    result = runner.invoke(
+        app,
+        [
+            "instruments",
+            "refresh",
+            "--symbols",
+            "AAPL",
+            "--provider",
+            "interactive_brokers",
+        ],
+    )
 
     assert result.exit_code == 0, result.output
-    assert "AAPL" in result.output
-
-    # --- Factory kwargs correctness ---
-    assert mock_get_client.called
-    kwargs = mock_get_client.call_args.kwargs
-    assert kwargs["host"] == "127.0.0.1"
-    assert kwargs["port"] == 4002
-    assert kwargs["client_id"] == 999
-    assert kwargs["request_timeout_secs"] == 30
-
-    # --- Lifecycle correctness (Codex plan-review iter 1 P1s) ---
-    # Factory already calls client.start() internally; CLI must NOT call it.
-    mock_client.start.assert_not_called()
-    # Public stop() only schedules the async stop; CLI must NOT call it.
-    mock_client.stop.assert_not_called()
-    # _stop_async MUST have been awaited directly.
-    mock_client._stop_async.assert_awaited_once()
+    assert "AAPL.NASDAQ" in result.output
 
 
 def test_ib_provider_dead_gateway_times_out_with_operator_hint(

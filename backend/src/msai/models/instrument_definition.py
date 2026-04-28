@@ -5,23 +5,14 @@ Venue-qualified Nautilus ``InstrumentId`` strings live in
 :class:`InstrumentAlias`, so a ticker change, listing-venue move, or
 future MIC revision is a row update, not a PK migration.
 
-See ``docs/prds/db-backed-strategy-registry.md`` §6 for the full
-schema rationale.
-
-**Coexistence note (2026-04-17):** the existing ``InstrumentCache``
-model / table (``instrument_cache``) is NOT migrated in this PR. The
-migration is deferred to a follow-up PR — see the split-off skeletons
-at the end of ``docs/plans/2026-04-17-db-backed-strategy-registry.md``.
-The coexistence lasts until Nautilus-native cache durability
-(``CacheConfig(database=redis)``) has proven out through a restart
-cycle in production.
+See ``docs/prds/db-backed-strategy-registry.md`` §6 for schema rationale.
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime  # noqa: TC003 — SQLAlchemy Mapped[datetime] resolves at runtime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import (
     CheckConstraint,
@@ -31,6 +22,7 @@ from sqlalchemy import (
     Uuid,
     func,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from msai.models.base import Base
@@ -63,9 +55,7 @@ class InstrumentDefinition(Base):
         ),
     )
 
-    instrument_uid: Mapped[uuid.UUID] = mapped_column(
-        Uuid(), primary_key=True, default=uuid.uuid4
-    )
+    instrument_uid: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True, default=uuid.uuid4)
     raw_symbol: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     listing_venue: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     routing_venue: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
@@ -79,6 +69,14 @@ class InstrumentDefinition(Base):
     lifecycle_state: Mapped[str] = mapped_column(
         String(32), nullable=False, server_default="staged"
     )
+    trading_hours: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
+    """Per-instrument RTH/ETH window data.
+    Schema: ``{"timezone": str, "rth": [{"day", "open", "close"}], "eth": [...]}``.
+    NULL means "no schedule data" — :class:`MarketHoursService` fail-opens
+    (returns True) on NULL."""
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

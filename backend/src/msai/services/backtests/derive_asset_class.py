@@ -1,4 +1,4 @@
-"""Server-authoritative ``asset_class`` derivation (Task B3).
+"""Server-authoritative ``asset_class`` derivation.
 
 Closes the PR #39 scope-defer: the classifier / orchestrator no longer
 needs the caller to hand-roll an ``asset_class`` hint for a symbol like
@@ -63,9 +63,9 @@ def derive_asset_class_sync(symbols: list[str]) -> str | None:
 
     Returning ``None`` (rather than a ``"stocks"`` default) lets the
     classifier chain fall through to the caller-supplied
-    ``asset_class`` hint and finally the regex path-capture. See the
-    Task B3 iter-2 P2 finding: a non-null default here silently
-    overrode a correct ``asset_class="options"`` hint to ``"stocks"``.
+    ``asset_class`` hint and finally the regex path-capture. A non-null
+    default here would silently override a correct ``asset_class="options"``
+    hint to ``"stocks"``.
 
     Empty input returns ``None`` — no symbols means no basis to infer.
 
@@ -103,33 +103,60 @@ async def derive_asset_class(
     When a DB session is supplied we resolve the first symbol through
     :class:`SecurityMaster` and look up its ingest-taxonomy asset_class via
     :meth:`SecurityMaster.asset_class_for_alias`. A registry miss or any
-    failure (DB offline, unknown venue, etc.) silently falls back to the
-    pure-shape :func:`derive_asset_class_sync` — auto-heal must never die
-    because the registry is unreachable.
+    expected DB failure (registry offline, unknown venue, ambiguous symbol)
+    falls back to the pure-shape :func:`derive_asset_class_sync` — auto-heal
+    must never die because the registry is unreachable.
 
     Returns ``None`` when neither the registry nor the shape heuristic
-    can identify the asset class. Callers own the final default — see
-    REV B7-v2's orchestrator pattern
-    ``derive_asset_class(...) or caller_asset_class_hint or "stocks"``.
+    can identify the asset class. Callers own the final default — typical
+    pattern: ``derive_asset_class(...) or caller_asset_class_hint or "stocks"``.
     """
+    import asyncio
+    import contextlib
+
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from msai.services.nautilus.security_master.registry import AmbiguousSymbolError
+    from msai.services.nautilus.security_master.service import (
+        DatabentoDefinitionMissing,
+        SecurityMaster,
+    )
+
     if not symbols:
         return None
     if db is not None:
         try:
-            from msai.services.nautilus.security_master.service import (
-                SecurityMaster,
-            )
-
-            master = SecurityMaster(db=db)
+            master = SecurityMaster(qualifier=None, db=db)
             resolved = await master.resolve_for_backtest([symbols[0]], start=start.isoformat())
             if resolved:
-                asset_class = master.asset_class_for_alias(resolved[0])
+                asset_class = await master.asset_class_for_alias(resolved[0])
                 if asset_class:
                     return asset_class
-        except Exception:  # noqa: BLE001 — registry failure never kills auto-heal
+        except SQLAlchemyError:
             log.warning(
                 "asset_class_registry_lookup_failed",
                 symbol=symbols[0],
                 exc_info=True,
             )
+            # Roll back so the caller's session is reusable. Without this,
+            # asyncpg raises InFailedSQLTransactionError on every subsequent
+            # query within the same session — a poisoned-session contagion
+            # that masks the underlying issue. Narrow the rollback
+            # suppression to ``SQLAlchemyError`` only — legitimate
+            # "rollback after rollback" or "session already closed" errors
+            # should be hidden, but programmer errors (``AttributeError``
+            # if ``db`` is unexpectedly stale, ``RuntimeError`` from an
+            # awaited-twice coroutine, etc.) MUST propagate.
+            with contextlib.suppress(SQLAlchemyError):
+                await db.rollback()
+        except asyncio.CancelledError:
+            # Never swallow cancellation — required for cooperative
+            # task cancellation (Python 3.8+ idiom).
+            raise
+        except (DatabentoDefinitionMissing, AmbiguousSymbolError):
+            # Expected — these are the legitimate "fall through to shape"
+            # signals: registry has no Databento alias for the symbol, or
+            # the raw_symbol matches multiple asset classes and the caller
+            # didn't disambiguate. Both fall back to the shape heuristic.
+            pass
     return derive_asset_class_sync(symbols)

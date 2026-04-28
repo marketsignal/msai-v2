@@ -1,11 +1,9 @@
-"""Unit tests for :mod:`msai.services.nautilus.instruments`
-(Phase 2 tasks 2.6 + 2.10)."""
+"""Unit tests for :mod:`msai.services.nautilus.instruments`."""
 
 from __future__ import annotations
 
 from msai.services.nautilus.instruments import (
     DEFAULT_EQUITY_VENUE,
-    canonical_instrument_id,
     default_bar_type,
     resolve_instrument,
 )
@@ -15,8 +13,8 @@ class TestResolveInstrument:
     def test_bare_symbol_defaults_to_nasdaq(self) -> None:
         """The default venue is ``NASDAQ`` — matches what
         ``SecurityMaster`` would return from its cache for a bare
-        ``"AAPL"`` request. This is the primary Phase 2 contract:
-        no more ``*.SIM`` rebinding for equity lookups."""
+        ``"AAPL"`` request. No more ``*.SIM`` rebinding for equity
+        lookups."""
         inst = resolve_instrument("AAPL")
         assert str(inst.id) == "AAPL.NASDAQ"
         assert inst.raw_symbol.value == "AAPL"
@@ -37,29 +35,37 @@ class TestResolveInstrument:
         assert DEFAULT_EQUITY_VENUE == "NASDAQ"
 
 
-class TestCanonicalInstrumentId:
-    def test_bare_symbol(self) -> None:
-        assert canonical_instrument_id("AAPL") == "AAPL.NASDAQ"
-
-    def test_explicit_venue(self) -> None:
-        assert canonical_instrument_id("VOD", venue="LSE") == "VOD.LSE"
-
-
 class TestDefaultBarType:
-    def test_bar_type_string_format(self) -> None:
+    def test_default_bar_type_inlines_resolve_instrument(self) -> None:
+        """default_bar_type returns canonical-id-shaped string without
+        calling the deleted canonical_instrument_id helper."""
         assert default_bar_type("AAPL") == "AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL"
+        assert default_bar_type("VOD", venue="LSE") == "VOD.LSE-1-MINUTE-LAST-EXTERNAL"
+
+
+class TestCanonicalInstrumentIdRemoved:
+    """Regression guard: ``canonical_instrument_id`` is not exported
+    from this module any more. Any future commit reintroducing the
+    helper fails CI."""
+
+    def test_canonical_instrument_id_is_not_importable(self) -> None:
+        import msai.services.nautilus.instruments as mod
+
+        assert not hasattr(mod, "canonical_instrument_id"), (
+            "canonical_instrument_id must be deleted from instruments.py"
+        )
 
 
 class TestLegacyResolveSimRemoved:
-    """Task 2.10: ``legacy_resolve_sim`` was deleted. A regression
-    guard so any future commit reintroducing the shim fails CI."""
+    """``legacy_resolve_sim`` was deleted. Regression guard so any
+    future commit reintroducing the shim fails CI."""
 
     def test_legacy_shim_no_longer_importable(self) -> None:
         import msai.services.nautilus.instruments as instruments_module
 
         assert not hasattr(instruments_module, "legacy_resolve_sim"), (
-            "legacy_resolve_sim was removed in Task 2.10. Migrate "
-            "callers to resolve_instrument(symbol, venue=...)."
+            "legacy_resolve_sim was removed. Migrate callers to "
+            "resolve_instrument(symbol, venue=...)."
         )
 
 

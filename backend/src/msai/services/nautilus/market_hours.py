@@ -1,10 +1,10 @@
-"""MarketHoursService — read trading hours from
-``instrument_cache.trading_hours`` and answer "is this
-instrument tradeable right now?" (Phase 4 task 4.3).
+"""MarketHoursService — read trading hours from the instrument registry
+(``instrument_definitions.trading_hours`` joined via ``instrument_aliases``)
+and answer "is this instrument tradeable right now?".
 
-The :class:`RiskAwareStrategy` mixin (Phase 3 task 3.7) takes
-an optional ``_market_hours_check`` callable; this module
-provides the production wiring. The callable signature is
+The :class:`RiskAwareStrategy` mixin takes an optional
+``_market_hours_check`` callable; this module provides the
+production wiring. The callable signature is
 ``(InstrumentId) -> bool`` — synchronous because the strategy
 is on Nautilus's hot path and can't await.
 
@@ -12,13 +12,13 @@ Implementation notes:
 
 - The service caches the trading-hours JSON in memory once
   loaded, refreshed lazily on first access per instrument
-  per process. Phase 2's instrument cache rarely changes, so
-  the in-memory snapshot is good enough — a future task
-  will add a periodic refresh against the DB.
-- Times are interpreted in the cache row's ``timezone`` field
-  using ``zoneinfo``. We do NOT call ``pytz`` (deprecated as
-  of Python 3.9) — the stdlib zoneinfo is the right choice
-  for modern Python.
+  per process. Trading hours change rarely (DST transitions,
+  exchange schedule revisions); the in-memory snapshot is
+  good enough until a future periodic-refresh task lands.
+- Times are interpreted in the registry row's ``timezone``
+  field using ``zoneinfo``. We do NOT call ``pytz``
+  (deprecated as of Python 3.9) — the stdlib zoneinfo is
+  the right choice for modern Python.
 - ``is_in_rth`` answers "Regular Trading Hours". ``is_in_eth``
   answers "Extended Hours". RTH is a subset of ETH for any
   reasonable schedule, but we don't enforce that — the
@@ -36,10 +36,11 @@ contention isn't a concern.
 
 from __future__ import annotations
 
-import logging
 from datetime import UTC, datetime, time
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
+
+from msai.core.logging import get_logger
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -47,13 +48,13 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 _DAY_NAMES = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
 """Indices match Python's ``datetime.weekday()`` (Monday = 0).
-Trading hours JSON uses 3-letter uppercase day names per the
-Phase 2 schema."""
+Trading hours JSON uses 3-letter uppercase day names per the registry's
+stored format."""
 
 
 def _parse_hhmm(value: str) -> time:
@@ -86,13 +87,11 @@ def _is_in_window(
       TOMORROW), OR
     - The PREVIOUS day matches AND ``time < close`` (we're
       in the after-midnight tail of YESTERDAY's session).
-
-    Codex batch 10 P2 fix.
     """
     try:
         tz = ZoneInfo(timezone)
     except Exception:  # noqa: BLE001
-        log.warning("market_hours_unknown_timezone", extra={"timezone": timezone})
+        log.warning("market_hours_unknown_timezone", timezone=timezone)
         return True  # fail open — better than blocking every order
 
     local = ts.astimezone(tz)
@@ -108,7 +107,7 @@ def _is_in_window(
             open_t = _parse_hhmm(window["open"])
             close_t = _parse_hhmm(window["close"])
         except (KeyError, ValueError):
-            log.warning("market_hours_bad_window", extra={"window": window})
+            log.warning("market_hours_bad_window", window=window)
             continue
 
         if open_t <= close_t:
@@ -131,7 +130,7 @@ def _is_in_window(
 
 class MarketHoursService:
     """Per-process service that loads trading hours from the
-    ``instrument_cache`` table and answers RTH/ETH questions.
+    instrument registry and answers RTH/ETH questions.
 
     Construction is async because the cache primer hits the
     DB. The instance is then used synchronously from the hot
@@ -145,21 +144,47 @@ class MarketHoursService:
 
     async def prime(self, session: AsyncSession, canonical_ids: list[str]) -> None:
         """Pre-load trading hours for ``canonical_ids`` from the
-        ``instrument_cache`` table. Call once at deployment
-        startup with the strategy's universe so the
+        ``instrument_definitions`` table (joined via the active
+        alias in ``instrument_aliases``). Call once at
+        deployment startup with the strategy's universe so the
         synchronous read path never blocks on a DB call.
+
+        Cold-miss canonical_ids that don't resolve to a registry
+        alias today are recorded as ``None`` in the in-memory
+        cache so the synchronous reader fails-open without
+        re-querying.
         """
         from sqlalchemy import select
 
-        from msai.models.instrument_cache import InstrumentCache
+        from msai.models.instrument_alias import InstrumentAlias
+        from msai.models.instrument_definition import InstrumentDefinition
 
-        result = await session.execute(
-            select(InstrumentCache.canonical_id, InstrumentCache.trading_hours).where(
-                InstrumentCache.canonical_id.in_(canonical_ids)
+        # Join: alias_string IN (canonical_ids) → instrument_uid → trading_hours.
+        # Restrict to the active alias (effective_to IS NULL) so historical
+        # rolls don't leak. Filter by ``provider="interactive_brokers"``:
+        # IB is the trading-hours source of truth (extracted from
+        # ``ContractDetails.tradingHours`` at refresh time); Databento aliases
+        # that share the same ``alias_string`` carry ``trading_hours = NULL``
+        # because Databento's symbology doesn't expose RTH/ETH windows.
+        # Without this filter, result-order non-determinism between IB and
+        # Databento alias rows for the same canonical_id could cache NULL
+        # and silently fail-open every market-hours check.
+        stmt = (
+            select(InstrumentAlias.alias_string, InstrumentDefinition.trading_hours)
+            .join(
+                InstrumentDefinition,
+                InstrumentAlias.instrument_uid == InstrumentDefinition.instrument_uid,
             )
+            .where(InstrumentAlias.alias_string.in_(canonical_ids))
+            .where(InstrumentAlias.effective_to.is_(None))
+            .where(InstrumentAlias.provider == "interactive_brokers")
         )
+        result = await session.execute(stmt)
+        seen: set[str] = set()
         for canonical_id, trading_hours in result:
-            self._cache[canonical_id] = trading_hours
+            if canonical_id not in seen:
+                self._cache[canonical_id] = trading_hours
+                seen.add(canonical_id)
 
         # Anything we asked for but didn't find — record as
         # "no data" so the synchronous reader doesn't keep

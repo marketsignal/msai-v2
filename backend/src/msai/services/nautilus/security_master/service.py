@@ -1,55 +1,51 @@
-"""SecurityMaster service (Phase 2 task 2.5).
+"""SecurityMaster service.
 
-Cache-first resolver that answers "give me the Nautilus
+Registry-backed resolver answering "give me the Nautilus
 ``Instrument`` for this logical spec" with the fewest possible IB
 round-trips:
 
 1. Compute the canonical ID from the spec
    (``InstrumentSpec.canonical_id()``).
-2. Look up ``instrument_cache`` by canonical_id.
-3. Cache HIT → deserialize the cached ``nautilus_instrument_json``
-   back into a Nautilus ``Instrument`` via its ``from_dict``
-   classmethod and return.
-4. Cache MISS → qualify via :class:`IBQualifier` (which delegates
-   to Nautilus's ``InteractiveBrokersInstrumentProvider``), extract
-   trading hours from the ``contract_details`` Nautilus cached on
-   the provider, write the row, return.
-5. Stale (``last_refreshed_at`` older than ``cache_validity_days``)
-   → background refresh scheduled, current cached value returned.
+2. Look up ``instrument_aliases`` for an active row at the
+   exchange-local date.
+3. Warm hit (equity/fx) → reconstruct the Nautilus ``Instrument``
+   directly from the spec via
+   :meth:`SecurityMaster._build_instrument_from_spec`.
+4. Warm miss OR warm-hit on future/option/index → qualify via
+   :class:`IBQualifier` (which delegates to Nautilus's
+   ``InteractiveBrokersInstrumentProvider``), extract trading hours
+   from the qualifier provider's ``contract_details``, upsert the
+   registry row, and return the qualified instrument.
 
 Why this is separate from :class:`IBQualifier`:
 
 - The qualifier owns the IB round-trip mechanics (contract
   construction, provider delegation, batching).
-- The service owns the DB cache layer + the hot-path routing.
-
-Running separately means the service can answer from cache without
-instantiating an ``InteractiveBrokersClient`` at all — which is the
-common case once the cache is warm.
+- The service owns the registry control-plane + the hot-path
+  routing.
 
 Bulk resolve semantics:
 
-- :meth:`bulk_resolve` splits the input into "cached" and
-  "missing" buckets BEFORE hitting IB, so a batch of 100 specs
-  with 95 cache hits fires exactly 5 IB requests (not 100). This
-  is the whole reason the cache exists — IB's
-  ``reqContractDetails`` rate limit is 50 msg/sec and each live
-  deployment pre-loads every instrument its strategies need.
+- :meth:`bulk_resolve` issues ONE SELECT to find every warm-hit
+  alias, then per-spec qualification on the residual misses — so
+  a batch of 100 specs with 95 warm hits fires exactly 5 IB
+  requests (not 100). IB's ``reqContractDetails`` rate limit is
+  50 msg/sec and each live deployment pre-loads every instrument
+  its strategies need.
 """
 
 from __future__ import annotations
 
 import uuid  # noqa: TC003 — used in dataclass field annotation evaluated at runtime
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from datetime import UTC, date, datetime
+from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from msai.core.config import settings
 from msai.core.logging import get_logger
-from msai.models.instrument_cache import InstrumentCache
 from msai.services.nautilus.security_master.continuous_futures import (
     is_databento_continuous_pattern,
     raw_symbol_from_request,
@@ -57,44 +53,51 @@ from msai.services.nautilus.security_master.continuous_futures import (
 )
 from msai.services.nautilus.security_master.parser import (
     extract_trading_hours,
-    nautilus_instrument_to_cache_json,
 )
-from msai.services.nautilus.security_master.specs import InstrumentSpec
+from msai.services.nautilus.security_master.types import (
+    REGISTRY_TO_INGEST_ASSET_CLASS as _REGISTRY_TO_INGEST_ASSET_CLASS,
+)
+from msai.services.nautilus.security_master.types import (
+    RegistryAssetClass as _RegistryAssetClass,
+)
+
+_REGISTRY_TO_SPEC_ASSET_CLASS: dict[_RegistryAssetClass, str] = {
+    "equity": "equity",
+    "futures": "future",  # registry plural → spec singular (specs.AssetClass)
+    "fx": "forex",
+    "option": "option",
+    "crypto": "crypto",
+}
+"""Bridge from registry asset_class taxonomy
+(:data:`RegistryAssetClass` — the values stored in
+``instrument_definitions.asset_class``) to the spec taxonomy
+(:class:`InstrumentSpec.asset_class`, which uses ``future``/``forex``).
+Used by :meth:`SecurityMaster._resolve_one` so the warm-hit dispatch
+into :meth:`_build_instrument_from_spec` doesn't reach across two
+implicit-aligned vocabularies."""
 
 if TYPE_CHECKING:
     from nautilus_trader.model.instruments import Instrument
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from msai.models.instrument_definition import InstrumentDefinition
     from msai.services.data_sources.databento_client import DatabentoClient
     from msai.services.nautilus.security_master.ib_qualifier import IBQualifier
+    from msai.services.nautilus.security_master.specs import InstrumentSpec
+    from msai.services.nautilus.security_master.types import (
+        IngestAssetClass,
+        Provider,
+        RegistryAssetClass,
+        VenueFormat,
+    )
 
 
 log = get_logger(__name__)
 
 
-DEFAULT_CACHE_VALIDITY_DAYS = 30
-"""Rows older than this are considered stale — the next resolve
-returns the cached value AND schedules a background refresh."""
-
-
-_REGISTRY_TO_INGEST_ASSET_CLASS: dict[str, str] = {
-    "equity": "stocks",
-    "future": "futures",
-    "option": "options",
-    "forex": "forex",
-    "crypto": "crypto",
-    # ``index`` is not currently an ingest-taxonomy key; pass-through
-    # so the operator sees the raw value rather than a silent coerce.
-    "index": "index",
-}
-"""Registry/spec-taxonomy (``InstrumentSpec.asset_class``)
-→ ingest / Parquet-storage taxonomy. Used by
-:meth:`SecurityMaster.asset_class_for_alias` — keep module-level so
-callers can inspect the mapping for testing + telemetry without
-instantiating a SecurityMaster."""
-
-
-def compute_advisory_lock_key(provider: str, raw_symbol: str, asset_class: str) -> int:
+def compute_advisory_lock_key(
+    provider: Provider, raw_symbol: str, asset_class: RegistryAssetClass
+) -> int:
     """Postgres ``int8`` advisory-lock key derived from a stable blake2b digest.
 
     Shared between ``_upsert_definition_and_alias`` and the bootstrap
@@ -127,14 +130,6 @@ def compute_blake2b_digest_key(*parts: str) -> int:
     return int.from_bytes(digest, "big", signed=False) & 0x7FFFFFFFFFFFFFFF
 
 
-_ROLL_SENSITIVE_ROOTS: frozenset[str] = frozenset({"ES"})
-"""Raw symbols whose canonical alias changes over time (quarterly
-futures roll). For these, ``resolve_for_live``'s warm path B compares
-the stored active alias to ``canonical_instrument_id(sym, today=today)``
-and falls through to the cold path on mismatch so the roll triggers a
-re-qualify. For non-rollable symbols the registry is authoritative."""
-
-
 class DatabentoDefinitionMissing(Exception):  # noqa: N818 — spec-mandated name (codex parity)
     """Raised by :meth:`SecurityMaster.resolve_for_backtest` when a requested
     symbol has no active registry row under the ``databento`` provider and
@@ -161,7 +156,7 @@ class AliasResolution:
     instrument_uid: uuid.UUID | None
     primary_provider: str  # e.g. "databento"; empty string when unregistered
     has_ib_alias: bool
-    ingest_asset_class: str  # registry-taxonomy value passed in by caller
+    registry_asset_class: RegistryAssetClass  # registry-taxonomy value from caller
 
     def coverage_summary_hint(self) -> str | None:
         if self.instrument_uid is None:
@@ -170,20 +165,21 @@ class AliasResolution:
 
 
 class SecurityMaster:
-    """Cache-first instrument resolver.
+    """Registry-backed instrument resolver.
 
     Args:
         qualifier: IB qualifier adapter that hits Nautilus's
-            :class:`InteractiveBrokersInstrumentProvider` for
-            cache misses. Production wires a short-lived provider
-            bound to an isolated IB client; tests pass a stub.
-        db: Async session factory callable — we open a fresh
-            session per ``resolve`` call so the cache writes don't
-            interfere with callers' transactions.
-        cache_validity_days: Staleness threshold. A row whose
-            ``last_refreshed_at`` is older than this gets a
-            background refresh queued (caller still sees the
-            cached value).
+            :class:`InteractiveBrokersInstrumentProvider` for registry
+            misses (and for warm-hit non-equity/fx asset classes that
+            need a fresh Nautilus :class:`Instrument` from live contract
+            details). Production wires a short-lived provider bound to
+            an isolated IB client; tests pass a stub.
+        db: Async session — registry reads/writes share this session
+            with the caller's transaction.
+        databento_client: Used by the continuous-futures backtest path
+            (:meth:`_resolve_databento_continuous`). ``None`` is
+            permitted for live-only callers; a cold-miss on a Databento
+            continuous symbol with ``databento_client=None`` will raise.
     """
 
     def __init__(
@@ -191,12 +187,10 @@ class SecurityMaster:
         *,
         qualifier: IBQualifier | None = None,
         db: AsyncSession,
-        cache_validity_days: int = DEFAULT_CACHE_VALIDITY_DAYS,
         databento_client: DatabentoClient | None = None,
     ) -> None:
         self._qualifier = qualifier
         self._db = db
-        self._cache_validity = timedelta(days=cache_validity_days)
         # Used by the continuous-futures backtest path
         # (``_resolve_databento_continuous``). ``None`` is permitted for
         # live-only callers — a cold-miss on a Databento continuous symbol
@@ -204,217 +198,189 @@ class SecurityMaster:
         self._databento = databento_client
 
     async def resolve(self, spec: InstrumentSpec) -> Instrument:
-        """Resolve a single spec, consulting the cache first.
+        """Resolve a single spec via the registry.
 
-        Returns a freshly-built Nautilus ``Instrument`` (either
-        deserialized from the cache or newly qualified from IB).
-        """
-        canonical_id = spec.canonical_id()
+        Warm path (equity / fx): registry has an active alias for the
+        spec's canonical_id → reconstruct the Nautilus
+        :class:`Instrument` from the spec via
+        :meth:`_build_instrument_from_spec`.
 
-        cached = await self._read_cache(canonical_id)
-        if cached is not None:
-            return _instrument_from_cache_row(cached)
-
-        # Cache miss — qualify, extract trading hours, write, return.
-        if self._qualifier is None:
-            raise ValueError(
-                f"Cache miss for spec {spec!r} requires an IBQualifier — "
-                "construct SecurityMaster with qualifier=... or pre-warm "
-                "the cache via resolve_for_backtest / resolve_for_live."
-            )
-        instrument = await self._qualifier.qualify(spec)
-        trading_hours_json = self._trading_hours_for(
-            canonical_id=canonical_id,
-        )
-        await self._write_cache(
-            spec=spec,
-            canonical_id=canonical_id,
-            instrument=instrument,
-            trading_hours_json=trading_hours_json,
-        )
-        return instrument
-
-    async def bulk_resolve(self, specs: list[InstrumentSpec]) -> list[Instrument]:
-        """Resolve a batch of specs, minimizing IB round-trips.
-
-        The implementation:
-
-        1. Computes all canonical ids once.
-        2. Fetches all matching cache rows in a single SELECT.
-        3. Iterates the input preserving order, using the cached
-           row if present or calling ``resolve`` (which qualifies)
-           for misses.
-
-        A bulk call of 100 specs with 95 cache hits makes ONE
-        SELECT + 5 ``reqContractDetails`` round-trips.
-        """
-        if not specs:
-            return []
-
-        canonical_ids = [spec.canonical_id() for spec in specs]
-        cached_rows = await self._read_cache_bulk(canonical_ids)
-
-        results: list[Instrument] = []
-        for spec, canonical_id in zip(specs, canonical_ids, strict=True):
-            row = cached_rows.get(canonical_id)
-            if row is not None:
-                results.append(_instrument_from_cache_row(row))
-                continue
-            # Miss → full single-spec resolve path (writes cache
-            # as a side effect so a subsequent spec with the same
-            # canonical id in this same batch gets the fresh row).
-            results.append(await self.resolve(spec))
-        return results
-
-    async def refresh(self, canonical_id: str) -> Instrument:
-        """Force a fresh IB qualification for this canonical_id.
-
-        The caller must have the ``InstrumentSpec`` that produced
-        this canonical_id — we can't reconstruct it from the string
-        alone. In practice the staleness-aware background refresh
-        path rebuilds the spec from the cached ``ib_contract_json``
-        and calls ``refresh`` with the fresh result; callers that
-        don't know the spec should use ``resolve`` instead (which
-        reads from cache first).
-
-        Implementation note: for the Phase 2 acceptance we expose
-        this as a hook; the background-refresh scheduler lands in
-        Phase 4 along with the heartbeat-driven stale detection.
-        """
-        raise NotImplementedError(
-            "refresh() requires a spec reconstructed from cached IB "
-            "contract details; the background-refresh scheduler lands "
-            "in Phase 4. Callers should use resolve() for now."
-        )
-
-    # ------------------------------------------------------------------
-    # Live-trading resolve entrypoint (registry-backed)
-    # ------------------------------------------------------------------
-
-    async def resolve_for_live(self, symbols: list[str]) -> list[str]:
-        """Return canonical Nautilus ``InstrumentId`` strings for ``symbols``.
-
-        Warm path: registry hit by alias OR raw_symbol → return the active
-        alias. Cold path: delegate to the Phase-1 closed-universe
-        :func:`canonical_instrument_id` helper, resolve the built
-        :class:`InstrumentSpec` through the existing cache-first
-        :meth:`resolve`, then upsert
-        ``instrument_definitions`` + ``instrument_aliases`` so the next
-        call goes down the warm path.
-
-        Non-hot-path; uses ``self._db`` + optional IB qualify round-trips.
-        Callers must pre-warm before ``TradingNode.run()`` (gotchas #9,
-        #11 — dynamic instrument loading on the trading critical path
-        fails at the first bar event, not at startup).
-
-        Cold-miss scope:
-            The cold-miss path currently delegates to the closed-universe
-            :func:`live_instrument_bootstrap.canonical_instrument_id`
-            helper. Symbols outside ``{AAPL, MSFT, SPY, EUR/USD, ES}``
-            will raise ``ValueError`` from that helper. To add a new
-            symbol:
-
-            1. Extend :func:`canonical_instrument_id`'s if-chain.
-            2. Extend :meth:`_spec_from_canonical` (below) with the new
-               venue case.
-            3. Pre-warm the registry via ``msai instruments refresh
-               --symbols <NEW>`` so future hits go down the warm path
-               instead of the cold path.
+        Warm hit on future / option / index OR registry miss: qualify
+        via the IB qualifier, upsert the definition + alias row (with
+        extracted trading_hours), return the qualified instrument.
+        ``listing_venue`` is derived via
+        :meth:`IBQualifier.listing_venue_for`; ``routing_venue`` is the
+        Nautilus-resolved venue (e.g. ``SMART`` for stocks).
 
         Raises:
-            ValueError: A cold-miss path was required but ``self._qualifier``
-                is ``None`` — construct the :class:`SecurityMaster` with
-                ``qualifier=...`` for any live-trading entrypoint.
+            ValueError: a path that requires the qualifier was reached
+                with ``self._qualifier is None`` — either a cold miss
+                on any asset class, or a warm hit on an asset class the
+                spec-builder doesn't support in v1.
         """
-        # Use CME-local date (America/Chicago), matching what
-        # canonical_instrument_id + build_ib_instrument_provider_config
-        # use — otherwise on late-UTC-night runs the UTC date disagrees
-        # with the exchange date and the two resolve to different
-        # quarterly contracts.
-        from msai.services.nautilus.live_instrument_bootstrap import (
-            canonical_instrument_id,
+        from msai.services.nautilus.live_instrument_bootstrap import (  # noqa: PLC0415
             exchange_local_today,
         )
-        from msai.services.nautilus.security_master.registry import (
+        from msai.services.nautilus.security_master.registry import (  # noqa: PLC0415
             InstrumentRegistry,
         )
 
         registry = InstrumentRegistry(self._db)
+        # Use exchange-local (America/Chicago) date for IB alias windowing;
+        # date.today() (UTC) would disagree with the supervisor's spawn-time
+        # lookup_for_live(as_of_date=spawn_today) and could resolve a
+        # different futures contract on roll-day.
         today = exchange_local_today()
-        out: list[str] = []
-        for sym in symbols:
-            # Warm path A — caller passed an already-qualified dotted alias.
-            # Thread ``today`` (exchange-local CME date) so roll-sensitive
-            # aliases are windowed against the same date the cold path +
-            # canonical_instrument_id use — otherwise a late-UTC-night
-            # run could resolve a different quarterly contract here than
-            # elsewhere in the live path.
-            if "." in sym:
-                idef = await registry.find_by_alias(
-                    sym, provider="interactive_brokers", as_of_date=today
+
+        idef = await registry.find_by_alias(
+            spec.canonical_id(),
+            provider="interactive_brokers",
+            as_of_date=today,
+        )
+        return await self._resolve_one(spec, warm_def=idef)
+
+    async def bulk_resolve(self, specs: list[InstrumentSpec]) -> list[Instrument]:
+        """Bulk resolve via the registry — one SELECT for all warm hits,
+        then per-spec qualification on the residual cold-misses (and
+        warm-hit non-equity/fx asset classes that need IB qualification).
+        """
+        if not specs:
+            return []
+
+        from msai.services.nautilus.live_instrument_bootstrap import (  # noqa: PLC0415
+            exchange_local_today,
+        )
+        from msai.services.nautilus.security_master.registry import (  # noqa: PLC0415
+            InstrumentRegistry,
+        )
+
+        registry = InstrumentRegistry(self._db)
+        # Compute ``today`` once for the whole batch so per-spec resolution
+        # cannot drift across a roll-day midnight boundary mid-call.
+        today = exchange_local_today()
+        canonical_ids = [spec.canonical_id() for spec in specs]
+        warm_aliases = await registry.find_by_aliases_bulk(
+            canonical_ids, provider="interactive_brokers", as_of_date=today
+        )
+
+        results: list[Instrument] = []
+        for spec, canonical_id in zip(specs, canonical_ids, strict=True):
+            results.append(
+                await self._resolve_one(
+                    spec,
+                    warm_def=warm_aliases.get(canonical_id),
                 )
-                if idef is not None:
-                    out.append(sym)
-                    continue
-            # Warm path B — caller passed a bare ticker, resolve to
-            # active alias. For roll-sensitive symbols (futures that
-            # quarterly-roll like ES), the stored active alias may be
-            # stale after an expiry; compare against today's canonical
-            # and fall through to cold path if it differs so the
-            # re-qualify + upsert closes the old alias and opens the
-            # new one. For non-rollable symbols (AAPL/MSFT/SPY/EUR/USD)
-            # the registry IS authoritative — a legitimate alias move
-            # (e.g. AAPL.NASDAQ → AAPL.ARCA) must be honored, not
-            # reverted to canonical_instrument_id's hardcoded default.
-            idef = await registry.find_by_raw_symbol(sym, provider="interactive_brokers")
-            if idef is not None:
-                active_alias = next((a for a in idef.aliases if a.effective_to is None), None)
-                if active_alias is not None:
-                    is_stale = False
-                    if sym in _ROLL_SENSITIVE_ROOTS:
-                        try:
-                            expected = canonical_instrument_id(sym, today=today)
-                        except ValueError:
-                            expected = None
-                        if expected is not None and expected != active_alias.alias_string:
-                            is_stale = True
-                    if not is_stale:
-                        out.append(active_alias.alias_string)
-                        continue
-            # Cold path — delegate to existing live_instrument_bootstrap
-            # front-month rollover + existing SecurityMaster.resolve(spec).
-            # Reason: live_instrument_bootstrap.canonical_instrument_id(...)
-            # holds the closed-universe roll logic (ES → ESM6.CME at spawn
-            # today); we reuse it rather than reinventing. The returned
-            # canonical alias string is then used to build an InstrumentSpec
-            # via _spec_from_canonical() and the spec is resolved through
-            # the existing cache-first path (which triggers an IB qualify
-            # round-trip on cache miss).
-            if self._qualifier is None:
-                raise ValueError(
-                    f"Cold-miss resolve for {sym!r} requires an IBQualifier — "
-                    "construct SecurityMaster with qualifier=... for live use."
-                )
-            canonical = canonical_instrument_id(sym, today=today)
-            spec = self._spec_from_canonical(canonical, today=today)
-            instrument = await self.resolve(spec)  # cache-first
-            alias_str = str(instrument.id)
-            routing_venue = instrument.id.venue.value
-            listing_venue = routing_venue
-            details = self._qualifier._provider.contract_details.get(instrument.id)
-            if details is not None and getattr(details, "contract", None) is not None:
-                primary = getattr(details.contract, "primaryExchange", None) or None
-                if primary:
-                    listing_venue = primary
-            await self._upsert_definition_and_alias(
-                raw_symbol=instrument.raw_symbol.value,
-                listing_venue=listing_venue,
-                routing_venue=routing_venue,
-                asset_class=self._asset_class_for_instrument(instrument),
-                alias_string=alias_str,
             )
-            out.append(alias_str)
-        return out
+        return results
+
+    async def _resolve_one(
+        self,
+        spec: InstrumentSpec,
+        *,
+        warm_def: InstrumentDefinition | None,
+    ) -> Instrument:
+        """Internal resolver shared by :meth:`resolve` and :meth:`bulk_resolve`.
+
+        Takes an already-fetched warm :class:`InstrumentDefinition`
+        (``None`` for cold miss). Callers compute ``today`` themselves
+        before fetching ``warm_def`` so that the bulk path's roll-day
+        window stays consistent across every spec; this method does not
+        need it.
+
+        Spec-build is scoped to ``equity`` + ``fx`` per
+        :meth:`_build_instrument_from_spec`. Future / option / index warm
+        hits fall through to the qualifier (the IB provider IS the source
+        of truth for those at runtime — no Postgres payload blob to
+        replay), matching the cold-miss path's behavior. Idempotent
+        registry upsert at the end of qualification is a no-op when the
+        warm row already exists.
+        """
+        # Bridge the warm row's registry-taxonomy ``asset_class`` (e.g.
+        # ``futures``/``fx``) to the spec-taxonomy value
+        # :meth:`_build_instrument_from_spec` dispatches on (``future``/
+        # ``forex``). Without this bridge the dispatch worked by accident
+        # because callers always built specs with spec values; the bridge
+        # makes the cross-walk explicit and mypy-typed.
+        spec_asset_class = (
+            _REGISTRY_TO_SPEC_ASSET_CLASS.get(warm_def.asset_class)  # type: ignore[call-overload]
+            if warm_def is not None
+            else None
+        )
+        if warm_def is not None and spec_asset_class in {"equity", "forex"}:
+            return self._build_instrument_from_spec(spec)
+
+        # Either: (a) cold miss, OR (b) warm hit on future/option/index
+        # which spec-build can't satisfy in v1. Both paths require an
+        # IB qualifier.
+        if self._qualifier is None:
+            if warm_def is not None:
+                raise ValueError(
+                    f"Registry warm hit for asset_class={warm_def.asset_class!r} "
+                    "requires an IBQualifier — equity/fx build from spec, "
+                    "future/option/index require live IB qualification. "
+                    "Construct SecurityMaster with qualifier=... or use "
+                    "`live_resolver.lookup_for_live` directly for non-IB callers."
+                )
+            raise ValueError(
+                f"Registry miss for spec {spec!r} requires an IBQualifier — "
+                "construct SecurityMaster with qualifier=... or pre-warm the "
+                "registry via `msai instruments refresh`."
+            )
+
+        instrument = await self._qualifier.qualify(spec)
+        canonical_id = spec.canonical_id()
+        trading_hours_json = self._trading_hours_for(canonical_id=canonical_id)
+
+        routing_venue = instrument.id.venue.value
+        listing_venue = self._qualifier.listing_venue_for(instrument)
+
+        await self._upsert_definition_and_alias(
+            raw_symbol=instrument.raw_symbol.value,
+            listing_venue=listing_venue,
+            routing_venue=routing_venue,
+            asset_class=self._asset_class_for_instrument(instrument),
+            alias_string=str(instrument.id),
+            trading_hours=trading_hours_json,
+        )
+        return instrument
+
+    def _build_instrument_from_spec(self, spec: InstrumentSpec) -> Instrument:
+        """Construct a Nautilus :class:`Instrument` from the spec WITHOUT
+        consulting a Postgres payload blob.
+
+        Scoped to ``equity`` and ``forex`` for v1. Live preload at
+        :class:`InteractiveBrokersInstrumentProviderConfig(load_contracts=...)`
+        in ``live_node_config.py`` is the production hydration path for
+        futures + options at runtime (Nautilus's IB provider builds the
+        Instrument from the qualified contract). Callers that need a
+        Nautilus :class:`Instrument` for a future/option/index without a
+        live IB connection should use ``live_resolver.lookup_for_live``
+        — that's the canonical primitive post-PR-#37.
+
+        Raises :class:`NotImplementedError` for unsupported asset classes
+        with an operator-action hint.
+        """
+        from nautilus_trader.model.identifiers import Venue  # noqa: PLC0415
+        from nautilus_trader.test_kit.providers import (  # noqa: PLC0415
+            TestInstrumentProvider,
+        )
+
+        if spec.asset_class == "equity":
+            return TestInstrumentProvider.equity(symbol=spec.symbol, venue=spec.venue)
+        if spec.asset_class == "forex":
+            # Nautilus default_fx_ccy expects "BASE/QUOTE" form; spec.symbol is
+            # the base, spec.currency is the quote. The Nautilus API takes a
+            # Venue object (not a str), so wrap the spec's venue suffix.
+            pair = f"{spec.symbol}/{spec.currency}"
+            return TestInstrumentProvider.default_fx_ccy(symbol=pair, venue=Venue(spec.venue))
+        raise NotImplementedError(
+            f"_build_instrument_from_spec does not support asset_class="
+            f"{spec.asset_class!r} in v1 (only equity + forex). For futures, "
+            f"options, and indexes, use `live_resolver.lookup_for_live` "
+            f"directly — it returns a ResolvedInstrument from the registry "
+            f"that the live preload can hydrate via "
+            f"InteractiveBrokersInstrumentProviderConfig(load_contracts=...)."
+        )
 
     # ------------------------------------------------------------------
     # Backtest resolve entrypoint (registry-backed)
@@ -617,7 +583,7 @@ class SecurityMaster:
         return resolved.instrument_id
 
     @staticmethod
-    def _asset_class_for_instrument(instrument: Any) -> str:
+    def _asset_class_for_instrument(instrument: Any) -> RegistryAssetClass:
         """Derive the registry's ``asset_class`` column value from a Nautilus
         :class:`Instrument` via its runtime class name.
 
@@ -638,14 +604,16 @@ class SecurityMaster:
 
         return asset_class_for_instrument_type(instrument.__class__.__name__)
 
-    def asset_class_for_alias(self, alias_str: str) -> str | None:
+    async def asset_class_for_alias(self, alias_str: str) -> IngestAssetClass | None:
         """Canonical alias → ingest-taxonomy asset_class.
 
-        Public wrapper over :meth:`_spec_from_canonical` that translates
-        the registry/spec taxonomy (``"equity"`` / ``"future"`` /
-        ``"option"`` / ``"forex"`` / ``"index"``) to the ingest /
-        Parquet-storage taxonomy (``"stocks"`` / ``"futures"`` /
-        ``"options"`` / ``"forex"`` / ``"crypto"``).
+        Looks up the alias in the registry under ``provider="interactive_brokers"``
+        (using :func:`exchange_local_today` for windowing) and translates
+        the definition's ``asset_class`` field (``equity`` / ``futures`` /
+        ``fx`` / ``option`` / ``crypto`` per the
+        ``ck_instrument_definitions_asset_class`` CHECK) to the ingest /
+        Parquet-storage taxonomy (``stocks`` / ``futures`` / ``options`` /
+        ``forex`` / ``crypto``) via :data:`_REGISTRY_TO_INGEST_ASSET_CLASS`.
 
         This mapping is critical — if the wrong name reaches
         ``DataIngestionService._resolve_plan`` the Parquet writes go
@@ -653,34 +621,61 @@ class SecurityMaster:
         the catalog reader expects ``data/parquet/stocks/``, producing
         a perpetual auto-heal loop.
 
-        Returns ``None`` if the alias shape is unknown — callers fall
-        back to the shape heuristic in
+        Returns ``None`` when the alias is empty, has no registry row,
+        or has an unrecognized registry taxonomy. Callers fall back to
+        the shape heuristic in
         :func:`msai.services.backtests.derive_asset_class.derive_asset_class_sync`.
+
+        Narrow exception handling: SQLAlchemy errors (DB hiccup) and
+        :class:`AmbiguousSymbolError` (legitimate registry signal that the
+        caller can't disambiguate without ``asset_class``) are swallowed
+        with a warning so the auto-heal pipeline doesn't crash; programmer
+        errors (``AssertionError``, ``ImportError``, ``TypeError``) propagate.
         """
         if not alias_str:
             return None
+
+        from sqlalchemy.exc import SQLAlchemyError
+
+        from msai.services.nautilus.live_instrument_bootstrap import (
+            exchange_local_today,
+        )
+        from msai.services.nautilus.security_master.registry import (
+            AmbiguousSymbolError,
+            InstrumentRegistry,
+        )
+
+        today = exchange_local_today()
+        registry = InstrumentRegistry(self._db)
         try:
-            spec = self._spec_from_canonical(alias_str)
-        except Exception:  # noqa: BLE001 — unknown venue / malformed alias
+            idef = await registry.find_by_alias(
+                alias_str,
+                provider="interactive_brokers",
+                as_of_date=today,
+            )
+        except (SQLAlchemyError, AmbiguousSymbolError):
             log.warning(
-                "asset_class_for_alias_spec_failed",
+                "asset_class_for_alias_registry_lookup_failed",
                 alias=alias_str,
                 exc_info=True,
             )
             return None
 
-        registry_taxon: str | None = getattr(spec, "asset_class", None)
-        if registry_taxon is None:
+        if idef is None:
             return None
-        # Unknown taxonomy passes through unchanged — operator can still
-        # see it and decide; tests parametrize each known key.
-        return _REGISTRY_TO_INGEST_ASSET_CLASS.get(registry_taxon, registry_taxon)
+
+        # ``InstrumentDefinition.asset_class`` is a generic ``str`` at the SQLA
+        # type-stub level; the DB CHECK constraint keeps it within the registry
+        # taxonomy. ``.get`` returns ``None`` for any unrecognized value, so an
+        # off-list row from a future schema drift gracefully degrades to the
+        # shape-heuristic fallback rather than raising.
+        return _REGISTRY_TO_INGEST_ASSET_CLASS.get(idef.asset_class)  # type: ignore[call-overload,no-any-return]
 
     async def find_active_aliases(
         self,
         *,
         symbol: str,
-        asset_class: str,
+        asset_class: RegistryAssetClass,
         as_of_date: date,
     ) -> AliasResolution:
         """Aggregate readiness view for a ``(symbol, asset_class)`` pair.
@@ -745,15 +740,24 @@ class SecurityMaster:
                 instrument_uid=None,
                 primary_provider="",
                 has_ib_alias=False,
-                ingest_asset_class=asset_class,
+                registry_asset_class=asset_class,
             )
 
         uids = {r.instrument_uid for r in rows}
         if len(uids) > 1:
             sorted_providers = sorted({r.provider for r in rows})
+            # ``AmbiguousSymbolError.provider`` is typed as :data:`Provider`
+            # (registry-namespaced); the SQLA-stub-typed ``r.provider`` is
+            # ``str``. DB rows reach this branch only after passing the
+            # ``ck_instrument_aliases_provider`` CHECK, so the cast is
+            # invariant-preserving.
+            first_provider = cast(
+                "Provider",
+                sorted_providers[0] if sorted_providers else "interactive_brokers",
+            )
             raise AmbiguousSymbolError(
                 symbol=symbol,
-                provider=sorted_providers[0] if sorted_providers else "",
+                provider=first_provider,
                 asset_classes=[asset_class],
             )
         instrument_uid = next(iter(uids))
@@ -770,81 +774,7 @@ class SecurityMaster:
             instrument_uid=instrument_uid,
             primary_provider=primary,
             has_ib_alias=has_ib,
-            ingest_asset_class=asset_class,
-        )
-
-    def _spec_from_canonical(
-        self,
-        canonical: str,
-        *,
-        today: date | None = None,
-    ) -> InstrumentSpec:
-        """Parse an already-resolved canonical alias string into an
-        :class:`InstrumentSpec` for downstream :meth:`resolve`.
-
-        Reuses the venue mapping established by
-        :func:`live_instrument_bootstrap.canonical_instrument_id`. Closed
-        universe:
-
-        - ``AAPL.NASDAQ`` / ``MSFT.NASDAQ`` → equity / NASDAQ
-        - ``SPY.ARCA`` → equity / ARCA
-        - ``EUR/USD.IDEALPRO`` → forex / IDEALPRO
-        - ``ESM6.CME`` (or similar) → future / CME.
-          ``today`` is used to compute the third-Friday expiry. Without
-          it the spec has ``expiry=None`` and ``IBQualifier`` maps it
-          to ``CONTFUT`` — IB Gateway then returns the continuous
-          placeholder, not the concrete front-month.
-
-        Raises:
-            ValueError: On an unknown venue suffix — callers should
-                widen the closed universe by adding a case here first.
-        """
-        symbol, _, venue = canonical.rpartition(".")
-        if not venue:
-            raise ValueError(f"Canonical alias {canonical!r} has no venue suffix")
-        if venue == "NASDAQ":
-            return InstrumentSpec(asset_class="equity", symbol=symbol, venue="NASDAQ")
-        if venue == "ARCA":
-            return InstrumentSpec(asset_class="equity", symbol=symbol, venue="ARCA")
-        if venue == "IDEALPRO":
-            # symbol here is "EUR/USD"; base = "EUR", quote = "USD"
-            base, _, quote = symbol.partition("/")
-            return InstrumentSpec(
-                asset_class="forex",
-                symbol=base,
-                venue="IDEALPRO",
-                currency=quote or "USD",
-            )
-        if venue == "CME":
-            # Import locally to avoid a security_master →
-            # live_instrument_bootstrap cycle at module import time.
-            from msai.services.nautilus.live_instrument_bootstrap import (
-                _current_quarterly_expiry,
-                exchange_local_today,
-                third_friday_of,
-            )
-
-            if today is None:
-                today = exchange_local_today()
-            # Incoming symbol is the local-symbol form ("ESM6") — root
-            # + 1-char month code + 1-digit year. InstrumentSpec
-            # RECOMPUTES that suffix from expiry, so passing "ESM6" +
-            # expiry would yield "ESM6M6.CME". Strip to the root.
-            root = symbol[:-2]
-            expiry_str = _current_quarterly_expiry(today)  # YYYYMM
-            expiry = third_friday_of(
-                int(expiry_str[0:4]),
-                int(expiry_str[4:6]),
-            )
-            return InstrumentSpec(
-                asset_class="future",
-                symbol=root,
-                venue="CME",
-                expiry=expiry,
-            )
-        raise ValueError(
-            f"Unknown venue {venue!r} in canonical {canonical!r} — extend "
-            "SecurityMaster._spec_from_canonical for new venues."
+            registry_asset_class=asset_class,
         )
 
     async def _upsert_definition_and_alias(
@@ -853,16 +783,17 @@ class SecurityMaster:
         raw_symbol: str,
         listing_venue: str,
         routing_venue: str,
-        asset_class: str,
+        asset_class: RegistryAssetClass,
         alias_string: str,
-        provider: str = "interactive_brokers",
-        venue_format: str = "exchange_name",
+        provider: Provider = "interactive_brokers",
+        venue_format: VenueFormat = "exchange_name",
         source_venue_raw: str | None = None,
+        trading_hours: dict[str, Any] | None = None,
     ) -> None:
         """Idempotent upsert: one :class:`InstrumentDefinition` row +
         one active :class:`InstrumentAlias` row.
 
-        Called from both :meth:`resolve_for_live` (provider defaults to
+        Called from both the IB qualification path (provider defaults to
         ``interactive_brokers``, venue_format ``exchange_name``) and
         :meth:`_resolve_databento_continuous` (provider ``databento``,
         venue_format ``databento_continuous``).
@@ -878,8 +809,7 @@ class SecurityMaster:
 
         Race-safety: both statements use PostgreSQL ``INSERT ... ON
         CONFLICT`` so concurrent resolvers for the same symbol can't
-        collide on the unique constraints. Mirrors the pattern in
-        :meth:`_write_cache`.
+        collide on the unique constraints.
         """
         from sqlalchemy import text
 
@@ -1001,38 +931,62 @@ class SecurityMaster:
                         prior_ib_venue=prior_ib_venue,
                     )
 
+        from sqlalchemy import func as _sa_func  # noqa: PLC0415
+        from sqlalchemy import text as _sa_text  # noqa: PLC0415
+
         now = datetime.now(UTC)
-        def_stmt = (
-            pg_insert(InstrumentDefinition)
-            .values(
-                raw_symbol=raw_symbol,
-                listing_venue=listing_venue,
-                routing_venue=routing_venue,
-                asset_class=asset_class,
-                provider=provider,
-                lifecycle_state="active",
-                refreshed_at=now,
-            )
-            .on_conflict_do_update(
-                constraint="uq_instrument_definitions_symbol_provider_asset",
-                # Refresh venue fields on conflict so an alias move
-                # (e.g. AAPL.NASDAQ → AAPL.ARCA) propagates to the
-                # definition row, not just the alias table. Without
-                # this, callers reading InstrumentDefinition get
-                # permanently stale venue metadata after the first
-                # venue change.
-                set_={
-                    "refreshed_at": now,
-                    "listing_venue": listing_venue,
-                    "routing_venue": routing_venue,
-                },
-            )
-            .returning(InstrumentDefinition.__table__.c.instrument_uid)
+        def_insert = pg_insert(InstrumentDefinition).values(
+            raw_symbol=raw_symbol,
+            listing_venue=listing_venue,
+            routing_venue=routing_venue,
+            asset_class=asset_class,
+            provider=provider,
+            lifecycle_state="active",
+            refreshed_at=now,
+            trading_hours=trading_hours,
         )
+        def_stmt = def_insert.on_conflict_do_update(
+            constraint="uq_instrument_definitions_symbol_provider_asset",
+            # Refresh venue fields on conflict so an alias move
+            # (e.g. AAPL.NASDAQ → AAPL.ARCA) propagates to the
+            # definition row, not just the alias table. Without
+            # this, callers reading InstrumentDefinition get
+            # permanently stale venue metadata after the first
+            # venue change.
+            #
+            # trading_hours uses COALESCE(NULLIF(excluded, 'null'::jsonb),
+            # current) so callers passing trading_hours=None do NOT clobber
+            # existing rows (writers without IB contract details preserve
+            # prior data). The NULLIF guard is required because asyncpg
+            # binds Python ``None`` as the JSONB literal ``'null'``, which
+            # is distinct from SQL NULL — plain COALESCE keeps the JSON
+            # ``null`` and silently overwrites the existing row.
+            set_={
+                "refreshed_at": now,
+                "listing_venue": listing_venue,
+                "routing_venue": routing_venue,
+                "trading_hours": _sa_func.coalesce(
+                    _sa_func.nullif(
+                        def_insert.excluded.trading_hours,
+                        _sa_text("'null'::jsonb"),
+                    ),
+                    InstrumentDefinition.trading_hours,
+                ),
+            },
+        ).returning(InstrumentDefinition.__table__.c.instrument_uid)
         result = await self._db.execute(def_stmt)
         instrument_uid = result.scalar_one()
 
-        today = now.date()
+        # Use exchange-local (America/Chicago) date for the alias window
+        # so the freshly-inserted alias passes ``find_by_alias`` immediately
+        # after this upsert returns. ``now.date()`` is UTC and would stamp
+        # tomorrow's UTC date during late US-Central hours, leaving the
+        # resolver (which evaluates ``as_of_date = exchange_local_today()``,
+        # still yesterday in Chicago) to compute ``effective_from > as_of_date``
+        # → registry miss until the next Chicago calendar rollover.
+        from msai.services.nautilus.live_instrument_bootstrap import exchange_local_today
+
+        today = exchange_local_today()
 
         # Close any previous active aliases for this
         # ``(instrument_uid, provider)`` so the new alias becomes the single
@@ -1078,81 +1032,6 @@ class SecurityMaster:
         await self._db.flush()
 
     # ------------------------------------------------------------------
-    # Cache IO
-    # ------------------------------------------------------------------
-
-    async def _read_cache(self, canonical_id: str) -> InstrumentCache | None:
-        row = (
-            await self._db.execute(
-                select(InstrumentCache).where(InstrumentCache.canonical_id == canonical_id)
-            )
-        ).scalar_one_or_none()
-        return row
-
-    async def _read_cache_bulk(self, canonical_ids: list[str]) -> dict[str, InstrumentCache]:
-        """One-shot SELECT WHERE canonical_id IN (...) — bounded by
-        the input batch size, so no risk of loading the whole cache."""
-        if not canonical_ids:
-            return {}
-        rows = (
-            (
-                await self._db.execute(
-                    select(InstrumentCache).where(InstrumentCache.canonical_id.in_(canonical_ids))
-                )
-            )
-            .scalars()
-            .all()
-        )
-        return {row.canonical_id: row for row in rows}
-
-    async def _write_cache(
-        self,
-        *,
-        spec: InstrumentSpec,
-        canonical_id: str,
-        instrument: Instrument,
-        trading_hours_json: dict[str, Any] | None,
-    ) -> None:
-        """Upsert into ``instrument_cache`` using
-        ``INSERT ... ON CONFLICT DO UPDATE`` so concurrent resolves
-        for the same instrument can't collide on the PK."""
-        table = InstrumentCache.__table__
-        nautilus_json = nautilus_instrument_to_cache_json(instrument)
-        # IB contract JSON — reconstruct from the spec so we store
-        # the user's intent alongside the Nautilus-side serialization.
-        # The live/refresh paths can re-derive the IBContract from
-        # this dict when the cache row is the only source of truth
-        # (e.g. after a Nautilus upgrade).
-        from msai.services.nautilus.security_master.ib_qualifier import (
-            spec_to_ib_contract,
-        )
-
-        ib_contract_dict = _ib_contract_to_dict(spec_to_ib_contract(spec))
-
-        stmt = pg_insert(InstrumentCache).values(
-            canonical_id=canonical_id,
-            asset_class=spec.asset_class,
-            venue=spec.venue,
-            ib_contract_json=ib_contract_dict,
-            nautilus_instrument_json=nautilus_json,
-            trading_hours=trading_hours_json,
-            last_refreshed_at=datetime.now(UTC),
-        )
-        upsert = stmt.on_conflict_do_update(
-            index_elements=[table.c.canonical_id],
-            set_={
-                "asset_class": stmt.excluded.asset_class,
-                "venue": stmt.excluded.venue,
-                "ib_contract_json": stmt.excluded.ib_contract_json,
-                "nautilus_instrument_json": stmt.excluded.nautilus_instrument_json,
-                "trading_hours": stmt.excluded.trading_hours,
-                "last_refreshed_at": stmt.excluded.last_refreshed_at,
-            },
-        )
-        await self._db.execute(upsert)
-        await self._db.commit()
-
-    # ------------------------------------------------------------------
     # Trading-hours extraction hook
     # ------------------------------------------------------------------
 
@@ -1190,78 +1069,3 @@ class SecurityMaster:
             liquid_hours=getattr(details, "liquidHours", None),
             time_zone_id=getattr(details, "timeZoneId", None),
         )
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _instrument_from_cache_row(row: InstrumentCache) -> Instrument:
-    """Rebuild a Nautilus ``Instrument`` from its cached
-    ``to_dict()`` JSONB blob.
-
-    Nautilus's concrete instrument classes (``Equity``,
-    ``FuturesContract``, ``OptionContract``, ``CurrencyPair``, …)
-    each have their own static ``from_dict(values)`` + per-class
-    ``to_dict(obj)`` (see e.g. ``model/instruments/equity.pyx``
-    line 207/224). There is no base-class dispatch by ``type``
-    field — we do that here from the ``"type"`` key each
-    ``to_dict`` writes.
-
-    Unknown types raise ``ValueError`` loudly so a corrupted or
-    future-schema cache row doesn't silently build the wrong
-    object.
-    """
-    from nautilus_trader.model.instruments import (
-        BettingInstrument,
-        BinaryOption,
-        CryptoFuture,
-        CryptoPerpetual,
-        CurrencyPair,
-        Equity,
-        FuturesContract,
-        FuturesSpread,
-        IndexInstrument,
-        OptionContract,
-        OptionSpread,
-        SyntheticInstrument,
-    )
-
-    data = dict(row.nautilus_instrument_json)
-    type_name = data.get("type")
-
-    dispatch: dict[str, type[Instrument]] = {
-        "Equity": Equity,
-        "FuturesContract": FuturesContract,
-        "FuturesSpread": FuturesSpread,
-        "OptionContract": OptionContract,
-        "OptionSpread": OptionSpread,
-        "CurrencyPair": CurrencyPair,
-        "CryptoFuture": CryptoFuture,
-        "CryptoPerpetual": CryptoPerpetual,
-        "IndexInstrument": IndexInstrument,
-        "BinaryOption": BinaryOption,
-        "BettingInstrument": BettingInstrument,
-        "SyntheticInstrument": SyntheticInstrument,
-    }
-    cls = dispatch.get(type_name or "")
-    if cls is None:
-        raise ValueError(
-            f"unknown instrument type in cache row: {type_name!r} — "
-            "schema drift between writer and reader",
-        )
-    return cls.from_dict(data)
-
-
-def _ib_contract_to_dict(contract) -> dict[str, Any]:  # type: ignore[no-untyped-def]
-    """Serialize an IBContract msgspec struct to a plain dict.
-
-    ``msgspec.structs.asdict`` is the canonical way to convert a
-    frozen struct into a dict without copying Nautilus's own
-    bespoke serialization. We keep this as a small helper so the
-    service doesn't take a direct dependency on msgspec.
-    """
-    import msgspec
-
-    return msgspec.structs.asdict(contract)
