@@ -1,8 +1,12 @@
-@CONTINUITY.md
+<!-- forge:migrated 2026-04-28 -->
 
 # CLAUDE.md — MSAI v2 (MarketSignal AI)
 
 ## Project Overview
+
+### Goal
+
+First real backtest — ingest market data and run EMA Cross strategy on real AAPL/SPY data.
 
 ### What Is This?
 
@@ -95,7 +99,6 @@ msai-v2/
 ├── docker-compose.dev.yml   # Ports: 3300, 8800, 5433, 6380
 ├── docker-compose.prod.yml
 ├── CLAUDE.md                # This file
-├── CONTINUITY.md            # Session state
 └── README.md
 ```
 
@@ -205,7 +208,7 @@ Live deployments sit under a `LivePortfolio → LivePortfolioRevision → LiveDe
 
 Tables `instrument_definitions` + `instrument_aliases` hold control-plane metadata for instrument resolution. UUID-keyed with effective-date windowing on aliases for futures rolls. `SecurityMaster.resolve_for_backtest` honors `start` kwarg for historical alias windowing. `msai instruments refresh --provider interactive_brokers` CLI warms the registry via IB qualification.
 
-**Deferred follow-ups** (see CONTINUITY):
+**Deferred follow-ups:**
 
 - Live-path wiring onto registry (currently `/live/start-portfolio` uses closed-universe `canonical_instrument_id()`)
 - `instrument_cache` → registry migration

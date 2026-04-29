@@ -51,6 +51,8 @@ data/alerts/
 .env.local
 .env.*.local
 .env.*-backup*
+.env.*-snapshot*
+.env.live-snapshot-*
 docker-compose.override.yml
 
 # IB Gateway credentials
@@ -78,3 +80,6 @@ Desktop.ini
 *.pem
 *.key
 data/databento_definitions/
+
+# Volatile per-developer workflow state (PR #2 / continuity-split)
+.claude/local/
