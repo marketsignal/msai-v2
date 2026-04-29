@@ -4,6 +4,40 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-04-28 — Developer-journey how-tos (branch `feat/how-tos-developer-journey`) — DOCS-ONLY PR
+
+**Goal:** 9-doc developer-journey set in `docs/architecture/` covering the path from blank repo → live P&L. Subsystem-level deep-dives modeled on `mcpgateway/docs/architecture/how-*-works.md`. ~5,440 lines, no code changes.
+
+**Docs shipped:**
+
+- `00-developer-journey.md` — front-of-house narrative + ASCII component diagram + Mermaid trial diagram
+- `how-symbols-work.md` — symbol onboarding, `instrument_definitions`+`instrument_aliases` registry
+- `how-strategies-work.md` — git-only authoring, `code_hash`/`git_sha`, `FailureIsolatedStrategy` (mixin, no shipping adopter)
+- `how-backtesting-works.md` — single-strategy single-symbol, BacktestRunner subprocess, QuantStats
+- `how-research-and-selection-works.md` — sweeps, walk-forward CV, OOS validation, promotion seam
+- `how-graduation-works.md` — 9-stage state machine, immutable transition log, no-RBAC-yet caveat
+- `how-backtest-portfolios-work.md` — multi-strategy × multi-symbol allocation; per-component fan-out + aggregation (no portfolio-level walk-forward yet)
+- `how-live-portfolios-and-ib-accounts.md` — `LivePortfolio→Revision→Deployment`, IB ports `(4002,4004)`/`(4001,4003)`, `DU`/`DF` paper prefixes, 3-layer idempotency, 4-layer kill-all, multi-IB-login fabric
+- `how-real-time-monitoring-works.md` — WebSocket + JWT first-message auth, dual-channel `msai:live:state:*` + `msai:live:events:*` pub/sub, dashboard
+
+**Workflow trajectory:**
+
+- **Phase 2 research:** N/A — docs-only, no external libraries (justification in research brief)
+- **Phase 3 design:** Codex (gpt-5.4 xhigh) consult validated structure on 2026-04-28 — adopted both Codex pivots: split walk-forward into research (not portfolio); split portfolio into backtest-vs-live as two distinct domains
+- **Phase 4 execution:** 4 parallel research agents (cluster A/B/C/D citation reports) → hand-write `00-developer-journey.md` to lock voice → 8 parallel writer subagents
+- **Phase 5 code-review loop (3 iterations):**
+  - **Round 1 (9 Claude reviewers in parallel):** found ~5 P0, ~34 P1, many P2 across the set. Codex CLI attempted in parallel but stalled reliably (12+ hour hangs at 0% CPU even with `high` reasoning); reverted to Claude-only review per user direction.
+  - **Round 1 fix-pass (9 parallel fixers):** every P0/P1/P2 addressed against actual source. Cross-doc propagated errors (graduation stage names, `backtest_job.py` filename, "approved-only" enforcement, SIM-venue pinning) batched in `scratch/shared-corrections.md`.
+  - **Round 2 (9 Claude reviewers):** confirmed 7 docs CLEAN; 1 doc (D5 graduation) had truncated round-1 fixer leaving P0 leftovers; 1 doc (D3 backtesting) had 3 NEW P1 fabrications surface in §5.
+  - **Round 2 targeted re-fixes:** D5 graduation re-fix scrubbed all risk-overlay fabrications + 422 body-shape examples; D3 backtesting fixed 3 fictional `FailureCode` enum values + SIGTERM/SIGKILL distinction; polish-pass landed 4 P2 nits across 00/01/02/08.
+  - **Round 3 (D5 only):** CLEAN.
+
+**P3 nits intentionally deferred:** style/cosmetic items not affecting correctness (mixin-vs-base-class wording, ASCII raggedness, single-line off-by-one cites).
+
+**Diagram convention:** ASCII canonical (portable, doesn't rot). One Mermaid trial in doc 00 — pending render-quality assessment on GitHub.
+
+**Files modified outside docs/architecture:** `docs/architecture/README.md` reading-order updated with new "Subsystem Deep Dives — Developer Journey" section.
+
 ### 2026-04-27 — Instrument-cache → registry migration (branch `feat/instrument-cache-registry-migration`) — PHASE 5 CODE-REVIEW LOOP CLOSED (3 iters)
 
 **Code-review loop trajectory:** iter-1 (2 P0 + 22 P1 + 25 P2 + 14 P3) → iter-2 (0 P0 + 8 P1 + 13 P2 + 7 P3) → iter-3 (0 P0 / 0 P1 / 0 P2 / 2 P3 deferrable). **Decisive convergence per `feedback_code_review_iteration_discipline.md`.**
