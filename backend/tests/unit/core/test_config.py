@@ -8,9 +8,11 @@ these values.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
-from msai.core.config import Settings
+from msai.core.config import Settings, settings
 
 
 def test_auto_heal_settings_have_council_defaults() -> None:
@@ -51,3 +53,18 @@ def test_auto_heal_settings_env_override(
     monkeypatch.setenv(env_var, env_value)
     s = Settings()
     assert getattr(s, attr) == expected
+
+
+def test_default_cost_ceiling_is_50_usd() -> None:
+    """Default symbol-onboarding cost ceiling is $50.00 (Task B4)."""
+    assert settings.symbol_onboarding_default_cost_ceiling_usd == Decimal("50.00")
+
+
+def test_cost_ceiling_overridable_via_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Operators can raise/lower the default ceiling via env without redeploy.
+
+    Validates the canonical alias (``MSAI_SYMBOL_ONBOARDING_DEFAULT_COST_CEILING_USD``).
+    """
+    monkeypatch.setenv("MSAI_SYMBOL_ONBOARDING_DEFAULT_COST_CEILING_USD", "100.50")
+    s = Settings()
+    assert s.symbol_onboarding_default_cost_ceiling_usd == Decimal("100.50")

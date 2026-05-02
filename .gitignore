@@ -83,3 +83,6 @@ data/databento_definitions/
 
 # Volatile per-developer workflow state (PR #2 / continuity-split)
 .claude/local/
+
+# Superpowers brainstorming visual companion (per-session mockups)
+.superpowers/

@@ -6,6 +6,8 @@ import {
   PublicClientApplication,
   type IPublicClientApplication,
 } from "@azure/msal-browser";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { Toaster } from "@/components/ui/sonner";
 import { msalConfig } from "@/lib/msal-config";
 
 const msalInstance = new PublicClientApplication(msalConfig);
@@ -37,4 +39,30 @@ export function AuthProvider({
   }
 
   return <MsalProvider instance={instance}>{children}</MsalProvider>;
+}
+
+export function QueryProviders({
+  children,
+}: {
+  children: React.ReactNode;
+}): React.ReactElement {
+  const [client] = useState(
+    () =>
+      new QueryClient({
+        defaultOptions: {
+          queries: {
+            staleTime: 30_000,
+            gcTime: 5 * 60_000,
+            refetchOnWindowFocus: false,
+            retry: 1,
+          },
+        },
+      }),
+  );
+  return (
+    <QueryClientProvider client={client}>
+      {children}
+      <Toaster richColors closeButton position="bottom-right" />
+    </QueryClientProvider>
+  );
 }

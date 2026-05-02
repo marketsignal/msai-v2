@@ -11,7 +11,6 @@ import {
   PieChart,
   Radio,
   BarChart3,
-  Database,
   Settings,
   Menu,
   X,
@@ -37,7 +36,6 @@ const navItems: NavItem[] = [
   { label: "Portfolio", href: "/portfolio", icon: PieChart },
   { label: "Live Trading", href: "/live-trading", icon: Radio },
   { label: "Market Data", href: "/market-data", icon: BarChart3 },
-  { label: "Data Management", href: "/data-management", icon: Database },
   { label: "Settings", href: "/settings", icon: Settings },
 ];
 

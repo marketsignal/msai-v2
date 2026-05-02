@@ -12,7 +12,7 @@ Contract pins (council-ratified 2026-04-24):
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Literal
@@ -163,3 +163,33 @@ class ReadinessResponse(BaseModel):
     missing_ranges: list[dict[str, Any]] = []
     live_qualified: bool
     coverage_summary: str | None = None
+
+
+class InventoryRow(BaseModel):
+    """One row in the bulk inventory response.
+
+    Mirrors `ReadinessResponse` plus pre-computed `status` (server-side
+    derived per `services/symbol_onboarding/inventory.derive_status`) and
+    `is_stale` boolean for client-side filtering / styling.
+    """
+
+    instrument_uid: UUID
+    symbol: str
+    asset_class: AssetClass
+    provider: str
+    registered: bool
+    backtest_data_available: bool | None
+    coverage_status: Literal["full", "gapped", "none"] | None
+    covered_range: str | None
+    missing_ranges: list[dict[str, str]] = []
+    is_stale: bool
+    live_qualified: bool
+    last_refresh_at: datetime | None
+    status: Literal[
+        "ready",
+        "stale",
+        "gapped",
+        "backtest_only",
+        "live_only",
+        "not_registered",
+    ]

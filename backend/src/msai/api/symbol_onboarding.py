@@ -6,6 +6,8 @@ Routes:
 - GET /api/v1/symbols/onboard/{run_id}/status — Poll job progress.
 - POST /api/v1/symbols/onboard/{run_id}/repair — Retry failed symbols only.
 - GET /api/v1/symbols/readiness — Window-scoped per-instrument readiness.
+- GET /api/v1/symbols/inventory — Bulk readiness across all registered instruments.
+- DELETE /api/v1/symbols/{symbol} — Soft-delete (hide from inventory).
 """
 
 from __future__ import annotations
@@ -19,9 +21,9 @@ from uuid import UUID, uuid4
 
 import redis.exceptions as redis_exceptions
 import structlog
-from fastapi import APIRouter, Depends, Path, Query, status
+from fastapi import APIRouter, Depends, Path, Query, Response, status
 from fastapi.responses import JSONResponse
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from msai.api._common import error_response
@@ -29,12 +31,14 @@ from msai.core.auth import get_current_user
 from msai.core.config import settings
 from msai.core.database import get_db
 from msai.core.queue import get_redis_pool
+from msai.models.instrument_definition import InstrumentDefinition
 from msai.models.symbol_onboarding_run import (
     SymbolOnboardingRun,
     SymbolOnboardingRunStatus,
 )
 from msai.schemas.symbol_onboarding import (
     DryRunResponse,
+    InventoryRow,
     OnboardProgress,
     OnboardRequest,
     OnboardResponse,
@@ -44,6 +48,7 @@ from msai.schemas.symbol_onboarding import (
     SymbolStateRow,
     SymbolStatus,
 )
+from msai.services.nautilus.live_instrument_bootstrap import exchange_local_today
 from msai.services.nautilus.security_master.registry import AmbiguousSymbolError
 from msai.services.nautilus.security_master.service import (
     SecurityMaster,
@@ -55,6 +60,7 @@ from msai.services.symbol_onboarding.cost_estimator import (
     estimate_cost,
 )
 from msai.services.symbol_onboarding.coverage import compute_coverage
+from msai.services.symbol_onboarding.inventory import derive_status, is_trailing_only
 from msai.services.symbol_onboarding.manifest import ParsedManifest
 
 # Asset classes the readiness endpoint accepts. Restricted to the registry
@@ -227,6 +233,11 @@ async def _enqueue_and_persist_run(
     EXISTING row's ``status`` (not a hardcoded "pending" — a duplicate
     POST after the run completed must not claim it's still pending).
     Happy path returns plain ``OnboardResponse`` so FastAPI applies 202.
+
+    Per Override O-15: this helper MUST NOT modify
+    ``InstrumentDefinition.hidden_from_inventory``. That column is
+    user-owned (set by DELETE /symbols/{symbol}, cleared by the pre-dedup
+    block in :func:`onboard`). Worker UPSERT paths must never touch it.
     """
     existing = (
         await db.execute(
@@ -339,22 +350,64 @@ async def onboard(
     - 409 Conflict — a concurrent submission claimed the slot first.
     - 503 Service Unavailable — Redis / arq queue rejected the submission.
     """
+    # Iteration-2 review fix: when request omits cost_ceiling_usd, fall back to
+    # settings default — but only if a Databento key is configured. Without a key,
+    # _compute_cost_estimate would raise (no client to call), so skip the cap and
+    # log a warning. Production always has the key; CLI/X-API-Key callers also
+    # get cap protection via this path.
+    effective_cap: Decimal | None = (
+        request.cost_ceiling_usd
+        if request.cost_ceiling_usd is not None
+        else (
+            settings.symbol_onboarding_default_cost_ceiling_usd
+            if settings.databento_api_key
+            else None
+        )
+    )
     estimated_cost: Decimal | None = None
-    if request.cost_ceiling_usd is not None:
+    if effective_cap is not None:
         try:
             estimate = await _compute_cost_estimate(request)
         except UnpriceableAssetClassError as exc:
             return _unpriceable_response(exc)
         estimated_cost = Decimal(str(estimate.total_usd))
-        if estimated_cost > request.cost_ceiling_usd:
+        if estimated_cost > effective_cap:
             return error_response(
                 status_code=422,
                 code="COST_CEILING_EXCEEDED",
                 message=(
-                    f"Estimated cost ${estimated_cost:.2f} exceeds "
-                    f"ceiling ${request.cost_ceiling_usd:.2f}."
+                    f"Estimated cost ${estimated_cost:.2f} exceeds ceiling ${effective_cap:.2f}."
                 ),
             )
+
+    if request.cost_ceiling_usd is None and not settings.databento_api_key:
+        log.warning(
+            "cost_cap_skipped_no_databento_key",
+            request_watchlist=request.watchlist_name,
+        )
+
+    # Iteration-2 review fix (Override O-11): when a user removes a symbol then
+    # re-onboards with identical request shape, ``_dedup_job_id`` may return an
+    # existing run before any worker UPSERT path runs — so the hidden flag
+    # would stay True without this explicit clear. Run an idempotent UPDATE
+    # for every (raw_symbol, asset_class) tuple in the request that's currently
+    # hidden. Override O-15: this is one of the only two sites allowed to
+    # mutate ``hidden_from_inventory`` (the other being the DELETE endpoint
+    # below).
+    #
+    # Iter-1 review fix (P2-1): runs AFTER the cost-cap 422 short-circuit so
+    # a rejected onboard does NOT silently re-surface a soft-deleted symbol.
+    for spec in request.symbols:
+        await db.execute(
+            update(InstrumentDefinition)
+            .where(
+                InstrumentDefinition.raw_symbol == spec.symbol,
+                InstrumentDefinition.asset_class == spec.asset_class,
+                InstrumentDefinition.hidden_from_inventory.is_(True),
+            )
+            .values(hidden_from_inventory=False)
+        )
+    await db.commit()
 
     job_id = _dedup_job_id(request)
     digest_hex = job_id.removeprefix("symbol-onboarding:")
@@ -584,7 +637,7 @@ async def readiness(
         resolution = await master.find_active_aliases(
             symbol=symbol,
             asset_class=asset_class,
-            as_of_date=_date.today(),
+            as_of_date=exchange_local_today(),
         )
     except AmbiguousSymbolError as exc:
         return error_response(
@@ -639,3 +692,129 @@ async def readiness(
         live_qualified=live_qualified,
         coverage_summary=None,
     )
+
+
+@router.get("/inventory", response_model=list[InventoryRow])
+async def inventory(
+    start: _date | None = Query(default=None),  # noqa: B008
+    end: _date | None = Query(default=None),  # noqa: B008
+    asset_class: ReadinessAssetClass | None = Query(default=None),  # noqa: B008
+    _user: Any = Depends(get_current_user),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+) -> list[InventoryRow]:
+    """Bulk readiness across all registered instruments.
+
+    Window-scoped: when ``start`` + ``end`` are provided, computes
+    ``coverage_status`` + ``backtest_data_available`` per row; otherwise
+    returns nulls + bare registration metadata.
+
+    Optional ``asset_class`` filter narrows the row set. Hidden
+    (soft-deleted) rows are excluded.
+
+    Performance: per-row filesystem scan for coverage. Uses
+    :func:`asyncio.gather` with a concurrency cap of 10. v1 target
+    < 800ms at 80-symbol inventory.
+    """
+    master = SecurityMaster(db=db)
+    registered = await master.list_registered_instruments(asset_class=asset_class)
+    today = exchange_local_today()
+
+    async def _build_one(item: Any) -> InventoryRow:
+        ingest_asset = normalize_asset_class_for_ingest(item.asset_class)
+        coverage_status: Literal["full", "gapped", "none"] | None = None
+        covered_range: str | None = None
+        missing_ranges_typed: list[tuple[_date, _date]] = []
+        backtest_data_available: bool | None = None
+
+        if start is not None and end is not None:
+            report = await compute_coverage(
+                asset_class=ingest_asset,
+                symbol=item.raw_symbol,
+                start=start,
+                end=end,
+                data_root=_FsPath(settings.data_root),
+                today=today,
+            )
+            coverage_status = report.status
+            covered_range = report.covered_range
+            missing_ranges_typed = report.missing_ranges
+            backtest_data_available = report.status == "full"
+
+        bt_avail_for_status = (
+            bool(backtest_data_available) if backtest_data_available is not None else False
+        )
+        status_value = derive_status(
+            registered=True,
+            bt_avail=bt_avail_for_status,
+            live=item.live_qualified,
+            coverage_status=coverage_status,
+            missing_ranges=missing_ranges_typed,
+            today=today,
+        )
+
+        return InventoryRow(
+            instrument_uid=item.instrument_uid,
+            symbol=item.raw_symbol,  # API exposes "symbol"; model field is raw_symbol
+            asset_class=item.asset_class,
+            provider=item.provider,
+            registered=True,
+            backtest_data_available=backtest_data_available,
+            coverage_status=coverage_status,
+            covered_range=covered_range,
+            missing_ranges=[
+                {"start": s.isoformat(), "end": e.isoformat()} for s, e in missing_ranges_typed
+            ],
+            is_stale=is_trailing_only(missing_ranges=missing_ranges_typed, today=today),
+            live_qualified=item.live_qualified,
+            last_refresh_at=item.last_refresh_at,
+            status=status_value,
+        )
+
+    semaphore = asyncio.Semaphore(10)
+
+    async def _bounded(item: Any) -> InventoryRow:
+        async with semaphore:
+            return await _build_one(item)
+
+    return list(await asyncio.gather(*(_bounded(item) for item in registered)))
+
+
+@router.delete("/{symbol}", response_model=None)
+async def remove_symbol(
+    symbol: str,
+    asset_class: ReadinessAssetClass = Query(...),  # noqa: B008
+    _user: Any = Depends(get_current_user),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+) -> Response | JSONResponse:
+    """Soft-delete: hide the (symbol, asset_class) instrument from the
+    user-visible inventory. Underlying Parquet data is preserved.
+    Re-onboarding the symbol via POST /onboard restores visibility (see
+    pre-dedup clear-flag in the onboard handler).
+
+    Per Pablo's intent (single-user product): does NOT block on usage in
+    active strategies / live deployments. The user owns inventory state.
+
+    **Errors:**
+    - 404 NOT_FOUND — no active alias rows for ``(symbol, asset_class)``.
+    - 401 Unauthorized — JWT missing or invalid.
+    """
+    master = SecurityMaster(db=db)
+    resolution = await master.find_active_aliases(
+        symbol=symbol,
+        asset_class=asset_class,
+        as_of_date=exchange_local_today(),
+    )
+    if resolution.instrument_uid is None:
+        return error_response(
+            status_code=404,
+            code="NOT_FOUND",
+            message=f"Symbol {symbol!r} not registered for asset_class={asset_class!r}",
+        )
+
+    await db.execute(
+        update(InstrumentDefinition)
+        .where(InstrumentDefinition.instrument_uid == resolution.instrument_uid)
+        .values(hidden_from_inventory=True)
+    )
+    await db.commit()
+    return Response(status_code=204)

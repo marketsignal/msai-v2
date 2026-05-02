@@ -589,3 +589,160 @@ export interface PortfolioRunListResponse {
   items: PortfolioRunResponse[];
   total: number;
 }
+
+// ─── Inventory + symbol-onboarding types (universe-page) ───────────────────
+
+export type AssetClass = "equity" | "futures" | "fx" | "option";
+export type InventoryStatus =
+  | "ready"
+  | "stale"
+  | "gapped"
+  | "backtest_only"
+  | "live_only"
+  | "not_registered";
+
+export interface InventoryRow {
+  instrument_uid: string;
+  symbol: string;
+  asset_class: AssetClass;
+  provider: string;
+  registered: boolean;
+  backtest_data_available: boolean | null;
+  coverage_status: "full" | "gapped" | "none" | null;
+  covered_range: string | null;
+  missing_ranges: { start: string; end: string }[];
+  is_stale: boolean;
+  live_qualified: boolean;
+  last_refresh_at: string | null;
+  status: InventoryStatus;
+}
+
+export interface OnboardSymbolSpec {
+  symbol: string;
+  asset_class: AssetClass;
+  start: string;
+  end: string;
+}
+
+export interface OnboardRequest {
+  watchlist_name: string;
+  symbols: OnboardSymbolSpec[];
+  request_live_qualification?: boolean;
+  cost_ceiling_usd?: string;
+}
+
+export type OnboardLifecycle =
+  | "pending"
+  | "in_progress"
+  | "completed"
+  | "completed_with_failures"
+  | "failed";
+
+export interface OnboardResponse {
+  run_id: string;
+  watchlist_name: string;
+  status: OnboardLifecycle;
+}
+
+export interface DryRunResponse {
+  watchlist_name: string;
+  dry_run: true;
+  estimated_cost_usd: string;
+  estimate_basis: string;
+  estimate_confidence: "high" | "medium" | "low";
+  symbol_count: number;
+  breakdown: Array<Record<string, unknown>>;
+}
+
+export interface OnboardStatusResponse {
+  run_id: string;
+  watchlist_name: string;
+  status: OnboardLifecycle;
+  progress: {
+    total: number;
+    succeeded: number;
+    failed: number;
+    in_progress: number;
+    not_started: number;
+  };
+  per_symbol: Array<{
+    symbol: string;
+    asset_class: AssetClass;
+    start: string;
+    end: string;
+    status: "not_started" | "in_progress" | "succeeded" | "failed";
+    step: string;
+    error: Record<string, unknown> | null;
+    next_action: string | null;
+  }>;
+  estimated_cost_usd: string | null;
+  actual_cost_usd: string | null;
+}
+
+export async function getInventory(
+  token: string | null,
+  params: { start?: string; end?: string; asset_class?: AssetClass } = {},
+): Promise<InventoryRow[]> {
+  const query = new URLSearchParams();
+  if (params.start) query.set("start", params.start);
+  if (params.end) query.set("end", params.end);
+  if (params.asset_class) query.set("asset_class", params.asset_class);
+  const qs = query.toString();
+  const path = `/api/v1/symbols/inventory${qs ? "?" + qs : ""}`;
+  return apiGet<InventoryRow[]>(path, token);
+}
+
+export async function postOnboard(
+  token: string | null,
+  body: OnboardRequest,
+): Promise<OnboardResponse> {
+  return apiPost<OnboardResponse>("/api/v1/symbols/onboard", body, token);
+}
+
+export async function postOnboardDryRun(
+  token: string | null,
+  body: OnboardRequest,
+): Promise<DryRunResponse> {
+  return apiPost<DryRunResponse>(
+    "/api/v1/symbols/onboard/dry-run",
+    body,
+    token,
+  );
+}
+
+export async function getOnboardStatus(
+  token: string | null,
+  runId: string,
+): Promise<OnboardStatusResponse> {
+  return apiGet<OnboardStatusResponse>(
+    `/api/v1/symbols/onboard/${runId}/status`,
+    token,
+  );
+}
+
+/**
+ * DELETE /api/v1/symbols/{symbol}?asset_class=... — soft-deletes inventory row.
+ * Backend disambiguates by (symbol, asset_class) since the same ticker can map
+ * to multiple instruments across asset classes (Override O-3 + O-10).
+ */
+export async function deleteSymbol(
+  token: string | null,
+  args: { symbol: string; asset_class: AssetClass },
+): Promise<void> {
+  const path =
+    `/api/v1/symbols/${encodeURIComponent(args.symbol)}` +
+    `?asset_class=${encodeURIComponent(args.asset_class)}`;
+  const res = await apiFetch(path, { method: "DELETE" }, token);
+  if (res.status === 204) return;
+  let body: unknown = null;
+  try {
+    body = await res.json();
+  } catch {
+    // ignore
+  }
+  throw new ApiError(
+    `DELETE /api/v1/symbols/${args.symbol} failed: ${res.status}`,
+    res.status,
+    body,
+  );
+}

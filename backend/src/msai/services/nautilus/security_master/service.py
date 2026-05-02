@@ -175,6 +175,25 @@ class AliasResolution:
         return f"Registered via {self.primary_provider}; live-qualified: {self.has_ib_alias}"
 
 
+@dataclass(frozen=True, slots=True)
+class _RegisteredInstrument:
+    """One registered instrument with its aggregated live-qualification flag.
+
+    Returned by :meth:`SecurityMaster.list_registered_instruments` for the
+    bulk inventory endpoint. ``live_qualified`` is computed as
+    "any active alias for this instrument_uid carries
+    ``provider='interactive_brokers'``" so a single SELECT serves all
+    inventory rows.
+    """
+
+    instrument_uid: uuid.UUID
+    raw_symbol: str  # matches InstrumentDefinition.raw_symbol
+    asset_class: str
+    provider: str
+    live_qualified: bool
+    last_refresh_at: datetime | None
+
+
 class SecurityMaster:
     """Registry-backed instrument resolver.
 
@@ -683,6 +702,83 @@ class SecurityMaster:
         # shape-heuristic fallback rather than raising.
         return _REGISTRY_TO_INGEST_ASSET_CLASS.get(idef.asset_class)  # type: ignore[call-overload,no-any-return]
 
+    async def list_registered_instruments(
+        self,
+        *,
+        asset_class: str | None = None,
+    ) -> list[_RegisteredInstrument]:
+        """Return all instruments with at least one currently-active alias,
+        grouped by definition with an aggregated ``live_qualified`` flag.
+
+        Used by the bulk inventory endpoint at
+        ``GET /api/v1/symbols/inventory``. Filters out
+        ``hidden_from_inventory`` rows (B6a soft-delete).
+
+        v1 trade-off: ``last_refresh_at = InstrumentDefinition.updated_at``.
+        This reflects ANY row mutation (alias rotation, registration
+        correction), not strictly successful data downloads. Acceptable for
+        v1's expected 30-80 row inventory. Deferred follow-up: denormalized
+        ``last_refresh`` column updated by the worker on successful runs.
+        """
+        from sqlalchemy import func
+
+        from msai.models.instrument_alias import InstrumentAlias
+        from msai.models.instrument_definition import InstrumentDefinition
+        from msai.services.nautilus.live_instrument_bootstrap import exchange_local_today
+
+        ib_present_expr = func.bool_or(InstrumentAlias.provider == "interactive_brokers").label(
+            "live_qualified"
+        )
+
+        # Iter-1 review fix (P2-4): use Chicago "today" — the project invariant
+        # for alias windowing per `feedback_alias_windowing_must_use_exchange_local_today`.
+        # ``func.current_date()`` evaluates in Postgres server tz; matching the
+        # writer side (and find_active_aliases) keeps the boundary uniform.
+        today = exchange_local_today()
+
+        stmt = (
+            select(
+                InstrumentDefinition.instrument_uid,
+                InstrumentDefinition.raw_symbol,
+                InstrumentDefinition.asset_class,
+                InstrumentDefinition.provider,
+                InstrumentDefinition.updated_at,
+                ib_present_expr,
+            )
+            .join(
+                InstrumentAlias,
+                InstrumentAlias.instrument_uid == InstrumentDefinition.instrument_uid,
+            )
+            .where(InstrumentAlias.effective_from <= today)
+            .where(InstrumentAlias.effective_to.is_(None) | (InstrumentAlias.effective_to > today))
+            .where(InstrumentDefinition.hidden_from_inventory.is_(False))
+            .group_by(
+                InstrumentDefinition.instrument_uid,
+                InstrumentDefinition.raw_symbol,
+                InstrumentDefinition.asset_class,
+                InstrumentDefinition.provider,
+                InstrumentDefinition.updated_at,
+            )
+        )
+        if asset_class is not None:
+            stmt = stmt.where(InstrumentDefinition.asset_class == asset_class)
+        stmt = stmt.order_by(InstrumentDefinition.raw_symbol)
+
+        result = await self._db.execute(stmt)
+        rows = result.all()
+
+        return [
+            _RegisteredInstrument(
+                instrument_uid=r.instrument_uid,
+                raw_symbol=r.raw_symbol,
+                asset_class=r.asset_class,
+                provider=r.provider,
+                live_qualified=bool(r.live_qualified),
+                last_refresh_at=r.updated_at,
+            )
+            for r in rows
+        ]
+
     async def find_active_aliases(
         self,
         *,
@@ -1008,6 +1104,16 @@ class SecurityMaster:
         # without this, a futures roll or repeated refreshes on different
         # days leave multiple aliases active simultaneously and the caller
         # picks arbitrarily.
+        #
+        # E2E rerun fix (2026-05-01): also exclude same-day siblings from the
+        # close. If two distinct aliases (e.g. MSFT.NASDAQ + MSFT.NYSE) get
+        # written in the same Chicago day, closing the first when the second
+        # arrives would leave both aliases with ``effective_to = today``
+        # (the [effective_from, effective_to) window collapses to empty), so
+        # the read-side filter ``effective_to > today`` excludes both — ZERO
+        # active aliases. Bounding the close to ``effective_from < today``
+        # keeps both same-day aliases active; downstream ``active alias``
+        # pickers tolerate multiples (they pick the first), but never zero.
         close_stmt = (
             update(InstrumentAlias)
             .where(
@@ -1019,6 +1125,8 @@ class SecurityMaster:
                 # ON CONFLICT DO NOTHING on
                 # ``(alias_string, provider, effective_from)``).
                 InstrumentAlias.alias_string != alias_string,
+                # Don't close same-day siblings either; see comment above.
+                InstrumentAlias.effective_from < today,
             )
             .values(effective_to=today)
         )

@@ -4,6 +4,85 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-05-01 — Market Data v1 / `/universe-page` Phase 5 code-review loop — iter-1 + iter-2 fixes (branch `feat/universe-page`) — IN PROGRESS
+
+**Goal:** /loop tick-1 of 10-min cadence — drive Phase 5 quality gates to "ready to merge."
+
+**Code-review loop (in progress, 2 iterations so far — productive narrowing):**
+
+- **Iter 1** (pr-review-toolkit code-reviewer; Codex unavailable per memory `feedback_codex_cli_locked_out_council_fallback`): 0 P0 / 1 P1 / 4 P2.
+  - **P1-1 (watchlist regex)**: symbols containing `.`, `_`, `/` (`BRK.B`, `ES.c.0`, `EUR/USD`) failed backend validation `^[a-z0-9-]+$` when used in `watchlist_name`. Added `slugifySymbol(s) = s.toLowerCase().replace(/[^a-z0-9-]+/g, "-")` and applied at both call sites: `frontend/src/lib/hooks/use-symbol-mutations.ts` (refresh slug) + `frontend/src/components/market-data/add-symbol-dialog.tsx` (onboard slug).
+  - **P2-1 (cost-cap visibility leak)**: pre-dedup `UPDATE hidden_from_inventory=False` ran BEFORE the cap-check 422 short-circuit — a rejected onboard would silently un-hide. Moved the block to AFTER the cap-check in `backend/src/msai/api/symbol_onboarding.py`.
+  - **P2-2 (missing regression tests)**: added `test_re_onboard_after_delete_restores_visibility_even_when_deduplicated` (Override O-11; exercises the dedup path explicitly with two POSTs of identical canonical body) and `test_worker_upsert_does_not_modify_hidden_from_inventory` (Override O-15; verifies `_upsert_definition_and_alias` source-level invariant by seeding hidden=True and asserting the writer doesn't touch the column).
+  - **P2-3 (misleading column header)**: "Last refresh" → "Last update" in `inventory-table.tsx` + `row-drawer.tsx` with comment explaining v1's `last_refresh_at = updated_at` trade-off (column advances on any row mutation, not exclusively on data ingestion).
+  - **P2-4 (mixed today() semantics)**: `func.current_date()` (Postgres server-tz) and `_date.today()` (UTC) replaced with `exchange_local_today()` (Chicago) in `services/nautilus/security_master/service.py:list_registered_instruments` and 3 callsites in `api/symbol_onboarding.py`. Project invariant per memory `feedback_alias_windowing_must_use_exchange_local_today`. Required co-locating import + usage in single edit pattern (memory: `feedback_colocate_imports_with_usage_in_edits`) — done usage-first to survive ruff format pass.
+
+- **Iter 2** (pr-review-toolkit code-reviewer): 0 P0 / 0 P1 / 3 P2.
+  - **P2-A (chart deep-link broken)**: `frontend/src/app/market-data/chart/page.tsx` never read `useSearchParams()` — the inventory's "View chart" navigation set `?symbol=AAPL` in the URL but the page silently picked `flat[0].value` instead. Added `useSearchParams` import + `initialSymbol = searchParams.get("symbol") ?? ""` to seed `useState<string>(initialSymbol)`. Fall-through to `flat[0]` only when the param is absent.
+  - **P2-B (missing 422-rejection regression test)**: added `test_cost_cap_rejection_does_not_clear_hidden_from_inventory` — seeds hidden=True, POSTs with cap < dry-run estimate, asserts 422 + `hidden is True` + `pool.enqueue_job.assert_not_awaited()`. Future refactor reverting the iter-1 P2-1 reorder will now break this test.
+  - **P2-C (dedup test fidelity)**: added `pool.enqueue_job.assert_awaited_once()` to `test_re_onboard_after_delete_restores_visibility_even_when_deduplicated`. Proves the second POST took the dedup branch rather than spawning a new arq job (run_id match alone is reasonable but not airtight).
+  - **P3-B fixed inline**: stale UC5 reference `test_remove_during_in_flight_onboard_stays_hidden` → `test_worker_upsert_does_not_modify_hidden_from_inventory` (the actual test name).
+
+- **Iter-1 fix verification:** all 3 new + iterated tests pass (`pytest tests/integration/api/test_symbol_onboarding_api.py::{cost_cap_rejection,re_onboard,worker_upsert}` 3/3 in 2.93s); mypy --strict clean; ruff clean on all touched files (78 ruff errors are pre-existing on main, confirmed via `git stash` + recheck — outside this branch's scope).
+
+**Test count update:** 51 backend tests in scope (was 48; added 1 new test in iter-2 + iter-2 strengthened 1 existing test with enqueue assertion). All pass. Frontend tsc + eslint still clean (1 pre-existing warning in `app/research/page.tsx` — unrelated).
+
+**Workflow-loop trajectory (`feedback_code_review_iteration_discipline`):** iter-1 (0/1/4) → iter-2 (0/0/3) — narrowing. Findings became more specific each pass. No architectural surprises.
+
+**Workflow state:** Phase 5 — Quality gates. Next tick: iter-3 review (expected clean) → simplify → verify → E2E (verify-e2e against running stack for UC1–UC6) → Phase 6 (commit + PR). Wakeup scheduled for 10-min cadence per user's `/loop` invocation.
+
+### 2026-05-01 — Market Data v1 / `/universe-page` Phase 4 complete — frontend + E2E use cases (branch `feat/universe-page`) — IN PROGRESS
+
+**Goal:** Symbol-centric inventory page at `/market-data` replacing `/data-management`. Phase 4 (TDD execution) complete this session — all 18 tasks done across both halves; ready for Phase 5 quality gates.
+
+**Frontend shipped this session (uncommitted in worktree, lands at Phase 5):**
+
+- **C1 routing reshape:** moved `frontend/src/app/market-data/page.tsx` → `.../market-data/chart/page.tsx` (chart now lives at `/market-data/chart`); deleted `frontend/src/app/data-management/` and the unused `frontend/src/components/data/{storage-chart,ingestion-status}.tsx` components; removed Data Management entry + `Database` icon import from sidebar.
+- **D1 typed API + inventory hook:** added `InventoryRow` / `OnboardRequest` / `OnboardResponse` / `DryRunResponse` / `OnboardStatusResponse` types + `getInventory` / `postOnboard` / `postOnboardDryRun` / `getOnboardStatus` / `deleteSymbol` helpers to `frontend/src/lib/api.ts`. Created `useInventoryQuery` (TanStack Query v5) with Override O-5 applied: flat-string debounce + `useMemo` to avoid object-identity infinite re-render.
+- **D2 StatusBadge:** 6-variant pill (`ready` / `stale` / `gapped` / `backtest_only` / `live_only` / `not_registered`), color + icon + text per accessibility rule "never color alone."
+- **D3 InventoryTable:** sticky header, kebab actions per row (Refresh / Repair gaps / View chart / Remove), Override O-6 applied (server-trusted `is_stale`, no client double-count).
+- **D4 RowDrawer:** sectioned panel (Actions / Coverage / Recent jobs / Metadata) with per-range Repair buttons; closes mutually-exclusively with JobsDrawer.
+- **D5 AddSymbolDialog:** dry-run cost preview with explicit $0-included emerald banner branch (Pablo's Databento plan covers v1 schemas) vs sky-blue estimated-cost banner. Explicit return types added per project typescript-style rule.
+- **D6 polling discipline:** pure `computeRefetchInterval(status, prevStatus, consecutiveSameCount)` in `frontend/src/lib/hooks/refetch-policy.ts` per Overrides O-7 + O-13 (consistent 2s base, exp backoff to 30s on no-state-change, terminal-status returns `false` for hard stop). `useJobStatusQuery` integrates per Override O-16 with `useRef` for prevStatus + sameCount (mutated outside render phase, React 19 strict-mode safe). `refetchIntervalInBackground: false` for visibility-pause.
+- **D7 HeaderToolbar + EmptyState:** asset-class ToggleGroup (All / Equity / Futures / FX), trailing-window Select (1y / 2y / 5y / 10y / Custom), Add + Jobs buttons, conditional bulk-action chips (`<N> stale · Refresh all`, `<N> gapped · Repair all`).
+- **E1 page composition:** `frontend/src/app/market-data/page.tsx` rewritten to compose all subcomponents. Mutually-exclusive drawer rule enforced (open one → close other). Override O-8 confirm-remove flow: shadcn AlertDialog with soft-delete description ("Parquet preserved, active strategies not blocked, re-onboarding restores"); `useRemoveSymbol` mutation invalidates inventory query on success. Bulk repair fans out per-row refresh covering the full window (worker dedups inside).
+
+**E2E use cases authored (Phase 3.2b artifact):** 6 markdown files at `tests/e2e/use-cases/market-data/uc{1..6}*.md` covering: browse inventory (UC1) · add-symbol $0 happy path (UC2) · refresh stale (UC3) · repair mid-window gap (UC4) · remove-from-inventory + re-onboard restore (UC5) · jobs-drawer polling discipline (UC6: 2s cadence + visibility-pause + terminal-stop). Each follows the Intent → Setup (sanctioned ARRANGE only) → Steps → Verification → Persistence template.
+
+**Verification this session:** full-frontend `pnpm exec tsc --noEmit` exit 0; `pnpm lint` 0 errors (2 pre-existing warnings in unrelated files: `app/research/page.tsx` exhaustive-deps + `tests/e2e/fixtures/auth.ts` unused param). Backend tests untouched this session — 28 still pass from prior.
+
+**Files touched this session:** 19 files changed — 1 chart-page rename, 2 deletions (data-management page + 2 unused data components), 9 new frontend components/hooks/use-cases, 6 new use-case markdown files, sidebar + api.ts + page.tsx + state.md edits.
+
+**Backend shipped (uncommitted in worktree, lands at Phase 5):**
+
+- New: `GET /api/v1/symbols/inventory?start=&end=&asset_class=` — bulk readiness with server-derived `status` field (`ready` / `stale` / `gapped` / `backtest_only` / `live_only` / `not_registered`) per the council taxonomy. Single SQL query with `bool_or` aggregation for IB qualification (no per-row N+1). Filters out hidden rows. Concurrency-capped `asyncio.gather` for per-row coverage scans.
+- New: `DELETE /api/v1/symbols/{symbol}?asset_class=` — soft-delete sets `instrument_definitions.hidden_from_inventory = true`. Parquet preserved. Per Pablo's call: does NOT block on usage in active strategies/live deployments. 204 on success, 404 if symbol not registered.
+- New column: `instrument_definitions.hidden_from_inventory: BOOLEAN NOT NULL DEFAULT FALSE` + Alembic migration `1e2d728f1b32`.
+- Modified `POST /api/v1/symbols/onboard`: (a) cost-cap fallback to new settings default `symbol_onboarding_default_cost_ceiling_usd` ($50) gated on `databento_api_key` presence — protects CLI/X-API-Key callers; logs `cost_cap_skipped_no_databento_key` warning when key absent. (b) Pre-dedup UPDATE clears `hidden_from_inventory=False` for any symbols in the request, so re-onboarding a removed symbol restores visibility even when the run is deduplicated. Per Override O-15: worker UPSERT path does NOT touch the hidden flag (user-owned column).
+- New helpers: `services/symbol_onboarding/inventory.py` — pure `derive_status` (worst-actionable-wins priority resolution) + `is_trailing_only` (single-range, prev-month-start boundary). 18 unit tests.
+- New: `SecurityMaster.list_registered_instruments` bulk reader using project conventions (`self._db`, `raw_symbol`, `provider` model fields).
+- New schema: `InventoryRow` Pydantic model (13 fields) with the locked status taxonomy.
+
+**Tests added:** 28 total — 18 unit (B1) + 8 integration (B3 inventory + B6b DELETE/restore) + 2 added to existing `test_symbol_onboarding_api.py` (B5 cap fallback branches + B6b re-onboard race fix). All ruff + mypy --strict clean.
+
+**Frontend pending:** C1 (routing reshape — move chart to `/market-data/chart`, retire `/data-management`, sidebar update), D1–D7 (TanStack Query hooks, StatusBadge, InventoryTable, RowDrawer, AddSymbolDialog, JobsDrawer, HeaderToolbar+EmptyState), E1 (page assembly + remove flow + AlertDialog), F1 (E2E use cases UC1-UC6). Plan + design + 16 corrections at `docs/plans/2026-05-01-universe-page.md` and `docs/plans/2026-05-01-universe-page-design.md`.
+
+**Workflow trajectory:**
+
+- **Phase 1:** PRD reframed mid-discussion from watchlist-centric (locked SPLIT_RELEASE_TRAIN scope 2026-04-30) to symbol-centric (Pablo's vision 2026-05-01); validated via Codex second opinion. Empirical Databento billing probe confirmed v1 schemas are $0 metered under Pablo's existing plan; cost-cap reframed as defense-in-depth not primary friction.
+- **Phase 2:** Research-first agent surfaced TanStack Query v5 as the canonical polling/cancellation surface; flagged perf risk on per-row coverage scans at 80 rows.
+- **Phase 3:** Engineering Council (5 advisors + Codex chairman gpt-5.5 xhigh) ratified all 9 design questions. Hawk's CONDITIONAL verdict surfaced 3 NFR blockers (polling discipline, debounce, server-side cap) — accepted as v1 hard-requirements.
+- **Plan-review loop (3 iterations):**
+  - **Iter 1** (Codex gpt-5.5 xhigh): 2 P0 + 12 P1 + 5 P2. Major findings: providers.tsx collision, `list_registered_instruments` compile errors, `last_refresh_at` source wrong, polling backoff missing, fixtures non-existent, US-005 remove not in tasks.
+  - **Iter 2** (Codex gpt-5.5 xhigh): 1 P0 + 5 P1 + 2 P2 + 1 P3. Caught B3 referencing column added by B6, `apiDelete` 204 incompatibility with `apiPost` shape, re-onboard race with dedup path, asset_class collision in JSONB key check.
+  - **Iter 3** (Claude self-review; Codex stalled at 17 min on now-3300-line plan, matching `feedback_codex_cli_stalls_on_long_audit_prompts`): 0 P0 + 1 P1 + 1 P2. Worker UPSERT must NOT touch hidden flag (user-remove race during in-flight onboard); polling integration wiring snippet missing.
+  - User sign-off closed the loop per workflow fallback.
+
+**Caveats:**
+
+- B6a Alembic autogen surfaced 3 unrelated pre-existing model/DB drift items (`ix_instrument_aliases_uid` rename, `order_attempt_audits` unique-constraint→index swap, `ix_symbol_onboarding_runs_created_at` drop). Stripped from this branch's migration to keep focus. Follow-up cleanup migration owed per "no bugs left behind."
+- B3 perf spike at 80 real symbols deferred — dev stack containers from another worktree blocking startup. Re-run when stack is up.
+
 ### 2026-04-28 — Developer-journey how-tos (branch `feat/how-tos-developer-journey`) — DOCS-ONLY PR
 
 **Goal:** 9-doc developer-journey set in `docs/architecture/` covering the path from blank repo → live P&L. Subsystem-level deep-dives modeled on `mcpgateway/docs/architecture/how-*-works.md`. ~5,440 lines, no code changes.
