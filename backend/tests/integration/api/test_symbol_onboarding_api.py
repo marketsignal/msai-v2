@@ -830,3 +830,100 @@ async def test_cost_cap_rejection_does_not_clear_hidden_from_inventory(
     )
     # And no enqueue_job call was made — the rejection short-circuited.
     pool.enqueue_job.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_enqueue_503_does_not_clear_hidden_from_inventory(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex iter-2 review fix (P2): when the Redis enqueue path returns 503,
+    the pre-dedup ``hidden_from_inventory=False`` UPDATE must be rolled back.
+    Otherwise a re-onboard attempt that the queue rejects would silently
+    re-surface a soft-deleted symbol with no run started.
+    """
+    from datetime import date
+
+    from sqlalchemy import select
+
+    from msai.models.instrument_alias import InstrumentAlias
+    from msai.models.instrument_definition import InstrumentDefinition
+
+    # ARRANGE: hidden alias for AAPL.
+    async with session_factory() as s:
+        defn = InstrumentDefinition(
+            raw_symbol="AAPL",
+            listing_venue="XNAS",
+            routing_venue="XNAS",
+            asset_class="equity",
+            provider="databento",
+            hidden_from_inventory=True,
+        )
+        s.add(defn)
+        await s.flush()
+        s.add(
+            InstrumentAlias(
+                instrument_uid=defn.instrument_uid,
+                alias_string="AAPL.XNAS",
+                provider="databento",
+                venue_format="exchange_name",
+                effective_from=date(2020, 1, 1),
+                effective_to=None,
+            )
+        )
+        await s.commit()
+        instrument_uid = defn.instrument_uid
+
+    payload: dict[str, Any] = {
+        "watchlist_name": "test-enqueue-fail",
+        "symbols": [
+            {
+                "symbol": "AAPL",
+                "asset_class": "equity",
+                "start": "2024-01-01",
+                "end": "2025-01-01",
+            }
+        ],
+        "cost_ceiling_usd": "100.00",
+    }
+
+    from msai.core.config import settings
+
+    monkeypatch.setattr(settings, "databento_api_key", "test-key-present")
+
+    # ACT: enqueue raises ConnectionError → 503 QUEUE_UNAVAILABLE.
+    pool = _make_pool(raises=ConnectionError("redis down"))
+    with (
+        patch("msai.api.symbol_onboarding._get_arq_pool", new=AsyncMock(return_value=pool)),
+        patch(
+            "msai.api.symbol_onboarding.estimate_cost",
+            new_callable=AsyncMock,
+            return_value=_fake_estimate(total_usd=5.00),
+        ),
+        patch(
+            "msai.api.symbol_onboarding._get_databento_client",
+            return_value=object(),
+        ),
+    ):
+        response = await client.post("/api/v1/symbols/onboard", json=payload)
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "QUEUE_UNAVAILABLE"
+
+    # ASSERT: hidden flag still True — failed enqueue must NOT un-hide.
+    async with session_factory() as s:
+        result = await s.execute(
+            select(InstrumentDefinition.hidden_from_inventory).where(
+                InstrumentDefinition.instrument_uid == instrument_uid
+            )
+        )
+        hidden = result.scalar_one()
+    assert hidden is True, (
+        "503 QUEUE_UNAVAILABLE must NOT un-hide a soft-deleted symbol "
+        "(Codex iter-2 P2 fix: pre-dedup unhide is held pending and rolled back "
+        "if the enqueue path errors)."
+    )
+    # And no run row was committed.
+    async with session_factory() as s:
+        rows = (await s.execute(select(SymbolOnboardingRun))).scalars().all()
+    assert len(rows) == 0

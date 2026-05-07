@@ -247,6 +247,12 @@ async def _enqueue_and_persist_run(
         )
     ).scalar_one_or_none()
     if existing is not None:
+        # Codex iter-2 review fix (P2): commit any caller-pending writes
+        # (the onboard handler's pre-dedup ``hidden_from_inventory=False``
+        # update) before returning. Without this commit the dedup branch
+        # would discard the unhide on session dispose, breaking Override
+        # O-11. Harmless when there are no pending changes (onboard_repair).
+        await db.commit()
         return JSONResponse(
             status_code=200,
             content=OnboardResponse(
@@ -397,6 +403,13 @@ async def onboard(
     #
     # Iter-1 review fix (P2-1): runs AFTER the cost-cap 422 short-circuit so
     # a rejected onboard does NOT silently re-surface a soft-deleted symbol.
+    #
+    # Codex iter-2 review fix (P2): leave the UPDATE PENDING — do NOT commit
+    # here. ``_enqueue_and_persist_run`` commits atomically with the run
+    # insert on the success path AND on the dedup-existing path. On 503 / 409
+    # error branches it returns without committing, so the pending unhide
+    # gets rolled back when the session is disposed — a rejected re-onboard
+    # no longer leaks visibility.
     for spec in request.symbols:
         await db.execute(
             update(InstrumentDefinition)
@@ -407,7 +420,6 @@ async def onboard(
             )
             .values(hidden_from_inventory=False)
         )
-    await db.commit()
 
     job_id = _dedup_job_id(request)
     digest_hex = job_id.removeprefix("symbol-onboarding:")

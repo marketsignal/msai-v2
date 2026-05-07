@@ -108,6 +108,18 @@ export function AddSymbolDialog({
     };
   }
 
+  /**
+   * Codex iter-2 review fix (P2): drop a previously-issued cost estimate
+   * whenever the inputs that fed it change. Without this guard the user
+   * could approve a $0 estimate for AAPL/Equity, then edit the symbol to
+   * MSFT and click Confirm — defeating the cost-confirmation step. Each
+   * input setter calls invalidateEstimate() on change so the dialog reverts
+   * to the pre-estimate footer (Estimate-cost button).
+   */
+  function invalidateEstimate(): void {
+    if (estimate !== null) setEstimate(null);
+  }
+
   async function handleEstimate(): Promise<void> {
     setError(null);
     try {
@@ -142,7 +154,10 @@ export function AddSymbolDialog({
             <Input
               id="symbol"
               value={symbol}
-              onChange={(e) => setSymbol(e.target.value)}
+              onChange={(e) => {
+                setSymbol(e.target.value);
+                invalidateEstimate();
+              }}
               placeholder="AAPL"
               autoFocus
               data-testid="add-symbol-input"
@@ -153,7 +168,10 @@ export function AddSymbolDialog({
             <Label htmlFor="asset-class">Asset class</Label>
             <Select
               value={assetClass}
-              onValueChange={(v) => setAssetClass(v as AssetClass)}
+              onValueChange={(v) => {
+                setAssetClass(v as AssetClass);
+                invalidateEstimate();
+              }}
             >
               <SelectTrigger id="asset-class">
                 <SelectValue />
@@ -174,7 +192,10 @@ export function AddSymbolDialog({
                 type="date"
                 min={PROVIDER_MIN_START}
                 value={start}
-                onChange={(e) => setStart(e.target.value)}
+                onChange={(e) => {
+                  setStart(e.target.value);
+                  invalidateEstimate();
+                }}
               />
             </div>
             <div className="space-y-1">
@@ -183,7 +204,10 @@ export function AddSymbolDialog({
                 id="end"
                 type="date"
                 value={end}
-                onChange={(e) => setEnd(e.target.value)}
+                onChange={(e) => {
+                  setEnd(e.target.value);
+                  invalidateEstimate();
+                }}
               />
             </div>
           </div>

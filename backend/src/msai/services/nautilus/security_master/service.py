@@ -1104,16 +1104,6 @@ class SecurityMaster:
         # without this, a futures roll or repeated refreshes on different
         # days leave multiple aliases active simultaneously and the caller
         # picks arbitrarily.
-        #
-        # E2E rerun fix (2026-05-01): also exclude same-day siblings from the
-        # close. If two distinct aliases (e.g. MSFT.NASDAQ + MSFT.NYSE) get
-        # written in the same Chicago day, closing the first when the second
-        # arrives would leave both aliases with ``effective_to = today``
-        # (the [effective_from, effective_to) window collapses to empty), so
-        # the read-side filter ``effective_to > today`` excludes both — ZERO
-        # active aliases. Bounding the close to ``effective_from < today``
-        # keeps both same-day aliases active; downstream ``active alias``
-        # pickers tolerate multiples (they pick the first), but never zero.
         close_stmt = (
             update(InstrumentAlias)
             .where(
@@ -1121,19 +1111,25 @@ class SecurityMaster:
                 InstrumentAlias.provider == provider,
                 InstrumentAlias.effective_to.is_(None),
                 # Don't close an alias that's about to be re-inserted today
-                # (idempotent same-day refresh path — the insert below is
-                # ON CONFLICT DO NOTHING on
-                # ``(alias_string, provider, effective_from)``).
+                # (idempotent same-day refresh path — the insert below
+                # re-activates same-day rows via ON CONFLICT DO UPDATE).
                 InstrumentAlias.alias_string != alias_string,
-                # Don't close same-day siblings either; see comment above.
-                InstrumentAlias.effective_from < today,
             )
             .values(effective_to=today)
         )
         await self._db.execute(close_stmt)
 
-        # Alias upsert — ON CONFLICT DO NOTHING since the uniqueness key
-        # includes ``effective_from`` so a same-day re-upsert is a no-op.
+        # Alias upsert — re-activate same-day-same-alias rows (set effective_to
+        # back to NULL) instead of ON CONFLICT DO NOTHING.
+        #
+        # E2E rerun fix (2026-05-01): a sequence A → B → A within one Chicago
+        # day previously trapped state into ZERO active aliases. The third
+        # call's close_stmt closed B (because effective_to IS NULL and
+        # alias_string != A) but the A insert was a no-op due to the previous
+        # uniqueness ON CONFLICT DO NOTHING — A was already in the table from
+        # call 1, just with effective_to set by call 2's close. Switching to
+        # ON CONFLICT DO UPDATE SET effective_to=NULL revives A as the single
+        # active alias.
         alias_stmt = (
             pg_insert(InstrumentAlias)
             .values(
@@ -1142,10 +1138,12 @@ class SecurityMaster:
                 venue_format=venue_format,
                 provider=provider,
                 effective_from=today,
+                effective_to=None,
                 source_venue_raw=source_venue_raw,
             )
-            .on_conflict_do_nothing(
+            .on_conflict_do_update(
                 constraint="uq_instrument_aliases_string_provider_from",
+                set_={"effective_to": None},
             )
         )
         await self._db.execute(alias_stmt)
