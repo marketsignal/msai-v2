@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -37,7 +38,10 @@ def main() -> int:
     )
     args = p.parse_args()
 
-    start, end = args.window.split(":", 1)
+    parts = args.window.split(":", 1)
+    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+        p.error("--window must be START:END in ISO date format (e.g. 2024-01-01:2025-12-31)")
+    start, end = parts[0].strip(), parts[1].strip()
     params: dict[str, str] = {"start": start, "end": end}
     if args.asset_class:
         params["asset_class"] = args.asset_class
@@ -53,7 +57,11 @@ def main() -> int:
         rows = resp.json()
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps({"window": args.window, "rows": rows}, indent=2, sort_keys=True))
+    tmp_path = args.output.with_suffix(args.output.suffix + ".tmp")
+    tmp_path.write_text(
+        json.dumps({"window": args.window, "rows": rows}, indent=2, sort_keys=True)
+    )
+    os.replace(tmp_path, args.output)
     print(f"wrote {len(rows)} rows to {args.output}", file=sys.stderr)
     return 0
 
