@@ -9,13 +9,19 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 import pyarrow as pa
 
 from msai.core.data_integrity import atomic_write_parquet, dedup_bars
 from msai.core.logging import get_logger
+from msai.services.symbol_onboarding.partition_index import CacheRefreshMisuseError
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    PartitionIndexRefresh = Callable[[str, str, int, int, Path], None]
 
 _SYMBOL_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,20}$")
 
@@ -25,8 +31,36 @@ log = get_logger(__name__)
 class ParquetStore:
     """File-based Parquet store partitioned by asset_class / symbol / year / month."""
 
-    def __init__(self, data_root: str) -> None:
+    def __init__(
+        self,
+        data_root: str,
+        *,
+        partition_index_refresh: PartitionIndexRefresh | None = None,
+    ) -> None:
+        """Construct the store.
+
+        ``partition_index_refresh`` is a SYNC callable invoked once per
+        ``(year, month)`` group after each atomic write succeeds. The callback
+        owns its own DB session + event-loop binding (see
+        :func:`msai.services.symbol_onboarding.partition_index.make_refresh_callback`
+        for the canonical builder). The writer itself is event-loop-agnostic
+        and never opens a session, so we do not cross SQLAlchemy's
+        "one async engine per event loop" rule
+        (https://docs.sqlalchemy.org/20/orm/extensions/asyncio.html#using-multiple-asyncio-event-loops).
+
+        :class:`CacheRefreshMisuseError` (defined in
+        :mod:`msai.services.symbol_onboarding.partition_index`) is the only
+        callback exception that ``write_bars`` re-raises — it signals a
+        caller-contract violation (running ``write_bars`` from an async
+        context without ``asyncio.to_thread``). Every other exception is
+        logged + swallowed; the parquet file is the source of truth and a
+        subsequent ``compute_coverage`` run will refresh the cache.
+
+        Pass ``None`` for environments without DB access (CLI seed scripts,
+        ad-hoc tooling). The one-time backfill (Task 5) catches up the cache.
+        """
         self.data_root = Path(data_root)
+        self._refresh_callback: PartitionIndexRefresh | None = partition_index_refresh
 
     # ------------------------------------------------------------------
     # Write
@@ -39,6 +73,13 @@ class ParquetStore:
         writing.  If the target Parquet file already exists, the new data is
         merged with the existing rows and deduplicated again so that
         overlapping ingestion windows are handled idempotently.
+
+        After each successful atomic write, ``partition_index_refresh`` (if
+        provided) is invoked once with the partition coordinates so the
+        ``parquet_partition_index`` cache stays in sync. ``CacheRefreshMisuseError``
+        from the callback is re-raised (caller-contract violation: see
+        :func:`make_refresh_callback`); every other exception is logged and
+        swallowed because the parquet file on disk is the source of truth.
 
         Args:
             asset_class: E.g. ``"stocks"``, ``"futures"``, ``"crypto"``.
@@ -81,6 +122,31 @@ class ParquetStore:
                 month=month,
                 rows=len(group),
             )
+
+            if self._refresh_callback is not None:
+                try:
+                    self._refresh_callback(asset_class, symbol, int(year), int(month), target)
+                except CacheRefreshMisuseError:
+                    # Caller-contract violation (write_bars invoked from
+                    # async without to_thread wrap). NOT a runtime
+                    # data-layer problem — propagate so the engineer sees
+                    # the misuse instead of a silent stale cache.
+                    # P2 Codex iteration 4 fix.
+                    raise
+                except Exception:
+                    # Genuine cache-update failure (DB down, transient
+                    # network error). Best-effort: the parquet file is
+                    # the source of truth and the next compute_coverage
+                    # call will refresh from the footer. P3-2 plan-review
+                    # fix: include traceback for diagnosability.
+                    log.warning(
+                        "partition_index_refresh_failed",
+                        symbol=symbol,
+                        asset_class=asset_class,
+                        year=int(year),
+                        month=int(month),
+                        exc_info=True,
+                    )
 
         return last_checksum
 

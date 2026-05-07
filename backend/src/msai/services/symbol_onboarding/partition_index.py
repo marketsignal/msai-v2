@@ -18,22 +18,40 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from msai.core.logging import get_logger
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 log = get_logger(__name__)
 
 __all__ = [
+    "CacheRefreshMisuseError",
     "PartitionFooter",
     "PartitionIndexGatewayProto",
     "PartitionIndexService",
     "PartitionRow",
+    "make_refresh_callback",
     "read_parquet_footer",
 ]
+
+
+class CacheRefreshMisuseError(RuntimeError):
+    """Raised by :func:`make_refresh_callback`'s callback when invoked from
+    inside a running event loop.
+
+    Signals a caller-contract violation: ``ParquetStore.write_bars`` must be
+    called from a sync context. When invoked from async code, wrap the call
+    in ``await asyncio.to_thread(store.write_bars, ...)``. This is distinct
+    from runtime cache-update failures (DB down, transient network) so the
+    writer's outer ``except`` can let it propagate instead of swallowing it
+    as a transient failure.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,3 +285,89 @@ class PartitionIndexService:
         )
         await self._db.upsert(row)
         return row
+
+
+def make_refresh_callback(*, database_url: str) -> Callable[[str, str, int, int, Path], None]:
+    """Build a SYNC callback for ``ParquetStore(partition_index_refresh=...)``.
+
+    The callback **always** opens a fresh ``AsyncEngine`` (with ``NullPool``),
+    a fresh ``AsyncSession``, runs the refresh to completion via
+    ``asyncio.run`` on whatever thread is calling, and disposes the engine
+    before returning. The engine and session therefore never cross event
+    loops, and we never share the global ``async_session_factory`` engine
+    with a fresh loop — addressing the SQLAlchemy "one async engine per
+    loop" rule (P1 Codex iteration 3 fix; see
+    https://docs.sqlalchemy.org/20/orm/extensions/asyncio.html#using-multiple-asyncio-event-loops).
+
+    **Caller contract:** ``write_bars`` is sync. It MUST be called from one
+    of:
+
+    - A truly sync context (CLI script's main, a worker job's sync callback).
+      The refresh callback's ``asyncio.run`` simply runs to completion.
+    - A sync context obtained from async code via ``asyncio.to_thread`` (the
+      ingest worker pattern). The refresh callback's ``asyncio.run`` runs in
+      the worker thread and blocks only that thread; the caller's loop stays
+      free.
+
+    **Calling ``write_bars`` directly from an async function** (without
+    ``asyncio.to_thread``) is unsupported: the refresh callback would raise
+    :class:`CacheRefreshMisuseError` because ``asyncio.run`` cannot start a
+    new loop on a thread that already has one running. Wrap every async
+    call site in ``await asyncio.to_thread(...)`` — see
+    ``services/data_ingestion.py:ingest_historical``.
+
+    Per-call cost is one engine create + dispose (~ms-level for an asyncpg
+    connection); negligible against the parquet write itself and acceptable
+    on the cache-update path (not the hot read path).
+    """
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
+    from sqlalchemy.pool import NullPool
+
+    from msai.services.symbol_onboarding.partition_index_db import (
+        PartitionIndexGateway,
+    )
+
+    async def _do_refresh(asset_class: str, symbol: str, year: int, month: int, path: Path) -> None:
+        engine = create_async_engine(database_url, poolclass=NullPool)
+        try:
+            session_maker = async_sessionmaker(engine, class_=AsyncSession)
+            async with session_maker() as session:
+                gateway = PartitionIndexGateway(session=session)
+                service = PartitionIndexService(db_gateway=gateway)
+                await service.refresh_for_partition(
+                    asset_class=asset_class,
+                    symbol=symbol,
+                    year=year,
+                    month=month,
+                    path=path,
+                )
+        finally:
+            await engine.dispose()
+
+    def _callback(asset_class: str, symbol: str, year: int, month: int, path: Path) -> None:
+        # Defensive guard: refuse to run inside an already-running loop
+        # (would RuntimeError on asyncio.run). Raise the custom class so
+        # the writer's outer try/except (Task 4 Step 4) can let
+        # contract-violation errors propagate instead of swallowing them
+        # as transient failures (P2 Codex iteration 4 fix).
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass  # No loop on this thread — safe to proceed.
+        else:
+            raise CacheRefreshMisuseError(
+                "make_refresh_callback's callback was invoked from inside a "
+                "running event loop. write_bars must be called from a sync "
+                "context — wrap async call sites in "
+                "`await asyncio.to_thread(store.write_bars, ...)`."
+            )
+
+        asyncio.run(_do_refresh(asset_class, symbol, year, month, path))
+
+    return _callback
