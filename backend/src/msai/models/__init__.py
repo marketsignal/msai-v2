@@ -19,6 +19,7 @@ from msai.models.live_portfolio import LivePortfolio
 from msai.models.live_portfolio_revision import LivePortfolioRevision
 from msai.models.live_portfolio_revision_strategy import LivePortfolioRevisionStrategy
 from msai.models.order_attempt_audit import OrderAttemptAudit
+from msai.models.parquet_partition_index import ParquetPartitionIndex
 from msai.models.portfolio import Portfolio
 from msai.models.portfolio_allocation import PortfolioAllocation
 from msai.models.portfolio_run import PortfolioRun
@@ -46,6 +47,7 @@ __all__ = [
     "LivePortfolioRevision",
     "LivePortfolioRevisionStrategy",
     "OrderAttemptAudit",
+    "ParquetPartitionIndex",
     "Portfolio",
     "PortfolioAllocation",
     "PortfolioRun",
