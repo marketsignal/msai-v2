@@ -146,3 +146,55 @@ async def test_intra_month_gap_is_detected(tmp_path: Path) -> None:
     # Jan 12 (Fri) is the last trading day before our partition begins on Jan 15.
     assert miss_start == date(2024, 1, 2)
     assert miss_end == date(2024, 1, 12)
+
+
+@pytest.mark.asyncio
+async def test_trailing_edge_tolerance_forgives_recent_days(tmp_path: Path) -> None:
+    """Today is 2024-01-22 (Mon). Coverage exists through Friday 2024-01-12.
+    The seven trading days {Jan 16-19, 22} (skipping MLK = Jan 15) are
+    inside the trailing-edge window and forgiven; status='full'."""
+    base = tmp_path / "parquet" / "stocks" / "AAPL" / "2024"
+    days = list(range(2, 13))
+    p = _write_partition(base, year=2024, month=1, days=days)
+
+    index = _make_index_with_rows(
+        [_seed_row(p, asset_class="stocks", symbol="AAPL", year=2024, month=1, days=days)]
+    )
+    report = await compute_coverage(
+        asset_class="stocks",
+        symbol="AAPL",
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 22),
+        data_root=tmp_path,
+        partition_index=index,
+        today=date(2024, 1, 22),
+    )
+
+    assert report.status == "full"
+    assert report.missing_ranges == []
+
+
+@pytest.mark.asyncio
+async def test_older_gaps_are_NOT_forgiven(tmp_path: Path) -> None:  # noqa: N802
+    """A two-week-old gap is outside the 7-day trailing-edge window and
+    surfaces as 'gapped'."""
+    base = tmp_path / "parquet" / "stocks" / "AAPL" / "2024"
+    # Day 2 only — leaves 3-12 missing (10 trading days back from 2024-01-22).
+    days = [2]
+    p = _write_partition(base, year=2024, month=1, days=days)
+
+    index = _make_index_with_rows(
+        [_seed_row(p, asset_class="stocks", symbol="AAPL", year=2024, month=1, days=days)]
+    )
+    report = await compute_coverage(
+        asset_class="stocks",
+        symbol="AAPL",
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 22),
+        data_root=tmp_path,
+        partition_index=index,
+        today=date(2024, 1, 22),
+    )
+
+    assert report.status == "gapped"
+    assert len(report.missing_ranges) == 1
