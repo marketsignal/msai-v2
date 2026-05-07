@@ -7,6 +7,7 @@ for convenient import across the codebase.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from os import cpu_count
 from pathlib import Path
 
@@ -249,6 +250,27 @@ class Settings(BaseSettings):
     # wrapper ingests yesterday's session instead of today's. Must be
     # non-positive — ingesting future sessions is never correct.
     daily_ingest_session_offset_days: int = Field(default=0, ge=-7, le=0)
+
+    # Default hard spend cap (USD) applied by ``POST /api/v1/symbols/onboard``
+    # when the request body omits ``cost_ceiling_usd``. The value is a
+    # ``Decimal`` (not ``float``) so monetary math through the symbol-
+    # onboarding stack stays exact — the request schema already declares
+    # ``cost_ceiling_usd: Decimal | None`` with ``max_digits=12,
+    # decimal_places=2`` (see ``schemas/symbol_onboarding.py``) and the DB
+    # column is ``Numeric(12, 2)`` (see ``models/symbol_onboarding_run.py``).
+    # Operators can raise/lower this floor without redeploying via the
+    # ``MSAI_SYMBOL_ONBOARDING_DEFAULT_COST_CEILING_USD`` env var.
+    symbol_onboarding_default_cost_ceiling_usd: Decimal = Field(
+        default=Decimal("50.00"),
+        validation_alias=AliasChoices(
+            "MSAI_SYMBOL_ONBOARDING_DEFAULT_COST_CEILING_USD",
+            "SYMBOL_ONBOARDING_DEFAULT_COST_CEILING_USD",
+        ),
+        description=(
+            "Default cost ceiling (USD) applied to /symbols/onboard requests "
+            "that omit cost_ceiling_usd. Decimal for exact monetary math."
+        ),
+    )
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

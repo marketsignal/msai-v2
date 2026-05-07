@@ -175,6 +175,25 @@ class AliasResolution:
         return f"Registered via {self.primary_provider}; live-qualified: {self.has_ib_alias}"
 
 
+@dataclass(frozen=True, slots=True)
+class _RegisteredInstrument:
+    """One registered instrument with its aggregated live-qualification flag.
+
+    Returned by :meth:`SecurityMaster.list_registered_instruments` for the
+    bulk inventory endpoint. ``live_qualified`` is computed as
+    "any active alias for this instrument_uid carries
+    ``provider='interactive_brokers'``" so a single SELECT serves all
+    inventory rows.
+    """
+
+    instrument_uid: uuid.UUID
+    raw_symbol: str  # matches InstrumentDefinition.raw_symbol
+    asset_class: str
+    provider: str
+    live_qualified: bool
+    last_refresh_at: datetime | None
+
+
 class SecurityMaster:
     """Registry-backed instrument resolver.
 
@@ -683,6 +702,83 @@ class SecurityMaster:
         # shape-heuristic fallback rather than raising.
         return _REGISTRY_TO_INGEST_ASSET_CLASS.get(idef.asset_class)  # type: ignore[call-overload,no-any-return]
 
+    async def list_registered_instruments(
+        self,
+        *,
+        asset_class: str | None = None,
+    ) -> list[_RegisteredInstrument]:
+        """Return all instruments with at least one currently-active alias,
+        grouped by definition with an aggregated ``live_qualified`` flag.
+
+        Used by the bulk inventory endpoint at
+        ``GET /api/v1/symbols/inventory``. Filters out
+        ``hidden_from_inventory`` rows (B6a soft-delete).
+
+        v1 trade-off: ``last_refresh_at = InstrumentDefinition.updated_at``.
+        This reflects ANY row mutation (alias rotation, registration
+        correction), not strictly successful data downloads. Acceptable for
+        v1's expected 30-80 row inventory. Deferred follow-up: denormalized
+        ``last_refresh`` column updated by the worker on successful runs.
+        """
+        from sqlalchemy import func
+
+        from msai.models.instrument_alias import InstrumentAlias
+        from msai.models.instrument_definition import InstrumentDefinition
+        from msai.services.nautilus.live_instrument_bootstrap import exchange_local_today
+
+        ib_present_expr = func.bool_or(InstrumentAlias.provider == "interactive_brokers").label(
+            "live_qualified"
+        )
+
+        # Iter-1 review fix (P2-4): use Chicago "today" — the project invariant
+        # for alias windowing per `feedback_alias_windowing_must_use_exchange_local_today`.
+        # ``func.current_date()`` evaluates in Postgres server tz; matching the
+        # writer side (and find_active_aliases) keeps the boundary uniform.
+        today = exchange_local_today()
+
+        stmt = (
+            select(
+                InstrumentDefinition.instrument_uid,
+                InstrumentDefinition.raw_symbol,
+                InstrumentDefinition.asset_class,
+                InstrumentDefinition.provider,
+                InstrumentDefinition.updated_at,
+                ib_present_expr,
+            )
+            .join(
+                InstrumentAlias,
+                InstrumentAlias.instrument_uid == InstrumentDefinition.instrument_uid,
+            )
+            .where(InstrumentAlias.effective_from <= today)
+            .where(InstrumentAlias.effective_to.is_(None) | (InstrumentAlias.effective_to > today))
+            .where(InstrumentDefinition.hidden_from_inventory.is_(False))
+            .group_by(
+                InstrumentDefinition.instrument_uid,
+                InstrumentDefinition.raw_symbol,
+                InstrumentDefinition.asset_class,
+                InstrumentDefinition.provider,
+                InstrumentDefinition.updated_at,
+            )
+        )
+        if asset_class is not None:
+            stmt = stmt.where(InstrumentDefinition.asset_class == asset_class)
+        stmt = stmt.order_by(InstrumentDefinition.raw_symbol)
+
+        result = await self._db.execute(stmt)
+        rows = result.all()
+
+        return [
+            _RegisteredInstrument(
+                instrument_uid=r.instrument_uid,
+                raw_symbol=r.raw_symbol,
+                asset_class=r.asset_class,
+                provider=r.provider,
+                live_qualified=bool(r.live_qualified),
+                last_refresh_at=r.updated_at,
+            )
+            for r in rows
+        ]
+
     async def find_active_aliases(
         self,
         *,
@@ -1015,17 +1111,25 @@ class SecurityMaster:
                 InstrumentAlias.provider == provider,
                 InstrumentAlias.effective_to.is_(None),
                 # Don't close an alias that's about to be re-inserted today
-                # (idempotent same-day refresh path — the insert below is
-                # ON CONFLICT DO NOTHING on
-                # ``(alias_string, provider, effective_from)``).
+                # (idempotent same-day refresh path — the insert below
+                # re-activates same-day rows via ON CONFLICT DO UPDATE).
                 InstrumentAlias.alias_string != alias_string,
             )
             .values(effective_to=today)
         )
         await self._db.execute(close_stmt)
 
-        # Alias upsert — ON CONFLICT DO NOTHING since the uniqueness key
-        # includes ``effective_from`` so a same-day re-upsert is a no-op.
+        # Alias upsert — re-activate same-day-same-alias rows (set effective_to
+        # back to NULL) instead of ON CONFLICT DO NOTHING.
+        #
+        # E2E rerun fix (2026-05-01): a sequence A → B → A within one Chicago
+        # day previously trapped state into ZERO active aliases. The third
+        # call's close_stmt closed B (because effective_to IS NULL and
+        # alias_string != A) but the A insert was a no-op due to the previous
+        # uniqueness ON CONFLICT DO NOTHING — A was already in the table from
+        # call 1, just with effective_to set by call 2's close. Switching to
+        # ON CONFLICT DO UPDATE SET effective_to=NULL revives A as the single
+        # active alias.
         alias_stmt = (
             pg_insert(InstrumentAlias)
             .values(
@@ -1034,10 +1138,12 @@ class SecurityMaster:
                 venue_format=venue_format,
                 provider=provider,
                 effective_from=today,
+                effective_to=None,
                 source_venue_raw=source_venue_raw,
             )
-            .on_conflict_do_nothing(
+            .on_conflict_do_update(
                 constraint="uq_instrument_aliases_string_provider_from",
+                set_={"effective_to": None},
             )
         )
         await self._db.execute(alias_stmt)

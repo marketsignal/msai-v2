@@ -15,6 +15,7 @@ from datetime import datetime  # noqa: TC003 — SQLAlchemy Mapped[datetime] res
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     String,
@@ -69,6 +70,16 @@ class InstrumentDefinition(Base):
     lifecycle_state: Mapped[str] = mapped_column(
         String(32), nullable=False, server_default="staged"
     )
+    hidden_from_inventory: Mapped[bool] = mapped_column(
+        Boolean(),
+        nullable=False,
+        server_default="false",
+        default=False,
+    )
+    """Soft-delete flag for the symbol inventory page.
+    True means the user has removed the symbol from the inventory view; the
+    underlying definition + aliases stay intact so re-onboarding restores
+    the row instead of creating a duplicate."""
     trading_hours: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB,
         nullable=True,
