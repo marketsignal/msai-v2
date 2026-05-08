@@ -112,7 +112,19 @@ async def test_inventory_returns_empty_array_when_no_instruments(
 async def test_inventory_returns_all_registered_instruments(
     client: httpx.AsyncClient,
     session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Isolate from the host's data_root so the cold-start fallback in
+    # compute_coverage (which walks <data_root>/parquet/) doesn't pick
+    # up real AAPL parquet files left over from earlier sessions.
+    # Without this, the test depends on test-isolation accident — the
+    # in-memory cache being empty per-testcontainer DB while the host
+    # data dir DOES have AAPL parquet from prior worktree onboarding.
+    from msai.core.config import settings
+
+    monkeypatch.setattr(settings, "data_root", str(tmp_path), raising=True)
+
     await _seed_active_alias(session_factory, raw_symbol="AAPL", asset_class="equity")
     await _seed_active_alias(
         session_factory,
@@ -138,7 +150,7 @@ async def test_inventory_returns_all_registered_instruments(
     assert aapl["registered"] is True
     # _seed_active_alias defaults to provider=databento (no IB row), so live_qualified=False
     assert aapl["live_qualified"] is False
-    # No Parquet seeded for these symbols → coverage status is "none" → backtest_only
+    # No Parquet on the isolated tmp_path → coverage status is "none" → backtest_only
     assert aapl["status"] == "backtest_only"
 
 

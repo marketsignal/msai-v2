@@ -91,13 +91,33 @@ async def compute_coverage(
     )
 
     if not covered_days:
-        # Nothing in the partition index for this symbol that overlaps
-        # [start, end]. Backfill (Task 5) populates the index from
-        # existing files; the writer (Task 4) refreshes on every
-        # successful write. If the index is empty here, no parquet data
-        # is available — surface that as ``status="none"`` and a single
-        # window-spanning missing range so the auto-heal flow sees a
-        # cleanly-shaped repair request.
+        # Cold-start fallback (Codex PR-#49 P2 fix). An empty cache may
+        # mean (a) the symbol has never been ingested, OR (b) the
+        # writer-side refresh callback failed transiently and the cache
+        # never caught up. Walk the symbol's parquet directory once and
+        # let ``PartitionIndexService.get(path=...)`` seed the cache
+        # from each parquet's footer. Bounded cost — runs only on empty
+        # cache; subsequent inventory calls hit the populated cache via
+        # ``get_for_symbol``.
+        rows = await _walk_and_seed_cache(
+            partition_index=partition_index,
+            asset_class=asset_class,
+            symbol=symbol,
+            data_root=data_root,
+        )
+        covered_days = _covered_days_from_rows(
+            rows,
+            start=start,
+            end=end,
+            asset_class=asset_class,
+        )
+
+    if not covered_days:
+        # Still empty after the directory walk — either no parquet on
+        # disk or the partition files lack a usable timestamp column.
+        # Surface as ``status="none"`` with a window-spanning missing
+        # range so the auto-heal flow sees a cleanly-shaped repair
+        # request.
         return CoverageReport(
             status="none",
             covered_range=None,
@@ -121,10 +141,12 @@ async def compute_coverage(
 
     # --- Hawk prereq #5: emit metric + alert on the gapped exit ---
     # Reachable only when missing is non-empty (post-tolerance) AND
-    # covered_days is non-empty (else we returned status="none" earlier
-    # in the function). All four exits of compute_coverage:
+    # covered_days is non-empty (else we returned status="none"
+    # earlier in the function, after the cold-start cache-seed
+    # fallback ran). All four exits of compute_coverage:
     #   1. expected_days empty  → "full" (vacuous), no alert
-    #   2. covered_days empty   → "none", no alert
+    #   2. covered_days empty (after cold-start fallback)
+    #                           → "none", no alert
     #   3. missing empty (post-tolerance) → "full", no alert
     #   4. THIS PATH            → "gapped", alert
     COVERAGE_GAP_DETECTED.inc(symbol=symbol, asset_class=asset_class)
@@ -151,6 +173,53 @@ async def compute_coverage(
         covered_range=_derive_covered_range(covered_days),
         missing_ranges=_collapse_missing(missing),
     )
+
+
+async def _walk_and_seed_cache(
+    *,
+    partition_index: PartitionIndexService,
+    asset_class: str,
+    symbol: str,
+    data_root: Path,
+) -> list[PartitionRow]:
+    """Cold-start fallback: walk the symbol's parquet directory and
+    seed the cache from each footer via ``PartitionIndexService.get``.
+
+    Used by ``compute_coverage`` when ``get_for_symbol`` returns no
+    rows — the case where either (a) the symbol has never been
+    ingested, or (b) the writer-side refresh callback failed
+    transiently (e.g. DB blip) and the cache never caught up.
+    Walking on every inventory request would defeat the cache;
+    walking only on empty is a bounded cost (one stat per parquet
+    file the symbol owns on disk, plus one footer read per uncached
+    file). Subsequent calls hit the populated cache via
+    ``get_for_symbol`` and never enter this path.
+    """
+    sym_dir = data_root / "parquet" / asset_class / symbol
+    if not sym_dir.is_dir():
+        return []
+    seeded: list[PartitionRow] = []
+    for year_dir in sorted(sym_dir.iterdir()):
+        if not year_dir.is_dir() or not year_dir.name.isdigit():
+            continue
+        year = int(year_dir.name)
+        for month_file in sorted(year_dir.glob("*.parquet")):
+            stem = month_file.stem
+            if not stem.isdigit():
+                continue
+            month = int(stem)
+            if not (1 <= month <= 12):
+                continue
+            row = await partition_index.get(
+                asset_class=asset_class,
+                symbol=symbol,
+                year=year,
+                month=month,
+                path=month_file,
+            )
+            if row is not None:
+                seeded.append(row)
+    return seeded
 
 
 def _covered_days_from_rows(

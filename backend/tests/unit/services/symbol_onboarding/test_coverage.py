@@ -291,6 +291,42 @@ async def test_window_with_no_trading_days_is_full(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cold_start_fallback_seeds_cache_when_writer_refresh_failed(
+    tmp_path: Path,
+) -> None:
+    """Codex PR-#49 P2 fix: when ``get_for_symbol`` returns no rows
+    but parquet files exist on disk (because the writer-side refresh
+    callback failed transiently), ``compute_coverage`` walks the
+    symbol's parquet directory and seeds the cache from each footer
+    via ``PartitionIndexService.get(path=...)``. After the fallback,
+    coverage reflects the actual data.
+    """
+    base = tmp_path / "parquet" / "stocks" / "AAPL" / "2024"
+    days = list(range(2, 32))  # 2024-01-02 through 2024-01-31
+    _write_partition(base, year=2024, month=1, days=days)
+
+    # Empty cache — simulates "writer-side refresh callback failed
+    # transiently after write_bars wrote 01.parquet to disk".
+    index = _make_index_with_rows([])
+
+    report = await compute_coverage(
+        asset_class="stocks",
+        symbol="AAPL",
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 31),
+        data_root=tmp_path,
+        partition_index=index,
+        today=date(2024, 6, 1),  # past the window — no trailing tolerance
+    )
+
+    # Cold-start fallback seeded the cache from 01.parquet's footer.
+    # All January trading days (post New Year's) are covered.
+    assert report.status == "full"
+    assert report.missing_ranges == []
+    assert report.covered_range is not None  # min/max trading day in Jan
+
+
+@pytest.mark.asyncio
 async def test_gapped_emits_metric_and_alert(tmp_path: Path, monkeypatch) -> None:
     base = tmp_path / "parquet" / "stocks" / "AAPL" / "2024"
     days = [2]  # Jan 2 only — leaves 3-12 missing
