@@ -3504,7 +3504,7 @@ The `verify-e2e` agent (Phase 5.4) executes these in order: API first; if any AP
 
 **Steps:**
 
-1. `GET /api/v1/symbols/AAPL/readiness?start=2024-01-01&end=2024-04-30&asset_class=equity`.
+1. `GET /api/v1/symbols/readiness?symbol=AAPL&asset_class=equity&start=2024-01-01&end=2024-04-30` (the readiness endpoint takes `symbol` as a query parameter, NOT a path parameter — corrected after Phase 5.4 verify-e2e found the path-stale).
 
 **Verification:**
 
@@ -3512,7 +3512,7 @@ The `verify-e2e` agent (Phase 5.4) executes these in order: API first; if any AP
 - `coverage_status == "gapped"`.
 - `missing_ranges` contains `{"start": "2024-01-02", "end": "2024-01-12"}`.
 - `backtest_data_available == false` (gap means not full).
-- `covered_range` is a non-null string of the form `"2024-01-15 → 2024-04-30"` (or similar — date interval with `→` separator).
+- `covered_range` is a non-null string of the form `"2024-01-16 → 2024-04-29"` (trading-day min/max — NOT the request window; format matches `services/symbol_onboarding/coverage.py:_derive_covered_range`).
 
 **Persistence:** Re-fetch → identical body.
 
@@ -3529,13 +3529,16 @@ The `verify-e2e` agent (Phase 5.4) executes these in order: API first; if any AP
    ```bash
    curl -s http://localhost:8800/metrics | grep msai_coverage_gap_detected_total
    ```
-2. Note the current value `V_before` for `{symbol="AAPL",asset_class="equity"}` (zero or absent if first scan).
+2. Note the current value `V_before` for `{symbol="AAPL",asset_class="stocks"}` (zero or absent if first scan).
+
+   > **Note on the metric label.** The counter labels use the INGEST taxonomy (`stocks`, `forex`, `futures`, `options`, `crypto`) — not the registry taxonomy (`equity`, `fx`, `futures`, `option`, `crypto`). `compute_coverage` is called from the API/orchestrator with `asset_class=ingest_asset` (already normalized via `normalize_asset_class_for_ingest`), and the counter increments under THAT value. Phase 5.4 verify-e2e caught this stale label — the use case asserts the actual emitted value.
+
 3. Trigger a fresh inventory scan: `GET /api/v1/symbols/inventory?start=2024-01-01&end=2024-04-30`.
 4. Re-read `/metrics`.
 
 **Verification:**
 
-- Step 4 shows a line `msai_coverage_gap_detected_total{asset_class="equity",symbol="AAPL"} V_after` with `V_after >= V_before + 1`.
+- Step 4 shows a line `msai_coverage_gap_detected_total{asset_class="stocks",symbol="AAPL"} V_after` with `V_after >= V_before + 1`.
 - A matching alert appears via `GET /api/v1/alerts/?limit=10` — most recent record has `level="warning"` and `title` containing `"AAPL"`.
 
 **Persistence:** Re-fetch `/api/v1/alerts/` → the alert is durable across the 200-record cap.
