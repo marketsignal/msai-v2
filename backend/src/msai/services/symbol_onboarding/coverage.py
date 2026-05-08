@@ -32,6 +32,9 @@ from typing import TYPE_CHECKING, Literal
 
 import structlog
 
+from msai.services.alerting import AlertingService
+from msai.services.alerting import alerting_service as _default_alerting_service
+from msai.services.observability.trading_metrics import COVERAGE_GAP_DETECTED
 from msai.services.trading_calendar import trading_days
 
 if TYPE_CHECKING:
@@ -45,6 +48,11 @@ log = structlog.get_logger(__name__)
 __all__ = ["CoverageReport", "compute_coverage"]
 
 _TRAILING_EDGE_TOLERANCE_TRADING_DAYS = 7
+
+
+def _get_alerting_service() -> AlertingService:
+    """Indirection to allow tests to substitute an alerting double."""
+    return _default_alerting_service
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +117,33 @@ async def compute_coverage(
             status="full",
             covered_range=_derive_covered_range(covered_days),
             missing_ranges=[],
+        )
+
+    # --- Hawk prereq #5: emit metric + alert on the gapped exit ---
+    # Reachable only when missing is non-empty (post-tolerance) AND
+    # covered_days is non-empty (else we returned status="none" earlier
+    # in the function). All four exits of compute_coverage:
+    #   1. expected_days empty  → "full" (vacuous), no alert
+    #   2. covered_days empty   → "none", no alert
+    #   3. missing empty (post-tolerance) → "full", no alert
+    #   4. THIS PATH            → "gapped", alert
+    COVERAGE_GAP_DETECTED.inc(symbol=symbol, asset_class=asset_class)
+    try:
+        _get_alerting_service().send_alert(
+            level="warning",
+            title=f"Coverage gap detected: {asset_class}/{symbol}",
+            message=(
+                f"compute_coverage returned {len(missing)} missing trading days "
+                f"in window {start.isoformat()} → {end.isoformat()}. "
+                f"First gap starts {missing[0].isoformat()}."
+            ),
+        )
+    except Exception:  # noqa: BLE001 — alerting must never block coverage
+        log.warning(
+            "coverage_alert_send_failed",
+            symbol=symbol,
+            asset_class=asset_class,
+            exc_info=True,
         )
 
     return CoverageReport(

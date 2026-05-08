@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, date, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -9,11 +10,28 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from msai.services.observability import get_registry
+from msai.services.observability.trading_metrics import (  # noqa: F401 — import side-effect registers the counter
+    COVERAGE_GAP_DETECTED,
+)
 from msai.services.symbol_onboarding.coverage import compute_coverage
 from msai.services.symbol_onboarding.partition_index import (
     PartitionIndexService,
     PartitionRow,
 )
+
+
+def _read_counter_value(metric_name: str, **labels: str) -> float:
+    """Read a labeled counter value from the registry's exposition
+    output. Returns 0.0 when the labeled series hasn't been touched
+    yet (Prometheus convention)."""
+    label_str = ",".join(f'{k}="{v}"' for k, v in sorted(labels.items()))
+    pattern = rf"^{re.escape(metric_name)}\{{{re.escape(label_str)}\}}\s+(\S+)\s*$"
+    for line in get_registry().render().splitlines():
+        m = re.match(pattern, line)
+        if m:
+            return float(m.group(1))
+    return 0.0
 
 
 def _write_partition(
@@ -270,3 +288,102 @@ async def test_window_with_no_trading_days_is_full(tmp_path: Path) -> None:
     assert report.status == "full"
     assert report.missing_ranges == []
     assert report.covered_range is None
+
+
+@pytest.mark.asyncio
+async def test_gapped_emits_metric_and_alert(tmp_path: Path, monkeypatch) -> None:
+    base = tmp_path / "parquet" / "stocks" / "AAPL" / "2024"
+    days = [2]  # Jan 2 only — leaves 3-12 missing
+    p = _write_partition(base, year=2024, month=1, days=days)
+
+    index = _make_index_with_rows(
+        [_seed_row(p, asset_class="stocks", symbol="AAPL", year=2024, month=1, days=days)]
+    )
+
+    sent_alerts: list[tuple[str, str, str]] = []
+
+    class _StubAlerts:
+        def send_alert(self, level: str, title: str, message: str) -> None:
+            sent_alerts.append((level, title, message))
+
+    monkeypatch.setattr(
+        "msai.services.symbol_onboarding.coverage._get_alerting_service",
+        lambda: _StubAlerts(),
+    )
+
+    before = _read_counter_value(
+        "msai_coverage_gap_detected_total",
+        asset_class="stocks",
+        symbol="AAPL",
+    )
+
+    report = await compute_coverage(
+        asset_class="stocks",
+        symbol="AAPL",
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 22),
+        data_root=tmp_path,
+        partition_index=index,
+        today=date(2024, 4, 1),
+    )
+
+    assert report.status == "gapped"
+    after = _read_counter_value(
+        "msai_coverage_gap_detected_total",
+        asset_class="stocks",
+        symbol="AAPL",
+    )
+    assert after >= before + 1
+    assert len(sent_alerts) == 1
+    level, title, message = sent_alerts[0]
+    assert level in ("warning", "info")
+    assert "AAPL" in title or "AAPL" in message
+
+
+@pytest.mark.asyncio
+async def test_status_none_does_NOT_emit_metric_or_alert(  # noqa: N802
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When the partition_index is empty for a symbol (no parquet data
+    indexed), compute_coverage returns status='none' with a window-
+    spanning missing range — but it MUST NOT increment the
+    coverage_gap_detected metric or fire an alert. status='none' is a
+    DATA-MISSING signal, not a coverage-gap signal; alert rules will be
+    different.
+    """
+    sent_alerts: list[tuple[str, str, str]] = []
+
+    class _StubAlerts:
+        def send_alert(self, level: str, title: str, message: str) -> None:
+            sent_alerts.append((level, title, message))
+
+    monkeypatch.setattr(
+        "msai.services.symbol_onboarding.coverage._get_alerting_service",
+        lambda: _StubAlerts(),
+    )
+
+    before = _read_counter_value(
+        "msai_coverage_gap_detected_total",
+        asset_class="stocks",
+        symbol="ZZZZ",
+    )
+
+    index = _make_index_with_rows([])
+    report = await compute_coverage(
+        asset_class="stocks",
+        symbol="ZZZZ",
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 22),
+        data_root=tmp_path,
+        partition_index=index,
+        today=date(2024, 4, 1),
+    )
+
+    assert report.status == "none"
+    after = _read_counter_value(
+        "msai_coverage_gap_detected_total",
+        asset_class="stocks",
+        symbol="ZZZZ",
+    )
+    assert after == before  # NO metric increment
+    assert sent_alerts == []  # NO alert
