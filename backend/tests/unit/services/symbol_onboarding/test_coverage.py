@@ -198,3 +198,75 @@ async def test_older_gaps_are_NOT_forgiven(tmp_path: Path) -> None:  # noqa: N80
 
     assert report.status == "gapped"
     assert len(report.missing_ranges) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_data_returns_status_none(tmp_path: Path) -> None:
+    index = _make_index_with_rows([])
+    report = await compute_coverage(
+        asset_class="stocks",
+        symbol="ZZZZ",
+        start=date(2024, 1, 1),
+        end=date(2024, 12, 31),
+        data_root=tmp_path,
+        partition_index=index,
+        today=date(2025, 6, 1),
+    )
+    assert report.status == "none"
+    assert report.covered_range is None
+    assert report.missing_ranges == [(date(2024, 1, 1), date(2024, 12, 31))]
+
+
+@pytest.mark.asyncio
+async def test_full_year_coverage_returns_full(tmp_path: Path) -> None:
+    base = tmp_path / "parquet" / "stocks" / "SPY" / "2024"
+    seed_rows: list[PartitionRow] = []
+    for month in range(1, 13):
+        # 2024 is a leap year — Feb 29 is a real trading day.
+        if month == 2:
+            days = list(range(1, 30))
+        elif month in (4, 6, 9, 11):
+            days = list(range(1, 31))
+        else:
+            days = list(range(1, 32))
+        p = _write_partition(base, year=2024, month=month, days=days)
+        seed_rows.append(
+            _seed_row(p, asset_class="stocks", symbol="SPY", year=2024, month=month, days=days)
+        )
+
+    index = _make_index_with_rows(seed_rows)
+    report = await compute_coverage(
+        asset_class="stocks",
+        symbol="SPY",
+        start=date(2024, 1, 1),
+        end=date(2024, 12, 31),
+        data_root=tmp_path,
+        partition_index=index,
+        today=date(2025, 6, 1),
+    )
+    assert report.status == "full"
+    assert report.missing_ranges == []
+    assert report.covered_range is not None
+
+
+@pytest.mark.asyncio
+async def test_window_with_no_trading_days_is_full(tmp_path: Path) -> None:
+    """A window like Sat→Sun (no trading days) is vacuously full.
+
+    Semantic change from pre-Scope-B: month-granularity returned 'none' for
+    any no-data window; day-precise returns 'full' when ZERO trading days
+    are EXPECTED.
+    """
+    index = _make_index_with_rows([])
+    report = await compute_coverage(
+        asset_class="stocks",
+        symbol="SPY",
+        start=date(2024, 1, 6),
+        end=date(2024, 1, 7),
+        data_root=tmp_path,
+        partition_index=index,
+        today=date(2024, 6, 1),
+    )
+    assert report.status == "full"
+    assert report.missing_ranges == []
+    assert report.covered_range is None
