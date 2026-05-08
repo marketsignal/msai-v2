@@ -75,6 +75,7 @@ from msai.services.data_ingestion import DataIngestionService
 from msai.services.data_sources.databento_client import DatabentoClient
 from msai.services.nautilus.security_master.service import SecurityMaster
 from msai.services.parquet_store import ParquetStore
+from msai.services.symbol_onboarding.partition_index import make_refresh_callback
 
 setup_logging(settings.environment)
 log = get_logger(__name__)
@@ -221,7 +222,12 @@ def ingest(
     if not symbol_list:
         _fail("no symbols provided")
 
-    service = DataIngestionService(ParquetStore(str(settings.parquet_root)))
+    service = DataIngestionService(
+        ParquetStore(
+            str(settings.parquet_root),
+            partition_index_refresh=make_refresh_callback(database_url=settings.database_url),
+        )
+    )
     typer.echo(f"Ingesting {asset} {symbol_list} from {start} to {end}...")
     result = asyncio.run(
         service.ingest_historical(
@@ -248,7 +254,10 @@ def ingest_daily(
     schema: str = typer.Option("", help="Override default Databento schema"),
 ) -> None:
     """Download yesterday's data for incremental daily update."""
-    store = ParquetStore(str(settings.parquet_root))
+    store = ParquetStore(
+        str(settings.parquet_root),
+        partition_index_refresh=make_refresh_callback(database_url=settings.database_url),
+    )
     if symbols.lower() == "all":
         symbol_list = store.list_symbols(asset)
         if not symbol_list:
@@ -273,7 +282,12 @@ def ingest_daily(
 @app.command("data-status")
 def data_status() -> None:
     """Show storage stats, ingestion history, and data summary."""
-    service = DataIngestionService(ParquetStore(str(settings.parquet_root)))
+    service = DataIngestionService(
+        ParquetStore(
+            str(settings.parquet_root),
+            partition_index_refresh=make_refresh_callback(database_url=settings.database_url),
+        )
+    )
     _emit_json(service.data_status())
 
 

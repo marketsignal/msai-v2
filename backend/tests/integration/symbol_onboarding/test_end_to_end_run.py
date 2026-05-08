@@ -29,10 +29,13 @@ from msai.models.symbol_onboarding_run import (
     SymbolOnboardingRunStatus,
 )
 from msai.services.data_ingestion import IngestResult
+from msai.services.symbol_onboarding.partition_index_db import PartitionIndexGateway
 from msai.workers.symbol_onboarding_job import run_symbol_onboarding
+from tests.conftest import make_partition_row_from_path
 
 if TYPE_CHECKING:
     from pathlib import Path
+    from typing import Any
 
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -41,8 +44,11 @@ if TYPE_CHECKING:
 async def test_end_to_end_run_marks_completed_with_persisted_envelope(
     session_factory: async_sessionmaker[AsyncSession],
     tmp_path: Path,
+    write_partition: Any,
 ) -> None:
     """Full pipeline: PENDING run -> worker invocation -> COMPLETED + ib_skipped envelope."""
+    import calendar as _calendar
+
     # ---- Arrange ----
     # Seed a single-symbol PENDING run; the worker flips it to IN_PROGRESS.
     async with session_factory() as db:
@@ -68,10 +74,29 @@ async def test_end_to_end_run_marks_completed_with_persisted_envelope(
         run_id = run.id
 
     # Seed full-year Parquet so the post-ingest coverage scan reports "full".
-    base = tmp_path / "parquet" / "stocks" / "SPY" / "2024"
-    base.mkdir(parents=True, exist_ok=True)
+    # Scope-B: the coverage scan reads parquet_partition_index, not the
+    # filesystem directly, so we write real partitions AND seed the index.
     for month in range(1, 13):
-        (base / f"{month:02d}.parquet").write_bytes(b"")
+        last_day = _calendar.monthrange(2024, month)[1]
+        days = list(range(1, last_day + 1))
+        path = write_partition(
+            tmp_path,
+            asset_class="stocks",
+            symbol="SPY",
+            year=2024,
+            month=month,
+            days=days,
+        )
+        row = make_partition_row_from_path(
+            path,
+            asset_class="stocks",
+            symbol="SPY",
+            year=2024,
+            month=month,
+            days=days,
+        )
+        async with session_factory() as session:
+            await PartitionIndexGateway(session=session).upsert(row)
 
     # Patch the LEAF services the orchestrator depends on, not
     # ``_onboard_one_symbol`` itself, so the four-phase pipeline runs in

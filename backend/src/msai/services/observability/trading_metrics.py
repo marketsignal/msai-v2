@@ -47,6 +47,19 @@ LIVE_INSTRUMENT_RESOLVED_TOTAL = _r.counter(
 # registry_incomplete}; ``asset_class`` mirrors ``AssetClass`` values plus
 # ``unknown`` when the row is unresolvable.
 
+# Coverage scan outcomes — emitted by compute_coverage when missing_ranges
+# is non-empty (status="gapped" exit). Labels:
+#   asset_class — ingest-side asset class (matches AssetClass enum)
+#   symbol — the registered symbol with the gap
+# Use for gap-rate dashboards + alert rules. Production-vs-staging cohort
+# filtering is delegated to alert rules (no is_production flag in the registry
+# yet — see Task 9 + plan Implementation Notes "scoped deviation" on Hawk #5).
+COVERAGE_GAP_DETECTED = _r.counter(
+    "msai_coverage_gap_detected_total",
+    "Number of compute_coverage calls that returned non-empty missing_ranges, "
+    "labeled by symbol/asset_class. Use for gap-rate dashboards and alert rules.",
+)
+
 # Backtest results payload size — observed at worker-write (post-JSONB
 # materialization) AND /results response. Detects accidental payload bloat
 # (e.g. minute-bar leak into the JSONB) on either hop.

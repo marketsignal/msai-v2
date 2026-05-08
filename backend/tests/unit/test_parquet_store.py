@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pandas as pd
 import pytest
 
 from msai.services.parquet_store import ParquetStore
+from msai.services.symbol_onboarding.partition_index import CacheRefreshMisuseError
 
 if TYPE_CHECKING:
     from pathlib import Path
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -30,6 +31,21 @@ def _sample_bars(symbol: str = "AAPL", n: int = 5) -> pd.DataFrame:
             "low": [149.0 + i for i in range(n)],
             "close": [150.5 + i for i in range(n)],
             "volume": [1000 + i * 100 for i in range(n)],
+        }
+    )
+
+
+def _single_bar_df(month_day: tuple[int, int] = (1, 2)) -> pd.DataFrame:
+    """One-row OHLCV frame at ``2024-{month}-{day} 00:00 UTC`` for callback tests."""
+    month, day = month_day
+    return pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime([datetime(2024, month, day, tzinfo=UTC)]),
+            "open": [1.0],
+            "high": [1.0],
+            "low": [1.0],
+            "close": [1.0],
+            "volume": [100],
         }
     )
 
@@ -173,3 +189,93 @@ class TestGetStorageStats:
         assert stats["total_files"] == 0
         assert stats["total_bytes"] == 0
         assert stats["asset_classes"] == {}
+
+
+class TestPartitionIndexRefreshCallback:
+    """Coverage-day-precise Task 4: ``ParquetStore`` invokes the optional
+    ``partition_index_refresh`` callback once per (year, month) group after
+    each successful atomic write. Distinguishes contract-violation errors
+    (``CacheRefreshMisuseError`` — propagated) from runtime failures (logged
+    + swallowed)."""
+
+    def test_write_bars_invokes_partition_index_refresh(self, tmp_path: Path) -> None:
+        """The writer calls the supplied callback once per (year, month) group
+        with the right partition coordinates."""
+        captured: list[tuple[str, str, int, int, Path]] = []
+
+        def refresh(asset_class: str, symbol: str, year: int, month: int, path: Path) -> None:
+            captured.append((asset_class, symbol, year, month, path))
+
+        store = ParquetStore(
+            data_root=str(tmp_path),
+            partition_index_refresh=refresh,
+        )
+        df = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    [
+                        datetime(2024, 1, 2, tzinfo=UTC),
+                        datetime(2024, 1, 30, tzinfo=UTC),
+                    ]
+                ),
+                "open": [1.0, 1.0],
+                "high": [1.0, 1.0],
+                "low": [1.0, 1.0],
+                "close": [1.0, 1.0],
+                "volume": [100, 100],
+            }
+        )
+        checksum = store.write_bars("stocks", "AAPL", df)
+        assert checksum
+
+        assert len(captured) == 1
+        asset_class, symbol, year, month, path = captured[0]
+        assert (asset_class, symbol, year, month) == ("stocks", "AAPL", 2024, 1)
+        assert path.name == "01.parquet"
+
+    def test_write_bars_swallows_runtime_callback_errors(self, tmp_path: Path) -> None:
+        """A genuine runtime callback exception (DB down, transient network)
+        is logged at WARN with traceback and swallowed — the parquet file is
+        the source of truth and the next compute_coverage call will refresh
+        the cache from the footer.
+
+        The codebase renders structlog events directly (bypassing stdlib), so
+        ``caplog`` does not see structured kwargs; we use
+        ``structlog.testing.capture_logs`` to assert on event names — same
+        pattern as ``test_live_resolver_telemetry.py``.
+        """
+        import structlog.testing
+
+        def boom(*_args: object, **_kw: object) -> None:
+            raise ConnectionError("DB unavailable")
+
+        store = ParquetStore(data_root=str(tmp_path), partition_index_refresh=boom)
+        df = _single_bar_df()
+        with structlog.testing.capture_logs() as captured:
+            checksum = store.write_bars("stocks", "AAPL", df)  # MUST NOT raise
+        assert checksum
+        events = [entry["event"] for entry in captured]
+        assert "partition_index_refresh_failed" in events
+
+    def test_write_bars_propagates_misuse_error(self, tmp_path: Path) -> None:
+        """A ``CacheRefreshMisuseError`` signals a caller-contract violation
+        (write_bars invoked from async without ``to_thread``). The writer MUST
+        let it propagate so the engineer sees the misuse instead of a silently
+        stale cache. P2 Codex iteration 4 fix."""
+
+        def misuse(*_args: object, **_kw: object) -> None:
+            raise CacheRefreshMisuseError("test caller violated the contract")
+
+        store = ParquetStore(data_root=str(tmp_path), partition_index_refresh=misuse)
+        df = _single_bar_df()
+        with pytest.raises(CacheRefreshMisuseError, match="test caller violated"):
+            store.write_bars("stocks", "AAPL", df)
+
+    def test_write_bars_works_without_callback(self, tmp_path: Path) -> None:
+        """CLI seed scripts and ad-hoc tooling don't have DB wiring; backfill
+        (Task 5) catches up. ``partition_index_refresh=None`` must be a valid
+        construction."""
+        store = ParquetStore(data_root=str(tmp_path), partition_index_refresh=None)
+        df = _single_bar_df()
+        checksum = store.write_bars("stocks", "AAPL", df)
+        assert checksum

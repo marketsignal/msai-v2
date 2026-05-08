@@ -1,0 +1,145 @@
+{
+  "rows": [
+    {
+      "asset_class": "equity",
+      "backtest_data_available": false,
+      "coverage_status": "gapped",
+      "covered_range": "2024-01-02 \u2192 2024-12-30",
+      "instrument_uid": "65c033af-37d4-4733-8e6b-8c577c5b579d",
+      "is_stale": false,
+      "last_refresh_at": "2026-05-07T19:57:12.194941Z",
+      "live_qualified": false,
+      "missing_ranges": [
+        {
+          "end": "2025-12-31",
+          "start": "2024-12-31"
+        }
+      ],
+      "provider": "databento",
+      "registered": true,
+      "status": "gapped",
+      "symbol": "AAPL"
+    },
+    {
+      "asset_class": "equity",
+      "backtest_data_available": false,
+      "coverage_status": "none",
+      "covered_range": null,
+      "instrument_uid": "d45c4b61-44f5-44b7-8451-66fff4fcf7ce",
+      "is_stale": false,
+      "last_refresh_at": "2026-04-24T00:42:42.464519Z",
+      "live_qualified": false,
+      "missing_ranges": [
+        {
+          "end": "2025-12-31",
+          "start": "2024-01-01"
+        }
+      ],
+      "provider": "databento",
+      "registered": true,
+      "status": "backtest_only",
+      "symbol": "BRK.B"
+    },
+    {
+      "asset_class": "futures",
+      "backtest_data_available": false,
+      "coverage_status": "none",
+      "covered_range": null,
+      "instrument_uid": "03b23b11-d7ad-4234-9819-ec031ba6979f",
+      "is_stale": false,
+      "last_refresh_at": "2026-04-21T12:06:20.696917Z",
+      "live_qualified": false,
+      "missing_ranges": [
+        {
+          "end": "2025-12-31",
+          "start": "2024-01-01"
+        }
+      ],
+      "provider": "databento",
+      "registered": true,
+      "status": "backtest_only",
+      "symbol": "ES.n.0"
+    },
+    {
+      "asset_class": "fx",
+      "backtest_data_available": false,
+      "coverage_status": "none",
+      "covered_range": null,
+      "instrument_uid": "4e8486ca-9d44-4622-82dc-4b862c32bdb5",
+      "is_stale": false,
+      "last_refresh_at": "2026-04-28T03:15:54.539814Z",
+      "live_qualified": true,
+      "missing_ranges": [
+        {
+          "end": "2025-12-31",
+          "start": "2024-01-01"
+        }
+      ],
+      "provider": "interactive_brokers",
+      "registered": true,
+      "status": "live_only",
+      "symbol": "EUR/USD"
+    },
+    {
+      "asset_class": "equity",
+      "backtest_data_available": false,
+      "coverage_status": "gapped",
+      "covered_range": "2024-01-02 \u2192 2024-12-30",
+      "instrument_uid": "63097a16-1b4b-4e0d-8af6-f8f557ba17c3",
+      "is_stale": false,
+      "last_refresh_at": "2026-05-07T19:57:12.194941Z",
+      "live_qualified": false,
+      "missing_ranges": [
+        {
+          "end": "2025-12-31",
+          "start": "2024-12-31"
+        }
+      ],
+      "provider": "databento",
+      "registered": true,
+      "status": "gapped",
+      "symbol": "MSFT"
+    },
+    {
+      "asset_class": "equity",
+      "backtest_data_available": false,
+      "coverage_status": "none",
+      "covered_range": null,
+      "instrument_uid": "17e2ee13-038d-4a6f-81d8-1f3ae51d6b78",
+      "is_stale": false,
+      "last_refresh_at": "2026-05-02T05:02:43.199950Z",
+      "live_qualified": false,
+      "missing_ranges": [
+        {
+          "end": "2025-12-31",
+          "start": "2024-01-01"
+        }
+      ],
+      "provider": "databento",
+      "registered": true,
+      "status": "backtest_only",
+      "symbol": "NVDA"
+    },
+    {
+      "asset_class": "equity",
+      "backtest_data_available": false,
+      "coverage_status": "gapped",
+      "covered_range": "2024-01-02 \u2192 2024-12-30",
+      "instrument_uid": "f8908f13-4c84-4643-a1f0-96418d2b00fa",
+      "is_stale": false,
+      "last_refresh_at": "2026-04-21T17:58:17.772020Z",
+      "live_qualified": false,
+      "missing_ranges": [
+        {
+          "end": "2025-12-31",
+          "start": "2024-12-31"
+        }
+      ],
+      "provider": "databento",
+      "registered": true,
+      "status": "gapped",
+      "symbol": "SPY"
+    }
+  ],
+  "window": "2024-01-01:2025-12-31"
+}

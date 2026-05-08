@@ -4,6 +4,55 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-05-07 — Coverage day-precise refactor (PR #49 open, branch `feat/coverage-day-precise`)
+
+**Goal:** Replace `compute_coverage`'s month-granularity scan with day-precise trading-day inspection. Spike (`docs/research/2026-05-07-coverage-granularity-spike.md`) confirmed production paths CAN emit partial-month parquet files (sub-month onboarding, provider partial returns, CLI spot fixes); pre-Scope-B those silently passed as `status="full"`. Council ratified Scope B with 6 prereqs (4 Contrarian + 2 Hawk).
+
+**Plan-review loop:** 6 iterations to convergence. Trajectory 11 → 4 → 2 → 3 → 2 → 0. Reviewers: Claude (`feature-dev:code-reviewer`) + Codex (`codex exec` with focused-prompt fallback per memory `feedback_codex_cli_stalls_on_long_audit_prompts`). Codex caught the most architecturally-subtle issues: SQLAlchemy multi-loop async-engine sharing on iter 3 (drove redesign from `session_factory + thread + asyncio.run` to `NullPool engine + asyncio.run` per call); missing `await asyncio.to_thread(...)` wrap of the actual `data_ingestion.ingest_historical` call site on iter 4; AST-level verification correctness on iter 5. Memory: `feedback_plan_review_cant_verify_external_api_behavior` saved (CMES MLK 2025 empirical bug — 6 iters of plan review missed it; implementer caught on first run).
+
+**Phase 4 (Execute):** 13 tasks via `superpowers:subagent-driven-development`, 19 commits on the branch. Per-task subagent dispatch with two-stage review (spec compliance + code quality). Tasks 0 (capture-before-change snapshot) → 11 (post-Scope-B diff report); Task 6 split into 6a-6d for bite-sized TDD discipline.
+
+**What shipped:**
+
+- **`services/trading_calendar.py`** wraps `exchange_calendars` (NYSE/CMES) with asset-class → exchange map (ingest taxonomy: stocks/options/forex/futures + registry aliases equity/option/fx; crypto falls back to `pandas.bdate_range` weekday-only). `lru_cache(maxsize=8)` on calendar construction. New dep `exchange_calendars>=4.5,<5.0`.
+- **New table + migration `aa00b11c22d3`:** `parquet_partition_index` (composite PK `(asset_class, symbol, year, month)`; columns `min_ts/max_ts/row_count/file_mtime/file_size/file_path/indexed_at`).
+- **`services/symbol_onboarding/partition_index.py`:** `PartitionFooter`, `PartitionRow`, `PartitionIndexService` (mtime/size invalidation), `make_refresh_callback(database_url=...)` (NullPool engine + `asyncio.run` per call — never share async engine across loops), `CacheRefreshMisuseError(RuntimeError)` (caller-contract violation class).
+- **`services/symbol_onboarding/partition_index_db.py`:** SQLAlchemy `INSERT ... ON CONFLICT DO UPDATE` gateway.
+- **`ParquetStore.write_bars`** takes a sync `partition_index_refresh: Callable | None` callback. Invokes per `(year, month)` group post-atomic-write. Outer `try/except` catches `CacheRefreshMisuseError` and **re-raises** (contract violation — fail loud); catches `Exception` and logs+swallows (transient runtime failure — best-effort cache update; parquet is source of truth).
+- **`compute_coverage` rewrite:** `_covered_days_from_rows` uses `trading_days(min, max, asset_class)` per row, unioned (P1 plan-review fix — original walked calendar days and admitted weekends/holidays as covered, defeating the entire point of Scope B). `_apply_trailing_edge_tolerance` uses 21-day calendar lookback to harvest 7 trading days. `_collapse_missing` uses 5-day-gap heuristic for run boundaries. Public `CoverageReport` shape preserved (status / covered_range / missing_ranges) — no caller-side breakage. Required new kwarg `partition_index: PartitionIndexService`.
+- **`is_trailing_only`** uses 7-trading-day cutoff (matches `compute_coverage`'s tolerance) instead of "missing range starts ≥ prev-month-1st". Adds `asset_class: str = "equity"` kwarg (default keeps legacy callers green); `derive_status` extended to thread `asset_class` through to `is_trailing_only` so non-equity rows get correct cutoffs.
+- **New metric `msai_coverage_gap_detected_total{symbol, asset_class}`** — emits ONLY on `status="gapped"` exit. Vacuous-full (no expected days) and `status="none"` (no covered days) deliberately do NOT emit (Hawk #5 with 2 scoped deviations: no `asset_subclass` label and no `is_production` gating — both reversible config changes once registry has those fields).
+- **Alerting:** `compute_coverage` calls `alerting_service.send_alert(level="warning", title=..., message=...)` on gapped exit. Failures logged with `exc_info=True` and swallowed.
+- **One-time backfill:** `scripts/build_partition_index.py` walks `DATA_ROOT/parquet/` and upserts every existing partition via `PartitionIndexService.refresh_for_partition`. Idempotent (verified: 36 partitions → 36 partitions on re-run).
+- **Capture-before-change script:** `scripts/snapshot_inventory.py` with atomic `os.replace` write + `--window` format validation.
+- **Pre/post snapshot fixtures committed:** `tests/fixtures/coverage-pre-scope-b.json` + `coverage-post-scope-b.json` + diff report at `docs/plans/2026-05-07-coverage-day-precise-diff-report.md`. **0 unexplained gaps** — 3 rows refined (covered_range now reports trading-day min/max instead of clamped request-window; missing_ranges extends 1 day to include 2024-12-31 trading day not in the parquet); 4 rows unchanged (registered without parquet backing).
+
+**Phase 5.4 verify-e2e caught a real integration bug (UC-CDP-005 = FAIL_BUG → fixed inline):** the CLI ingest path (`msai ingest`, `msai ingest-daily`, `msai data-status`) and the `nightly_ingest` scheduler constructed `ParquetStore` WITHOUT the `partition_index_refresh` callback. Result: parquet files written but `parquet_partition_index` NOT updated, so day-precise `compute_coverage` reported stale (or missing) coverage state until something else triggered `build_partition_index.py`. Fix at `e9c2952` wires `make_refresh_callback(database_url=settings.database_url)` into all 4 missing construction sites. **NO BUGS LEFT BEHIND honored.** Plan also patched for 2 minor stale items found by verify-e2e: UC-CDP-002's path-style readiness URL (`/{symbol}/readiness` returns 404; actual route uses query-params `?symbol=...`); UC-CDP-003's metric label assertion (`asset_class="equity"` was the registry value; counter actually emits `asset_class="stocks"` because `compute_coverage` is invoked with the post-`normalize_asset_class_for_ingest` value).
+
+**Quality gates green:**
+
+- Unit + integration: 2179 passed / 2 skipped / 16 xfailed. 3 pre-existing failures (`auto_heal::test_happy_path` instrument-resolution drift `'AAPL.NASDAQ' != 'AAPL'`; 2× `test_registry_venue_divergence` Prometheus counter pollution between unit + integration suites). All verified pre-existing via stash-test on Tasks 6c + 7. NOT introduced by Scope B.
+- `ruff check src/` clean.
+- `mypy --strict` clean across 186 source files.
+- Migration `1e2d728f1b32 → aa00b11c22d3` applies and rolls back cleanly on Postgres 16.
+- Backfill idempotent on re-run (36 → 36 partitions).
+- verify-e2e: 5 PASS (4 API + 1 CLI post-fix); 2 FAIL_INFRA (UI cases blocked on Azure Entra ID auth setup — pre-existing infra gap, not Scope B). Report: `tests/e2e/reports/coverage-day-precise-2026-05-07.md`.
+
+**Implementer-time corrections beyond the plan:**
+
+- Task 1 (CMES MLK): plan asserted CMES closes on 2025-01-20 (MLK); actually CMES Globex stays open with reduced hours, only NYSE-tracked products close. Implementer changed test data to Christmas 2025-12-25 (which CMES does close for) and updated the plan inline. Empirical bug plan-review couldn't verify without running the lib.
+- Task 6a (leap-year Feb 29): plan's fixture had `feb_days = list(range(1, 29))` which omits Feb 29 — 2024 is a leap year and Feb 29 is a real NYSE trading day (Thu). Fixed.
+- Task 6d: P2-3 plan-review fix honored — integration tests for `test_inventory_endpoint.py`, `test_orchestrator.py`, `test_end_to_end_run.py`, `test_orchestrator_failure_paths.py`, `test_symbol_onboarding_readiness.py` all updated in the SAME commit as the API/orchestrator wiring. No "failing tests across commits" violation.
+- Task 7 architectural extension: `derive_status(asset_class=...)` kwarg threaded through to `is_trailing_only` so futures/fx rows get correct calendar cutoffs (would otherwise inherit equity's NYSE schedule).
+
+**Operational deploy notes (in PR description):**
+
+1. Image rebuild required — `pyproject.toml` adds `exchange_calendars`; existing container venvs are stale.
+2. Run `scripts/build_partition_index.py` once per environment after `alembic upgrade head` to populate `parquet_partition_index` from existing parquet files.
+3. UI E2E auth not configured — separate infra ticket.
+
+**State:** PR #49 open at https://github.com/marketsignal/msai-v2/pull/49. Awaiting review.
+
 ### 2026-05-01 — Market Data v1 / `/universe-page` Phase 5 code-review loop — iter-1 + iter-2 fixes (branch `feat/universe-page`) — IN PROGRESS
 
 **Goal:** /loop tick-1 of 10-min cadence — drive Phase 5 quality gates to "ready to merge."

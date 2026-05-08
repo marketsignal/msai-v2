@@ -26,7 +26,8 @@ from msai.models.instrument_alias import InstrumentAlias
 from msai.models.instrument_definition import InstrumentDefinition
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable
+    from pathlib import Path
 
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -111,7 +112,19 @@ async def test_inventory_returns_empty_array_when_no_instruments(
 async def test_inventory_returns_all_registered_instruments(
     client: httpx.AsyncClient,
     session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Isolate from the host's data_root so the cold-start fallback in
+    # compute_coverage (which walks <data_root>/parquet/) doesn't pick
+    # up real AAPL parquet files left over from earlier sessions.
+    # Without this, the test depends on test-isolation accident — the
+    # in-memory cache being empty per-testcontainer DB while the host
+    # data dir DOES have AAPL parquet from prior worktree onboarding.
+    from msai.core.config import settings
+
+    monkeypatch.setattr(settings, "data_root", str(tmp_path), raising=True)
+
     await _seed_active_alias(session_factory, raw_symbol="AAPL", asset_class="equity")
     await _seed_active_alias(
         session_factory,
@@ -137,7 +150,7 @@ async def test_inventory_returns_all_registered_instruments(
     assert aapl["registered"] is True
     # _seed_active_alias defaults to provider=databento (no IB row), so live_qualified=False
     assert aapl["live_qualified"] is False
-    # No Parquet seeded for these symbols → coverage status is "none" → backtest_only
+    # No Parquet on the isolated tmp_path → coverage status is "none" → backtest_only
     assert aapl["status"] == "backtest_only"
 
 
@@ -246,3 +259,92 @@ async def test_delete_unknown_symbol_returns_404(client: httpx.AsyncClient) -> N
     )
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_inventory_reports_intra_month_gap(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    write_partition: Callable[..., Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end Scope-B contract: a registered symbol with partition data
+    covering only days 15-31 of January 2024 surfaces an intra-month
+    missing range [2024-01-02, 2024-01-12] from /api/v1/symbols/inventory.
+
+    Pre-Scope-B (month-granularity) this returned status='full' because
+    a 01.parquet file existed. Post-Scope-B the day-precise scan inspects
+    footer min_ts/max_ts and reports the sub-month gap.
+    """
+    from datetime import UTC, datetime
+
+    from msai.core.config import settings
+    from msai.services.symbol_onboarding.partition_index import PartitionRow
+    from msai.services.symbol_onboarding.partition_index_db import (
+        PartitionIndexGateway,
+    )
+
+    # ARRANGE: point DATA_ROOT at tmp_path so the API reads our fixture parquet.
+    monkeypatch.setattr(settings, "data_root", str(tmp_path), raising=True)
+
+    # Register AAPL via the public-API path used by the rest of this file.
+    await _seed_active_alias(
+        session_factory,
+        raw_symbol="AAPL",
+        asset_class="equity",
+        listing_venue="XNAS",
+        provider="databento",
+        alias_string="AAPL.XNAS",
+    )
+
+    # Write a January 2024 partition covering only days 15-31 (sub-month).
+    jan_days = list(range(15, 32))
+    parquet_path = write_partition(
+        tmp_path,
+        asset_class="stocks",
+        symbol="AAPL",
+        year=2024,
+        month=1,
+        days=jan_days,
+    )
+
+    # Seed the parquet_partition_index row so compute_coverage's day-precise
+    # scan sees the partition (no writer-side refresh fired in this fixture).
+    stat = parquet_path.stat()
+    timestamps = [datetime(2024, 1, d, 16, 0, tzinfo=UTC) for d in jan_days]
+    async with session_factory() as session:
+        await PartitionIndexGateway(session=session).upsert(
+            PartitionRow(
+                asset_class="stocks",
+                symbol="AAPL",
+                year=2024,
+                month=1,
+                min_ts=min(timestamps),
+                max_ts=max(timestamps),
+                row_count=len(jan_days),
+                file_mtime=stat.st_mtime,
+                file_size=stat.st_size,
+                file_path=str(parquet_path),
+            )
+        )
+
+    # ACT
+    response = await client.get(
+        "/api/v1/symbols/inventory",
+        params={"start": "2024-01-01", "end": "2024-01-31", "asset_class": "equity"},
+    )
+
+    # ASSERT
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    aapl = next(r for r in rows if r["symbol"] == "AAPL")
+    assert aapl["coverage_status"] == "gapped", aapl
+    # Sub-month range: starts 2024-01-02 (Tue, NYE is holiday), ends 2024-01-12
+    # (Fri, day before partition's first row at Jan 15).
+    intra_month = next(
+        (mr for mr in aapl["missing_ranges"] if mr["start"] == "2024-01-02"),
+        None,
+    )
+    assert intra_month is not None, aapl["missing_ranges"]
+    assert intra_month["end"] == "2024-01-12"

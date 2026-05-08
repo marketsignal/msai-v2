@@ -10,6 +10,7 @@ the primary provider for equities and futures, with Polygon as fallback.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from msai.services.data_sources.polygon_client import PolygonClient
 from msai.services.market_data_query import MarketDataQuery
 from msai.services.nautilus.catalog_builder import ensure_catalog_data
 from msai.services.parquet_store import ParquetStore
+from msai.services.symbol_onboarding.partition_index import make_refresh_callback
 
 log = get_logger(__name__)
 
@@ -120,7 +122,20 @@ class DataIngestionService:
             stats = _frame_stats(frame)
             # Use the original asset_class for Parquet storage so existing
             # paths ("stocks/AAPL/...") are preserved.
-            written = self.parquet_store.write_bars(asset_class, target.raw_symbol, frame)
+            #
+            # ``write_bars`` is sync and runs the partition_index_refresh
+            # callback (asyncio.run inside) — wrap in ``asyncio.to_thread``
+            # so the calling event loop stays free and the callback's
+            # fresh AsyncEngine is created on a thread without a running
+            # loop. This satisfies the caller-must-be-sync contract that
+            # ``make_refresh_callback`` documents and avoids
+            # ``CacheRefreshMisuseError`` (P1 Codex iteration 3 fix).
+            written = await asyncio.to_thread(
+                self.parquet_store.write_bars,
+                asset_class,
+                target.raw_symbol,
+                frame,
+            )
             if not written:
                 empty_symbols.append(target.raw_symbol)
             ingested[target.raw_symbol] = {
@@ -346,8 +361,21 @@ class IngestResult:
 
 
 def _build_default_service() -> DataIngestionService:
-    """Construct a :class:`DataIngestionService` with default settings-bound clients."""
-    return DataIngestionService(ParquetStore(str(settings.parquet_root)))
+    """Construct a :class:`DataIngestionService` with default settings-bound clients.
+
+    The :class:`ParquetStore` is built with a partition-index-refresh callback
+    that opens a fresh ``AsyncEngine`` (NullPool) per call — see
+    :func:`make_refresh_callback`. This keeps the writer event-loop-agnostic
+    while still updating ``parquet_partition_index`` after each atomic write
+    so the day-precise coverage path stays accurate.
+    """
+    refresh_cb = make_refresh_callback(database_url=settings.database_url)
+    return DataIngestionService(
+        ParquetStore(
+            str(settings.parquet_root),
+            partition_index_refresh=refresh_cb,
+        )
+    )
 
 
 async def ingest_symbols(

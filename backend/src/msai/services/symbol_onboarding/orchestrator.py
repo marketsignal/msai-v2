@@ -37,6 +37,8 @@ from msai.services.observability.trading_metrics import (
 )
 from msai.services.symbol_onboarding import normalize_asset_class_for_ingest
 from msai.services.symbol_onboarding.coverage import compute_coverage
+from msai.services.symbol_onboarding.partition_index import PartitionIndexService
+from msai.services.symbol_onboarding.partition_index_db import PartitionIndexGateway
 
 if TYPE_CHECKING:
     from datetime import date
@@ -185,14 +187,18 @@ async def _onboard_one_symbol(
 
     # ---- Phase 3: coverage scan (must be 'full' to advance) ----
     await _persist_step(db_factory, run_id, spec.symbol, step=SymbolStepStatus.COVERAGE)
-    coverage = await compute_coverage(
-        asset_class=ingest_asset,
-        symbol=spec.symbol,
-        start=spec.start,
-        end=spec.end,
-        data_root=data_root,
-        today=today,
-    )
+    async with db_factory() as session:
+        coverage = await compute_coverage(
+            asset_class=ingest_asset,
+            symbol=spec.symbol,
+            start=spec.start,
+            end=spec.end,
+            data_root=data_root,
+            partition_index=PartitionIndexService(
+                db_gateway=PartitionIndexGateway(session=session),
+            ),
+            today=today,
+        )
     if coverage.status != "full":
         return await _fail(
             db_factory,

@@ -9,7 +9,7 @@ from msai.services.symbol_onboarding.inventory import (
     is_trailing_only,
 )
 
-TODAY = date(2026, 5, 1)
+TODAY = date(2026, 5, 1)  # Fri — last 7 trading days are Apr 23..May 1.
 
 
 class TestDeriveStatus:
@@ -78,14 +78,15 @@ class TestDeriveStatus:
             == "gapped"
         )
 
-    def test_stale_when_only_trailing_month_missing(self) -> None:
+    def test_stale_when_only_trailing_range_missing(self) -> None:
+        # Range start 2026-04-28 (Tue) is within last 7 trading days of TODAY.
         assert (
             derive_status(
                 registered=True,
                 bt_avail=True,
                 live=True,
                 coverage_status="gapped",
-                missing_ranges=[(date(2026, 4, 1), date(2026, 4, 30))],
+                missing_ranges=[(date(2026, 4, 28), date(2026, 4, 30))],
                 today=TODAY,
             )
             == "stale"
@@ -100,7 +101,7 @@ class TestDeriveStatus:
                 coverage_status="gapped",
                 missing_ranges=[
                     (date(2024, 3, 1), date(2024, 3, 31)),
-                    (date(2026, 4, 1), date(2026, 4, 30)),
+                    (date(2026, 4, 28), date(2026, 4, 30)),
                 ],
                 today=TODAY,
             )
@@ -108,13 +109,14 @@ class TestDeriveStatus:
         )
 
     def test_priority_order_data_beats_registration(self) -> None:
+        # Range start 2026-04-28 (Tue) is within last 7 trading days of TODAY.
         assert (
             derive_status(
                 registered=True,
                 bt_avail=True,
                 live=False,
                 coverage_status="gapped",
-                missing_ranges=[(date(2026, 4, 1), date(2026, 4, 30))],
+                missing_ranges=[(date(2026, 4, 28), date(2026, 4, 30))],
                 today=TODAY,
             )
             == "stale"
@@ -161,67 +163,38 @@ class TestDeriveStatus:
 
 
 class TestIsTrailingOnly:
-    def test_empty_is_not_trailing(self) -> None:
-        assert is_trailing_only(missing_ranges=[], today=TODAY) is False
+    # Anchor on a fixed date so the trading-day arithmetic is stable.
+    _ANCHOR = date(2024, 1, 22)  # Mon
 
-    def test_single_trailing_month_is_trailing(self) -> None:
-        assert (
-            is_trailing_only(
-                missing_ranges=[(date(2026, 4, 1), date(2026, 4, 30))],
-                today=TODAY,
-            )
-            is True
+    def test_trailing_when_single_range_within_7_trading_days(self) -> None:
+        # Range starts 2024-01-12 (Fri) — 6 trading days back: 12,16,17,18,19,22 — within 7.
+        assert is_trailing_only(
+            missing_ranges=[(date(2024, 1, 12), date(2024, 1, 22))],
+            today=self._ANCHOR,
+            asset_class="equity",
         )
 
-    def test_old_missing_alone_is_not_trailing(self) -> None:
-        assert (
-            is_trailing_only(
-                missing_ranges=[(date(2024, 3, 1), date(2024, 3, 31))],
-                today=TODAY,
-            )
-            is False
+    def test_not_trailing_when_range_starts_8_or_more_trading_days_back(self) -> None:
+        # Range starts 2024-01-02 (Tue) — 14 trading days back: outside window.
+        assert not is_trailing_only(
+            missing_ranges=[(date(2024, 1, 2), date(2024, 1, 22))],
+            today=self._ANCHOR,
+            asset_class="equity",
         )
 
-    def test_trailing_plus_old_is_not_trailing_only(self) -> None:
-        assert (
-            is_trailing_only(
-                missing_ranges=[
-                    (date(2024, 3, 1), date(2024, 3, 31)),
-                    (date(2026, 4, 1), date(2026, 4, 30)),
-                ],
-                today=TODAY,
-            )
-            is False
+    def test_multiple_ranges_never_count_as_trailing(self) -> None:
+        assert not is_trailing_only(
+            missing_ranges=[
+                (date(2024, 1, 2), date(2024, 1, 5)),
+                (date(2024, 1, 18), date(2024, 1, 22)),
+            ],
+            today=self._ANCHOR,
+            asset_class="equity",
         )
 
-    def test_single_trailing_range_spanning_two_months_is_not_trailing(self) -> None:
-        # Per tightened rule (iter-1 fix): start must be >= prev_month_start.
-        # Range start 2026-03-01 < prev_month_start 2026-04-01 → False.
-        assert (
-            is_trailing_only(
-                missing_ranges=[(date(2026, 3, 1), date(2026, 4, 30))],
-                today=TODAY,
-            )
-            is False
-        )
-
-    def test_long_multi_month_gap_is_not_trailing(self) -> None:
-        assert (
-            is_trailing_only(
-                missing_ranges=[(date(2025, 5, 1), date(2026, 4, 30))],
-                today=TODAY,
-            )
-            is False
-        )
-
-    def test_two_separate_ranges_both_trailing_is_not_trailing_only(self) -> None:
-        assert (
-            is_trailing_only(
-                missing_ranges=[
-                    (date(2026, 3, 1), date(2026, 3, 31)),
-                    (date(2026, 4, 15), date(2026, 4, 30)),
-                ],
-                today=TODAY,
-            )
-            is False
+    def test_empty_ranges_returns_false(self) -> None:
+        assert not is_trailing_only(
+            missing_ranges=[],
+            today=self._ANCHOR,
+            asset_class="equity",
         )

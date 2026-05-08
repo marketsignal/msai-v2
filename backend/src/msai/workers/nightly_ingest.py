@@ -250,8 +250,12 @@ async def run_nightly_ingest(
     from msai.services.data_sources.databento_client import DatabentoClient
     from msai.services.data_sources.polygon_client import PolygonClient
     from msai.services.parquet_store import ParquetStore
+    from msai.services.symbol_onboarding.partition_index import make_refresh_callback
 
-    store = ParquetStore(str(settings.parquet_root))
+    store = ParquetStore(
+        str(settings.parquet_root),
+        partition_index_refresh=make_refresh_callback(database_url=settings.database_url),
+    )
     polygon = PolygonClient(settings.polygon_api_key) if settings.polygon_api_key else None
     databento = DatabentoClient(settings.databento_api_key) if settings.databento_api_key else None
     svc = DataIngestionService(store, polygon=polygon, databento=databento)
