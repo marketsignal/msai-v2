@@ -62,6 +62,8 @@ from msai.services.symbol_onboarding.cost_estimator import (
 from msai.services.symbol_onboarding.coverage import compute_coverage
 from msai.services.symbol_onboarding.inventory import derive_status, is_trailing_only
 from msai.services.symbol_onboarding.manifest import ParsedManifest
+from msai.services.symbol_onboarding.partition_index import PartitionIndexService
+from msai.services.symbol_onboarding.partition_index_db import PartitionIndexGateway
 
 # Asset classes the readiness endpoint accepts. Restricted to the registry
 # taxonomy so unsupported values produce a FastAPI 422 instead of bubbling
@@ -690,6 +692,9 @@ async def readiness(
         start=start,
         end=end,
         data_root=_FsPath(settings.data_root),
+        partition_index=PartitionIndexService(
+            db_gateway=PartitionIndexGateway(session=db),
+        ),
     )
     return ReadinessResponse(
         instrument_uid=resolution.instrument_uid,
@@ -745,6 +750,9 @@ async def inventory(
                 start=start,
                 end=end,
                 data_root=_FsPath(settings.data_root),
+                partition_index=PartitionIndexService(
+                    db_gateway=PartitionIndexGateway(session=db),
+                ),
                 today=today,
             )
             coverage_status = report.status

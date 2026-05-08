@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 from datetime import date
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
@@ -35,6 +35,8 @@ from msai.schemas.symbol_onboarding import (
 from msai.services.data_ingestion import IngestResult
 from msai.services.observability.trading_metrics import onboarding_ib_timeout_total
 from msai.services.symbol_onboarding.orchestrator import _onboard_one_symbol
+from msai.services.symbol_onboarding.partition_index_db import PartitionIndexGateway
+from tests.conftest import make_partition_row_from_path
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -82,12 +84,47 @@ async def _seed_run(
         return run.id
 
 
-def _seed_full_year_parquet(tmp_path: Path) -> None:
-    """Create the canonical 12-month Parquet layout the coverage scan expects."""
-    base = tmp_path / "parquet" / "stocks" / "SPY" / "2024"
-    base.mkdir(parents=True, exist_ok=True)
+async def _seed_full_year_parquet(
+    tmp_path: Path,
+    session_factory: async_sessionmaker[AsyncSession],
+    write_partition_fn: Any,
+) -> None:
+    """Create the canonical 12-month Parquet layout AND seed
+    ``parquet_partition_index`` rows so :func:`compute_coverage`
+    reports ``"full"`` for the post-ingest scan.
+
+    Scope-B refactor: the coverage scan reads the partition_index DB
+    cache, not the filesystem directly, so empty parquet stubs are
+    insufficient. We write real partitions via ``write_partition_fn``
+    (the conftest fixture) and seed the matching index row using
+    ``PartitionIndexGateway.upsert``.
+    """
+    import calendar as _calendar
+
     for month in range(1, 13):
-        (base / f"{month:02d}.parquet").write_bytes(b"")
+        # Cover every calendar day in the month so ``trading_days``
+        # returns all expected sessions and the scan reports ``full``.
+        # ``monthrange`` correctly handles 28/29/30/31-day months.
+        last_day = _calendar.monthrange(2024, month)[1]
+        days = list(range(1, last_day + 1))
+        path = write_partition_fn(
+            tmp_path,
+            asset_class="stocks",
+            symbol="SPY",
+            year=2024,
+            month=month,
+            days=days,
+        )
+        row = make_partition_row_from_path(
+            path,
+            asset_class="stocks",
+            symbol="SPY",
+            year=2024,
+            month=month,
+            days=days,
+        )
+        async with session_factory() as session:
+            await PartitionIndexGateway(session=session).upsert(row)
 
 
 def _ok_bootstrap_mock() -> AsyncMock:
@@ -271,6 +308,7 @@ async def test_coverage_incomplete_when_parquet_missing_month(
 async def test_ib_timeout_increments_metric(
     session_factory: async_sessionmaker[AsyncSession],
     tmp_path: Path,
+    write_partition: Any,
 ) -> None:
     """IB qualify hanging past ib_timeout_s -> IB_TIMEOUT envelope + metric increment."""
     run_id = await _seed_run(
@@ -278,7 +316,7 @@ async def test_ib_timeout_increments_metric(
         request_live_qualification=True,
         digest_suffix="ib-timeout",
     )
-    _seed_full_year_parquet(tmp_path)
+    await _seed_full_year_parquet(tmp_path, session_factory, write_partition)
 
     # Snapshot the unlabeled counter before invoking the orchestrator so we
     # can assert an exact +1 increment regardless of cross-test pollution.

@@ -26,11 +26,17 @@ from msai.schemas.symbol_onboarding import (
 )
 from msai.services.data_ingestion import IngestResult
 from msai.services.symbol_onboarding.orchestrator import _onboard_one_symbol
+from msai.services.symbol_onboarding.partition_index_db import PartitionIndexGateway
+from tests.conftest import make_partition_row_from_path
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_happy_path_without_live_qualification(session_factory, tmp_path):
+async def test_orchestrator_happy_path_without_live_qualification(
+    session_factory, tmp_path, write_partition
+):
     """Bootstrap → ingest → coverage(full) → ib_skipped → succeeded."""
+    import calendar as _calendar
+
     spec = OnboardSymbolSpec(
         symbol="SPY",
         asset_class="equity",
@@ -62,10 +68,29 @@ async def test_orchestrator_happy_path_without_live_qualification(session_factor
         run_id = run.id
 
     # Seed full-year SPY coverage so the post-ingest scan reports "full".
-    base = tmp_path / "parquet" / "stocks" / "SPY" / "2024"
-    base.mkdir(parents=True, exist_ok=True)
+    # Scope-B: the coverage scan reads parquet_partition_index, not the
+    # filesystem directly, so we write real partitions AND seed the index.
     for month in range(1, 13):
-        (base / f"{month:02d}.parquet").write_bytes(b"")
+        last_day = _calendar.monthrange(2024, month)[1]
+        days = list(range(1, last_day + 1))
+        path = write_partition(
+            tmp_path,
+            asset_class="stocks",
+            symbol="SPY",
+            year=2024,
+            month=month,
+            days=days,
+        )
+        row = make_partition_row_from_path(
+            path,
+            asset_class="stocks",
+            symbol="SPY",
+            year=2024,
+            month=month,
+            days=days,
+        )
+        async with session_factory() as session:
+            await PartitionIndexGateway(session=session).upsert(row)
 
     # Stand-in BootstrapResult — the orchestrator only inspects ``.outcome``.
     fake_bootstrap = AsyncMock()

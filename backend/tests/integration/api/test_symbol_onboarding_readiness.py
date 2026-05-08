@@ -11,6 +11,7 @@ Validates the three-state readiness contract (pin #3):
 
 from __future__ import annotations
 
+import calendar as _calendar
 from datetime import date
 from typing import TYPE_CHECKING, Any
 
@@ -25,6 +26,8 @@ from msai.core.config import settings
 from msai.core.database import get_db
 from msai.models.instrument_alias import InstrumentAlias
 from msai.models.instrument_definition import InstrumentDefinition
+from msai.services.symbol_onboarding.partition_index_db import PartitionIndexGateway
+from tests.conftest import make_partition_row_from_path
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -117,19 +120,38 @@ async def test_readiness_with_window_returns_scoped_availability(
     session_factory: async_sessionmaker[AsyncSession],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    write_partition: Any,
 ) -> None:
     # Arrange — registry row + Parquet months covering the requested window.
+    # Scope-B: the coverage scan reads ``parquet_partition_index``, not the
+    # filesystem directly, so we write real partitions AND seed the index.
     await _seed_active_alias(
         session_factory,
         raw_symbol="SPY",
         asset_class="equity",
         provider="databento",
     )
-    parquet_root = tmp_path / "parquet" / "stocks" / "SPY"
     for month in (1, 2, 3):
-        month_dir = parquet_root / "2024"
-        month_dir.mkdir(parents=True, exist_ok=True)
-        (month_dir / f"{month:02d}.parquet").write_bytes(b"")
+        last_day = _calendar.monthrange(2024, month)[1]
+        days = list(range(1, last_day + 1))
+        path = write_partition(
+            tmp_path,
+            asset_class="stocks",
+            symbol="SPY",
+            year=2024,
+            month=month,
+            days=days,
+        )
+        row = make_partition_row_from_path(
+            path,
+            asset_class="stocks",
+            symbol="SPY",
+            year=2024,
+            month=month,
+            days=days,
+        )
+        async with session_factory() as session:
+            await PartitionIndexGateway(session=session).upsert(row)
     monkeypatch.setattr(settings, "data_root", str(tmp_path), raising=False)
 
     # Act
@@ -150,7 +172,11 @@ async def test_readiness_with_window_returns_scoped_availability(
     assert body["provider"] == "databento"
     assert body["backtest_data_available"] is True
     assert body["coverage_status"] == "full"
-    assert body["covered_range"] == "2024-01-01 → 2024-03-31"
+    # covered_range now reflects the trading-day min/max within the window
+    # (Scope-B refactor): Jan 1 2024 is New Year's Day (closed); first
+    # trading day is Jan 2. Mar 29 is Good Friday; last trading day in the
+    # Jan–Mar window is Mar 28 (Mar 30/31 are weekend).
+    assert body["covered_range"] == "2024-01-02 → 2024-03-28"
     assert body["missing_ranges"] == []
     assert body["live_qualified"] is False
     assert body["coverage_summary"] is None
