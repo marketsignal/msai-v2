@@ -770,6 +770,7 @@ async def inventory(
             coverage_status=coverage_status,
             missing_ranges=missing_ranges_typed,
             today=today,
+            asset_class=ingest_asset,
         )
 
         return InventoryRow(
@@ -784,7 +785,11 @@ async def inventory(
             missing_ranges=[
                 {"start": s.isoformat(), "end": e.isoformat()} for s, e in missing_ranges_typed
             ],
-            is_stale=is_trailing_only(missing_ranges=missing_ranges_typed, today=today),
+            is_stale=is_trailing_only(
+                missing_ranges=missing_ranges_typed,
+                today=today,
+                asset_class=ingest_asset,
+            ),
             live_qualified=item.live_qualified,
             last_refresh_at=item.last_refresh_at,
             status=status_value,
