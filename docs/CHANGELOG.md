@@ -4,6 +4,29 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-05-09 — Prod compose deployable (precursor PR open, branch `feat/prod-compose-deployable`)
+
+**Goal:** Make `docker-compose.prod.yml` actually deployable so a future deployment-pipeline branch can wire CI/CD. Council verdict at [`docs/decisions/deployment-pipeline-architecture.md`](decisions/deployment-pipeline-architecture.md) (5 advisors — Simplifier, Hawk, Pragmatist, Contrarian, Maintainer; 4/5 APPROVE/CONDITIONAL, Contrarian OBJECT cleared by this PR) ratified the architecture; this PR is the literal "Next Step" — fixes Blocking Objections items 1-6.
+
+**Plan:** [`docs/plans/2026-05-09-prod-compose-deployable.md`](plans/2026-05-09-prod-compose-deployable.md). 11 tasks, sequential mode. Per memory feedback `feedback_skip_phase3_brainstorm_when_council_predone.md`, Phases 3.1/3.1b/3.1c PRE-DONE per council; Phase 3.2 (writing-plans) and 3.3 (plan-review) ran fresh — Claude review found 1 P0 + 2 P1 + 2 P2 over 2 iterations, all fixed before execution. Codex CLI unavailable in worktree (`.claude/hooks/lib/` is gitignored — exit 127 reproducer); user-as-second-reviewer satisfied via `/new-feature` "Full workflow" choice.
+
+**What shipped:**
+
+- **`backend/Dockerfile`**: `COPY alembic/` + `COPY alembic.ini` so `alembic upgrade head` runs from the container, not the host (Contrarian objection — `verify-paper-soak.sh:211` was a workaround for this defect). **Build context switched to repo root** (`docker build -f backend/Dockerfile .`) — fixes a latent bug where the original `COPY strategies/` couldn't possibly work with `context: ./backend` because `strategies/` lives at the repo root. Bug never previously triggered because dev uses `Dockerfile.dev` which doesn't COPY strategies (mounts as a volume).
+- **`docker-compose.prod.yml`**:
+  - Switched all 6 application services (`backend`, `backtest-worker`, `research-worker`, `portfolio-worker`, `live-supervisor`, `frontend`) from `build:` to `image:` references with `:?` guards on `MSAI_REGISTRY` / `MSAI_BACKEND_IMAGE` / `MSAI_FRONTEND_IMAGE` / `MSAI_GIT_SHA`. Compose now expects pre-built registry images for image-pull deploys.
+  - Added one-shot `migrate` service (`alembic upgrade head`, `restart: "no"`, `depends_on: postgres: service_healthy`).
+  - Added missing `ingest-worker` service (Contrarian/Maintainer — `IngestWorkerSettings` exists at `backend/src/msai/workers/ingest_settings.py:35`, queue routed at `backend/src/msai/core/queue.py:150`, but prod had no consumer — symbol onboarding would have hung forever in production).
+  - All app services + `live-supervisor` now `depends_on: migrate: condition: service_completed_successfully` — race-free single-runner migrations.
+  - Plumbed missing env vars through backend service: `REPORT_SIGNING_SECRET` (`config.py:295` hard-fails prod startup on the dev default), `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `JWT_TENANT_ID/CLIENT_ID` (default to AZURE\_\*), `CORS_ORIGINS`, `MSAI_API_KEY` (optional). **P0 plan-review finding**: `REPORT_SIGNING_SECRET` is required by EVERY service that imports `msai.core.config.settings` (alembic, all workers, live-supervisor) — not just the backend HTTP app. Prod-mode validator runs at module-import time; without the var, every container crashloops. Fixed.
+  - Moved `ib-gateway` + `live-supervisor` behind `profiles: ["broker"]` — default `up -d` no longer touches a running trading session. Council Blocking Objection #7 (NautilusTrader gotcha #3 — duplicate `client_id` silently disconnects). Operator opts in via `COMPOSE_PROFILES=broker`.
+- **`frontend/Dockerfile`**: Added `ARG NEXT_PUBLIC_AZURE_CLIENT_ID` / `NEXT_PUBLIC_AZURE_TENANT_ID` / `NEXT_PUBLIC_API_URL` + corresponding `ENV` declarations BEFORE `RUN pnpm build`. Next.js bakes `NEXT_PUBLIC_*` into the JS bundle at build time — without these, the prod bundle ships with empty MSAL config and auth silently fails for every user. Smoke-test verified the test client/tenant ids land in `.next/server/*.js`.
+- **Runbooks (`docs/runbooks/vm-setup.md` + `disaster-recovery.md`)**: `/api/v1/health` → `/health` (4 occurrences). VM size `Standard_D4s_v5` → `Standard_D4s_v6` (council Verification — DSv5 family quota is 0/0 on MarketSignal2; Ddsv6 has 0/10 default, no quota request needed). Added `COMPOSE_PROFILES=broker` documentation to vm-setup.md.
+
+**Phase 5 smoke test:** `docker compose -f docker-compose.prod.yml config` validates with all `:?` vars set; fails cleanly with the named missing var when any is unset. Backend image builds + `alembic --help` succeeds inside the image; alembic can load `msai.core.config.settings` with REPORT_SIGNING_SECRET set (verified by attempting `alembic current` against a fake DB host — failure mode is connection refused, not config validation). Frontend image builds + grep confirms `test-client-id` / `test-tenant-id` baked into bundle. No `compose up` in smoke (would touch shared `name: msai_postgres_data` volume — defer live-bring-up to deployment-pipeline branch).
+
+**Out of scope (deployment-pipeline branch):** Bicep IaC, GitHub Actions OIDC + ACR provisioning, Key Vault + managed identity, nightly `pg_dump` automation, Azure Log Analytics agent, VM provisioning. The council's Phase 1 deploy shape stands; this PR removes the precondition that was blocking it.
+
 ### 2026-05-07 — Coverage day-precise refactor (PR #49 open, branch `feat/coverage-day-precise`)
 
 **Goal:** Replace `compute_coverage`'s month-granularity scan with day-precise trading-day inspection. Spike (`docs/research/2026-05-07-coverage-granularity-spike.md`) confirmed production paths CAN emit partial-month parquet files (sub-month onboarding, provider partial returns, CLI spot fixes); pre-Scope-B those silently passed as `status="full"`. Council ratified Scope B with 6 prereqs (4 Contrarian + 2 Hawk).

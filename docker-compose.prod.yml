@@ -1,3 +1,51 @@
+# Production compose file.
+#
+# This file expects PRE-BUILT images pulled from a registry (ACR in
+# Phase 1 deploy-pipeline; GHCR or local during smoke tests). It does
+# NOT build images at deploy time. CI must build + push backend and
+# frontend images, then SSH to the VM and run `docker compose pull &&
+# up -d --wait`.
+#
+# Required environment variables (all `:?`-guarded — compose fails fast
+# if missing):
+#   - MSAI_REGISTRY        : registry hostname, e.g. msai.azurecr.io
+#   - MSAI_BACKEND_IMAGE   : repo name for backend, e.g. msai-backend
+#   - MSAI_FRONTEND_IMAGE  : repo name for frontend, e.g. msai-frontend
+#   - MSAI_GIT_SHA         : tag pinning a deployment to an immutable image
+#   - POSTGRES_PASSWORD    : Postgres password
+#   - REPORT_SIGNING_SECRET: 32+ char secret (`openssl rand -base64 48`).
+#                            Required by EVERY service that imports
+#                            ``msai.core.config.settings`` because the
+#                            production-mode validator at
+#                            ``backend/src/msai/core/config.py:295``
+#                            raises at import time. Workers + migrate
+#                            inherit the same value via interpolation.
+#   - AZURE_TENANT_ID      : Entra ID tenant for backend JWT validation
+#   - AZURE_CLIENT_ID      : Entra ID app id
+#   - CORS_ORIGINS         : JSON list of allowed origins,
+#                            e.g. '["https://msai.example.com"]'
+#   - IB_ACCOUNT_ID        : starts with DU (paper) or U (live)
+#   - TWS_USERID/PASSWORD  : IB Gateway login (only when broker profile)
+#
+# Optional env (sane defaults):
+#   - JWT_TENANT_ID/CLIENT_ID : default to AZURE_*
+#   - MSAI_API_KEY            : alternative to JWT for dev/CLI
+#   - POLYGON_API_KEY         : empty disables Polygon ingestion
+#   - DATABENTO_API_KEY       : empty disables Databento ingestion
+#   - PUBLIC_API_URL          : used for frontend SSR fallback only
+#   - TRADING_MODE            : ``paper`` (default) or ``live``
+#   - IB_PORT                 : 4002 paper (default), 4001 live
+#
+# Profile usage:
+#   - default profile: postgres, redis, migrate, backend, all arq workers,
+#     frontend. Safe for staging/CI deploys.
+#   - broker profile: live-supervisor + ib-gateway. Only start with
+#     ``COMPOSE_PROFILES=broker docker compose ... up -d`` when an
+#     operator is actively running paper or live trading. Mirrors the
+#     dev compose pattern. Council Blocking Objection #7: re-deploying
+#     ib-gateway during an active live session silently disconnects the
+#     trading client (NautilusTrader gotcha #3 — duplicate client_id).
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -33,10 +81,29 @@ services:
           cpus: "0.5"
           memory: 512M
 
+  # One-shot migration runner. Runs `alembic upgrade head` once and exits.
+  # Backend + every worker depends on this completing successfully so
+  # they never boot against a pre-migration schema. Built from the same
+  # backend image (alembic/ + alembic.ini are now COPY'd into it).
+  migrate:
+    image: ${MSAI_REGISTRY:?Set MSAI_REGISTRY}/${MSAI_BACKEND_IMAGE:?Set MSAI_BACKEND_IMAGE}:${MSAI_GIT_SHA:?Set MSAI_GIT_SHA}
+    command: ["alembic", "upgrade", "head"]
+    working_dir: /app
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:${POSTGRES_PASSWORD}@postgres:5432/msai
+      ENVIRONMENT: production
+      # Required because alembic/env.py imports msai.core.config.settings
+      # which triggers the prod-mode REPORT_SIGNING_SECRET validator at
+      # config.py:295 — without this the migration fails at import time
+      # before alembic even runs.
+      REPORT_SIGNING_SECRET: ${REPORT_SIGNING_SECRET}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: ${MSAI_REGISTRY}/${MSAI_BACKEND_IMAGE}:${MSAI_GIT_SHA}
     ports:
       - "8000:8000"
     volumes:
@@ -46,6 +113,17 @@ services:
       REDIS_URL: redis://redis:6379
       DATA_ROOT: /app/data
       ENVIRONMENT: production
+      # Production-mode mandatory secret (validated at config.py:295).
+      # The :? guard fires once here, on the first interpolation; downstream
+      # services interpolate the resolved value via `${REPORT_SIGNING_SECRET}`.
+      REPORT_SIGNING_SECRET: ${REPORT_SIGNING_SECRET:?Set REPORT_SIGNING_SECRET in .env (openssl rand -base64 48)}
+      # Auth — backend imports msal/jwt validators that read these.
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID:?Set AZURE_TENANT_ID in .env}
+      AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:?Set AZURE_CLIENT_ID in .env}
+      JWT_TENANT_ID: ${JWT_TENANT_ID:-${AZURE_TENANT_ID}}
+      JWT_CLIENT_ID: ${JWT_CLIENT_ID:-${AZURE_CLIENT_ID}}
+      CORS_ORIGINS: ${CORS_ORIGINS:?Set CORS_ORIGINS in .env (JSON list of allowed origins)}
+      MSAI_API_KEY: ${MSAI_API_KEY:-}
       POLYGON_API_KEY: ${POLYGON_API_KEY:-}
       DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
       # Codex iter4 P1: ``api/live.py`` reads
@@ -57,11 +135,17 @@ services:
       # semantics as live-supervisor so compose fails instantly
       # without credentials.
       IB_HOST: ${IB_HOST:-ib-gateway}
-      IB_PORT: ${IB_PORT:-4004}
+      # Align with ib-gateway's IB_API_PORT default (4002 = paper).
+      # Override to 4001 for live trading. Pre-2026-05-09 this defaulted
+      # to 4004 — never matched any ib-gateway listener; broker stack
+      # would silently connection-refuse without an explicit override.
+      IB_PORT: ${IB_PORT:-4002}
       IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:?Set IB_ACCOUNT_ID in .env}
       IB_MARKET_DATA_TYPE: ${IB_MARKET_DATA_TYPE:-REALTIME}
       IB_USE_REGULAR_TRADING_HOURS: ${IB_USE_REGULAR_TRADING_HOURS:-false}
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -90,9 +174,7 @@ services:
           memory: 4G
 
   backtest-worker:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: ${MSAI_REGISTRY}/${MSAI_BACKEND_IMAGE}:${MSAI_GIT_SHA}
     command: ["python", "-m", "arq", "msai.workers.settings.WorkerSettings"]
     volumes:
       - app_data:/app/data
@@ -101,7 +183,11 @@ services:
       REDIS_URL: redis://redis:6379
       DATA_ROOT: /app/data
       ENVIRONMENT: production
+      # Required: workers import msai.core.config which validates this in production.
+      REPORT_SIGNING_SECRET: ${REPORT_SIGNING_SECRET}
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -114,9 +200,7 @@ services:
           memory: 4G
 
   research-worker:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: ${MSAI_REGISTRY}/${MSAI_BACKEND_IMAGE}:${MSAI_GIT_SHA}
     command: ["python", "-m", "arq", "msai.workers.research_settings.ResearchWorkerSettings"]
     volumes:
       - app_data:/app/data
@@ -125,7 +209,10 @@ services:
       REDIS_URL: redis://redis:6379
       DATA_ROOT: /app/data
       ENVIRONMENT: production
+      REPORT_SIGNING_SECRET: ${REPORT_SIGNING_SECRET}
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -138,9 +225,7 @@ services:
           memory: 4G
 
   portfolio-worker:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: ${MSAI_REGISTRY}/${MSAI_BACKEND_IMAGE}:${MSAI_GIT_SHA}
     command: ["python", "-m", "arq", "msai.workers.portfolio_settings.WorkerSettings"]
     volumes:
       - app_data:/app/data
@@ -149,7 +234,41 @@ services:
       REDIS_URL: redis://redis:6379
       DATA_ROOT: /app/data
       ENVIRONMENT: production
+      REPORT_SIGNING_SECRET: ${REPORT_SIGNING_SECRET}
     depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
+  # Consumes msai:ingest queue (`backend/src/msai/core/queue.py:150`).
+  # Without this service prod has no consumer for ingest jobs — symbol
+  # onboarding hangs forever. Caught by Council (Contrarian + Maintainer)
+  # 2026-05-09.
+  ingest-worker:
+    image: ${MSAI_REGISTRY}/${MSAI_BACKEND_IMAGE}:${MSAI_GIT_SHA}
+    command: ["python", "-m", "arq", "msai.workers.ingest_settings.IngestWorkerSettings"]
+    volumes:
+      - app_data:/app/data
+    environment:
+      DATABASE_URL: postgresql+asyncpg://msai:${POSTGRES_PASSWORD}@postgres:5432/msai
+      REDIS_URL: redis://redis:6379
+      DATA_ROOT: /app/data
+      ENVIRONMENT: production
+      REPORT_SIGNING_SECRET: ${REPORT_SIGNING_SECRET}
+      POLYGON_API_KEY: ${POLYGON_API_KEY:-}
+      DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -166,10 +285,12 @@ services:
   # LiveCommandBus (XAUTOCLAIM PEL recovery + DLQ), runs ProcessManager
   # spawn/reap + HeartbeatMonitor stale sweep. Isolated from arq because
   # on_startup blocks the poll loop (Codex v2 P0).
+  #
+  # Behind the ``broker`` profile so default `up -d` does NOT touch a
+  # running trading session (council Blocking Objection #7).
   live-supervisor:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: ${MSAI_REGISTRY}/${MSAI_BACKEND_IMAGE}:${MSAI_GIT_SHA}
+    profiles: ["broker"]
     command: ["python", "-m", "msai.live_supervisor"]
     volumes:
       - app_data:/app/data
@@ -178,12 +299,15 @@ services:
       REDIS_URL: redis://redis:6379
       DATA_ROOT: /app/data
       ENVIRONMENT: production
+      REPORT_SIGNING_SECRET: ${REPORT_SIGNING_SECRET}
       # Phase 4 task #154 scope-B: the trading subprocess reads
       # these to construct TradingNodePayload. Inside the Compose
       # network, the gateway is reachable at ``ib-gateway:4002``
       # (paper) or ``ib-gateway:4001`` (live).
       IB_HOST: ib-gateway
-      IB_PORT: ${IB_PORT:-4004}
+      # Align with ib-gateway's IB_API_PORT default (4002 = paper).
+      # Override to 4001 for live trading.
+      IB_PORT: ${IB_PORT:-4002}
       IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:?Set IB_ACCOUNT_ID in .env}
       IB_MARKET_DATA_TYPE: ${IB_MARKET_DATA_TYPE:-REALTIME}
       IB_USE_REGULAR_TRADING_HOURS: ${IB_USE_REGULAR_TRADING_HOURS:-false}
@@ -194,6 +318,8 @@ services:
       TWS_USERID: ${TWS_USERID:?Set TWS_USERID in .env}
       TWS_PASSWORD: ${TWS_PASSWORD:?Set TWS_PASSWORD in .env}
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -213,13 +339,24 @@ services:
           memory: 4G
 
   frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
+    # NEXT_PUBLIC_* env vars are baked into the JS bundle at
+    # `pnpm build` time inside the Dockerfile (see frontend/Dockerfile
+    # ARG/ENV ordering). The runtime `NEXT_PUBLIC_API_URL` env below is
+    # only consumed by Next.js server-rendered pages; client-side bundles
+    # see the BUILD-time value. CI must pass `--build-arg
+    # NEXT_PUBLIC_AZURE_CLIENT_ID=…`, `--build-arg
+    # NEXT_PUBLIC_AZURE_TENANT_ID=…`, and `--build-arg
+    # NEXT_PUBLIC_API_URL=…` when building the frontend image.
+    image: ${MSAI_REGISTRY}/${MSAI_FRONTEND_IMAGE:?Set MSAI_FRONTEND_IMAGE}:${MSAI_GIT_SHA}
     ports:
       - "3000:3000"
     environment:
-      NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost:8000}
+      # Server-side fallback only (Next.js SSR + standalone server reads
+      # at runtime). Client bundles see the BUILD-time value baked in by
+      # the Dockerfile ARG. Default targets the in-network backend
+      # service so SSR fetches resolve correctly inside the compose
+      # network if PUBLIC_API_URL is unset.
+      NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL:-http://backend:8000}
     restart: unless-stopped
     deploy:
       resources:
@@ -236,8 +373,12 @@ services:
   # so "first run" dialogs only fire once. Without this, a container
   # restart after an IB Gateway version bump hits edge cases where
   # IBC can't dismiss the new version's "welcome" dialogs.
+  #
+  # Behind the ``broker`` profile so default `up -d` does NOT touch
+  # a running trading session (council Blocking Objection #7).
   ib-gateway:
     image: ghcr.io/gnzsnz/ib-gateway:10.43.1c
+    profiles: ["broker"]
     environment:
       TWS_USERID: ${TWS_USERID:?Set TWS_USERID in .env}
       TWS_PASSWORD: ${TWS_PASSWORD:?Set TWS_PASSWORD in .env}
