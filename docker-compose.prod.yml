@@ -105,7 +105,11 @@ services:
   backend:
     image: ${MSAI_REGISTRY}/${MSAI_BACKEND_IMAGE}:${MSAI_GIT_SHA}
     ports:
-      - "8000:8000"
+      # Slice 3: bind to loopback only — Caddy is the public ingress on 80/443.
+      # VM-local debugging via curl http://127.0.0.1:8000/health still works.
+      # NSG only allows 22/80/443 inbound but loopback bind is defense-in-depth
+      # against accidental NSG changes that might expose 8000 publicly.
+      - "127.0.0.1:8000:8000"
     volumes:
       - app_data:/app/data
     environment:
@@ -349,7 +353,9 @@ services:
     # NEXT_PUBLIC_API_URL=…` when building the frontend image.
     image: ${MSAI_REGISTRY}/${MSAI_FRONTEND_IMAGE:?Set MSAI_FRONTEND_IMAGE}:${MSAI_GIT_SHA}
     ports:
-      - "3000:3000"
+      # Slice 3: loopback only — Caddy reaches frontend via the compose network at
+      # frontend:3000. Same defense-in-depth as backend.ports.
+      - "127.0.0.1:3000:3000"
     environment:
       # Server-side fallback only (Next.js SSR + standalone server reads
       # at runtime). Client bundles see the BUILD-time value baked in by
@@ -363,6 +369,33 @@ services:
         limits:
           cpus: "1.0"
           memory: 1G
+
+  # Slice 3: Caddy reverse-proxy with automatic Let's Encrypt TLS termination.
+  # The ONLY service publishing host ports 80/443. Routes /api/* to backend:8000
+  # and everything else to frontend:3000. Cert state persists in named volumes
+  # across restarts. See ./Caddyfile (bind-mounted ro) for routing logic.
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      MSAI_HOSTNAME: ${MSAI_HOSTNAME:?Set MSAI_HOSTNAME (e.g. platform.marketsignal.ai)}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
 
   # Interactive Brokers Gateway running inside the Compose network.
   # IBC handles the IB Gateway GUI automatically — no manual clicks.
@@ -467,3 +500,10 @@ volumes:
     name: msai_app_data
   ib_gateway_settings:
     name: msai_ib_gateway_settings
+  # Slice 3: Caddy ACME state (account keys, issued certs) and runtime config.
+  # Persists across restarts so we don't re-issue certs every deploy (LE rate
+  # limit: 5 certs / hostname / week).
+  caddy_data:
+    name: msai_caddy_data
+  caddy_config:
+    name: msai_caddy_config

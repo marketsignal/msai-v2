@@ -1,0 +1,44 @@
+# MSAI v2 — Caddy reverse-proxy + automatic Let's Encrypt TLS.
+#
+# Site address comes from the MSAI_HOSTNAME env var (interpolated at Caddyfile-parse
+# time before any directive evaluation). Slice 3 deploy-on-vm.sh writes MSAI_HOSTNAME
+# into /run/msai-images.env which docker-compose loads via --env-file; the caddy
+# service propagates it through `environment:` block.
+#
+# IMPORTANT: We use `handle /api/*` — NOT `handle_path /api/*`. The backend serves
+# under `/api/v1/...` (project canonical convention per .claude/rules/api-design.md).
+# `handle_path` strips the matched prefix before proxying, so `/api/v1/auth/me` would
+# route to backend as `/v1/auth/me` and 404. `handle` preserves the prefix so the
+# backend sees the full URL it expects. Do NOT change to handle_path.
+#
+# `handle` blocks are mutex / first-match-wins (preferred over `route` for ordered
+# routing without fall-through). Reference: https://caddyserver.com/docs/caddyfile/patterns
+
+{$MSAI_HOSTNAME} {
+	encode gzip zstd
+
+	log {
+		output stdout
+		format console
+	}
+
+	handle /api/* {
+		reverse_proxy backend:8000
+	}
+
+	# Backend exposes /health and /ready at root (not under /api/v1/) — see
+	# backend/src/msai/main.py:316,322. These are unauth probes used by the
+	# Slice 3 deploy pipeline's success-signal checks. Caddy `handle` takes
+	# exactly one matcher, so split into two blocks.
+	handle /health {
+		reverse_proxy backend:8000
+	}
+
+	handle /ready {
+		reverse_proxy backend:8000
+	}
+
+	handle {
+		reverse_proxy frontend:3000
+	}
+}

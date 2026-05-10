@@ -33,6 +33,33 @@ grep -q "resource ghOidcAcrPushAssignment 'Microsoft.Authorization/roleAssignmen
 grep -q "roleDefinitionId: roleDefIdAcrPush" infra/main.bicep \
     || { echo "FAIL: AcrPush role-def reference missing in role-assignment block" >&2; exit 1; }
 
+echo "=== Slice 3 grep assertions ==="
+
+# Slice 3 T13: NSG securityRules refactored to child resources (NOT inline property).
+# If `securityRules:` appears as a property of the NSG, the refactor regressed.
+grep -q "resource nsgRuleSshFromOperator 'Microsoft.Network/networkSecurityGroups/securityRules" infra/main.bicep \
+    || { echo "FAIL: NSG SSH rule child resource missing in infra/main.bicep (Slice 3 T13)" >&2; exit 1; }
+grep -q "resource nsgRuleHttpsInbound 'Microsoft.Network/networkSecurityGroups/securityRules" infra/main.bicep \
+    || { echo "FAIL: NSG HTTPS rule child resource missing in infra/main.bicep (Slice 3 T13)" >&2; exit 1; }
+
+# Confirm NSG itself does NOT declare securityRules as a property (regression guard).
+if awk '/^resource nsg /,/^}$/' infra/main.bicep | grep -q "securityRules:"; then
+    echo "FAIL: NSG declares inline securityRules — must be child resources (Slice 3 T13, Contrarian P0 in deploy-ssh-jit.md)" >&2
+    exit 1
+fi
+
+# Slice 3 T14: Network Contributor on ghOidcMi scoped to NSG only
+grep -q "var roleDefIdNetworkContributor = subscriptionResourceId" infra/main.bicep \
+    || { echo "FAIL: roleDefIdNetworkContributor variable missing (Slice 3 T14)" >&2; exit 1; }
+grep -q "resource ghOidcNsgContributorAssignment 'Microsoft.Authorization/roleAssignments" infra/main.bicep \
+    || { echo "FAIL: ghOidcNsgContributorAssignment missing (Slice 3 T14)" >&2; exit 1; }
+grep -q "scope: nsg" infra/main.bicep \
+    || { echo "FAIL: ghOidc Network Contributor must be scoped to nsg (NOT subscription/RG)" >&2; exit 1; }
+
+# Slice 3 nsgName output (consumed by deploy.yml + reaper)
+grep -q "^output nsgName string = nsg.name" infra/main.bicep \
+    || { echo "FAIL: nsgName output missing (consumed by deploy workflows)" >&2; exit 1; }
+
 echo "Slice 2 grep assertions clean."
 
 if [[ "${SKIP_WHATIF:-}" == "1" ]] || ! az account show >/dev/null 2>&1; then

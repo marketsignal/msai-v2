@@ -4,6 +4,24 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-05-10 — Deployment-pipeline Slice 3: SSH Deploy + First Real Production Deploy (`feat/deploy-pipeline-ssh-deploy-and-first-deploy`)
+
+**Goal:** `.github/workflows/deploy.yml` (workflow_run after Slice 2 + workflow_dispatch) — OIDC + `webfactory/ssh-agent` SSH-from-runner; `scripts/deploy-on-vm.sh` (idempotent, classified failure markers, 1-step rollback to last-good SHA); Caddy 2 reverse-proxy + auto-LE TLS at `platform.marketsignal.ai`; updated `scripts/backup-to-blob.sh` (Bicep outputs + system-assigned MI; streams `pg_dump | gzip | az storage blob upload --file /dev/stdin`); ADR `docs/decisions/deploy-ssh-jit.md` resolving the council Plan-Review iter-1 P0 (Slice 1 NSG only allowed SSH from `operatorIp/32`, blocking GH-runner deploys).
+
+**Operator gates (BLOCKING):**
+
+- ☐ **Hawk's gate** (before first deploy): `scripts/backup-to-blob.sh` against empty prod Postgres + verify dump in `msai-backups` Blob — evidence in PR
+- ☐ **Contrarian's gate** (before merge): full deploy rehearsed in throwaway RG; Bicep child-resource refactor spike confirms transient rule survives reapply; RG torn down — evidence in PR
+- ☐ **First real prod deploy** (after merge): `gh workflow run deploy.yml -f git_sha=<merge-sha>` manually (per research §5 finding 6); 5/5 probes against `https://platform.marketsignal.ai/`
+
+**Council Plan-Review iter 1 (NSG SSH gap, P0):** 5/5 advisors reject static-GH-IP-ranges. Default (transient JIT NSG rule + Network Contributor scoped to NSG only) approved with 5 mandatory mitigations (Bicep child-resources, concurrency cancel-in-progress:false, cleanup as separate job, reaper cron, ADR + runbook). Contrarian caught 2 P0s the others missed (Bicep drift bomb, concurrent-deploy collision). See `docs/decisions/deploy-ssh-jit.md`.
+
+**Code-review iter 1 (pr-review-toolkit; Codex CLI locked out):** 0 P0, 0 P1, 4 P2 all addressed (additive-only migrations rule in `.claude/rules/database.md`, systemctl combine, SHA-pin actions in deploy.yml + reap.yml, reaper timestamp comment), 5 P3 deferred non-blocking.
+
+**Verification:** verify-app subagent — 1821 backend unit tests PASS, ruff clean. All Slice 3 infra tests green (actionlint, shellcheck, bash -n, bicep build + Slice 2/3 grep, Caddyfile positive + negative validation).
+
+**Slice 4 carry-over:** nightly cron via `azcopy`; active-`live_deployments` hard refusal gate; Log Analytics dashboards + alert rules; SHA-pin Slice 2's `build-and-push.yml`; custom RBAC role with only `securityRules/*` actions; Azure Policy deny on non-runner-IP `sourceAddressPrefix`. Full list in `docs/decisions/deploy-ssh-jit.md` "Deferred".
+
 ### 2026-05-10 — Deployment-pipeline Slice 2: CI Image Publish (`feat/deploy-pipeline-ci-image-publish`)
 
 **Goal:** Wire push-to-main into Azure via OIDC federation, build backend + frontend Docker images, push to ACR with immutable short-SHA tags. **No deploy step** — that's Slice 3.

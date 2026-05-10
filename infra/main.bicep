@@ -85,6 +85,12 @@ var roleDefIdKvSecretsOfficer = subscriptionResourceId('Microsoft.Authorization/
 var roleDefIdAcrPull = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')
 var roleDefIdAcrPush = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '8311e382-0749-4cb8-b61a-304f252e45ec')
 var roleDefIdBlobContributor = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+// Network Contributor — Slice 3 grants this to the GH OIDC MI scoped to the NSG only,
+// so the deploy workflow can `az network nsg rule create/delete` for the just-in-time
+// transient SSH allow rule (`gha-transient-${run_id}-${run_attempt}`). Built-in role.
+// Custom role with only securityRules/{read,write,delete} is a Phase 2 hardening; see
+// docs/decisions/deploy-ssh-jit.md "Deferred hardening".
+var roleDefIdNetworkContributor = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4d97b98b-1d4f-4787-a291-c67834d212e7')
 
 // ─────────────────────────────────────────────────────────────────────────────
 // T8 (declared early): GH OIDC user-assigned managed identity + federated credential.
@@ -113,55 +119,64 @@ resource ghOidcCredential 'Microsoft.ManagedIdentity/userAssignedIdentities/fede
 // T2: Network — VNet + Subnet + Public IP + NSG
 // ─────────────────────────────────────────────────────────────────────────────
 
+// NSG is declared with NO inline `securityRules:` property. Rules below are CHILD
+// resources so transient deploy-time rules (e.g. `gha-transient-<run_id>-<attempt>`
+// added by .github/workflows/deploy.yml) survive future `az deployment group create`
+// reapplies. Inline rules are a complete property — ARM reconciles them as a set on
+// every apply, which would silently delete transient rules mid-deploy. Council Plan-
+// Review Iter 1, Contrarian P0; see docs/decisions/deploy-ssh-jit.md.
 resource nsg 'Microsoft.Network/networkSecurityGroups@2024-01-01' = {
   name: nsgName
   location: location
   tags: tags
+  properties: {}
+}
+
+resource nsgRuleSshFromOperator 'Microsoft.Network/networkSecurityGroups/securityRules@2024-01-01' = {
+  parent: nsg
+  name: 'AllowSshFromOperator'
   properties: {
-    securityRules: [
-      {
-        name: 'AllowSshFromOperator'
-        properties: {
-          description: 'SSH from operator workstation (single /32). Tighten if operator IP changes.'
-          protocol: 'Tcp'
-          sourcePortRange: '*'
-          destinationPortRange: '22'
-          sourceAddressPrefix: '${operatorIp}/32'
-          destinationAddressPrefix: '*'
-          access: 'Allow'
-          priority: 100
-          direction: 'Inbound'
-        }
-      }
-      {
-        name: 'AllowHttpInbound'
-        properties: {
-          description: 'HTTP from anywhere (TLS termination via Caddy on the VM).'
-          protocol: 'Tcp'
-          sourcePortRange: '*'
-          destinationPortRange: '80'
-          sourceAddressPrefix: '*'
-          destinationAddressPrefix: '*'
-          access: 'Allow'
-          priority: 110
-          direction: 'Inbound'
-        }
-      }
-      {
-        name: 'AllowHttpsInbound'
-        properties: {
-          description: 'HTTPS from anywhere.'
-          protocol: 'Tcp'
-          sourcePortRange: '*'
-          destinationPortRange: '443'
-          sourceAddressPrefix: '*'
-          destinationAddressPrefix: '*'
-          access: 'Allow'
-          priority: 120
-          direction: 'Inbound'
-        }
-      }
-    ]
+    description: 'SSH from operator workstation (single /32). Tighten if operator IP changes.'
+    protocol: 'Tcp'
+    sourcePortRange: '*'
+    destinationPortRange: '22'
+    sourceAddressPrefix: '${operatorIp}/32'
+    destinationAddressPrefix: '*'
+    access: 'Allow'
+    priority: 100
+    direction: 'Inbound'
+  }
+}
+
+resource nsgRuleHttpInbound 'Microsoft.Network/networkSecurityGroups/securityRules@2024-01-01' = {
+  parent: nsg
+  name: 'AllowHttpInbound'
+  properties: {
+    description: 'HTTP from anywhere (TLS termination via Caddy on the VM).'
+    protocol: 'Tcp'
+    sourcePortRange: '*'
+    destinationPortRange: '80'
+    sourceAddressPrefix: '*'
+    destinationAddressPrefix: '*'
+    access: 'Allow'
+    priority: 110
+    direction: 'Inbound'
+  }
+}
+
+resource nsgRuleHttpsInbound 'Microsoft.Network/networkSecurityGroups/securityRules@2024-01-01' = {
+  parent: nsg
+  name: 'AllowHttpsInbound'
+  properties: {
+    description: 'HTTPS from anywhere.'
+    protocol: 'Tcp'
+    sourcePortRange: '*'
+    destinationPortRange: '443'
+    sourceAddressPrefix: '*'
+    destinationAddressPrefix: '*'
+    access: 'Allow'
+    priority: 120
+    direction: 'Inbound'
   }
 }
 
@@ -605,6 +620,22 @@ resource ghOidcAcrPushAssignment 'Microsoft.Authorization/roleAssignments@2022-0
   }
 }
 
+// Slice 3: Network Contributor on NSG ONLY (not RG, not subscription). The deploy
+// workflow opens a transient SSH allow rule for the runner's public IP just-in-time,
+// then deletes it in a separate cleanup job. A leaked rule is reaped by
+// .github/workflows/reap-orphan-nsg-rules.yml on a 15-min cron. Council-mandated
+// (Plan-Review Iter 1, Contrarian P0 — see docs/decisions/deploy-ssh-jit.md).
+resource ghOidcNsgContributorAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: nsg
+  name: guid(ghOidcMi.id, nsg.id, 'network-contributor')
+  properties: {
+    principalId: ghOidcMi.properties.principalId
+    roleDefinitionId: roleDefIdNetworkContributor
+    principalType: 'ServicePrincipal'
+    description: 'Slice 3: GH OIDC MI mutates NSG security rules to open transient SSH for deploy.yml. Scoped to this NSG only — defense-in-depth via Phase 2 Azure Policy deferred per docs/decisions/deploy-ssh-jit.md.'
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Outputs (consumed by Slice 2/3 via `az deployment group show --query 'properties.outputs'`)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -618,4 +649,5 @@ output vmPrincipalId string = vm.identity.principalId
 output logAnalyticsWorkspaceId string = logWorkspace.properties.customerId
 output backupsStorageAccount string = storageAccount.name
 output backupsContainerName string = backupsContainer.name
+output nsgName string = nsg.name
 
