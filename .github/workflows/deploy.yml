@@ -166,7 +166,7 @@ jobs:
             --protocol Tcp \
             --source-address-prefixes "${{ steps.runner-ip.outputs.ip }}/32" \
             --destination-port-ranges 22 \
-            --description "Transient SSH from GH Actions runner. run_id=${{ github.run_id }} attempt=${{ github.run_attempt }}. Auto-deleted by cleanup job; reaped by reap-orphan-nsg-rules.yml if leaked. See docs/decisions/deploy-ssh-jit.md." \
+            --description "Transient SSH from GHA. run_id=${{ github.run_id }} attempt=${{ github.run_attempt }}. See docs/decisions/deploy-ssh-jit.md" \
             --output none
 
       - name: Wait briefly for NSG rule propagation
