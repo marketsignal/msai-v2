@@ -456,11 +456,49 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-07-01' = {
 // AMA does NOT auto-create the DCR — explicit DCR + association is required for any data flow.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// First-deploy fix (caught at acceptance smoke step 3): the original DCR was
+// `kind`-less with stream `Microsoft-Heartbeat`. AMA's MCS endpoint returned
+// 404 ("VM is not associated with the DCR") on every refresh, and Heartbeat
+// never flowed to the workspace. Root cause:
+//   1. `kind: 'Linux'` is required for AMA to recognize the DCR for Linux VMs.
+//   2. `Microsoft-Heartbeat` is NOT a valid AMA stream — AMA emits Heartbeat
+//      IMPLICITLY when associated with a properly-kinded DCR with at least one
+//      valid data source.
+// Fix: declare `kind: 'Linux'` + a minimal `Microsoft-Syslog` data source
+// (Warning+ severity on common facilities). Heartbeat then flows automatically
+// AND we get useful syslog data for Slice 4 alert rules at no extra cost.
 resource heartbeatDcr 'Microsoft.Insights/dataCollectionRules@2022-06-01' = {
   name: heartbeatDcrName
   location: location
   tags: tags
+  kind: 'Linux'
   properties: {
+    dataSources: {
+      syslog: [
+        {
+          name: 'syslogBase'
+          streams: [
+            'Microsoft-Syslog'
+          ]
+          facilityNames: [
+            'auth'
+            'authpriv'
+            'cron'
+            'daemon'
+            'kern'
+            'syslog'
+            'user'
+          ]
+          logLevels: [
+            'Warning'
+            'Error'
+            'Critical'
+            'Alert'
+            'Emergency'
+          ]
+        }
+      ]
+    }
     destinations: {
       logAnalytics: [
         {
@@ -472,7 +510,7 @@ resource heartbeatDcr 'Microsoft.Insights/dataCollectionRules@2022-06-01' = {
     dataFlows: [
       {
         streams: [
-          'Microsoft-Heartbeat'
+          'Microsoft-Syslog'
         ]
         destinations: [
           'msaiLogAnalytics'
