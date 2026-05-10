@@ -4,7 +4,35 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
-### 2026-05-10 — Deployment-pipeline Slice 1: IaC Foundation (PR open, branch `feat/deploy-pipeline-iac-foundation`)
+### 2026-05-10 — Slice 1 acceptance fixes (PR #52 + PR #53 merged)
+
+After PR #51 merged, the Slice 1 acceptance smoke (operator runs `./scripts/deploy-azure.sh` from main) caught 4 reality gaps in 2 follow-up PRs.
+
+**PR #52 (`b5869fe`) — 3 deploy-blocker fixes** (Bicep wouldn't deploy at all):
+
+1. **Bicep BCP258**: every parameter without a default in `main.bicep` MUST be assigned in `main.bicepparam`, even when CLI `--parameters` overrides at deploy time. Add `operatorIp`, `operatorPrincipalId`, `vmSshPublicKey` placeholders in bicepparam; CLI override semantics still take precedence.
+2. **Ubuntu 24.04 image URN**: Canonical changed the URN scheme. The plan's `0001-com-ubuntu-server-noble:24_04-lts-gen2:latest` doesn't exist. Correct: `Canonical:ubuntu-24_04-lts:server:latest` (Gen2 in eastus2).
+3. **KV `enablePurgeProtection: false`**: Azure rejects this with "cannot be set to false. Enabling the purge protection for a vault is an irreversible action." Property must be `true` (irreversible) or absent. Plan's "Phase 1 stays at false" intent achieved by omitting the property (default disabled).
+
+**PR #53 (`64126fd`) — DCR malformed; Heartbeat never flowed**:
+
+The DCR shipped in Slice 1 had three issues that together prevented the Slice 1 acceptance smoke step 3 from passing:
+
+1. **`kind` field absent**. AMA on Linux requires `kind: 'Linux'` for the MCS endpoint to recognize the DCR. Without it, MCS returns 404 for the VM-association lookup every refresh cycle.
+2. **Stream `Microsoft-Heartbeat` is NOT a documented AMA stream.** The valid stream enum (per MS Learn DCR 2022-06-01 reference): `Microsoft-Event`, `Microsoft-InsightsMetrics`, `Microsoft-Perf`, `Microsoft-Syslog`, `Microsoft-WindowsEvent`. Research-brief topic 3 cited `Microsoft-Heartbeat` as the heartbeat-only DCR shape — empirically wrong.
+3. **`dataSources` block missing**. AMA needs at least one valid data source for MCS to publish the DCR config.
+
+**Fix**: `kind: 'Linux'` + `Microsoft-Syslog` data source (Warning+ severity on 7 facilities: `auth, authpriv, cron, daemon, kern, syslog, user`). Heartbeat then flows automatically as a side effect of the AMA-DCR association. Bonus: syslog data is operationally useful for Slice 4 alert rules at no extra cost.
+
+**Operational caveat (matters for Slice 4 / future DCR edits)**: After applying the Bicep fix, AMA on the running VM still required `sudo systemctl restart azuremonitoragent` to clear its negative-cache and re-fetch the now-valid DCR. Without restart, AMA's next ~10-min refresh continued to return 404 even after the ARM-side DCR was fixed. This is the documented MS remediation path; AMA's negative-cache is stickier than its 10-min refresh window suggests.
+
+**Codex research validated**: corrected pattern matches MS Learn's documented Bicep template at [`learn.microsoft.com/.../resource-manager-agent#azure-linux-virtual-machine`](https://learn.microsoft.com/en-us/azure/azure-monitor/agents/resource-manager-agent#azure-linux-virtual-machine).
+
+**Slice 1 acceptance**: 7/7 smoke steps PASS. Heartbeat verified flowing (8 records, last seen `2026-05-10T06:15:01Z`, Computer=`msaiv2-vm`, Category=`Azure Monitor Agent`).
+
+**Research-brief topic 3 needs revision** before Slice 2 starts (deferred — adds context for next session).
+
+### 2026-05-10 — Deployment-pipeline Slice 1: IaC Foundation (PR #51, merged)
 
 **Goal:** Provision the foundational Azure infrastructure for the deployment pipeline. Slice 1 of 4 in the council-ratified series ([`docs/decisions/deployment-pipeline-architecture.md`](decisions/deployment-pipeline-architecture.md), [`docs/decisions/deployment-pipeline-slicing.md`](decisions/deployment-pipeline-slicing.md)). NO application deploys — Slice 1 lays the platform; Slice 2 wires GH Actions; Slice 3 wires SSH deploy + first real prod deploy; Slice 4 wires backups + alert rules.
 
