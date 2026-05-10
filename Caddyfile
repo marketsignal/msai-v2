@@ -26,6 +26,14 @@
 		reverse_proxy backend:8000
 	}
 
+	# Backend exposes /health and /ready at root (not under /api/v1/) — see
+	# backend/src/msai/main.py:316,322. These are unauth probes used by the
+	# Slice 3 deploy pipeline's success-signal checks. Route them to backend
+	# explicitly; everything else falls through to frontend (Next.js SPA).
+	handle /health /ready {
+		reverse_proxy backend:8000
+	}
+
 	handle {
 		reverse_proxy frontend:3000
 	}
