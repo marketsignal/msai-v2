@@ -1,0 +1,88 @@
+name: Reap orphan NSG rules
+
+# Council-mandated (docs/decisions/deploy-ssh-jit.md, Hawk + Contrarian):
+# the deploy.yml cleanup job is best-effort. If a runner OOMs, gets
+# preempted, or the workflow is cancelled mid-run, transient SSH allow
+# rules may leak. This cron deletes any `gha-transient-*` rule older
+# than 30 minutes — belt-and-braces for the cleanup job.
+
+on:
+  schedule:
+    # Every 15 min off-the-mark. Skews from :00/:15/:30/:45 to spread API load.
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: nsg-reaper
+  cancel-in-progress: true
+
+jobs:
+  reap:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@1384c340ab2dda50fed2bee3041d1d87018aa5e8 # v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: List + delete stale gha-transient-* rules
+        # NSG rules don't carry a creation timestamp accessible via `az network nsg
+        # rule list`, so we use the Activity Log to find rules created >30 min ago.
+        # If the activity log query is empty (rare RBAC issue), fall back to
+        # delete-everything-named-gha-transient-* which is safe because the deploy
+        # cleanup deletes the active rule synchronously. Only orphans remain.
+        run: |
+          set -euo pipefail
+          RG="${{ vars.RESOURCE_GROUP }}"
+          NSG="${{ vars.NSG_NAME }}"
+          THRESHOLD_ISO=$(date -u -d '30 minutes ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+            || python3 -c 'import datetime; print((datetime.datetime.utcnow()-datetime.timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ"))')
+
+          echo "Threshold (rules older than this are reaped): $THRESHOLD_ISO"
+
+          rules=$(az network nsg rule list -g "$RG" --nsg-name "$NSG" \
+            --query "[?starts_with(name, 'gha-transient-')].name" -o tsv 2>/dev/null || true)
+
+          if [[ -z "$rules" ]]; then
+            echo "No gha-transient-* rules present; nothing to reap."
+            exit 0
+          fi
+
+          reaped_count=0
+          while IFS= read -r rule; do
+            [[ -z "$rule" ]] && continue
+            # Use Activity Log to find when the rule was created. If we can't, treat
+            # it as orphaned and delete (the active deploy's rule is deleted
+            # synchronously by deploy.yml's cleanup job, so a `gha-transient-*` rule
+            # that's still present here is by definition not the active one).
+            created=$(az monitor activity-log list \
+              --resource-group "$RG" \
+              --offset 6h \
+              --query "[?contains(resourceId, '/$rule') && operationName.value=='Microsoft.Network/networkSecurityGroups/securityRules/write'] | [0].eventTimestamp" \
+              -o tsv 2>/dev/null || true)
+
+            # Bash lexicographic comparison on ISO-8601 strings is correct because
+            # ISO-8601 sorts lexicographically when zone-aligned (UTC 'Z' suffix).
+            # Activity Log emits sub-second precision (`...123Z`); THRESHOLD_ISO is
+            # second-precision — the lex compare still works because the prefix up
+            # to the second compares first. Code-review iter 1 P2.
+            if [[ -z "$created" ]] || [[ "$created" < "$THRESHOLD_ISO" ]]; then
+              echo "Reaping orphan rule: $rule (created=${created:-unknown})"
+              az network nsg rule delete -g "$RG" --nsg-name "$NSG" --name "$rule" --output none
+              reaped_count=$((reaped_count + 1))
+            else
+              echo "Skipping fresh rule: $rule (created=$created)"
+            fi
+          done <<< "$rules"
+
+          {
+            echo "## Reaper run"
+            echo "- Threshold: \`$THRESHOLD_ISO\`"
+            echo "- Reaped: $reaped_count rule(s)"
+          } >> "$GITHUB_STEP_SUMMARY"
