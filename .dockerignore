@@ -1,0 +1,44 @@
+# Repo-root .dockerignore — used when CI builds the backend image with
+# `docker build -f backend/Dockerfile .` (build context is the repo
+# root, not `./backend`). Frontend builds stay scoped to `./frontend`
+# and are governed by `frontend/.dockerignore`.
+#
+# Allowlist semantics: exclude everything by default, then explicitly
+# allow paths the backend Dockerfile actually COPYs from (see
+# backend/Dockerfile). Anything not allowed below is excluded from the
+# build context — meaning faster builds, smaller layer churn, and zero
+# risk of accidentally baking secrets/data into the image if a future
+# COPY uses a wildcard.
+
+# Exclude everything
+*
+
+# Allow paths the backend Dockerfile reads
+!backend/pyproject.toml
+!backend/uv.lock
+!backend/src/
+!backend/alembic/
+!backend/alembic.ini
+!strategies/
+
+# Re-exclude cruft inside allowed paths
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.venv/
+**/*.log
+**/.DS_Store
+
+# Belt-and-suspenders: never ship secrets / git history / test data
+# even if a future allow rule above would otherwise let them in.
+.env
+.env.*
+.git/
+.gitignore
+.dockerignore
+data/
+**/.env
+**/.env.*

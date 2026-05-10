@@ -93,7 +93,7 @@ docker compose -f docker-compose.prod.yml up -d
 ### 8. Verify
 
 ```bash
-curl http://localhost:8000/api/v1/health
+curl http://localhost:8000/health
 docker compose -f docker-compose.prod.yml logs --tail=20
 ```
 
@@ -116,7 +116,7 @@ Follow the P2 steps above (steps 3-8) to restore the database and Parquet data f
 ### 4. Verify Full System
 
 - [ ] All containers running: `docker compose -f docker-compose.prod.yml ps`
-- [ ] Backend health check passes: `curl http://localhost:8000/api/v1/health`
+- [ ] Backend health check passes: `curl http://localhost:8000/health`
 - [ ] Database has expected data: check table row counts
 - [ ] Parquet data directory is populated: `ls -la /app/data/parquet/`
 - [ ] IB Gateway is connected (if applicable)
