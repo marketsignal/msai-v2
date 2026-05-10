@@ -1,6 +1,8 @@
-# Claude Code (local config)
-.claude/
-.mcp.json
+# Claude Code (per-developer state — Forge convention: only .claude/local/ + transient artifacts gitignored, NOT the whole .claude/ tree)
+.claude/local/
+.claude/settings.bak.*
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
 .playwright-mcp/
 
 # Python
@@ -80,9 +82,6 @@ Desktop.ini
 *.pem
 *.key
 data/databento_definitions/
-
-# Volatile per-developer workflow state (PR #2 / continuity-split)
-.claude/local/
 
 # Superpowers brainstorming visual companion (per-session mockups)
 .superpowers/

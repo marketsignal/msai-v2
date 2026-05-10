@@ -1,0 +1,195 @@
+#!/bin/bash
+# .claude/hooks/check-workflow-gates.sh
+# PreToolUse hook for Bash: blocks commit/push/PR if quality gates aren't complete.
+#
+# Fires BEFORE Bash commands. Only activates when:
+# 1. An active workflow exists in .claude/local/state.md (Command != none)
+# 2. The command is git commit, git push, or gh pr create
+# 3. Always-required quality gate checklist items aren't checked off
+#
+# Gated markers (canonical vocabulary — see rules/testing.md "Canonical E2E gate vocabulary"):
+#   "Code review loop"  — code review must pass
+#   "Simplified"        — code simplification must run
+#   "Verified (tests"   — unit tests + lint + types + migrations must pass
+#   "E2E verified"      — Phase 5.4 E2E must pass OR be explicitly N/A with reason
+#
+# Non-gated (conditional) items like "E2E use cases designed" and "E2E regression
+# passed" stay advisory — the model decides if they apply. The E2E verified gate
+# has an explicit N/A escape: `- [x] E2E verified — N/A: <reason>`.
+#
+# Input (JSON via stdin): {session_id, cwd, tool_name, tool_input: {command}}
+# Block: exit 2 + message on stderr
+# Allow: exit 0
+#
+# Requirements: jq (recommended, grep fallback)
+
+INPUT=$(cat)
+
+# --- Parse command ---
+if command -v jq &> /dev/null; then
+    COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // ""')
+else
+    COMMAND=$(echo "$INPUT" | grep -o '"command"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*:[[:space:]]*"//;s/"$//')
+fi
+
+[ -z "$COMMAND" ] && exit 0
+
+# --- Only gate ship actions ---
+IS_SHIP=false
+echo "$COMMAND" | grep -qE '^\s*git\s+commit\b' && IS_SHIP=true
+echo "$COMMAND" | grep -qE '^\s*git\s+push\b' && IS_SHIP=true
+echo "$COMMAND" | grep -qE '^\s*gh\s+pr\s+create\b' && IS_SHIP=true
+
+# Not a ship action — allow immediately
+$IS_SHIP || exit 0
+
+# --- Check for active workflow (post PR #2: state file is .claude/local/state.md) ---
+STATE_FILE=".claude/local/state.md"
+
+if [ ! -f "$STATE_FILE" ]; then
+    # Hard-cut: do NOT fall back to CONTINUITY.md.
+    # Emit friendly breadcrumb on stderr, exit 0 (don't gate — nothing to enforce).
+    echo "ℹ check-workflow-gates: $STATE_FILE not found." >&2
+    echo "  If you have a legacy CONTINUITY.md and just upgraded, run setup --migrate" >&2
+    exit 0
+fi
+
+# Scope extraction to ONLY the `## Workflow` section. Migrated content (e.g.,
+# from `setup.sh --migrate` ingesting old CONTINUITY.md "### Done" entries that
+# mention prior workflow scaffolds) can leave stray `| Command |` lines or
+# `### Checklist` headings elsewhere in the file. A whole-file grep with
+# `head -1` would pick the first match — which can be the stray, not the
+# canonical scaffold — and gate (or fail to gate) on bogus content.
+WORKFLOW_BLOCK=$(awk '/^## Workflow$/{flag=1;next} flag && /^## /{flag=0} flag' "$STATE_FILE" 2>/dev/null)
+
+# Use flexible whitespace matching — formatters may pad table cells
+WORKFLOW_CMD=$(echo "$WORKFLOW_BLOCK" | grep -iE '\|\s*Command\s*\|' | head -1 | awk -F'|' '{print $3}' | xargs)
+# No active workflow — allow
+[ -z "$WORKFLOW_CMD" ] && exit 0
+[ "$WORKFLOW_CMD" = "none" ] && exit 0
+[ "$WORKFLOW_CMD" = "—" ] && exit 0
+[ "$WORKFLOW_CMD" = "-" ] && exit 0
+
+# --- Active workflow: check always-required quality gates ---
+# Extract the Checklist section (between ### Checklist and next ## or ### heading
+# inside the Workflow block — staying scoped prevents stray "### Checklist"
+# headings in migrated State content from being picked up).
+CHECKLIST=$(echo "$WORKFLOW_BLOCK" | sed -n '/^### Checklist/,$p')
+
+# Only gate on the 4 pre-ship quality gates:
+#   "Code review loop" — code review must pass before shipping
+#   "Simplified" — code simplification must run before shipping
+#   "Verified (tests" — tests/lint/types must pass before shipping
+#   "E2E verified" — Phase 5.4 must pass OR be checked [x] with an N/A reason
+# Explicitly exclude non-gate items that contain similar words:
+#   "PR reviews addressed" — happens AFTER PR, not a pre-ship gate
+#   "Plugins verified" — pre-flight check, not a quality gate
+#   "Plan review loop" — design phase discipline, not a pre-ship gate
+#   "E2E use cases designed" — Phase 3.2b, conditional on user-facing change
+#   "E2E regression passed" — Phase 5.4b, conditional on accumulated UCs
+#   "E2E use cases graduated" / "E2E specs graduated" — post-PASS housekeeping
+UNCHECKED=$(echo "$CHECKLIST" | grep '\- \[ \]' | grep -iE '(Code review loop|Simplified|Verified \(tests|E2E verified)' || true)
+
+if [ -n "$UNCHECKED" ]; then
+    UNCHECKED_COUNT=$(echo "$UNCHECKED" | wc -l | tr -d ' ')
+    MISSING=$(echo "$UNCHECKED" | sed 's/- \[ \] /  - /')
+    echo "WORKFLOW GATE: $UNCHECKED_COUNT required quality gate(s) incomplete." >&2
+    echo "Complete these before shipping:" >&2
+    echo "$MISSING" >&2
+    echo "" >&2
+    echo "How to clear each gate:" >&2
+    echo "  - Code review loop:  run /codex review + /pr-review-toolkit:review-pr, fix findings" >&2
+    echo "  - Simplified:        run /simplify" >&2
+    echo "  - Verified (tests):  run the verify-app agent" >&2
+    echo "  - E2E verified:      run the verify-e2e agent AND persist its report, OR mark N/A:" >&2
+    echo '                         - [x] E2E verified — N/A: <specific reason>' >&2
+    echo "  See .claude/rules/testing.md for the canonical gate vocabulary." >&2
+    exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# Evidence-based gate for E2E verified
+#
+# The checklist-only gate above is paperwork enforcement: a bad-faith actor
+# can type '[x] E2E verified ...' without actually running the verify-e2e
+# agent. This check binds the '[x] E2E verified' claim to a real filesystem
+# artifact — a report file in tests/e2e/reports/ with mtime later than the
+# branch-off point.
+#
+# Escape valve: the N/A form ('[x] E2E verified — N/A: <reason>') is trusted
+# and skips the evidence check. Human reviewers catch lazy N/A justifications.
+#
+# Failure modes intentionally accepted:
+#   - User on main (no branch) → can't compute merge-base → skip evidence
+#   - No git / no main or master branch → skip evidence
+#   - Report path writes fail → next commit-attempt catches it
+# ---------------------------------------------------------------------------
+E2E_CHECKED_LINE=$(echo "$CHECKLIST" | grep -E '^\s*- \[x\]\s+E2E verified' | head -1)
+
+if [ -n "$E2E_CHECKED_LINE" ] && ! echo "$E2E_CHECKED_LINE" | grep -qE 'N/A:'; then
+    # [x] E2E verified checked without N/A → require a fresh report file.
+
+    # Find the branch-off commit (try main, fall back to master, else skip).
+    BRANCH_OFF=$(git merge-base HEAD main 2>/dev/null || git merge-base HEAD master 2>/dev/null || true)
+
+    # If HEAD itself IS the branch-off point (i.e., user is on main/master
+    # directly, not a feature branch), there's no meaningful "produced on
+    # this branch" comparison to make. Skip the evidence check — matches
+    # the documented "on main → skip" contract in rules/testing.md.
+    HEAD_SHA=$(git rev-parse HEAD 2>/dev/null || true)
+    if [ -n "$BRANCH_OFF" ] && [ -n "$HEAD_SHA" ] && [ "$BRANCH_OFF" = "$HEAD_SHA" ]; then
+        BRANCH_OFF=""  # Force the skip path below
+    fi
+
+    if [ -n "$BRANCH_OFF" ]; then
+        BRANCH_OFF_TS=$(git log -1 --format=%ct "$BRANCH_OFF" 2>/dev/null || echo "")
+    else
+        BRANCH_OFF_TS=""
+    fi
+
+    # Detect platform for stat syntax (GNU vs BSD/macOS)
+    if stat -c %Y /dev/null >/dev/null 2>&1; then
+        STAT_MTIME_CMD='stat -c %Y'
+    else
+        STAT_MTIME_CMD='stat -f %m'
+    fi
+
+    # Look for at least one fresh report. A "fresh" report has mtime greater
+    # than the branch-off commit's timestamp — meaning it was produced on
+    # THIS branch, not inherited from a previous feature.
+    FRESH_REPORT_FOUND=0
+    if [ -n "$BRANCH_OFF_TS" ] && [ -d "tests/e2e/reports" ]; then
+        for report in tests/e2e/reports/*.md; do
+            [ -f "$report" ] || continue
+            REPORT_MTIME=$($STAT_MTIME_CMD "$report" 2>/dev/null || echo "0")
+            if [ "$REPORT_MTIME" -gt "$BRANCH_OFF_TS" ] 2>/dev/null; then
+                FRESH_REPORT_FOUND=1
+                break
+            fi
+        done
+    elif [ -z "$BRANCH_OFF_TS" ]; then
+        # No merge-base (user on main, or no main/master branch).
+        # Skip evidence check rather than fail closed — this is a degraded
+        # environment, not a policy violation.
+        FRESH_REPORT_FOUND=1
+    fi
+
+    if [ "$FRESH_REPORT_FOUND" -eq 0 ]; then
+        echo "WORKFLOW GATE: E2E verified is checked, but no fresh report was found." >&2
+        echo "" >&2
+        echo "The checklist says [x] E2E verified, but tests/e2e/reports/ has no" >&2
+        echo "report file newer than this branch's commit off main. That usually means" >&2
+        echo "the verify-e2e agent was never actually run on this branch." >&2
+        echo "" >&2
+        echo "Either:" >&2
+        echo "  (a) Run the verify-e2e agent and have the main agent persist its" >&2
+        echo "      report to tests/e2e/reports/<YYYY-MM-DD-HH-MM>-<feature>.md," >&2
+        echo "  (b) Mark the gate N/A with justification:" >&2
+        echo '        - [x] E2E verified — N/A: <specific reason>' >&2
+        echo "" >&2
+        echo "See .claude/rules/testing.md for the full policy." >&2
+        exit 2
+    fi
+fi
+
+exit 0
