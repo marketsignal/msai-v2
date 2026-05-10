@@ -285,7 +285,11 @@ resource keyVault 'Microsoft.KeyVault/vaults@2025-05-01' = {
     enableRbacAuthorization: true
     enableSoftDelete: true
     softDeleteRetentionInDays: 90
-    enablePurgeProtection: false  // Phase 1 — allows clean re-deploys after RG nuke
+    // enablePurgeProtection is OMITTED (not set to false) — Azure rejects explicit
+    // `false` with "cannot be set to false. Enabling the purge protection for a vault
+    // is an irreversible action." The property defaults to disabled when absent;
+    // explicitly setting `true` is irreversible. Phase 1 stays default (disabled) so
+    // RG-nuke + redeploy is possible. Phase 2 may set `true` once the deploy stabilizes.
     sku: {
       family: 'A'
       name: 'standard'
@@ -410,9 +414,14 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-07-01' = {
     }
     storageProfile: {
       imageReference: {
+        // Canonical changed the URN scheme for 24.04 — older `0001-com-ubuntu-server-*`
+        // pattern (used through 22.04) does not exist for Noble. Verified at first deploy
+        // against eastus2: `Canonical:ubuntu-24_04-lts:server:latest` resolves to a Gen2
+        // image (hyperVGeneration: V2). Available SKUs in this offer: cvm, minimal,
+        // server, ubuntu-pro (and -arm64, -gen1 variants). `server` is x64 + Gen2 default.
         publisher: 'Canonical'
-        offer: '0001-com-ubuntu-server-noble'
-        sku: '24_04-lts-gen2'
+        offer: 'ubuntu-24_04-lts'
+        sku: 'server'
         version: 'latest'
       }
       osDisk: {
