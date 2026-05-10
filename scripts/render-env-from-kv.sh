@@ -113,6 +113,22 @@ get_secret() {
     return 1
 }
 
+# PR-review (Codex bot) P2 fix: emit values in dotenv double-quoted form, NOT shell
+# single-quote concat. /run/msai.env is consumed by Docker Compose env-file parsing
+# (dotenv format), which does NOT understand shell quoting like `'abc'"'"'def'` —
+# verified empirically: shell-style escape produces no value (silent dropout); dotenv
+# double-quoted produces correct value. systemd EnvironmentFile is also dotenv-style.
+# Reference: https://docs.docker.com/compose/environment-variables/env-file/
+emit_kv_line() {
+    local key="$1" val="$2"
+    # Escape backslashes FIRST (must precede other escapes), then double quotes,
+    # then $ (compose interpolates ${VAR} in env-file values otherwise).
+    val="${val//\\/\\\\}"
+    val="${val//\"/\\\"}"
+    val="${val//\$/\\\$}"
+    printf '%s="%s"\n' "$key" "$val"
+}
+
 main() {
     local token
     token=$(get_token) || exit 1
@@ -127,9 +143,7 @@ main() {
     IFS=',' read -ra required <<<"$REQUIRED_SECRETS"
     for secret in "${required[@]}"; do
         if value=$(get_secret "$token" "$secret"); then
-            # Single-quote the value for compose/systemd env-file safety. Embedded
-            # single quotes use the standard sh '"'"' construct.
-            printf "%s='%s'\n" "$secret" "${value//\'/\'\"\'\"\'}" >>"$TMP_FILE"
+            emit_kv_line "$secret" "$value" >>"$TMP_FILE"
         else
             echo "Required secret '$secret' missing or unreachable; aborting." >&2
             rm -f "$TMP_FILE"
@@ -142,7 +156,7 @@ main() {
         IFS=',' read -ra optional <<<"$OPTIONAL_SECRETS"
         for secret in "${optional[@]}"; do
             if value=$(get_secret "$token" "$secret" 2>/dev/null); then
-                printf "%s='%s'\n" "$secret" "${value//\'/\'\"\'\"\'}" >>"$TMP_FILE"
+                emit_kv_line "$secret" "$value" >>"$TMP_FILE"
             else
                 echo "Optional secret '$secret' not present in KV; skipping." >&2
             fi
