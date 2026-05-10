@@ -21,6 +21,20 @@ echo "=== az bicep build infra/main.bicep ==="
 az bicep build --file infra/main.bicep --stdout >/dev/null
 echo "Lint clean."
 
+echo "=== Slice 2 grep assertions ==="
+
+# AcrPush role-def variable (Slice 2)
+grep -q "var roleDefIdAcrPush = subscriptionResourceId" infra/main.bicep \
+    || { echo "FAIL: roleDefIdAcrPush variable missing in infra/main.bicep" >&2; exit 1; }
+
+# AcrPush role assignment for the gh-oidc MI (Slice 2)
+grep -q "resource ghOidcAcrPushAssignment 'Microsoft.Authorization/roleAssignments" infra/main.bicep \
+    || { echo "FAIL: ghOidcAcrPushAssignment resource missing in infra/main.bicep" >&2; exit 1; }
+grep -q "roleDefinitionId: roleDefIdAcrPush" infra/main.bicep \
+    || { echo "FAIL: AcrPush role-def reference missing in role-assignment block" >&2; exit 1; }
+
+echo "Slice 2 grep assertions clean."
+
 if [[ "${SKIP_WHATIF:-}" == "1" ]] || ! az account show >/dev/null 2>&1; then
     echo "Skipping what-if (no Azure auth or SKIP_WHATIF=1)."
     exit 0

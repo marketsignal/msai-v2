@@ -332,3 +332,122 @@ az storage container show --account-name "$STORAGE_ACCOUNT" --name msai-backups 
 - **`az storage container show` returns AuthorizationFailure (step 7):** Operator needs a data-plane Blob role on the account/container. Run `az role assignment create --role "Storage Blob Data Reader" --assignee <your-principal-id> --scope <storage-account-or-container-resource-id>`.
 
 See [`docs/research/2026-05-09-deploy-pipeline-iac-foundation.md`](../research/2026-05-09-deploy-pipeline-iac-foundation.md) topics 4-5 for additional AMA + MI troubleshooting.
+
+## Slice 2 acceptance smoke (10 min)
+
+After merging Slice 2, the workflow `.github/workflows/build-and-push.yml` runs on every push to `main` and on manual `workflow_dispatch`. **Before the first run can succeed**, two operator-side steps are required:
+
+### Step 1 — Re-apply Bicep to grant AcrPush
+
+Slice 2 adds one Bicep resource (`ghOidcAcrPushAssignment`) granting AcrPush on the ACR to the `msai-gh-oidc` user-assigned MI. Re-run the deploy script — `OPERATOR_IP` and the SSH public key are auto-resolved by the script (current IP via `ifconfig.me`; key from `~/.ssh/{id_ed25519,id_rsa,id_ecdsa}.pub`):
+
+```bash
+cd /Users/pablomarin/Code/msai-v2
+./scripts/deploy-azure.sh
+# Or, with an explicit operator IP:
+# OPERATOR_IP="$(curl -4 -fsS --max-time 10 https://api.ipify.org)" ./scripts/deploy-azure.sh
+```
+
+Verify the role assignment landed:
+
+```bash
+GHOIDC_PRINCIPAL=$(az identity show -g msaiv2_rg -n msai-gh-oidc --query principalId -o tsv)
+ACR_ID=$(az acr show -g msaiv2_rg --name "$(az acr list -g msaiv2_rg --query '[0].name' -o tsv)" --query id -o tsv)
+az role assignment list --scope "$ACR_ID" --assignee "$GHOIDC_PRINCIPAL" \
+  --query "[?roleDefinitionName=='AcrPush']" -o table
+# Expect: one row with roleDefinitionName=AcrPush, principalType=ServicePrincipal
+```
+
+### Step 2 — Set GitHub repo Variables
+
+The workflow reads **8 public values** from `${{ vars.* }}` (NOT `${{ secrets.* }}` — none of these are secrets). Set them in the repo: **Settings → Secrets and variables → Actions → Variables tab → "New repository variable"**.
+
+> Why `ACR_NAME` AND `ACR_LOGIN_SERVER` (both): `az acr login --name` expects the **short** registry name (`msaiacrXXX`), while `docker/login-action.registry` and image tags use the **FQDN** (`msaiacrXXX.azurecr.io`). Operator sets both; runtime split avoids string-manipulation in YAML.
+
+```bash
+# Retrieve the runtime values
+ACR_LOGIN_SERVER=$(az deployment group show -g msaiv2_rg -n main \
+  --query 'properties.outputs.acrLoginServer.value' -o tsv)
+ACR_NAME=$(az acr list -g msaiv2_rg --query '[0].name' -o tsv)
+GH_OIDC_CLIENT_ID=$(az deployment group show -g msaiv2_rg -n main \
+  --query 'properties.outputs.ghOidcClientId.value' -o tsv)
+
+echo "Set these GitHub repo Variables (Settings → Secrets and variables → Actions → Variables):"
+echo "  AZURE_TENANT_ID             = 2237d332-fc65-4994-b676-61edad7be319"
+echo "  AZURE_SUBSCRIPTION_ID       = 68067b9b-943f-4461-8cb5-2bc97cbc462d"
+echo "  AZURE_CLIENT_ID             = $GH_OIDC_CLIENT_ID"
+echo "  ACR_NAME                    = $ACR_NAME"
+echo "  ACR_LOGIN_SERVER            = $ACR_LOGIN_SERVER"
+echo "  NEXT_PUBLIC_AZURE_TENANT_ID = 2237d332-fc65-4994-b676-61edad7be319"
+echo "  NEXT_PUBLIC_AZURE_CLIENT_ID = <frontend Entra SPA app reg's client ID — separate AAD app from AZURE_CLIENT_ID, which is the gh-oidc MI>"
+echo "  NEXT_PUBLIC_API_URL         = <production API base URL; placeholder until Slice 3 sets DNS, e.g. http://<vmPublicIp>:8000>"
+```
+
+Or via `gh` CLI (one command per var) — **all 8 must be set**, or the frontend Dockerfile fail-fast guards (`exit 1` on empty `NEXT_PUBLIC_*` ARG) kill the build:
+
+```bash
+gh variable set AZURE_TENANT_ID             --body "2237d332-fc65-4994-b676-61edad7be319"
+gh variable set AZURE_SUBSCRIPTION_ID       --body "68067b9b-943f-4461-8cb5-2bc97cbc462d"
+gh variable set AZURE_CLIENT_ID             --body "$GH_OIDC_CLIENT_ID"
+gh variable set ACR_NAME                    --body "$ACR_NAME"
+gh variable set ACR_LOGIN_SERVER            --body "$ACR_LOGIN_SERVER"
+gh variable set NEXT_PUBLIC_AZURE_TENANT_ID --body "2237d332-fc65-4994-b676-61edad7be319"
+
+# Replace these two with real values (or unblocking placeholders for the Slice 2 smoke):
+gh variable set NEXT_PUBLIC_AZURE_CLIENT_ID --body "<your-frontend-entra-app-client-id>"
+gh variable set NEXT_PUBLIC_API_URL         --body "http://placeholder.invalid"  # Slice 3 sets the real DNS
+
+# Verify all 8 are set:
+gh variable list --json name --jq '.[].name' | sort
+# Expect (alphabetized):
+#   ACR_LOGIN_SERVER
+#   ACR_NAME
+#   AZURE_CLIENT_ID
+#   AZURE_SUBSCRIPTION_ID
+#   AZURE_TENANT_ID
+#   NEXT_PUBLIC_API_URL
+#   NEXT_PUBLIC_AZURE_CLIENT_ID
+#   NEXT_PUBLIC_AZURE_TENANT_ID
+```
+
+### Step 3 — Run the workflow
+
+After waiting ~60 seconds for RBAC propagation (research brief topic 10), trigger the workflow manually:
+
+```bash
+gh workflow run build-and-push.yml
+gh run watch                          # streams the latest run's logs
+```
+
+Or push a no-op commit to main to trigger the `push:` event:
+
+```bash
+# (only on main, after Slice 2 PR merges)
+git commit --allow-empty -m "chore: Slice 2 acceptance smoke"
+git push
+```
+
+### Step 4 — Verify images in ACR
+
+```bash
+ACR_NAME=$(az acr list -g msaiv2_rg --query '[0].name' -o tsv)
+SHORT_SHA=$(git rev-parse --short HEAD)
+
+az acr repository show-tags --name "$ACR_NAME" --repository msai-backend -o tsv | grep -q "^${SHORT_SHA}$" \
+  && echo "✓ msai-backend:${SHORT_SHA} present" \
+  || echo "✗ msai-backend:${SHORT_SHA} MISSING"
+
+az acr repository show-tags --name "$ACR_NAME" --repository msai-frontend -o tsv | grep -q "^${SHORT_SHA}$" \
+  && echo "✓ msai-frontend:${SHORT_SHA} present" \
+  || echo "✗ msai-frontend:${SHORT_SHA} MISSING"
+```
+
+Both ✓ marks = acceptance pass.
+
+### Slice 2 — If something fails
+
+- **`az acr login --expose-token` returns 403 `AuthenticationFailed`:** AcrPush role-assignment hasn't propagated. Wait 60 seconds and re-run `gh workflow run build-and-push.yml`. If it persists more than 5 min, double-check Step 1's `az role assignment list` query — the role assignment may not have actually landed (Bicep diff didn't include it, or the deploy script wasn't re-run after merging Slice 2).
+- **Frontend job fails with `ERROR: --build-arg NEXT_PUBLIC_AZURE_CLIENT_ID is required (currently empty)`:** the GH repo Variable is unset or empty. Re-check `gh variable list` and set it.
+- **`azure/login@v2` step fails with `AADSTS70021: No matching federated identity record found`:** the federated credential subject doesn't match the workflow's OIDC token subject. Confirm `infra/main.bicep` line 104 still says `repo:${repoOwner}/${repoName}:ref:refs/heads/${repoBranch}` and that the workflow ran on a `push: main` or `workflow_dispatch:` from main (not a feature branch via the Actions UI).
+- **Workflow runs but only one image gets cached (slow rebuilds):** the `scope=backend` / `scope=frontend` cache disambiguation got removed. Without it, the second job's cache silently overwrites the first. Re-grep the workflow for `scope=`.
+- **Two runs land within seconds and one is `cancelled`:** that's the `concurrency: cancel-in-progress: true` block working as intended. Newer commits on main supersede in-progress builds.

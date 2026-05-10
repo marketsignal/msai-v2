@@ -1,0 +1,134 @@
+name: Build and Push Images
+
+# Slice 2 of 4 — see docs/decisions/deployment-pipeline-slicing.md.
+# Builds backend + frontend Docker images on push-to-main (or manual dispatch),
+# pushes to Azure Container Registry tagged with the short git SHA only.
+# No deploy step — that's Slice 3.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# OIDC token exchange + checkout. No secrets needed.
+permissions:
+  id-token: write
+  contents: read
+
+# Newer commits on main supersede in-progress builds. Slice 3's deploy
+# workflow will use cancel-in-progress: false instead.
+concurrency:
+  group: build-and-push-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Build & push msai-backend
+    # Defense-in-depth: workflow_dispatch from a feature branch via the Actions UI
+    # would mint an OIDC token with sub=refs/heads/<feature>, which the federated
+    # credential at infra/main.bicep:104 (pinned to refs/heads/main) rejects with
+    # AADSTS70021. Skip the job up-front so the failure is "0 jobs ran on this ref"
+    # rather than a confusing AAD error mid-build. push: branches: [main] above
+    # already prevents the push trigger from non-main; this guard handles dispatch.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: Compute short SHA
+        id: short
+        # Bash because GitHub Actions context expressions don't support substring.
+        run: echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get ACR access token
+        id: acr-token
+        # ACR Basic SKU + docker/login-action does not natively understand OIDC;
+        # `az acr login --expose-token` mints a 3-hour ACR access token. Username
+        # is a documented sentinel UUID; password is the access token.
+        # `az acr login --name` expects the SHORT registry name (e.g. msaiacrXXX),
+        # NOT the FQDN — that's why vars.ACR_NAME and vars.ACR_LOGIN_SERVER are
+        # both stored as separate repo Variables.
+        run: |
+          token=$(az acr login --name "${{ vars.ACR_NAME }}" --expose-token --output tsv --query accessToken)
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Docker login to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.ACR_LOGIN_SERVER }}
+          username: 00000000-0000-0000-0000-000000000000
+          password: ${{ steps.acr-token.outputs.token }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build & push msai-backend
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: true
+          tags: ${{ vars.ACR_LOGIN_SERVER }}/msai-backend:${{ steps.short.outputs.short_sha }}
+          # Distinct cache scopes per image — without this, parallel builds
+          # overwrite each other's cache (research brief topic 3).
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+  frontend:
+    name: Build & push msai-frontend
+    # See backend job for rationale on the if-guard.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: Compute short SHA
+        id: short
+        run: echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get ACR access token
+        id: acr-token
+        run: |
+          token=$(az acr login --name "${{ vars.ACR_NAME }}" --expose-token --output tsv --query accessToken)
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Docker login to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.ACR_LOGIN_SERVER }}
+          username: 00000000-0000-0000-0000-000000000000
+          password: ${{ steps.acr-token.outputs.token }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build & push msai-frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: frontend/Dockerfile
+          push: true
+          tags: ${{ vars.ACR_LOGIN_SERVER }}/msai-frontend:${{ steps.short.outputs.short_sha }}
+          # NEXT_PUBLIC_* are baked into the JS bundle at build time; the frontend
+          # Dockerfile has fail-fast guards on each (`exit 1` if empty).
+          # Values come from repo Variables — see docs/runbooks/vm-setup.md.
+          build-args: |
+            NEXT_PUBLIC_AZURE_TENANT_ID=${{ vars.NEXT_PUBLIC_AZURE_TENANT_ID }}
+            NEXT_PUBLIC_AZURE_CLIENT_ID=${{ vars.NEXT_PUBLIC_AZURE_CLIENT_ID }}
+            NEXT_PUBLIC_API_URL=${{ vars.NEXT_PUBLIC_API_URL }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,mode=max,scope=frontend
