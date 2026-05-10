@@ -54,6 +54,14 @@ on:
         required: false
         type: string
         description: "Override vars.VM_SSH_KNOWN_HOSTS (rehearsal VM host key)."
+      acr_name:
+        required: false
+        type: string
+        description: "Override vars.ACR_NAME (rehearsal RG ACR short name)."
+      acr_login_server:
+        required: false
+        type: string
+        description: "Override vars.ACR_LOGIN_SERVER (rehearsal RG ACR FQDN)."
 
 permissions:
   id-token: write
@@ -105,6 +113,10 @@ jobs:
           [[ -z "$kv" ]] && kv="${{ vars.KV_NAME }}"
           host="${{ inputs.msai_hostname }}"
           [[ -z "$host" ]] && host="${{ vars.MSAI_HOSTNAME }}"
+          acr_n="${{ inputs.acr_name }}"
+          [[ -z "$acr_n" ]] && acr_n="${{ vars.ACR_NAME }}"
+          acr_l="${{ inputs.acr_login_server }}"
+          [[ -z "$acr_l" ]] && acr_l="${{ vars.ACR_LOGIN_SERVER }}"
 
           {
             echo "short_sha=$sha"
@@ -113,6 +125,8 @@ jobs:
             echo "nsg_name=$nsg"
             echo "kv_name=$kv"
             echo "msai_hostname=$host"
+            echo "acr_name=$acr_n"
+            echo "acr_login_server=$acr_l"
             # run_id-run_attempt makes the rule unique across re-runs (Hawk + Maintainer).
             echo "rule_name=gha-transient-${{ github.run_id }}-${{ github.run_attempt }}"
           } >> "$GITHUB_OUTPUT"
@@ -181,9 +195,9 @@ jobs:
           VM_IP: ${{ steps.resolve.outputs.vm_public_ip }}
         run: |
           ssh "${VM_USER}@${VM_IP}" "umask 077 && cat > /tmp/deploy-env-${{ github.run_id }}.env" <<EOF
-          MSAI_ACR_NAME=${{ vars.ACR_NAME }}
-          MSAI_ACR_LOGIN_SERVER=${{ vars.ACR_LOGIN_SERVER }}
-          MSAI_REGISTRY=${{ vars.ACR_LOGIN_SERVER }}
+          MSAI_ACR_NAME=${{ steps.resolve.outputs.acr_name }}
+          MSAI_ACR_LOGIN_SERVER=${{ steps.resolve.outputs.acr_login_server }}
+          MSAI_REGISTRY=${{ steps.resolve.outputs.acr_login_server }}
           MSAI_BACKEND_IMAGE=${{ vars.MSAI_BACKEND_IMAGE }}
           MSAI_FRONTEND_IMAGE=${{ vars.MSAI_FRONTEND_IMAGE }}
           MSAI_HOSTNAME=${{ steps.resolve.outputs.msai_hostname }}
