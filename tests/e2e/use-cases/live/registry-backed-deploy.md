@@ -24,7 +24,7 @@ Per `.claude/rules/testing.md`: each case = Intent → Steps → Verification �
 1. CLI: `uv run msai instruments refresh --symbols QQQ --provider interactive_brokers` — warms the registry via IB qualification.
 2. API: `POST /api/v1/live-portfolios/` — create a portfolio. Body: `{"name": "qqq-smoke", "description": "UC-L-REG-001"}`.
 3. API: `POST /api/v1/live-portfolios/{id}/strategies` — add a strategy member referencing `strategies/example/buy_hold.py` with `instruments=["QQQ"]`, `weight=1.0`.
-4. API: `POST /api/v1/live-portfolios/{id}/revisions` — snapshot + freeze.
+4. API: `POST /api/v1/live-portfolios/{id}/snapshot` — snapshot + freeze (renamed from `/revisions` in a prior PR).
 5. API: `POST /api/v1/live/start-portfolio` with `{"portfolio_revision_id": "<id>", "account_id": "DUP733211", "paper_trading": true}`.
 6. API: poll `GET /api/v1/live/status` until `status=running` or `failed` (max 60s).
 
