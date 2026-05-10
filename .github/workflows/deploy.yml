@@ -180,10 +180,16 @@ jobs:
         # VM_SSH_KNOWN_HOSTS is a multi-line GitHub Variable populated during Slice 1
         # acceptance via `ssh-keyscan -t ed25519 <vmPublicIp>`. SSH host keys are public,
         # safe to commit/store as a Variable.
+        # For rehearsal-RG runs, the inline `vm_ssh_known_hosts_var` workflow_dispatch
+        # input wins (the rehearsal VM's host key differs from prod's).
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          echo "${{ vars.VM_SSH_KNOWN_HOSTS }}" >> ~/.ssh/known_hosts
+          if [[ -n "${{ inputs.vm_ssh_known_hosts_var }}" ]]; then
+            echo "${{ inputs.vm_ssh_known_hosts_var }}" >> ~/.ssh/known_hosts
+          else
+            echo "${{ vars.VM_SSH_KNOWN_HOSTS }}" >> ~/.ssh/known_hosts
+          fi
           chmod 600 ~/.ssh/known_hosts
 
       - name: Stage deploy env on VM
