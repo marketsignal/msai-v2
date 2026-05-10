@@ -252,6 +252,16 @@ if ! docker compose "${COMPOSE_FLAGS[@]}" up -d --wait --wait-timeout 300 "${DEF
     exit 1
 fi
 
+# Caddy bind-mounts ./Caddyfile read-only. When the host file changes via the
+# `Stage compose file + Caddyfile + scripts on VM` step in deploy.yml, the
+# in-container file changes too — but Caddy itself doesn't auto-reload. Compose
+# also won't recreate the container because no compose-level config changed.
+# Reload Caddy explicitly so route changes take effect on every deploy. Cheap
+# (no downtime) and idempotent.
+echo "→ Reloading Caddy config (in case Caddyfile changed)"
+docker compose "${COMPOSE_FLAGS[@]}" exec -T caddy caddy reload --config /etc/caddy/Caddyfile 2>/dev/null \
+    || echo "  (caddy reload failed or container not yet ready; will rely on next probe to surface)"
+
 # Probe: backend /health (VM-loopback, bypasses Caddy).
 echo "→ Probe: backend /health"
 for i in $(seq 1 30); do
