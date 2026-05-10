@@ -32,6 +32,28 @@ on:
         required: false
         type: string
         description: "Override target RG (e.g. msaiv2-rehearsal-<date>). Defaults to vars.RESOURCE_GROUP."
+      # Rehearsal-RG overrides for the Contrarian's gate. When unset, vars.* wins.
+      # Wiring: if `inputs.<key>` non-empty, use it; else fall back to `vars.<KEY>`.
+      vm_public_ip:
+        required: false
+        type: string
+        description: "Override vars.VM_PUBLIC_IP (rehearsal RG VM IP)."
+      nsg_name:
+        required: false
+        type: string
+        description: "Override vars.NSG_NAME (rehearsal RG NSG name)."
+      kv_name:
+        required: false
+        type: string
+        description: "Override vars.KV_NAME (rehearsal RG Key Vault)."
+      msai_hostname:
+        required: false
+        type: string
+        description: "Override vars.MSAI_HOSTNAME (e.g. platform-rehearsal.marketsignal.ai)."
+      vm_ssh_known_hosts_var:
+        required: false
+        type: string
+        description: "Override vars.VM_SSH_KNOWN_HOSTS (rehearsal VM host key)."
 
 permissions:
   id-token: write
@@ -54,11 +76,12 @@ jobs:
       runner_ip: ${{ steps.runner-ip.outputs.ip }}
       resource_group: ${{ steps.resolve.outputs.resource_group }}
       rule_name: ${{ steps.resolve.outputs.rule_name }}
+      nsg_name: ${{ steps.resolve.outputs.nsg_name }}
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Resolve git_sha + resource_group + transient rule name
+      - name: Resolve inputs vs vars (rehearsal-aware)
         id: resolve
         run: |
           if [[ -n "${{ inputs.git_sha }}" ]]; then
@@ -72,9 +95,24 @@ jobs:
           fi
           rg="${{ inputs.resource_group }}"
           [[ -z "$rg" ]] && rg="${{ vars.RESOURCE_GROUP }}"
+
+          # Rehearsal overrides — input wins; else vars.* wins.
+          vm_ip="${{ inputs.vm_public_ip }}"
+          [[ -z "$vm_ip" ]] && vm_ip="${{ vars.VM_PUBLIC_IP }}"
+          nsg="${{ inputs.nsg_name }}"
+          [[ -z "$nsg" ]] && nsg="${{ vars.NSG_NAME }}"
+          kv="${{ inputs.kv_name }}"
+          [[ -z "$kv" ]] && kv="${{ vars.KV_NAME }}"
+          host="${{ inputs.msai_hostname }}"
+          [[ -z "$host" ]] && host="${{ vars.MSAI_HOSTNAME }}"
+
           {
             echo "short_sha=$sha"
             echo "resource_group=$rg"
+            echo "vm_public_ip=$vm_ip"
+            echo "nsg_name=$nsg"
+            echo "kv_name=$kv"
+            echo "msai_hostname=$host"
             # run_id-run_attempt makes the rule unique across re-runs (Hawk + Maintainer).
             echo "rule_name=gha-transient-${{ github.run_id }}-${{ github.run_attempt }}"
           } >> "$GITHUB_OUTPUT"
@@ -106,7 +144,7 @@ jobs:
         run: |
           az network nsg rule create \
             --resource-group "${{ steps.resolve.outputs.resource_group }}" \
-            --nsg-name "${{ vars.NSG_NAME }}" \
+            --nsg-name "${{ steps.resolve.outputs.nsg_name }}" \
             --name "${{ steps.resolve.outputs.rule_name }}" \
             --priority 200 \
             --direction Inbound \
@@ -140,7 +178,7 @@ jobs:
         # before scp lands.
         env:
           VM_USER: ${{ vars.VM_SSH_USER }}
-          VM_IP: ${{ vars.VM_PUBLIC_IP }}
+          VM_IP: ${{ steps.resolve.outputs.vm_public_ip }}
         run: |
           ssh "${VM_USER}@${VM_IP}" "umask 077 && cat > /tmp/deploy-env-${{ github.run_id }}.env" <<EOF
           MSAI_ACR_NAME=${{ vars.ACR_NAME }}
@@ -148,8 +186,8 @@ jobs:
           MSAI_REGISTRY=${{ vars.ACR_LOGIN_SERVER }}
           MSAI_BACKEND_IMAGE=${{ vars.MSAI_BACKEND_IMAGE }}
           MSAI_FRONTEND_IMAGE=${{ vars.MSAI_FRONTEND_IMAGE }}
-          MSAI_HOSTNAME=${{ vars.MSAI_HOSTNAME }}
-          KV_NAME=${{ vars.KV_NAME }}
+          MSAI_HOSTNAME=${{ steps.resolve.outputs.msai_hostname }}
+          KV_NAME=${{ steps.resolve.outputs.kv_name }}
           RESOURCE_GROUP=${{ steps.resolve.outputs.resource_group }}
           DEPLOYMENT_NAME=${{ vars.DEPLOYMENT_NAME }}
           EOF
@@ -157,14 +195,14 @@ jobs:
       - name: Push deploy script
         env:
           VM_USER: ${{ vars.VM_SSH_USER }}
-          VM_IP: ${{ vars.VM_PUBLIC_IP }}
+          VM_IP: ${{ steps.resolve.outputs.vm_public_ip }}
         run: |
           scp scripts/deploy-on-vm.sh "${VM_USER}@${VM_IP}:/tmp/deploy-on-vm-${{ github.run_id }}.sh"
 
       - name: Execute deploy
         env:
           VM_USER: ${{ vars.VM_SSH_USER }}
-          VM_IP: ${{ vars.VM_PUBLIC_IP }}
+          VM_IP: ${{ steps.resolve.outputs.vm_public_ip }}
         run: |
           ssh "${VM_USER}@${VM_IP}" \
             "sudo bash /tmp/deploy-on-vm-${{ github.run_id }}.sh ${{ steps.resolve.outputs.short_sha }} /tmp/deploy-env-${{ github.run_id }}.env"
@@ -176,7 +214,7 @@ jobs:
         # probes miss.
         run: |
           for i in $(seq 1 5); do
-            if curl -sf -o /dev/null --max-time 10 "https://${{ vars.MSAI_HOSTNAME }}/health"; then
+            if curl -sf -o /dev/null --max-time 10 "https://${{ steps.resolve.outputs.msai_hostname }}/health"; then
               echo "Public /health 200 (attempt $i)"
               break
             fi
@@ -189,7 +227,7 @@ jobs:
 
       - name: Probe — frontend root
         run: |
-          status=$(curl -sI --max-time 10 -o /dev/null -w '%{http_code}' "https://${{ vars.MSAI_HOSTNAME }}/" || echo "000")
+          status=$(curl -sI --max-time 10 -o /dev/null -w '%{http_code}' "https://${{ steps.resolve.outputs.msai_hostname }}/" || echo "000")
           if [[ "$status" != "200" ]]; then
             echo "Frontend root returned $status (expected 200)" >&2
             exit 1
@@ -197,8 +235,8 @@ jobs:
 
       - name: Probe — TLS cert chain (Let's Encrypt)
         run: |
-          issuer=$(echo | openssl s_client -connect "${{ vars.MSAI_HOSTNAME }}:443" \
-            -servername "${{ vars.MSAI_HOSTNAME }}" 2>/dev/null \
+          issuer=$(echo | openssl s_client -connect "${{ steps.resolve.outputs.msai_hostname }}:443" \
+            -servername "${{ steps.resolve.outputs.msai_hostname }}" 2>/dev/null \
             | openssl x509 -noout -issuer 2>/dev/null || true)
           echo "Issuer: $issuer"
           if ! echo "$issuer" | grep -qi "Let's Encrypt"; then
@@ -212,7 +250,7 @@ jobs:
           {
             echo "## Slice 3 deploy"
             echo "- SHA: \`${{ steps.resolve.outputs.short_sha }}\`"
-            echo "- Hostname: \`${{ vars.MSAI_HOSTNAME }}\`"
+            echo "- Hostname: \`${{ steps.resolve.outputs.msai_hostname }}\`"
             echo "- Resource group: \`${{ steps.resolve.outputs.resource_group }}\`"
             echo "- Runner IP: \`${{ steps.runner-ip.outputs.ip }}\`"
             echo "- Transient NSG rule: \`${{ steps.resolve.outputs.rule_name }}\`"
@@ -246,7 +284,7 @@ jobs:
         run: |
           az network nsg rule delete \
             --resource-group "${{ needs.deploy.outputs.resource_group }}" \
-            --nsg-name "${{ vars.NSG_NAME }}" \
+            --nsg-name "${{ needs.deploy.outputs.nsg_name }}" \
             --name "${{ needs.deploy.outputs.rule_name }}" \
             --output none 2>/dev/null || true
 
