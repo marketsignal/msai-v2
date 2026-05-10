@@ -1,0 +1,327 @@
+name: Deploy
+
+# Slice 3 of 4 — see docs/decisions/deployment-pipeline-slicing.md.
+# Triggers on Slice 2's `Build and Push Images` workflow completing successfully on
+# main, OR on manual workflow_dispatch (with optional git_sha for rollback).
+#
+# Flow:
+#   1. azure/login@v2 (SHA-pinned in `uses:` blocks for supply-chain hardening — OIDC, no client secret)
+#   2. Resolve runner public IP, open transient NSG rule for SSH (council-mandated:
+#      docs/decisions/deploy-ssh-jit.md)
+#   3. webfactory/ssh-agent loads VM key; trust VM host key from VM_SSH_KNOWN_HOSTS Variable
+#   4. scp deploy-on-vm.sh + heredoc env file to VM
+#   5. ssh sudo bash deploy-on-vm.sh — VM runs az login --identity (uses its own MI for ACR pull),
+#      writes /run/msai-images.env, refreshes KV-rendered /run/msai.env, validates Caddyfile,
+#      docker compose pull + up -d --wait, runs probes, rolls back on failure
+#   6. Runner-side public-internet probes (TLS chain, /health, frontend root)
+#   7. Cleanup job (separate, needs:[deploy], if:always()) — deletes transient SSH rule,
+#      cleans /tmp on VM. A failed cleanup is reaped by reap-orphan-nsg-rules.yml.
+
+on:
+  workflow_run:
+    workflows: ["Build and Push Images"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      git_sha:
+        required: false
+        type: string
+        description: "7-char short SHA to deploy (rollback). Defaults to triggering commit."
+      resource_group:
+        required: false
+        type: string
+        description: "Override target RG (e.g. msaiv2-rehearsal-<date>). Defaults to vars.RESOURCE_GROUP."
+      # Rehearsal-RG overrides for the Contrarian's gate. When unset, vars.* wins.
+      # Wiring: if `inputs.<key>` non-empty, use it; else fall back to `vars.<KEY>`.
+      vm_public_ip:
+        required: false
+        type: string
+        description: "Override vars.VM_PUBLIC_IP (rehearsal RG VM IP)."
+      nsg_name:
+        required: false
+        type: string
+        description: "Override vars.NSG_NAME (rehearsal RG NSG name)."
+      kv_name:
+        required: false
+        type: string
+        description: "Override vars.KV_NAME (rehearsal RG Key Vault)."
+      msai_hostname:
+        required: false
+        type: string
+        description: "Override vars.MSAI_HOSTNAME (e.g. platform-rehearsal.marketsignal.ai)."
+      vm_ssh_known_hosts_var:
+        required: false
+        type: string
+        description: "Override vars.VM_SSH_KNOWN_HOSTS (rehearsal VM host key)."
+      acr_name:
+        required: false
+        type: string
+        description: "Override vars.ACR_NAME (rehearsal RG ACR short name)."
+      acr_login_server:
+        required: false
+        type: string
+        description: "Override vars.ACR_LOGIN_SERVER (rehearsal RG ACR FQDN)."
+
+permissions:
+  id-token: write
+  contents: read
+
+# Serialize deploys; queue rather than cancel so an in-flight deploy isn't severed
+# (Hawk + Contrarian — cancellation mid-deploy = orphaned NSG rule).
+concurrency:
+  group: deploy-msai
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # workflow_run fires on ALL conclusions; gate on success explicitly. workflow_dispatch
+    # always runs (no conclusion field on dispatch events).
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-24.04
+    outputs:
+      short_sha: ${{ steps.resolve.outputs.short_sha }}
+      runner_ip: ${{ steps.runner-ip.outputs.ip }}
+      resource_group: ${{ steps.resolve.outputs.resource_group }}
+      rule_name: ${{ steps.resolve.outputs.rule_name }}
+      nsg_name: ${{ steps.resolve.outputs.nsg_name }}
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Resolve inputs vs vars (rehearsal-aware)
+        id: resolve
+        run: |
+          if [[ -n "${{ inputs.git_sha }}" ]]; then
+            sha="${{ inputs.git_sha }}"
+          else
+            sha="${GITHUB_SHA::7}"
+          fi
+          if ! [[ "$sha" =~ ^[0-9a-f]{7}$ ]]; then
+            echo "git_sha must be 7 hex chars, got: $sha" >&2
+            exit 1
+          fi
+          rg="${{ inputs.resource_group }}"
+          [[ -z "$rg" ]] && rg="${{ vars.RESOURCE_GROUP }}"
+
+          # Rehearsal overrides — input wins; else vars.* wins.
+          vm_ip="${{ inputs.vm_public_ip }}"
+          [[ -z "$vm_ip" ]] && vm_ip="${{ vars.VM_PUBLIC_IP }}"
+          nsg="${{ inputs.nsg_name }}"
+          [[ -z "$nsg" ]] && nsg="${{ vars.NSG_NAME }}"
+          kv="${{ inputs.kv_name }}"
+          [[ -z "$kv" ]] && kv="${{ vars.KV_NAME }}"
+          host="${{ inputs.msai_hostname }}"
+          [[ -z "$host" ]] && host="${{ vars.MSAI_HOSTNAME }}"
+          acr_n="${{ inputs.acr_name }}"
+          [[ -z "$acr_n" ]] && acr_n="${{ vars.ACR_NAME }}"
+          acr_l="${{ inputs.acr_login_server }}"
+          [[ -z "$acr_l" ]] && acr_l="${{ vars.ACR_LOGIN_SERVER }}"
+
+          {
+            echo "short_sha=$sha"
+            echo "resource_group=$rg"
+            echo "vm_public_ip=$vm_ip"
+            echo "nsg_name=$nsg"
+            echo "kv_name=$kv"
+            echo "msai_hostname=$host"
+            echo "acr_name=$acr_n"
+            echo "acr_login_server=$acr_l"
+            # run_id-run_attempt makes the rule unique across re-runs (Hawk + Maintainer).
+            echo "rule_name=gha-transient-${{ github.run_id }}-${{ github.run_attempt }}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@1384c340ab2dda50fed2bee3041d1d87018aa5e8 # v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve runner public IP
+        id: runner-ip
+        # ifconfig.me is a well-known runner-IP echo; fail fast if unreachable
+        # (treat that as a runner-network issue, not a deploy issue).
+        run: |
+          ip=$(curl -sf --max-time 10 https://ifconfig.me)
+          if ! [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Could not resolve runner public IP (got: $ip)" >&2
+            exit 1
+          fi
+          echo "ip=$ip" >> "$GITHUB_OUTPUT"
+
+      - name: Open transient SSH allow rule
+        # Council-mandated (docs/decisions/deploy-ssh-jit.md). Priority 200 — operator
+        # rule at priority 100 always wins. Description includes run_id for orphan
+        # diagnosis. NSG child-resource refactor (Slice 3 T13) ensures this transient
+        # rule survives any concurrent Bicep reapply.
+        run: |
+          az network nsg rule create \
+            --resource-group "${{ steps.resolve.outputs.resource_group }}" \
+            --nsg-name "${{ steps.resolve.outputs.nsg_name }}" \
+            --name "${{ steps.resolve.outputs.rule_name }}" \
+            --priority 200 \
+            --direction Inbound \
+            --access Allow \
+            --protocol Tcp \
+            --source-address-prefixes "${{ steps.runner-ip.outputs.ip }}/32" \
+            --destination-port-ranges 22 \
+            --description "Transient SSH from GH Actions runner. run_id=${{ github.run_id }} attempt=${{ github.run_attempt }}. Auto-deleted by cleanup job; reaped by reap-orphan-nsg-rules.yml if leaked. See docs/decisions/deploy-ssh-jit.md." \
+            --output none
+
+      - name: Wait briefly for NSG rule propagation
+        run: sleep 15
+
+      - uses: webfactory/ssh-agent@a6f90b1f127823b31d4d4a8d96047790581349bd # v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.VM_SSH_PRIVATE_KEY }}
+
+      - name: Trust VM host key
+        # VM_SSH_KNOWN_HOSTS is a multi-line GitHub Variable populated during Slice 1
+        # acceptance via `ssh-keyscan -t ed25519 <vmPublicIp>`. SSH host keys are public,
+        # safe to commit/store as a Variable.
+        # For rehearsal-RG runs, the inline `vm_ssh_known_hosts_var` workflow_dispatch
+        # input wins (the rehearsal VM's host key differs from prod's).
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          if [[ -n "${{ inputs.vm_ssh_known_hosts_var }}" ]]; then
+            echo "${{ inputs.vm_ssh_known_hosts_var }}" >> ~/.ssh/known_hosts
+          else
+            echo "${{ vars.VM_SSH_KNOWN_HOSTS }}" >> ~/.ssh/known_hosts
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Stage deploy env on VM
+        # Build the env file via heredoc-over-ssh BEFORE invoking sudo. Avoids sudo
+        # env-strip + brittle sudoers env_keep. umask 077 keeps the temp file root-only
+        # before scp lands.
+        env:
+          VM_USER: ${{ vars.VM_SSH_USER }}
+          VM_IP: ${{ steps.resolve.outputs.vm_public_ip }}
+        run: |
+          ssh "${VM_USER}@${VM_IP}" "umask 077 && cat > /tmp/deploy-env-${{ github.run_id }}.env" <<EOF
+          MSAI_ACR_NAME=${{ steps.resolve.outputs.acr_name }}
+          MSAI_ACR_LOGIN_SERVER=${{ steps.resolve.outputs.acr_login_server }}
+          MSAI_REGISTRY=${{ steps.resolve.outputs.acr_login_server }}
+          MSAI_BACKEND_IMAGE=${{ vars.MSAI_BACKEND_IMAGE }}
+          MSAI_FRONTEND_IMAGE=${{ vars.MSAI_FRONTEND_IMAGE }}
+          MSAI_HOSTNAME=${{ steps.resolve.outputs.msai_hostname }}
+          KV_NAME=${{ steps.resolve.outputs.kv_name }}
+          RESOURCE_GROUP=${{ steps.resolve.outputs.resource_group }}
+          DEPLOYMENT_NAME=${{ vars.DEPLOYMENT_NAME }}
+          EOF
+
+      - name: Stage compose file + Caddyfile + scripts on VM
+        # docker-compose.prod.yml + Caddyfile must live at /opt/msai/ on the VM. Slice 1
+        # cloud-init doesn't plant them (cloud-init was committed before Slice 3 added
+        # Caddy). Slice 3 deploy.yml is the single source of truth for these files —
+        # they're versioned in this repo and re-staged on every deploy. backup-to-blob.sh
+        # is also staged (operators run it manually for Hawk's gate post-merge).
+        env:
+          VM_USER: ${{ vars.VM_SSH_USER }}
+          VM_IP: ${{ steps.resolve.outputs.vm_public_ip }}
+        run: |
+          # shellcheck disable=SC2029  # VM_USER expansion is intentional client-side
+          ssh "${VM_USER}@${VM_IP}" "sudo mkdir -p /opt/msai/scripts && sudo chown -R ${VM_USER}:${VM_USER} /opt/msai"
+          scp docker-compose.prod.yml Caddyfile "${VM_USER}@${VM_IP}:/opt/msai/"
+          scp scripts/backup-to-blob.sh scripts/deploy-on-vm.sh "${VM_USER}@${VM_IP}:/opt/msai/scripts/"
+          ssh "${VM_USER}@${VM_IP}" "sudo chmod +x /opt/msai/scripts/backup-to-blob.sh /opt/msai/scripts/deploy-on-vm.sh"
+          # Also stage the per-run script at /tmp for the next step (kept in /tmp so the
+          # `sudo bash /tmp/...` below is unambiguous about which run is firing)
+          scp scripts/deploy-on-vm.sh "${VM_USER}@${VM_IP}:/tmp/deploy-on-vm-${{ github.run_id }}.sh"
+
+      - name: Execute deploy
+        env:
+          VM_USER: ${{ vars.VM_SSH_USER }}
+          VM_IP: ${{ steps.resolve.outputs.vm_public_ip }}
+        run: |
+          ssh "${VM_USER}@${VM_IP}" \
+            "sudo bash /tmp/deploy-on-vm-${{ github.run_id }}.sh ${{ steps.resolve.outputs.short_sha }} /tmp/deploy-env-${{ github.run_id }}.env"
+
+      - name: Probe — public TLS endpoint
+        # Confirms public-internet reachability + valid LE cert + Caddy proxy + backend
+        # responsiveness in one round-trip. The VM-local probes (in deploy-on-vm.sh)
+        # already passed; this catches DNS / NSG / LE issuance issues that VM-local
+        # probes miss.
+        run: |
+          for i in $(seq 1 5); do
+            if curl -sf -o /dev/null --max-time 10 "https://${{ steps.resolve.outputs.msai_hostname }}/health"; then
+              echo "Public /health 200 (attempt $i)"
+              break
+            fi
+            if [[ $i -eq 5 ]]; then
+              echo "Public /health probe failed after 5 attempts" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Probe — frontend root
+        run: |
+          status=$(curl -sI --max-time 10 -o /dev/null -w '%{http_code}' "https://${{ steps.resolve.outputs.msai_hostname }}/" || echo "000")
+          if [[ "$status" != "200" ]]; then
+            echo "Frontend root returned $status (expected 200)" >&2
+            exit 1
+          fi
+
+      - name: Probe — TLS cert chain (Let's Encrypt)
+        run: |
+          issuer=$(echo | openssl s_client -connect "${{ steps.resolve.outputs.msai_hostname }}:443" \
+            -servername "${{ steps.resolve.outputs.msai_hostname }}" 2>/dev/null \
+            | openssl x509 -noout -issuer 2>/dev/null || true)
+          echo "Issuer: $issuer"
+          if ! echo "$issuer" | grep -qi "Let's Encrypt"; then
+            echo "Cert is not from Let's Encrypt (got: $issuer)" >&2
+            exit 1
+          fi
+
+      - name: Deploy summary
+        if: always()
+        run: |
+          {
+            echo "## Slice 3 deploy"
+            echo "- SHA: \`${{ steps.resolve.outputs.short_sha }}\`"
+            echo "- Hostname: \`${{ steps.resolve.outputs.msai_hostname }}\`"
+            echo "- Resource group: \`${{ steps.resolve.outputs.resource_group }}\`"
+            echo "- Runner IP: \`${{ steps.runner-ip.outputs.ip }}\`"
+            echo "- Transient NSG rule: \`${{ steps.resolve.outputs.rule_name }}\`"
+            echo "- Job conclusion: \`${{ job.status }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  cleanup:
+    # Separate job to survive runner-VM kill on the deploy job. needs+always() ensures
+    # this runs even if deploy was cancelled or failed mid-step.
+    needs: [deploy]
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@1384c340ab2dda50fed2bee3041d1d87018aa5e8 # v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Delete transient SSH rule
+        # Tolerant to upstream failures — the rule may not exist if the deploy job died
+        # before creating it. `--output none` + `|| true` ensures cleanup never fails
+        # the workflow. If the delete legitimately fails (RBAC, network blip), the
+        # reap-orphan-nsg-rules.yml cron picks it up within 15 minutes.
+        if: needs.deploy.outputs.rule_name != ''
+        run: |
+          az network nsg rule delete \
+            --resource-group "${{ needs.deploy.outputs.resource_group }}" \
+            --nsg-name "${{ needs.deploy.outputs.nsg_name }}" \
+            --name "${{ needs.deploy.outputs.rule_name }}" \
+            --output none 2>/dev/null || true
+
+      # NB: /tmp cleanup is intentionally NOT done here. The transient SSH rule is
+      # deleted ABOVE, so subsequent SSH from the runner would fail. Leftover
+      # /tmp/deploy-{env,on-vm}-${run_id}.{env,sh} files are root-owned, harmless,
+      # and overwritten by the next deploy's run_id. If they accumulate, a
+      # systemd-tmpfiles rule on the VM could reap them — out of scope for Slice 3.
