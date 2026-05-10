@@ -1,0 +1,63 @@
+#cloud-config
+# MSAI v2 — first-boot VM configuration for Slice 1.
+#
+# Bicep replaces the three placeholders below at template-build time:
+#   __SLICE1_BICEP_BASE64_OF_RENDER_SCRIPT__  ← base64(loadTextContent('../scripts/render-env-from-kv.sh'))
+#   __SLICE1_BICEP_BASE64_OF_UNIT__           ← base64(loadTextContent('../scripts/msai-render-env.service'))
+#   __SLICE1_BICEP_VM_ADMIN_USERNAME__        ← param `vmAdminUsername`
+#
+# Order of operations:
+#   1. Format and mount the Premium SSD data disk at /var/lib/msai
+#   2. Plant /etc/docker/daemon.json with data-root=/var/lib/msai/docker (BEFORE Docker installs)
+#   3. Install Docker engine + compose plugin via official apt repo
+#   4. Plant the boot-time secret renderer + systemd unit (NOT enabled — Slice 3 enables them)
+package_update: true
+package_upgrade: false      # don't auto-upgrade — keep predictable image
+packages:
+  - jq
+  - curl
+  - ca-certificates
+  - gnupg
+  - lsb-release
+disk_setup:
+  /dev/disk/azure/scsi1/lun0:
+    table_type: gpt
+    layout: true
+    overwrite: false
+fs_setup:
+  - device: /dev/disk/azure/scsi1/lun0
+    partition: 1
+    filesystem: ext4
+    overwrite: false
+mounts:
+  - [/dev/disk/azure/scsi1/lun0-part1, /var/lib/msai, ext4, "defaults,nofail,discard", "0", "2"]
+runcmd:
+  # Step 1-2: data-disk landing site for Docker (must exist before dockerd first start)
+  - mkdir -p /var/lib/msai/docker /etc/docker
+  - |
+    cat > /etc/docker/daemon.json <<'EOF'
+    {"data-root": "/var/lib/msai/docker"}
+    EOF
+  # Step 3: install Docker engine + compose plugin via official apt repo
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  - chmod a+r /etc/apt/keyrings/docker.gpg
+  - |
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+  - apt-get update
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  - systemctl enable --now docker
+  - usermod -aG docker __SLICE1_BICEP_VM_ADMIN_USERNAME__
+  # Step 4: register the systemd unit but DO NOT enable it (Slice 3 enables on first deploy)
+  - systemctl daemon-reload
+write_files:
+  - path: /usr/local/bin/render-env-from-kv.sh
+    permissions: "0755"
+    owner: "root:root"
+    encoding: b64
+    content: __SLICE1_BICEP_BASE64_OF_RENDER_SCRIPT__
+  - path: /etc/systemd/system/msai-render-env.service
+    permissions: "0644"
+    owner: "root:root"
+    encoding: b64
+    content: __SLICE1_BICEP_BASE64_OF_UNIT__

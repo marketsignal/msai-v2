@@ -1,0 +1,46 @@
+[Unit]
+Description=Render /run/msai.env from Azure Key Vault via system-assigned managed identity
+# Block docker-compose-msai.service until env file is rendered.
+Before=docker-compose-msai.service
+After=network-online.target
+Wants=network-online.target
+# StartLimit settings belong in [Unit], not [Service].
+StartLimitIntervalSec=900
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# These env vars are populated by Slice 3's deploy step. Slice 1 ships the file with
+# placeholders that will fail at first run unless KV_NAME is overridden by the deployer
+# (msaiadmin operator or future GH Actions deploy job).
+Environment="KV_NAME=__SLICE3_FILLS_THIS__"
+# REQUIRED secrets — boot fails hard on any missing. Cross-checked against
+# docker-compose.prod.yml :?-guards (lines 143, 311, 318-319, 383-384).
+# Empirically verified (code-review iter 4): Docker Compose v2.40 interpolates
+# ${VAR:?...} substitutions BEFORE applying profile filtering, so even a
+# default non-broker `docker compose up` parses ALL services' env blocks and
+# fails fast on missing TWS_USERID/TWS_PASSWORD. Repro:
+#   env -i ... docker compose --env-file /dev/null -f docker-compose.prod.yml config
+#   → "error while interpolating services.live-supervisor.environment.TWS_USERID"
+# So TWS_* MUST be REQUIRED — operator seeds these to KV before any deploy,
+# even for paper-only / non-broker workflows. (Alternative would be relaxing
+# compose :? guards to ${TWS_USERID:-}, but that breaks PR #50's design intent
+# and is out of scope for Slice 1.)
+Environment="REQUIRED_SECRETS=REPORT_SIGNING_SECRET,POSTGRES_PASSWORD,AZURE_TENANT_ID,AZURE_CLIENT_ID,CORS_ORIGINS,IB_ACCOUNT_ID,TWS_USERID,TWS_PASSWORD"
+# OPTIONAL secrets — boot logs warning + skips on missing. Backend has runtime
+# defaults (JWT_*) or these are nice-to-have data-source API keys.
+Environment="OPTIONAL_SECRETS=JWT_TENANT_ID,JWT_CLIENT_ID,POLYGON_API_KEY,DATABENTO_API_KEY,MSAI_API_KEY"
+# Image-version vars (MSAI_REGISTRY, MSAI_BACKEND_IMAGE, MSAI_FRONTEND_IMAGE, MSAI_GIT_SHA)
+# are NOT rendered here — they come from Slice 3's deploy step (set at unit-invocation
+# time via /run/msai-images.env or direct Environment= in docker-compose-msai.service).
+ExecStart=/usr/local/bin/render-env-from-kv.sh
+User=root
+Group=root
+Restart=on-failure
+RestartSec=30
+
+[Install]
+# WantedBy is declared, but Slice 1 does NOT enable this unit. Slice 3's deploy step
+# runs `systemctl enable --now msai-render-env.service` as part of the first deploy.
+WantedBy=multi-user.target
