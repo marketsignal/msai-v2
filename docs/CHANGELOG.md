@@ -8,11 +8,24 @@ All notable changes to msai-v2 will be documented in this file.
 
 **Goal:** `.github/workflows/deploy.yml` (workflow_run after Slice 2 + workflow_dispatch) — OIDC + `webfactory/ssh-agent` SSH-from-runner; `scripts/deploy-on-vm.sh` (idempotent, classified failure markers, 1-step rollback to last-good SHA); Caddy 2 reverse-proxy + auto-LE TLS at `platform.marketsignal.ai`; updated `scripts/backup-to-blob.sh` (Bicep outputs + system-assigned MI; streams `pg_dump | gzip | az storage blob upload --file /dev/stdin`); ADR `docs/decisions/deploy-ssh-jit.md` resolving the council Plan-Review iter-1 P0 (Slice 1 NSG only allowed SSH from `operatorIp/32`, blocking GH-runner deploys).
 
-**Operator gates (BLOCKING):**
+**Operator gates — ALL ✅ COMPLETE:**
 
-- ☐ **Hawk's gate** (before first deploy): `scripts/backup-to-blob.sh` against empty prod Postgres + verify dump in `msai-backups` Blob — evidence in PR
-- ☐ **Contrarian's gate** (before merge): full deploy rehearsed in throwaway RG; Bicep child-resource refactor spike confirms transient rule survives reapply; RG torn down — evidence in PR
-- ☐ **First real prod deploy** (after merge): `gh workflow run deploy.yml -f git_sha=<merge-sha>` manually (per research §5 finding 6); 5/5 probes against `https://platform.marketsignal.ai/`
+- ✅ **Contrarian's gate** (pre-merge): rehearsal RG `msaiv2-rehearsal-20260510` smoked clean on [run 25634158094](https://github.com/marketsignal/msai-v2/actions/runs/25634158094) after 9 attempts (8 caught real issues — see PR #57 commit history `c0fe11e..5bb74b7`). 5/5 probes pass against `platform-rehearsal.marketsignal.ai`. RG torn down via `az group delete --no-wait`.
+- ✅ **Hawk's gate** (post-merge, pre-first-deploy): `scripts/backup-to-blob.sh` ran against empty prod Postgres. Blob `backup-20260510T175820Z/postgres.sql.gz` (372B, expected for empty DB) verified in `msai-backups` container via `az storage blob list --auth-mode login` from VM MI.
+- ✅ **First real prod deploy** ([run 25635866251](https://github.com/marketsignal/msai-v2/actions/runs/25635866251), git_sha `3ba4200`): 5/5 prod acceptance probes PASS against `https://platform.marketsignal.ai/`:
+  - `GET /health` → 200
+  - `GET /ready` → 200
+  - `GET /` → 200 + `text/html`
+  - LE cert chain → `O=Let's Encrypt`
+  - `GET /api/v1/auth/me` → 401 (Caddy prefix-preserving proxy confirmed)
+
+**Manual operator patches outside the PR diff** (Slice 3 Bicep wasn't re-applied to live prod RG before merge):
+
+- Granted `Network Contributor` to GH-OIDC MI scoped to prod NSG. Slice 3 Bicep declares this; lands idempotently on next `az deployment group create`.
+- Granted `Reader` to prod VM MI on `msaiv2_rg` (Bicep-output read for `backup-to-blob.sh`). Should be added to Slice 3 Bicep as a Phase-1.1 patch.
+- Manually installed Docker on both prod + rehearsal VMs (Slice 1 cloud-init dpkg-lock race left it uninstalled). Cloud-init updated in this PR — applies to next provision.
+- Manually installed `azure-cli` on both prod + rehearsal VMs (Slice 1 cloud-init didn't include it). Cloud-init updated in this PR — applies to next provision.
+- One-off `gh-actions-rehearsal-tmp` federated credential added + deleted around the rehearsal run.
 
 **Council Plan-Review iter 1 (NSG SSH gap, P0):** 5/5 advisors reject static-GH-IP-ranges. Default (transient JIT NSG rule + Network Contributor scoped to NSG only) approved with 5 mandatory mitigations (Bicep child-resources, concurrency cancel-in-progress:false, cleanup as separate job, reaper cron, ADR + runbook). Contrarian caught 2 P0s the others missed (Bicep drift bomb, concurrent-deploy collision). See `docs/decisions/deploy-ssh-jit.md`.
 
