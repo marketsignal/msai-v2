@@ -3,26 +3,40 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Generator
-from datetime import UTC, datetime
-from pathlib import Path
-from typing import Any
 
-import httpx
-import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
-import pytest
+# CRITICAL: must set ENVIRONMENT=test BEFORE any `msai.*` import below.
+# `msai/main.py:53` calls `setup_logging(settings.environment)` at module
+# import time. When environment != "test", structlog is configured with
+# `cache_logger_on_first_use=True`, which makes
+# `structlog.testing.capture_logs()` unable to intercept already-bound
+# loggers — breaking unit tests that depend on it (e.g.
+# `test_materialize_series_payload_*`). CI sets ENVIRONMENT=test in the
+# job env; this `setdefault` covers local `pytest` runs that don't.
+# Use `setdefault` so an explicit override (e.g. for testing prod-mode
+# behavior) still wins.
+os.environ.setdefault("ENVIRONMENT", "test")
 
-from msai.core.auth import get_current_user
-from msai.main import app
-from msai.services.symbol_onboarding.partition_index import PartitionRow
+from collections.abc import Callable, Generator  # noqa: E402
+from datetime import UTC, datetime  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Any  # noqa: E402
 
-# Note: setup_logging() (called at msai.main import) disables
-# cache_logger_on_first_use when ENVIRONMENT=="test", which the CI job
-# sets and which tests expect. This lets structlog.testing.capture_logs()
-# swap in its own processor chain at any point during the test run,
-# regardless of which loggers have already been bound by earlier imports.
+import httpx  # noqa: E402
+import pandas as pd  # noqa: E402
+import pyarrow as pa  # noqa: E402
+import pyarrow.parquet as pq  # noqa: E402
+import pytest  # noqa: E402
+
+from msai.core.auth import get_current_user  # noqa: E402
+from msai.main import app  # noqa: E402
+from msai.services.symbol_onboarding.partition_index import PartitionRow  # noqa: E402
+
+# setup_logging() (called at msai.main import) disables
+# cache_logger_on_first_use when ENVIRONMENT=="test", which the env-setdefault
+# above guarantees for both CI and local runs. This lets
+# structlog.testing.capture_logs() swap in its own processor chain at any
+# point during the test run, regardless of which loggers have already been
+# bound by earlier imports.
 
 _MOCK_CLAIMS: dict[str, Any] = {
     "sub": "test-user",
