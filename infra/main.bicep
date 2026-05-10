@@ -83,11 +83,12 @@ var heartbeatDcrName = 'msai-heartbeat-dcr'
 var roleDefIdKvSecretsUser = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
 var roleDefIdKvSecretsOfficer = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b86a8fe4-44ce-4948-aee5-eccb2c155cd7')
 var roleDefIdAcrPull = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')
+var roleDefIdAcrPush = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '8311e382-0749-4cb8-b61a-304f252e45ec')
 var roleDefIdBlobContributor = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
 
 // ─────────────────────────────────────────────────────────────────────────────
 // T8 (declared early): GH OIDC user-assigned managed identity + federated credential.
-// Slice 1 declares both; AcrPush role assignment lives in Slice 2.
+// Slice 1 declared both; Slice 2 added the AcrPush role assignment below (`ghOidcAcrPushAssignment`).
 // ─────────────────────────────────────────────────────────────────────────────
 
 resource ghOidcMi 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
@@ -545,8 +546,9 @@ resource heartbeatDcrAssociation 'Microsoft.Insights/dataCollectionRuleAssociati
 
 // ─────────────────────────────────────────────────────────────────────────────
 // T8 (continued): Role assignments
-// 4 total: VM gets KV Secrets User + AcrPull + Blob Contributor (3 runtime grants),
-// operator gets KV Secrets Officer (1 data-plane grant for seeding/rotating secrets).
+// 5 total: VM gets KV Secrets User + AcrPull + Blob Contributor (3 runtime grants),
+// operator gets KV Secrets Officer (1 data-plane grant for seeding/rotating secrets),
+// gh-oidc MI gets AcrPush (Slice 2 — CI image push from GitHub Actions).
 // ─────────────────────────────────────────────────────────────────────────────
 
 resource vmKvSecretsUserAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
@@ -589,6 +591,17 @@ resource operatorKvSecretsOfficerAssignment 'Microsoft.Authorization/roleAssignm
     principalId: operatorPrincipalId
     roleDefinitionId: roleDefIdKvSecretsOfficer
     description: 'Operator (Pablo) data-plane access: seed and rotate secrets in KV. Required because enableRbacAuthorization=true means subscription Owner alone is insufficient.'
+  }
+}
+
+resource ghOidcAcrPushAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: acr
+  name: guid(ghOidcMi.id, acr.id, 'acr-push')
+  properties: {
+    principalId: ghOidcMi.properties.principalId
+    roleDefinitionId: roleDefIdAcrPush
+    principalType: 'ServicePrincipal'
+    description: 'Slice 2: GitHub Actions OIDC user-assigned MI pushes images to ACR via .github/workflows/build-and-push.yml'
   }
 }
 
