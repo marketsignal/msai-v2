@@ -49,12 +49,6 @@ runcmd:
   - systemctl enable --now docker
   - usermod -aG docker __SLICE1_BICEP_VM_ADMIN_USERNAME__
   # Step 4: register the systemd unit but DO NOT enable it (Slice 3 enables on first deploy)
-  # NOTE: Slice 3 ops (az CLI install) + Slice 4 ops (azcopy install + backup-to-blob
-  # systemd units) intentionally NOT baked into cloud-init. Azure rejects
-  # `osProfile.customData` changes on existing VMs (PropertyChangeNotAllowed), so any
-  # cloud-init delta breaks `az deployment group create` re-applies. Slice 3 az CLI +
-  # Slice 4 azcopy + systemd units all land via deploy-on-vm.sh at deploy time instead
-  # (idempotent). Fresh provisions get the same setup on their first deploy.
   - systemctl daemon-reload
 write_files:
   - path: /usr/local/bin/render-env-from-kv.sh
