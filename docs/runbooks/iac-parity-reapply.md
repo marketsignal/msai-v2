@@ -71,6 +71,26 @@ az deployment group create \
 
 ~5-10 min. Outputs same Slice 1/3 values plus new Slice 4 outputs (`actionGroupId`, `appInsightsId`).
 
+The `module activityLog` reference in `main.bicep` is sub-scoped (deploys
+the Activity Log diagnostic setting at SUBSCRIPTION scope). The RG-scoped
+`deployment group create` above can nest a sub-scoped module — confirm in
+the output that you see "activity-log-<hash>" succeed.
+
+If the deployment fails specifically on `Microsoft.Insights/diagnosticSettings`
+with `AuthorizationFailed`, your operator role is RG-scoped (Contributor)
+rather than subscription-scoped (Owner / Monitoring Contributor). Two options:
+
+1. Get Monitoring Contributor at subscription scope (preferred — narrow grant)
+2. Deploy the activity-log module standalone with sub-scoped what-if first:
+   ```bash
+   az deployment sub what-if -l eastus2 -f infra/activity-log.bicep \
+     -p logAnalyticsWorkspaceId=$(az monitor log-analytics workspace show \
+       -g msaiv2_rg -n msai-law-* --query id -o tsv)
+   az deployment sub create -l eastus2 -f infra/activity-log.bicep \
+     -p logAnalyticsWorkspaceId=$(az monitor log-analytics workspace show \
+       -g msaiv2_rg -n msai-law-* --query id -o tsv)
+   ```
+
 ## 5. Verify the new role assignment
 
 ```bash

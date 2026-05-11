@@ -157,7 +157,14 @@ jobs:
           # would block the gate for the runner timeout while holding the
           # `deploy-msai` concurrency lock, queueing subsequent prod deploys instead
           # of failing closed quickly. 10s is generous (existing probes use 5-10s).
-          if ! resp=$(curl -sf --max-time 10 -H "X-API-Key: $MSAI_API_KEY" "https://${MSAI_HOST}/api/v1/live/status"); then
+          # ?active_only=true filters status IN (starting,running) AND drops the
+          # 50-row cap (raised to a 1000-row safety cap) so a long-running broker
+          # deployment can't be pushed out of the response by 50+ subsequent stop
+          # events. Codex P1 review on PR #58 caught that limit-50 bug. Backwards
+          # compat: old backend (pre-Slice-4) ignores unknown query params and
+          # returns the limited 50-row response, so the gate degrades to the
+          # original behavior on a backend that hasn't deployed Slice 4 yet.
+          if ! resp=$(curl -sf --max-time 10 -H "X-API-Key: $MSAI_API_KEY" "https://${MSAI_HOST}/api/v1/live/status?active_only=true"); then
             echo "FAIL_CANNOT_DETERMINE_LIVE_STATE: backend /api/v1/live/status unreachable or stalled (curl --max-time 10s). Fail-closed: refusing deploy." >&2
             exit 1
           fi

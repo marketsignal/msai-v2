@@ -82,6 +82,16 @@ grep -q "daysAfterCreationGreaterThan: 30" infra/main.bicep \
 grep -q "module alerts './alerts.bicep'" infra/main.bicep \
     || { echo "FAIL: alerts module reference missing (Slice 4 T10)" >&2; exit 1; }
 
+# Slice 4 PR #58 Codex P2 fix: Activity Log → Log Analytics wiring (sub-scoped module).
+grep -q "module activityLog './activity-log.bicep'" infra/main.bicep \
+    || { echo "FAIL: activity-log module reference missing (PR #58 Codex P2 — orphan-NSG-rule alert would silently miss without AzureActivity wiring)" >&2; exit 1; }
+[ -f infra/activity-log.bicep ] \
+    || { echo "FAIL: infra/activity-log.bicep missing" >&2; exit 1; }
+grep -q "targetScope = 'subscription'" infra/activity-log.bicep \
+    || { echo "FAIL: activity-log.bicep must be sub-scoped (diagnosticSettings for Activity Log lives at subscription scope)" >&2; exit 1; }
+az bicep build --file infra/activity-log.bicep --stdout >/dev/null \
+    || { echo "FAIL: infra/activity-log.bicep bicep build error" >&2; exit 1; }
+
 # Slice 4: Bicep loads + base64-encodes new Slice 4 systemd units into cloud-init.
 grep -q "loadTextContent('../scripts/backup-to-blob.service')" infra/main.bicep \
     || { echo "FAIL: backup-to-blob.service loadTextContent missing" >&2; exit 1; }

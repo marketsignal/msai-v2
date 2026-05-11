@@ -722,6 +722,19 @@ module alerts './alerts.bicep' = {
   }
 }
 
+// Slice 4 PR #58 Codex P2 fix: wire Azure Activity Log into Log Analytics so
+// the orphan-NSG-rule alert (KQL against `AzureActivity` table) actually finds
+// rows. Sub-scoped module — requires Owner / Monitoring Contributor on the
+// subscription. Standalone what-if (`az deployment sub what-if`) recommended
+// before apply per docs/runbooks/iac-parity-reapply.md.
+module activityLog './activity-log.bicep' = {
+  scope: subscription()
+  name: 'activity-log-${uniqueString(resourceGroup().id)}'
+  params: {
+    logAnalyticsWorkspaceId: logWorkspace.id
+  }
+}
+
 // Outputs (consumed by Slice 2/3 via `az deployment group show --query 'properties.outputs'`)
 // ─────────────────────────────────────────────────────────────────────────────
 

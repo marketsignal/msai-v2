@@ -98,6 +98,25 @@ class TestLiveStatus:
         assert "active_count" in body
         assert isinstance(body["deployments"], list)
 
+    async def test_live_status_accepts_active_only_query_param(
+        self, client_with_mock_db: httpx.AsyncClient
+    ) -> None:
+        """GET /api/v1/live/status?active_only=true returns 200.
+
+        Slice 4 PR #58 Codex P1 fix: the deploy.yml active-deployments gate
+        uses this query param to bypass the default 50-row cap so a
+        long-running broker deployment can't be pushed off the response by
+        50+ subsequent stop events.
+        """
+        response = await client_with_mock_db.get("/api/v1/live/status?active_only=true")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert "deployments" in body
+        # Same response shape; only the filter + cap differs server-side.
+        assert "risk_halted" in body
+        assert "active_count" in body
+
 
 # ---------------------------------------------------------------------------
 # Tests: POST /api/v1/live/kill-all

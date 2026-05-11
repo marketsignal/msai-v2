@@ -934,6 +934,7 @@ async def live_resume(
 
 @router.get("/status")
 async def live_status(
+    active_only: bool = False,
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> LiveStatusResponse:
@@ -941,6 +942,16 @@ async def live_status(
 
     Queries the database for recent deployments and combines that with
     the in-memory node manager status.
+
+    Query params:
+        active_only: if True, filter to deployments with status in
+            {starting, running} and return ALL matches (no 50-row cap).
+            Default False preserves the existing dashboard contract
+            (50 most-recently-active deployments regardless of status).
+            Added 2026-05-11 for the Slice 4 deploy.yml active-deployments
+            gate — Codex PR #58 review caught that the 50-row default cap
+            could push a long-running broker deployment off the response
+            after 50+ subsequent stop events accumulate.
     """
     # Order by most recent activity, not by immutable ``created_at``:
     # since v9 a deployment row is a stable logical record that survives
@@ -955,7 +966,15 @@ async def live_status(
         func.coalesce(LiveDeployment.last_stopped_at, LiveDeployment.created_at),
         LiveDeployment.created_at,
     )
-    result = await db.execute(select(LiveDeployment).order_by(last_activity.desc()).limit(50))
+    query = select(LiveDeployment).order_by(last_activity.desc())
+    if active_only:
+        # No 50-row cap for the gate — every running/starting row must surface.
+        # A 1000-row safety cap is still applied to bound response size; in
+        # practice broker resources cap actual running deployments well below.
+        query = query.where(LiveDeployment.status.in_(["starting", "running"])).limit(1000)
+    else:
+        query = query.limit(50)
+    result = await db.execute(query)
     deployments = result.scalars().all()
 
     items = [
