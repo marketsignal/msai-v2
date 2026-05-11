@@ -127,7 +127,7 @@ grep -qE '\.deployments\[\] \| select\(\.status' "$DEPLOY_YML" \
 # while broker subprocesses are still trading.
 grep -q "inputs.bootstrap" "$DEPLOY_YML" \
     || { echo "FAIL: deploy.yml must accept 'bootstrap' workflow_dispatch input (PR #58 round-8 P1)" >&2; exit 1; }
-grep -qE "curl_exit.*6\|7" "$DEPLOY_YML" \
+grep -qF "6|7)" "$DEPLOY_YML" \
     || { echo "FAIL: curl-exit case statement missing 6|7 branch" >&2; exit 1; }
 
 # Regression guard: gate must NOT jq-parse .active_count (see PR #58 Codex review).
