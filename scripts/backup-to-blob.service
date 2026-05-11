@@ -8,12 +8,11 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-# Bicep outputs are queried at runtime; the env vars below let backup-to-blob.sh
-# locate them without hardcoding. RESOURCE_GROUP + DEPLOYMENT_NAME match the Slice 1
-# deploy ("msaiv2_rg" + "main"; "main" is the deployment-name Pablo used, not the
-# `msai-iac` default the script defaults to — operator updates here if RG changes).
-Environment="RESOURCE_GROUP=msaiv2_rg"
-Environment="DEPLOYMENT_NAME=main"
+# RESOURCE_GROUP + DEPLOYMENT_NAME come from a drop-in override written by
+# deploy-on-vm.sh at /etc/systemd/system/backup-to-blob.service.d/env.conf
+# (same pattern Slice 3 used for KV_NAME on msai-render-env.service). The override
+# carries the actual RG the VM was provisioned into — prevents a rehearsal VM
+# from writing backups using the prod RG name (Codex P2 review on PR #58).
 ExecStart=/opt/msai/scripts/backup-to-blob.sh
 User=root
 Group=root

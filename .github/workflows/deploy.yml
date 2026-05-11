@@ -152,8 +152,13 @@ jobs:
           # and the gate fails OPEN. Querying the DB-persisted status is correct;
           # status enum is {starting, running, stopped} per backend/src/msai/api/live.py
           # lines 421, 504, 597, 732.
-          if ! resp=$(curl -sf -H "X-API-Key: $MSAI_API_KEY" "https://${MSAI_HOST}/api/v1/live/status"); then
-            echo "FAIL_CANNOT_DETERMINE_LIVE_STATE: backend /api/v1/live/status unreachable. Fail-closed: refusing deploy." >&2
+          # Bound the request — Codex P2 review on PR #58: if backend accepts the
+          # connection but stalls (e.g., DB query hanging), curl without --max-time
+          # would block the gate for the runner timeout while holding the
+          # `deploy-msai` concurrency lock, queueing subsequent prod deploys instead
+          # of failing closed quickly. 10s is generous (existing probes use 5-10s).
+          if ! resp=$(curl -sf --max-time 10 -H "X-API-Key: $MSAI_API_KEY" "https://${MSAI_HOST}/api/v1/live/status"); then
+            echo "FAIL_CANNOT_DETERMINE_LIVE_STATE: backend /api/v1/live/status unreachable or stalled (curl --max-time 10s). Fail-closed: refusing deploy." >&2
             exit 1
           fi
           active_ids=$(echo "$resp" | jq -r '[.deployments[] | select(.status == "running" or .status == "starting") | .id] | join(",")')

@@ -333,9 +333,20 @@ else
     echo "  WARN: /opt/msai/scripts/install-azcopy.sh missing — first deploy?" >&2
 fi
 
-echo "→ Slice 4: stage systemd units + enable backup-to-blob.timer"
+echo "→ Slice 4: stage systemd units + drop-in override for RG + enable backup-to-blob.timer"
 cp /opt/msai/scripts/backup-to-blob.service /etc/systemd/system/
 cp /opt/msai/scripts/backup-to-blob.timer /etc/systemd/system/
+# Drop-in override carries the actual RG this VM was provisioned into. Codex P2
+# review on PR #58: hardcoded RESOURCE_GROUP=msaiv2_rg in the unit file would
+# either break rehearsal-RG backups (can't read prod outputs) or, with broadened
+# perms, write rehearsal backups into prod storage. Same drop-in pattern Slice 3
+# used for KV_NAME on msai-render-env.service.
+mkdir -p /etc/systemd/system/backup-to-blob.service.d
+cat >/etc/systemd/system/backup-to-blob.service.d/env.conf <<EOF
+[Service]
+Environment="RESOURCE_GROUP=$RESOURCE_GROUP"
+Environment="DEPLOYMENT_NAME=$DEPLOYMENT_NAME"
+EOF
 systemctl daemon-reload
 if ! systemctl enable --now backup-to-blob.timer; then
     echo "FAIL_BACKUP_TIMER" >&2
