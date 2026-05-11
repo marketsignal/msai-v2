@@ -436,23 +436,18 @@ resource nic 'Microsoft.Network/networkInterfaces@2024-01-01' = {
 var cloudInitText = loadTextContent('cloud-init.yaml')
 var renderScriptText = loadTextContent('../scripts/render-env-from-kv.sh')
 var renderUnitText = loadTextContent('../scripts/msai-render-env.service')
-// Slice 4: three additional files baked into cloud-init for fresh provisions.
-var backupServiceText = loadTextContent('../scripts/backup-to-blob.service')
-var backupTimerText = loadTextContent('../scripts/backup-to-blob.timer')
-var installAzcopyText = loadTextContent('../scripts/install-azcopy.sh')
+// Slice 4: backup-to-blob.{service,timer} + install-azcopy.sh are staged by
+// deploy-on-vm.sh at runtime (T04). Originally they were ALSO baked into
+// cloud-init for fresh provisions, but Azure rejects `osProfile.customData`
+// changes on an existing VM ("PropertyChangeNotAllowed") — so on a re-apply
+// the Slice 4 cloud-init delta would fail the deploy. Reverted: cloud-init
+// stays at Slice 1+3 content; Slice 4 systemd units land via deploy-on-vm.sh
+// on every deploy. Fresh provisions get the same units on their first deploy
+// (which runs immediately after cloud-init completes).
 var cloudInit = replace(
   replace(
-    replace(
-      replace(
-        replace(
-          replace(cloudInitText, '__SLICE1_BICEP_BASE64_OF_RENDER_SCRIPT__', base64(renderScriptText)),
-          '__SLICE1_BICEP_BASE64_OF_UNIT__', base64(renderUnitText)
-        ),
-        '__SLICE4_BICEP_BASE64_OF_BACKUP_SERVICE__', base64(backupServiceText)
-      ),
-      '__SLICE4_BICEP_BASE64_OF_BACKUP_TIMER__', base64(backupTimerText)
-    ),
-    '__SLICE4_BICEP_BASE64_OF_INSTALL_AZCOPY__', base64(installAzcopyText)
+    replace(cloudInitText, '__SLICE1_BICEP_BASE64_OF_RENDER_SCRIPT__', base64(renderScriptText)),
+    '__SLICE1_BICEP_BASE64_OF_UNIT__', base64(renderUnitText)
   ),
   '__SLICE1_BICEP_VM_ADMIN_USERNAME__', vmAdminUsername
 )

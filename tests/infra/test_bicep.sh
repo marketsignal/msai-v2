@@ -92,11 +92,20 @@ grep -q "targetScope = 'subscription'" infra/activity-log.bicep \
 az bicep build --file infra/activity-log.bicep --stdout >/dev/null \
     || { echo "FAIL: infra/activity-log.bicep bicep build error" >&2; exit 1; }
 
-# Slice 4: Bicep loads + base64-encodes new Slice 4 systemd units into cloud-init.
-grep -q "loadTextContent('../scripts/backup-to-blob.service')" infra/main.bicep \
-    || { echo "FAIL: backup-to-blob.service loadTextContent missing" >&2; exit 1; }
-grep -q "__SLICE4_BICEP_BASE64_OF_BACKUP_TIMER__" infra/main.bicep \
-    || { echo "FAIL: backup timer cloud-init placeholder not substituted" >&2; exit 1; }
+# Slice 4 hotfix: Bicep used to bake backup-to-blob.{service,timer} +
+# install-azcopy.sh into cloud-init, but Azure rejects osProfile.customData
+# changes on existing VMs (PropertyChangeNotAllowed) — so the IaC parity
+# re-apply broke. Slice 4 systemd units now land via deploy-on-vm.sh at
+# runtime (T04). Regression guard: cloud-init MUST NOT carry the Slice 4
+# loadTextContent calls.
+if grep -q "loadTextContent('../scripts/backup-to-blob.service')" infra/main.bicep; then
+    echo "FAIL: regression — main.bicep tried to re-bake Slice 4 systemd units into cloud-init, which breaks re-apply on existing VMs (hotfix/slice-4-iac-customdata-revert)" >&2
+    exit 1
+fi
+if grep -q "__SLICE4_BICEP_BASE64_OF" infra/main.bicep || grep -q "__SLICE4_BICEP_BASE64_OF" infra/cloud-init.yaml; then
+    echo "FAIL: regression — SLICE4_BICEP_BASE64_OF placeholders still in IaC; see hotfix/slice-4-iac-customdata-revert" >&2
+    exit 1
+fi
 
 echo "Slice 2/3/4 grep assertions clean."
 
