@@ -48,19 +48,7 @@ runcmd:
   - DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   - systemctl enable --now docker
   - usermod -aG docker __SLICE1_BICEP_VM_ADMIN_USERNAME__
-  # Step 4: install az CLI (Slice 3 deploy-on-vm.sh + backup-to-blob.sh both call az login --identity)
-  - curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg
-  - chmod a+r /etc/apt/keyrings/microsoft.gpg
-  - |
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ $(lsb_release -cs) main" > /etc/apt/sources.list.d/azure-cli.list
-  - apt-get update
-  - DEBIAN_FRONTEND=noninteractive apt-get install -y azure-cli apt-transport-https
-  # Step 5: register the systemd unit but DO NOT enable it (Slice 3 enables on first deploy)
-  # NOTE: Slice 4 ops (azcopy install + backup-to-blob systemd units) intentionally NOT
-  # baked into cloud-init. Azure rejects `osProfile.customData` changes on existing VMs
-  # (PropertyChangeNotAllowed), so any cloud-init delta breaks `az deployment group create`
-  # re-applies. Slice 4 systemd units + azcopy install land via deploy-on-vm.sh at deploy
-  # time instead (idempotent). Fresh provisions get the same units on their first deploy.
+  # Step 4: register the systemd unit but DO NOT enable it (Slice 3 enables on first deploy)
   - systemctl daemon-reload
 write_files:
   - path: /usr/local/bin/render-env-from-kv.sh

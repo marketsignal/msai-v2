@@ -4,6 +4,16 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-05-11 — Hotfix #2: Slice 3 az-CLI cloud-init revert (`hotfix/slice-4-iac-azcli-cloudinit-revert`)
+
+**Why:** Hotfix #59 reverted the Slice 4 cloud-init substitutions but PR #57's earlier `apt-get install azure-cli` lines (also in cloud-init) remained. The prod VM was provisioned at Slice 1's customData baseline (no az-cli), so any `az deployment group create` re-apply still failed `PropertyChangeNotAllowed: osProfile.customData`. This blocked landing `vmMiReaderAssignment` and the sub-scoped `activityLog` diagnostic module from Slice 4 — leaving the orphan-NSG-rule alert silently broken (Codex PR-58 P2 catch).
+
+**Fix:**
+
+- `infra/cloud-init.yaml`: removed the Slice 3 az-CLI install block (curl key, apt repo, `apt-get install azure-cli`). cloud-init is back to its Slice 1 baseline (Docker + render-env unit only).
+- `scripts/deploy-on-vm.sh`: idempotent `command -v az || install azure-cli` block added at Phase 2.5, before the `az login --identity` calls. Fresh VMs and the existing prod VM both converge to having az-CLI present after the first deploy. Pattern mirrors Slice 4's `install-azcopy.sh`.
+- `tests/infra/test_bicep.sh`: regression guards block any future `install -y .*azure-cli` line in cloud-init or removal of the runtime install in deploy-on-vm.sh.
+
 ### 2026-05-10 — Deployment-pipeline Slice 4: Ops, Backup, Observability (`feat/deploy-pipeline-ops-backup-observability`)
 
 **Goal:** Final slice of the 4-PR deploy-pipeline series. Three new operational surfaces — nightly backup automation (systemd timer + `azcopy` for Parquet), Log Analytics scheduled-query alerts + Application Insights availability test, active-`live_deployments` hard refusal gate in `deploy.yml` — plus folded-in IaC parity carry-overs from Slice 3 (`Reader` on RG for VM MI declaratively + runbook for idempotent prod Bicep re-apply).
