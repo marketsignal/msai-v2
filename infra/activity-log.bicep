@@ -21,8 +21,16 @@ targetScope = 'subscription'
 @description('Log Analytics workspace resource ID — from main.bicep logWorkspace.id.')
 param logAnalyticsWorkspaceId string
 
-@description('Diagnostic-setting name — singleton-ish per workspace.')
-param settingName string = 'msai-activity-log-to-law'
+// PR #58 Codex round-6 P2: the Activity Log diagnostic setting is subscription-
+// scoped. If two RGs (e.g. prod msaiv2_rg + rehearsal msaiv2-rehearsal-<date>)
+// both deploy this template using the SAME fixed name, the second deploy
+// REPLACES the first — silently redirecting prod's Activity Log into the
+// rehearsal workspace and breaking prod's orphan-NSG-rule alert. Deriving the
+// name from the workspace itself ensures each RG owns a distinct
+// subscription-scoped setting; Activity Log can have multiple settings
+// concurrently (Azure limit: 5 per subscription), so prod + rehearsal coexist.
+@description('Diagnostic-setting name — derived from workspace identity to avoid prod/rehearsal collisions.')
+param settingName string = 'msai-activity-log-${last(split(logAnalyticsWorkspaceId, '/'))}'
 
 resource activityLogDiagnostic 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
   name: settingName
