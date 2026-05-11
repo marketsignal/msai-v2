@@ -569,6 +569,32 @@ resource heartbeatDcr 'Microsoft.Insights/dataCollectionRules@2022-06-01' = {
             'Emergency'
           ]
         }
+        {
+          // Slice 4 PR #58 Codex round-5 P2: dockerd container-lifecycle
+          // events (exit, OOMKilled, signal-received) are emitted at Info
+          // level on the daemon facility. The msai-container-restart
+          // heuristic alert (infra/alerts.bicep) would never fire under the
+          // syslogBase Warning+ filter. Separate dataSource collects ONLY
+          // daemon facility Info+ — keeps the syslogBase low-volume cost
+          // profile for the other 6 facilities while surfacing Docker
+          // lifecycle events the alert depends on.
+          name: 'syslogDockerInfo'
+          streams: [
+            'Microsoft-Syslog'
+          ]
+          facilityNames: [
+            'daemon'
+          ]
+          logLevels: [
+            'Info'
+            'Notice'
+            'Warning'
+            'Error'
+            'Critical'
+            'Alert'
+            'Emergency'
+          ]
+        }
       ]
     }
     destinations: {

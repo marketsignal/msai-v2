@@ -349,10 +349,15 @@ Environment="DEPLOYMENT_NAME=$DEPLOYMENT_NAME"
 EOF
 systemctl daemon-reload
 if ! systemctl enable --now backup-to-blob.timer; then
-    echo "FAIL_BACKUP_TIMER" >&2
-    # Don't exit — deploy is otherwise green. Operator will see this in CI log
-    # and the Azure Monitor alert "backup-to-blob.service failure" will fire when
-    # the timer should have fired and didn't.
+    echo "FAIL_BACKUP_TIMER: systemctl enable --now backup-to-blob.timer failed" >&2
+    echo "  Check: sudo journalctl -u backup-to-blob.timer + 'systemctl status backup-to-blob.timer'" >&2
+    # PR #58 Codex round-5 P2: was previously non-fatal on the rationale that
+    # 'backup-failure alert covers it'. WRONG — that alert only fires if the
+    # SERVICE runs and fails. If the TIMER never enables, the service never
+    # runs, and nightly backups are silently disabled. Make this fatal so the
+    # deploy log surfaces the issue immediately rather than discovering days
+    # later when no backup blob has appeared.
+    exit 1
 fi
 # Code-review P2 fix: `enable --now` does NOT re-load the running timer's
 # definition if the unit-file content changed (since restart). Explicit restart
@@ -360,7 +365,15 @@ fi
 # action. `enable` is still needed for the WantedBy linkage on first install.
 systemctl restart backup-to-blob.timer 2>&1 \
     || echo "  WARN: backup-to-blob.timer restart non-zero (already-running OK; see journalctl)" >&2
-echo "  backup-to-blob.timer: $(systemctl is-active backup-to-blob.timer)"
+
+# Confirm the timer is actually active+enabled — defense against the case where
+# `enable --now` returned 0 but the timer immediately fell out of active state.
+timer_state=$(systemctl is-active backup-to-blob.timer)
+if [[ "$timer_state" != "active" ]]; then
+    echo "FAIL_BACKUP_TIMER_INACTIVE: timer reports state='$timer_state' after enable+restart" >&2
+    exit 1
+fi
+echo "  backup-to-blob.timer: $timer_state"
 
 # Success — clear the rollback flag so trap exits cleanly.
 rollback_required=0
