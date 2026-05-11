@@ -110,4 +110,36 @@ grep -qE "run --rm caddy caddy validate" "$DEPLOY_SH" \
 grep -q "project-name msai" "$DEPLOY_SH" \
     || { echo "FAIL: deploy-on-vm.sh must set --project-name msai (predictable container names)" >&2; exit 1; }
 
-echo "All Slice 3 deploy-pipeline tests passed."
+echo "=== Slice 4 deploy.yml grep assertions ==="
+
+# Active-live_deployments gate must exist + reference active_count (NOT .deployments[].status — that path doesn't include `ready` and active_count is the simpler field per LiveStatusResponse).
+grep -q "Refuse if active live_deployments" "$DEPLOY_YML" \
+    || { echo "FAIL: deploy.yml missing 'Refuse if active live_deployments' step (Slice 4 T05)" >&2; exit 1; }
+grep -q "FAIL_ACTIVE_DEPLOYMENTS_REFUSAL" "$DEPLOY_YML" \
+    || { echo "FAIL: deploy.yml missing FAIL_ACTIVE_DEPLOYMENTS_REFUSAL marker" >&2; exit 1; }
+grep -q "FAIL_CANNOT_DETERMINE_LIVE_STATE" "$DEPLOY_YML" \
+    || { echo "FAIL: deploy.yml missing FAIL_CANNOT_DETERMINE_LIVE_STATE marker (fail-closed when backend is unreachable)" >&2; exit 1; }
+grep -qE "\\.active_count" "$DEPLOY_YML" \
+    || { echo "FAIL: gate must parse .active_count (not .deployments[].status — see plan-review iter-1 P1)" >&2; exit 1; }
+
+# Regression guard: NO force-bypass flag (plan-review iter-2 P1 removed it — run_id-bound token was impractical).
+if grep -qE "force_during_active_deploys|confirmation_token|FAIL_FORCE_TOKEN" "$DEPLOY_YML"; then
+    echo "FAIL: deploy.yml reintroduced force-bypass flag — plan-review iter-2 P1 deliberately removed (impractical token scheme)" >&2
+    exit 1
+fi
+
+# Slice 4: also scp install-azcopy.sh + backup-to-blob.{service,timer}
+grep -q "install-azcopy.sh" "$DEPLOY_YML" \
+    || { echo "FAIL: deploy.yml must scp install-azcopy.sh (Slice 4 T04)" >&2; exit 1; }
+grep -q "backup-to-blob.timer" "$DEPLOY_YML" \
+    || { echo "FAIL: deploy.yml must scp backup-to-blob.timer (Slice 4 T04)" >&2; exit 1; }
+
+echo "=== Slice 4 deploy-on-vm.sh grep assertions ==="
+grep -q "FAIL_BACKUP_TIMER" "$DEPLOY_SH" \
+    || { echo "FAIL: deploy-on-vm.sh missing FAIL_BACKUP_TIMER marker (Slice 4 T04)" >&2; exit 1; }
+grep -q "systemctl enable --now backup-to-blob.timer" "$DEPLOY_SH" \
+    || { echo "FAIL: deploy-on-vm.sh must enable + start backup-to-blob.timer" >&2; exit 1; }
+grep -q "/opt/msai/scripts/install-azcopy.sh" "$DEPLOY_SH" \
+    || { echo "FAIL: deploy-on-vm.sh must invoke install-azcopy.sh" >&2; exit 1; }
+
+echo "All Slice 3 + Slice 4 deploy-pipeline tests passed."

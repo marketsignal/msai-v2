@@ -131,6 +131,32 @@ jobs:
             echo "rule_name=gha-transient-${{ github.run_id }}-${{ github.run_attempt }}"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Refuse if active live_deployments
+        # Slice 4: refuse the deploy if backend reports any active deployment. Fail
+        # fast BEFORE Azure login (no OIDC mint, no NSG rule churn) so the gate is
+        # the cheapest possible pre-flight. Uses public endpoint via Caddy + X-API-Key
+        # (which Caddy passes through unchanged per Slice 4 research §7). No force
+        # flag — operator clears state with `msai live stop --all` first.
+        env:
+          MSAI_HOST: ${{ steps.resolve.outputs.msai_hostname }}
+          MSAI_API_KEY: ${{ secrets.MSAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          # `active_count` is the LiveStatusResponse field; reflects supervisor's
+          # in-memory active subprocesses (not stale DB rows). Source:
+          # backend/src/msai/schemas/live.py:60 + backend/src/msai/api/live.py
+          # (returns _node_manager.active_count).
+          if ! resp=$(curl -sf -H "X-API-Key: $MSAI_API_KEY" "https://${MSAI_HOST}/api/v1/live/status"); then
+            echo "FAIL_CANNOT_DETERMINE_LIVE_STATE: backend /api/v1/live/status unreachable. Fail-closed: refusing deploy." >&2
+            exit 1
+          fi
+          active=$(echo "$resp" | jq -r '.active_count')
+          if [[ "$active" != "0" ]]; then
+            echo "FAIL_ACTIVE_DEPLOYMENTS_REFUSAL: $active deployments still active. Run 'msai live stop --all' first, then re-dispatch." >&2
+            exit 1
+          fi
+          echo "active_count=0 — gate clear"
+
       - name: Azure login (OIDC)
         uses: azure/login@1384c340ab2dda50fed2bee3041d1d87018aa5e8 # v2
         with:
@@ -225,8 +251,10 @@ jobs:
           # shellcheck disable=SC2029  # VM_USER expansion is intentional client-side
           ssh "${VM_USER}@${VM_IP}" "sudo mkdir -p /opt/msai/scripts && sudo chown -R ${VM_USER}:${VM_USER} /opt/msai"
           scp docker-compose.prod.yml Caddyfile "${VM_USER}@${VM_IP}:/opt/msai/"
-          scp scripts/backup-to-blob.sh scripts/deploy-on-vm.sh "${VM_USER}@${VM_IP}:/opt/msai/scripts/"
-          ssh "${VM_USER}@${VM_IP}" "sudo chmod +x /opt/msai/scripts/backup-to-blob.sh /opt/msai/scripts/deploy-on-vm.sh"
+          scp scripts/backup-to-blob.sh scripts/deploy-on-vm.sh scripts/install-azcopy.sh \
+              scripts/backup-to-blob.service scripts/backup-to-blob.timer \
+              "${VM_USER}@${VM_IP}:/opt/msai/scripts/"
+          ssh "${VM_USER}@${VM_IP}" "sudo chmod +x /opt/msai/scripts/backup-to-blob.sh /opt/msai/scripts/deploy-on-vm.sh /opt/msai/scripts/install-azcopy.sh"
           # Also stage the per-run script at /tmp for the next step (kept in /tmp so the
           # `sudo bash /tmp/...` below is unambiguous about which run is firing)
           scp scripts/deploy-on-vm.sh "${VM_USER}@${VM_IP}:/tmp/deploy-on-vm-${{ github.run_id }}.sh"

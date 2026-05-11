@@ -319,6 +319,38 @@ for i in $(seq 1 60); do
     sleep 5
 done
 
+# ─── Phase 8 (Slice 4): Install azcopy + enable backup-to-blob.timer ───────────
+
+# Idempotent — both succeed silently if state is already correct. Non-fatal on
+# failure: deploy is "done", nightly backup is "operational layer". A failure here
+# alerts via FAIL_BACKUP_TIMER but does NOT roll back the deploy (rollback would
+# regress app code over an ops-layer hiccup; backup-failure alert covers it).
+echo "→ Slice 4: install azcopy if needed"
+if [[ -x /opt/msai/scripts/install-azcopy.sh ]]; then
+    /opt/msai/scripts/install-azcopy.sh \
+        || echo "  WARN: install-azcopy.sh failed — Parquet mirror will fall back to azcopy-not-present error in the script" >&2
+else
+    echo "  WARN: /opt/msai/scripts/install-azcopy.sh missing — first deploy?" >&2
+fi
+
+echo "→ Slice 4: stage systemd units + enable backup-to-blob.timer"
+cp /opt/msai/scripts/backup-to-blob.service /etc/systemd/system/
+cp /opt/msai/scripts/backup-to-blob.timer /etc/systemd/system/
+systemctl daemon-reload
+if ! systemctl enable --now backup-to-blob.timer; then
+    echo "FAIL_BACKUP_TIMER" >&2
+    # Don't exit — deploy is otherwise green. Operator will see this in CI log
+    # and the Azure Monitor alert "backup-to-blob.service failure" will fire when
+    # the timer should have fired and didn't.
+fi
+# Code-review P2 fix: `enable --now` does NOT re-load the running timer's
+# definition if the unit-file content changed (since restart). Explicit restart
+# is idempotent and ensures future timer-content edits land without operator
+# action. `enable` is still needed for the WantedBy linkage on first install.
+systemctl restart backup-to-blob.timer 2>&1 \
+    || echo "  WARN: backup-to-blob.timer restart non-zero (already-running OK; see journalctl)" >&2
+echo "  backup-to-blob.timer: $(systemctl is-active backup-to-blob.timer)"
+
 # Success — clear the rollback flag so trap exits cleanly.
 rollback_required=0
 trap - EXIT
