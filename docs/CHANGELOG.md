@@ -4,6 +4,24 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-05-11 — Slice 4 acceptance: 6/6 PASS (post-hotfix-#60 IaC re-apply)
+
+After PR #60 merged and `iac-parity-reapply.md` landed `vmMiReaderAssignment` + the sub-scoped `activityLog` diagnostic, ran `docs/runbooks/slice-4-acceptance.md` end-to-end via `az vm run-command` (operator SSH route timed out — unrelated to acceptance scope).
+
+- **Step 1 — Manual backup smoke:** PASS. `sudo systemctl start backup-to-blob.service` produced `backup-20260511T171245Z/postgres.sql.gz` (7421 bytes) in blob storage; service exit 0; Parquet correctly skipped (none yet).
+- **Step 2 — Backup-failure alert:** PASS. Injected `exit 1` into `/opt/msai/scripts/backup-to-blob.sh` at 17:14Z, service failed with `FAIL_INJECTED_FOR_ACCEPTANCE`; `msai-backup-failure-alert` fired at 17:54:16Z (T+40min, within the 1-hour eval window). Script restored from `/tmp/backup-to-blob.sh.orig`; SHA back to `6eef0d2a…`; re-smoked successfully (`backup-20260511T180032Z`).
+- **Step 3 — /health availability alert:** PASS. Stopped backend container at 17:19:07Z; `msai-health-availability-alert` fired at 17:23:59Z (T+5min — first eval cycle caught it); restarted backend at 17:31Z; alert **auto-resolved at 17:49:58Z** (autoMitigate=true working as designed).
+- **Step 4 — Active-`live_deployments` gate:** skip-by-unit-test per runbook (no portfolios exist on prod — `GET /api/v1/live/status` returned `{"deployments":[],"active_count":0}`). Gate logic itself is shellcheck-clean + green per `tests/infra/test_workflow_deploy.sh` grep assertions on `deploy.yml`. End-to-end re-test deferred until first real portfolio is deployed.
+- **Step 5 — Orphan-NSG-rule alert + reaper:** PASS. Created `gha-transient-acceptance-20260511-1715` at 17:15Z. Reaper at 17:29Z correctly skipped (rule <30min old, log: `Skipping fresh rule … (created=2026-05-11T17:15:11.331Z)`). `msai-orphan-nsg-rule-alert` fired at 17:46:53Z (T+31min, just past the 30-min KQL threshold). GitHub cron skipped the 17:37 + 17:52 slots (known cron lag); manual `gh workflow run reap-orphan-nsg-rules.yml` confirmed reaper deletes the rule (run 25687344103 → "Reaped 1 rule"). Both halves of the design verified.
+- **Step 6 — IaC parity drift-check:** PASS. `az deployment group what-if` returns 0 Deletes, 0 unexpected Creates, 17 Modifies — all Azure-added-default fields per the documented behavior in `tests/infra/test_bicep.sh` ("Only fail on Delete operations").
+
+**Side-effect fixes during acceptance:**
+
+- `MSAI_API_KEY` GH Secret was empty (env var blank in run logs from earlier `5b43f6b` deploy). Synced from KV `msai-api-key` — unblocks the active-deployments gate.
+- Slice 4 first prod deploy on `5b43f6b` succeeded (azcopy `10.32.3` installed, `backup-to-blob.timer` active + enabled, next fire 2026-05-12 02:09:58 UTC).
+
+Deploy-pipeline 4-PR series (PRs #51 / #56 / #57 / #58) + 2 IaC-parity hotfixes (PRs #59 / #60) all shipped and validated.
+
 ### 2026-05-11 — Hotfix #2: Slice 3 az-CLI cloud-init revert (`hotfix/slice-4-iac-azcli-cloudinit-revert`)
 
 **Why:** Hotfix #59 reverted the Slice 4 cloud-init substitutions but PR #57's earlier `apt-get install azure-cli` lines (also in cloud-init) remained. The prod VM was provisioned at Slice 1's customData baseline (no az-cli), so any `az deployment group create` re-apply still failed `PropertyChangeNotAllowed: osProfile.customData`. This blocked landing `vmMiReaderAssignment` and the sub-scoped `activityLog` diagnostic module from Slice 4 — leaving the orphan-NSG-rule alert silently broken (Codex PR-58 P2 catch).
