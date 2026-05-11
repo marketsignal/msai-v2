@@ -168,7 +168,11 @@ jobs:
             echo "FAIL_CANNOT_DETERMINE_LIVE_STATE: backend /api/v1/live/status unreachable or stalled (curl --max-time 10s). Fail-closed: refusing deploy." >&2
             exit 1
           fi
-          active_ids=$(echo "$resp" | jq -r '[.deployments[] | select(.status == "running" or .status == "starting") | .id] | join(",")')
+          # Active status set must match backend/src/msai/main.py:158 startup
+          # re-hydration filter — Codex round-4 P1 on PR #58. `building` and
+          # `ready` are intermediate states between starting → running; treating
+          # them as inactive lets the gate fail open during the spawn window.
+          active_ids=$(echo "$resp" | jq -r '[.deployments[] | select(.status == "starting" or .status == "building" or .status == "ready" or .status == "running") | .id] | join(",")')
           if [[ -n "$active_ids" ]]; then
             echo "FAIL_ACTIVE_DEPLOYMENTS_REFUSAL: active deployments [$active_ids]. Run 'msai live stop --all' (or 'msai live kill-all' if backend is wedged) first, then re-dispatch." >&2
             exit 1

@@ -227,7 +227,15 @@ resource alertOrphanNsgRule 'Microsoft.Insights/scheduledQueryRules@2022-06-15' 
     severity: 2
     enabled: true
     evaluationFrequency: 'PT15M'
-    windowSize: 'PT1H'
+    // Window must be longer than the longest credible "rule leaked but
+    // operator hasn't noticed" duration. PR #58 Codex round-4 P2: PT1H was
+    // too short — a rule created >1h ago falls outside the query window and
+    // the alert auto-resolves while the rule is still exposed. PT24H gives
+    // 24-hour visibility before the create-event ages out; if a rule is leaked
+    // longer than that, the every-15-min reaper would have caught it many
+    // times over (or the operator notices via the Slice 4 acceptance
+    // procedure's quarterly drift-check).
+    windowSize: 'PT24H'
     scopes: [
       logAnalyticsWorkspaceId
     ]

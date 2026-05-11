@@ -968,10 +968,15 @@ async def live_status(
     )
     query = select(LiveDeployment).order_by(last_activity.desc())
     if active_only:
-        # No 50-row cap for the gate — every running/starting row must surface.
-        # A 1000-row safety cap is still applied to bound response size; in
-        # practice broker resources cap actual running deployments well below.
-        query = query.where(LiveDeployment.status.in_(["starting", "running"])).limit(1000)
+        # Active set must match the one main.py:158 uses on startup re-hydration —
+        # PR #58 Codex round-4 P1: `building` and `ready` are written by paths
+        # other than api/live.py (NautilusTrader subprocess + supervisor lifecycle
+        # callbacks) and DO count as "live" for the deploy-gate's purposes. A
+        # mismatch here causes the gate to fail open during the building/ready
+        # window of a starting deployment.
+        query = query.where(
+            LiveDeployment.status.in_(["starting", "building", "ready", "running"])
+        ).limit(1000)
     else:
         query = query.limit(50)
     result = await db.execute(query)
