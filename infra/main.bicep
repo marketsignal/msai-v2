@@ -49,6 +49,9 @@ param repoName string = 'msai-v2'
 @description('GitHub branch the federated credential will accept tokens from. Slice 1 binds to main; Slice 3 may add an environment-bound second credential.')
 param repoBranch string = 'main'
 
+@description('Production hostname for the availability test + alert. Override for rehearsal RG (e.g. platform-rehearsal.marketsignal.ai). PR #58 Codex round-9 P2 — hardcoded prod hostname meant rehearsal stacks would page on prod health.')
+param msaiHostname string = 'platform.marketsignal.ai'
+
 @description('Tags applied to every resource.')
 param tags object = {
   project: 'msaiv2'
@@ -743,7 +746,7 @@ module alerts './alerts.bicep' = {
     location: location
     logAnalyticsWorkspaceId: logWorkspace.id
     operatorEmail: 'pablo@ksgai.com'
-    msaiHostname: 'platform.marketsignal.ai'
+    msaiHostname: msaiHostname
     tags: tags
   }
 }
