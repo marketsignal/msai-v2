@@ -1,0 +1,30 @@
+[Unit]
+Description=MSAI v2 — Postgres + Parquet backup to Azure Blob Storage
+# Wait for Docker (postgres container) and network. The backup script's own
+# `docker exec` against the postgres container will surface "no such container"
+# clearly if the stack is down — no need to gate on docker-compose-msai.service.
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# RESOURCE_GROUP + DEPLOYMENT_NAME come from a drop-in override written by
+# deploy-on-vm.sh at /etc/systemd/system/backup-to-blob.service.d/env.conf
+# (same pattern Slice 3 used for KV_NAME on msai-render-env.service). The override
+# carries the actual RG the VM was provisioned into — prevents a rehearsal VM
+# from writing backups using the prod RG name (Codex P2 review on PR #58).
+ExecStart=/opt/msai/scripts/backup-to-blob.sh
+User=root
+Group=root
+StandardOutput=journal
+StandardError=journal
+# A single failed nightly is logged + alerted (Slice 4 Azure Monitor alert on Syslog
+# stream looking for "backup-to-blob.service" + "Failed"). Don't auto-retry —
+# systemd timer will re-fire tomorrow.
+SuccessExitStatus=0
+
+[Install]
+# Enabled by deploy-on-vm.sh on first deploy after Slice 4 merge.
+# (Cloud-init plants the file but does NOT enable, so freshly-provisioned VMs
+# without a running app stack don't fire empty backups.)
+WantedBy=multi-user.target

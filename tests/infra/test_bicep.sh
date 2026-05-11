@@ -60,7 +60,45 @@ grep -q "scope: nsg" infra/main.bicep \
 grep -q "^output nsgName string = nsg.name" infra/main.bicep \
     || { echo "FAIL: nsgName output missing (consumed by deploy workflows)" >&2; exit 1; }
 
-echo "Slice 2 grep assertions clean."
+echo "=== Slice 4 grep assertions ==="
+
+# Slice 4 T07: Reader on RG for VM MI (was Slice 3 manual patch).
+grep -q "resource vmMiReaderAssignment 'Microsoft.Authorization/roleAssignments" infra/main.bicep \
+    || { echo "FAIL: vmMiReaderAssignment missing (Slice 4 T07 — IaC parity)" >&2; exit 1; }
+grep -q "var roleDefIdReader = subscriptionResourceId" infra/main.bicep \
+    || { echo "FAIL: roleDefIdReader variable missing (Slice 4 T07)" >&2; exit 1; }
+
+# Slice 4 T08: storage lifecycle policy.
+grep -q "resource backupsLifecycle 'Microsoft.Storage/storageAccounts/managementPolicies" infra/main.bicep \
+    || { echo "FAIL: backupsLifecycle resource missing (Slice 4 T08)" >&2; exit 1; }
+grep -q "name: 'default'" infra/main.bicep \
+    || { echo "FAIL: lifecycle policy must be named 'default' (singleton — research §5)" >&2; exit 1; }
+grep -q "msai-backups/backup-" infra/main.bicep \
+    || { echo "FAIL: lifecycle prefixMatch must be 'msai-backups/backup-' (research §5)" >&2; exit 1; }
+grep -q "daysAfterCreationGreaterThan: 30" infra/main.bicep \
+    || { echo "FAIL: 30-day retention rule missing in lifecycle policy" >&2; exit 1; }
+
+# Slice 4 T10: alerts module reference.
+grep -q "module alerts './alerts.bicep'" infra/main.bicep \
+    || { echo "FAIL: alerts module reference missing (Slice 4 T10)" >&2; exit 1; }
+
+# Slice 4 PR #58 Codex P2 fix: Activity Log → Log Analytics wiring (sub-scoped module).
+grep -q "module activityLog './activity-log.bicep'" infra/main.bicep \
+    || { echo "FAIL: activity-log module reference missing (PR #58 Codex P2 — orphan-NSG-rule alert would silently miss without AzureActivity wiring)" >&2; exit 1; }
+[ -f infra/activity-log.bicep ] \
+    || { echo "FAIL: infra/activity-log.bicep missing" >&2; exit 1; }
+grep -q "targetScope = 'subscription'" infra/activity-log.bicep \
+    || { echo "FAIL: activity-log.bicep must be sub-scoped (diagnosticSettings for Activity Log lives at subscription scope)" >&2; exit 1; }
+az bicep build --file infra/activity-log.bicep --stdout >/dev/null \
+    || { echo "FAIL: infra/activity-log.bicep bicep build error" >&2; exit 1; }
+
+# Slice 4: Bicep loads + base64-encodes new Slice 4 systemd units into cloud-init.
+grep -q "loadTextContent('../scripts/backup-to-blob.service')" infra/main.bicep \
+    || { echo "FAIL: backup-to-blob.service loadTextContent missing" >&2; exit 1; }
+grep -q "__SLICE4_BICEP_BASE64_OF_BACKUP_TIMER__" infra/main.bicep \
+    || { echo "FAIL: backup timer cloud-init placeholder not substituted" >&2; exit 1; }
+
+echo "Slice 2/3/4 grep assertions clean."
 
 if [[ "${SKIP_WHATIF:-}" == "1" ]] || ! az account show >/dev/null 2>&1; then
     echo "Skipping what-if (no Azure auth or SKIP_WHATIF=1)."

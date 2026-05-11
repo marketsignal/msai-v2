@@ -15,9 +15,13 @@
 # MUST run this against the empty prod Postgres BEFORE the first `up -d --wait`
 # and verify the dump appears in the msai-backups Blob container. Evidence in PR.
 #
-# Slice 4 carry-over (research §4 finding 5): replace the Parquet `cp -r` +
-# `az storage blob upload-batch` step with `azcopy --recursive` for the nightly
-# cron — `--auth-mode login` is ~10× slower than azcopy at scale.
+# Slice 4 (this commit): Parquet mirror uses azcopy v10.22+ with the
+# AZCOPY_AUTO_LOGIN_TYPE=MSI env var (research §1 finding 1 — `azcopy login --identity`
+# was deprecated in v10.22). Postgres single-blob still uses `az storage blob upload`
+# (correct tool for streaming pg_dump | gzip | --file /dev/stdin).
+#
+# azcopy install: see scripts/install-azcopy.sh; binary lives at /usr/local/bin/azcopy.
+# cloud-init also installs it for fresh provisions.
 
 set -euo pipefail
 
@@ -85,21 +89,46 @@ docker exec "$PG_CONTAINER" pg_dump -U msai msai \
         --overwrite \
         --output none
 
-# 2. Parquet tree — `az storage blob upload-batch` via MI.
-# NOTE (Slice 4): switch to `azcopy login --identity && azcopy cp --recursive` for
-# nightly cron — ~10× faster than `az storage blob upload-batch --auth-mode login`
-# at scale. Keep this path for Hawk's-gate (small dataset; one-shot operator run).
+# Post-upload sanity: code-review P1 caught that pipefail propagates pg_dump failure
+# but `az storage blob upload` will happily upload a partial/empty gzipped stream —
+# you discover the corruption at restore time. A gzip of an empty pg_dump is ~20B
+# (just headers); an empty-DB dump is ~360B; populated-DB dumps are 1KB+. Floor of
+# 100B catches "pg_dump failed before writing anything"; floor of 20KB is a stretch
+# given Slice 3's empty-DB Hawk's-gate landed a 372B blob. Compromise: 100B floor
+# to catch pg_dump's "no output" failure mode but not over-tighten and break the
+# empty-DB Hawk's gate.
+PG_BLOB_SIZE=$(az storage blob show \
+    --auth-mode login \
+    --account-name "$STORAGE_ACCT" \
+    --container-name "$CONTAINER" \
+    --name "$PG_BLOB_NAME" \
+    --query 'properties.contentLength' -o tsv 2>/dev/null || echo 0)
+if [[ "$PG_BLOB_SIZE" -lt 100 ]]; then
+    echo "ERROR: Postgres backup blob is only ${PG_BLOB_SIZE} bytes — likely a partial / empty pg_dump." >&2
+    echo "       Inspect via: az storage blob download --account-name $STORAGE_ACCT --container-name $CONTAINER --name $PG_BLOB_NAME --file -" >&2
+    exit 5
+fi
+echo "→ Postgres blob OK: ${PG_BLOB_SIZE} bytes"
+
+# 2. Parquet tree — azcopy via MI (research §1 finding 1: AZCOPY_AUTO_LOGIN_TYPE=MSI
+# env var, NOT deprecated `--identity` flag). ~10× faster than az storage blob
+# upload-batch at scale.
 PARQUET_SRC="${PARQUET_SRC:-/var/lib/msai/docker/volumes/msai_app_data/_data/parquet}"
 if [[ -d "$PARQUET_SRC" ]] && [[ -n "$(ls -A "$PARQUET_SRC" 2>/dev/null || true)" ]]; then
-    echo "→ Mirroring Parquet tree from $PARQUET_SRC"
-    az storage blob upload-batch \
-        --auth-mode login \
-        --account-name "$STORAGE_ACCT" \
-        --destination "$CONTAINER" \
-        --destination-path "backup-${TIMESTAMP}/parquet" \
-        --source "$PARQUET_SRC" \
-        --overwrite \
-        --output none
+    if ! command -v azcopy >/dev/null 2>&1; then
+        echo "ERROR: azcopy not on PATH — install via /opt/msai/scripts/install-azcopy.sh" >&2
+        exit 4
+    fi
+    echo "→ Mirroring Parquet tree from $PARQUET_SRC via azcopy"
+    export AZCOPY_AUTO_LOGIN_TYPE=MSI
+    # Code-review P2 fix: azcopy's directory-copy semantics vary by version with
+    # trailing-slash handling. Use explicit `<src>/*` + dest-with-slash so the
+    # tree lands at `<dest>/<file-tree>` regardless of azcopy version. v10.22+
+    # without this can produce `parquet/parquet/...` (double-nested basename).
+    azcopy cp "${PARQUET_SRC%/}/*" \
+        "https://${STORAGE_ACCT}.blob.core.windows.net/${CONTAINER}/backup-${TIMESTAMP}/parquet/" \
+        --recursive \
+        --output-level=essential
 else
     echo "→ Parquet src $PARQUET_SRC missing or empty; skipping (acceptable for Hawk's gate)"
 fi

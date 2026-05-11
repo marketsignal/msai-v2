@@ -4,6 +4,45 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-05-10 — Deployment-pipeline Slice 4: Ops, Backup, Observability (`feat/deploy-pipeline-ops-backup-observability`)
+
+**Goal:** Final slice of the 4-PR deploy-pipeline series. Three new operational surfaces — nightly backup automation (systemd timer + `azcopy` for Parquet), Log Analytics scheduled-query alerts + Application Insights availability test, active-`live_deployments` hard refusal gate in `deploy.yml` — plus folded-in IaC parity carry-overs from Slice 3 (`Reader` on RG for VM MI declaratively + runbook for idempotent prod Bicep re-apply).
+
+**What ships:**
+
+- **Backup automation**: `scripts/backup-to-blob.{service,timer}` (`OnCalendar=*-*-* 02:07:00 UTC`, `Persistent=true`, `RandomizedDelaySec=300`); `scripts/install-azcopy.sh` (idempotent v10.22+ tarball installer); `scripts/backup-to-blob.sh` Parquet mirror switched to `AZCOPY_AUTO_LOGIN_TYPE=MSI` env (research §1 — `azcopy login --identity` deprecated since v10.22); storage account lifecycle policy with `daysAfterCreationGreaterThan: 30` on `msai-backups/backup-` prefix
+- **`deploy.yml` active-`live_deployments` gate**: pre-flight step (before Azure login — fail fast, no OIDC mint) curls `/api/v1/live/status` with X-API-Key, checks `.active_count`; refuses with `FAIL_ACTIVE_DEPLOYMENTS_REFUSAL` if non-zero. **No force-bypass flag** (plan-review iter-2 P1 removed it — run_id-bound token was impractical pre-dispatch). Backend unreachable → fail-closed with `FAIL_CANNOT_DETERMINE_LIVE_STATE`
+- **`infra/alerts.bicep` module**: Action Group `msai-ops-alerts` (email `pablo@ksgai.com`), Application Insights `msai-app-insights` (workspace-based, linked to Slice 1 Log Analytics), Availability test `msai-health-ping` (`kind: 'standard'`, 3 geo-locations to stay <€10/mo, mandatory `hidden-link` tag), 4 `scheduledQueryRules@2022-06-15` (pinned GA — `2023-12-01-preview` is regionally unregistered per research §2): /health availability, backup-failure, orphan NSG rule >30 min, container restart heuristic (last is a Syslog-stream heuristic since AMA doesn't emit per-container metrics, research §3)
+- **IaC parity**: `vmMiReaderAssignment` (Reader on RG for VM MI) — was Slice 3 manual patch
+- **Runbooks**: `docs/runbooks/restore-from-backup.md`, `docs/runbooks/iac-parity-reapply.md`, `docs/runbooks/slice-4-acceptance.md`
+- **Operational follow-ups during pre-flight (already committed pre-Slice-4)**: paper IB creds (`tws-userid=marin1016test`, `tws-password=…`, `ib-account-id=DUP733213`) seeded in KV from `.ibaccounts.txt`; `databento-api-key` from `.env`; Polygon key deferred (not in repo, not requested by current ingestion path)
+
+**Research-driven design choices (6):**
+
+1. azcopy: `AZCOPY_AUTO_LOGIN_TYPE=MSI` env (NOT deprecated `--identity` flag); tarball install (not in apt)
+2. `scheduledQueryRules` API: `2022-06-15` GA pin; `2023-12-01-preview` is unregistered in many regions
+3. Container restart "alert": KQL heuristic over Syslog stream (Container Insights is K8s-only; AMA on VM doesn't emit per-container metrics)
+4. systemd timer: `OnCalendar` + `Persistent=true` + `RandomizedDelaySec=300` on Ubuntu 24.04 systemd 255
+5. Storage lifecycle: singleton `name='default'`, `daysAfterCreationGreaterThan: 30`, `prefixMatch: ['msai-backups/backup-']`
+6. Availability test: requires App Insights component, `kind: 'standard'` (URL-ping retires 2026-09-30), 3 geo-locations to keep cost <€10/mo
+
+**Plan-review iter 1 (2 P1s addressed, Codex CLI locked out):**
+
+1. Backend status enum is `{starting,running,stopped}` not `{running,starting,ready}`; gate now uses `LiveStatusResponse.active_count` (simpler than parsing `.deployments[].status`)
+2. Force-flag + run_id-bound confirmation_token was impractical (run_id unknowable pre-dispatch). Removed entirely; real emergencies → operator clears state with `msai live stop --all` first
+
+**Verification:** All 4 Slice infra tests green — `test_bicep.sh` (Slice 2/3/4 grep assertions clean; bicep build OK), `test_alerts_bicep.sh` (NEW: API version pin + 4 alert rules + workspace-based AI + heuristic doc), `test_workflow_deploy.sh` (gate marker + active_count parse + force-flag regression guard), `test_caddyfile.sh`. shellcheck clean on all touched shell scripts.
+
+**Post-merge operator gates:**
+
+- ☐ Run `docs/runbooks/iac-parity-reapply.md` (idempotent re-apply of Bicep — `what-if` should show only Slice 4 Creates, 0 Modify/Delete on existing resources)
+- ☐ Set `MSAI_API_KEY` GH Secret (copy from KV `msai-api-key`)
+- ☐ Trigger first Slice 4 deploy via `gh workflow run deploy.yml -f git_sha=<merge-sha>` (deploy-on-vm.sh installs azcopy + enables backup-to-blob.timer)
+- ☐ Run `docs/runbooks/slice-4-acceptance.md` (6 sub-tests — manual backup, backup-failure alert, /health alert, active-deployment gate, orphan-NSG alert, drift-check)
+- ☐ Watch first overnight backup blob appear in `msai-backups` at ~02:07-02:12 UTC
+
+**Slice 4 closes the 4-PR deploy-pipeline series.** Phase 2 deferred per `docs/decisions/deploy-ssh-jit.md` "Deferred" (custom RBAC role replacing Network Contributor, Azure Policy `sourceAddressPrefix` deny, AKS migration when 2-VM split happens).
+
 ### 2026-05-10 — Deployment-pipeline Slice 3: SSH Deploy + First Real Production Deploy (`feat/deploy-pipeline-ssh-deploy-and-first-deploy`)
 
 **Goal:** `.github/workflows/deploy.yml` (workflow_run after Slice 2 + workflow_dispatch) — OIDC + `webfactory/ssh-agent` SSH-from-runner; `scripts/deploy-on-vm.sh` (idempotent, classified failure markers, 1-step rollback to last-good SHA); Caddy 2 reverse-proxy + auto-LE TLS at `platform.marketsignal.ai`; updated `scripts/backup-to-blob.sh` (Bicep outputs + system-assigned MI; streams `pg_dump | gzip | az storage blob upload --file /dev/stdin`); ADR `docs/decisions/deploy-ssh-jit.md` resolving the council Plan-Review iter-1 P0 (Slice 1 NSG only allowed SSH from `operatorIp/32`, blocking GH-runner deploys).

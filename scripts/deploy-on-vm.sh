@@ -319,6 +319,62 @@ for i in $(seq 1 60); do
     sleep 5
 done
 
+# ─── Phase 8 (Slice 4): Install azcopy + enable backup-to-blob.timer ───────────
+
+# Idempotent — both succeed silently if state is already correct. Non-fatal on
+# failure: deploy is "done", nightly backup is "operational layer". A failure here
+# alerts via FAIL_BACKUP_TIMER but does NOT roll back the deploy (rollback would
+# regress app code over an ops-layer hiccup; backup-failure alert covers it).
+echo "→ Slice 4: install azcopy if needed"
+if [[ -x /opt/msai/scripts/install-azcopy.sh ]]; then
+    /opt/msai/scripts/install-azcopy.sh \
+        || echo "  WARN: install-azcopy.sh failed — Parquet mirror will fall back to azcopy-not-present error in the script" >&2
+else
+    echo "  WARN: /opt/msai/scripts/install-azcopy.sh missing — first deploy?" >&2
+fi
+
+echo "→ Slice 4: stage systemd units + drop-in override for RG + enable backup-to-blob.timer"
+cp /opt/msai/scripts/backup-to-blob.service /etc/systemd/system/
+cp /opt/msai/scripts/backup-to-blob.timer /etc/systemd/system/
+# Drop-in override carries the actual RG this VM was provisioned into. Codex P2
+# review on PR #58: hardcoded RESOURCE_GROUP=msaiv2_rg in the unit file would
+# either break rehearsal-RG backups (can't read prod outputs) or, with broadened
+# perms, write rehearsal backups into prod storage. Same drop-in pattern Slice 3
+# used for KV_NAME on msai-render-env.service.
+mkdir -p /etc/systemd/system/backup-to-blob.service.d
+cat >/etc/systemd/system/backup-to-blob.service.d/env.conf <<EOF
+[Service]
+Environment="RESOURCE_GROUP=$RESOURCE_GROUP"
+Environment="DEPLOYMENT_NAME=$DEPLOYMENT_NAME"
+EOF
+systemctl daemon-reload
+if ! systemctl enable --now backup-to-blob.timer; then
+    echo "FAIL_BACKUP_TIMER: systemctl enable --now backup-to-blob.timer failed" >&2
+    echo "  Check: sudo journalctl -u backup-to-blob.timer + 'systemctl status backup-to-blob.timer'" >&2
+    # PR #58 Codex round-5 P2: was previously non-fatal on the rationale that
+    # 'backup-failure alert covers it'. WRONG — that alert only fires if the
+    # SERVICE runs and fails. If the TIMER never enables, the service never
+    # runs, and nightly backups are silently disabled. Make this fatal so the
+    # deploy log surfaces the issue immediately rather than discovering days
+    # later when no backup blob has appeared.
+    exit 1
+fi
+# Code-review P2 fix: `enable --now` does NOT re-load the running timer's
+# definition if the unit-file content changed (since restart). Explicit restart
+# is idempotent and ensures future timer-content edits land without operator
+# action. `enable` is still needed for the WantedBy linkage on first install.
+systemctl restart backup-to-blob.timer 2>&1 \
+    || echo "  WARN: backup-to-blob.timer restart non-zero (already-running OK; see journalctl)" >&2
+
+# Confirm the timer is actually active+enabled — defense against the case where
+# `enable --now` returned 0 but the timer immediately fell out of active state.
+timer_state=$(systemctl is-active backup-to-blob.timer)
+if [[ "$timer_state" != "active" ]]; then
+    echo "FAIL_BACKUP_TIMER_INACTIVE: timer reports state='$timer_state' after enable+restart" >&2
+    exit 1
+fi
+echo "  backup-to-blob.timer: $timer_state"
+
 # Success — clear the rollback flag so trap exits cleanly.
 rollback_required=0
 trap - EXIT

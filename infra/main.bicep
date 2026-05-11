@@ -49,6 +49,9 @@ param repoName string = 'msai-v2'
 @description('GitHub branch the federated credential will accept tokens from. Slice 1 binds to main; Slice 3 may add an environment-bound second credential.')
 param repoBranch string = 'main'
 
+@description('Production hostname for the availability test + alert. Override for rehearsal RG (e.g. platform-rehearsal.marketsignal.ai). PR #58 Codex round-9 P2 — hardcoded prod hostname meant rehearsal stacks would page on prod health.')
+param msaiHostname string = 'platform.marketsignal.ai'
+
 @description('Tags applied to every resource.')
 param tags object = {
   project: 'msaiv2'
@@ -91,6 +94,11 @@ var roleDefIdBlobContributor = subscriptionResourceId('Microsoft.Authorization/r
 // Custom role with only securityRules/{read,write,delete} is a Phase 2 hardening; see
 // docs/decisions/deploy-ssh-jit.md "Deferred hardening".
 var roleDefIdNetworkContributor = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4d97b98b-1d4f-4787-a291-c67834d212e7')
+// Reader — Slice 4 grants this to the VM system-assigned MI scoped to the RG so
+// backup-to-blob.sh can read Bicep outputs (storage account name + container)
+// via `az deployment group show`. Was granted manually during Slice 3 first-deploy;
+// landing in IaC for parity.
+var roleDefIdReader = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'acdd72a7-3385-48ef-bd42-f606fba81ae7')
 
 // ─────────────────────────────────────────────────────────────────────────────
 // T8 (declared early): GH OIDC user-assigned managed identity + federated credential.
@@ -254,6 +262,44 @@ resource backupsContainer 'Microsoft.Storage/storageAccounts/blobServices/contai
   }
 }
 
+// Slice 4: lifecycle policy — auto-delete backup-* blobs older than 30 days.
+// Singleton resource named `default` (Azure-mandated — no other name accepted per
+// Slice 4 research §5 finding 1). `daysAfterCreationGreaterThan` (not modification)
+// because blobs are immutable once written by backup-to-blob.sh. prefixMatch is
+// `<container>/<blob-prefix>` not just blob prefix.
+resource backupsLifecycle 'Microsoft.Storage/storageAccounts/managementPolicies@2024-01-01' = {
+  parent: storageAccount
+  name: 'default'
+  properties: {
+    policy: {
+      rules: [
+        {
+          name: 'expire-backup-blobs-30d'
+          enabled: true
+          type: 'Lifecycle'
+          definition: {
+            filters: {
+              blobTypes: [
+                'blockBlob'
+              ]
+              prefixMatch: [
+                'msai-backups/backup-'
+              ]
+            }
+            actions: {
+              baseBlob: {
+                delete: {
+                  daysAfterCreationGreaterThan: 30
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // T4: Azure Container Registry (Basic SKU, no admin user — only OIDC for push)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -390,10 +436,23 @@ resource nic 'Microsoft.Network/networkInterfaces@2024-01-01' = {
 var cloudInitText = loadTextContent('cloud-init.yaml')
 var renderScriptText = loadTextContent('../scripts/render-env-from-kv.sh')
 var renderUnitText = loadTextContent('../scripts/msai-render-env.service')
+// Slice 4: three additional files baked into cloud-init for fresh provisions.
+var backupServiceText = loadTextContent('../scripts/backup-to-blob.service')
+var backupTimerText = loadTextContent('../scripts/backup-to-blob.timer')
+var installAzcopyText = loadTextContent('../scripts/install-azcopy.sh')
 var cloudInit = replace(
   replace(
-    replace(cloudInitText, '__SLICE1_BICEP_BASE64_OF_RENDER_SCRIPT__', base64(renderScriptText)),
-    '__SLICE1_BICEP_BASE64_OF_UNIT__', base64(renderUnitText)
+    replace(
+      replace(
+        replace(
+          replace(cloudInitText, '__SLICE1_BICEP_BASE64_OF_RENDER_SCRIPT__', base64(renderScriptText)),
+          '__SLICE1_BICEP_BASE64_OF_UNIT__', base64(renderUnitText)
+        ),
+        '__SLICE4_BICEP_BASE64_OF_BACKUP_SERVICE__', base64(backupServiceText)
+      ),
+      '__SLICE4_BICEP_BASE64_OF_BACKUP_TIMER__', base64(backupTimerText)
+    ),
+    '__SLICE4_BICEP_BASE64_OF_INSTALL_AZCOPY__', base64(installAzcopyText)
   ),
   '__SLICE1_BICEP_VM_ADMIN_USERNAME__', vmAdminUsername
 )
@@ -513,6 +572,32 @@ resource heartbeatDcr 'Microsoft.Insights/dataCollectionRules@2022-06-01' = {
             'Emergency'
           ]
         }
+        {
+          // Slice 4 PR #58 Codex round-5 P2: dockerd container-lifecycle
+          // events (exit, OOMKilled, signal-received) are emitted at Info
+          // level on the daemon facility. The msai-container-restart
+          // heuristic alert (infra/alerts.bicep) would never fire under the
+          // syslogBase Warning+ filter. Separate dataSource collects ONLY
+          // daemon facility Info+ — keeps the syslogBase low-volume cost
+          // profile for the other 6 facilities while surfacing Docker
+          // lifecycle events the alert depends on.
+          name: 'syslogDockerInfo'
+          streams: [
+            'Microsoft-Syslog'
+          ]
+          facilityNames: [
+            'daemon'
+          ]
+          logLevels: [
+            'Info'
+            'Notice'
+            'Warning'
+            'Error'
+            'Critical'
+            'Alert'
+            'Emergency'
+          ]
+        }
       ]
     }
     destinations: {
@@ -599,6 +684,20 @@ resource vmBlobContributorAssignment 'Microsoft.Authorization/roleAssignments@20
   }
 }
 
+// Slice 4 IaC parity: Reader on RG for VM MI so backup-to-blob.sh can read Bicep
+// outputs via `az deployment group show`. Was granted manually during Slice 3 first
+// deploy (CHANGELOG Slice 3 manual-patch list); landing in IaC for parity.
+resource vmMiReaderAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: resourceGroup()
+  name: guid(vm.id, resourceGroup().id, 'reader')
+  properties: {
+    principalId: vm.identity.principalId
+    roleDefinitionId: roleDefIdReader
+    principalType: 'ServicePrincipal'
+    description: 'Slice 4: Reader on RG so backup-to-blob.sh resolves Bicep outputs via az deployment group show. Granted manually during Slice 3 first-deploy; declarative parity.'
+  }
+}
+
 resource operatorKvSecretsOfficerAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: keyVault
   name: guid(operatorPrincipalId, keyVault.id, 'kv-secrets-officer')
@@ -637,6 +736,34 @@ resource ghOidcNsgContributorAssignment 'Microsoft.Authorization/roleAssignments
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Slice 4: Observability module — Action Group, App Insights, 4 alert rules,
+// availability test. See infra/alerts.bicep header for design rationale.
+// ─────────────────────────────────────────────────────────────────────────────
+
+module alerts './alerts.bicep' = {
+  name: 'alerts-${uniqueString(resourceGroup().id)}'
+  params: {
+    location: location
+    logAnalyticsWorkspaceId: logWorkspace.id
+    operatorEmail: 'pablo@ksgai.com'
+    msaiHostname: msaiHostname
+    tags: tags
+  }
+}
+
+// Slice 4 PR #58 Codex P2 fix: wire Azure Activity Log into Log Analytics so
+// the orphan-NSG-rule alert (KQL against `AzureActivity` table) actually finds
+// rows. Sub-scoped module — requires Owner / Monitoring Contributor on the
+// subscription. Standalone what-if (`az deployment sub what-if`) recommended
+// before apply per docs/runbooks/iac-parity-reapply.md.
+module activityLog './activity-log.bicep' = {
+  scope: subscription()
+  name: 'activity-log-${uniqueString(resourceGroup().id)}'
+  params: {
+    logAnalyticsWorkspaceId: logWorkspace.id
+  }
+}
+
 // Outputs (consumed by Slice 2/3 via `az deployment group show --query 'properties.outputs'`)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -650,4 +777,6 @@ output logAnalyticsWorkspaceId string = logWorkspace.properties.customerId
 output backupsStorageAccount string = storageAccount.name
 output backupsContainerName string = backupsContainer.name
 output nsgName string = nsg.name
+output actionGroupId string = alerts.outputs.actionGroupId
+output appInsightsId string = alerts.outputs.appInsightsId
 

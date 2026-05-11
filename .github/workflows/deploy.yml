@@ -62,6 +62,11 @@ on:
         required: false
         type: string
         description: "Override vars.ACR_LOGIN_SERVER (rehearsal RG ACR FQDN)."
+      bootstrap:
+        required: false
+        type: boolean
+        default: false
+        description: "Explicit fresh-target / DR-rebuild flag. Allows the active-live_deployments gate to bypass on curl 6/7 (no DNS / connect-refused). MUST be false for prod re-deploys — Caddy being down doesn't mean broker (separate compose profile) is also down."
 
 permissions:
   id-token: write
@@ -130,6 +135,79 @@ jobs:
             # run_id-run_attempt makes the rule unique across re-runs (Hawk + Maintainer).
             echo "rule_name=gha-transient-${{ github.run_id }}-${{ github.run_attempt }}"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Refuse if active live_deployments
+        # Slice 4: refuse the deploy if backend reports any active deployment. Fail
+        # fast BEFORE Azure login (no OIDC mint, no NSG rule churn) so the gate is
+        # the cheapest possible pre-flight. Uses public endpoint via Caddy + X-API-Key
+        # (which Caddy passes through unchanged per Slice 4 research §7). No force
+        # flag — operator clears state with `msai live stop --all` first.
+        env:
+          MSAI_HOST: ${{ steps.resolve.outputs.msai_hostname }}
+          MSAI_API_KEY: ${{ secrets.MSAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          # SOURCE OF TRUTH: persisted .deployments[].status (DB column, populated
+          # from backend/src/msai/api/live.py:935 via SELECT on live_deployments).
+          # Codex-bot review on PR #58 caught that `.active_count` reads
+          # `_node_manager.active_count` — backend-local state that does NOT track
+          # live-supervisor-owned subprocesses (supervisor is a separate broker-profile
+          # container, started via /api/v1/live/start-portfolio → Redis Streams →
+          # supervisor.spawn). So active_count stays 0 during real broker trading
+          # and the gate fails OPEN. Querying the DB-persisted status is correct;
+          # status enum is {starting, running, stopped} per backend/src/msai/api/live.py
+          # lines 421, 504, 597, 732.
+          # Bound the request — Codex P2 review on PR #58: if backend accepts the
+          # connection but stalls (e.g., DB query hanging), curl without --max-time
+          # would block the gate for the runner timeout while holding the
+          # `deploy-msai` concurrency lock, queueing subsequent prod deploys instead
+          # of failing closed quickly. 10s is generous (existing probes use 5-10s).
+          # ?active_only=true filters status IN (starting,running) AND drops the
+          # 50-row cap (raised to a 1000-row safety cap) so a long-running broker
+          # deployment can't be pushed out of the response by 50+ subsequent stop
+          # events. Codex P1 review on PR #58 caught that limit-50 bug. Backwards
+          # compat: old backend (pre-Slice-4) ignores unknown query params and
+          # returns the limited 50-row response, so the gate degrades to the
+          # original behavior on a backend that hasn't deployed Slice 4 yet.
+          # Distinguish "fresh target" (curl can't connect — no DNS, connection
+          # refused) from "stalled server" (curl timed out). PR #58 Codex round-8
+          # P1: round-7's blanket bypass on curl 6/7 was unsafe — Caddy being
+          # down doesn't mean broker is also down (broker is a SEPARATE compose
+          # profile with `live-supervisor` + ib-gateway; they can keep trading
+          # even if the API listener is dead). So the bypass MUST be opt-in via
+          # the `bootstrap` workflow_dispatch input. For an established prod
+          # deploy, any curl failure fails closed.
+          set +e
+          resp=$(curl -sf --max-time 10 -H "X-API-Key: $MSAI_API_KEY" "https://${MSAI_HOST}/api/v1/live/status?active_only=true")
+          curl_exit=$?
+          set -e
+          case "$curl_exit" in
+            0)
+              ;;  # got a response — proceed to active-deployments check below
+            6|7)
+              if [[ "${{ inputs.bootstrap }}" == "true" ]]; then
+                echo "Gate: fresh-target bootstrap explicit (curl exit $curl_exit — DNS or connect-refused). Allowing." >&2
+                resp='{"deployments":[]}'
+              else
+                echo "FAIL_CANNOT_DETERMINE_LIVE_STATE: /api/v1/live/status not reachable (curl exit $curl_exit). For prod re-deploys this fails closed (Caddy down does NOT mean broker is down — separate compose profile). Re-dispatch with -f bootstrap=true IFF this is a fresh-VM bootstrap / DR rebuild and you've confirmed no broker subprocesses are running." >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "FAIL_CANNOT_DETERMINE_LIVE_STATE: /api/v1/live/status reachable but unhealthy (curl exit $curl_exit — timeout or 5xx). Fail-closed: refusing deploy." >&2
+              exit 1
+              ;;
+          esac
+          # Active status set must match backend/src/msai/main.py:158 startup
+          # re-hydration filter — Codex round-4 P1 on PR #58. `building` and
+          # `ready` are intermediate states between starting → running; treating
+          # them as inactive lets the gate fail open during the spawn window.
+          active_ids=$(echo "$resp" | jq -r '[.deployments[] | select(.status == "starting" or .status == "building" or .status == "ready" or .status == "running") | .id] | join(",")')
+          if [[ -n "$active_ids" ]]; then
+            echo "FAIL_ACTIVE_DEPLOYMENTS_REFUSAL: active deployments [$active_ids]. Run 'msai live stop --all' (or 'msai live kill-all' if backend is wedged) first, then re-dispatch." >&2
+            exit 1
+          fi
+          echo "deployments[].status check: 0 active — gate clear"
 
       - name: Azure login (OIDC)
         uses: azure/login@1384c340ab2dda50fed2bee3041d1d87018aa5e8 # v2
@@ -225,8 +303,10 @@ jobs:
           # shellcheck disable=SC2029  # VM_USER expansion is intentional client-side
           ssh "${VM_USER}@${VM_IP}" "sudo mkdir -p /opt/msai/scripts && sudo chown -R ${VM_USER}:${VM_USER} /opt/msai"
           scp docker-compose.prod.yml Caddyfile "${VM_USER}@${VM_IP}:/opt/msai/"
-          scp scripts/backup-to-blob.sh scripts/deploy-on-vm.sh "${VM_USER}@${VM_IP}:/opt/msai/scripts/"
-          ssh "${VM_USER}@${VM_IP}" "sudo chmod +x /opt/msai/scripts/backup-to-blob.sh /opt/msai/scripts/deploy-on-vm.sh"
+          scp scripts/backup-to-blob.sh scripts/deploy-on-vm.sh scripts/install-azcopy.sh \
+              scripts/backup-to-blob.service scripts/backup-to-blob.timer \
+              "${VM_USER}@${VM_IP}:/opt/msai/scripts/"
+          ssh "${VM_USER}@${VM_IP}" "sudo chmod +x /opt/msai/scripts/backup-to-blob.sh /opt/msai/scripts/deploy-on-vm.sh /opt/msai/scripts/install-azcopy.sh"
           # Also stage the per-run script at /tmp for the next step (kept in /tmp so the
           # `sudo bash /tmp/...` below is unambiguous about which run is firing)
           scp scripts/deploy-on-vm.sh "${VM_USER}@${VM_IP}:/tmp/deploy-on-vm-${{ github.run_id }}.sh"

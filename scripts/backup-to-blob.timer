@@ -1,0 +1,19 @@
+[Unit]
+Description=Nightly trigger for MSAI v2 backup-to-blob
+
+[Timer]
+# 02:07 UTC nightly. Off-the-hour at :07 to avoid the Azure storage-account
+# scheduler stampede at :00. 02 UTC = 22:00 ET = 03 CET — post-US-market, late
+# overnight for operator timezone.
+OnCalendar=*-*-* 02:07:00 UTC
+# Catch up if the timer was inactive when its window passed (e.g. VM rebooted
+# between 02:00 and 03:00 UTC). systemd 255 honors this on Ubuntu 24.04 per
+# research §4 finding 4.
+Persistent=true
+# Up to 5 min of jitter on top of OnCalendar so concurrent fleets don't all
+# hit at exactly 02:07:00. Belt-and-braces past the :07 off-the-hour pick.
+RandomizedDelaySec=300
+Unit=backup-to-blob.service
+
+[Install]
+WantedBy=timers.target
