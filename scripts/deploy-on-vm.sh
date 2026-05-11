@@ -90,6 +90,26 @@ fi
 
 echo "=== deploy-on-vm.sh — sha=$GIT_SHA hostname=$MSAI_HOSTNAME rg=$RESOURCE_GROUP ==="
 
+# ─── Phase 2.5: Ensure az CLI is installed (idempotent) ────────────────────────
+# Slice 3 originally baked az-cli install into cloud-init, but
+# `osProfile.customData` is immutable on existing VMs (PropertyChangeNotAllowed)
+# — any cloud-init delta blocks `az deployment group create` re-apply on the
+# live VM. Slice 4 hotfix moves az-cli install here so it runs at deploy time
+# (idempotent: skipped if already present), keeping cloud-init pinned at the
+# Slice 1 baseline that the prod VM was provisioned with.
+if ! command -v az >/dev/null 2>&1; then
+    echo "az CLI not present — installing via Microsoft apt repo"
+    sudo install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+        | sudo gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg
+    sudo chmod a+r /etc/apt/keyrings/microsoft.gpg
+    AZ_REPO=$(lsb_release -cs)
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ ${AZ_REPO} main" \
+        | sudo tee /etc/apt/sources.list.d/azure-cli.list >/dev/null
+    sudo apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y azure-cli apt-transport-https
+fi
+
 # ─── Phase 3: Azure / ACR auth via VM system-assigned MI ───────────────────────
 
 if ! az login --identity --output none 2>/dev/null; then

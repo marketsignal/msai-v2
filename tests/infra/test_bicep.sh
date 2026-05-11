@@ -107,6 +107,24 @@ if grep -q "__SLICE4_BICEP_BASE64_OF" infra/main.bicep || grep -q "__SLICE4_BICE
     exit 1
 fi
 
+# Slice 4 hotfix #2: Slice 3's `apt-get install ... azure-cli` was also baked
+# into cloud-init (PR #57), causing the same customData immutability blocker on
+# IaC re-apply against the existing VM. hotfix/slice-4-iac-azcli-cloudinit-revert
+# moved az-cli install into deploy-on-vm.sh at runtime. Regression guard:
+# cloud-init MUST NOT carry azure-cli install steps.
+if grep -qE "install -y .*azure-cli" infra/cloud-init.yaml; then
+    echo "FAIL: regression — cloud-init carries azure-cli install, which breaks IaC re-apply (hotfix/slice-4-iac-azcli-cloudinit-revert)" >&2
+    exit 1
+fi
+if grep -q "packages.microsoft.com/repos/azure-cli" infra/cloud-init.yaml; then
+    echo "FAIL: regression — cloud-init still references Microsoft azure-cli apt repo (hotfix/slice-4-iac-azcli-cloudinit-revert)" >&2
+    exit 1
+fi
+
+# Companion assertion: deploy-on-vm.sh MUST install az CLI at runtime if missing.
+grep -q "command -v az" scripts/deploy-on-vm.sh \
+    || { echo "FAIL: deploy-on-vm.sh must install az CLI at runtime when missing (hotfix/slice-4-iac-azcli-cloudinit-revert)" >&2; exit 1; }
+
 echo "Slice 2/3/4 grep assertions clean."
 
 if [[ "${SKIP_WHATIF:-}" == "1" ]] || ! az account show >/dev/null 2>&1; then
