@@ -121,6 +121,15 @@ grep -q "FAIL_CANNOT_DETERMINE_LIVE_STATE" "$DEPLOY_YML" \
     || { echo "FAIL: deploy.yml missing FAIL_CANNOT_DETERMINE_LIVE_STATE marker (fail-closed when backend is unreachable)" >&2; exit 1; }
 grep -qE '\.deployments\[\] \| select\(\.status' "$DEPLOY_YML" \
     || { echo "FAIL: gate must parse .deployments[].status (NOT .active_count — Codex bot PR-review caught that active_count is backend-local _node_manager state and does NOT track supervisor-owned subprocesses; gate would fail open during real broker trading)" >&2; exit 1; }
+# Round-8 P1 guard: curl 6/7 bypass MUST be gated on inputs.bootstrap, not
+# always-allowed. Caddy down does NOT mean broker (separate compose profile) is
+# also down — bypassing without explicit bootstrap=true could allow a deploy
+# while broker subprocesses are still trading.
+grep -q "inputs.bootstrap" "$DEPLOY_YML" \
+    || { echo "FAIL: deploy.yml must accept 'bootstrap' workflow_dispatch input (PR #58 round-8 P1)" >&2; exit 1; }
+grep -qE "curl_exit.*6\|7" "$DEPLOY_YML" \
+    || { echo "FAIL: curl-exit case statement missing 6|7 branch" >&2; exit 1; }
+
 # Regression guard: gate must NOT jq-parse .active_count (see PR #58 Codex review).
 # Strip YAML comments first so the explanatory `# active_count is …` block doesn't trip
 # the check; only inspect actual jq commands.

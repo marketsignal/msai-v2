@@ -62,6 +62,11 @@ on:
         required: false
         type: string
         description: "Override vars.ACR_LOGIN_SERVER (rehearsal RG ACR FQDN)."
+      bootstrap:
+        required: false
+        type: boolean
+        default: false
+        description: "Explicit fresh-target / DR-rebuild flag. Allows the active-live_deployments gate to bypass on curl 6/7 (no DNS / connect-refused). MUST be false for prod re-deploys — Caddy being down doesn't mean broker (separate compose profile) is also down."
 
 permissions:
   id-token: write
@@ -165,12 +170,13 @@ jobs:
           # returns the limited 50-row response, so the gate degrades to the
           # original behavior on a backend that hasn't deployed Slice 4 yet.
           # Distinguish "fresh target" (curl can't connect — no DNS, connection
-          # refused) from "stalled server" (curl timed out). PR #58 Codex round-7
-          # P2: fresh-VM bootstrap / DR rebuild / rehearsal first-deploy have
-          # nothing listening yet; failing closed would block the bootstrap path
-          # forever. Connect-refused (curl exit 7) and DNS-fail (6) mean no live
-          # trading is possible → allow past the gate. Timeout (28) or HTTP 5xx
-          # (22 with -f) mean something IS there and unhealthy → fail closed.
+          # refused) from "stalled server" (curl timed out). PR #58 Codex round-8
+          # P1: round-7's blanket bypass on curl 6/7 was unsafe — Caddy being
+          # down doesn't mean broker is also down (broker is a SEPARATE compose
+          # profile with `live-supervisor` + ib-gateway; they can keep trading
+          # even if the API listener is dead). So the bypass MUST be opt-in via
+          # the `bootstrap` workflow_dispatch input. For an established prod
+          # deploy, any curl failure fails closed.
           set +e
           resp=$(curl -sf --max-time 10 -H "X-API-Key: $MSAI_API_KEY" "https://${MSAI_HOST}/api/v1/live/status?active_only=true")
           curl_exit=$?
@@ -179,8 +185,13 @@ jobs:
             0)
               ;;  # got a response — proceed to active-deployments check below
             6|7)
-              echo "Gate: fresh target (curl exit $curl_exit — DNS or connect-refused). Nothing listening at https://${MSAI_HOST}; no live trading is possible. Allowing bootstrap deploy." >&2
-              resp='{"deployments":[]}'
+              if [[ "${{ inputs.bootstrap }}" == "true" ]]; then
+                echo "Gate: fresh-target bootstrap explicit (curl exit $curl_exit — DNS or connect-refused). Allowing." >&2
+                resp='{"deployments":[]}'
+              else
+                echo "FAIL_CANNOT_DETERMINE_LIVE_STATE: /api/v1/live/status not reachable (curl exit $curl_exit). For prod re-deploys this fails closed (Caddy down does NOT mean broker is down — separate compose profile). Re-dispatch with -f bootstrap=true IFF this is a fresh-VM bootstrap / DR rebuild and you've confirmed no broker subprocesses are running." >&2
+                exit 1
+              fi
               ;;
             *)
               echo "FAIL_CANNOT_DETERMINE_LIVE_STATE: /api/v1/live/status reachable but unhealthy (curl exit $curl_exit — timeout or 5xx). Fail-closed: refusing deploy." >&2
