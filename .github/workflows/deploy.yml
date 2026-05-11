@@ -142,20 +142,26 @@ jobs:
           MSAI_API_KEY: ${{ secrets.MSAI_API_KEY }}
         run: |
           set -euo pipefail
-          # `active_count` is the LiveStatusResponse field; reflects supervisor's
-          # in-memory active subprocesses (not stale DB rows). Source:
-          # backend/src/msai/schemas/live.py:60 + backend/src/msai/api/live.py
-          # (returns _node_manager.active_count).
+          # SOURCE OF TRUTH: persisted .deployments[].status (DB column, populated
+          # from backend/src/msai/api/live.py:935 via SELECT on live_deployments).
+          # Codex-bot review on PR #58 caught that `.active_count` reads
+          # `_node_manager.active_count` — backend-local state that does NOT track
+          # live-supervisor-owned subprocesses (supervisor is a separate broker-profile
+          # container, started via /api/v1/live/start-portfolio → Redis Streams →
+          # supervisor.spawn). So active_count stays 0 during real broker trading
+          # and the gate fails OPEN. Querying the DB-persisted status is correct;
+          # status enum is {starting, running, stopped} per backend/src/msai/api/live.py
+          # lines 421, 504, 597, 732.
           if ! resp=$(curl -sf -H "X-API-Key: $MSAI_API_KEY" "https://${MSAI_HOST}/api/v1/live/status"); then
             echo "FAIL_CANNOT_DETERMINE_LIVE_STATE: backend /api/v1/live/status unreachable. Fail-closed: refusing deploy." >&2
             exit 1
           fi
-          active=$(echo "$resp" | jq -r '.active_count')
-          if [[ "$active" != "0" ]]; then
-            echo "FAIL_ACTIVE_DEPLOYMENTS_REFUSAL: $active deployments still active. Run 'msai live stop --all' first, then re-dispatch." >&2
+          active_ids=$(echo "$resp" | jq -r '[.deployments[] | select(.status == "running" or .status == "starting") | .id] | join(",")')
+          if [[ -n "$active_ids" ]]; then
+            echo "FAIL_ACTIVE_DEPLOYMENTS_REFUSAL: active deployments [$active_ids]. Run 'msai live stop --all' (or 'msai live kill-all' if backend is wedged) first, then re-dispatch." >&2
             exit 1
           fi
-          echo "active_count=0 — gate clear"
+          echo "deployments[].status check: 0 active — gate clear"
 
       - name: Azure login (OIDC)
         uses: azure/login@1384c340ab2dda50fed2bee3041d1d87018aa5e8 # v2

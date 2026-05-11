@@ -119,8 +119,15 @@ grep -q "FAIL_ACTIVE_DEPLOYMENTS_REFUSAL" "$DEPLOY_YML" \
     || { echo "FAIL: deploy.yml missing FAIL_ACTIVE_DEPLOYMENTS_REFUSAL marker" >&2; exit 1; }
 grep -q "FAIL_CANNOT_DETERMINE_LIVE_STATE" "$DEPLOY_YML" \
     || { echo "FAIL: deploy.yml missing FAIL_CANNOT_DETERMINE_LIVE_STATE marker (fail-closed when backend is unreachable)" >&2; exit 1; }
-grep -qE "\\.active_count" "$DEPLOY_YML" \
-    || { echo "FAIL: gate must parse .active_count (not .deployments[].status — see plan-review iter-1 P1)" >&2; exit 1; }
+grep -qE '\.deployments\[\] \| select\(\.status' "$DEPLOY_YML" \
+    || { echo "FAIL: gate must parse .deployments[].status (NOT .active_count — Codex bot PR-review caught that active_count is backend-local _node_manager state and does NOT track supervisor-owned subprocesses; gate would fail open during real broker trading)" >&2; exit 1; }
+# Regression guard: gate must NOT jq-parse .active_count (see PR #58 Codex review).
+# Strip YAML comments first so the explanatory `# active_count is …` block doesn't trip
+# the check; only inspect actual jq commands.
+if sed 's/#.*//' "$DEPLOY_YML" | grep -qE "jq -r '.active_count"; then
+    echo "FAIL: regression — gate must NOT jq-parse .active_count (see PR #58 Codex review — that field is backend-local; gate would fail open during broker trading)" >&2
+    exit 1
+fi
 
 # Regression guard: NO force-bypass flag (plan-review iter-2 P1 removed it — run_id-bound token was impractical).
 if grep -qE "force_during_active_deploys|confirmation_token|FAIL_FORCE_TOKEN" "$DEPLOY_YML"; then
