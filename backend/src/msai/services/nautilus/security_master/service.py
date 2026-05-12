@@ -1288,11 +1288,32 @@ class SecurityMaster:
         #
         # Fix: time-invariant asset classes (equity / fx / crypto — the
         # last covers crypto-perpetual; crypto-futures aren't currently
-        # in this codebase's asset_class taxonomy) get a far-past anchor.
-        # Futures / options keep ``today`` so the roll history is precise.
+        # in this codebase's asset_class taxonomy) get a far-past anchor
+        # for the FIRST alias on a definition. **Subsequent aliases**
+        # (venue swap: an existing equity gets a new alias_string, the
+        # old alias was just closed by ``close_stmt`` above at
+        # ``today``) start at ``today`` — the switch date — so historical
+        # backtests with ``as_of < today`` resolve to the alias that was
+        # ACTUALLY active then (the now-closed sibling), not silently
+        # to the new venue (Codex P2 catch, PR #61 round 6).
+        # Futures / options always use ``today`` so the roll history is
+        # precise.
         time_invariant_asset_classes: frozenset[str] = frozenset({"equity", "fx", "crypto"})
         far_past_anchor: date = date(1900, 1, 1)
-        effective_from = far_past_anchor if asset_class in time_invariant_asset_classes else today
+        if asset_class in time_invariant_asset_classes:
+            # Did this definition already have any alias rows (active or
+            # closed) for this provider? If so, this is a venue swap and
+            # the new alias's effective_from is the switch date.
+            prior_alias_check = await self._db.execute(
+                select(InstrumentAlias.id).where(
+                    InstrumentAlias.instrument_uid == instrument_uid,
+                    InstrumentAlias.provider == provider,
+                )
+            )
+            has_prior_alias = prior_alias_check.first() is not None
+            effective_from = today if has_prior_alias else far_past_anchor
+        else:
+            effective_from = today
 
         # Alias upsert — re-activate same-day-same-alias rows (set effective_to
         # back to NULL) instead of ON CONFLICT DO NOTHING.

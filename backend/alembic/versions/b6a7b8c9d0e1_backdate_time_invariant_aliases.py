@@ -61,8 +61,7 @@ def upgrade() -> None:
     # NOT NULL``) are untouched — they represent historical venue
     # migrations the registry still needs to differentiate.
     #
-    # Two-step guard against ``uq_instrument_aliases_string_provider_from``
-    # unique-constraint violations:
+    # Three guards on the backdate set:
     #
     # 1. **Pre-existing-anchor guard.** If any sibling row with the
     #    same ``(alias_string, provider)`` already has
@@ -84,6 +83,18 @@ def upgrade() -> None:
     #    that. The other duplicates retain their original
     #    ``effective_from`` and remain discoverable via raw_symbol
     #    lookup.
+    #
+    # 3. **Closed-sibling guard (Codex P2 catch, PR #61 round 6).** If
+    #    the definition already has ANY closed alias row
+    #    (``effective_to IS NOT NULL``) — e.g. a historical venue swap
+    #    like ``AAPL.XNYS`` (closed) → ``AAPL.XNAS`` (active) — backdating
+    #    the active row to ``1900-01-01`` would silently overlap the
+    #    closed sibling's window and corrupt historical resolution: a
+    #    backtest dated to the closed sibling's era would (after backdate)
+    #    resolve to the NEW venue instead of the historically correct one.
+    #    Skip these definitions entirely; the active alias keeps its
+    #    original ``effective_from`` (the switch date), matching the
+    #    venue-swap semantics ``service.py`` now writes going forward.
     op.execute(
         sa.text(
             """
@@ -103,6 +114,11 @@ def upgrade() -> None:
                       WHERE sib.alias_string = a.alias_string
                         AND sib.provider = a.provider
                         AND sib.effective_from = DATE '1900-01-01'
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM instrument_aliases closed_sib
+                      WHERE closed_sib.instrument_uid = a.instrument_uid
+                        AND closed_sib.effective_to IS NOT NULL
                   )
             )
             UPDATE instrument_aliases a

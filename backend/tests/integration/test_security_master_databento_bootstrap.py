@@ -65,6 +65,105 @@ async def test_changed_mic_returns_alias_rotated(session_factory, mock_databento
 
 
 @pytest.mark.asyncio
+async def test_first_equity_alias_gets_far_past_anchor(session_factory, mock_databento):
+    """Codex P2 (PR #61 round 6): the FIRST alias on a time-invariant
+    definition (equity) gets ``effective_from = 1900-01-01`` so historical
+    backtests with ``start_date < bootstrap_date`` window-hit the alias.
+    """
+    from datetime import date
+
+    from sqlalchemy import select
+
+    from msai.models.instrument_alias import InstrumentAlias
+
+    svc = DatabentoBootstrapService(
+        session_factory=session_factory, databento_client=mock_databento
+    )
+
+    await svc.bootstrap(symbols=["SPY"], asset_class_override=None, exact_ids=None)
+
+    async with session_factory() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(InstrumentAlias).where(InstrumentAlias.provider == "databento")
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+        assert rows[0].effective_from == date(1900, 1, 1), (
+            f"first alias must anchor to far past, got {rows[0].effective_from}"
+        )
+        assert rows[0].effective_to is None
+
+
+@pytest.mark.asyncio
+async def test_venue_swap_second_alias_starts_at_switch_date(session_factory, mock_databento):
+    """Codex P2 (PR #61 round 6): when an equity definition already has a
+    closed sibling alias (venue swap), the NEW active alias's
+    ``effective_from`` must be the switch date (today), NOT the far-past
+    anchor. Backdating it to 1900-01-01 would overlap the closed sibling's
+    window and silently route historical backtests to the wrong venue.
+    """
+    from datetime import date
+
+    from sqlalchemy import select
+
+    from msai.models.instrument_alias import InstrumentAlias
+    from msai.services.nautilus.live_instrument_bootstrap import exchange_local_today
+    from tests.integration.conftest_databento import _make_equity_instrument
+
+    svc = DatabentoBootstrapService(
+        session_factory=session_factory, databento_client=mock_databento
+    )
+
+    # Seed: SPY.XARC → SPY.ARCA (first alias, gets far-past anchor).
+    await svc.bootstrap(symbols=["SPY"], asset_class_override=None, exact_ids=None)
+
+    # Rotate to a new venue on the same calendar day.
+    def _rotated_side_effect(symbol, start, end, *, dataset, target_path, exact_id=None):
+        if symbol == "SPY":
+            return [_make_equity_instrument("SPY", "BATS")]
+        raise RuntimeError(f"unexpected symbol {symbol}")
+
+    mock_databento.fetch_definition_instruments = AsyncMock(side_effect=_rotated_side_effect)
+    await svc.bootstrap(symbols=["SPY"], asset_class_override=None, exact_ids=None)
+
+    today = exchange_local_today()
+    async with session_factory() as session:
+        rows = (
+            (
+                await session.execute(
+                    select(InstrumentAlias)
+                    .where(InstrumentAlias.provider == "databento")
+                    .order_by(InstrumentAlias.alias_string)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # Two aliases: the closed ARCA + the new active BATS.
+        by_str = {r.alias_string: r for r in rows}
+        assert set(by_str) == {"SPY.ARCA", "SPY.BATS"}, by_str
+
+        closed = by_str["SPY.ARCA"]
+        active = by_str["SPY.BATS"]
+
+        # The original ARCA alias keeps its far-past anchor and is now closed.
+        assert closed.effective_from == date(1900, 1, 1)
+        assert closed.effective_to == today
+
+        # The replacement BATS alias starts at the switch date — NOT the
+        # anchor — so historical backtests pre-switch resolve to ARCA, not BATS.
+        assert active.effective_from == today, (
+            f"replacement alias must start at switch date, got {active.effective_from}"
+        )
+        assert active.effective_to is None
+
+
+@pytest.mark.asyncio
 async def test_live_qualified_true_when_ib_alias_exists(session_factory, mock_databento):
     """Seed an active IB alias first, then bootstrap via Databento for the
     same raw_symbol + asset_class — the result must surface

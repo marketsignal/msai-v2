@@ -768,3 +768,161 @@ async def test_revision_b_fails_loud_on_share_class_ticker_not_in_known_venues(
     assert "share-class" in combined or "NASDAQ" in combined, (
         f"failure message must include the operator hint; got:\n{combined}"
     )
+
+
+# ---------------------------------------------------------------------------
+# b6a7b8c9d0e1 backdate migration — closed-sibling guard (Codex P2, PR #61)
+# ---------------------------------------------------------------------------
+
+REV_BACKDATE = "b6a7b8c9d0e1"
+REV_PRE_BACKDATE = "a5y6z7a8b9c0"
+
+
+@pytest.mark.asyncio
+async def test_backdate_skips_active_alias_when_closed_sibling_exists(
+    isolated_postgres_url: str,
+) -> None:
+    """Codex P2 (PR #61 round 6): the backdate migration must NOT touch
+    the active alias of a definition that already has a closed sibling
+    (historical venue swap). Backdating it to 1900-01-01 would overlap
+    the closed sibling's window and silently route historical backtests
+    to the wrong venue.
+    """
+    from datetime import date
+
+    # Bring DB to a known head then step back to before the backdate
+    # migration so we can seed equity rows with the prior schema's
+    # semantics. The module-scoped Postgres may arrive fresh or already
+    # at head from prior tests — upgrade first to normalize, then
+    # downgrade.
+    _run_alembic(["upgrade", "head"], isolated_postgres_url)
+    _run_alembic(["downgrade", REV_PRE_BACKDATE], isolated_postgres_url)
+
+    engine: AsyncEngine = create_async_engine(isolated_postgres_url, future=True)
+    async with engine.begin() as conn:
+        await conn.execute(text("TRUNCATE instrument_aliases, instrument_definitions CASCADE"))
+        # Seed: one equity definition with a closed XNYS alias +
+        # active XNAS alias starting at the switch date.
+        await conn.execute(
+            text(
+                """
+                INSERT INTO instrument_definitions
+                  (instrument_uid, raw_symbol, listing_venue, routing_venue,
+                   asset_class, provider, roll_policy, lifecycle_state)
+                VALUES
+                  (gen_random_uuid(), 'AAPL', 'NYSE', 'NYSE',
+                   'equity', 'databento', 'none', 'active')
+                """
+            )
+        )
+        uid = (
+            await conn.execute(text("SELECT instrument_uid FROM instrument_definitions"))
+        ).scalar_one()
+        await conn.execute(
+            text(
+                """
+                INSERT INTO instrument_aliases
+                  (id, instrument_uid, alias_string, venue_format,
+                   provider, effective_from, effective_to)
+                VALUES
+                  (gen_random_uuid(), :uid, 'AAPL.NYSE', 'exchange_name',
+                   'databento', DATE '2020-01-01', DATE '2024-06-15'),
+                  (gen_random_uuid(), :uid, 'AAPL.NASDAQ', 'exchange_name',
+                   'databento', DATE '2024-06-16', NULL)
+                """
+            ),
+            {"uid": uid},
+        )
+    await engine.dispose()
+
+    # Run the backdate migration.
+    _run_alembic(["upgrade", REV_BACKDATE], isolated_postgres_url)
+
+    # Verify: active XNAS keeps its switch-date effective_from; closed
+    # XNYS keeps its original window. Neither got rewritten to 1900-01-01.
+    engine = create_async_engine(isolated_postgres_url, future=True)
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT alias_string, effective_from, effective_to "
+                    "FROM instrument_aliases ORDER BY alias_string"
+                )
+            )
+        ).all()
+    await engine.dispose()
+
+    by_str = {r[0]: (r[1], r[2]) for r in rows}
+    assert by_str["AAPL.NASDAQ"] == (date(2024, 6, 16), None), (
+        f"active alias must NOT be backdated when a closed sibling exists; got {by_str}"
+    )
+    assert by_str["AAPL.NYSE"] == (date(2020, 1, 1), date(2024, 6, 15)), (
+        f"closed sibling must remain untouched; got {by_str}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_backdate_anchors_lone_active_alias_with_no_history(
+    isolated_postgres_url: str,
+) -> None:
+    """Regression guard: the closed-sibling check must not over-apply.
+    A definition whose only alias is a fresh ``today``-anchored row
+    (no venue swap history) MUST be backdated to ``1900-01-01`` so
+    historical backtests work.
+    """
+    from datetime import date
+
+    _run_alembic(["upgrade", "head"], isolated_postgres_url)
+    _run_alembic(["downgrade", REV_PRE_BACKDATE], isolated_postgres_url)
+
+    engine = create_async_engine(isolated_postgres_url, future=True)
+    async with engine.begin() as conn:
+        await conn.execute(text("TRUNCATE instrument_aliases, instrument_definitions CASCADE"))
+        await conn.execute(
+            text(
+                """
+                INSERT INTO instrument_definitions
+                  (instrument_uid, raw_symbol, listing_venue, routing_venue,
+                   asset_class, provider, roll_policy, lifecycle_state)
+                VALUES
+                  (gen_random_uuid(), 'MSFT', 'NASDAQ', 'NASDAQ',
+                   'equity', 'databento', 'none', 'active')
+                """
+            )
+        )
+        uid = (
+            await conn.execute(
+                text("SELECT instrument_uid FROM instrument_definitions WHERE raw_symbol='MSFT'")
+            )
+        ).scalar_one()
+        await conn.execute(
+            text(
+                """
+                INSERT INTO instrument_aliases
+                  (id, instrument_uid, alias_string, venue_format,
+                   provider, effective_from, effective_to)
+                VALUES
+                  (gen_random_uuid(), :uid, 'MSFT.NASDAQ', 'exchange_name',
+                   'databento', CURRENT_DATE, NULL)
+                """
+            ),
+            {"uid": uid},
+        )
+    await engine.dispose()
+
+    _run_alembic(["upgrade", REV_BACKDATE], isolated_postgres_url)
+
+    engine = create_async_engine(isolated_postgres_url, future=True)
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT effective_from FROM instrument_aliases WHERE alias_string='MSFT.NASDAQ'"
+                )
+            )
+        ).scalar_one()
+    await engine.dispose()
+
+    assert row == date(1900, 1, 1), (
+        f"lone equity alias must be backdated to far-past anchor; got {row}"
+    )
