@@ -211,6 +211,66 @@ async def test_run_backtest_writes_registry_canonical_instruments(
 
 
 @pytest.mark.asyncio
+async def test_run_backtest_strips_smoke_flag_from_external_caller(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    seeded_strategy: Strategy,
+    seeded_aapl_registry: None,
+) -> None:
+    """``smoke=True`` from a non-loopback caller is silently stripped.
+
+    Codex P2 catch (PR #61): any authenticated caller setting
+    ``smoke=True`` could hide their backtest from
+    ``/api/v1/backtests/history`` AND make it eligible for the
+    deploy-rollback cleanup ``DELETE``. The smoke flag is reserved for
+    ``scripts/deploy-smoke.sh`` which runs ON the prod VM and hits
+    ``127.0.0.1``. The endpoint detects non-loopback clients and strips
+    the flag (preserves request, no 4xx) so legitimate workflows aren't
+    broken — the row just lands with ``smoke=False`` and stays visible.
+
+    External traffic in prod ALWAYS passes through Caddy (which injects
+    ``X-Forwarded-For``). The httpx ASGI transport in tests defaults to
+    a loopback ``client.host`` with no proxy headers — exactly what the
+    gate treats as trusted-internal. Set ``X-Forwarded-For`` explicitly
+    to simulate the prod-realistic external-caller shape.
+    """
+    mock_pool = AsyncMock()
+    mock_job = MagicMock()
+    mock_job.job_id = "fake-job-id"
+    mock_pool.enqueue_job = AsyncMock(return_value=mock_job)
+
+    body = {
+        "strategy_id": str(seeded_strategy.id),
+        "config": {},
+        "instruments": ["AAPL"],
+        "start_date": "2024-01-01",
+        "end_date": "2024-03-01",
+        "smoke": True,
+    }
+
+    with patch(
+        "msai.api.backtests.get_redis_pool",
+        new=AsyncMock(return_value=mock_pool),
+    ):
+        response = await client.post(
+            "/api/v1/backtests/run",
+            json=body,
+            # Simulate Caddy-proxied external traffic.
+            headers={"X-Forwarded-For": "203.0.113.42"},
+        )
+
+    assert response.status_code == 201, response.text
+    backtest_id = UUID(response.json()["id"])
+
+    async with session_factory() as session:
+        row = (
+            await session.execute(select(Backtest).where(Backtest.id == backtest_id))
+        ).scalar_one()
+        # Flag was stripped — external callers cannot tag rows as smoke.
+        assert row.smoke is False
+
+
+@pytest.mark.asyncio
 async def test_run_backtest_raises_when_registry_is_empty(
     session_factory: async_sessionmaker[AsyncSession],
     seeded_strategy: Strategy,
@@ -269,10 +329,19 @@ async def test_run_backtest_raises_when_registry_is_empty(
     # 422 is the operator-facing failure — the resolver raised
     # DatabentoDefinitionMissing because the registry has no active row
     # under provider='databento' for 'MSFT', and the endpoint surfaces
-    # that as a well-formed HTTP response whose ``detail`` contains the
-    # ``msai instruments refresh`` hint. Any 2xx here would indicate
-    # silent fallback to the deprecated canonical_instrument_id helper.
+    # that as a well-formed HTTP response whose ``detail`` points at the
+    # correct CLI subcommand. For Databento equities the correct command
+    # is ``msai instruments bootstrap --provider databento``, not the
+    # IB-only ``refresh`` (Codex revised Item 4 / 2026-05-12; see
+    # ``services/nautilus/security_master/service.py:DatabentoDefinitionMissing``
+    # docstring for the provider-specific hint contract). Any 2xx here
+    # would indicate silent fallback to the deprecated
+    # canonical_instrument_id helper.
     assert response.status_code == 422
     detail = response.json()["detail"]
     assert "MSFT" in detail
-    assert "msai instruments refresh" in detail
+    assert "instruments bootstrap" in detail
+    assert "--provider databento" in detail
+    # Regression guard: do NOT suggest the IB-only ``refresh`` for a
+    # Databento cold-miss.
+    assert "instruments refresh" not in detail

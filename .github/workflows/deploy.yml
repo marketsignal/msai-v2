@@ -304,9 +304,10 @@ jobs:
           ssh "${VM_USER}@${VM_IP}" "sudo mkdir -p /opt/msai/scripts && sudo chown -R ${VM_USER}:${VM_USER} /opt/msai"
           scp docker-compose.prod.yml Caddyfile "${VM_USER}@${VM_IP}:/opt/msai/"
           scp scripts/backup-to-blob.sh scripts/deploy-on-vm.sh scripts/install-azcopy.sh \
+              scripts/deploy-smoke.sh \
               scripts/backup-to-blob.service scripts/backup-to-blob.timer \
               "${VM_USER}@${VM_IP}:/opt/msai/scripts/"
-          ssh "${VM_USER}@${VM_IP}" "sudo chmod +x /opt/msai/scripts/backup-to-blob.sh /opt/msai/scripts/deploy-on-vm.sh /opt/msai/scripts/install-azcopy.sh"
+          ssh "${VM_USER}@${VM_IP}" "sudo chmod +x /opt/msai/scripts/backup-to-blob.sh /opt/msai/scripts/deploy-on-vm.sh /opt/msai/scripts/install-azcopy.sh /opt/msai/scripts/deploy-smoke.sh"
           # Also stage the per-run script at /tmp for the next step (kept in /tmp so the
           # `sudo bash /tmp/...` below is unambiguous about which run is firing)
           scp scripts/deploy-on-vm.sh "${VM_USER}@${VM_IP}:/tmp/deploy-on-vm-${{ github.run_id }}.sh"

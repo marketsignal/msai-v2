@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID  # noqa: TC003 — FastAPI resolves path param types at runtime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import func, select
 
@@ -154,10 +154,42 @@ def _prepare_and_validate_backtest_config(
     # --- Prep: inject canonical instruments to match worker behavior ---
     prepared = dict(config)
     if canonical_instruments:
-        if "instrument_id" not in prepared:
-            prepared["instrument_id"] = canonical_instruments[0]
-        if "bar_type" not in prepared:
-            prepared["bar_type"] = f"{canonical_instruments[0]}-1-MINUTE-LAST-EXTERNAL"
+        canonical_id = canonical_instruments[0]
+        # **Always overwrite ``instrument_id``** with the canonical form
+        # from the resolver. The 2026-05-12 data-path-closure work made
+        # the read-boundary resolver accept both Databento MIC
+        # (``AAPL.XNAS``) and exchange-name (``AAPL.NASDAQ``) input.
+        # Leaving the user's input form here would make the Nautilus
+        # subprocess read the catalog at the wrong path → zero bars →
+        # ``trade_count=0``.
+        prepared["instrument_id"] = canonical_id
+
+        # **Rewrite only the instrument PREFIX in ``bar_type``** (Codex
+        # P1 catch, PR #61 round 4). The bar_type format is
+        # ``<instrument_id>-<step>-<aggregation>-<price_type>-<source>``
+        # (e.g. ``AAPL.NASDAQ-5-MINUTE-LAST-EXTERNAL``). Callers
+        # legitimately pick non-default step/aggregation/price_type/
+        # source values (5-minute bars, hourly, BID/ASK price types,
+        # INTERNAL source for synthetic bars). Unconditionally
+        # rewriting the whole string to
+        # ``{canonical_id}-1-MINUTE-LAST-EXTERNAL`` silently erases
+        # those choices. Surgical rewrite: replace just the instrument
+        # prefix (everything before ``-<digit>``), preserving the rest.
+        user_bar_type = prepared.get("bar_type")
+        if isinstance(user_bar_type, str) and "-" in user_bar_type:
+            # The ``<step>`` segment is always numeric — split on the
+            # first ``-<digit>`` boundary to find the instrument prefix.
+            import re
+
+            m = re.match(r"^(.+?)-(\d.*)$", user_bar_type)
+            if m is not None:
+                _old_prefix, rest = m.group(1), m.group(2)
+                prepared["bar_type"] = f"{canonical_id}-{rest}"
+            else:
+                # Unparseable — fall back to the canonical default.
+                prepared["bar_type"] = f"{canonical_id}-1-MINUTE-LAST-EXTERNAL"
+        else:
+            prepared["bar_type"] = f"{canonical_id}-1-MINUTE-LAST-EXTERNAL"
 
     # --- Locate config class ---
     if not config_class_name:
@@ -217,6 +249,7 @@ def _prepare_and_validate_backtest_config(
 )
 async def run_backtest(
     body: BacktestRunRequest,
+    request: Request,
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> BacktestStatusResponse:
@@ -227,6 +260,38 @@ async def run_backtest(
     to track progress.
 
     """
+    # Gate on the smoke flag (Codex P2 catches, PR #61 rounds 3+4).
+    # ``BacktestRunRequest.smoke`` is for the deploy-time data-path
+    # smoke (``scripts/deploy-smoke.sh``) which runs ON the prod VM and
+    # connects to the API DIRECTLY at ``127.0.0.1:8000`` (bypasses Caddy).
+    # Any other caller setting ``smoke=True`` could hide their backtest
+    # from ``/backtests/history`` AND make it eligible for the rollback
+    # cleanup ``DELETE``.
+    #
+    # Trust signal: **absence of ``X-Forwarded-For``**. Caddy is the
+    # sole public ingress on the prod VM; it injects ``X-Forwarded-For``
+    # on every proxied request. The smoke script's
+    # ``curl http://127.0.0.1:8000`` bypasses Caddy → no ``XFF``. An
+    # earlier version of this gate (round 3) also required
+    # ``client.host in {127.0.0.1, ::1, localhost}``, but that broke
+    # legit smoke runs: inside the backend container the host's
+    # loopback request arrives via the Docker bridge gateway IP
+    # (typically ``172.x.x.x``), NOT literally ``127.0.0.1``, so the
+    # allowlist stripped the legit flag. The XFF check alone is robust:
+    # there's no network path to reach the backend's published port
+    # without either (a) being on the host (compose binds
+    # ``127.0.0.1:8000``, NOT a public interface) or (b) coming
+    # through Caddy (which always sets XFF). Silent strip, not 4xx —
+    # legitimate workflows that happen to include ``smoke=true``
+    # shouldn't break; they just don't get the smoke privilege.
+    if body.smoke:
+        has_forwarded = "x-forwarded-for" in {k.lower() for k in request.headers}
+        if has_forwarded:
+            log.warning(
+                "backtest_smoke_flag_stripped_from_external_caller",
+                user=claims.get("preferred_username"),
+            )
+            body = body.model_copy(update={"smoke": False})
     # Verify the strategy exists
     result = await db.execute(select(Strategy).where(Strategy.id == body.strategy_id))
     strategy: Strategy | None = result.scalar_one_or_none()
@@ -315,6 +380,10 @@ async def run_backtest(
         end_date=body.end_date,
         status="pending",
         progress=0,
+        # Tag deploy-time data-path smoke so it stays out of human history
+        # and is eligible for rollback cleanup. ``BacktestRunRequest.smoke``
+        # defaults to ``False`` — only the deploy pipeline sets it ``True``.
+        smoke=body.smoke,
     )
     db.add(backtest)
     # Flush so ``backtest.id`` is assigned before we enqueue it to arq.
@@ -355,18 +424,38 @@ async def run_backtest(
 async def list_backtests(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
+    include_smoke: bool = Query(
+        default=False,
+        description=(
+            "Include deploy-time data-path smoke backtests in the results. "
+            "Smoke rows are written by ``deploy-on-vm.sh`` Phase 12 to prove "
+            "the data path works on the prod VM after each deploy; they are "
+            "filtered out by default because operators don't want them in "
+            "their human history. Set ``true`` for diagnostic / audit views."
+        ),
+    ),
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> BacktestListResponse:
-    """List past backtests with pagination."""
-    # Count total
-    count_result = await db.execute(select(func.count()).select_from(Backtest))
+    """List past backtests with pagination.
+
+    Deploy-time smoke backtests are filtered by default (``smoke=False``).
+    Pass ``include_smoke=true`` to see them — useful when diagnosing a
+    deploy failure or auditing the smoke history.
+    """
+    # Build the optionally-filtered query once and reuse for count + page.
+    base_query = select(Backtest)
+    count_query = select(func.count()).select_from(Backtest)
+    if not include_smoke:
+        base_query = base_query.where(Backtest.smoke.is_(False))
+        count_query = count_query.where(Backtest.smoke.is_(False))
+
+    count_result = await db.execute(count_query)
     total: int = count_result.scalar_one()
 
-    # Fetch page
     offset = (page - 1) * page_size
     result = await db.execute(
-        select(Backtest).order_by(Backtest.created_at.desc()).offset(offset).limit(page_size)
+        base_query.order_by(Backtest.created_at.desc()).offset(offset).limit(page_size)
     )
     backtests = result.scalars().all()
 

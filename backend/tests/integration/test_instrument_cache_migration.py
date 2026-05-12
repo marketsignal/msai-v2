@@ -516,7 +516,19 @@ async def test_full_round_trip_upgrade_a_b_downgrade_b_a_re_upgrade(
     isolated_postgres_url: str,
 ) -> None:
     """End-to-end: A up → B up → B down (data lost, schema-only) →
-    A down → A up → B up → still works."""
+    A down → A up → B up → still works.
+
+    Reset to PRIOR_HEAD before starting so this test's up/down cycle
+    semantics don't depend on prior tests' end-state. Without the
+    reset, when later revisions exist past REV_B (e.g. the
+    2026-05-12 ``a5y6z7a8b9c0`` + ``b6a7b8c9d0e1`` additions),
+    earlier tests' ``upgrade head`` leaves the DB past REV_B and this
+    test's ``upgrade REV_B`` becomes a no-op — landing the final state
+    at HEAD instead of REV_B, failing the assertion below. The reset
+    keeps the test self-contained and order-independent.
+    """
+    _run_alembic(["downgrade", PRIOR_HEAD], isolated_postgres_url)
+
     _run_alembic(["upgrade", REV_A], isolated_postgres_url)
     _run_alembic(["upgrade", REV_B], isolated_postgres_url)
     _run_alembic(["downgrade", "-1"], isolated_postgres_url)  # back to A

@@ -136,7 +136,16 @@ class DatabentoDefinitionMissing(Exception):  # noqa: N818 — spec-mandated nam
     the operator has not pre-warmed the registry.
 
     Backtests are fail-loud on cold-miss — the error carries the original
-    symbol and an operator hint pointing to ``msai instruments refresh``.
+    symbol and a provider-specific operator hint:
+
+    * Databento equity/ETF symbols → ``msai instruments bootstrap
+      --provider databento --symbols X``.
+    * Databento ``.Z.N`` continuous-futures cold-miss synthesis →
+      ``msai instruments refresh`` (the futures-aware path; see
+      :meth:`SecurityMaster._resolve_databento_continuous`).
+
+    Hint dispatch lives in ``resolve_for_backtest`` itself; this class
+    docstring records the contract so a future reader can audit it.
     """
 
 
@@ -432,20 +441,33 @@ class SecurityMaster:
            :meth:`_resolve_databento_continuous` which warm-hits
            by ``raw_symbol`` and falls through to the Databento
            definition fetch + synthesis on miss.
-        2. Any other dotted input (e.g. ``"ESH4.CME"``) → warm-hit
-           via :meth:`InstrumentRegistry.find_by_alias` under
-           ``provider="databento"``. Returned alias IS the input string.
+        2. Any other dotted input (e.g. ``"AAPL.XNAS"`` or
+           ``"AAPL.NASDAQ"``) → warm-hit via
+           :meth:`InstrumentRegistry.find_by_alias` under
+           ``provider="databento"``. The user input is normalized to the
+           registry's canonical exchange-name form via
+           :func:`venue_normalization.normalize_databento_alias_for_lookup`
+           (accepts both Databento MIC and exchange-name suffixes), so a
+           Databento-bootstrapped row stored as ``AAPL.NASDAQ`` is hit by
+           both ``AAPL.XNAS`` (MIC, what ``msai ingest stocks`` prints)
+           and ``AAPL.NASDAQ`` (what ``lookup_for_live`` documents). The
+           **returned** alias is always the canonical form, not the raw
+           input — downstream code paths can compare against
+           ``find_by_alias`` results without re-normalizing.
         3. Bare ticker (e.g. ``"AAPL"``) → warm-hit via
            :meth:`InstrumentRegistry.find_by_raw_symbol` under
            ``provider="databento"``, return its active alias string.
         4. Miss on the warm paths → raise :class:`DatabentoDefinitionMissing`
-           with an actionable operator hint.
+           with a provider-specific operator hint.
 
-        Backtests are fail-loud on cold-miss: the operator must run
-        ``msai instruments refresh`` first. The one exception is the
-        ``.Z.N`` continuous path, which *does* synthesize on miss because
-        the front-month roll is a known-good Databento-side operation
-        with no IB round-trip.
+        Backtests are fail-loud on cold-miss. The error hints at the
+        correct CLI subcommand for the symbol class:
+
+        * Databento equity/ETF cold-miss → ``msai instruments bootstrap
+          --provider databento --symbols X``.
+        * ``.Z.N`` continuous-futures cold-miss is the one *self-healing*
+          path — it synthesizes via Databento ``definition`` fetch without
+          requiring a pre-warm step. No operator action needed.
 
         Args:
             symbols: Requested symbols. Accepts any of the three input
@@ -487,14 +509,140 @@ class SecurityMaster:
 
             # Path 2 — dotted alias already in registry.
             if "." in sym:
-                idef = await registry.find_by_alias(sym, provider="databento", as_of_date=as_of)
+                # Normalize user input at the read boundary: ``msai ingest
+                # stocks`` prints Databento MIC aliases (``AAPL.XNAS``) but
+                # the registry stores exchange-name aliases (``AAPL.NASDAQ``)
+                # because the IB live-resolver exact-matches on the latter.
+                # ``normalize_databento_alias_for_lookup`` is idempotent on
+                # already-canonical input, so a caller passing ``AAPL.NASDAQ``
+                # still resolves; unknown suffixes fail loud rather than
+                # silently miss. See ``venue_normalization.py`` and Codex's
+                # revised Item 4 in the 2026-05-12 fresh-VM-data-path-closure
+                # PR briefing.
+                from msai.services.nautilus.security_master.venue_normalization import (
+                    UnknownDatabentoVenueError,
+                    normalize_databento_alias_for_lookup,
+                )
+
+                try:
+                    lookup_alias = normalize_databento_alias_for_lookup(sym)
+                except UnknownDatabentoVenueError as exc:
+                    raise DatabentoDefinitionMissing(
+                        f"Cannot resolve alias {sym!r} for Databento backtest: "
+                        f"{exc}. To register a Databento equity/ETF symbol, run "
+                        f"`msai instruments bootstrap --provider databento "
+                        f"--symbols {sym.rpartition('.')[0]}`."
+                    ) from exc
+
+                # First try the exchange-name canonical form (the form the
+                # writer persists under for fresh registries + live-resolver
+                # compat).
+                idef = await registry.find_by_alias(
+                    lookup_alias, provider="databento", as_of_date=as_of
+                )
                 if idef is not None:
-                    out.append(sym)
+                    out.append(lookup_alias)
                     continue
+
+                # Historical-alias fallback. When the registry holds a
+                # pre-normalization MIC alias (``AAPL.XNAS``) for a window
+                # the user's start_date falls in — e.g. a venue migration
+                # where the same definition had ``XNAS`` historical and
+                # ``NASDAQ`` current — the canonical-form lookup above
+                # misses the date but the ORIGINAL input form still hits.
+                # Falling back to ``sym`` (un-normalized) covers this
+                # without softening the unknown-suffix fail-loud contract:
+                # by the time we get here, ``sym`` already passed
+                # ``normalize_databento_alias_for_lookup`` validation.
+                # E2E-discovered regression 2026-05-12 (fresh-VM-data-path-
+                # closure verify-e2e report UC1/UC2): without this
+                # fallback, every historical backtest using the MIC form
+                # printed by ``msai ingest stocks`` 422s, AND every
+                # exchange-name backtest with start_date predating the
+                # current alias's ``effective_from`` 422s — a strict
+                # regression from the prior exact-match resolver.
+                if sym != lookup_alias:
+                    idef = await registry.find_by_alias(sym, provider="databento", as_of_date=as_of)
+                    if idef is not None:
+                        # Return the FORM that actually matched, so
+                        # downstream callers (catalog reads, Nautilus
+                        # InstrumentId construction) get the venue suffix
+                        # the registry row was written with.
+                        out.append(sym)
+                        continue
+
+                # Path 2c — raw_symbol fallback. The user gave a dotted form
+                # but neither the canonical nor the original-input form found
+                # a row covering ``as_of``. This commonly happens when:
+                # (a) the input has the exchange-name suffix (``AAPL.NASDAQ``)
+                #     but the registry holds only the MIC form (``AAPL.XNAS``)
+                #     because the bootstrap was run before
+                #     ``venue_normalization`` shipped, OR
+                # (b) the input has a MIC venue that maps to the same
+                #     exchange-name as a registry row, but the multi-MIC →
+                #     same-name compression (``XARC``/``ARCX`` → ``ARCA``)
+                #     means reverse-mapping is ambiguous and we can't try
+                #     all pre-images blindly.
+                # ``find_by_raw_symbol`` resolves the symbol by its ticker
+                # alone and returns whatever alias is active on ``as_of``.
+                # Returning the registry's active alias (rather than echoing
+                # the user input) keeps downstream catalog reads aligned with
+                # the row that actually holds data. Discovered by verify-e2e
+                # pass-2 UC2 on 2026-05-12.
+                raw_root = sym.rpartition(".")[0]
+                idef = await registry.find_by_raw_symbol(raw_root, provider="databento")
+                if idef is not None:
+                    active_alias = next(
+                        (
+                            a
+                            for a in idef.aliases
+                            if a.effective_from <= as_of
+                            and (a.effective_to is None or a.effective_to > as_of)
+                        ),
+                        None,
+                    )
+                    if active_alias is not None:
+                        # Venue-mismatch guard (Codex P2 catch, PR #61 round 4):
+                        # path 2c is only "right" when the user's input alias
+                        # refers to the SAME instrument the registry holds —
+                        # just under a different Databento-MIC vs exchange-name
+                        # spelling (``AAPL.XNAS`` ↔ ``AAPL.NASDAQ``). If the
+                        # user types a venue that names a DIFFERENT instrument
+                        # (e.g. ``AAPL.NYSE`` — AAPL is on NASDAQ, not NYSE),
+                        # silently returning the NASDAQ alias would let the
+                        # backtest run against the wrong-venue contract
+                        # without surfacing the operator error. Compare the
+                        # normalized forms: if the active alias's normalized
+                        # exchange-name differs from the user input's
+                        # normalized form, fail loud with a hint.
+                        try:
+                            active_normalized = normalize_databento_alias_for_lookup(
+                                active_alias.alias_string
+                            )
+                        except UnknownDatabentoVenueError:
+                            active_normalized = active_alias.alias_string
+                        if active_normalized == lookup_alias:
+                            out.append(active_alias.alias_string)
+                            continue
+                        raise DatabentoDefinitionMissing(
+                            f"Venue mismatch: requested alias {sym!r} "
+                            f"(normalized to {lookup_alias!r}) but the registry "
+                            f"row for raw_symbol {raw_root!r} resolves to "
+                            f"{active_alias.alias_string!r} (normalized: "
+                            f"{active_normalized!r}). Different venue → different "
+                            f"instrument. Either correct the venue suffix or "
+                            f"run `msai instruments bootstrap --provider "
+                            f"databento --symbols {sym}` if {sym!r} is a "
+                            f"distinct symbol that needs its own registry row."
+                        )
+
                 raise DatabentoDefinitionMissing(
-                    f"No registry row for alias {sym!r} under provider "
-                    "'databento' — run `msai instruments refresh --symbols "
-                    f"{sym}` to pre-warm the registry before the backtest."
+                    f"No registry row for alias {sym!r} (tried "
+                    f"{lookup_alias!r}, {sym!r}, and raw_symbol "
+                    f"{raw_root!r} as of {as_of.isoformat()}) under provider "
+                    f"'databento' — run `msai instruments bootstrap "
+                    f"--provider databento --symbols {raw_root}` to register "
+                    f"the symbol, then re-submit the backtest."
                 )
 
             # Path 3 — bare ticker, warm-hit by raw_symbol.
@@ -516,8 +664,9 @@ class SecurityMaster:
             # Path 4 — cold-miss, fail loud.
             raise DatabentoDefinitionMissing(
                 f"No registry row for raw_symbol {sym!r} under provider "
-                "'databento' — run `msai instruments refresh --symbols "
-                f"{sym}` to pre-warm the registry before the backtest."
+                f"'databento' — run `msai instruments bootstrap --provider "
+                f"databento --symbols {sym}` to register the symbol, then "
+                f"re-submit the backtest."
             )
         return out
 
@@ -1119,6 +1268,32 @@ class SecurityMaster:
         )
         await self._db.execute(close_stmt)
 
+        # Asset-class-aware effective_from. NautilusTrader's own instrument
+        # model gives ``FuturesContract`` / ``OptionContract`` / ``*_spread``
+        # an ``expiration_ns`` field (time-bounded identity) but Equity / FX
+        # (CurrencyPair) / Index / Crypto-perpetual / CFD have NO lifecycle
+        # dates — they're time-invariant. Empirically verified in
+        # ``.venv/lib/python3.12/site-packages/nautilus_trader/model/
+        # instruments/{equity,futures_contract,currency_pair}.pyx`` on
+        # 2026-05-12.
+        #
+        # Our registry uses ``effective_from/effective_to`` to model alias
+        # lifecycle. That's correct for futures (``ESH4.GLBX`` IS bounded by
+        # contract expiry) but wrong for equities (``AAPL.NASDAQ`` applies to
+        # all time). Stamping ``effective_from=today`` for equities makes
+        # historical backtests with ``start_date < today`` cold-miss the
+        # alias windowing filter even though the alias is conceptually
+        # always active. Discovered when the prod AAPL backtest with
+        # ``start_date=2025-11-03`` 422-ed against an alias created today.
+        #
+        # Fix: time-invariant asset classes (equity / fx / crypto — the
+        # last covers crypto-perpetual; crypto-futures aren't currently
+        # in this codebase's asset_class taxonomy) get a far-past anchor.
+        # Futures / options keep ``today`` so the roll history is precise.
+        time_invariant_asset_classes: frozenset[str] = frozenset({"equity", "fx", "crypto"})
+        far_past_anchor: date = date(1900, 1, 1)
+        effective_from = far_past_anchor if asset_class in time_invariant_asset_classes else today
+
         # Alias upsert — re-activate same-day-same-alias rows (set effective_to
         # back to NULL) instead of ON CONFLICT DO NOTHING.
         #
@@ -1137,7 +1312,7 @@ class SecurityMaster:
                 alias_string=alias_string,
                 venue_format=venue_format,
                 provider=provider,
-                effective_from=today,
+                effective_from=effective_from,
                 effective_to=None,
                 source_venue_raw=source_venue_raw,
             )

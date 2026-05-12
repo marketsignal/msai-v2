@@ -15,6 +15,7 @@
 # Exit codes / failure markers (last line of stderr on failure):
 #   0                       SUCCESS
 #   FAIL_ENV                Env file unreadable or required var missing
+#   FAIL_VOLUME_HEAL        Could not chown msai_app_data volume to msai:msai (sentinel-gated heal)
 #   FAIL_AZ_LOGIN           az login --identity failed (MI not propagated or VM has no MI)
 #   FAIL_ACR_LOGIN          az acr login failed (RBAC propagating? AcrPull missing?)
 #   FAIL_RENDER_ENV         msai-render-env.service failed (KV unreachable, RBAC, secret missing)
@@ -24,6 +25,10 @@
 #   FAIL_PROBE_HEALTH       backend /health did not return 200 within budget
 #   FAIL_PROBE_READY        backend /ready did not return 200 within budget
 #   FAIL_PROBE_TLS          https://${MSAI_HOSTNAME}/health did not return 200 within budget
+#   FAIL_SMOKE              Phase 12 data-path smoke failed (sub-marker on stderr
+#                           identifies which step: FAIL_SMOKE_BOOTSTRAP /
+#                           FAIL_SMOKE_INGEST / FAIL_SMOKE_RESOLVE / FAIL_SMOKE_BACKTEST).
+#                           Triggers rollback + smoke-row cleanup.
 #   FAIL_ROLLBACK_OK        Deploy failed but rollback to last-good SHA succeeded
 #   FAIL_ROLLBACK_BROKEN    Deploy failed AND rollback also failed — manual intervention
 #
@@ -88,7 +93,13 @@ if [[ ! "$GIT_SHA" =~ ^[0-9a-f]{7}$ ]]; then
     exit 1
 fi
 
-echo "=== deploy-on-vm.sh — sha=$GIT_SHA hostname=$MSAI_HOSTNAME rg=$RESOURCE_GROUP ==="
+# DEPLOY_START_TS marks the cutoff for rollback's smoke-row cleanup so a
+# rollback only deletes the smoke rows THIS deploy created. Set once at
+# the top so every subprocess (Phase 12, rollback) shares the same value.
+DEPLOY_START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+export DEPLOY_START_TS
+
+echo "=== deploy-on-vm.sh — sha=$GIT_SHA hostname=$MSAI_HOSTNAME rg=$RESOURCE_GROUP started=$DEPLOY_START_TS ==="
 
 # ─── Phase 2.5: Ensure az CLI is installed (idempotent) ────────────────────────
 # Slice 3 originally baked az-cli install into cloud-init, but
@@ -108,6 +119,40 @@ if ! command -v az >/dev/null 2>&1; then
         | sudo tee /etc/apt/sources.list.d/azure-cli.list >/dev/null
     sudo apt-get update -qq
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y azure-cli apt-transport-https
+fi
+
+# ─── Phase 2.6: Heal existing app_data volume ownership (idempotent) ──────────
+# Docker's "named volume inherits image-path ownership at first mount" rule
+# fires ONLY on first mount. The prod VM's ``msai_app_data`` volume was
+# initialized as ``root:root`` before the Dockerfile fix (mkdir -p /app/data
+# /app/reports + chown msai:msai). The backend container runs as uid 999
+# (``msai``), so every write to ``/app/data`` raises PermissionError forever
+# on that VM. Fresh VMs are healed by the Dockerfile fix; this step heals
+# already-provisioned VMs.
+#
+# Idempotency: a sentinel file inside the volume marks "chown applied".
+# Re-running the deploy is a no-op once the sentinel exists.
+#
+# Why ``alpine chown`` from outside the backend container: the backend
+# container runs as non-root and cannot chown its own bind/volume mount.
+# A throwaway root-mode container does the privileged op without keeping a
+# long-lived root process.
+APP_DATA_VOLUME="${APP_DATA_VOLUME:-msai_app_data}"
+SENTINEL_PATH=".msai-data-volume-chowned"
+if ! sudo docker volume inspect "$APP_DATA_VOLUME" >/dev/null 2>&1; then
+    echo "Volume ${APP_DATA_VOLUME} not yet created — Dockerfile fix will own the fresh volume on first mount"
+elif sudo docker run --rm -v "${APP_DATA_VOLUME}:/d" alpine:3 \
+        test -f "/d/${SENTINEL_PATH}" 2>/dev/null; then
+    echo "Volume ${APP_DATA_VOLUME} already healed (sentinel /d/${SENTINEL_PATH} present)"
+else
+    echo "Healing volume ${APP_DATA_VOLUME} ownership (msai uid=999, gid=999)"
+    if ! sudo docker run --rm -v "${APP_DATA_VOLUME}:/d" alpine:3 \
+            sh -c "chown -R 999:999 /d && touch /d/${SENTINEL_PATH}"; then
+        echo "Failed to chown volume ${APP_DATA_VOLUME}" >&2
+        echo "FAIL_VOLUME_HEAL" >&2
+        exit 1
+    fi
+    echo "Volume ${APP_DATA_VOLUME} healed; sentinel /d/${SENTINEL_PATH} planted"
 fi
 
 # ─── Phase 3: Azure / ACR auth via VM system-assigned MI ───────────────────────
@@ -229,6 +274,21 @@ rollback() {
         echo "First-deploy failure — no last-good to roll back to." >&2
         echo "FAIL_ROLLBACK_BROKEN" >&2
         exit 1
+    fi
+
+    # Clean up smoke-tagged backtest rows created during THIS deploy attempt.
+    # Pre-existing smoke rows from earlier deploys are left alone (their
+    # rollbacks already ran or chose not to). Postgres lives in the
+    # ``postgres`` compose service; ``backtests.smoke`` defaults to FALSE
+    # so any pre-existing user backtest is untouched even if its
+    # ``created_at`` falls in the window.
+    if [[ -n "${DEPLOY_START_TS:-}" ]]; then
+        echo "→ Cleanup: removing smoke=true backtests created since $DEPLOY_START_TS"
+        docker compose "${COMPOSE_FLAGS[@]}" exec -T postgres \
+            psql -U msai -d msai -v "ON_ERROR_STOP=1" \
+                -c "DELETE FROM backtests WHERE smoke = true AND created_at >= '${DEPLOY_START_TS}';" \
+            2>&1 \
+            || echo "  WARN: smoke cleanup query failed — manual cleanup may be needed" >&2
     fi
 
     echo "→ Rolling back to last-good SHA"
@@ -394,6 +454,54 @@ if [[ "$timer_state" != "active" ]]; then
     exit 1
 fi
 echo "  backup-to-blob.timer: $timer_state"
+
+# ─── Phase 12: data-path smoke ─────────────────────────────────────────────────
+# Exercise the real data path end-to-end against the just-deployed image:
+# bootstrap → ingest → resolve → submit backtest → poll → verify results.
+#
+# This is the regression net for the 3 env-only bugs that survived 4
+# deployment-pipeline slices (volume perms, STRATEGIES_ROOT, alias/venue
+# mismatch). Any future config drift in the same shape fails this gate
+# the moment it lands, not at end-user-question time.
+#
+# Exit semantics from scripts/deploy-smoke.sh:
+#   0  PASS                         — deploy completes normally
+#   1  FAIL_SMOKE_*                 — our bug; deploy rolls back to last-good
+#   2  WARN_SMOKE_UPSTREAM          — Databento 429/5xx; deploy proceeds
+#   3  SKIP_SMOKE_LIVE_ACTIVE       — live deployment running; deploy
+#                                     proceeds without smoke (shared
+#                                     Parquet/DuckDB during real-money
+#                                     trading is unsafe).
+echo "→ Phase 12: data-path smoke"
+export MSAI_API_KEY DEPLOY_START_TS="${DEPLOY_START_TS:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+export API_BASE="${API_BASE:-http://127.0.0.1:8000}"
+set +e
+bash /opt/msai/scripts/deploy-smoke.sh
+SMOKE_EXIT=$?
+set -e
+
+case "$SMOKE_EXIT" in
+    0)
+        echo "  smoke PASS"
+        ;;
+    2)
+        # Upstream-flake: don't roll back a healthy deploy because Databento is
+        # having a bad day. Operator will see the WARN line and follow up.
+        echo "  smoke WARN — upstream flake (Databento). Deploy proceeds."
+        ;;
+    3)
+        # Live deployment active: refuse to smoke against shared
+        # Parquet/DuckDB. Deploy proceeds. Operator can run the smoke
+        # manually after the live session ends.
+        echo "  smoke SKIPPED — live deployment running. Deploy proceeds."
+        ;;
+    *)
+        rollback_required=1
+        probe_failed="FAIL_SMOKE"
+        echo "FAIL_SMOKE (exit=$SMOKE_EXIT) — see /tmp/smoke_*.log + the FAIL_SMOKE_* marker above" >&2
+        exit 1
+        ;;
+esac
 
 # Success — clear the rollback flag so trap exits cleanly.
 rollback_required=0

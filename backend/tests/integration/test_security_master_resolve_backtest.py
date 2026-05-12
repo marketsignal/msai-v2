@@ -74,8 +74,12 @@ async def test_resolve_for_backtest_raises_on_empty_registry(
     """Empty registry + bare ticker → fail-loud DatabentoDefinitionMissing.
 
     Backtests must NOT call IB on cold-miss — the operator is expected to
-    run ``msai instruments refresh`` first. The exception carries the
-    operator hint so the failure is actionable.
+    pre-warm the registry first. For Databento equity/ETF symbols the
+    correct CLI is ``msai instruments bootstrap --provider databento``
+    (Codex revised Item 4 / 2026-05-12). The error message previously
+    suggested ``msai instruments refresh``, which is the IB-qualification
+    path and silently fails for Databento stocks because the resolver
+    inside ``refresh`` cold-misses without bootstrap having run first.
     """
     async with session_factory() as session:
         sm = SecurityMaster(db=session, databento_client=None)
@@ -83,8 +87,14 @@ async def test_resolve_for_backtest_raises_on_empty_registry(
         with pytest.raises(DatabentoDefinitionMissing) as exc:
             await sm.resolve_for_backtest(["AAPL"])
 
-        assert "AAPL" in str(exc.value)
-        assert "msai instruments refresh" in str(exc.value)
+        msg = str(exc.value)
+        assert "AAPL" in msg
+        # Must point to the correct provider-specific CLI subcommand.
+        assert "instruments bootstrap" in msg
+        assert "--provider databento" in msg
+        # Regression guard: do NOT suggest the IB-only ``refresh`` subcommand
+        # for a Databento cold-miss.
+        assert "instruments refresh" not in msg
 
 
 @pytest.mark.asyncio
@@ -318,3 +328,320 @@ async def test_resolve_for_backtest_bare_ticker_no_start_uses_today(
         ids = await sm.resolve_for_backtest(["AAPL"])
 
         assert ids == ["AAPL.ARCA"]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Databento MIC vs exchange-name read-boundary normalization
+# (fresh-VM data-path closure — Codex revised Item 4, 2026-05-12)
+#
+# Background: ingest emits Databento MIC aliases (``AAPL.XNAS``); the
+# registry write boundary translates MIC → exchange-name (``AAPL.NASDAQ``)
+# via ``venue_normalization.normalize_alias_for_registry`` so the same row
+# is visible to both backtest and the IB-backed ``lookup_for_live`` which
+# exact-matches on the exchange-name form. The backtest resolver's path 2
+# previously did NOT apply the same normalization, so a user submitting
+# ``AAPL.XNAS`` (the form ``msai ingest stocks`` prints) cold-missed
+# against an ``AAPL.NASDAQ`` registry row.
+# ──────────────────────────────────────────────────────────────────────
+
+
+async def _seed_aapl_nasdaq_only(session: AsyncSession) -> InstrumentDefinition:
+    """Single-alias seed mirroring what ``msai instruments bootstrap`` writes today.
+
+    One open-window ``AAPL.NASDAQ`` alias (exchange-name canonical form) on
+    a Databento-provided definition with ``listing_venue=XNAS``. Matches
+    the prod-VM row shape from the 2026-05-12 incident.
+    """
+    from datetime import date
+
+    idef = InstrumentDefinition(
+        raw_symbol="AAPL",
+        listing_venue="XNAS",
+        routing_venue="XNAS",
+        asset_class="equity",
+        provider="databento",
+        roll_policy="none",
+        lifecycle_state="active",
+    )
+    session.add(idef)
+    await session.flush()
+    session.add(
+        InstrumentAlias(
+            instrument_uid=idef.instrument_uid,
+            alias_string="AAPL.NASDAQ",
+            venue_format="exchange_name",
+            provider="databento",
+            source_venue_raw="XNAS",
+            effective_from=date(2020, 1, 1),
+            effective_to=None,
+        )
+    )
+    await session.commit()
+    return idef
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_backtest_databento_mic_input_normalizes_to_exchange_name(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """User submits ``AAPL.XNAS`` (Databento MIC) → resolves to ``AAPL.NASDAQ``.
+
+    Tonight's bug: ``msai ingest stocks`` prints ``instrument_id=AAPL.XNAS``,
+    the operator submits a backtest with that string, the resolver path 2
+    does an exact-match on ``AAPL.XNAS`` against a registry row written as
+    ``AAPL.NASDAQ`` → 422. Fix: normalize Databento MIC input at the read
+    boundary using the same map the writer uses.
+    """
+    async with session_factory() as session:
+        await _seed_aapl_nasdaq_only(session)
+        sm = SecurityMaster(db=session, databento_client=None)
+
+        ids = await sm.resolve_for_backtest(["AAPL.XNAS"])
+
+        # Returns the canonical registry alias, NOT the raw user input.
+        assert ids == ["AAPL.NASDAQ"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_backtest_exchange_name_input_is_idempotent(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """User submits ``AAPL.NASDAQ`` (exchange-name) → still resolves.
+
+    The read-boundary normalization must be idempotent on already-canonical
+    inputs. Anyone who scripted against ``.NASDAQ`` (the form
+    ``lookup_for_live`` documents) keeps working unchanged.
+    """
+    async with session_factory() as session:
+        await _seed_aapl_nasdaq_only(session)
+        sm = SecurityMaster(db=session, databento_client=None)
+
+        ids = await sm.resolve_for_backtest(["AAPL.NASDAQ"])
+
+        assert ids == ["AAPL.NASDAQ"]
+
+
+async def _seed_aapl_xnas_to_nasdaq_swap(
+    session: AsyncSession,
+) -> InstrumentDefinition:
+    """Two-alias seed: historical ``AAPL.XNAS`` (closed) → current ``AAPL.NASDAQ`` (open).
+
+    Mirrors what real Databento + bootstrap state looks like after a
+    bootstrap-pattern migration: an older row was written under the
+    pre-``venue_normalization`` MIC form, then the writer changed and a
+    new row was opened under the canonical exchange-name. The
+    resolver must hit BOTH forms depending on the requested
+    ``start_date``.
+
+    Discovered by verify-e2e UC1/UC2 on 2026-05-12 — see report
+    ``tests/e2e/reports/2026-05-12-14-15-fresh-vm-data-path-closure.md``.
+    """
+    from datetime import date
+
+    idef = InstrumentDefinition(
+        raw_symbol="AAPL",
+        listing_venue="XNAS",
+        routing_venue="XNAS",
+        asset_class="equity",
+        provider="databento",
+        roll_policy="none",
+        lifecycle_state="active",
+    )
+    session.add(idef)
+    await session.flush()
+    session.add_all(
+        [
+            # Historical row in MIC form (pre-normalization). Covers the
+            # 2020 → 2025-11 window the user's 6-month backtest would land in.
+            InstrumentAlias(
+                instrument_uid=idef.instrument_uid,
+                alias_string="AAPL.XNAS",
+                venue_format="mic_code",
+                provider="databento",
+                source_venue_raw="XNAS",
+                effective_from=date(2020, 1, 1),
+                effective_to=date(2026, 4, 24),
+            ),
+            # Current row in exchange-name canonical form (post-normalization).
+            InstrumentAlias(
+                instrument_uid=idef.instrument_uid,
+                alias_string="AAPL.NASDAQ",
+                venue_format="exchange_name",
+                provider="databento",
+                source_venue_raw="XNAS",
+                effective_from=date(2026, 4, 24),
+                effective_to=None,
+            ),
+        ]
+    )
+    await session.commit()
+    return idef
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_backtest_mic_input_historical_window_hits_historical_alias(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """``AAPL.XNAS`` + historical start_date → hits the MIC historical alias.
+
+    E2E-discovered regression: when both ``AAPL.XNAS`` (historical) and
+    ``AAPL.NASDAQ`` (current) aliases exist on the same definition,
+    requesting a backtest with the MIC form and a historical start_date
+    must hit the MIC row. Without the historical fallback in
+    ``resolve_for_backtest`` path 2, the normalizer would rewrite
+    ``AAPL.XNAS`` → ``AAPL.NASDAQ`` and the NASDAQ row's
+    ``effective_from`` would mask the still-valid MIC row covering the
+    requested date.
+    """
+    async with session_factory() as session:
+        await _seed_aapl_xnas_to_nasdaq_swap(session)
+        sm = SecurityMaster(db=session, databento_client=None)
+
+        # 2025-11-03 falls in the historical XNAS window (2020-01-01 →
+        # 2026-04-24). Submit with the MIC form (what ``msai ingest stocks``
+        # would print to the user during that era).
+        ids = await sm.resolve_for_backtest(["AAPL.XNAS"], start="2025-11-03", end="2026-04-29")
+
+        # Returns the historical MIC form — the alias the registry actually
+        # has for that date — NOT the normalized form (which has no row
+        # covering 2025-11-03).
+        assert ids == ["AAPL.XNAS"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_backtest_mic_input_current_window_hits_normalized_alias(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """``AAPL.XNAS`` + post-cutover start_date → hits the NASDAQ canonical alias.
+
+    The fallback's "no-regression" partner to
+    ``test_resolve_for_backtest_mic_input_historical_window_hits_historical_alias``:
+    when the requested date falls in the CURRENT (post-normalization)
+    window, the user's MIC input must still resolve via the canonical
+    NASDAQ alias. The fallback is ordered try-canonical-first, so this
+    case never reaches the historical fallback.
+    """
+    async with session_factory() as session:
+        await _seed_aapl_xnas_to_nasdaq_swap(session)
+        sm = SecurityMaster(db=session, databento_client=None)
+
+        # 2026-05-01 is after the XNAS→NASDAQ cutover (2026-04-24).
+        ids = await sm.resolve_for_backtest(["AAPL.XNAS"], start="2026-05-01", end="2026-05-10")
+
+        # Returns the canonical NASDAQ form (the row that actually covers
+        # the date), NOT the user's MIC input.
+        assert ids == ["AAPL.NASDAQ"]
+
+
+async def _seed_aapl_xnas_only(session: AsyncSession) -> InstrumentDefinition:
+    """Single-row seed with ONLY the MIC alias (``AAPL.XNAS``), no NASDAQ row.
+
+    Mirrors a real prod state where bootstrap ran BEFORE
+    ``venue_normalization`` shipped — every row was stored in MIC form.
+    Discovered by verify-e2e pass-2 UC2 on 2026-05-12.
+    """
+    from datetime import date
+
+    idef = InstrumentDefinition(
+        raw_symbol="AAPL",
+        listing_venue="XNAS",
+        routing_venue="XNAS",
+        asset_class="equity",
+        provider="databento",
+        roll_policy="none",
+        lifecycle_state="active",
+    )
+    session.add(idef)
+    await session.flush()
+    session.add(
+        InstrumentAlias(
+            instrument_uid=idef.instrument_uid,
+            alias_string="AAPL.XNAS",
+            venue_format="mic_code",
+            provider="databento",
+            source_venue_raw="XNAS",
+            effective_from=date(2020, 1, 1),
+            effective_to=None,
+        )
+    )
+    await session.commit()
+    return idef
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_backtest_exchange_name_input_falls_back_to_raw_symbol(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """``AAPL.NASDAQ`` input + only ``AAPL.XNAS`` in registry → raw_symbol fallback finds it.
+
+    Symmetric to the MIC-historical case but for the *forward* direction:
+    user supplies the documented exchange-name form, registry has only
+    the MIC form (legacy state). Direct alias-form lookups both miss
+    (``AAPL.NASDAQ`` and ``AAPL.NASDAQ`` are identical after the no-op
+    idempotency-preserving normalization). The path-2c raw_symbol
+    fallback derives ``AAPL`` from the dotted input and returns the
+    active alias — which IS ``AAPL.XNAS`` in this seed.
+    """
+    async with session_factory() as session:
+        await _seed_aapl_xnas_only(session)
+        sm = SecurityMaster(db=session, databento_client=None)
+
+        ids = await sm.resolve_for_backtest(["AAPL.NASDAQ"])
+
+        # Returns the actual registry alias, NOT the user input. This is
+        # the contract for the raw_symbol fallback: align downstream
+        # catalog reads with the row that holds data.
+        assert ids == ["AAPL.XNAS"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_backtest_venue_mismatch_fails_loud(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """User submits ``AAPL.NYSE`` (wrong venue) → fails loud, not silent.
+
+    Codex P2 catch (PR #61 round 4): the path-2c raw_symbol fallback
+    was too lenient — when the user typed an alias with a venue
+    suffix that names a DIFFERENT instrument than the registry's
+    listing venue (e.g. ``AAPL.NYSE`` while AAPL is on NASDAQ),
+    silently returning ``AAPL.NASDAQ`` would let the backtest run
+    against the wrong-venue contract. The fix: in path 2c, compare
+    the normalized form of the user input with the normalized form
+    of the active alias; if they differ, raise.
+    """
+    async with session_factory() as session:
+        await _seed_aapl_nasdaq_only(session)  # seeded earlier in this file
+        sm = SecurityMaster(db=session, databento_client=None)
+
+        with pytest.raises(DatabentoDefinitionMissing) as exc:
+            await sm.resolve_for_backtest(["AAPL.NYSE"])
+
+        msg = str(exc.value)
+        # The error must clearly name the venue mismatch + both sides.
+        assert "Venue mismatch" in msg
+        assert "AAPL.NYSE" in msg
+        assert "AAPL.NASDAQ" in msg
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_backtest_unknown_mic_fails_loudly(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An unmapped MIC (``AAPL.FAKEMIC``) must surface as a typed miss.
+
+    Fail-loud is mandatory at this boundary — silent passthrough would
+    recreate the invisible-row failure mode for new venues. The resolver
+    must NOT confuse a write-boundary lineage issue with the read-boundary
+    rejection.
+    """
+    async with session_factory() as session:
+        await _seed_aapl_nasdaq_only(session)
+        sm = SecurityMaster(db=session, databento_client=None)
+
+        with pytest.raises(DatabentoDefinitionMissing) as exc:
+            await sm.resolve_for_backtest(["AAPL.FAKEMIC"])
+
+        # The error must mention the operator-facing CLI to recover the
+        # registry, and that command for Databento stocks is ``bootstrap``,
+        # NOT the ``refresh`` (futures/IB) the legacy message suggested.
+        assert "bootstrap" in str(exc.value).lower()

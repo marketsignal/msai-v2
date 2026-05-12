@@ -21,6 +21,13 @@ class BacktestRunRequest(BaseModel):
     instruments: list[str]
     start_date: date
     end_date: date
+    smoke: bool = False
+    """Tag this row as a deploy-time data-path smoke (Phase 12 of
+    ``deploy-on-vm.sh``). Smoke rows are filtered out of
+    ``GET /api/v1/backtests/history`` by default and are eligible for
+    cleanup by the deploy rollback path. Defaults to ``False`` so normal
+    user-initiated backtests never accidentally enter the smoke namespace.
+    """
 
 
 class BacktestStatusResponse(BaseModel):

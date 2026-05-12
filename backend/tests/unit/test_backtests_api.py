@@ -140,15 +140,116 @@ class TestPrepareAndValidateBacktestConfig:
         # Caller-supplied values preserved
         assert prepared["fast_ema_period"] == 5
 
-    def test_rejects_malformed_instrument_id_with_422_and_field_path(
+    def test_bar_type_preserves_user_step_and_aggregation(self) -> None:
+        """Bar-type rewrite must preserve caller-selected
+        step/aggregation/price_type/source — only the instrument prefix
+        is replaced with the canonical form.
+
+        Codex P1 catch (PR #61 round 4): an earlier unconditional
+        ``bar_type = f"{canonical_id}-1-MINUTE-LAST-EXTERNAL"`` silently
+        coerced 5-minute, hourly, BID/ASK, INTERNAL-source bar types
+        back to the 1-minute LAST EXTERNAL default. Callers who
+        legitimately picked non-default specs got a different backtest
+        than they asked for.
+        """
+        from msai.api.backtests import _prepare_and_validate_backtest_config
+
+        file_path, config_class = self._example_strategy()
+        # User submits MIC venue + non-default 5-minute bar spec.
+        config = {
+            "instrument_id": "AAPL.XNAS",
+            "bar_type": "AAPL.XNAS-5-MINUTE-LAST-EXTERNAL",
+            "fast_ema_period": 10,
+            "slow_ema_period": 30,
+        }
+        prepared = _prepare_and_validate_backtest_config(
+            config,
+            strategy_file_path=file_path,
+            config_class_name=config_class,
+            canonical_instruments=["AAPL.NASDAQ"],
+        )
+
+        # Instrument prefix rewritten to canonical; step/aggregation/
+        # price_type/source preserved verbatim.
+        assert prepared["instrument_id"] == "AAPL.NASDAQ"
+        assert prepared["bar_type"] == "AAPL.NASDAQ-5-MINUTE-LAST-EXTERNAL"
+
+    def test_bar_type_preserves_user_bid_price_type(self) -> None:
+        """Another bar_type spec preservation case: BID price_type +
+        INTERNAL source (a synthetic-bar setup) survives the rewrite.
+        """
+        from msai.api.backtests import _prepare_and_validate_backtest_config
+
+        file_path, config_class = self._example_strategy()
+        config = {
+            "instrument_id": "SPY.NASDAQ",
+            "bar_type": "SPY.NASDAQ-15-MINUTE-BID-INTERNAL",
+        }
+        prepared = _prepare_and_validate_backtest_config(
+            config,
+            strategy_file_path=file_path,
+            config_class_name=config_class,
+            canonical_instruments=["SPY.ARCA"],
+        )
+        assert prepared["instrument_id"] == "SPY.ARCA"
+        assert prepared["bar_type"] == "SPY.ARCA-15-MINUTE-BID-INTERNAL"
+
+    def test_overwrites_user_supplied_instrument_id_with_canonical(self) -> None:
+        """Caller-supplied ``instrument_id`` MUST be overwritten by the
+        canonical form returned by the resolver — not just "injected if
+        missing".
+
+        The 2026-05-12 data-path closure made the read-boundary resolver
+        accept both Databento MIC (``AAPL.XNAS``) and exchange-name
+        (``AAPL.NASDAQ``) input. The resolver canonicalizes either form to
+        the registry's exchange-name canonical. If the API layer leaves
+        the caller's input form in ``config.instrument_id`` while
+        ``Backtest.instruments`` gets the canonical form, the Nautilus
+        subprocess reads the catalog at one path while the writer landed
+        bars at another → ``trade_count=0``. Surfaced on the prod AAPL
+        backtest 2026-05-12.
+        """
+        from msai.api.backtests import _prepare_and_validate_backtest_config
+
+        file_path, config_class = self._example_strategy()
+        # Caller submits the MIC form (what ``msai ingest stocks`` prints).
+        config = {
+            "instrument_id": "AAPL.XNAS",
+            "bar_type": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL",
+            "fast_ema_period": 10,
+            "slow_ema_period": 30,
+        }
+        # Resolver returns the canonical exchange-name form.
+        prepared = _prepare_and_validate_backtest_config(
+            config,
+            strategy_file_path=file_path,
+            config_class_name=config_class,
+            canonical_instruments=["AAPL.NASDAQ"],
+        )
+
+        # The user-input form is REPLACED with the canonical form.
+        assert prepared["instrument_id"] == "AAPL.NASDAQ"
+        assert prepared["bar_type"] == "AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL"
+        # Other caller-supplied fields preserved.
+        assert prepared["fast_ema_period"] == 10
+        assert prepared["slow_ema_period"] == 30
+
+    def test_rejects_malformed_field_with_422_and_field_path(
         self,
     ) -> None:
-        """Malformed ``instrument_id`` → raises ``StrategyConfigValidationError``
+        """Malformed strategy-config field → raises ``StrategyConfigValidationError``
         with ``envelope()`` matching the api-design.md shape: a top-level
         ``{"error": {"code", "message", "details": [{"field", "message"}]}}``.
         The FastAPI exception handler at ``main.py::_strategy_config_validation_handler``
         converts the raise into the 422 JSON response. Frontend consumes
-        ``error.details[0].field`` to highlight the bad input."""
+        ``error.details[0].field`` to highlight the bad input.
+
+        Note: the canonical_instruments **overwrite** ``instrument_id`` /
+        ``bar_type`` per the 2026-05-12 data-path closure (preventing
+        catalog-key mismatch when user submits MIC form but registry stores
+        exchange-name form). To test the validation path, pin a different
+        strategy-config field — ``fast_ema_period`` must be a positive int.
+        """
         from msai.api.backtests import (
             StrategyConfigValidationError,
             _prepare_and_validate_backtest_config,
@@ -158,7 +259,7 @@ class TestPrepareAndValidateBacktestConfig:
 
         with pytest.raises(StrategyConfigValidationError) as excinfo:
             _prepare_and_validate_backtest_config(
-                {"instrument_id": "garbage"},
+                {"fast_ema_period": "not-an-int"},
                 strategy_file_path=file_path,
                 config_class_name=config_class,
                 canonical_instruments=["AAPL.NASDAQ"],
@@ -168,7 +269,33 @@ class TestPrepareAndValidateBacktestConfig:
         assert envelope["code"] == "VALIDATION_ERROR"
         # Field must be the PLAIN dotted path — no backticks, no $. prefix
         # — so frontend fieldErrors[name] lookup matches schema keys.
-        assert envelope["details"][0]["field"] == "instrument_id"
+        assert envelope["details"][0]["field"] == "fast_ema_period"
+
+    def test_canonical_overrides_malformed_user_instrument_id(self) -> None:
+        """A malformed ``instrument_id`` in the user's submission is silently
+        overwritten by the canonical from the resolver — not propagated to
+        the validator. This is intentional: the API canonicalization step
+        guarantees a valid form before the strategy-config validator runs.
+
+        Prior to the 2026-05-12 fix this branch was unreachable (a
+        malformed ``instrument_id`` would surface at validation as a
+        per-field 422). After the fix, the canonical takes over and the
+        validator only sees the registry-authoritative form. The user's
+        original malformed value is preserved nowhere — that's the contract.
+        """
+        from msai.api.backtests import _prepare_and_validate_backtest_config
+
+        file_path, config_class = self._example_strategy()
+        prepared = _prepare_and_validate_backtest_config(
+            {"instrument_id": "garbage"},
+            strategy_file_path=file_path,
+            config_class_name=config_class,
+            canonical_instruments=["AAPL.NASDAQ"],
+        )
+
+        # Malformed input silently dropped; canonical takes its place.
+        assert prepared["instrument_id"] == "AAPL.NASDAQ"
+        assert prepared["bar_type"] == "AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL"
 
     def test_skips_validation_gracefully_when_no_config_class(self, tmp_path: Path) -> None:
         """Legacy strategies without a matching ``*Config`` class don't
@@ -198,7 +325,12 @@ class TestPrepareAndValidateBacktestConfig:
         class name flows in via ``DiscoveredStrategy.config_class_name``
         which persistence stores on ``Strategy.config_class``. Validates
         that a config class whose name DOESN'T match ``<strategy>Config``
-        still gets server-authoritative validation."""
+        still gets server-authoritative validation.
+
+        Use ``fast_ema_period`` as the malformed-field probe (instead of
+        ``instrument_id``, which the 2026-05-12 canonicalization step now
+        overrides before validation runs).
+        """
         from msai.api.backtests import (
             StrategyConfigValidationError,
             _prepare_and_validate_backtest_config,
@@ -211,7 +343,7 @@ class TestPrepareAndValidateBacktestConfig:
         # change to the helper.
         with pytest.raises(StrategyConfigValidationError):
             _prepare_and_validate_backtest_config(
-                {"instrument_id": "bad"},
+                {"fast_ema_period": "not-an-int"},
                 strategy_file_path=file_path,
                 config_class_name=config_class,
                 canonical_instruments=["AAPL.NASDAQ"],

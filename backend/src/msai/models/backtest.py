@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from msai.models.user import User
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     Date,
     DateTime,
@@ -113,6 +114,16 @@ class Backtest(Base):
     worker_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     attempt: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0)
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Deploy-time data-path smoke flag. Phase 12 of ``deploy-on-vm.sh``
+    # submits a synthetic backtest after each deploy to prove the data
+    # path actually works end-to-end on the prod VM (Codex revised Item 4,
+    # 2026-05-12). Smoke rows are NOT user-facing — the history endpoint
+    # filters them out by default — and the deploy rollback path deletes
+    # rows tagged ``smoke=True`` to keep the table clean across failed
+    # deploys. Operators querying history with ``include_smoke=true`` see
+    # them for diagnostic purposes.
+    smoke: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false", index=True)
 
     # Relationships
     strategy: Mapped[Strategy] = relationship(lazy="selectin")  # noqa: F821

@@ -664,11 +664,31 @@ def _prepare_strategy_config(
     config: dict[str, Any],
     instrument_ids: list[str],
 ) -> dict[str, Any]:
-    """Inject a default ``instrument_id`` / ``bar_type`` if the caller omitted them.
+    """Set ``instrument_id`` / ``bar_type`` from the canonical instrument list.
 
-    Nautilus ``StrategyConfig`` subclasses typically require both fields.
-    The API layer already exposes them but older payloads and CLI calls
-    may not, so we default to the first resolved instrument.
+    Nautilus ``StrategyConfig`` subclasses require both fields. This helper
+    **unconditionally overwrites** whatever the caller submitted with the
+    canonical form from ``instrument_ids[0]`` — symmetric with
+    ``msai.api.backtests._prepare_and_validate_backtest_config``.
+
+    Why unconditional overwrite (changed 2026-05-12 — fresh-VM-data-path-
+    closure): the read-boundary resolver now accepts both Databento MIC
+    (``AAPL.XNAS``) and exchange-name (``AAPL.NASDAQ``) forms as user
+    input and canonicalizes either to the registry's exchange-name
+    canonical. If we left the user's input form in
+    ``config.instrument_id`` / ``config.bar_type``, the Nautilus
+    subprocess would read the catalog at the wrong path (``AAPL.XNAS-1-
+    MINUTE-LAST-EXTERNAL/``) while bars landed at the canonical path
+    (``AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL/``) → zero bars discovered →
+    ``trade_count=0`` even though the API path succeeded. The override
+    keeps every downstream component (config, ``Backtest.instruments``,
+    catalog reads) aligned with the same single canonical form.
+
+    The API helper and this worker helper MUST stay byte-identical so
+    ``Backtest.config`` (persisted by the API) matches what the worker
+    runs — Contrarian Council Blocking Objection #2 (2026-04-20). The
+    parity is regression-tested in
+    ``tests/integration/test_parity_config_roundtrip.py``.
 
     Args:
         config: Raw strategy config dict from the API.
@@ -679,10 +699,24 @@ def _prepare_strategy_config(
         :class:`ImportableStrategyConfig`.
     """
     prepared = dict(config)
-    if "instrument_id" not in prepared and instrument_ids:
-        prepared["instrument_id"] = instrument_ids[0]
-    if "bar_type" not in prepared and instrument_ids:
-        prepared["bar_type"] = f"{instrument_ids[0]}-1-MINUTE-LAST-EXTERNAL"
+    if instrument_ids:
+        canonical_id = instrument_ids[0]
+        prepared["instrument_id"] = canonical_id
+        # Preserve caller-selected step/aggregation/price_type/source —
+        # only rewrite the instrument prefix. See ``backend/src/msai/api/
+        # backtests.py::_prepare_and_validate_backtest_config`` for the
+        # rationale (Codex P1 catch, PR #61 round 4).
+        user_bar_type = prepared.get("bar_type")
+        if isinstance(user_bar_type, str) and "-" in user_bar_type:
+            import re
+
+            m = re.match(r"^(.+?)-(\d.*)$", user_bar_type)
+            if m is not None:
+                prepared["bar_type"] = f"{canonical_id}-{m.group(2)}"
+            else:
+                prepared["bar_type"] = f"{canonical_id}-1-MINUTE-LAST-EXTERNAL"
+        else:
+            prepared["bar_type"] = f"{canonical_id}-1-MINUTE-LAST-EXTERNAL"
     return prepared
 
 
