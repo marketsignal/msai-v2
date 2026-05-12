@@ -790,13 +790,23 @@ async def test_backdate_skips_active_alias_when_closed_sibling_exists(
     """
     from datetime import date
 
-    # Bring DB to a known head then step back to before the backdate
-    # migration so we can seed equity rows with the prior schema's
-    # semantics. The module-scoped Postgres may arrive fresh or already
-    # at head from prior tests — upgrade first to normalize, then
-    # downgrade.
-    _run_alembic(["upgrade", "head"], isolated_postgres_url)
-    _run_alembic(["downgrade", REV_PRE_BACKDATE], isolated_postgres_url)
+    # Reach REV_PRE_BACKDATE regardless of starting state. The
+    # module-scoped Postgres may arrive past it, below it, or carry
+    # poison rows in ``instrument_cache`` (a prior fail-loud test seeds
+    # a share-class ticker that breaks revision B's forward migration).
+    # Strategy: downgrade to REV_A (definitely below REV_B, restores
+    # cache table if dropped), truncate every table that could carry
+    # state, then march forward to REV_PRE_BACKDATE.
+    downgrade_result = _run_alembic_raw(["downgrade", REV_A], isolated_postgres_url)
+    if downgrade_result.returncode != 0:
+        _run_alembic(["upgrade", REV_A], isolated_postgres_url)
+    engine_pre: AsyncEngine = create_async_engine(isolated_postgres_url, future=True)
+    async with engine_pre.begin() as conn:
+        await conn.execute(
+            text("TRUNCATE instrument_cache, instrument_aliases, instrument_definitions CASCADE")
+        )
+    await engine_pre.dispose()
+    _run_alembic(["upgrade", REV_PRE_BACKDATE], isolated_postgres_url)
 
     engine: AsyncEngine = create_async_engine(isolated_postgres_url, future=True)
     async with engine.begin() as conn:
@@ -872,8 +882,14 @@ async def test_backdate_anchors_lone_active_alias_with_no_history(
     """
     from datetime import date
 
-    _run_alembic(["upgrade", "head"], isolated_postgres_url)
-    _run_alembic(["downgrade", REV_PRE_BACKDATE], isolated_postgres_url)
+    # Reach REV_PRE_BACKDATE regardless of starting state. The
+    # module-scoped Postgres may arrive past it (HEAD from prior tests),
+    # below it (fresh container), or carry rows in ``instrument_cache``
+    # that would make ``upgrade head`` fail-loud — so we never run
+    # upgrade-to-head here.
+    downgrade_result = _run_alembic_raw(["downgrade", REV_PRE_BACKDATE], isolated_postgres_url)
+    if downgrade_result.returncode != 0:
+        _run_alembic(["upgrade", REV_PRE_BACKDATE], isolated_postgres_url)
 
     engine = create_async_engine(isolated_postgres_url, future=True)
     async with engine.begin() as conn:
