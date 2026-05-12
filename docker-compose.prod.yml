@@ -116,6 +116,13 @@ services:
       DATABASE_URL: postgresql+asyncpg://msai:${POSTGRES_PASSWORD}@postgres:5432/msai
       REDIS_URL: redis://redis:6379
       DATA_ROOT: /app/data
+      # Where the strategy auto-registration scanner looks for ``*.py``
+      # files. Dev compose sets this; prod compose was missing it before
+      # 2026-05-12, so the resolved default (``__file__.parents[4] /
+      # strategies``) pointed at ``/strategies`` (doesn't exist in the
+      # installed-venv image) and the strategy registry stayed empty.
+      # Must match the ``COPY ... /app/strategies`` in ``backend/Dockerfile``.
+      STRATEGIES_ROOT: /app/strategies
       ENVIRONMENT: production
       # Production-mode mandatory secret (validated at config.py:295).
       # The :? guard fires once here, on the first interpolation; downstream
@@ -186,6 +193,13 @@ services:
       DATABASE_URL: postgresql+asyncpg://msai:${POSTGRES_PASSWORD}@postgres:5432/msai
       REDIS_URL: redis://redis:6379
       DATA_ROOT: /app/data
+      # Where the strategy auto-registration scanner looks for ``*.py``
+      # files. Dev compose sets this; prod compose was missing it before
+      # 2026-05-12, so the resolved default (``__file__.parents[4] /
+      # strategies``) pointed at ``/strategies`` (doesn't exist in the
+      # installed-venv image) and the strategy registry stayed empty.
+      # Must match the ``COPY ... /app/strategies`` in ``backend/Dockerfile``.
+      STRATEGIES_ROOT: /app/strategies
       ENVIRONMENT: production
       # Required: workers import msai.core.config which validates this in production.
       REPORT_SIGNING_SECRET: ${REPORT_SIGNING_SECRET}
@@ -212,6 +226,13 @@ services:
       DATABASE_URL: postgresql+asyncpg://msai:${POSTGRES_PASSWORD}@postgres:5432/msai
       REDIS_URL: redis://redis:6379
       DATA_ROOT: /app/data
+      # Where the strategy auto-registration scanner looks for ``*.py``
+      # files. Dev compose sets this; prod compose was missing it before
+      # 2026-05-12, so the resolved default (``__file__.parents[4] /
+      # strategies``) pointed at ``/strategies`` (doesn't exist in the
+      # installed-venv image) and the strategy registry stayed empty.
+      # Must match the ``COPY ... /app/strategies`` in ``backend/Dockerfile``.
+      STRATEGIES_ROOT: /app/strategies
       ENVIRONMENT: production
       REPORT_SIGNING_SECRET: ${REPORT_SIGNING_SECRET}
     depends_on:
@@ -237,6 +258,13 @@ services:
       DATABASE_URL: postgresql+asyncpg://msai:${POSTGRES_PASSWORD}@postgres:5432/msai
       REDIS_URL: redis://redis:6379
       DATA_ROOT: /app/data
+      # Where the strategy auto-registration scanner looks for ``*.py``
+      # files. Dev compose sets this; prod compose was missing it before
+      # 2026-05-12, so the resolved default (``__file__.parents[4] /
+      # strategies``) pointed at ``/strategies`` (doesn't exist in the
+      # installed-venv image) and the strategy registry stayed empty.
+      # Must match the ``COPY ... /app/strategies`` in ``backend/Dockerfile``.
+      STRATEGIES_ROOT: /app/strategies
       ENVIRONMENT: production
       REPORT_SIGNING_SECRET: ${REPORT_SIGNING_SECRET}
     depends_on:
@@ -266,6 +294,13 @@ services:
       DATABASE_URL: postgresql+asyncpg://msai:${POSTGRES_PASSWORD}@postgres:5432/msai
       REDIS_URL: redis://redis:6379
       DATA_ROOT: /app/data
+      # Where the strategy auto-registration scanner looks for ``*.py``
+      # files. Dev compose sets this; prod compose was missing it before
+      # 2026-05-12, so the resolved default (``__file__.parents[4] /
+      # strategies``) pointed at ``/strategies`` (doesn't exist in the
+      # installed-venv image) and the strategy registry stayed empty.
+      # Must match the ``COPY ... /app/strategies`` in ``backend/Dockerfile``.
+      STRATEGIES_ROOT: /app/strategies
       ENVIRONMENT: production
       REPORT_SIGNING_SECRET: ${REPORT_SIGNING_SECRET}
       POLYGON_API_KEY: ${POLYGON_API_KEY:-}
@@ -302,6 +337,13 @@ services:
       DATABASE_URL: postgresql+asyncpg://msai:${POSTGRES_PASSWORD}@postgres:5432/msai
       REDIS_URL: redis://redis:6379
       DATA_ROOT: /app/data
+      # Where the strategy auto-registration scanner looks for ``*.py``
+      # files. Dev compose sets this; prod compose was missing it before
+      # 2026-05-12, so the resolved default (``__file__.parents[4] /
+      # strategies``) pointed at ``/strategies`` (doesn't exist in the
+      # installed-venv image) and the strategy registry stayed empty.
+      # Must match the ``COPY ... /app/strategies`` in ``backend/Dockerfile``.
+      STRATEGIES_ROOT: /app/strategies
       ENVIRONMENT: production
       REPORT_SIGNING_SECRET: ${REPORT_SIGNING_SECRET}
       # Phase 4 task #154 scope-B: the trading subprocess reads

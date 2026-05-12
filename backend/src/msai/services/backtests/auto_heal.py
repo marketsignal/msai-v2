@@ -313,12 +313,18 @@ async def run_auto_heal(
             # Imports are deferred until after the poll loop so a coverage
             # check failure in a remote context doesn't mask the earlier
             # orchestrator error paths.
-            # Resolve to canonical IDs the catalog actually stores. The catalog
-            # builder writes under e.g. SPY.NASDAQ (Nautilus venue convention),
-            # while SecurityMaster.resolve_for_backtest returns SPY.XNAS (MIC
-            # code). Those diverge. Use ensure_catalog_data here — same helper
-            # the backtest subprocess uses — so coverage verification looks in
-            # the same directories the subprocess will read from.
+            # Resolve to canonical IDs the catalog actually stores. As of
+            # 2026-05-12 (fresh-VM-data-path-closure PR), both the catalog
+            # builder and ``SecurityMaster.resolve_for_backtest`` return the
+            # exchange-name form (e.g. ``SPY.NASDAQ``) — the resolver
+            # normalizes any Databento-MIC user input (``SPY.XARC``) to the
+            # canonical exchange-name on the way out (see
+            # :func:`venue_normalization.normalize_databento_alias_for_lookup`).
+            # We still call ``ensure_catalog_data`` rather than re-resolving
+            # because it's the same helper the backtest subprocess uses —
+            # coverage verification stays anchored to the catalog directories
+            # the subprocess will read from, independent of any future change
+            # to the alias canonicalization convention.
             from msai.core.config import settings as _settings
             from msai.services.nautilus.catalog_builder import (
                 ensure_catalog_data,

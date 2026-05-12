@@ -217,8 +217,17 @@ def test_api_and_worker_inject_identical_configs_for_omitted_defaults() -> None:
         "persisted Backtest.config will not match the worker's runtime config."
     )
 
-    # Case 2: user supplies their own instrument_id — the API helper
-    # must preserve it, same as the worker.
+    # Case 2: user supplies their own instrument_id — BOTH helpers now
+    # unconditionally overwrite it with the canonical from the resolver.
+    # Behavior change 2026-05-12 (fresh-VM-data-path-closure): the
+    # read-boundary resolver accepts both Databento MIC (``AAPL.XNAS``)
+    # and exchange-name (``AAPL.NASDAQ``) input and canonicalizes either
+    # to the registry's canonical form. Leaving user input in the worker
+    # config would make the Nautilus subprocess read the catalog at the
+    # wrong venue suffix path — see ``_prepare_strategy_config``'s
+    # docstring for the full rationale. The parity invariant from the
+    # Contrarian's blocking objection #2 still holds: API and worker
+    # produce byte-identical dicts.
     user_config_with_override = {
         "instrument_id": "MSFT.NASDAQ",
         "bar_type": "MSFT.NASDAQ-5-MINUTE-LAST-EXTERNAL",
@@ -232,4 +241,9 @@ def test_api_and_worker_inject_identical_configs_for_omitted_defaults() -> None:
     )
     worker_override = _prepare_strategy_config(dict(user_config_with_override), canonical)
     assert api_override == worker_override
-    assert api_override["instrument_id"] == "MSFT.NASDAQ"  # override respected
+    # Both helpers REPLACE the user-supplied MSFT instrument prefix with
+    # the canonical AAPL — but preserve the caller's step/aggregation
+    # (Codex P1 catch, PR #61 round 4): a user-supplied bar_type with
+    # a non-default step (e.g. ``5-MINUTE``) MUST survive the rewrite.
+    assert api_override["instrument_id"] == "AAPL.NASDAQ"
+    assert api_override["bar_type"] == "AAPL.NASDAQ-5-MINUTE-LAST-EXTERNAL"

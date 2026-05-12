@@ -4,6 +4,52 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-05-12 — Fresh-VM data-path closure (`fix/fresh-vm-data-path-closure`)
+
+The first end-to-end "ingest market data + run a backtest" exercise on the prod Azure VM exposed three environment-only bugs that survived all four deployment-pipeline slices because no test ever exercised the data path on prod:
+
+1. **Named Docker volume permission.** `docker-compose.prod.yml` mounts `app_data:/app/data`; Docker initialized the directory as `root:root`; backend runs as uid 999 → every Parquet write raised `PermissionError`. Dev compose uses a bind mount owned by the developer, masking it.
+2. **Missing `STRATEGIES_ROOT` env var.** Set in `docker-compose.dev.yml`, NOT in `docker-compose.prod.yml`. Default in `core/config.py` resolves to `/strategies` (doesn't exist in the installed-venv image), so the strategy auto-registration scanner stayed empty.
+3. **Alias/venue read-vs-write asymmetry.** Bootstrap writes `instrument_aliases.alias_string="AAPL.NASDAQ"` (exchange-name, required by IB live-resolver exact-match per `venue_normalization.py`'s documented invariant). `SecurityMaster.resolve_for_backtest` path 2 did exact-match on user input — `AAPL.XNAS` (the MIC form `msai ingest stocks` prints) cold-missed against the `AAPL.NASDAQ` row.
+4. **Equity-alias effective_from set to "today".** `_upsert_definition_and_alias` stamped `effective_from = exchange_local_today()` for every alias regardless of asset class. NautilusTrader's own model treats equities (`Equity`), FX (`CurrencyPair`), indices, perpetuals — every non-expiring asset class — as time-invariant (no `expiration_ns` field, empirically verified in `nautilus_trader/model/instruments/{equity,currency_pair,index}.pyx`). Stamping `effective_from=today` for equity aliases broke every historical backtest with `start_date < today` because the resolver's `effective_from <= as_of` filter rejected the alias. Surfaced on the prod AAPL backtest with `start_date=2025-11-03` against an alias bootstrapped that same day.
+5. **API canonicalization didn't override user-submitted aliases in the worker config.** `_prepare_and_validate_backtest_config` injected `canonical_instruments[0]` into `config.instrument_id` / `config.bar_type` only when missing — when the user submitted `AAPL.XNAS`, those fields kept the MIC form even though `Backtest.instruments` got the canonical `AAPL.NASDAQ`. The Nautilus subprocess reads the catalog using `config.bar_type` → looked at `AAPL.XNAS-1-MINUTE-LAST-EXTERNAL/` (doesn't exist; writer landed bars at `AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL/`) → discovered zero bars → `trade_count=0` even though the API path succeeded. Surfaced on the prod AAPL backtest right after fixing bugs 1–4.
+
+A 5-advisor council + Codex chairman session decided a 10-item bundled fix PR. After implementation, two consecutive verify-e2e passes caught regressions in the original design; a third pass (with the path-2c raw_symbol fallback) cleared all 5 use cases.
+
+**Ships:**
+
+- **Resolver read-boundary normalization** (`services/nautilus/security_master/`):
+  - New `normalize_databento_alias_for_lookup` in `venue_normalization.py` — accepts both Databento MIC (`AAPL.XNAS`) and exchange-name (`AAPL.NASDAQ`) input, idempotent, fail-loud on unknown suffix.
+  - `SecurityMaster.resolve_for_backtest` path 2 three-step lookup: canonical-form → original input form (historical pre-normalization aliases) → `find_by_raw_symbol` fallback for asymmetric registry states. Returns canonical registry alias, not raw input.
+  - Provider-aware error message sweep — `bootstrap` (Databento equities) vs `refresh` (IB/futures) suggestions branched correctly.
+- **Dockerfile data-volume ownership.** `RUN mkdir -p /app/data /app/reports && chown -R msai:msai /app` before `USER msai` — fresh named volumes inherit msai ownership at first mount.
+- **`docker-compose.prod.yml` STRATEGIES_ROOT** added to all 6 services (backend + 4 workers + live-supervisor).
+- **`deploy-on-vm.sh` Phase 2.6 volume-heal sentinel** — `docker run --rm -v msai_app_data:/d alpine chown -R 999:999 /d`, gated by `.msai-data-volume-chowned` sentinel inside the volume. Heals the existing prod volume (Docker's "inherit image-path ownership" rule is strictly first-mount, so the Dockerfile fix alone doesn't repair a previously-initialized volume).
+- **`backtests.smoke` column** + alembic migration `a5y6z7a8b9c0` (also merges two pre-existing parallel alembic heads from PR #49 — `aa00b11c22d3` was parented at an older revision and never joined the main chain).
+- **`BacktestRunRequest.smoke`** schema field (default False). `GET /api/v1/backtests/history` default-filters `smoke=False`; opt-in via `?include_smoke=true`.
+- **`scripts/deploy-smoke.sh`** — Phase 12 data-path smoke for `deploy-on-vm.sh`. Bootstrap → ingest → submit smoke backtest → poll → verify trade*count. Per-step `FAIL_SMOKE*{BOOTSTRAP,INGEST,RESOLVE,BACKTEST}`markers, each emitting an exact local-reproduce command. Fail-open`WARN_SMOKE_UPSTREAM`on Databento 429/5xx (deploy proceeds; image is healthy, upstream isn't). Skip-with-WARN`SKIP_SMOKE_LIVE_ACTIVE` when any live deployment is running (refuse to share Parquet/DuckDB with real-money trading).
+- **`deploy-on-vm.sh` Phase 12 + rollback cleanup.** Smoke failure triggers rollback to last-good image AND `DELETE FROM backtests WHERE smoke = true AND created_at >= DEPLOY_START_TS` — keeps prod tables clean across failed deploys without touching pre-existing user data.
+- **CI `image-data-path` job** (`.github/workflows/ci.yml`) — builds the prod backend image, asserts (1) `/app/data` writable by uid 999 on fresh volume mount, (2) `/app/strategies/example/ema_cross.py` present + `STRATEGIES_ROOT` resolves, (3) `/api/v1/strategies/` returns non-empty after migration + startup. Each invariant is a direct regression guard for one of the three 2026-05-12 bugs.
+- **Asset-class-aware `effective_from` in `_upsert_definition_and_alias`** — `equity`/`fx`/`crypto` aliases now stamp `effective_from=1900-01-01`; `futures`/`option` keep `today` for roll-window precision. Backed by alembic migration `b6a7b8c9d0e1` that backdates existing time-invariant aliases.
+- **API canonicalization always overrides `instrument_id`/`bar_type` in `Backtest.config`.** Prior behavior (inject-if-missing) left user-submitted MIC form in worker config when `Backtest.instruments` already had the canonical form, causing the Nautilus subprocess to read the catalog at the wrong path. Now both fields are unconditionally replaced with `canonical_instruments[0]` — single source of truth.
+
+**Prod re-verification (2026-05-12 evening).** After all fixes, hot-patched the running prod backend via `docker cp` + `docker restart` (PR not yet merged → no automated deploy yet). Re-ran the AAPL + SPY 6-month backtests that originally surfaced the bugs:
+
+- AAPL.XNAS 2025-11-03 → 2026-04-29: HTTP 201 → `completed` in 15s → `trade_count=1962`, same metrics as the local run (sharpe -3.28, total_return -0.08%).
+- SPY.XNAS 2025-11-03 → 2026-04-29: HTTP 201 → `completed` in 15s → `trade_count=2028`, sharpe -1.47, total_return -5.46%.
+
+The exact prod-VM scenario that 422-ed earlier in the day now runs end-to-end and produces results identical to local.
+
+**Council + Codex chairman audit trail:** 5-advisor council (1 OBJECT, 4 CONDITIONAL); Codex's initial Item 4 ("canonicalize on XNAS") was overridden after surfacing `venue_normalization.py`'s live-resolver invariant; Codex re-decided to fix at the read boundary and preserve registry canonical form on `.NASDAQ`. Three verify-e2e passes — each one caught a regression the prior didn't.
+
+**Hot-patches superseded** (cleanup after deploy):
+
+- `chown 999:999 /var/lib/msai/docker/volumes/msai_app_data/_data` on prod VM → now handled by Phase 2.6.
+- `/opt/msai/docker-compose.override.yml` on prod VM → now in `docker-compose.prod.yml`.
+- `STRATEGIES_ROOT=/app/strategies` appended to `/run/msai.env` → now in compose; render-env-from-kv.sh repopulates on next deploy.
+
+**Deferred (follow-up PRs, in priority order):** alembic deployment rehearsal smoke → arq worker stale-import checks → WebSocket auth smoke → IB Gateway resolution smoke → AMA Heartbeat post-DCR. All five were flagged by the Contrarian advisor as dormant prod paths Phase 12 doesn't cover.
+
 ### 2026-05-11 — Slice 4 acceptance: 6/6 PASS (post-hotfix-#60 IaC re-apply)
 
 After PR #60 merged and `iac-parity-reapply.md` landed `vmMiReaderAssignment` + the sub-scoped `activityLog` diagnostic, ran `docs/runbooks/slice-4-acceptance.md` end-to-end via `az vm run-command` (operator SSH route timed out — unrelated to acceptance scope).

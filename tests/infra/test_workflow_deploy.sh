@@ -158,4 +158,68 @@ grep -q "systemctl enable --now backup-to-blob.timer" "$DEPLOY_SH" \
 grep -q "/opt/msai/scripts/install-azcopy.sh" "$DEPLOY_SH" \
     || { echo "FAIL: deploy-on-vm.sh must invoke install-azcopy.sh" >&2; exit 1; }
 
-echo "All Slice 3 + Slice 4 deploy-pipeline tests passed."
+echo "=== Fresh-VM data-path closure (2026-05-12) grep assertions ==="
+# Phase 2.6 — heal the existing msai_app_data named volume on the prod VM.
+# Docker's "named volume inherits image-path ownership at first mount" rule
+# is strictly first-mount; an already-initialized root:root volume stays
+# root:root forever unless explicitly healed. Sentinel-gated for idempotency.
+grep -q "FAIL_VOLUME_HEAL" "$DEPLOY_SH" \
+    || { echo "FAIL: deploy-on-vm.sh missing FAIL_VOLUME_HEAL marker (fresh-VM data-path closure)" >&2; exit 1; }
+grep -qE "msai-data-volume-chowned|SENTINEL_PATH=\".msai-data-volume" "$DEPLOY_SH" \
+    || { echo "FAIL: deploy-on-vm.sh must use a sentinel file inside the volume for idempotency" >&2; exit 1; }
+grep -qE "chown -R 999:999 /d" "$DEPLOY_SH" \
+    || { echo "FAIL: deploy-on-vm.sh volume-heal must chown to 999:999 (msai uid in the prod image)" >&2; exit 1; }
+
+# Dockerfile must pre-create /app/data so the named volume inherits msai:msai
+# ownership at first mount (fresh-VM path).
+DOCKERFILE="backend/Dockerfile"
+grep -qE "mkdir -p /app/data /app/reports" "$DOCKERFILE" \
+    || { echo "FAIL: backend/Dockerfile must pre-create /app/data AND /app/reports before USER msai (fresh-VM data-path closure)" >&2; exit 1; }
+
+# docker-compose.prod.yml must set STRATEGIES_ROOT on every service that
+# reads the strategy registry (backend + 4 workers + live-supervisor = 6).
+PROD_COMPOSE="docker-compose.prod.yml"
+STRAT_ROOT_COUNT=$(grep -c "STRATEGIES_ROOT: /app/strategies" "$PROD_COMPOSE")
+if [[ "$STRAT_ROOT_COUNT" -lt 6 ]]; then
+    echo "FAIL: docker-compose.prod.yml has $STRAT_ROOT_COUNT STRATEGIES_ROOT lines; needs 6 (backend + 4 workers + live-supervisor)" >&2
+    exit 1
+fi
+
+echo "=== Phase 12 (data-path smoke) grep assertions ==="
+SMOKE_SH="scripts/deploy-smoke.sh"
+[[ -f "$SMOKE_SH" ]] \
+    || { echo "FAIL: scripts/deploy-smoke.sh missing" >&2; exit 1; }
+bash -n "$SMOKE_SH" \
+    || { echo "FAIL: deploy-smoke.sh has bash syntax errors" >&2; exit 1; }
+
+# Per-step failure markers — each must point at the exact CLI to reproduce.
+for marker in FAIL_SMOKE_BOOTSTRAP FAIL_SMOKE_INGEST FAIL_SMOKE_RESOLVE FAIL_SMOKE_BACKTEST; do
+    grep -q "$marker" "$SMOKE_SH" \
+        || { echo "FAIL: deploy-smoke.sh missing $marker marker (per-step diagnostic — Maintainer + Contrarian BLOCKING)" >&2; exit 1; }
+done
+
+# Fail-open classification for upstream outages (Hawk BLOCKING #1).
+grep -q "WARN_SMOKE_UPSTREAM" "$SMOKE_SH" \
+    || { echo "FAIL: deploy-smoke.sh missing WARN_SMOKE_UPSTREAM (Databento 429/5xx must fail-open, not rollback)" >&2; exit 1; }
+
+# Live-deployment conflict skip (Hawk BLOCKING #3).
+grep -q "SKIP_SMOKE_LIVE_ACTIVE" "$SMOKE_SH" \
+    || { echo "FAIL: deploy-smoke.sh missing SKIP_SMOKE_LIVE_ACTIVE (refuse to run backtest worker against shared Parquet/DuckDB during live trading)" >&2; exit 1; }
+
+# Phase 12 invocation in deploy-on-vm.sh.
+grep -q "Phase 12: data-path smoke" "$DEPLOY_SH" \
+    || { echo "FAIL: deploy-on-vm.sh missing Phase 12 invocation" >&2; exit 1; }
+grep -q "/opt/msai/scripts/deploy-smoke.sh" "$DEPLOY_SH" \
+    || { echo "FAIL: deploy-on-vm.sh must invoke deploy-smoke.sh from /opt/msai/scripts/" >&2; exit 1; }
+
+# Rollback path must delete smoke=true backtest rows created during THIS deploy.
+grep -q "smoke = true AND created_at >=" "$DEPLOY_SH" \
+    || { echo "FAIL: deploy-on-vm.sh rollback must delete smoke=true backtests created since DEPLOY_START_TS (Hawk + Contrarian BLOCKING: idempotency + history pollution)" >&2; exit 1; }
+grep -q "DEPLOY_START_TS=" "$DEPLOY_SH" \
+    || { echo "FAIL: deploy-on-vm.sh must set DEPLOY_START_TS early so rollback cleanup window is well-defined" >&2; exit 1; }
+
+# deploy.yml must scp deploy-smoke.sh + chmod +x.
+grep -q "scripts/deploy-smoke.sh" "$DEPLOY_YML" \
+    || { echo "FAIL: deploy.yml must scp deploy-smoke.sh" >&2; exit 1; }
+
+echo "All Slice 3 + Slice 4 + fresh-VM-data-path-closure deploy-pipeline tests passed."

@@ -57,3 +57,161 @@ jobs:
       - run: cd frontend && pnpm install --frozen-lockfile
       - run: cd frontend && pnpm lint
       - run: cd frontend && pnpm build
+
+  # Image-data-path integration gate. Builds the prod backend image and
+  # asserts the three invariants the 2026-05-12 prod-VM exercise revealed
+  # had no test coverage — every one of which would have caught at least
+  # one of the bugs that survived 4 deployment-pipeline slices:
+  #
+  #   1. ``/app/data`` is writable by uid 999 after a fresh named-volume
+  #      mount (regression guard on the Dockerfile ``mkdir -p`` fix).
+  #   2. ``/app/strategies/example/ema_cross.py`` is present + the
+  #      ``STRATEGIES_ROOT`` env var lands in the backend process so the
+  #      strategy auto-registration scanner finds at least one strategy.
+  #   3. ``GET /api/v1/strategies/`` returns non-empty ``items`` against
+  #      a freshly-migrated ephemeral Postgres + the built image — proves
+  #      end-to-end that compose-config + container + DB + API agree.
+  #
+  # Deliberately NOT testing the full Databento bootstrap/ingest path
+  # here — that costs money per CI run and is exercised end-to-end by
+  # ``deploy-on-vm.sh`` Phase 12 against the real prod environment.
+  image-data-path:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: msai
+          POSTGRES_USER: msai
+          POSTGRES_PASSWORD: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: Build prod backend image
+        run: |
+          docker build \
+            -f backend/Dockerfile \
+            -t msai-backend:image-data-path \
+            .
+
+      - name: Invariant 1 — /app/data writable by uid 999 after fresh volume mount
+        # Mount a fresh named volume at /app/data and assert the msai
+        # user can write. Docker's "named volume inherits image-path
+        # ownership at first mount" rule needs /app/data to exist with
+        # msai:msai ownership in the IMAGE — proved by the Dockerfile
+        # ``mkdir -p /app/data /app/reports && chown -R msai:msai /app``.
+        run: |
+          docker volume create test_app_data
+          set +e
+          docker run --rm \
+            -v test_app_data:/app/data \
+            --user 999:999 \
+            msai-backend:image-data-path \
+            touch /app/data/.ci-writable-test
+          rc=$?
+          set -e
+          docker volume rm test_app_data >/dev/null
+          if [[ "$rc" -ne 0 ]]; then
+            echo "FAIL: /app/data is not writable by uid 999 on first volume mount" >&2
+            echo "  → Dockerfile is missing ``mkdir -p /app/data && chown msai:msai /app`` before USER msai" >&2
+            exit 1
+          fi
+          echo "  /app/data writable by uid 999 — PASS"
+
+      - name: Invariant 2 — /app/strategies present + STRATEGIES_ROOT resolution
+        run: |
+          # The image must ship strategies/example/ema_cross.py at
+          # /app/strategies; the resolved settings.strategies_root must
+          # point to that path when STRATEGIES_ROOT=/app/strategies is
+          # set (mirrors docker-compose.prod.yml).
+          docker run --rm \
+            -e STRATEGIES_ROOT=/app/strategies \
+            -e DATABASE_URL=postgresql+asyncpg://msai:test@host.docker.internal:5432/msai \
+            -e REDIS_URL=redis://host.docker.internal:6379 \
+            -e ENVIRONMENT=test \
+            -e REPORT_SIGNING_SECRET=test-secret-not-prod \
+            -e AZURE_TENANT_ID=00000000-0000-0000-0000-000000000000 \
+            -e AZURE_CLIENT_ID=00000000-0000-0000-0000-000000000000 \
+            -e CORS_ORIGINS='["http://localhost:3000"]' \
+            msai-backend:image-data-path \
+            python -c "
+          from pathlib import Path
+          from msai.core.config import settings
+          assert settings.strategies_root == Path('/app/strategies'), \
+              f'strategies_root resolved to {settings.strategies_root}, expected /app/strategies'
+          example = settings.strategies_root / 'example' / 'ema_cross.py'
+          assert example.exists(), f'EMA Cross example not in image at {example}'
+          print('  strategies_root + ema_cross.py — PASS')
+          "
+
+      - name: Invariant 3 — Strategy registry sync produces non-empty items
+        # Run alembic upgrade head against ephemeral Postgres, then bring
+        # the backend up against it and verify the strategy auto-sync
+        # finds at least one strategy. The 2026-05-12 prod exercise saw
+        # this return an empty items[] because STRATEGIES_ROOT was unset
+        # — this assertion is the direct regression guard.
+        run: |
+          # Migrate ephemeral Postgres.
+          docker run --rm \
+            -e DATABASE_URL=postgresql+asyncpg://msai:test@host.docker.internal:5432/msai \
+            --add-host=host.docker.internal:host-gateway \
+            msai-backend:image-data-path \
+            alembic upgrade head
+
+          # Start backend in the background, wait for /health, then probe
+          # /api/v1/strategies/ — must return non-empty items.
+          docker run -d --name msai-ci-backend \
+            -p 8000:8000 \
+            -e STRATEGIES_ROOT=/app/strategies \
+            -e DATA_ROOT=/app/data \
+            -e DATABASE_URL=postgresql+asyncpg://msai:test@host.docker.internal:5432/msai \
+            -e REDIS_URL=redis://host.docker.internal:6379 \
+            -e ENVIRONMENT=test \
+            -e REPORT_SIGNING_SECRET=test-secret-not-prod \
+            -e AZURE_TENANT_ID=00000000-0000-0000-0000-000000000000 \
+            -e AZURE_CLIENT_ID=00000000-0000-0000-0000-000000000000 \
+            -e CORS_ORIGINS='["http://localhost:3000"]' \
+            -e MSAI_API_KEY=ci-test-key \
+            --add-host=host.docker.internal:host-gateway \
+            msai-backend:image-data-path
+
+          # Wait for /health (up to 60s).
+          for i in $(seq 1 30); do
+            if curl -sf -o /dev/null --max-time 3 http://localhost:8000/health; then
+              echo "  /health 200 after ${i} attempts"
+              break
+            fi
+            sleep 2
+            if [[ "$i" -eq 30 ]]; then
+              echo "FAIL: backend /health never returned 200" >&2
+              docker logs msai-ci-backend 2>&1 | tail -50 >&2
+              docker rm -f msai-ci-backend >/dev/null 2>&1
+              exit 1
+            fi
+          done
+
+          # Probe the strategies endpoint. ``items`` MUST be non-empty —
+          # this is the assertion that would have caught the
+          # ``STRATEGIES_ROOT`` env-var bug on day one.
+          resp=$(curl -sf -H "X-API-Key: ci-test-key" http://localhost:8000/api/v1/strategies/)
+          item_count=$(echo "$resp" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("items",[])))')
+          docker rm -f msai-ci-backend >/dev/null 2>&1
+          if [[ "$item_count" -eq 0 ]]; then
+            echo "FAIL: /api/v1/strategies/ returned empty items[] — strategy registry sync did not pick up /app/strategies" >&2
+            exit 1
+          fi
+          echo "  /api/v1/strategies/ → ${item_count} items — PASS"
