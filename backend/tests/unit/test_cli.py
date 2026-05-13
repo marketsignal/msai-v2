@@ -245,16 +245,18 @@ class TestHttpCommands:
     def test_graduation_list_passes_stage_filter(self, runner: CliRunner) -> None:
         body = {"items": [], "total": 0}
         with patch("msai.cli.httpx.request", return_value=_ok_response(body)) as mock:
-            result = runner.invoke(app, ["graduation", "list", "--stage", "promoted"])
+            result = runner.invoke(app, ["graduation", "list", "--stage", "live_candidate"])
         assert result.exit_code == 0
         _, kwargs = mock.call_args
-        assert kwargs["params"]["stage"] == "promoted"
+        assert kwargs["params"]["stage"] == "live_candidate"
 
     def test_graduation_show_merges_candidate_and_transitions(self, runner: CliRunner) -> None:
         # ``show`` promises the transition audit trail — verify both
         # endpoints are called and the outputs are merged.
-        candidate_response = _ok_response({"id": "c-1", "stage": "promoted"})
-        transitions_response = _ok_response([{"from_stage": "incubation", "to_stage": "promoted"}])
+        candidate_response = _ok_response({"id": "c-1", "stage": "live_candidate"})
+        transitions_response = _ok_response(
+            [{"from_stage": "paper_review", "to_stage": "live_candidate"}]
+        )
         with (
             patch("msai.cli.httpx.request", return_value=candidate_response) as req_mock,
             patch("msai.cli.httpx.get", return_value=transitions_response) as get_mock,

@@ -99,7 +99,7 @@ async def test_full_portfolio_deploy_cycle(session: AsyncSession) -> None:
             GraduationCandidate(
                 id=uuid4(),
                 strategy_id=strat.id,
-                stage="promoted",
+                stage="live_candidate",
                 config={"fast": 10 + i},
                 metrics={"sharpe": 1.5 + i * 0.1},
             )
@@ -278,7 +278,7 @@ async def test_deployment_cascade_deletes_deployment_strategies(
         GraduationCandidate(
             id=uuid4(),
             strategy_id=strat.id,
-            stage="promoted",
+            stage="live_candidate",
             config={},
             metrics={},
         )

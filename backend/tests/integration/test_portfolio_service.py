@@ -78,7 +78,7 @@ async def _seed_strategy(
             GraduationCandidate(
                 id=uuid4(),
                 strategy_id=strategy.id,
-                stage="promoted",
+                stage="live_candidate",
                 config={},
                 metrics={},
             )

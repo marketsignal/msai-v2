@@ -365,3 +365,55 @@ class TestLiveStartDeprecated:
         body = response.json()
         assert body["detail"]["error"]["code"] == "ENDPOINT_DEPRECATED"
         assert "start-portfolio" in body["detail"]["error"]["message"]
+
+
+class TestStartPortfolioLiveBlocked:
+    """POST /api/v1/live/start-portfolio rejects ``paper_trading=false`` with
+    503 LIVE_DEPLOY_BLOCKED until the snapshot-binding follow-up lands
+    (Codex Contrarian's blocking objection #1 from the 2026-05-13 graduation-
+    gate council). The guard MUST fire BEFORE the idempotency layer so a
+    cached outcome can never replay a paper_trading=false response.
+    """
+
+    @pytest.mark.asyncio
+    async def test_live_paper_trading_false_returns_503(
+        self,
+        client_with_mock_db: httpx.AsyncClient,
+    ) -> None:
+        response = await client_with_mock_db.post(
+            "/api/v1/live/start-portfolio",
+            json={
+                "portfolio_revision_id": "00000000-0000-0000-0000-000000000002",
+                "account_id": "U1234567",
+                "paper_trading": False,
+            },
+        )
+        assert response.status_code == 503, response.text
+        body = response.json()
+        assert body["detail"]["error"]["code"] == "LIVE_DEPLOY_BLOCKED"
+        assert "snapshot" in body["detail"]["error"]["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_live_paper_trading_false_blocked_before_idempotency(
+        self,
+        client_with_mock_db: httpx.AsyncClient,
+    ) -> None:
+        """Replay with same Idempotency-Key still returns 503; the guard
+        fires before any reservation is recorded so there's no cached
+        outcome to replay."""
+        body = {
+            "portfolio_revision_id": "00000000-0000-0000-0000-000000000002",
+            "account_id": "U1234567",
+            "paper_trading": False,
+        }
+        headers = {"Idempotency-Key": "test-replay-key-001"}
+        r1 = await client_with_mock_db.post(
+            "/api/v1/live/start-portfolio", json=body, headers=headers
+        )
+        r2 = await client_with_mock_db.post(
+            "/api/v1/live/start-portfolio", json=body, headers=headers
+        )
+        assert r1.status_code == 503
+        assert r2.status_code == 503
+        assert r1.json()["detail"]["error"]["code"] == "LIVE_DEPLOY_BLOCKED"
+        assert r2.json()["detail"]["error"]["code"] == "LIVE_DEPLOY_BLOCKED"

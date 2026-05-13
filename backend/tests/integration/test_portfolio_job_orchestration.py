@@ -106,14 +106,14 @@ async def seeded_portfolio(
         candidate_alpha = GraduationCandidate(
             id=uuid4(),
             strategy_id=strategy_alpha.id,
-            stage="promoted",
+            stage="paper_candidate",
             config={"instruments": ["AAPL"]},
             metrics={"sharpe": 1.5, "total_return": 0.2, "sortino": 2.0},
         )
         candidate_beta = GraduationCandidate(
             id=uuid4(),
             strategy_id=strategy_beta.id,
-            stage="promoted",
+            stage="paper_candidate",
             config={"instruments": ["SPY"]},
             metrics={"sharpe": 0.8, "total_return": 0.1, "sortino": 1.1},
         )
