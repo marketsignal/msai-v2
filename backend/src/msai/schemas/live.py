@@ -6,7 +6,7 @@ from datetime import datetime  # noqa: TC003 — Pydantic resolves annotations a
 from typing import Any
 from uuid import UUID  # noqa: TC003 — Pydantic resolves annotations at runtime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class LiveStartRequest(BaseModel):
@@ -29,7 +29,7 @@ class PortfolioStartRequest(BaseModel):
     portfolio_revision_id: UUID
     account_id: str
     paper_trading: bool = True
-    ib_login_key: str | None = None
+    ib_login_key: str = Field(min_length=1, max_length=64)
 
 
 class LiveStopRequest(BaseModel):

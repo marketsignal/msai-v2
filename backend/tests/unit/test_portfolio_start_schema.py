@@ -13,6 +13,7 @@ def test_portfolio_start_request_requires_revision_id_and_account() -> None:
     req = PortfolioStartRequest(
         portfolio_revision_id=uuid4(),
         account_id="DU123",
+        ib_login_key="user-x",
     )
     assert req.paper_trading is True
 
@@ -40,6 +41,7 @@ def test_portfolio_start_request_paper_trading_defaults_true() -> None:
     req = PortfolioStartRequest(
         portfolio_revision_id=uuid4(),
         account_id="DU999",
+        ib_login_key="user-x",
     )
     assert req.paper_trading is True
 
@@ -49,16 +51,48 @@ def test_portfolio_start_request_paper_trading_override() -> None:
         portfolio_revision_id=uuid4(),
         account_id="U999",
         paper_trading=False,
+        ib_login_key="user-x",
     )
     assert req.paper_trading is False
 
 
-def test_portfolio_start_request_ib_login_key_defaults_none() -> None:
+def test_portfolio_start_request_ib_login_key_required() -> None:
+    """Bug #1 (live-deploy-safety-trio): ib_login_key must be required by the
+    API schema (the DB column has been NOT NULL since PR #3). Sending the
+    request without it should produce a 422 (Pydantic validation error),
+    not the previous 500 / IntegrityError surface."""
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError) as exc_info:
+        PortfolioStartRequest(
+            portfolio_revision_id=uuid4(),
+            account_id="DU123",
+        )
+    errors = exc_info.value.errors()
+    assert any(e["loc"] == ("ib_login_key",) and e["type"] == "missing" for e in errors)
+
+
+def test_portfolio_start_request_ib_login_key_accepts_value() -> None:
     req = PortfolioStartRequest(
         portfolio_revision_id=uuid4(),
         account_id="DU123",
+        ib_login_key="user-x",
     )
-    assert req.ib_login_key is None
+    assert req.ib_login_key == "user-x"
+
+
+def test_portfolio_start_request_ib_login_key_empty_rejected() -> None:
+    """min_length=1 — empty string is rejected."""
+    import pytest
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        PortfolioStartRequest(
+            portfolio_revision_id=uuid4(),
+            account_id="DU123",
+            ib_login_key="",
+        )
 
 
 # ---------------------------------------------------------------

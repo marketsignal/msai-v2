@@ -249,6 +249,7 @@ class PortfolioDeploymentIdentity:
     portfolio_revision_id: str
     account_id: str
     paper_trading: bool
+    ib_login_key: str
 
     def to_canonical_json(self) -> bytes:
         """Stable serialization for hashing (same contract as DeploymentIdentity)."""
@@ -265,18 +266,25 @@ def derive_portfolio_deployment_identity(
     portfolio_revision_id: UUID,
     account_id: str,
     paper_trading: bool,
+    ib_login_key: str,
     user_sub: str | None = None,
 ) -> PortfolioDeploymentIdentity:
     """Convenience builder for :class:`PortfolioDeploymentIdentity`.
 
     Mirrors :func:`derive_deployment_identity` but takes portfolio-level
     inputs instead of single-strategy inputs.
+
+    ``ib_login_key`` is part of the identity tuple: switching IB usernames
+    on the same revision+account produces a new identity_signature (cold
+    start), which is correct — different sessions cannot share the same
+    Nautilus subprocess.
     """
     return PortfolioDeploymentIdentity(
         started_by=canonicalize_user_id(user_id, fallback_sub=user_sub),
         portfolio_revision_id=portfolio_revision_id.hex,
         account_id=account_id,
         paper_trading=paper_trading,
+        ib_login_key=ib_login_key,
     )
 
 

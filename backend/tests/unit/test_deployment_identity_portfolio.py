@@ -15,7 +15,6 @@ from msai.services.live.deployment_identity import (
     derive_strategy_id_full,
 )
 
-
 # ---------------------------------------------------------------------------
 # Task 4: PortfolioDeploymentIdentity
 # ---------------------------------------------------------------------------
@@ -29,12 +28,14 @@ class TestPortfolioDeploymentIdentity:
             portfolio_revision_id=rev_id.hex,
             account_id="DU123",
             paper_trading=True,
+            ib_login_key="user-x",
         )
         id2 = PortfolioDeploymentIdentity(
             started_by="abc",
             portfolio_revision_id=rev_id.hex,
             account_id="DU123",
             paper_trading=True,
+            ib_login_key="user-x",
         )
         assert id1.signature() == id2.signature()
 
@@ -44,12 +45,14 @@ class TestPortfolioDeploymentIdentity:
             portfolio_revision_id=uuid4().hex,
             account_id="DU123",
             paper_trading=True,
+            ib_login_key="user-x",
         )
         id2 = PortfolioDeploymentIdentity(
             started_by="abc",
             portfolio_revision_id=uuid4().hex,
             account_id="DU123",
             paper_trading=True,
+            ib_login_key="user-x",
         )
         assert id1.signature() != id2.signature()
 
@@ -60,12 +63,14 @@ class TestPortfolioDeploymentIdentity:
             portfolio_revision_id=rev_id.hex,
             account_id="DU123",
             paper_trading=True,
+            ib_login_key="user-x",
         )
         id2 = PortfolioDeploymentIdentity(
             started_by="abc",
             portfolio_revision_id=rev_id.hex,
             account_id="DU456",
             paper_trading=True,
+            ib_login_key="user-x",
         )
         assert id1.signature() != id2.signature()
 
@@ -76,12 +81,36 @@ class TestPortfolioDeploymentIdentity:
             portfolio_revision_id=rev_id.hex,
             account_id="DU123",
             paper_trading=True,
+            ib_login_key="user-x",
         )
         id2 = PortfolioDeploymentIdentity(
             started_by="abc",
             portfolio_revision_id=rev_id.hex,
             account_id="DU123",
             paper_trading=False,
+            ib_login_key="user-x",
+        )
+        assert id1.signature() != id2.signature()
+
+    def test_different_ib_login_key_produces_different_signature(self) -> None:
+        """Bug #1 (live-deploy-safety-trio): two deployments of the same
+        revision+account with different IB login keys MUST produce
+        different identity_signatures so the supervisor doesn't reuse
+        the wrong subprocess/gateway."""
+        rev_id = uuid4()
+        id1 = PortfolioDeploymentIdentity(
+            started_by="abc",
+            portfolio_revision_id=rev_id.hex,
+            account_id="DU123",
+            paper_trading=True,
+            ib_login_key="user-a",
+        )
+        id2 = PortfolioDeploymentIdentity(
+            started_by="abc",
+            portfolio_revision_id=rev_id.hex,
+            account_id="DU123",
+            paper_trading=True,
+            ib_login_key="user-b",
         )
         assert id1.signature() != id2.signature()
 
@@ -91,6 +120,7 @@ class TestPortfolioDeploymentIdentity:
             portfolio_revision_id="deadbeef",
             account_id="DU123",
             paper_trading=True,
+            ib_login_key="user-x",
         )
         canonical = identity.to_canonical_json().decode("utf-8")
         keys = ["account_id", "paper_trading", "portfolio_revision_id", "started_by"]
@@ -107,6 +137,7 @@ class TestDerivePortfolioDeploymentIdentity:
             portfolio_revision_id=rev_id,
             account_id="DU123",
             paper_trading=False,
+            ib_login_key="user-x",
         )
         assert identity.portfolio_revision_id == rev_id.hex
         assert identity.account_id == "DU123"
@@ -120,6 +151,7 @@ class TestDerivePortfolioDeploymentIdentity:
             portfolio_revision_id=rev_id,
             account_id="DU123",
             paper_trading=True,
+            ib_login_key="user-x",
         )
         assert identity.started_by == ""
 
@@ -130,6 +162,7 @@ class TestDerivePortfolioDeploymentIdentity:
             portfolio_revision_id=rev_id,
             account_id="DU123",
             paper_trading=True,
+            ib_login_key="test-user",
             user_sub="alice@example.com",
         )
         assert identity.started_by == "sub:alice@example.com"
