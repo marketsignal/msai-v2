@@ -31,6 +31,34 @@ class GraduationStageError(Exception):
     """Raised when a stage transition is invalid."""
 
 
+# Stages at which a strategy is "eligible to be a member of a live
+# portfolio" — i.e. has crossed the live-promotion boundary in the
+# graduation lifecycle. This is NOT "safe to start trading without
+# further validation"; the start-portfolio path must ALSO verify the
+# frozen revision member's ``config`` + ``instruments`` match the
+# approved GraduationCandidate snapshot before real-money execution can
+# proceed (deferred follow-up — see
+# ``docs/plans/2026-05-13-graduation-gate-promoted-orphan.md``).
+#
+# Until that snapshot-binding follow-up lands, ``/api/v1/live/start-
+# portfolio`` rejects ``paper_trading=false`` with HTTP 503 (see
+# ``backend/src/msai/api/live.py``).
+#
+# Bug history: prior to 2026-05-13, ``portfolio_service.py`` queried
+# ``stage == "promoted"`` — a string that exists in NO transition of
+# ``VALID_TRANSITIONS``. The result was that no strategy could ever be
+# added to a live portfolio in production. Discovered by the paper-
+# live drill (council Option 3). See solution doc + the
+# ``test_portfolio_service_graduation_gate.py`` regression suite.
+ELIGIBLE_FOR_LIVE_PORTFOLIO: frozenset[str] = frozenset(
+    {
+        "live_candidate",
+        "live_running",
+        "paused",
+    }
+)
+
+
 class GraduationService:
     """Manages graduation candidate lifecycle with enforced state machine transitions."""
 

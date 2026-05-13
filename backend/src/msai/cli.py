@@ -515,7 +515,14 @@ def live_kill_all(
 
 @graduation_app.command("list")
 def graduation_list(
-    stage: str = typer.Option("", help="Filter by stage (discovery/paper/incubation/promoted)"),
+    stage: str = typer.Option(
+        "",
+        help=(
+            "Filter by stage (discovery / validation / paper_candidate / "
+            "paper_running / paper_review / live_candidate / live_running / "
+            "paused / archived). See services.graduation.VALID_TRANSITIONS."
+        ),
+    ),
     limit: int = typer.Option(50, help="Max rows to return"),
 ) -> None:
     """List graduation candidates, optionally filtered by stage."""

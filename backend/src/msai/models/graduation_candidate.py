@@ -22,7 +22,10 @@ if TYPE_CHECKING:
 class GraduationCandidate(TimestampMixin, Base):
     """A strategy+config pair moving through the graduation pipeline.
 
-    Stages: discovery -> paper_validation -> incubation -> promoted (or rejected).
+    Stages (per ``services.graduation.VALID_TRANSITIONS``):
+    discovery → validation → paper_candidate → paper_running → paper_review
+    → live_candidate → live_running ↔ paused. Any stage can also → archived
+    (terminal). ``paper_review`` can also regress → discovery for re-eval.
     Each stage transition is recorded as an immutable
     :class:`GraduationStageTransition` row.
     """

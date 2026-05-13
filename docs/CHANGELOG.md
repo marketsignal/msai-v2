@@ -4,6 +4,20 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-05-13 — Graduation gate referenced nonexistent "promoted" stage (`fix/graduation-gate-promoted-orphan`)
+
+Continuation of the paper-live drill (council Option 3) — after PR #62 fixed the IB_PORT bug and the broker rail came up clean, the drill halted at step 5 because `portfolio_service.py:_is_graduated` queried `GraduationCandidate.stage == "promoted"` but the actual state machine in `services/graduation.py:VALID_TRANSITIONS` has no `"promoted"` stage. **No strategy could ever be added to a live portfolio in production.** Every test that touched the gate inserted fixture rows with `stage="promoted"` (matching the broken query), so the bug was masked until a real graduation pipeline ran end-to-end on prod.
+
+- **Replace orphan literal with named constant:** `services/graduation.py` exports `ELIGIBLE_FOR_LIVE_PORTFOLIO = frozenset({"live_candidate", "live_running", "paused"})`. Council 5-advisor + Codex chairman verdict (Option B, 3-of-5 with caveats) — "strategy has crossed the live-promotion boundary."
+- **Live-deploy guard (Codex Contrarian's blocking objection):** the gate checks `strategy_id` only, but portfolio members carry arbitrary `config + instruments`. Until a snapshot-binding follow-up verifies the member matches the approved candidate, `POST /api/v1/live/start-portfolio` rejects `paper_trading=false` with HTTP 503 `LIVE_DEPLOY_BLOCKED`. Guard fires BEFORE the idempotency layer so cached outcomes can never bypass it (Codex iter-2 P2 catch).
+- **Three regression guards:** `test_portfolio_service_graduation_gate.py` parametrizes the gate over all 9 stages in `GraduationService.ALL_STAGES`; two completeness assertions ensure (1) the parametrize list covers every stage in `VALID_TRANSITIONS` and (2) `ELIGIBLE_FOR_LIVE_PORTFOLIO ⊆ ALL_STAGES`. Plus an idempotency-replay regression that asserts the live-block guard survives cached-outcome replay.
+- **Stale-doc sweep (10 files):** updated module + class docstrings, error message, CLI help text, model docstring, and 6 test files using `stage="promoted"` as fixture data — replaced with `live_candidate` for live-portfolio tests; `paper_candidate` for the legacy backtest-portfolio orchestration test (not gated by `_is_graduated`).
+- **Deferred follow-ups** (in solution doc): member-to-candidate snapshot binding (removes the 503 guard); api/live.py:545 stage-transition logic; archived membership invariants; paused re-add semantics; API 500→409 on unique-violation; forward-only transitions invariant test.
+
+**Verification:** 1859 backend unit tests pass (+13 new); 24 portfolio-related integration tests pass with updated fixtures; ruff + mypy --strict clean. Codex code review: CLEAN (no P0/P1/P2/P3). Plan-review loop: 3 iterations (productive convergence).
+
+**Drill state post-merge:** UC2 (paper-drill resumption) becomes operational milestone for next session — walk smoke_market_order candidate from `paper_candidate` through to `live_candidate`, add to portfolio, deploy on `DUP733213` with `paper_trading=true` (the guard explicitly does NOT block paper; only live).
+
 ### 2026-05-12 — IB Gateway prod compose: clients must target socat proxy port (`fix/ib-port-prod-compose-4004`)
 
 The paper-live drill preflight (council Option 3) discovered that prod compose set `IB_PORT=${IB_PORT:-4002}` for the backend and live-supervisor. The gnzsnz/ib-gateway image binds IB Gateway to `127.0.0.1:4002` (paper) inside the container and refuses non-loopback API connections; a `socat` proxy listens on `0.0.0.0:4004` and re-originates each connection as localhost. Cross-container clients MUST target the socat port — `4002` TCP-connects but the API handshake silently times out. This bug would have blocked the first real-money trading attempt at the broker-connect step; it survived four deploy-pipeline slices because no end-to-end broker drill had ever fired against the prod compose stack.

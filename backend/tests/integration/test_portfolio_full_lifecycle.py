@@ -81,7 +81,7 @@ async def test_full_lifecycle_create_add_snapshot_rebalance(
             GraduationCandidate(
                 id=uuid4(),
                 strategy_id=strat.id,
-                stage="promoted",
+                stage="live_candidate",
                 config={},
                 metrics={},
             )
@@ -171,7 +171,7 @@ async def test_deleting_portfolio_cascades_cleanly(session: AsyncSession) -> Non
         GraduationCandidate(
             id=uuid4(),
             strategy_id=strat.id,
-            stage="promoted",
+            stage="live_candidate",
             config={},
             metrics={},
         )

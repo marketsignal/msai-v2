@@ -1,8 +1,9 @@
 """Portfolio service — CRUD on LivePortfolio + draft-revision mutation.
 
 Invariants enforced:
-- Only graduated strategies (promoted ``GraduationCandidate`` exists)
-  can be added.
+- Only graduated strategies (``GraduationCandidate`` exists at a live-
+  eligible stage; see ``ELIGIBLE_FOR_LIVE_PORTFOLIO`` in
+  ``services/graduation.py``) can be added.
 - A strategy appears at most once per revision (DB UNIQUE + service
   pre-check for better error message).
 - At most one draft (``is_frozen=false``) revision per portfolio
@@ -22,6 +23,7 @@ from msai.models import (
     LivePortfolioRevision,
     LivePortfolioRevisionStrategy,
 )
+from msai.services.graduation import ELIGIBLE_FOR_LIVE_PORTFOLIO
 from msai.services.live.revision_service import (
     PortfolioDomainError,
     RevisionImmutableError,
@@ -35,8 +37,9 @@ if TYPE_CHECKING:
 
 
 class StrategyNotGraduatedError(PortfolioDomainError):
-    """Raised when adding a strategy that has no promoted
-    :class:`GraduationCandidate`."""
+    """Raised when adding a strategy whose :class:`GraduationCandidate`
+    is not at a live-eligible stage (see
+    :data:`ELIGIBLE_FOR_LIVE_PORTFOLIO` in ``services.graduation``)."""
 
 
 class PortfolioService:
@@ -70,12 +73,16 @@ class PortfolioService:
         """Add a strategy to the portfolio's draft revision.
 
         Raises :class:`StrategyNotGraduatedError` if the strategy has
-        no promoted :class:`GraduationCandidate`. Raises ``ValueError``
+        no :class:`GraduationCandidate` at a live-eligible stage
+        (:data:`ELIGIBLE_FOR_LIVE_PORTFOLIO`). Raises ``ValueError``
         if already a member.
         """
         if not await self._is_graduated(strategy_id):
             raise StrategyNotGraduatedError(
-                f"Strategy {strategy_id} has no promoted GraduationCandidate"
+                f"Strategy {strategy_id} has no GraduationCandidate at a "
+                f"live-eligible stage (one of: {sorted(ELIGIBLE_FOR_LIVE_PORTFOLIO)}). "
+                f"Run the graduation pipeline first: discovery → validation → "
+                f"paper_candidate → paper_running → paper_review → live_candidate."
             )
 
         draft = await self._get_or_create_draft_revision(portfolio_id)
@@ -173,7 +180,7 @@ class PortfolioService:
         result = await self._session.execute(
             select(GraduationCandidate.id).where(
                 GraduationCandidate.strategy_id == strategy_id,
-                GraduationCandidate.stage == "promoted",
+                GraduationCandidate.stage.in_(ELIGIBLE_FOR_LIVE_PORTFOLIO),
             )
         )
         return result.first() is not None

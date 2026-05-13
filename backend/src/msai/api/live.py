@@ -267,6 +267,38 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
        paper_trading)`` via :class:`PortfolioDeploymentIdentity`.
     """
     # ------------------------------------------------------------------
+    # Real-money safety gate (Codex Contrarian's blocking objection #1,
+    # 2026-05-13 graduation-gate council). The graduation gate at
+    # ``portfolio_service._is_graduated`` checks ``strategy_id`` only —
+    # but portfolio members carry arbitrary ``config`` + ``instruments``.
+    # Until the snapshot-binding follow-up lands (verifying that the
+    # frozen revision member matches the approved GraduationCandidate),
+    # live (real-money) deployments are blocked at this boundary.
+    #
+    # MUST fire BEFORE the idempotency layer below — otherwise a
+    # cached outcome could replay a paper_trading=false response from a
+    # prior call. With this gate first, no cached outcome can ever be
+    # recorded for live, so replay is naturally safe.
+    # ------------------------------------------------------------------
+    if not request.paper_trading:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "code": "LIVE_DEPLOY_BLOCKED",
+                    "message": (
+                        "Live (paper_trading=false) deployments are temporarily "
+                        "blocked pending the snapshot-binding follow-up: the "
+                        "portfolio member's config + instruments must be verified "
+                        "against the approved GraduationCandidate snapshot before "
+                        "real-money execution can proceed. Tracked in "
+                        "docs/plans/2026-05-13-graduation-gate-promoted-orphan.md."
+                    ),
+                }
+            },
+        )
+
+    # ------------------------------------------------------------------
     # Layer 1: HTTP Idempotency-Key reservation
     # ------------------------------------------------------------------
     user_id = await _resolve_user_id(db, claims)
