@@ -71,14 +71,14 @@ docker compose -f docker-compose.dev.yml down
 
 ## Ports
 
-| Service    | Host Port      | Internal Port |
-| ---------- | -------------- | ------------- |
-| Frontend   | 3300           | 3000          |
-| Backend    | 8800           | 8000          |
-| PostgreSQL | 5433           | 5432          |
-| Redis      | 6380           | 6379          |
-| IB Gateway | 127.0.0.1:4002 | 4002          |
-| VNC (IB)   | 127.0.0.1:5900 | 5900          |
+| Service    | Host Port      | Internal Port                       |
+| ---------- | -------------- | ----------------------------------- |
+| Frontend   | 3300           | 3000                                |
+| Backend    | 8800           | 8000                                |
+| PostgreSQL | 5433           | 5432                                |
+| Redis      | 6380           | 6379                                |
+| IB Gateway | 127.0.0.1:4004 | 4004 (socat → internal :4002 paper) |
+| VNC (IB)   | 127.0.0.1:5900 | 5900                                |
 
 ## Repository Layout
 
@@ -258,7 +258,7 @@ cd backend && uv run msai live-kill-all
 ## Safety Defaults
 
 - Paper trading ONLY in dev compose (`TRADING_MODE: paper` hard-coded)
-- IB port 4002 (paper) by default; 4001 (live) requires explicit env override
+- IB port 4004 (socat-proxied paper) by default; 4003 (socat-proxied live) requires explicit `IB_PORT=4003 IB_API_PORT=4001` overrides
 - Port/account consistency validation rejects paper port + live account (and vice versa)
 - Kill switch halt flag has 24h TTL (safety net against forgotten halts)
 - No auto-resume after kill switch or IB disconnect

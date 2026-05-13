@@ -34,7 +34,17 @@
 #   - DATABENTO_API_KEY       : empty disables Databento ingestion
 #   - PUBLIC_API_URL          : used for frontend SSR fallback only
 #   - TRADING_MODE            : ``paper`` (default) or ``live``
-#   - IB_PORT                 : 4002 paper (default), 4001 live
+#   - IB_PORT                 : 4004 paper (default), 4003 live — the gnzsnz
+#                               socat proxy port. Client containers (backend,
+#                               live-supervisor) connect through socat; IB
+#                               Gateway itself binds to 127.0.0.1:4002/4001
+#                               internally (see ``IB_API_PORT`` below).
+#   - IB_API_PORT             : 4002 paper (default), 4001 live — gateway's
+#                               internal bind, controls what ``ib-gateway``
+#                               tells the gnzsnz image to launch. Decoupled
+#                               from ``IB_PORT`` so live-mode flip requires
+#                               BOTH overrides explicit (TRADING_MODE=live,
+#                               IB_PORT=4003, IB_API_PORT=4001).
 #
 # Profile usage:
 #   - default profile: postgres, redis, migrate, backend, all arq workers,
@@ -146,11 +156,16 @@ services:
       # semantics as live-supervisor so compose fails instantly
       # without credentials.
       IB_HOST: ${IB_HOST:-ib-gateway}
-      # Align with ib-gateway's IB_API_PORT default (4002 = paper).
-      # Override to 4001 for live trading. Pre-2026-05-09 this defaulted
-      # to 4004 — never matched any ib-gateway listener; broker stack
-      # would silently connection-refuse without an explicit override.
-      IB_PORT: ${IB_PORT:-4002}
+      # gnzsnz/ib-gateway runs IB Gateway bound to 127.0.0.1:4002 (paper)
+      # internally and exposes a socat proxy on 0.0.0.0:4004 that
+      # re-originates connections as localhost. Cross-container clients
+      # MUST target the socat port (4004 paper / 4003 live), not the
+      # loopback bind. The 2026-05-12 paper-drill discovered the prior
+      # 4002 default TCP-connects fine but the IB API handshake times
+      # out — surfaced ONLY when a real broker drill ran. Live-mode flip
+      # requires BOTH ``IB_PORT=4003`` and ``IB_API_PORT=4001`` (see
+      # ib-gateway service below).
+      IB_PORT: ${IB_PORT:-4004}
       IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:?Set IB_ACCOUNT_ID in .env}
       IB_MARKET_DATA_TYPE: ${IB_MARKET_DATA_TYPE:-REALTIME}
       IB_USE_REGULAR_TRADING_HOURS: ${IB_USE_REGULAR_TRADING_HOURS:-false}
@@ -348,12 +363,14 @@ services:
       REPORT_SIGNING_SECRET: ${REPORT_SIGNING_SECRET}
       # Phase 4 task #154 scope-B: the trading subprocess reads
       # these to construct TradingNodePayload. Inside the Compose
-      # network, the gateway is reachable at ``ib-gateway:4002``
-      # (paper) or ``ib-gateway:4001`` (live).
+      # network, the gateway is reachable at ``ib-gateway:4004``
+      # (paper, socat proxy) or ``ib-gateway:4003`` (live, socat).
       IB_HOST: ib-gateway
-      # Align with ib-gateway's IB_API_PORT default (4002 = paper).
-      # Override to 4001 for live trading.
-      IB_PORT: ${IB_PORT:-4002}
+      # Socat proxy port. IB Gateway binds to 127.0.0.1:4002/4001
+      # internally (see ib-gateway service) and refuses non-loopback
+      # API connections; socat re-originates from localhost. Live-mode
+      # flip: set IB_PORT=4003 AND IB_API_PORT=4001 (decoupled).
+      IB_PORT: ${IB_PORT:-4004}
       IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:?Set IB_ACCOUNT_ID in .env}
       IB_MARKET_DATA_TYPE: ${IB_MARKET_DATA_TYPE:-REALTIME}
       IB_USE_REGULAR_TRADING_HOURS: ${IB_USE_REGULAR_TRADING_HOURS:-false}
@@ -479,21 +496,25 @@ services:
       # accounts you must configure IBKR Mobile Authenticator and
       # set TWOFA_DEVICE — see gnzsnz docs for details.
       TWOFA_TIMEOUT_ACTION: ${TWOFA_TIMEOUT_ACTION:-exit}
-      # The healthcheck below reads ``IB_API_PORT`` at runtime from
-      # the container's env. When flipping to live trading the
-      # operator sets ``IB_PORT=4001`` + ``TRADING_MODE=live`` in
-      # .env and both the supervisor and this healthcheck probe the
-      # right port. Without this indirection the healthcheck would
-      # hard-pin 4002 and a live-mode stack would never become
-      # healthy, so ``live-supervisor`` (which depends on
-      # ``service_healthy``) would hang forever (Codex P1 iter1).
-      IB_API_PORT: ${IB_PORT:-4002}
+      # IB_API_PORT is gnzsnz's signal for what port IB Gateway binds
+      # to internally on 127.0.0.1 — 4002 paper, 4001 live. Decoupled
+      # from the client-side ``IB_PORT`` (socat proxy port: 4004
+      # paper / 4003 live) so flipping to live mode requires TWO
+      # explicit overrides instead of one ambiguous knob.
+      #
+      # Healthcheck below probes ``$$IB_API_PORT`` from inside the
+      # container — i.e. tests that IB Gateway's actual loopback
+      # listener is up, which is the precondition for socat to have
+      # anything to forward to.
+      IB_API_PORT: ${IB_API_PORT:-4002}
     ports:
-      # Host-side mapping for optional debugging (VNC / curl).
-      # Bound to localhost to prevent LAN exposure. Use the same
-      # ${IB_PORT} as the supervisor + healthcheck so flipping
-      # paper→live moves every layer in lockstep.
-      - "127.0.0.1:${IB_PORT:-4002}:${IB_PORT:-4002}"
+      # Host-side mapping exposes the SOCAT proxy port (4004 paper /
+      # 4003 live) so ``curl 127.0.0.1:4004`` from the VM actually
+      # reaches a working API endpoint. Mapping the loopback-only
+      # bind (4002/4001) was a no-op — IB Gateway refuses non-127.0.0.1
+      # connections so nothing on the host could ever reach it.
+      # Bound to localhost to prevent LAN exposure.
+      - "127.0.0.1:${IB_PORT:-4004}:${IB_PORT:-4004}"
       - "127.0.0.1:5900:5900"
     volumes:
       - ib_gateway_settings:/home/ibgateway/Jts
@@ -508,7 +529,9 @@ services:
       # Compose "don't interpolate this at YAML parse time" — the
       # variable is expanded by bash INSIDE the container at
       # healthcheck run time, reading the container's own
-      # IB_API_PORT env var (set above from IB_PORT).
+      # IB_API_PORT env var (set above; now decoupled from IB_PORT
+      # so the gateway-internal port and the client-side socat port
+      # can flip independently).
       #
       # IBC typically takes 60-120s to log in before the port is
       # ready, so start_period is generous.

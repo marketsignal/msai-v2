@@ -37,7 +37,7 @@ startup watchdog, and the four-layer kill switch.
                      |  -> _HeartbeatThread      |
                      |                           |
                      |  Connects to:             |
-                     |    ib-gateway:4002 (paper) |
+                     |    ib-gateway:4004 (paper) |
                      |    postgres:5432          |
                      |    redis:6379             |
                      +---------------------------+
@@ -126,7 +126,7 @@ and constructs a `TradingNodePayload` with:
 
 Safety validations:
 
-- Paper/live port consistency: `paper_trading=True` requires `IB_PORT=4002`
+- Paper/live port consistency: `paper_trading=True` requires `IB_PORT` in `{4002, 4004}` (raw or socat-proxied paper); `paper_trading=False` requires `{4001, 4003}` (live). See `IB_PAPER_PORTS` / `IB_LIVE_PORTS` in `ib_port_validator.py`.
 - Account prefix consistency: paper accounts must start with `DU`
 - Mismatch raises `ValueError` -> `SPAWN_FAILED_PERMANENT`
 

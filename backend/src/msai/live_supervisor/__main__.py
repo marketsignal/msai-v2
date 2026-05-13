@@ -86,9 +86,11 @@ def _build_production_payload_factory(
     Settings-sourced fields (``database_url``, ``redis_url``,
     ``ib_account_id``) come from the process-wide
     :data:`msai.core.config.settings` singleton. ``ib_host`` defaults
-    to ``127.0.0.1`` and ``ib_port`` to ``4002`` (paper) — the
-    operator overrides these via env vars if running against a
-    non-default IB Gateway.
+    to ``127.0.0.1`` and ``ib_port`` to ``4004`` (gnzsnz socat proxy
+    for paper). IB Gateway itself binds to 127.0.0.1:4002 internally —
+    cross-container clients MUST use the socat port. The operator
+    overrides these via env vars when running against a non-default
+    IB Gateway (e.g. ``IB_PORT=4003`` for live mode).
 
     When a :class:`GatewayRouter` is provided and the deployment has
     an ``ib_login_key``, the factory resolves the IB host/port from

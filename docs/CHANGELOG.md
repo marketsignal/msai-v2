@@ -4,6 +4,18 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-05-12 — IB Gateway prod compose: clients must target socat proxy port (`fix/ib-port-prod-compose-4004`)
+
+The paper-live drill preflight (council Option 3) discovered that prod compose set `IB_PORT=${IB_PORT:-4002}` for the backend and live-supervisor. The gnzsnz/ib-gateway image binds IB Gateway to `127.0.0.1:4002` (paper) inside the container and refuses non-loopback API connections; a `socat` proxy listens on `0.0.0.0:4004` and re-originates each connection as localhost. Cross-container clients MUST target the socat port — `4002` TCP-connects but the API handshake silently times out. This bug would have blocked the first real-money trading attempt at the broker-connect step; it survived four deploy-pipeline slices because no end-to-end broker drill had ever fired against the prod compose stack.
+
+- **Compose defaults:** `docker-compose.prod.yml` now uses `IB_PORT=${IB_PORT:-4004}` for backend + live-supervisor. The ib-gateway service's `IB_API_PORT` is decoupled from `IB_PORT` and defaults to `4002`. Operator flip to live now requires THREE explicit overrides: `TRADING_MODE=live`, `IB_PORT=4003`, `IB_API_PORT=4001`.
+- **Pydantic default:** `Settings.ib_port` default raised from 4002 to 4004 so local-dev and one-shot CLI tools inherit the correct port without explicit env override.
+- **Regression guards (3 layers):** `test_compose_prod_ib_port.py` (structural YAML), `test_config.py::test_ib_port_default_is_socat_proxy_paper_port` (Pydantic default with `_env_file=None`), `tests/infra/test_workflow_deploy.sh` (bash grep on literal YAML strings).
+- **Stale-doc sweep (14 files):** CLAUDE.md, README.md, runbooks, architecture diagrams, paper-soak script error messages, use-case preconditions — all updated to distinguish the gnzsnz-internal-bind port from the client-side socat port. `ib_port_validator.py` was already correct (`IB_PAPER_PORTS = (4002, 4004)`).
+- **Deferred follow-up:** Durable live-mode env-var rendering — `scripts/msai-render-env.service` only handles secrets, not runtime config. Pre-real-money-drill: decide path for `TRADING_MODE` / `IB_PORT` / `IB_API_PORT` overrides.
+
+**Verification:** 1846 backend unit tests PASS; ruff + mypy --strict clean. UC1 broker-resolution smoke empirically PASSED in-session against the live prod IB Gateway (`server_version=178`, 6 paper sub-accounts returned). UC2 (full paper-drill resumption) deferred to post-merge auto-deploy. Plan-review: 8 iterations (productive convergence — each narrower than the last; not a foundation-wrong signal).
+
 ### 2026-05-12 — Fresh-VM data-path closure (`fix/fresh-vm-data-path-closure`)
 
 The first end-to-end "ingest market data + run a backtest" exercise on the prod Azure VM exposed three environment-only bugs that survived all four deployment-pipeline slices because no test ever exercised the data path on prod:

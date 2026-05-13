@@ -3,7 +3,8 @@
 
 Gated on ``RUN_PAPER_E2E=1`` (mirrors the existing opt-in e2e pattern
 in the repo). Requires the paper IB Gateway container to be up on
-port 4002 with a DU*/DF* account.
+client port 4004 (socat proxy) with a DU*/DF* account. Gateway binds
+to 127.0.0.1:4002 internally.
 
 Verifies the three things mocks can't:
 

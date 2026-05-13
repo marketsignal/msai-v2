@@ -110,8 +110,8 @@
 
 **Setup:**
 
-- `COMPOSE_PROFILES=broker docker compose -f docker-compose.dev.yml up -d` so IB Gateway is reachable on port 4002.
-- Paper IB account configured (`DU…` account prefix, port 4002).
+- `COMPOSE_PROFILES=broker docker compose -f docker-compose.dev.yml up -d` so IB Gateway is reachable on socat port 4004 (paper).
+- Paper IB account configured (`DU…` account prefix, client port 4004 — gateway binds 4002 internally).
 - Manifest with SPY only.
 
 **Steps:**

@@ -186,11 +186,14 @@ The convention is enforced as a runtime check in `build_live_trading_node_config
 ```
 IB_ACCOUNT_ID=DU0000000           # paper default; live starts with U
 IB_HOST=ib-gateway                # alias-accepted: IB_HOST or IB_GATEWAY_HOST
-IB_PORT=4004                      # alias-accepted: IB_PORT or IB_GATEWAY_PORT_PAPER
-                                  # Defaults to 4002 (raw paper). The dev compose stack
-                                  # injects 4004 (socat-proxied paper). For LIVE runs,
-                                  # set IB_PORT=4001 (raw) or 4003 (proxied) explicitly —
-                                  # there is NO IB_GATEWAY_PORT_LIVE settings field; the
+IB_PORT=4004                      # alias-accepted: IB_PORT or IB_GATEWAY_PORT_PAPER.
+                                  # Defaults to 4004 — the gnzsnz socat proxy port for
+                                  # paper. IB Gateway itself binds to 127.0.0.1:4002
+                                  # internally and refuses non-loopback API connections;
+                                  # cross-container clients MUST go through the proxy.
+                                  # For LIVE runs, set IB_PORT=4003 (socat proxy for
+                                  # live; IB Gateway binds 4001 internally) — there is
+                                  # NO IB_GATEWAY_PORT_LIVE settings field; the
                                   # supervisor's paper/live mismatch guard catches the
                                   # cross-wire.
 IB_CONNECT_TIMEOUT_SECONDS=5      # TCP + client-ready probe budget
@@ -198,7 +201,7 @@ IB_REQUEST_TIMEOUT_SECONDS=30     # per-request qualification budget
 IB_INSTRUMENT_CLIENT_ID=999       # default for one-shot CLI connections (see config.py:125-128)
 ```
 
-> **Important — what `core/config.py` actually reads.** The `Settings` model on the FastAPI/supervisor process exposes only `ib_host` and `ib_port`. Both accept aliases: `ib_port` is populated from `IB_PORT` **or** `IB_GATEWAY_PORT_PAPER` (whichever is set first), but **`IB_GATEWAY_PORT_LIVE` is NOT a `Settings` field** — it is set on the `live-supervisor` Compose service for downstream tooling (e.g., the gnzsnz IB Gateway image's socat proxy), not consumed by `Settings`. To run live, override `IB_PORT=4003` (or `4001`). CLAUDE.md's env-var snippet currently lists `IB_GATEWAY_PORT_LIVE=4001` — that snippet is drift; treat `core/config.py` as ground truth.
+> **Important — what `core/config.py` actually reads.** The `Settings` model on the FastAPI/supervisor process exposes only `ib_host` and `ib_port`. Both accept aliases: `ib_port` is populated from `IB_PORT` **or** `IB_GATEWAY_PORT_PAPER` (whichever is set first), but **`IB_GATEWAY_PORT_LIVE` is NOT a `Settings` field** — it is set on the `live-supervisor` Compose service for downstream tooling (e.g., the gnzsnz IB Gateway image's socat proxy), not consumed by `Settings`. To run live, override `IB_PORT=4003` (socat proxy) — `IB_GATEWAY_PORT_LIVE` in CLAUDE.md is documentation-only and not read by Pydantic Settings. Treat `core/config.py` as ground truth.
 
 Live subprocesses derive their `client_id` from a 31-bit hash of the deployment slug (`live_node_config.py::_derive_client_id`) rather than reusing the default `IB_INSTRUMENT_CLIENT_ID=999`, to avoid silent disconnects when two TradingNodes share a `client_id` (NautilusTrader gotcha #3).
 

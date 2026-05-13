@@ -63,12 +63,14 @@ class Settings(BaseSettings):
     ib_account_id: str = "DU0000000"
 
     # Interactive Brokers Gateway connection (Phase 4 task #154
-    # scope-B). Host + port together must match the account type:
-    # paper accounts (``DU...``) with port 4002, live accounts
-    # (``U...``) with port 4001. The ``live_node_config.py`` builder
-    # validates this via ``_validate_port_account_consistency`` —
-    # a mismatch crashes the subprocess at ``build_live_trading_node_config``
-    # time rather than silently sending orders to the wrong venue.
+    # scope-B). Host + port together must match the account type.
+    # The validator (``ib_port_validator.py``) accepts both raw and
+    # socat-proxied ports: paper = ``{4002, 4004}`` paired with
+    # ``DU*``/``DF*`` accounts; live = ``{4001, 4003}`` paired with
+    # ``U*``. ``live_node_config.py`` invokes the validator so a
+    # mismatch crashes the subprocess at
+    # ``build_live_trading_node_config`` time rather than silently
+    # sending orders to the wrong venue.
     # Accept both the legacy names (``IB_HOST`` / ``IB_PORT`` — used
     # by unit tests and local-dev setups) and the Docker-compose
     # names (``IB_GATEWAY_HOST`` / ``IB_GATEWAY_PORT_PAPER`` — set on
@@ -89,7 +91,13 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("IB_HOST", "IB_GATEWAY_HOST"),
     )
     ib_port: int = Field(
-        default=4002,
+        # 4004 = gnzsnz socat proxy port for paper. The image binds IB
+        # Gateway to 127.0.0.1:4002 internally; socat re-originates each
+        # cross-container connection as localhost. Targeting 4002 directly
+        # from outside the gateway container TCP-connects but the IB API
+        # handshake never completes — discovered in the 2026-05-12 paper
+        # drill. Live mode requires explicit ``IB_PORT=4003`` override.
+        default=4004,
         validation_alias=AliasChoices("IB_PORT", "IB_GATEWAY_PORT_PAPER"),
     )
 

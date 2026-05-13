@@ -18,7 +18,7 @@ Compose. There are two compose files:
 | backtest-worker | msai-claude-worker          | ./backend/Dockerfile.dev         | --            | --                             | default |
 | frontend        | msai-claude-frontend        | ./frontend/Dockerfile.dev        | 3000          | 3300                           | default |
 | live-supervisor | msai-claude-live-supervisor | ./backend/Dockerfile.dev         | --            | --                             | live    |
-| ib-gateway      | msai-claude-ib-gateway      | ghcr.io/gnzsnz/ib-gateway:stable | 4002/5900     | 127.0.0.1:4002, 127.0.0.1:5900 | live    |
+| ib-gateway      | msai-claude-ib-gateway      | ghcr.io/gnzsnz/ib-gateway:stable | 4004/5900     | 127.0.0.1:4004, 127.0.0.1:5900 | live    |
 
 ### Prod Compose Services (docker-compose.prod.yml)
 
@@ -81,41 +81,41 @@ container communication uses Docker DNS hostnames:
 |                             |                         |           |
 |                    +--------+---------+               |           |
 |                    |   ib-gateway     |               |           |
-|                    |   :4002 (paper)  |               |           |
-|                    |   :4001 (live)   |               |           |
+|                    |   :4004 (paper, socat→:4002)  |  |           |
+|                    |   :4003 (live, socat→:4001)   |  |           |
 |                    +------------------+               |           |
 +-------------------------------------------------------------------+
         |                                                   |
    Host :5433                                          Host :3300
    Host :6380                                          Host :8800
-   Host :4002 (127.0.0.1 only)
+   Host :4004 (127.0.0.1 only, paper socat proxy)
    Host :5900 (127.0.0.1 only, VNC)
 ```
 
 ### Inter-Container Communication Paths
 
-| From            | To         | Protocol    | Address         | Purpose                           |
-| --------------- | ---------- | ----------- | --------------- | --------------------------------- |
-| backend         | postgres   | TCP/asyncpg | postgres:5432   | App state (SQLAlchemy async)      |
-| backend         | redis      | TCP/Redis   | redis:6379      | Job queue, pub/sub, halt flag     |
-| backtest-worker | postgres   | TCP/asyncpg | postgres:5432   | Read/write backtest + trade rows  |
-| backtest-worker | redis      | TCP/Redis   | redis:6379      | arq job dequeue                   |
-| live-supervisor | postgres   | TCP/asyncpg | postgres:5432   | live_node_processes rows          |
-| live-supervisor | redis      | TCP/Redis   | redis:6379      | Command stream, halt flag         |
-| live-supervisor | ib-gateway | TCP/TWS API | ib-gateway:4002 | Trading subprocess connects to IB |
-| frontend        | backend    | HTTP        | localhost:8800  | Via browser (host network)        |
-| frontend        | backend    | WebSocket   | localhost:8800  | Live event stream                 |
+| From            | To         | Protocol    | Address         | Purpose                                                           |
+| --------------- | ---------- | ----------- | --------------- | ----------------------------------------------------------------- |
+| backend         | postgres   | TCP/asyncpg | postgres:5432   | App state (SQLAlchemy async)                                      |
+| backend         | redis      | TCP/Redis   | redis:6379      | Job queue, pub/sub, halt flag                                     |
+| backtest-worker | postgres   | TCP/asyncpg | postgres:5432   | Read/write backtest + trade rows                                  |
+| backtest-worker | redis      | TCP/Redis   | redis:6379      | arq job dequeue                                                   |
+| live-supervisor | postgres   | TCP/asyncpg | postgres:5432   | live_node_processes rows                                          |
+| live-supervisor | redis      | TCP/Redis   | redis:6379      | Command stream, halt flag                                         |
+| live-supervisor | ib-gateway | TCP/TWS API | ib-gateway:4004 | Trading subprocess connects to IB through the socat proxy (paper) |
+| frontend        | backend    | HTTP        | localhost:8800  | Via browser (host network)                                        |
+| frontend        | backend    | WebSocket   | localhost:8800  | Live event stream                                                 |
 
 ### Health Checks
 
 Every service has a health check in compose:
 
-| Service    | Probe                                                                | Interval | Start Period |
-| ---------- | -------------------------------------------------------------------- | -------- | ------------ |
-| postgres   | `pg_isready -U msai`                                                 | 5s       | --           |
-| redis      | `redis-cli ping`                                                     | 5s       | --           |
-| backend    | `python -c "urllib.request.urlopen('http://localhost:8000/health')"` | 5s       | 30s          |
-| ib-gateway | `bash -c 'exec 3<>/dev/tcp/localhost/4002'`                          | 15s      | 180s         |
+| Service    | Probe                                                                                                            | Interval | Start Period |
+| ---------- | ---------------------------------------------------------------------------------------------------------------- | -------- | ------------ |
+| postgres   | `pg_isready -U msai`                                                                                             | 5s       | --           |
+| redis      | `redis-cli ping`                                                                                                 | 5s       | --           |
+| backend    | `python -c "urllib.request.urlopen('http://localhost:8000/health')"`                                             | 5s       | 30s          |
+| ib-gateway | `bash -c 'exec 3<>/dev/tcp/localhost/$$IB_API_PORT'` (probes the gateway's loopback bind: 4002 paper, 4001 live) | 15s      | 180s         |
 
 The `live-supervisor` depends on `ib-gateway: service_healthy` (not
 `service_started`), so the supervisor only boots once IBC has logged in
@@ -142,21 +142,21 @@ reload:
 Key environment variables consumed by the backend
 (`core/config.py:Settings`):
 
-| Variable                 | Default                   | Description                             |
-| ------------------------ | ------------------------- | --------------------------------------- |
-| DATABASE_URL             | postgresql+asyncpg://...  | Async SQLAlchemy database URL           |
-| REDIS_URL                | redis://localhost:6379    | Redis connection URL                    |
-| DATA_ROOT                | (project)/data            | Root for Parquet, reports, catalogs     |
-| STRATEGIES_ROOT          | (project)/strategies      | Strategy Python files directory         |
-| ENVIRONMENT              | development               | `development` or `production`           |
-| AZURE_TENANT_ID          | (empty)                   | Entra ID tenant for JWT validation      |
-| AZURE_CLIENT_ID          | (empty)                   | Entra ID app client ID                  |
-| MSAI_API_KEY             | (empty)                   | Dev API key bypass for auth             |
-| CORS_ORIGINS             | ["http://localhost:3000"] | Allowed CORS origins                    |
-| POLYGON_API_KEY          | (empty)                   | Polygon.io API key                      |
-| DATABENTO_API_KEY        | (empty)                   | Databento API key                       |
-| IB_ACCOUNT_ID            | DU0000000                 | IB paper/live account ID                |
-| IB_HOST                  | 127.0.0.1                 | IB Gateway hostname                     |
-| IB_PORT                  | 4002                      | IB Gateway port (4002=paper, 4001=live) |
-| STARTUP_HEALTH_TIMEOUT_S | 60.0                      | Max wait for trader.is_running          |
-| BACKTEST_TIMEOUT_SECONDS | 1800                      | arq job timeout for backtests           |
+| Variable                 | Default                   | Description                                              |
+| ------------------------ | ------------------------- | -------------------------------------------------------- |
+| DATABASE_URL             | postgresql+asyncpg://...  | Async SQLAlchemy database URL                            |
+| REDIS_URL                | redis://localhost:6379    | Redis connection URL                                     |
+| DATA_ROOT                | (project)/data            | Root for Parquet, reports, catalogs                      |
+| STRATEGIES_ROOT          | (project)/strategies      | Strategy Python files directory                          |
+| ENVIRONMENT              | development               | `development` or `production`                            |
+| AZURE_TENANT_ID          | (empty)                   | Entra ID tenant for JWT validation                       |
+| AZURE_CLIENT_ID          | (empty)                   | Entra ID app client ID                                   |
+| MSAI_API_KEY             | (empty)                   | Dev API key bypass for auth                              |
+| CORS_ORIGINS             | ["http://localhost:3000"] | Allowed CORS origins                                     |
+| POLYGON_API_KEY          | (empty)                   | Polygon.io API key                                       |
+| DATABENTO_API_KEY        | (empty)                   | Databento API key                                        |
+| IB_ACCOUNT_ID            | DU0000000                 | IB paper/live account ID                                 |
+| IB_HOST                  | 127.0.0.1                 | IB Gateway hostname                                      |
+| IB_PORT                  | 4004                      | IB Gateway client port via socat (4004=paper, 4003=live) |
+| STARTUP_HEALTH_TIMEOUT_S | 60.0                      | Max wait for trader.is_running                           |
+| BACKTEST_TIMEOUT_SECONDS | 1800                      | arq job timeout for backtests                            |

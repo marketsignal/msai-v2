@@ -16,6 +16,7 @@ DEPLOY_YML=".github/workflows/deploy.yml"
 REAPER_YML=".github/workflows/reap-orphan-nsg-rules.yml"
 DEPLOY_SH="scripts/deploy-on-vm.sh"
 BACKUP_SH="scripts/backup-to-blob.sh"
+COMPOSE_PROD="docker-compose.prod.yml"
 
 for f in "$DEPLOY_YML" "$REAPER_YML" "$DEPLOY_SH" "$BACKUP_SH"; do
     [[ -f "$f" ]] || { echo "FAIL: $f missing" >&2; exit 1; }
@@ -223,3 +224,31 @@ grep -q "scripts/deploy-smoke.sh" "$DEPLOY_YML" \
     || { echo "FAIL: deploy.yml must scp deploy-smoke.sh" >&2; exit 1; }
 
 echo "All Slice 3 + Slice 4 + fresh-VM-data-path-closure deploy-pipeline tests passed."
+
+# ─── IB_PORT decoupling regression (PR fresh-VM-data-path #62) ─────────────────
+# After the 2026-05-12 paper-drill preflight discovered that prod compose'
+# IB_PORT=4002 default never matches IB Gateway's API (gnzsnz socat proxies
+# 4004→127.0.0.1:4002 internally), the client services must use the socat
+# port, and the gateway's IB_API_PORT must be DECOUPLED from IB_PORT.
+
+# Backend service uses IB_PORT default 4004 (socat paper proxy).
+awk '/^  backend:/{f=1} f && /IB_PORT:[[:space:]]*\$\{IB_PORT:-4004\}/{found=1; exit} /^  [a-z-]+:$/ && !/^  backend:/{f=0} END{exit !found}' "$COMPOSE_PROD" \
+    || { echo "FAIL: docker-compose.prod.yml backend service must set IB_PORT default to 4004 (socat paper proxy), not 4002" >&2; exit 1; }
+
+# live-supervisor service uses IB_PORT default 4004 (socat paper proxy).
+awk '/^  live-supervisor:/{f=1} f && /IB_PORT:[[:space:]]*\$\{IB_PORT:-4004\}/{found=1; exit} /^  [a-z-]+:$/ && !/^  live-supervisor:/{f=0} END{exit !found}' "$COMPOSE_PROD" \
+    || { echo "FAIL: docker-compose.prod.yml live-supervisor service must set IB_PORT default to 4004" >&2; exit 1; }
+
+# ib-gateway service: IB_API_PORT decoupled from IB_PORT (gateway-internal port stays 4002 paper / 4001 live).
+awk '/^  ib-gateway:/{f=1} f && /IB_API_PORT:[[:space:]]*\$\{IB_API_PORT:-4002\}/{found=1; exit} /^  [a-z-]+:$/ && !/^  ib-gateway:/{f=0} END{exit !found}' "$COMPOSE_PROD" \
+    || { echo "FAIL: docker-compose.prod.yml ib-gateway IB_API_PORT must be decoupled from IB_PORT and default to 4002 (gateway's loopback bind port for paper)" >&2; exit 1; }
+
+# Host port mapping uses IB_PORT default 4004 (exposes the socat proxy, not the loopback-only bind).
+grep -qE '127\.0\.0\.1:\$\{IB_PORT:-4004\}:\$\{IB_PORT:-4004\}' "$COMPOSE_PROD" \
+    || { echo "FAIL: docker-compose.prod.yml ib-gateway port mapping must expose the socat proxy (4004 paper default), not the loopback bind" >&2; exit 1; }
+
+# Misleading "Pre-2026-05-09" comment from PR #50 must be removed.
+! grep -q "Pre-2026-05-09 this defaulted to 4004 — never matched any ib-gateway listener" "$COMPOSE_PROD" \
+    || { echo "FAIL: docker-compose.prod.yml still contains misleading PR #50 comment about a 4004 default that 'never matched'" >&2; exit 1; }
+
+echo "IB_PORT decoupling regression assertions passed."
