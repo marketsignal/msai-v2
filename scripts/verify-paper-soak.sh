@@ -107,7 +107,8 @@ fi
 # Trading-mode / account-id consistency — matches what
 # ``_validate_port_account_consistency`` in ``live_node_config.py``
 # enforces inside the subprocess. Paper mode (default) requires a
-# ``DU*`` account + port 4002; live mode requires a non-paper
+# ``DU*``/``DF*`` account + a paper port (4002 raw or 4004 socat-
+# proxied); live mode requires a non-paper
 # account (not starting with ``DU``) + port 4001. This preflight
 # rejects the combinations that would crash the subprocess with
 # ``RECONCILIATION_FAILED`` seconds after startup.
@@ -131,14 +132,14 @@ if [[ "${_trading_mode}" == "paper" ]]; then
   if [[ ! "${IB_ACCOUNT_ID}" =~ ^D(U|F) ]]; then
     echo "ERROR: TRADING_MODE=paper requires IB_ACCOUNT_ID starting with 'DU' or 'DF'." >&2
     echo "       Got IB_ACCOUNT_ID='${IB_ACCOUNT_ID}'. Either use a paper" >&2
-    echo "       account or set TRADING_MODE=live IB_PORT=4001." >&2
+    echo "       account or set TRADING_MODE=live IB_PORT=4003 IB_API_PORT=4001." >&2
     exit 1
   fi
 elif [[ "${_trading_mode}" == "live" ]]; then
   if [[ "${IB_ACCOUNT_ID}" =~ ^D(U|F) ]]; then
     echo "ERROR: TRADING_MODE=live requires a live IB_ACCOUNT_ID (not 'DU*'/'DF*')." >&2
     echo "       Got IB_ACCOUNT_ID='${IB_ACCOUNT_ID}'. Either flip to paper" >&2
-    echo "       (unset TRADING_MODE + IB_PORT) or use a real live account." >&2
+    echo "       (unset TRADING_MODE + IB_PORT + IB_API_PORT) or use a real live account." >&2
     exit 1
   fi
   echo "[paper-soak] WARNING: running in LIVE trading mode — orders will" >&2

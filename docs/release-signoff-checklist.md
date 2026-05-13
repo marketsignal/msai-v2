@@ -65,9 +65,9 @@
       validated by the next item below.
 - [ ] **Production compose stack validation** — operator brings
       up the prod stack on the deployment host in paper mode
-      (`COMPOSE_FILE=docker-compose.prod.yml TRADING_MODE=paper IB_PORT=4002 ./scripts/verify-paper-soak.sh`)
+      (`COMPOSE_FILE=docker-compose.prod.yml TRADING_MODE=paper ./scripts/verify-paper-soak.sh`)
       AND in live mode
-      (`COMPOSE_FILE=docker-compose.prod.yml TRADING_MODE=live IB_PORT=4001 ...`).
+      (`COMPOSE_FILE=docker-compose.prod.yml TRADING_MODE=live IB_PORT=4003 IB_API_PORT=4001 ...`).
       Confirms that the prod healthcheck probes the right port
       for the selected mode and that both paper and live
       wiring actually boot on the production image. The

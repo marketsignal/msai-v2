@@ -230,8 +230,8 @@ CORS_ORIGINS=["http://localhost:3000"]
 POLYGON_API_KEY=your-key
 DATABENTO_API_KEY=your-key
 IB_GATEWAY_HOST=ib-gateway
-IB_GATEWAY_PORT_PAPER=4002
-IB_GATEWAY_PORT_LIVE=4001
+IB_GATEWAY_PORT_PAPER=4004              # client-side socat proxy port (gateway binds 4002 internally)
+IB_GATEWAY_PORT_LIVE=4003               # client-side socat proxy port (gateway binds 4001 internally); documentation-only — flip via IB_PORT=4003
 IB_ACCOUNT_ID=DU...                     # paper; real money starts with U
 ```
 
@@ -266,7 +266,7 @@ All API routes are versioned under `/api/v1/` (see `.claude/rules/api-design.md`
 
 1. `curl -sf http://localhost:8800/health` — if it fails, start the stack: `docker compose -f docker-compose.dev.yml up -d`.
 2. Confirm the UI responds at `http://localhost:3300` (only if UI use cases are in scope).
-3. For live-trading use cases: confirm IB Gateway is reachable (paper account `DU...` on port 4002, live account on 4001) — see `.claude/rules/nautilus.md` gotcha #6.
+3. For live-trading use cases: confirm IB Gateway is reachable (paper account `DU...` on port 4004 — socat proxy to internal 4002; live account on 4003 — socat to internal 4001) — see `.claude/rules/nautilus.md` gotcha #6.
 
 **Auth.** The app uses Azure Entra ID (MSAL on the frontend, PyJWT on the backend). E2E runs should authenticate via the documented login flow OR use a dev-mode bypass token if one is configured — never by forging JWTs or reading secrets from disk.
 

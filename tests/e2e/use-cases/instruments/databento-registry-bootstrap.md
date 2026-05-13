@@ -141,7 +141,7 @@ docker exec -e RUN_PAPER_E2E=1 msai-claude-backend sh -c "cd /app && \
 
 **Interface:** API
 
-**Prerequisite:** IB Gateway container running (`COMPOSE_PROFILES=broker docker compose -f docker-compose.dev.yml up -d`) with paper account reachable on port 4002.
+**Prerequisite:** IB Gateway container running (`COMPOSE_PROFILES=broker docker compose -f docker-compose.dev.yml up -d`) with paper account reachable on socat port 4004 (gateway loopback bind: 4002).
 
 **Steps:**
 

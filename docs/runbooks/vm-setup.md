@@ -85,7 +85,9 @@ MSAI_API_KEY=                              # leave empty unless using X-API-Key 
 JWT_TENANT_ID=                             # defaults to AZURE_TENANT_ID if empty
 JWT_CLIENT_ID=                             # defaults to AZURE_CLIENT_ID if empty
 TRADING_MODE=paper                         # or "live" (broker profile only)
-IB_PORT=4002                               # 4002 paper, 4001 live
+# Optional — compose defaults are correct for paper. Live flip requires BOTH:
+# IB_PORT=4003                             # client-side socat port (4004 paper / 4003 live)
+# IB_API_PORT=4001                         # gateway internal loopback bind (4002 paper / 4001 live)
 EOF
 chmod 600 /home/msaiadmin/.env
 ```

@@ -6,7 +6,7 @@ Common issues and resolutions for the Interactive Brokers Gateway container.
 
 The IB Gateway runs as a Docker container (`ib-gateway` service in `docker-compose.prod.yml`) using the `ghcr.io/gnzsnz/ib-gateway:stable` image. It exposes:
 
-- Port 4002: IB API (paper trading)
+- Port 4004: IB API (paper trading — socat proxy to internal 127.0.0.1:4002)
 - Port 5900: VNC for visual debugging
 
 ## Issue 1: Connection Drops
@@ -24,7 +24,7 @@ docker compose -f docker-compose.prod.yml logs ib-gateway --tail=50
 
 # Test connectivity from the backend container
 docker compose -f docker-compose.prod.yml exec backend \
-  python -c "import socket; s=socket.create_connection(('ib-gateway', 4002), timeout=5); print('OK'); s.close()"
+  python -c "import socket; s=socket.create_connection(('ib-gateway', 4004), timeout=5); print('OK'); s.close()"
 ```
 
 **Resolution**:

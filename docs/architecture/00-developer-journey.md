@@ -73,8 +73,8 @@ Read top-to-bottom: where data enters, where commands enter, where state lands.
         │                                     │
         │                                     ▼
         │                          ┌─ IB GATEWAY ─────────┐
-        │                          │ paper :4002          │
-        │                          │ live  :4001          │
+        │                          │ paper :4004 (socat)  │
+        │                          │ live  :4003 (socat)  │
         │                          └──────────┬───────────┘
         │                                     │
         │                                     ▼
@@ -132,7 +132,7 @@ A backtest portfolio is an **allocation of `GraduationCandidate` rows** with wei
 
 ### 7. [Deploy a live portfolio and wire it to an IB account](how-live-portfolios-and-ib-accounts.md)
 
-Once the basket vets out, you create a **live portfolio** at `POST /api/v1/live-portfolios`, add member strategies to its draft revision, and **freeze** that revision via `POST /api/v1/live-portfolios/{id}/snapshot`. Frozen revisions are immutable — they get a hash. To deploy, you `POST /api/v1/live/start-portfolio` with the `portfolio_revision_id`, an `account_id` (IB account — `DU…` for paper, `U…` for live), and `paper_trading: true|false`. The live supervisor spawns a TradingNode subprocess, connects to IB Gateway on port 4002 (paper) or 4001 (live), bootstraps the instruments, loads the strategies wrapped by `FailureIsolatedStrategy` (so one strategy crashing doesn't kill the node), and starts trading. The 4-layer kill-all (`POST /api/v1/live/kill-all`) gives you a panic button.
+Once the basket vets out, you create a **live portfolio** at `POST /api/v1/live-portfolios`, add member strategies to its draft revision, and **freeze** that revision via `POST /api/v1/live-portfolios/{id}/snapshot`. Frozen revisions are immutable — they get a hash. To deploy, you `POST /api/v1/live/start-portfolio` with the `portfolio_revision_id`, an `account_id` (IB account — `DU…` for paper, `U…` for live), and `paper_trading: true|false`. The live supervisor spawns a TradingNode subprocess, connects to IB Gateway through the socat proxy on port 4004 (paper) or 4003 (live) — the gateway itself binds to 127.0.0.1:4002/4001 internally, bootstraps the instruments, loads the strategies wrapped by `FailureIsolatedStrategy` (so one strategy crashing doesn't kill the node), and starts trading. The 4-layer kill-all (`POST /api/v1/live/kill-all`) gives you a panic button.
 
 ### 8. [Watch it run in real time](how-real-time-monitoring-works.md)
 

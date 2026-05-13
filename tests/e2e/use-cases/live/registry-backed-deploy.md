@@ -16,7 +16,7 @@ Per `.claude/rules/testing.md`: each case = Intent → Steps → Verification �
 **Pre-conditions:**
 
 - Stack up: `curl -sf http://localhost:8800/health` returns 200
-- IB Gateway reachable on paper (`IB_GATEWAY_PORT_PAPER=4002`, account `DUP733211`)
+- IB Gateway reachable on paper (`IB_GATEWAY_PORT_PAPER=4004` via socat → gateway loopback 4002, account `DUP733211`)
 - QQQ is NOT in the registry (verify: `psql $DATABASE_URL -c "SELECT * FROM instrument_aliases WHERE alias_string LIKE 'QQQ%'"` returns zero rows)
 
 **Steps:**
