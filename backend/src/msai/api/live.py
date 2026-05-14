@@ -74,6 +74,8 @@ from msai.services.risk_engine import RiskEngine
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from msai.models.graduation_candidate import GraduationCandidate
+
 log = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/live", tags=["live"])
@@ -247,6 +249,426 @@ async def live_start(
     )
 
 
+async def _resolve_binding_for_start_portfolio(
+    *,
+    db: AsyncSession,
+    request: PortfolioStartRequest,
+    user_id: UUID | None,
+    claims: dict[str, Any],
+) -> tuple[
+    str,
+    list[tuple[LivePortfolioRevisionStrategy, GraduationCandidate]],
+    list[tuple[list[str], list[str]]],
+]:
+    """Pre-reserve snapshot binding (Bug #3, replaces PR #63's 503
+    guard). Loads the frozen revision + members, resolves each
+    member's bound :class:`GraduationCandidate`, verifies
+    config-minus-injected + instruments match, computes a stable
+    binding fingerprint, returns it for inclusion in the idempotency
+    body_hash + the resolved (member, candidate) pairs for downstream
+    stage-link logic.
+
+    Raises ``HTTPException`` 422 on any binding failure:
+
+    - ``BINDING_REVISION_NOT_FOUND`` — bad request, no such revision
+    - ``LIVE_DEPLOY_REPAIR_REQUIRED`` — warm restart but candidate
+      vanished after first deploy (e.g. archived)
+    - ``BINDING_NOT_GRADUATED`` — first deploy but no live_candidate
+    - ``BINDING_AMBIGUOUS`` — multiple live_candidates for same strategy
+    - ``BINDING_INELIGIBLE`` — linked candidate drifted to archived
+    - ``BINDING_MISMATCH`` — config or instruments diverge
+    - ``BINDING_INSTRUMENTS_MISSING`` — pre-PR-#65 candidate without
+      instruments stamp (operator must re-graduate / backfill)
+
+    See ``docs/plans/2026-05-13-live-deploy-safety-trio.md`` §Bug #3.
+    """
+    from msai.models.graduation_candidate import GraduationCandidate
+    from msai.services.graduation import ELIGIBLE_FOR_LIVE_PORTFOLIO
+    from msai.services.live.snapshot_binding import (
+        BindingInstrumentsMissingError,
+        BindingMismatchError,
+        candidate_instruments,
+        compute_binding_fingerprint,
+        compute_member_fingerprint,
+        verify_member_matches_candidate,
+    )
+
+    # ----- 1. Identity signature (for warm-restart lookup) -----
+    identity = derive_portfolio_deployment_identity(
+        user_id=user_id,
+        portfolio_revision_id=request.portfolio_revision_id,
+        account_id=request.account_id,
+        paper_trading=request.paper_trading,
+        ib_login_key=request.ib_login_key,
+        user_sub=claims.get("sub"),
+    )
+    identity_signature = identity.signature()
+
+    # ----- 2. Existing deployment lookup (warm restart) -----
+    existing_deployment = (
+        await db.execute(
+            select(LiveDeployment).where(LiveDeployment.identity_signature == identity_signature)
+        )
+    ).scalar_one_or_none()
+    existing_deployment_id = existing_deployment.id if existing_deployment is not None else None
+
+    # ----- 2b. Codex round-3 P2: surface (revision_id, account_id)
+    # collisions BEFORE the binding lookup. If an existing deployment
+    # under a DIFFERENT identity already linked the only live_candidate,
+    # the first-deploy branch below would return BINDING_NOT_GRADUATED
+    # and operators would be told to re-graduate when the correct
+    # remediation is to stop/archive the colliding deployment. Mirrors
+    # the gate further down inside the handler so the error surfaces
+    # at the binding layer too.
+    if existing_deployment_id is None:
+        collision_row = (
+            await db.execute(
+                select(LiveDeployment).where(
+                    LiveDeployment.portfolio_revision_id == request.portfolio_revision_id,
+                    LiveDeployment.account_id == request.account_id,
+                    LiveDeployment.identity_signature != identity_signature,
+                )
+            )
+        ).scalar_one_or_none()
+        if collision_row is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": {
+                        "code": "LIVE_DEPLOY_CONFLICT",
+                        "message": (
+                            "An existing deployment for this portfolio revision + account "
+                            "exists with a different identity (different ib_login_key, "
+                            "paper_trading, or other identity-bearing field). Archive/stop "
+                            "the existing row OR re-submit with the same identity."
+                        ),
+                        "details": {
+                            "existing_deployment_id": str(collision_row.id),
+                            "existing_status": collision_row.status,
+                            "existing_ib_login_key": collision_row.ib_login_key,
+                            "existing_paper_trading": collision_row.paper_trading,
+                            "requested_ib_login_key": request.ib_login_key,
+                            "requested_paper_trading": request.paper_trading,
+                            "hint": (
+                                "stop the existing deployment via POST /api/v1/live/stop, "
+                                "then retry"
+                            ),
+                        },
+                    }
+                },
+            )
+
+    # ----- 3. Load frozen revision + members (no lock — binding is a
+    # read-only check; the actual deploy below takes SELECT FOR UPDATE).
+    revision = (
+        await db.execute(
+            select(LivePortfolioRevision).where(
+                LivePortfolioRevision.id == request.portfolio_revision_id
+            )
+        )
+    ).scalar_one_or_none()
+    if revision is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Portfolio revision {request.portfolio_revision_id} not found",
+        )
+    members: list[LivePortfolioRevisionStrategy] = list(
+        (
+            await db.execute(
+                select(LivePortfolioRevisionStrategy)
+                .where(LivePortfolioRevisionStrategy.revision_id == revision.id)
+                .order_by(LivePortfolioRevisionStrategy.order_index)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not members:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": {
+                    "code": "BINDING_EMPTY_REVISION",
+                    "message": "Frozen revision has no strategy members; cannot deploy.",
+                }
+            },
+        )
+
+    # ----- 4. Per-member candidate resolution -----
+    resolved_bindings: list[tuple[LivePortfolioRevisionStrategy, GraduationCandidate]] = []
+    canonical_per_member: list[tuple[list[str], list[str]]] = []
+    # Codex round-4 P2: the deployment row is committed BEFORE the
+    # candidate gets linked (see link block below). A retry that lands
+    # inside the upsert→link window — or after a previous attempt failed
+    # at link time and left an unlinked row marked `failed`/`starting` —
+    # would otherwise hit the warm-restart branch and incorrectly raise
+    # LIVE_DEPLOY_REPAIR_REQUIRED. Treat unlinked rows for the same
+    # identity as RETRYABLE: fall through to the first-deploy lookup
+    # path. The link-block P1 race guard (`locked.deployment_id !=
+    # deployment.id`) prevents cross-deployment rebinding even if a
+    # candidate later attaches mid-flight.
+    existing_unlinked_retry = existing_deployment is not None and existing_deployment.status in (
+        "starting",
+        "failed",
+        "stopped",
+    )
+    for member in members:
+        candidate: GraduationCandidate | None = None
+        if existing_deployment_id is not None:
+            # Warm restart: deterministic — candidate must be linked to
+            # this deployment from a prior successful start.
+            candidate = (
+                await db.execute(
+                    select(GraduationCandidate).where(
+                        GraduationCandidate.strategy_id == member.strategy_id,
+                        GraduationCandidate.deployment_id == existing_deployment_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if candidate is None and not existing_unlinked_retry:
+                # Codex iter-4 P1 #4: do NOT fall back to the first-deploy
+                # query when this looks like a successful prior deploy
+                # whose linked candidate was archived — operator must
+                # repair. Codex round-4 P2: the carve-out is for prior
+                # deploys that NEVER completed linking (status in
+                # {starting, failed, stopped}) — those retry through
+                # the first-deploy lookup below; the link-block P1 race
+                # guard prevents cross-deployment rebinding.
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "error": {
+                            "code": "LIVE_DEPLOY_REPAIR_REQUIRED",
+                            "message": (
+                                f"Existing deployment {existing_deployment_id} has no "
+                                f"linked GraduationCandidate for strategy "
+                                f"{member.strategy_id}. Likely the candidate was "
+                                f"archived after first deploy. Operator must restore "
+                                f"the candidate OR archive the deployment row before "
+                                f"re-deploying."
+                            ),
+                            "details": {
+                                "existing_deployment_id": str(existing_deployment_id),
+                                "strategy_id": str(member.strategy_id),
+                                "existing_deployment_status": (
+                                    existing_deployment.status
+                                    if existing_deployment is not None
+                                    else None
+                                ),
+                            },
+                        }
+                    },
+                )
+
+        if candidate is None:
+            # First deploy OR retryable unlinked existing deployment:
+            # exactly one candidate at live_candidate with no link yet.
+            matched = list(
+                (
+                    await db.execute(
+                        select(GraduationCandidate).where(
+                            GraduationCandidate.strategy_id == member.strategy_id,
+                            GraduationCandidate.stage == "live_candidate",
+                            GraduationCandidate.deployment_id.is_(None),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if len(matched) == 0:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "error": {
+                            "code": "BINDING_NOT_GRADUATED",
+                            "message": (
+                                f"Strategy {member.strategy_id} has no GraduationCandidate "
+                                f"at stage `live_candidate` with deployment_id=NULL. "
+                                f"Walk the candidate through the graduation pipeline first."
+                            ),
+                            "details": {"strategy_id": str(member.strategy_id)},
+                        }
+                    },
+                )
+            if len(matched) > 1:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        "error": {
+                            "code": "BINDING_AMBIGUOUS",
+                            "message": (
+                                f"Strategy {member.strategy_id} has {len(matched)} "
+                                f"live_candidate rows — operator must archive duplicates "
+                                f"or define an explicit tie-breaker."
+                            ),
+                            "details": {
+                                "strategy_id": str(member.strategy_id),
+                                "candidate_ids": [str(c.id) for c in matched],
+                            },
+                        }
+                    },
+                )
+            candidate = matched[0]
+
+        # ----- 5. Eligibility guard (Codex iter-4 P1 #5).
+        if candidate.stage not in ELIGIBLE_FOR_LIVE_PORTFOLIO:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": {
+                        "code": "BINDING_INELIGIBLE",
+                        "message": (
+                            f"Candidate {candidate.id} is at stage `{candidate.stage}`, "
+                            f"not in ELIGIBLE_FOR_LIVE_PORTFOLIO. Re-graduate or pick "
+                            f"a different candidate."
+                        ),
+                        "details": {
+                            "candidate_id": str(candidate.id),
+                            "stage": candidate.stage,
+                            "eligible_stages": sorted(ELIGIBLE_FOR_LIVE_PORTFOLIO),
+                        },
+                    }
+                },
+            )
+
+        # ----- 6. Canonicalize instruments via the LIVE resolver
+        # (lookup_for_live) so futures rolls + alias drift don't
+        # false-reject equivalent symbols. Plan §step 2 instruments
+        # canonicalization — Codex round-1 P2 fix. The resolver is
+        # pure-registry-read, no IB qualification.
+        from msai.services.nautilus.live_instrument_bootstrap import (
+            exchange_local_today,
+        )
+        from msai.services.nautilus.security_master.live_resolver import (
+            LiveResolverError,
+            lookup_for_live,
+        )
+
+        # PR round-2 P2: extract candidate instruments via a guarded call
+        # so a pre-contract candidate (missing `config["instruments"]`)
+        # surfaces as 422 BINDING_INSTRUMENTS_MISSING — not a 500.
+        try:
+            cand_raw_instruments = candidate_instruments(candidate)
+        except BindingInstrumentsMissingError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": {
+                        "code": "BINDING_INSTRUMENTS_MISSING",
+                        "message": str(exc),
+                        "details": {
+                            "candidate_id": str(candidate.id),
+                            "hint": (
+                                "run `scripts/backfill_candidate_instruments.py` to "
+                                "stamp `instruments` into existing pre-Bug-#3 candidates, "
+                                "OR re-graduate this candidate."
+                            ),
+                        },
+                    }
+                },
+            ) from exc
+
+        as_of = exchange_local_today()
+        try:
+            member_canonical = [
+                r.canonical_id
+                for r in await lookup_for_live(
+                    list(member.instruments), as_of_date=as_of, session=db
+                )
+            ]
+            candidate_canonical = [
+                r.canonical_id
+                for r in await lookup_for_live(cand_raw_instruments, as_of_date=as_of, session=db)
+            ]
+        except LiveResolverError as exc:
+            # PR round-2 P3: surface the typed resolver envelope (registry
+            # code, missing symbols, conflicts, as_of_date) so the operator
+            # gets the same diagnostic shape the supervisor surfaces.
+            envelope = exc.to_error_message() if hasattr(exc, "to_error_message") else {}
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": {
+                        "code": "BINDING_INSTRUMENT_RESOLVE_FAILED",
+                        "message": str(exc),
+                        "details": {
+                            "member_instruments": list(member.instruments),
+                            "candidate_instruments": cand_raw_instruments,
+                            "resolver_envelope": envelope,
+                        },
+                    }
+                },
+            ) from exc
+
+        # ----- 7. Verify binding using canonical instruments.
+        try:
+            verify_member_matches_candidate(
+                member,
+                candidate,
+                member_instruments_canonical=member_canonical,
+                candidate_instruments_canonical=candidate_canonical,
+            )
+        except BindingMismatchError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": {
+                        "code": "BINDING_MISMATCH",
+                        "message": str(exc),
+                        "details": {
+                            "member_id": str(member.id),
+                            "candidate_id": str(candidate.id),
+                            "mismatches": exc.mismatches,
+                        },
+                    }
+                },
+            ) from exc
+        except BindingInstrumentsMissingError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": {
+                        "code": "BINDING_INSTRUMENTS_MISSING",
+                        "message": str(exc),
+                        "details": {
+                            "candidate_id": str(candidate.id),
+                            "hint": (
+                                "run `scripts/backfill_candidate_instruments.py` to "
+                                "stamp `instruments` into existing pre-Bug-#3 "
+                                "candidates, OR re-graduate this candidate."
+                            ),
+                        },
+                    }
+                },
+            ) from exc
+
+        resolved_bindings.append((member, candidate))
+        canonical_per_member.append((member_canonical, candidate_canonical))
+
+    # ----- 8. Compute binding fingerprint using LIVE-resolved
+    # canonical instrument lists (Codex round-1 P2). The fingerprint
+    # must use the SAME canonical form the binding verification used
+    # — otherwise futures rolls would produce different fingerprints
+    # on every effective-date boundary.
+    member_parts: list[str] = []
+    for (member, candidate), (m_canon, c_canon) in zip(
+        resolved_bindings, canonical_per_member, strict=True
+    ):
+        member_parts.append(
+            compute_member_fingerprint(
+                member_id=str(member.id),
+                member_config=member.config,
+                member_instruments_canonical=m_canon,
+                candidate_id=str(candidate.id),
+                candidate_config=candidate.config,
+                candidate_instruments_canonical=c_canon,
+            )
+        )
+    binding_fingerprint = compute_binding_fingerprint(member_parts)
+    return binding_fingerprint, resolved_bindings, canonical_per_member
+
+
 @router.post("/start-portfolio")
 async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispatch by design
     request: PortfolioStartRequest,
@@ -272,46 +694,36 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
        paper_trading)`` via :class:`PortfolioDeploymentIdentity`.
     """
     # ------------------------------------------------------------------
-    # Real-money safety gate (Codex Contrarian's blocking objection #1,
-    # 2026-05-13 graduation-gate council). The graduation gate at
-    # ``portfolio_service._is_graduated`` checks ``strategy_id`` only —
-    # but portfolio members carry arbitrary ``config`` + ``instruments``.
-    # Until the snapshot-binding follow-up lands (verifying that the
-    # frozen revision member matches the approved GraduationCandidate),
-    # live (real-money) deployments are blocked at this boundary.
+    # Layer 0: Pre-reserve snapshot binding (Bug #3, replaces the
+    # PR #63 temporary 503 LIVE_DEPLOY_BLOCKED guard). For each frozen
+    # member, resolve the bound GraduationCandidate and verify
+    # `config` (minus deploy-injected fields) + `instruments` (as a
+    # sorted set) match. Compute a `binding_fingerprint` that folds
+    # into the idempotency body_hash so candidate drift (re-graduate,
+    # archive) invalidates cached outcomes naturally.
     #
-    # MUST fire BEFORE the idempotency layer below — otherwise a
-    # cached outcome could replay a paper_trading=false response from a
-    # prior call. With this gate first, no cached outcome can ever be
-    # recorded for live, so replay is naturally safe.
-    # ------------------------------------------------------------------
-    if not request.paper_trading:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": {
-                    "code": "LIVE_DEPLOY_BLOCKED",
-                    "message": (
-                        "Live (paper_trading=false) deployments are temporarily "
-                        "blocked pending the snapshot-binding follow-up: the "
-                        "portfolio member's config + instruments must be verified "
-                        "against the approved GraduationCandidate snapshot before "
-                        "real-money execution can proceed. Tracked in "
-                        "docs/plans/2026-05-13-graduation-gate-promoted-orphan.md."
-                    ),
-                }
-            },
-        )
-
-    # ------------------------------------------------------------------
-    # Layer 1: HTTP Idempotency-Key reservation
+    # MUST fire BEFORE idem.reserve(...) below — see plan §Bug #3 step 5
+    # "Problem A (cache bypass)".
     # ------------------------------------------------------------------
     user_id = await _resolve_user_id(db, claims)
+
+    (
+        binding_fingerprint,
+        resolved_bindings,
+        canonical_per_member,
+    ) = await _resolve_binding_for_start_portfolio(
+        db=db,
+        request=request,
+        user_id=user_id,
+        claims=claims,
+    )
+
     body_for_hash: dict[str, Any] = {
         "portfolio_revision_id": str(request.portfolio_revision_id),
         "account_id": request.account_id,
         "paper_trading": request.paper_trading,
         "ib_login_key": request.ib_login_key,
+        "binding_fingerprint": binding_fingerprint,
     }
     body_hash = IdempotencyStore.body_hash(body_for_hash)
 
@@ -602,49 +1014,253 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
             return _apply_outcome(outcome)
 
         # -------------------------------------------------------------
-        # Publish START command on the command bus
+        # Graduation linking — link the pre-resolved candidates and
+        # transition stage (Bug #3 plan §step 4, Codex round-1 P1 fix:
+        # MUST happen BEFORE publish_start so a START with no linked
+        # candidate is never on the bus). Re-queries each candidate
+        # with SELECT FOR UPDATE + re-checks binding (Codex round-1 P1
+        # fix: pre-resolved candidate can race with a concurrent
+        # archive / config edit / another first-deploy; the FOR UPDATE
+        # serializes us against that and the binding re-check catches
+        # any drift since pre-reserve).
         # -------------------------------------------------------------
-        await bus.publish_start(
-            deployment_id=deployment.id,
-            payload={
-                "deployment_slug": deployment.deployment_slug,
-                "strategy_id": str(first_strategy.id),
-                "strategy_path": first_strategy.file_path,
-                "config": combined_config,
-                "instruments": all_instruments,
-            },
-            idempotency_key=idempotency_key,
+        from msai.models.graduation_candidate import GraduationCandidate
+        from msai.services.graduation import (
+            ELIGIBLE_FOR_LIVE_PORTFOLIO,
+            GraduationService,
+        )
+        from msai.services.live.snapshot_binding import (
+            BindingInstrumentsMissingError,
+            BindingMismatchError,
+            candidate_instruments,
+            verify_member_matches_candidate,
+        )
+        from msai.services.nautilus.live_instrument_bootstrap import (
+            exchange_local_today,
+        )
+        from msai.services.nautilus.security_master.live_resolver import (
+            LiveResolverError,
+            lookup_for_live,
         )
 
-        # -------------------------------------------------------------
-        # Graduation linking — link all member strategies
-        # -------------------------------------------------------------
+        # Codex round-3 P2 (widens round-2 P1#2): the supervisor's
+        # startup watchdog scans `live_node_processes`, NOT
+        # `live_deployments`. Pre-publish there is no process row, so
+        # ANY raise in the link loop OR commit+publish leaves the
+        # deployment row stuck in `starting` until operator intervention.
+        # Wrap the FULL link block + commit + publish in one try/except;
+        # on any failure flip deployment.status="failed" so the next
+        # retry's warm-restart upsert reactivates it cleanly.
+        graduation_service = GraduationService()
         try:
-            from msai.models.graduation_candidate import GraduationCandidate
-
-            for member in members:
-                candidate = (
+            for (member, pre_resolved_candidate), (_m_canon, _c_canon) in zip(
+                resolved_bindings, canonical_per_member, strict=True
+            ):
+                locked = (
                     await db.execute(
-                        select(GraduationCandidate).where(
-                            GraduationCandidate.strategy_id == member.strategy_id,
-                            GraduationCandidate.stage == "live_running",
-                            GraduationCandidate.deployment_id.is_(None),
-                        )
+                        select(GraduationCandidate)
+                        .where(GraduationCandidate.id == pre_resolved_candidate.id)
+                        .with_for_update()
                     )
                 ).scalar_one_or_none()
-                if candidate is not None:
-                    candidate.deployment_id = deployment.id
-                    log.info(
-                        "graduation_candidate_linked",
-                        extra={
-                            "candidate_id": str(candidate.id),
-                            "deployment_id": str(deployment.id),
-                            "strategy_id": str(member.strategy_id),
+                if locked is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={
+                            "error": {
+                                "code": "LIVE_DEPLOY_REPAIR_REQUIRED",
+                                "message": (
+                                    f"Candidate {pre_resolved_candidate.id} was deleted "
+                                    f"between binding pre-reserve and stage-link. "
+                                    f"Operator must restore it or archive the deployment row."
+                                ),
+                            }
                         },
                     )
+                if locked.stage not in ELIGIBLE_FOR_LIVE_PORTFOLIO:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={
+                            "error": {
+                                "code": "BINDING_INELIGIBLE",
+                                "message": (
+                                    f"Candidate {locked.id} drifted to stage `{locked.stage}` "
+                                    f"between binding pre-reserve and stage-link."
+                                ),
+                                "details": {
+                                    "candidate_id": str(locked.id),
+                                    "stage": locked.stage,
+                                },
+                            }
+                        },
+                    )
+                # Re-verify binding against the LOCKED row — content could
+                # have changed via a concurrent operator edit. Codex round-2
+                # P1#1: re-canonicalize the candidate's instruments from
+                # the LOCKED row. Codex round-3 P2: also re-canonicalize
+                # the MEMBER side at the SAME as_of so day-boundary alias
+                # drift doesn't false-reject equivalent symbols.
+                try:
+                    locked_raw_inst = candidate_instruments(locked)
+                except BindingInstrumentsMissingError as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={
+                            "error": {
+                                "code": "BINDING_INSTRUMENTS_MISSING",
+                                "message": str(exc),
+                                "details": {"candidate_id": str(locked.id)},
+                            }
+                        },
+                    ) from exc
+                link_as_of = exchange_local_today()
+                try:
+                    locked_canon = [
+                        r.canonical_id
+                        for r in await lookup_for_live(
+                            locked_raw_inst, as_of_date=link_as_of, session=db
+                        )
+                    ]
+                    link_member_canon = [
+                        r.canonical_id
+                        for r in await lookup_for_live(
+                            list(member.instruments), as_of_date=link_as_of, session=db
+                        )
+                    ]
+                except LiveResolverError as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={
+                            "error": {
+                                "code": "BINDING_INSTRUMENT_RESOLVE_FAILED",
+                                "message": str(exc),
+                                "details": {"candidate_id": str(locked.id)},
+                            }
+                        },
+                    ) from exc
+                try:
+                    verify_member_matches_candidate(
+                        member,
+                        locked,
+                        member_instruments_canonical=link_member_canon,
+                        candidate_instruments_canonical=locked_canon,
+                    )
+                except BindingMismatchError as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={
+                            "error": {
+                                "code": "BINDING_MISMATCH",
+                                "message": str(exc),
+                                "details": {
+                                    "member_id": str(member.id),
+                                    "candidate_id": str(locked.id),
+                                    "mismatches": exc.mismatches,
+                                    "hint": ("candidate drifted between pre-reserve and link"),
+                                },
+                            }
+                        },
+                    ) from exc
+                except BindingInstrumentsMissingError as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={
+                            "error": {
+                                "code": "BINDING_INSTRUMENTS_MISSING",
+                                "message": str(exc),
+                            }
+                        },
+                    ) from exc
+
+                # Codex round-3 P1: guard against concurrent starts that
+                # already linked this candidate to a different deployment.
+                # Two cold starts of the same revision against two accounts
+                # both pre-reserve while `deployment_id` is NULL; whichever
+                # holds the FOR UPDATE lock second would otherwise overwrite
+                # the first deploy's FK and orphan its audit link, breaking
+                # warm restarts of the first deploy (LIVE_DEPLOY_REPAIR_REQUIRED).
+                if locked.deployment_id is not None and locked.deployment_id != deployment.id:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail={
+                            "error": {
+                                "code": "BINDING_AMBIGUOUS",
+                                "message": (
+                                    f"Candidate {locked.id} is already linked to a "
+                                    f"different deployment ({locked.deployment_id}). "
+                                    "Stop or archive that deployment, or re-graduate "
+                                    "a fresh candidate for this strategy."
+                                ),
+                                "details": {
+                                    "candidate_id": str(locked.id),
+                                    "linked_deployment_id": str(locked.deployment_id),
+                                    "this_deployment_id": str(deployment.id),
+                                },
+                            }
+                        },
+                    )
+                locked.deployment_id = deployment.id
+                # Stage transition rules (plan §Bug #3 step 4):
+                #   live_candidate → live_running for first deploy
+                #   paused         → live_running for resume
+                #   live_running   → live_running no-op for restart
+                if locked.stage == "live_candidate":
+                    await graduation_service.update_stage(
+                        db,
+                        locked.id,
+                        new_stage="live_running",
+                        reason="live_deploy",
+                        user_id=user_id,
+                    )
+                elif locked.stage == "paused":
+                    await graduation_service.update_stage(
+                        db,
+                        locked.id,
+                        new_stage="live_running",
+                        reason="live_resume",
+                        user_id=user_id,
+                    )
+                # else: already at live_running (warm restart) — no transition.
+                log.info(
+                    "graduation_candidate_linked",
+                    extra={
+                        "candidate_id": str(locked.id),
+                        "deployment_id": str(deployment.id),
+                        "strategy_id": str(member.strategy_id),
+                        "stage_after": locked.stage,
+                    },
+                )
             await db.commit()
-        except Exception:  # noqa: BLE001
-            log.warning("graduation_candidate_link_failed", exc_info=True)
+            await bus.publish_start(
+                deployment_id=deployment.id,
+                payload={
+                    "deployment_slug": deployment.deployment_slug,
+                    "strategy_id": str(first_strategy.id),
+                    "strategy_path": first_strategy.file_path,
+                    "config": combined_config,
+                    "instruments": all_instruments,
+                },
+                idempotency_key=idempotency_key,
+            )
+        except Exception:
+            log.exception(
+                "live_start_portfolio_link_or_publish_failed",
+                extra={"deployment_id": str(deployment.id)},
+            )
+            # Best-effort: flip the deployment row to `failed` so it
+            # doesn't dangle in `starting`. Any stage transition the
+            # link loop already performed is left in place — operator's
+            # retry is a warm-restart, which re-verifies binding against
+            # the same candidate and re-runs the link block (which is a
+            # no-op for already-linked candidates that pass binding).
+            try:
+                await db.rollback()
+                deployment.status = "failed"
+                deployment.last_stopped_at = datetime.now(UTC)
+                await db.commit()
+            except Exception:  # noqa: BLE001
+                log.exception("deployment_status_failed_mark_failed")
+            raise
 
         # -------------------------------------------------------------
         # Register message_bus_stream with projection consumer

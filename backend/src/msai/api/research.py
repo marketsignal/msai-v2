@@ -154,10 +154,7 @@ async def list_research_jobs(
 
     offset = (page - 1) * page_size
     result = await db.execute(
-        select(ResearchJob)
-        .order_by(ResearchJob.created_at.desc())
-        .offset(offset)
-        .limit(page_size)
+        select(ResearchJob).order_by(ResearchJob.created_at.desc()).offset(offset).limit(page_size)
     )
     jobs = result.scalars().all()
 
@@ -281,8 +278,7 @@ async def promote_research_result(
     metrics = dict(job.best_metrics)
     if body.trial_index is not None:
         trial_result = await db.execute(
-            select(ResearchTrial)
-            .where(
+            select(ResearchTrial).where(
                 ResearchTrial.research_job_id == body.research_job_id,
                 ResearchTrial.trial_number == body.trial_index,
             )
@@ -295,6 +291,19 @@ async def promote_research_result(
             )
         config = dict(trial.config)
         metrics = dict(trial.metrics) if trial.metrics else {}
+
+    # Bug #3 (live-deploy-safety-trio): stamp instruments into the
+    # candidate's config so the snapshot-binding verifier at
+    # /start-portfolio has the authoritative graduated instrument list.
+    # Before this fix, research best/trial configs were built via
+    # `{**base_config, **params}` at research_engine.py:636 — instruments
+    # were a separate top-level request field and never made it into
+    # `candidate.config`. Now stamped explicitly at the promotion
+    # boundary; pre-Bug-#3 candidates are repaired via
+    # `scripts/backfill_candidate_instruments.py`.
+    job_instruments = job.config.get("instruments") if isinstance(job.config, dict) else None
+    if isinstance(job_instruments, list) and job_instruments:
+        config["instruments"] = list(job_instruments)
 
     user_id = await resolve_user_id(db, claims)
     candidate = await _graduation_service.create_candidate(

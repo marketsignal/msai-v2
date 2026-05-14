@@ -15,7 +15,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from msai.core.database import get_db
 from msai.main import app
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -265,9 +264,7 @@ class TestListResearchJobs:
         client_with_mock_db: httpx.AsyncClient,
     ) -> None:
         """GET /jobs accepts page and page_size query params."""
-        response = await client_with_mock_db.get(
-            "/api/v1/research/jobs?page=2&page_size=10"
-        )
+        response = await client_with_mock_db.get("/api/v1/research/jobs?page=2&page_size=10")
 
         assert response.status_code == 200
 
@@ -288,9 +285,7 @@ class TestGetResearchJob:
         """GET /jobs/{id} with non-existent ID returns 404."""
         mock_db.get.return_value = None
 
-        response = await client_with_mock_db.get(
-            f"/api/v1/research/jobs/{uuid4()}"
-        )
+        response = await client_with_mock_db.get(f"/api/v1/research/jobs/{uuid4()}")
 
         assert response.status_code == 404
 
@@ -311,9 +306,7 @@ class TestGetResearchJob:
         trials_result.scalars.return_value = trials_scalars
         mock_db.execute.return_value = trials_result
 
-        response = await client_with_mock_db.get(
-            f"/api/v1/research/jobs/{_JOB_ID}"
-        )
+        response = await client_with_mock_db.get(f"/api/v1/research/jobs/{_JOB_ID}")
 
         assert response.status_code == 200
         body = response.json()
@@ -339,9 +332,7 @@ class TestCancelResearchJob:
         """POST /cancel with non-existent job returns 404."""
         mock_db.get.return_value = None
 
-        response = await client_with_mock_db.post(
-            f"/api/v1/research/jobs/{uuid4()}/cancel"
-        )
+        response = await client_with_mock_db.post(f"/api/v1/research/jobs/{uuid4()}/cancel")
 
         assert response.status_code == 404
 
@@ -354,9 +345,7 @@ class TestCancelResearchJob:
         job = _make_job_row(status="completed")
         mock_db.get.return_value = job
 
-        response = await client_with_mock_db.post(
-            f"/api/v1/research/jobs/{_JOB_ID}/cancel"
-        )
+        response = await client_with_mock_db.post(f"/api/v1/research/jobs/{_JOB_ID}/cancel")
 
         assert response.status_code == 200
         assert response.json()["status"] == "completed"
@@ -370,9 +359,7 @@ class TestCancelResearchJob:
         job = _make_job_row(status="pending")
         mock_db.get.return_value = job
 
-        response = await client_with_mock_db.post(
-            f"/api/v1/research/jobs/{_JOB_ID}/cancel"
-        )
+        response = await client_with_mock_db.post(f"/api/v1/research/jobs/{_JOB_ID}/cancel")
 
         assert response.status_code == 200
         assert job.status == "cancelled"
@@ -447,3 +434,111 @@ class TestPromoteResearchResult:
         body = response.json()
         assert body["candidate_id"] == str(candidate_id)
         assert body["stage"] == "discovery"
+
+    async def test_promote_stamps_instruments_from_job_config(
+        self,
+        mock_db: AsyncMock,
+        client_with_mock_db: httpx.AsyncClient,
+    ) -> None:
+        """Bug #3 (live-deploy-safety-trio): the API promotion endpoint
+        MUST stamp `instruments` from `job.config["instruments"]` into
+        the candidate's config before handing to GraduationService.
+        Without this stamp, snapshot-binding at /start-portfolio would
+        fail with BINDING_INSTRUMENTS_MISSING on every research-graduated
+        candidate.
+        """
+        from unittest.mock import patch
+
+        job = _make_job_row(status="completed")
+        job.config = {
+            "strategy_path": "/app/strategies/ema_cross.py",
+            "instruments": ["AAPL.NASDAQ"],
+        }
+        job.best_config = {"period": 20}
+        mock_db.get.return_value = job
+        candidate_id = uuid4()
+
+        async def _fake_refresh(obj: MagicMock) -> None:
+            obj.id = candidate_id
+            obj.stage = "discovery"
+
+        mock_db.refresh.side_effect = _fake_refresh
+
+        captured: dict[str, object] = {}
+
+        async def _capture_create_candidate(_db: AsyncMock, **kwargs: object) -> MagicMock:
+            captured.update(kwargs)
+            stub = MagicMock()
+            stub.id = candidate_id
+            stub.stage = "discovery"
+            return stub
+
+        with patch(
+            "msai.api.research._graduation_service.create_candidate",
+            side_effect=_capture_create_candidate,
+        ):
+            response = await client_with_mock_db.post(
+                "/api/v1/research/promotions",
+                json={"research_job_id": str(_JOB_ID)},
+            )
+
+        assert response.status_code == 201
+        # The config dict passed to create_candidate MUST carry the
+        # stamped instruments from job.config — verifier expects them.
+        assert captured["config"] == {"period": 20, "instruments": ["AAPL.NASDAQ"]}
+
+    async def test_promote_stamps_instruments_for_trial_index_path(
+        self,
+        mock_db: AsyncMock,
+        client_with_mock_db: httpx.AsyncClient,
+    ) -> None:
+        """Both promotion paths — best_config and trial_index — must
+        stamp instruments. The trial path replaces `config` with the
+        trial's params; the stamp must still land on top."""
+        from unittest.mock import patch
+
+        job = _make_job_row(status="completed")
+        job.config = {
+            "strategy_path": "/app/strategies/ema_cross.py",
+            "instruments": ["MSFT.NASDAQ"],
+        }
+        trial = _make_trial_row(trial_number=3)
+        trial.config = {"period": 50}
+        trial.metrics = {"sharpe_ratio": 2.0}
+
+        # mock_db.get returns job; mock_db.execute returns trial.
+        mock_db.get.return_value = job
+        trial_result = MagicMock()
+        trial_result.scalar_one_or_none.return_value = trial
+        mock_db.execute.return_value = trial_result
+
+        candidate_id = uuid4()
+
+        async def _fake_refresh(obj: MagicMock) -> None:
+            obj.id = candidate_id
+            obj.stage = "discovery"
+
+        mock_db.refresh.side_effect = _fake_refresh
+
+        captured: dict[str, object] = {}
+
+        async def _capture_create_candidate(_db: AsyncMock, **kwargs: object) -> MagicMock:
+            captured.update(kwargs)
+            stub = MagicMock()
+            stub.id = candidate_id
+            stub.stage = "discovery"
+            return stub
+
+        with patch(
+            "msai.api.research._graduation_service.create_candidate",
+            side_effect=_capture_create_candidate,
+        ):
+            response = await client_with_mock_db.post(
+                "/api/v1/research/promotions",
+                json={"research_job_id": str(_JOB_ID), "trial_index": 3},
+            )
+
+        assert response.status_code == 201
+        # Trial's config (period=50) + stamped instruments from the
+        # parent job.
+        assert captured["config"] == {"period": 50, "instruments": ["MSFT.NASDAQ"]}
