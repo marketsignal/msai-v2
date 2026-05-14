@@ -386,6 +386,7 @@ class TestStartPortfolioLiveBlocked:
                 "portfolio_revision_id": "00000000-0000-0000-0000-000000000002",
                 "account_id": "U1234567",
                 "paper_trading": False,
+                "ib_login_key": "test-user",
             },
         )
         assert response.status_code == 503, response.text
@@ -405,6 +406,7 @@ class TestStartPortfolioLiveBlocked:
             "portfolio_revision_id": "00000000-0000-0000-0000-000000000002",
             "account_id": "U1234567",
             "paper_trading": False,
+            "ib_login_key": "test-user",
         }
         headers = {"Idempotency-Key": "test-replay-key-001"}
         r1 = await client_with_mock_db.post(

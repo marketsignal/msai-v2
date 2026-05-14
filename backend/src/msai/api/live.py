@@ -306,6 +306,7 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
         "portfolio_revision_id": str(request.portfolio_revision_id),
         "account_id": request.account_id,
         "paper_trading": request.paper_trading,
+        "ib_login_key": request.ib_login_key,
     }
     body_hash = IdempotencyStore.body_hash(body_for_hash)
 
@@ -440,9 +441,56 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
             portfolio_revision_id=request.portfolio_revision_id,
             account_id=request.account_id,
             paper_trading=request.paper_trading,
+            ib_login_key=request.ib_login_key,
             user_sub=claims.get("sub"),
         )
         identity_signature = identity.signature()
+
+        # --------------------------------------------------------------
+        # UNIQUE(revision_id, account_id) pre-insert gate (Bug #1 fix).
+        # Changing ib_login_key produces a new identity_signature, but
+        # the row would still collide with the existing one on the
+        # (revision_id, account_id) UNIQUE constraint. Reject explicitly
+        # with 422 rather than surfacing IntegrityError to the caller —
+        # operator must archive/stop the existing row first.
+        # See docs/plans/2026-05-13-live-deploy-safety-trio.md §Bug #1.
+        # --------------------------------------------------------------
+        existing_collision = (
+            await db.execute(
+                select(LiveDeployment).where(
+                    LiveDeployment.portfolio_revision_id == request.portfolio_revision_id,
+                    LiveDeployment.account_id == request.account_id,
+                    LiveDeployment.identity_signature != identity_signature,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing_collision is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": {
+                        "code": "LIVE_DEPLOY_CONFLICT",
+                        "message": (
+                            "An existing deployment for this portfolio revision + account "
+                            "exists with a different identity (different ib_login_key, "
+                            "paper_trading, or other identity-bearing field). "
+                            "Archive/delete the existing row OR re-submit with the same identity."
+                        ),
+                        "details": {
+                            "existing_deployment_id": str(existing_collision.id),
+                            "existing_status": existing_collision.status,
+                            "existing_ib_login_key": existing_collision.ib_login_key,
+                            "existing_paper_trading": existing_collision.paper_trading,
+                            "requested_ib_login_key": request.ib_login_key,
+                            "requested_paper_trading": request.paper_trading,
+                            "hint": (
+                                "stop the existing deployment via POST /api/v1/live/stop, "
+                                "then retry"
+                            ),
+                        },
+                    }
+                },
+            )
 
         slug = generate_deployment_slug()
         now = datetime.now(UTC)

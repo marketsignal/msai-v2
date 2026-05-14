@@ -4,6 +4,20 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-05-13 — `ib_login_key` required + revision/account UNIQUE-conflict gate (`fix/live-deploy-safety-trio`)
+
+Bug #1 of three discovered during the 2026-05-13 paper-money drill. `POST /api/v1/live/start-portfolio` returned opaque 500s in two distinct failure modes: (1) missing `ib_login_key` reached `INSERT` and exploded with `IntegrityError` because the API schema marked the field optional while the DB column is `NOT NULL`; (2) retry with the same `(portfolio_revision_id, account_id)` and a different login key collided on `uq_live_deployments_revision_account`. Worse, the `PortfolioDeploymentIdentity` tuple did NOT include `ib_login_key`, so two requests differing only by login key produced the same `identity_signature` — silent footgun where the supervisor would reuse the wrong subprocess on relogin.
+
+- **Schema tightened:** `schemas/live.py` — `ib_login_key: str = Field(min_length=1, max_length=64)` (was `Optional[str] = None`). Missing → 422 `missing`; empty → 422 `string_too_short`.
+- **Identity tuple extended:** `services/live/deployment_identity.py` — `PortfolioDeploymentIdentity` gains `ib_login_key`; `derive_portfolio_deployment_identity()` requires it. Different login keys now produce different `identity_signature` values.
+- **Idempotency body_hash extended:** `api/live.py` — `body_for_hash` includes `ib_login_key` so replays from different login contexts don't share a cached outcome.
+- **Pre-insert UNIQUE conflict gate:** `api/live.py` — before `on_conflict_do_update`, query for existing row by `(revision_id, account_id)` with a DIFFERENT `identity_signature`. If found, reject 422 `LIVE_DEPLOY_CONFLICT` with operator-actionable hint. Works for `running`/`starting`/`stopped`/`failed` rows (all hold the UNIQUE slot).
+- **Council-mandated PR split:** 5-advisor + Codex chairman synthesis (Option D) — the drill discovered three bugs but Bug #2 (stop-flatness wire) needs a real paper IB drill and Bug #3 (snapshot binding) is unstarted. Bug #1 is correctness-only with no live-trading wire change — ships alone.
+
+**Verification:** 1862 backend unit tests pass (+18 new in `test_deployment_identity_portfolio.py`, `test_portfolio_start_schema.py`, `test_live_api.py`). `ruff check src/` clean. `mypy --strict src/` clean (186 files). E2E use case at `tests/e2e/use-cases/live/start-portfolio-ib-login-key-required.md` (UC1.1–UC1.4). No paper IB drill required — fix is purely at the FastAPI + ORM boundary; no supervisor / `TradingNodeSubprocess` / IB adapter changes.
+
+**Deferred follow-ups** (in solution doc + plan): Bug #2 stop-flatness verification + TIF=DAY (implementation drafted at `/tmp/bug2-backup/`, needs paper drill before merging — separate PR); Bug #3 snapshot binding replaces the PR #63 503 guard (plan converged after 10 Codex iterations, Layer D unstarted — separate PR after Bug #2).
+
 ### 2026-05-13 — Graduation gate referenced nonexistent "promoted" stage (`fix/graduation-gate-promoted-orphan`)
 
 Continuation of the paper-live drill (council Option 3) — after PR #62 fixed the IB_PORT bug and the broker rail came up clean, the drill halted at step 5 because `portfolio_service.py:_is_graduated` queried `GraduationCandidate.stage == "promoted"` but the actual state machine in `services/graduation.py:VALID_TRANSITIONS` has no `"promoted"` stage. **No strategy could ever be added to a live portfolio in production.** Every test that touched the gate inserted fixture rows with `stage="promoted"` (matching the broken query), so the bug was masked until a real graduation pipeline ran end-to-end on prod.

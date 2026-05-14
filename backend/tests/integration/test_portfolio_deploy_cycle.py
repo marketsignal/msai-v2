@@ -166,6 +166,7 @@ async def test_full_portfolio_deploy_cycle(session: AsyncSession) -> None:
         portfolio_revision_id=revision.id,
         account_id="DU1234567",
         paper_trading=True,
+        ib_login_key="test-user",
     )
 
     deployment = LiveDeployment(
@@ -315,6 +316,7 @@ async def test_deployment_cascade_deletes_deployment_strategies(
         portfolio_revision_id=revision.id,
         account_id="DU9999999",
         paper_trading=True,
+        ib_login_key="test-user",
     )
     deployment = LiveDeployment(
         id=uuid4(),
