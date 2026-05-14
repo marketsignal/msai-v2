@@ -17,6 +17,7 @@ See ``docs/plans/2026-05-13-live-deploy-safety-trio.md`` §Bug #2.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import secrets
 from typing import TYPE_CHECKING, Any
@@ -74,13 +75,26 @@ async def coalesce_or_publish_stop_with_flatness(
     inflight_key = f"inflight_stop:{deployment_id}"
     acquired = await redis.set(inflight_key, nonce, nx=True, ex=_INFLIGHT_TTL_S)
     if acquired:
-        await bus.publish_stop_and_report_flatness(
-            deployment_id,
-            stop_nonce=nonce,
-            member_strategy_id_fulls=member_strategy_id_fulls,
-            reason=reason,
-            idempotency_key=idempotency_key,
-        )
+        try:
+            await bus.publish_stop_and_report_flatness(
+                deployment_id,
+                stop_nonce=nonce,
+                member_strategy_id_fulls=member_strategy_id_fulls,
+                reason=reason,
+                idempotency_key=idempotency_key,
+            )
+        except Exception:
+            # PR #65 Codex P1: SET-NX succeeded but publish failed.
+            # Without this DEL the nonce sits in Redis for 60s and
+            # subsequent /stop callers coalesce onto a command that
+            # was never published — they'd poll a stop_report key
+            # that never materializes, hitting their 30s timeout
+            # while the deployment keeps running. Clear the key so
+            # the next caller retries cleanly. Best-effort: if the DEL
+            # itself fails, the 60s TTL is the fallback.
+            with contextlib.suppress(Exception):
+                await redis.delete(inflight_key)
+            raise
         return nonce, True
     # Lost the race — coalesce onto the existing nonce.
     FLATNESS_COALESCED_TOTAL.inc()

@@ -836,13 +836,19 @@ async def live_stop(
         interval_s=START_POLL_INTERVAL_S,
     )
 
-    if row is None and report is None:
+    # PR #65 Codex P1: only report ``status: stopped`` when the
+    # supervisor confirms a terminal LiveNodeProcess row. A standalone
+    # flatness report is insufficient — the child could write the
+    # stop_report and then hang before dispose/exit, leaving the
+    # subprocess alive while the API claims success. Treat
+    # report-without-terminal-row as the timeout path so the operator
+    # knows the supervisor side never closed out.
+    if row is None:
         return _apply_outcome(EndpointOutcome.api_poll_timeout())
 
-    if row is not None:
-        deployment.status = "stopped"
-        deployment.last_stopped_at = datetime.now(UTC)
-        await db.commit()
+    deployment.status = "stopped"
+    deployment.last_stopped_at = datetime.now(UTC)
+    await db.commit()
 
     await log_audit(
         db,
@@ -859,7 +865,7 @@ async def live_stop(
     log.info(
         "live_deployment_stopped",
         deployment_id=str(deployment.id),
-        process_status=row.status if row else "unknown",
+        process_status=row.status,
         broker_flat=report["broker_flat"] if report else None,
         stop_nonce=stop_nonce,
     )
@@ -869,7 +875,7 @@ async def live_stop(
             {
                 "id": str(deployment.id),
                 "status": "stopped",
-                "process_status": row.status if row else "unknown",
+                "process_status": row.status,
                 "stop_nonce": stop_nonce,
                 "broker_flat": report["broker_flat"] if report else None,
                 "remaining_positions": (report["remaining_positions"] if report else []),

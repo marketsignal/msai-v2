@@ -104,6 +104,43 @@ class TestCoalesceOrPublish:
         assert n1 != n2
         assert fake_bus.publish_stop_and_report_flatness.await_count == 2
 
+    @pytest.mark.asyncio
+    async def test_publish_failure_clears_inflight_key(
+        self,
+        fake_redis: fakeredis.aioredis.FakeRedis,
+        fake_bus: AsyncMock,
+    ) -> None:
+        """PR #65 Codex P1: if SET-NX succeeds but publish raises, the
+        helper MUST delete `inflight_stop:{deployment_id}` before
+        re-raising. Otherwise the next /stop call would coalesce onto
+        a phantom nonce and time out polling a never-published stop_report."""
+        deployment_id = uuid4()
+        fake_bus.publish_stop_and_report_flatness.side_effect = RuntimeError("redis blip")
+
+        with pytest.raises(RuntimeError, match="redis blip"):
+            await coalesce_or_publish_stop_with_flatness(
+                redis=fake_redis,
+                bus=fake_bus,
+                deployment_id=deployment_id,
+                member_strategy_id_fulls=[],
+            )
+
+        # Inflight key must be cleared.
+        assert await fake_redis.get(f"inflight_stop:{deployment_id}") is None
+
+        # Next caller should acquire fresh, NOT coalesce.
+        fake_bus.publish_stop_and_report_flatness.side_effect = None
+        fake_bus.publish_stop_and_report_flatness.reset_mock()
+        nonce, is_originator = await coalesce_or_publish_stop_with_flatness(
+            redis=fake_redis,
+            bus=fake_bus,
+            deployment_id=deployment_id,
+            member_strategy_id_fulls=[],
+        )
+        assert is_originator is True
+        assert fake_bus.publish_stop_and_report_flatness.await_count == 1
+        assert await fake_redis.get(f"inflight_stop:{deployment_id}") == nonce
+
 
 # ---------------------------------------------------------------------------
 # poll_stop_report
