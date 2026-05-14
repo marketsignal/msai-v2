@@ -1103,11 +1103,40 @@ async def live_kill_all(
                 stopped=stopped,
                 failed_publish=len(failed),
                 risk_halted=True,
+                any_non_flat=any_non_flat,
+                flatness_reports=flatness_summary,
             ).model_dump(),
         )
 
-    log.critical("kill_all_executed", stopped=stopped)
-    return LiveKillAllResponse(stopped=stopped, failed_publish=0, risk_halted=True)
+    log.critical(
+        "kill_all_executed",
+        stopped=stopped,
+        any_non_flat=any_non_flat,
+    )
+    if any_non_flat:
+        # PR #65 Codex P2: surface non-flat outcome in the HTTP layer,
+        # not just audit. The panic-button caller MUST see this
+        # without grepping the audit log. 207 Multi-Status — kill-all
+        # itself succeeded (all SIGTERMs sent), but at least one
+        # deployment has positions still on the broker requiring
+        # manual flatten via IB portal before /resume.
+        return JSONResponse(
+            status_code=207,
+            content=LiveKillAllResponse(
+                stopped=stopped,
+                failed_publish=0,
+                risk_halted=True,
+                any_non_flat=True,
+                flatness_reports=flatness_summary,
+            ).model_dump(),
+        )
+    return LiveKillAllResponse(
+        stopped=stopped,
+        failed_publish=0,
+        risk_halted=True,
+        any_non_flat=False,
+        flatness_reports=flatness_summary,
+    )
 
 
 @router.post("/resume")
