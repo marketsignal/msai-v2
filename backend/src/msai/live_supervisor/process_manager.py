@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import multiprocessing as mp
 import os
@@ -914,6 +915,65 @@ class ProcessManager:
     # ------------------------------------------------------------------
     # Stop
     # ------------------------------------------------------------------
+
+    async def push_flatness_request(
+        self,
+        deployment_id: UUID,
+        *,
+        stop_nonce: str,
+        member_strategy_id_fulls: list[str],
+    ) -> None:
+        """RPUSH a flatness ticket onto ``flatness_pending:{deployment_id}``.
+
+        Called by the supervisor handler when a STOP_AND_REPORT_FLATNESS
+        command arrives, BEFORE invoking :meth:`stop` (which SIGTERMs the
+        child). The child reads this list in its shutdown-finally hook
+        and writes ``stop_report:{stop_nonce}`` for the API to GET.
+        Stored as JSON so multiple concurrent stops queue cleanly
+        (Codex iter-4 P2 #1 — per-nonce list, not singleton key).
+        TTL 120s — long enough to outlive a slow shutdown, short enough
+        to clean up after the request is abandoned.
+
+        See ``docs/plans/2026-05-13-live-deploy-safety-trio.md`` §Bug #2.
+        """
+        if not stop_nonce:
+            log.warning(
+                "flatness_request_missing_nonce",
+                extra={"deployment_id": str(deployment_id)},
+            )
+            return
+        key = f"flatness_pending:{deployment_id}"
+        ticket = json.dumps(
+            {
+                "stop_nonce": stop_nonce,
+                "member_strategy_id_fulls": list(member_strategy_id_fulls),
+            },
+            separators=(",", ":"),
+        )
+        # redis-py's async client returns int / str directly; cast to
+        # placate mypy --strict (declared as Awaitable[int] | int).
+        # redis-py async typing declares Awaitable[X] | X; in practice
+        # the async client returns awaitables. Suppress mypy's union.
+        new_length: int = await self._redis.rpush(key, ticket)  # type: ignore[misc]
+        await self._redis.expire(key, 120)
+        # Bound the list at 32 entries so a coalescing failure or a
+        # /kill-all storm against a stuck child can't grow it unbounded.
+        if new_length > 32:
+            await self._redis.ltrim(key, -32, -1)  # type: ignore[misc]
+            new_length = 32
+        # Surface list length as a gauge so an operator dashboard can
+        # alert when coalescing isn't holding (healthy sustained = 1).
+        try:
+            from msai.services.observability.trading_metrics import (
+                FLATNESS_PENDING_LIST_LENGTH,
+            )
+
+            FLATNESS_PENDING_LIST_LENGTH.labels(deployment_id=str(deployment_id)).set(
+                float(new_length)
+            )
+        except Exception:  # noqa: BLE001
+            # Observability MUST NOT break stop semantics.
+            log.exception("flatness_pending_length_gauge_failed")
 
     async def stop(self, deployment_id: UUID, *, reason: str = "user") -> bool:
         """Send SIGTERM to the deployment's subprocess.

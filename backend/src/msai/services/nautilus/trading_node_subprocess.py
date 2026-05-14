@@ -983,6 +983,25 @@ async def run_subprocess_async(
                 await node.stop_async()
             except Exception:  # noqa: BLE001
                 log.exception("trading_node_stop_async_failed")
+            # Drain flatness-pending Redis list and publish stop_report:{nonce}
+            # before dispose(). Wrapped in wait_for(5s) so a stuck Redis
+            # never blocks shutdown (Bug #2, Codex iter-5 P1 #3).
+            try:
+                await asyncio.wait_for(
+                    _drain_and_report_flatness(
+                        node=node,
+                        deployment_id=payload.deployment_id,
+                        redis_url=payload.redis_url,
+                    ),
+                    timeout=5.0,
+                )
+            except TimeoutError:
+                log.warning(
+                    "flatness_drain_timeout",
+                    extra={"deployment_id": str(payload.deployment_id)},
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("flatness_drain_failed")
             if not skip_dispose:
                 with _safe_dispose(node):
                     pass
@@ -1050,6 +1069,124 @@ async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+async def _drain_and_report_flatness(
+    *,
+    node: Any,
+    deployment_id: UUID,
+    redis_url: str,
+) -> None:
+    """Drain ``flatness_pending:{deployment_id}`` and write
+    ``stop_report:{stop_nonce}`` for each ticket.
+
+    Called from the run_trading_node finally block AFTER
+    ``node.stop_async()`` resolves and BEFORE ``node.dispose()`` — at
+    this point ``node.kernel.cache.positions_open()`` is still safe to
+    call but Nautilus has run ``Strategy.stop()`` → ``market_exit()``
+    so positions SHOULD be flat. Wrapped by the caller in
+    ``asyncio.wait_for(5.0)`` so a stuck Redis never blocks shutdown.
+
+    See ``docs/plans/2026-05-13-live-deploy-safety-trio.md`` §Bug #2.
+    """
+    if not redis_url:
+        log.warning(
+            "flatness_drain_no_redis_url",
+            extra={"deployment_id": str(deployment_id)},
+        )
+        return
+
+    import json as _json
+
+    import redis.asyncio as aioredis
+
+    client = aioredis.from_url(  # type: ignore[no-untyped-call]
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=2.0,
+        socket_timeout=2.0,
+    )
+    list_key = f"flatness_pending:{deployment_id}"
+    try:
+        while True:
+            entry = await client.lpop(list_key)
+            if entry is None:
+                break
+            try:
+                ticket = _json.loads(entry)
+            except (ValueError, TypeError):
+                log.warning(
+                    "flatness_ticket_unparsable",
+                    extra={"deployment_id": str(deployment_id), "entry": entry},
+                )
+                continue
+            stop_nonce = str(ticket.get("stop_nonce") or "")
+            if not stop_nonce:
+                log.warning(
+                    "flatness_ticket_missing_nonce",
+                    extra={"deployment_id": str(deployment_id)},
+                )
+                continue
+            members = [str(x) for x in (ticket.get("member_strategy_id_fulls") or [])]
+            cache_read_failed = False
+            try:
+                cache = node.kernel.cache
+                all_open = cache.positions_open()
+            except Exception:  # noqa: BLE001
+                # PR #65 Codex P1: when the verification mechanism
+                # itself fails, we MUST NOT report broker_flat=True.
+                # Surface as non-flat with reason=cache_read_failed so
+                # the operator knows positions could not be verified.
+                log.exception("flatness_cache_read_failed")
+                all_open = []
+                cache_read_failed = True
+            # Filter by member strategy_id_fulls — covers ALL members
+            # of a portfolio (Codex iter-2 P1 #3 fix).
+            my_open = [p for p in all_open if str(getattr(p, "strategy_id", "")) in members]
+            broker_flat = (not my_open) and not cache_read_failed
+            if cache_read_failed:
+                reason = "cache_read_failed"
+            elif my_open:
+                reason = "max_attempts_exhausted"
+            else:
+                reason = "ok"
+            report = {
+                "stop_nonce": stop_nonce,
+                "deployment_id": str(deployment_id),
+                "broker_flat": broker_flat,
+                "remaining_positions": [
+                    {
+                        "strategy_id": str(getattr(p, "strategy_id", "")),
+                        "instrument_id": str(getattr(p, "instrument_id", "")),
+                        "quantity": str(getattr(p, "quantity", "")),
+                        "side": str(getattr(p, "side", "")),
+                    }
+                    for p in my_open
+                ],
+                "reason": reason,
+                "reported_at": datetime.now(UTC).isoformat(),
+            }
+            # Per-nonce key, 120s TTL — coalesced API readers MUST be
+            # able to GET the same key (no DEL race). See plan §Bug #2.
+            await client.set(
+                f"stop_report:{stop_nonce}",
+                _json.dumps(report),
+                ex=120,
+            )
+            log.info(
+                "flatness_report_written",
+                extra={
+                    "deployment_id": str(deployment_id),
+                    "stop_nonce": stop_nonce,
+                    "broker_flat": report["broker_flat"],
+                    "remaining_count": len(my_open),
+                },
+            )
+    finally:
+        try:
+            await client.aclose()
+        except Exception:  # noqa: BLE001
+            log.exception("flatness_redis_aclose_failed")
 
 
 @contextmanager

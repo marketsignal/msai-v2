@@ -7,6 +7,7 @@ strategies, stopping them, querying status, and emergency halt.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import UTC, datetime
 from time import monotonic
 from typing import TYPE_CHECKING, Any
@@ -48,6 +49,10 @@ from msai.services.live.deployment_identity import (
     generate_deployment_slug,
 )
 from msai.services.live.failure_kind import FailureKind
+from msai.services.live.flatness_service import (
+    coalesce_or_publish_stop_with_flatness,
+    poll_stop_report,
+)
 from msai.services.live.idempotency import (
     PERMANENT_FAILURE_KINDS,
     REGISTRY_FAILURE_KINDS,
@@ -785,18 +790,72 @@ async def live_stop(
         )
     ).scalar_one_or_none()
     if active_process is None:
+        # PR #65 Codex P2 round-4: if a prior /stop returned
+        # FLATNESS_UNKNOWN, persist that state so a retry doesn't
+        # silently 200 here. The marker key `stop_unknown:{deployment_id}`
+        # lives for 1h (long enough for an operator IB-portal check
+        # + manual flatten + /resume, short enough not to dirty Redis).
+        # Operator can clear it explicitly via /resume (Layer 1) which
+        # is the same path that clears the halt flag.
+        with contextlib.suppress(Exception):
+            unknown_marker = await bus._redis.get(  # noqa: SLF001
+                f"stop_unknown:{deployment.id}"
+            )
+            if unknown_marker:
+                # Marker carries the original stop_nonce for traceability.
+                return _apply_outcome(
+                    EndpointOutcome.flatness_unknown(
+                        deployment_id=str(deployment.id),
+                        stop_nonce=str(unknown_marker),
+                        process_status="stopped",
+                    )
+                )
         return _apply_outcome(
             EndpointOutcome.stopped({"id": str(deployment.id), "status": "stopped"})
         )
 
-    # Publish the STOP command.
-    await bus.publish_stop(
+    # Gather the deployment's member strategy_id_fulls so the child can
+    # filter cache.positions_open() by member ownership (Bug #2, plan §3).
+    member_rows = (
+        await db.execute(
+            select(LiveDeploymentStrategy.strategy_id_full).where(
+                LiveDeploymentStrategy.deployment_id == deployment.id
+            )
+        )
+    ).all()
+    member_strategy_id_fulls = [row.strategy_id_full for row in member_rows]
+
+    # Publish STOP_AND_REPORT_FLATNESS via SET-NX coalescing — concurrent
+    # /stop callers converge on the originator's nonce (Codex iter-6 P2 #1).
+    stop_nonce, _is_originator = await coalesce_or_publish_stop_with_flatness(
+        redis=bus._redis,  # noqa: SLF001 — intentional bus.redis reuse
+        bus=bus,
         deployment_id=deployment.id,
+        member_strategy_id_fulls=member_strategy_id_fulls,
         reason="user",
         idempotency_key=idempotency_key,
     )
 
-    # Poll until the supervisor flips the row to stopped / failed.
+    # Poll for the child's STOP_REPORT (30 s deadline). Does NOT DEL —
+    # 120 s TTL handles cleanup; coalesced readers share the key.
+    report = await poll_stop_report(
+        redis=bus._redis,  # noqa: SLF001
+        stop_nonce=stop_nonce,
+        # 45s deadline — clears the 30s XAUTOCLAIM idle window on the
+        # command bus so a cross-host redelivery (Phase 2 multi-supervisor
+        # topology) or a restart-during-stop scenario can still produce
+        # the report before this caller times out. Single-supervisor
+        # topology (Phase 1) doesn't actually need the headroom, but
+        # the cost is bounded (caller waits up to 45s only on the
+        # genuinely-degraded path; healthy stops resolve in ~10s).
+        # PR #65 Codex P2 round-6.
+        deadline_s=45.0,
+    )
+
+    # Also poll the LiveNodeProcess row for terminal status — gives us
+    # ``process_status`` for the response + lets us write
+    # ``LiveDeployment.status='stopped'`` only once the supervisor has
+    # confirmed the process exited.
     row = await _poll_for_terminal(
         db,
         deployment.id,
@@ -806,6 +865,13 @@ async def live_stop(
         interval_s=START_POLL_INTERVAL_S,
     )
 
+    # PR #65 Codex P1: only report ``status: stopped`` when the
+    # supervisor confirms a terminal LiveNodeProcess row. A standalone
+    # flatness report is insufficient — the child could write the
+    # stop_report and then hang before dispose/exit, leaving the
+    # subprocess alive while the API claims success. Treat
+    # report-without-terminal-row as the timeout path so the operator
+    # knows the supervisor side never closed out.
     if row is None:
         return _apply_outcome(EndpointOutcome.api_poll_timeout())
 
@@ -813,18 +879,64 @@ async def live_stop(
     deployment.last_stopped_at = datetime.now(UTC)
     await db.commit()
 
+    # PR #65 Codex P2: clear `inflight_stop:{deployment_id}` once the
+    # supervisor has confirmed termination. Without this, a deployment
+    # warm-restarted within the 60s TTL would have its next /stop call
+    # coalesce onto THIS run's nonce — polling a stop_report from the
+    # old process while the new one keeps running. Best-effort: if
+    # Redis DEL fails, the 60s TTL is the fallback.
+    with contextlib.suppress(Exception):
+        await bus._redis.delete(f"inflight_stop:{deployment.id}")  # noqa: SLF001
+
+    # PR #65 Codex P1 round-3: row is terminal but no flatness report
+    # arrived. The supervisor closed out, but the wire that verifies
+    # broker positions never confirmed. Surface as 504
+    # FLATNESS_UNKNOWN per the runbook — refusing to silently report
+    # `broker_flat: null` as success.
+    if report is None:
+        log.warning(
+            "live_deployment_stopped_flatness_unknown",
+            deployment_id=str(deployment.id),
+            stop_nonce=stop_nonce,
+            process_status=row.status,
+        )
+        # Persist the unknown state so a retry doesn't hit the
+        # "no active process → 200 stopped" shortcut at the top of
+        # this endpoint and silently swallow the warning (PR #65
+        # Codex P2 round-4). 1h TTL; cleared by /resume.
+        with contextlib.suppress(Exception):
+            await bus._redis.set(  # noqa: SLF001
+                f"stop_unknown:{deployment.id}",
+                stop_nonce,
+                ex=3600,
+            )
+        return _apply_outcome(
+            EndpointOutcome.flatness_unknown(
+                deployment_id=str(deployment.id),
+                stop_nonce=stop_nonce,
+                process_status=row.status,
+            )
+        )
+
+    # Past here `report` is guaranteed non-None (early returns above).
     await log_audit(
         db,
         user_id=deployment.started_by,
         action="live_stop",
         resource_type="live_deployment",
         resource_id=deployment.id,
+        details={
+            "stop_nonce": stop_nonce,
+            "broker_flat": report["broker_flat"],
+        },
     )
 
     log.info(
         "live_deployment_stopped",
         deployment_id=str(deployment.id),
         process_status=row.status,
+        broker_flat=report["broker_flat"],
+        stop_nonce=stop_nonce,
     )
 
     return _apply_outcome(
@@ -833,6 +945,9 @@ async def live_stop(
                 "id": str(deployment.id),
                 "status": "stopped",
                 "process_status": row.status,
+                "stop_nonce": stop_nonce,
+                "broker_flat": report["broker_flat"],
+                "remaining_positions": report["remaining_positions"],
             }
         )
     )
@@ -920,9 +1035,28 @@ async def live_kill_all(
 
     stopped = 0
     failed: list[str] = []
+    flatness_nonces: dict[str, str] = {}  # deployment_id -> stop_nonce
     for row in rows:
         try:
-            await bus.publish_stop(row.deployment_id, reason="kill_switch")
+            # Gather member strategy_id_fulls so the child reports
+            # deployment-scoped flatness (Bug #2).
+            member_rows = (
+                await db.execute(
+                    select(LiveDeploymentStrategy.strategy_id_full).where(
+                        LiveDeploymentStrategy.deployment_id == row.deployment_id
+                    )
+                )
+            ).all()
+            members = [r.strategy_id_full for r in member_rows]
+
+            nonce, _ = await coalesce_or_publish_stop_with_flatness(
+                redis=bus._redis,  # noqa: SLF001
+                bus=bus,
+                deployment_id=row.deployment_id,
+                member_strategy_id_fulls=members,
+                reason="kill_switch",
+            )
+            flatness_nonces[str(row.deployment_id)] = nonce
             stopped += 1
         except Exception:  # noqa: BLE001
             failed.append(str(row.deployment_id))
@@ -930,6 +1064,55 @@ async def live_kill_all(
                 "kill_switch_publish_stop_failed",
                 deployment_id=str(row.deployment_id),
             )
+
+    # Parallel-poll all stop_report keys with a single 15 s deadline
+    # — slower than /stop's 30 s because kill-all is a panic surface
+    # and the operator already knows positions need manual verification.
+    flatness_results: dict[str, dict[str, Any] | None] = {}
+    if flatness_nonces:
+
+        async def _poll_one(dep_id: str, nce: str) -> tuple[str, dict[str, Any] | None]:
+            return dep_id, await poll_stop_report(
+                redis=bus._redis,  # noqa: SLF001
+                stop_nonce=nce,
+                # 35s deadline — clears the 30s XAUTOCLAIM idle window
+                # plus a 5s buffer. Tighter than /stop's 45s because
+                # the panic-button caller benefits from a faster answer
+                # even at the cost of more `broker_flat: null` reports
+                # on cross-host redelivery races. Operator already
+                # knows kill-all requires IB-portal verification (per
+                # the ADR runbook) so an early `null` is recoverable.
+                # PR #65 Codex P2 round-6.
+                deadline_s=35.0,
+            )
+
+        results = await asyncio.gather(*(_poll_one(d, n) for d, n in flatness_nonces.items()))
+        flatness_results = dict(results)
+
+        # PR #65 Codex P2 round-3: mirror the /stop cleanup. Clear
+        # `inflight_stop:{deployment_id}` for every deployment whose
+        # report arrived, so an operator who resumes + warm-restarts
+        # + re-stops within the 60s TTL doesn't have the next /stop
+        # call coalesce onto this kill-all's already-completed nonce.
+        # Best-effort: 60s TTL is the fallback if DEL fails.
+        for dep_id, report in flatness_results.items():
+            if report is not None:
+                with contextlib.suppress(Exception):
+                    await bus._redis.delete(f"inflight_stop:{dep_id}")  # noqa: SLF001
+
+    def _summarize(dep_id: str) -> dict[str, Any]:
+        report = flatness_results.get(dep_id)
+        return {
+            "deployment_id": dep_id,
+            "stop_nonce": flatness_nonces[dep_id],
+            "broker_flat": report["broker_flat"] if report else None,
+            "remaining_positions": report["remaining_positions"] if report else [],
+        }
+
+    flatness_summary = [_summarize(dep_id) for dep_id in flatness_nonces]
+    any_non_flat = any(
+        f["broker_flat"] is False or f["broker_flat"] is None for f in flatness_summary
+    )
 
     await log_audit(
         db,
@@ -941,6 +1124,8 @@ async def live_kill_all(
             "failed_publish_count": len(failed),
             "failed_deployment_ids": failed,
             "halt_flag_set": True,
+            "any_non_flat": any_non_flat,
+            "flatness_reports": flatness_summary,
         },
     )
 
@@ -964,11 +1149,40 @@ async def live_kill_all(
                 stopped=stopped,
                 failed_publish=len(failed),
                 risk_halted=True,
+                any_non_flat=any_non_flat,
+                flatness_reports=flatness_summary,
             ).model_dump(),
         )
 
-    log.critical("kill_all_executed", stopped=stopped)
-    return LiveKillAllResponse(stopped=stopped, failed_publish=0, risk_halted=True)
+    log.critical(
+        "kill_all_executed",
+        stopped=stopped,
+        any_non_flat=any_non_flat,
+    )
+    if any_non_flat:
+        # PR #65 Codex P2: surface non-flat outcome in the HTTP layer,
+        # not just audit. The panic-button caller MUST see this
+        # without grepping the audit log. 207 Multi-Status — kill-all
+        # itself succeeded (all SIGTERMs sent), but at least one
+        # deployment has positions still on the broker requiring
+        # manual flatten via IB portal before /resume.
+        return JSONResponse(
+            status_code=207,
+            content=LiveKillAllResponse(
+                stopped=stopped,
+                failed_publish=0,
+                risk_halted=True,
+                any_non_flat=True,
+                flatness_reports=flatness_summary,
+            ).model_dump(),
+        )
+    return LiveKillAllResponse(
+        stopped=stopped,
+        failed_publish=0,
+        risk_halted=True,
+        any_non_flat=False,
+        flatness_reports=flatness_summary,
+    )
 
 
 @router.post("/resume")
@@ -999,12 +1213,28 @@ async def live_resume(
     await bus._redis.delete(f"{_HALT_KEY}:set_by")  # noqa: SLF001
     await bus._redis.delete(f"{_HALT_KEY}:set_at")  # noqa: SLF001
 
+    # PR #65 Codex P2 round-4: clear all `stop_unknown:*` markers on
+    # /resume. After the operator has verified IB-portal positions
+    # and is ready to re-deploy, the flatness-unknown state should
+    # be cleared so subsequent /stop calls don't keep returning 504.
+    # SCAN avoids blocking Redis on a KEYS call (production-safe).
+    unknown_cleared = 0
+    try:
+        async for key in bus._redis.scan_iter(match="stop_unknown:*"):  # noqa: SLF001
+            await bus._redis.delete(key)  # noqa: SLF001
+            unknown_cleared += 1
+    except Exception:  # noqa: BLE001
+        log.exception("stop_unknown_clear_failed")
+
     await log_audit(
         db,
         user_id=user_id,
         action="live_resume",
         resource_type="live_deployment",
-        details={"halt_flag_was_set": bool(deleted)},
+        details={
+            "halt_flag_was_set": bool(deleted),
+            "stop_unknown_cleared": unknown_cleared,
+        },
     )
 
     log.warning("kill_switch_resumed", resumed_by=str(user_id))

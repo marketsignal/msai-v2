@@ -15,6 +15,8 @@ Verifies the builder produces a config that:
 
 from __future__ import annotations
 
+from nautilus_trader.model.enums import TimeInForce
+
 import pytest
 
 from msai.services.nautilus.live_node_config import (
@@ -123,6 +125,22 @@ class TestHappyPath:
         config = _build(strategy_config={"fast_ema_period": 10})
         strat = config.strategies[0]
         assert strat.config["manage_stop"] is True
+
+    def test_market_exit_tif_day_injected_for_us_equity(self) -> None:
+        """Bug #2 (live-deploy-safety-trio): when the strategy targets
+        a US-equity venue (e.g. NASDAQ), the builder injects
+        ``market_exit_time_in_force="DAY"`` to match IB account preset
+        and avoid the GTC cancel/fill race (IB error 10349)."""
+        config = _build(strategy_config={"instruments": ["AAPL.NASDAQ"], "fast_ema_period": 10})
+        strat = config.strategies[0]
+        assert strat.config["market_exit_time_in_force"] == int(TimeInForce.DAY)
+
+    def test_market_exit_tif_not_injected_for_futures(self) -> None:
+        """Non-US-equity venues keep Nautilus's GTC default (no
+        override): CME, IDEALPRO, etc. are unaffected."""
+        config = _build(strategy_config={"instruments": ["ESM4.CME"]})
+        strat = config.strategies[0]
+        assert "market_exit_time_in_force" not in strat.config
 
     def test_order_id_tag_injected_from_slug(self) -> None:
         """Task 1.10: ``order_id_tag`` must be ``0-{deployment_slug}``

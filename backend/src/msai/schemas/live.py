@@ -116,6 +116,17 @@ class LiveKillAllResponse(BaseModel):
     stopped: int
     failed_publish: int = 0
     risk_halted: bool
+    # PR #65 Codex P2: surface broker flatness directly in the response.
+    # `any_non_flat` is True if ANY deployment's stop_report came back
+    # `broker_flat=False`, OR if any flatness poll timed out / never
+    # arrived (operator can't distinguish "still has positions" from
+    # "we don't know" — both demand IB-portal verification). When True
+    # the operator MUST verify residual positions via IB portal before
+    # `/resume`. The audit log carries the per-deployment detail; the
+    # response body keeps just the boolean so a panic-button caller
+    # doesn't have to inspect audit history to know.
+    any_non_flat: bool = False
+    flatness_reports: list[dict[str, Any]] = []
 
 
 class LiveResumeResponse(BaseModel):
