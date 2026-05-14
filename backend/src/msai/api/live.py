@@ -790,6 +790,26 @@ async def live_stop(
         )
     ).scalar_one_or_none()
     if active_process is None:
+        # PR #65 Codex P2 round-4: if a prior /stop returned
+        # FLATNESS_UNKNOWN, persist that state so a retry doesn't
+        # silently 200 here. The marker key `stop_unknown:{deployment_id}`
+        # lives for 1h (long enough for an operator IB-portal check
+        # + manual flatten + /resume, short enough not to dirty Redis).
+        # Operator can clear it explicitly via /resume (Layer 1) which
+        # is the same path that clears the halt flag.
+        with contextlib.suppress(Exception):
+            unknown_marker = await bus._redis.get(  # noqa: SLF001
+                f"stop_unknown:{deployment.id}"
+            )
+            if unknown_marker:
+                # Marker carries the original stop_nonce for traceability.
+                return _apply_outcome(
+                    EndpointOutcome.flatness_unknown(
+                        deployment_id=str(deployment.id),
+                        stop_nonce=str(unknown_marker),
+                        process_status="stopped",
+                    )
+                )
         return _apply_outcome(
             EndpointOutcome.stopped({"id": str(deployment.id), "status": "stopped"})
         )
@@ -872,6 +892,16 @@ async def live_stop(
             stop_nonce=stop_nonce,
             process_status=row.status,
         )
+        # Persist the unknown state so a retry doesn't hit the
+        # "no active process → 200 stopped" shortcut at the top of
+        # this endpoint and silently swallow the warning (PR #65
+        # Codex P2 round-4). 1h TTL; cleared by /resume.
+        with contextlib.suppress(Exception):
+            await bus._redis.set(  # noqa: SLF001
+                f"stop_unknown:{deployment.id}",
+                stop_nonce,
+                ex=3600,
+            )
         return _apply_outcome(
             EndpointOutcome.flatness_unknown(
                 deployment_id=str(deployment.id),
@@ -1167,12 +1197,28 @@ async def live_resume(
     await bus._redis.delete(f"{_HALT_KEY}:set_by")  # noqa: SLF001
     await bus._redis.delete(f"{_HALT_KEY}:set_at")  # noqa: SLF001
 
+    # PR #65 Codex P2 round-4: clear all `stop_unknown:*` markers on
+    # /resume. After the operator has verified IB-portal positions
+    # and is ready to re-deploy, the flatness-unknown state should
+    # be cleared so subsequent /stop calls don't keep returning 504.
+    # SCAN avoids blocking Redis on a KEYS call (production-safe).
+    unknown_cleared = 0
+    try:
+        async for key in bus._redis.scan_iter(match="stop_unknown:*"):  # noqa: SLF001
+            await bus._redis.delete(key)  # noqa: SLF001
+            unknown_cleared += 1
+    except Exception:  # noqa: BLE001
+        log.exception("stop_unknown_clear_failed")
+
     await log_audit(
         db,
         user_id=user_id,
         action="live_resume",
         resource_type="live_deployment",
-        details={"halt_flag_was_set": bool(deleted)},
+        details={
+            "halt_flag_was_set": bool(deleted),
+            "stop_unknown_cleared": unknown_cleared,
+        },
     )
 
     log.warning("kill_switch_resumed", resumed_by=str(user_id))
