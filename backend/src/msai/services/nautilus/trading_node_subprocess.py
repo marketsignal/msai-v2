@@ -1128,19 +1128,32 @@ async def _drain_and_report_flatness(
                 )
                 continue
             members = [str(x) for x in (ticket.get("member_strategy_id_fulls") or [])]
+            cache_read_failed = False
             try:
                 cache = node.kernel.cache
                 all_open = cache.positions_open()
             except Exception:  # noqa: BLE001
+                # PR #65 Codex P1: when the verification mechanism
+                # itself fails, we MUST NOT report broker_flat=True.
+                # Surface as non-flat with reason=cache_read_failed so
+                # the operator knows positions could not be verified.
                 log.exception("flatness_cache_read_failed")
                 all_open = []
+                cache_read_failed = True
             # Filter by member strategy_id_fulls — covers ALL members
             # of a portfolio (Codex iter-2 P1 #3 fix).
             my_open = [p for p in all_open if str(getattr(p, "strategy_id", "")) in members]
+            broker_flat = (not my_open) and not cache_read_failed
+            if cache_read_failed:
+                reason = "cache_read_failed"
+            elif my_open:
+                reason = "max_attempts_exhausted"
+            else:
+                reason = "ok"
             report = {
                 "stop_nonce": stop_nonce,
                 "deployment_id": str(deployment_id),
-                "broker_flat": not my_open,
+                "broker_flat": broker_flat,
                 "remaining_positions": [
                     {
                         "strategy_id": str(getattr(p, "strategy_id", "")),
@@ -1150,7 +1163,7 @@ async def _drain_and_report_flatness(
                     }
                     for p in my_open
                 ],
-                "reason": "ok" if not my_open else "max_attempts_exhausted",
+                "reason": reason,
                 "reported_at": datetime.now(UTC).isoformat(),
             }
             # Per-nonce key, 120s TTL — coalesced API readers MUST be

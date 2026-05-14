@@ -258,6 +258,45 @@ async def test_drain_skips_ticket_with_missing_nonce(
 
 
 @pytest.mark.asyncio
+async def test_cache_read_failure_reports_non_flat(
+    fake_redis_module: fakeredis.aioredis.FakeRedis,
+) -> None:
+    """PR #65 Codex P1: when ``cache.positions_open()`` raises during
+    shutdown, the helper MUST NOT report ``broker_flat=True`` — the
+    verification mechanism itself has failed, so the operator must be
+    told positions are unverified. Surface ``broker_flat=False`` with
+    ``reason='cache_read_failed'``."""
+    from msai.services.nautilus.trading_node_subprocess import (
+        _drain_and_report_flatness,
+    )
+
+    deployment_id = uuid4()
+    nonce = "abc123"
+    await fake_redis_module.rpush(
+        f"flatness_pending:{deployment_id}",
+        json.dumps({"stop_nonce": nonce, "member_strategy_id_fulls": ["S-0-slug"]}),
+    )
+
+    class _ExplodingCache:
+        def positions_open(self) -> list:
+            raise RuntimeError("Rust cache adapter went away")
+
+    node = SimpleNamespace(kernel=SimpleNamespace(cache=_ExplodingCache()))
+
+    await _drain_and_report_flatness(
+        node=node, deployment_id=deployment_id, redis_url="redis://fake"
+    )
+
+    raw = await fake_redis_module.get(f"stop_report:{nonce}")
+    assert raw is not None
+    report = json.loads(raw)
+    assert report["broker_flat"] is False, (
+        "cache-read failure must NOT report flat — would mask unverified state"
+    )
+    assert report["reason"] == "cache_read_failed"
+
+
+@pytest.mark.asyncio
 async def test_stop_report_has_ttl(
     fake_redis_module: fakeredis.aioredis.FakeRedis,
 ) -> None:

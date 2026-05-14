@@ -97,18 +97,32 @@ def _has_us_equity_venue(instrument_ids: list[str]) -> bool:
     return False
 
 
-def _strategy_us_equity_tif_overrides(strategy_config: dict[str, Any]) -> dict[str, Any]:
+def _strategy_us_equity_tif_overrides(
+    strategy_config: dict[str, Any],
+    extra_instruments: list[str] | None = None,
+) -> dict[str, Any]:
     """Return the dict fragment to merge into a strategy's config when
     its instruments target a US-equity venue. Empty dict otherwise.
 
-    Reads ``strategy_config["instruments"]`` (canonical IDs) AND any
-    ``strategy_config["instrument_id"]`` single-instrument convention.
+    Reads three sources of instrument IDs:
+    - ``strategy_config["instruments"]`` (canonical IDs as a list)
+    - ``strategy_config["instrument_id"]`` (single-instrument convention)
+    - ``extra_instruments`` — the authoritative per-member list from
+      ``StrategyMemberPayload.instruments`` for the portfolio path
+      (PR #65 Codex P2). The portfolio builder only writes
+      ``instrument_id`` into the per-member config but the
+      multi-instrument truth lives on the payload; a strategy whose
+      first config instrument is non-US-equity but whose payload
+      contains a US-equity member would otherwise miss the TIF=DAY
+      override and re-trigger the IB error-10349 cancel-fill race.
     """
     ids: list[str] = []
     if isinstance(strategy_config.get("instruments"), list):
         ids.extend(str(x) for x in strategy_config["instruments"])
     if "instrument_id" in strategy_config and strategy_config["instrument_id"]:
         ids.append(str(strategy_config["instrument_id"]))
+    if extra_instruments:
+        ids.extend(str(x) for x in extra_instruments)
     if _has_us_equity_venue(ids):
         # Emit the integer value of the Nautilus TimeInForce enum (DAY=5
         # in 1.225+). msgspec deserializes StrategyConfig from JSON and
@@ -631,7 +645,15 @@ def build_portfolio_trading_node_config(
                     "order_id_tag": order_id_tag,
                     # US-equity venues: override Nautilus default GTC
                     # to match IB account preset DAY (Bug #2 fix).
-                    **_strategy_us_equity_tif_overrides(member.strategy_config),
+                    # PR #65 Codex P2: pass member.instruments — the
+                    # authoritative per-member list — so a portfolio
+                    # member whose strategy_config carries only a non-US
+                    # equity instrument_id but whose payload includes a
+                    # US-equity member still gets TIF=DAY injected.
+                    **_strategy_us_equity_tif_overrides(
+                        member.strategy_config,
+                        extra_instruments=list(member.instruments or []),
+                    ),
                 },
             ),
         )

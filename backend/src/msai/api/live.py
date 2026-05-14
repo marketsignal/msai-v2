@@ -7,6 +7,7 @@ strategies, stopping them, querying status, and emergency halt.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import UTC, datetime
 from time import monotonic
 from typing import TYPE_CHECKING, Any
@@ -849,6 +850,15 @@ async def live_stop(
     deployment.status = "stopped"
     deployment.last_stopped_at = datetime.now(UTC)
     await db.commit()
+
+    # PR #65 Codex P2: clear `inflight_stop:{deployment_id}` once the
+    # supervisor has confirmed termination. Without this, a deployment
+    # warm-restarted within the 60s TTL would have its next /stop call
+    # coalesce onto THIS run's nonce — polling a stop_report from the
+    # old process while the new one keeps running. Best-effort: if
+    # Redis DEL fails, the 60s TTL is the fallback.
+    with contextlib.suppress(Exception):
+        await bus._redis.delete(f"inflight_stop:{deployment.id}")  # noqa: SLF001
 
     await log_audit(
         db,

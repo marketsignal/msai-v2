@@ -48,11 +48,15 @@ class TestHasUsEquityVenue:
 class TestStrategyUsEquityTifOverrides:
     def test_returns_day_for_instruments_list_with_us_equity(self) -> None:
         config = {"instruments": ["AAPL.NASDAQ"]}
-        assert _strategy_us_equity_tif_overrides(config) == {"market_exit_time_in_force": int(TimeInForce.DAY)}
+        assert _strategy_us_equity_tif_overrides(config) == {
+            "market_exit_time_in_force": int(TimeInForce.DAY)
+        }
 
     def test_returns_day_for_single_instrument_id(self) -> None:
         config = {"instrument_id": "SPY.ARCA"}
-        assert _strategy_us_equity_tif_overrides(config) == {"market_exit_time_in_force": int(TimeInForce.DAY)}
+        assert _strategy_us_equity_tif_overrides(config) == {
+            "market_exit_time_in_force": int(TimeInForce.DAY)
+        }
 
     def test_returns_empty_for_futures(self) -> None:
         config = {"instruments": ["ESM4.CME"]}
@@ -71,4 +75,29 @@ class TestStrategyUsEquityTifOverrides:
 
     def test_mixed_us_equity_and_futures_returns_day(self) -> None:
         config = {"instruments": ["ESM4.CME", "AAPL.NASDAQ"]}
-        assert _strategy_us_equity_tif_overrides(config) == {"market_exit_time_in_force": int(TimeInForce.DAY)}
+        assert _strategy_us_equity_tif_overrides(config) == {
+            "market_exit_time_in_force": int(TimeInForce.DAY)
+        }
+
+    def test_extra_instruments_us_equity_triggers_override(self) -> None:
+        """PR #65 Codex P2: portfolio members store the authoritative
+        instrument list on the payload, not the config. A strategy whose
+        config carries only a non-US-equity instrument_id but whose
+        payload contains a US-equity member must still get TIF=DAY."""
+        config = {"instrument_id": "ESM4.CME"}
+        result = _strategy_us_equity_tif_overrides(config, extra_instruments=["AAPL.NASDAQ"])
+        assert result == {"market_exit_time_in_force": int(TimeInForce.DAY)}
+
+    def test_extra_instruments_no_us_equity_returns_empty(self) -> None:
+        """Extra instruments that are all non-US-equity keep the GTC default."""
+        config = {"instrument_id": "ESM4.CME"}
+        result = _strategy_us_equity_tif_overrides(
+            config, extra_instruments=["ESH5.CME", "EUR/USD.IDEALPRO"]
+        )
+        assert result == {}
+
+    def test_extra_instruments_none_is_safe(self) -> None:
+        """Default ``extra_instruments=None`` matches the pre-PR-#65 signature."""
+        config = {"instruments": ["AAPL.NASDAQ"]}
+        result = _strategy_us_equity_tif_overrides(config, extra_instruments=None)
+        assert result == {"market_exit_time_in_force": int(TimeInForce.DAY)}
