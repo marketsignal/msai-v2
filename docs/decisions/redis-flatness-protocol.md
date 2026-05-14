@@ -74,12 +74,32 @@ deployment-scoped flatness at shutdown:
                           └────────────────► API GET stop_report:{nonce} (poll)
                                              with exponential backoff
                                              50ms→100ms→200ms→400ms→800ms→1600ms
-                                             deadline 30s (/stop) / 15s (/kill-all)
+                                             deadline 45s (/stop) / 35s (/kill-all)
 ```
+
+**Why these specific timeouts.** The command bus uses XAUTOCLAIM with
+a `min_idle_ms` of 30 s (see `services/live_command_bus.py`). If a
+STOP_AND_REPORT_FLATNESS command is consumed by the wrong supervisor
+host (Phase 2 multi-supervisor topology) or by a host that's busy
+restarting, the command waits 30 s before XAUTOCLAIM redelivers it
+to a healthy consumer. The API poll deadlines must be longer than
+that window so the report can still arrive:
+
+- `/stop` 45 s: 30 s XAUTOCLAIM + 5 s redelivery + 10 s for the child
+  to drain its cache and write the report.
+- `/kill-all` 35 s: 30 s XAUTOCLAIM + 5 s buffer. Tighter than /stop
+  because panic-button callers need a fast answer; if the report
+  doesn't arrive, the response already says `any_non_flat: true` /
+  `broker_flat: null` and the operator goes to IB portal anyway.
+
+Phase 1 deployment is single-supervisor so XAUTOCLAIM never actually
+fires for cross-host routing — every command lands on the only
+consumer. The headroom is for restart-during-stop scenarios and
+Phase 2 readiness. PR #65 Codex P2 round-6 flagged this.
 
 **TTL rationale.**
 
-- `inflight_stop` 60 s: must be ≥ the longest poll deadline (30 s) +
+- `inflight_stop` 60 s: must be ≥ the longest poll deadline (45 s) +
   slack. Lets a second caller arriving 25 s into the first's wait
   still observe the in-flight nonce.
 - `flatness_pending` 120 s: long enough to outlive a slow Nautilus
@@ -88,7 +108,7 @@ deployment-scoped flatness at shutdown:
   if the child never drains it, the list disappears before becoming
   a memory liability.
 - `stop_report` 120 s: matches the child's worst-case
-  pending-drain horizon. API only waits 30 s, but coalesced readers
+  pending-drain horizon. API only waits 45 s, but coalesced readers
   may arrive late and need the key still present (the API does NOT
   DEL after read — see Bug #2 plan §3 step 4).
 
@@ -137,7 +157,7 @@ shares.
 ### Operator observes `broker_flat: unknown` (504 timeout)
 
 The API never received a `stop_report:{nonce}` key within the
-30 s (/stop) or 15 s (/kill-all) deadline. Possible causes:
+45 s (/stop) or 35 s (/kill-all) deadline. Possible causes:
 
 | Cause                                                   | Detection                                                                           | Action                                                                                            |
 | ------------------------------------------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |

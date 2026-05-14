@@ -841,7 +841,15 @@ async def live_stop(
     report = await poll_stop_report(
         redis=bus._redis,  # noqa: SLF001
         stop_nonce=stop_nonce,
-        deadline_s=30.0,
+        # 45s deadline — clears the 30s XAUTOCLAIM idle window on the
+        # command bus so a cross-host redelivery (Phase 2 multi-supervisor
+        # topology) or a restart-during-stop scenario can still produce
+        # the report before this caller times out. Single-supervisor
+        # topology (Phase 1) doesn't actually need the headroom, but
+        # the cost is bounded (caller waits up to 45s only on the
+        # genuinely-degraded path; healthy stops resolve in ~10s).
+        # PR #65 Codex P2 round-6.
+        deadline_s=45.0,
     )
 
     # Also poll the LiveNodeProcess row for terminal status — gives us
@@ -1067,7 +1075,15 @@ async def live_kill_all(
             return dep_id, await poll_stop_report(
                 redis=bus._redis,  # noqa: SLF001
                 stop_nonce=nce,
-                deadline_s=15.0,
+                # 35s deadline — clears the 30s XAUTOCLAIM idle window
+                # plus a 5s buffer. Tighter than /stop's 45s because
+                # the panic-button caller benefits from a faster answer
+                # even at the cost of more `broker_flat: null` reports
+                # on cross-host redelivery races. Operator already
+                # knows kill-all requires IB-portal verification (per
+                # the ADR runbook) so an early `null` is recoverable.
+                # PR #65 Codex P2 round-6.
+                deadline_s=35.0,
             )
 
         results = await asyncio.gather(*(_poll_one(d, n) for d, n in flatness_nonces.items()))
