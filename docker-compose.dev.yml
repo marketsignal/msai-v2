@@ -33,6 +33,7 @@ x-worker-env: &worker-env
   IB_GATEWAY_HOST: ${IB_GATEWAY_HOST:-ib-gateway}
   IB_GATEWAY_PORT_PAPER: 4004
   IB_GATEWAY_PORT_LIVE: 4003
+  IB_PORT: ${IB_PORT:-4004}
   IB_ALLOW_MOCK_FALLBACK: ${IB_ALLOW_MOCK_FALLBACK:-true}
 
 x-worker-depends: &worker-depends
