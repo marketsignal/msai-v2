@@ -1022,6 +1022,17 @@ async def live_kill_all(
         results = await asyncio.gather(*(_poll_one(d, n) for d, n in flatness_nonces.items()))
         flatness_results = dict(results)
 
+        # PR #65 Codex P2 round-3: mirror the /stop cleanup. Clear
+        # `inflight_stop:{deployment_id}` for every deployment whose
+        # report arrived, so an operator who resumes + warm-restarts
+        # + re-stops within the 60s TTL doesn't have the next /stop
+        # call coalesce onto this kill-all's already-completed nonce.
+        # Best-effort: 60s TTL is the fallback if DEL fails.
+        for dep_id, report in flatness_results.items():
+            if report is not None:
+                with contextlib.suppress(Exception):
+                    await bus._redis.delete(f"inflight_stop:{dep_id}")  # noqa: SLF001
+
     def _summarize(dep_id: str) -> dict[str, Any]:
         report = flatness_results.get(dep_id)
         return {

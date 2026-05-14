@@ -645,14 +645,18 @@ def build_portfolio_trading_node_config(
                     "order_id_tag": order_id_tag,
                     # US-equity venues: override Nautilus default GTC
                     # to match IB account preset DAY (Bug #2 fix).
-                    # PR #65 Codex P2: pass member.instruments — the
-                    # authoritative per-member list — so a portfolio
-                    # member whose strategy_config carries only a non-US
-                    # equity instrument_id but whose payload includes a
-                    # US-equity member still gets TIF=DAY injected.
+                    # PR #65 Codex P2 round-3: use `resolved_instruments`
+                    # — those carry the canonical "SYMBOL.VENUE" form
+                    # (e.g. "AAPL.NASDAQ") that `_has_us_equity_venue`
+                    # parses. `member.instruments` carries paper roots
+                    # ("AAPL" via `inst.split(".")[0]` in the payload
+                    # factory) which have no `.VENUE` suffix → would
+                    # never trigger the override.
                     **_strategy_us_equity_tif_overrides(
                         member.strategy_config,
-                        extra_instruments=list(member.instruments or []),
+                        extra_instruments=[
+                            r.canonical_id for r in (member.resolved_instruments or ())
+                        ],
                     ),
                 },
             ),
