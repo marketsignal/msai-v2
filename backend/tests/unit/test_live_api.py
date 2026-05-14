@@ -52,7 +52,28 @@ def mock_command_bus() -> MagicMock:
     fake_redis.set = AsyncMock(return_value=True)
     fake_redis.delete = AsyncMock(return_value=1)
     fake_redis.exists = AsyncMock(return_value=0)
+    # Flatness service (Bug #2) uses get/rpush/expire on bus._redis.
+    # Default `get` returns a stub report so the API doesn't wait for
+    # the 15-30s deadline on every existing test. Tests that care
+    # about the flatness wire override fake_redis.get explicitly.
+    import json as _json
+
+    fake_redis.get = AsyncMock(
+        return_value=_json.dumps(
+            {
+                "stop_nonce": "stub",
+                "deployment_id": "stub",
+                "broker_flat": True,
+                "remaining_positions": [],
+                "reason": "ok",
+                "reported_at": "2026-05-13T00:00:00+00:00",
+            }
+        )
+    )
+    fake_redis.rpush = AsyncMock(return_value=1)
+    fake_redis.expire = AsyncMock(return_value=True)
     bus._redis = fake_redis  # noqa: SLF001
+    bus.publish_stop_and_report_flatness = AsyncMock(return_value="1-1")
     return bus
 
 
@@ -182,9 +203,10 @@ class TestLiveKillAll:
         assert response.status_code == 200
         body = response.json()
         assert body["stopped"] == 3
-        assert mock_command_bus.publish_stop.await_count == 3
-        # Each call carries the kill_switch reason
-        for call in mock_command_bus.publish_stop.await_args_list:
+        # Bug #2 (live-deploy-safety-trio): /kill-all publishes
+        # STOP_AND_REPORT_FLATNESS, not plain STOP.
+        assert mock_command_bus.publish_stop_and_report_flatness.await_count == 3
+        for call in mock_command_bus.publish_stop_and_report_flatness.await_args_list:
             assert call.kwargs.get("reason") == "kill_switch"
 
     async def test_kill_all_continues_when_one_publish_fails(
@@ -215,8 +237,12 @@ class TestLiveKillAll:
         mock_result.scalars.return_value = mock_scalars
         mock_db.execute.return_value = mock_result
 
-        # First call raises, second succeeds
-        mock_command_bus.publish_stop.side_effect = [RuntimeError("redis blip"), "1-0"]
+        # First call raises, second succeeds. /kill-all now uses
+        # publish_stop_and_report_flatness (Bug #2).
+        mock_command_bus.publish_stop_and_report_flatness.side_effect = [
+            RuntimeError("redis blip"),
+            "1-0",
+        ]
 
         response = await client_with_mock_db.post("/api/v1/live/kill-all")
 

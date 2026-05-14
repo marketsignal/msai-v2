@@ -48,6 +48,10 @@ from msai.services.live.deployment_identity import (
     generate_deployment_slug,
 )
 from msai.services.live.failure_kind import FailureKind
+from msai.services.live.flatness_service import (
+    coalesce_or_publish_stop_with_flatness,
+    poll_stop_report,
+)
 from msai.services.live.idempotency import (
     PERMANENT_FAILURE_KINDS,
     REGISTRY_FAILURE_KINDS,
@@ -789,14 +793,40 @@ async def live_stop(
             EndpointOutcome.stopped({"id": str(deployment.id), "status": "stopped"})
         )
 
-    # Publish the STOP command.
-    await bus.publish_stop(
+    # Gather the deployment's member strategy_id_fulls so the child can
+    # filter cache.positions_open() by member ownership (Bug #2, plan §3).
+    member_rows = (
+        await db.execute(
+            select(LiveDeploymentStrategy.strategy_id_full).where(
+                LiveDeploymentStrategy.deployment_id == deployment.id
+            )
+        )
+    ).all()
+    member_strategy_id_fulls = [row.strategy_id_full for row in member_rows]
+
+    # Publish STOP_AND_REPORT_FLATNESS via SET-NX coalescing — concurrent
+    # /stop callers converge on the originator's nonce (Codex iter-6 P2 #1).
+    stop_nonce, _is_originator = await coalesce_or_publish_stop_with_flatness(
+        redis=bus._redis,  # noqa: SLF001 — intentional bus.redis reuse
+        bus=bus,
         deployment_id=deployment.id,
+        member_strategy_id_fulls=member_strategy_id_fulls,
         reason="user",
         idempotency_key=idempotency_key,
     )
 
-    # Poll until the supervisor flips the row to stopped / failed.
+    # Poll for the child's STOP_REPORT (30 s deadline). Does NOT DEL —
+    # 120 s TTL handles cleanup; coalesced readers share the key.
+    report = await poll_stop_report(
+        redis=bus._redis,  # noqa: SLF001
+        stop_nonce=stop_nonce,
+        deadline_s=30.0,
+    )
+
+    # Also poll the LiveNodeProcess row for terminal status — gives us
+    # ``process_status`` for the response + lets us write
+    # ``LiveDeployment.status='stopped'`` only once the supervisor has
+    # confirmed the process exited.
     row = await _poll_for_terminal(
         db,
         deployment.id,
@@ -806,12 +836,13 @@ async def live_stop(
         interval_s=START_POLL_INTERVAL_S,
     )
 
-    if row is None:
+    if row is None and report is None:
         return _apply_outcome(EndpointOutcome.api_poll_timeout())
 
-    deployment.status = "stopped"
-    deployment.last_stopped_at = datetime.now(UTC)
-    await db.commit()
+    if row is not None:
+        deployment.status = "stopped"
+        deployment.last_stopped_at = datetime.now(UTC)
+        await db.commit()
 
     await log_audit(
         db,
@@ -819,12 +850,18 @@ async def live_stop(
         action="live_stop",
         resource_type="live_deployment",
         resource_id=deployment.id,
+        details={
+            "stop_nonce": stop_nonce,
+            "broker_flat": report["broker_flat"] if report else None,
+        },
     )
 
     log.info(
         "live_deployment_stopped",
         deployment_id=str(deployment.id),
-        process_status=row.status,
+        process_status=row.status if row else "unknown",
+        broker_flat=report["broker_flat"] if report else None,
+        stop_nonce=stop_nonce,
     )
 
     return _apply_outcome(
@@ -832,7 +869,10 @@ async def live_stop(
             {
                 "id": str(deployment.id),
                 "status": "stopped",
-                "process_status": row.status,
+                "process_status": row.status if row else "unknown",
+                "stop_nonce": stop_nonce,
+                "broker_flat": report["broker_flat"] if report else None,
+                "remaining_positions": (report["remaining_positions"] if report else []),
             }
         )
     )
@@ -920,9 +960,28 @@ async def live_kill_all(
 
     stopped = 0
     failed: list[str] = []
+    flatness_nonces: dict[str, str] = {}  # deployment_id -> stop_nonce
     for row in rows:
         try:
-            await bus.publish_stop(row.deployment_id, reason="kill_switch")
+            # Gather member strategy_id_fulls so the child reports
+            # deployment-scoped flatness (Bug #2).
+            member_rows = (
+                await db.execute(
+                    select(LiveDeploymentStrategy.strategy_id_full).where(
+                        LiveDeploymentStrategy.deployment_id == row.deployment_id
+                    )
+                )
+            ).all()
+            members = [r.strategy_id_full for r in member_rows]
+
+            nonce, _ = await coalesce_or_publish_stop_with_flatness(
+                redis=bus._redis,  # noqa: SLF001
+                bus=bus,
+                deployment_id=row.deployment_id,
+                member_strategy_id_fulls=members,
+                reason="kill_switch",
+            )
+            flatness_nonces[str(row.deployment_id)] = nonce
             stopped += 1
         except Exception:  # noqa: BLE001
             failed.append(str(row.deployment_id))
@@ -930,6 +989,36 @@ async def live_kill_all(
                 "kill_switch_publish_stop_failed",
                 deployment_id=str(row.deployment_id),
             )
+
+    # Parallel-poll all stop_report keys with a single 15 s deadline
+    # — slower than /stop's 30 s because kill-all is a panic surface
+    # and the operator already knows positions need manual verification.
+    flatness_results: dict[str, dict[str, Any] | None] = {}
+    if flatness_nonces:
+
+        async def _poll_one(dep_id: str, nce: str) -> tuple[str, dict[str, Any] | None]:
+            return dep_id, await poll_stop_report(
+                redis=bus._redis,  # noqa: SLF001
+                stop_nonce=nce,
+                deadline_s=15.0,
+            )
+
+        results = await asyncio.gather(*(_poll_one(d, n) for d, n in flatness_nonces.items()))
+        flatness_results = dict(results)
+
+    def _summarize(dep_id: str) -> dict[str, Any]:
+        report = flatness_results.get(dep_id)
+        return {
+            "deployment_id": dep_id,
+            "stop_nonce": flatness_nonces[dep_id],
+            "broker_flat": report["broker_flat"] if report else None,
+            "remaining_positions": report["remaining_positions"] if report else [],
+        }
+
+    flatness_summary = [_summarize(dep_id) for dep_id in flatness_nonces]
+    any_non_flat = any(
+        f["broker_flat"] is False or f["broker_flat"] is None for f in flatness_summary
+    )
 
     await log_audit(
         db,
@@ -941,6 +1030,8 @@ async def live_kill_all(
             "failed_publish_count": len(failed),
             "failed_deployment_ids": failed,
             "halt_flag_set": True,
+            "any_non_flat": any_non_flat,
+            "flatness_reports": flatness_summary,
         },
     )
 

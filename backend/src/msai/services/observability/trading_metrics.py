@@ -25,6 +25,40 @@ DEPLOYMENTS_FAILED = _r.counter("msai_deployments_failed_total", "Live deploymen
 # Kill switch
 KILL_SWITCH_ACTIVATED = _r.counter("msai_kill_switch_total", "Kill switch activations")
 
+# Stop-flatness verification — Redis-coordinated child→API report of
+# deployment-scoped position state at shutdown. See
+# `docs/decisions/redis-flatness-protocol.md`.
+FLATNESS_REQUESTS_TOTAL = _r.counter(
+    "msai_flatness_requests_total",
+    "Total /stop or /kill-all calls that issued a STOP_AND_REPORT_FLATNESS "
+    "command. Increments on every API invocation regardless of coalescing "
+    "outcome. Pair with msai_flatness_coalesced_total for hit rate.",
+)
+FLATNESS_COALESCED_TOTAL = _r.counter(
+    "msai_flatness_coalesced_total",
+    "Count of API stop calls that coalesced onto an existing in-flight "
+    "stop_nonce (SET-NX inflight_stop:{deployment_id} returned False). "
+    "Hit rate = msai_flatness_coalesced_total / msai_flatness_requests_total.",
+)
+FLATNESS_POLL_TIMEOUT_TOTAL = _r.counter(
+    "msai_flatness_poll_timeout_total",
+    "Count of API polls that hit the 30s (/stop) or 15s (/kill-all) "
+    "deadline without ever observing the child's stop_report:{nonce} key. "
+    "Investigate child shutdown or Redis health when this trends > 0.",
+)
+FLATNESS_REPORT_NON_FLAT_TOTAL = _r.counter(
+    "msai_flatness_report_non_flat_total",
+    "Count of stop_reports returning broker_flat=False — Nautilus market_exit "
+    "exhausted max_attempts while positions remained. Each increment requires "
+    "operator IB-portal review per the runbook.",
+)
+FLATNESS_PENDING_LIST_LENGTH = _r.gauge(
+    "msai_flatness_pending_list_length",
+    "RPUSH list length on flatness_pending:{deployment_id} just before SIGTERM. "
+    "Healthy: 1. Sustained > 1 means concurrent stops are stacking on a "
+    "stuck child (coalescing should normally hold this at 1).",
+)
+
 # Order lifecycle
 ORDERS_SUBMITTED = _r.counter("msai_orders_submitted_total", "Orders submitted to broker")
 ORDERS_FILLED = _r.counter("msai_orders_filled_total", "Orders filled by broker")

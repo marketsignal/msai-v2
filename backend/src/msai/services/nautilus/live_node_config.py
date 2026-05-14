@@ -57,6 +57,7 @@ from nautilus_trader.live.config import (
     LiveRiskEngineConfig,
     TradingNodeConfig,
 )
+from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.identifiers import TraderId
 from pydantic import BaseModel, Field
 
@@ -68,6 +69,52 @@ from msai.services.nautilus.live_instrument_bootstrap import (
     build_ib_instrument_provider_config,
     build_ib_instrument_provider_config_from_resolved,
 )
+
+# US equity venues — Nautilus VENUE component of InstrumentId for stocks
+# traded on US exchanges. When `manage_stop=True` triggers Nautilus's
+# built-in `market_exit()` on stop, the resulting market orders inherit
+# the IB account's default TIF. IB's stock accounts default to DAY, but
+# Nautilus emits GTC unless overridden — IB then rejects with error
+# 10349 "TIF not allowed for the order" + cancels in the same message
+# IB also CONFIRMS the order accepted, producing a phantom fill in
+# Nautilus's view (Bug #2 in live-deploy-safety-trio). Setting
+# `market_exit_time_in_force="DAY"` for US-equity venues matches the
+# account preset and avoids the cancel/fill race.
+_US_EQUITY_VENUES: frozenset[str] = frozenset(
+    {"NASDAQ", "NYSE", "ARCA", "BATS", "IEX", "AMEX", "XNAS", "XNYS"}
+)
+
+
+def _has_us_equity_venue(instrument_ids: list[str]) -> bool:
+    """Return True if any of the given canonical instrument IDs targets
+    a US-equity venue. Each ID is expected to be ``"SYMBOL.VENUE"``;
+    inputs that don't match the shape are treated as non-US-equity
+    (caller should keep the GTC default)."""
+    for instrument_id in instrument_ids:
+        _, _, venue = instrument_id.partition(".")
+        if venue and venue.upper() in _US_EQUITY_VENUES:
+            return True
+    return False
+
+
+def _strategy_us_equity_tif_overrides(strategy_config: dict[str, Any]) -> dict[str, Any]:
+    """Return the dict fragment to merge into a strategy's config when
+    its instruments target a US-equity venue. Empty dict otherwise.
+
+    Reads ``strategy_config["instruments"]`` (canonical IDs) AND any
+    ``strategy_config["instrument_id"]`` single-instrument convention.
+    """
+    ids: list[str] = []
+    if isinstance(strategy_config.get("instruments"), list):
+        ids.extend(str(x) for x in strategy_config["instruments"])
+    if "instrument_id" in strategy_config and strategy_config["instrument_id"]:
+        ids.append(str(strategy_config["instrument_id"]))
+    if _has_us_equity_venue(ids):
+        # Emit the integer value of the Nautilus TimeInForce enum (DAY=5
+        # in 1.225+). msgspec deserializes StrategyConfig from JSON and
+        # rejects string variants — see `nautilus_trader/model/enums.pyx`.
+        return {"market_exit_time_in_force": int(TimeInForce.DAY)}
+    return {}
 
 
 def build_redis_database_config() -> DatabaseConfig:
@@ -413,6 +460,9 @@ def build_live_trading_node_config(
                     # produces. Without the ``0-`` prefix the
                     # StrategyId and strategy_id_full would diverge.
                     "order_id_tag": f"0-{deployment_slug}",
+                    # US-equity venues: override Nautilus's default GTC
+                    # to match IB account preset DAY (Bug #2 fix).
+                    **_strategy_us_equity_tif_overrides(strategy_config),
                 },
             ),
         ],
@@ -579,6 +629,9 @@ def build_portfolio_trading_node_config(
                     **member.strategy_config,
                     "manage_stop": True,
                     "order_id_tag": order_id_tag,
+                    # US-equity venues: override Nautilus default GTC
+                    # to match IB account preset DAY (Bug #2 fix).
+                    **_strategy_us_equity_tif_overrides(member.strategy_config),
                 },
             ),
         )

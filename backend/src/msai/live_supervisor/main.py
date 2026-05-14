@@ -79,6 +79,21 @@ async def handle_command(command: LiveCommand, *, process_manager: ProcessManage
             command.deployment_id,
             reason=str(command.payload.get("reason", "user")),
         )
+    if command.command_type is LiveCommandType.STOP_AND_REPORT_FLATNESS:
+        # Push the per-request flatness "ticket" onto a per-deployment
+        # list so the child can drain it in its shutdown-finally hook
+        # and write the stop_report:{nonce} key (see plan §Bug #2). Then
+        # invoke the existing STOP path (SIGTERM). The supervisor ACKs
+        # after signaling — the API is the sole report collector.
+        await process_manager.push_flatness_request(
+            command.deployment_id,
+            stop_nonce=str(command.payload.get("stop_nonce", "")),
+            member_strategy_id_fulls=list(command.payload.get("member_strategy_id_fulls") or []),
+        )
+        return await process_manager.stop(
+            command.deployment_id,
+            reason=str(command.payload.get("reason", "stop_and_report_flatness")),
+        )
     log.warning(
         "unknown_command",
         extra={

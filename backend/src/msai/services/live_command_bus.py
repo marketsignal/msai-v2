@@ -100,6 +100,15 @@ class LiveCommandType(StrEnum):
 
     START = "start"
     STOP = "stop"
+    STOP_AND_REPORT_FLATNESS = "stop_and_report_flatness"
+    """Stop the deployment and have the child publish a STOP_REPORT
+    Redis key (``stop_report:{stop_nonce}``) containing
+    deployment-scoped position state from
+    ``trading_node.kernel.cache.positions_open()``. The supervisor
+    handler RPUSHes ``flatness_pending:{deployment_id}`` and then sends
+    SIGTERM via the existing STOP path; the child reads the list in
+    its shutdown-finally hook. See
+    ``docs/plans/2026-05-13-live-deploy-safety-trio.md`` §Bug #2."""
 
 
 class LiveCommand:
@@ -248,6 +257,37 @@ class LiveCommandBus:
             command_type=LiveCommandType.STOP,
             deployment_id=deployment_id,
             payload={"reason": reason},
+            idempotency_key=idempotency_key,
+        )
+
+    async def publish_stop_and_report_flatness(
+        self,
+        deployment_id: UUID,
+        *,
+        stop_nonce: str,
+        member_strategy_id_fulls: list[str],
+        reason: str = "user",
+        idempotency_key: str | None = None,
+    ) -> str:
+        """Publish a STOP_AND_REPORT_FLATNESS command.
+
+        Carries ``stop_nonce`` (caller-generated UUID4 hex) so the API
+        can correlate the eventual STOP_REPORT in
+        ``stop_report:{stop_nonce}`` back to this specific request.
+        Stable ``deployment_id`` alone cannot serve as correlation
+        because it survives warm restarts.
+        ``member_strategy_id_fulls`` tells the child which Nautilus
+        ``StrategyId`` values to filter ``positions_open()`` by — all
+        members of a portfolio, not just one.
+        """
+        return await self._publish(
+            command_type=LiveCommandType.STOP_AND_REPORT_FLATNESS,
+            deployment_id=deployment_id,
+            payload={
+                "reason": reason,
+                "stop_nonce": stop_nonce,
+                "member_strategy_id_fulls": member_strategy_id_fulls,
+            },
             idempotency_key=idempotency_key,
         )
 
