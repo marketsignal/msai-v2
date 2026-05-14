@@ -160,6 +160,58 @@ class EndpointOutcome:
         )
 
     @classmethod
+    def flatness_unknown(
+        cls,
+        *,
+        deployment_id: str,
+        stop_nonce: str,
+        process_status: str,
+    ) -> EndpointOutcome:
+        """Supervisor confirmed terminal but the child never wrote a
+        flatness report (`stop_report:{nonce}` never materialized).
+
+        Bug #2 protocol per `docs/decisions/redis-flatness-protocol.md`
+        "broker_flat: unknown" — the deployment IS stopped (DB row is
+        terminal), but the wire that verifies broker flatness never
+        confirmed. Operator MUST verify positions via IB portal.
+
+        HTTP 504, not cacheable — the deployment is stopped, but the
+        flatness verification mechanism failed; subsequent retries
+        won't recover this signal (the process is already gone). The
+        504 forces the client to acknowledge the unknown state rather
+        than silently surfacing `broker_flat: null` as success."""
+        return cls(
+            status_code=504,
+            response={
+                "id": deployment_id,
+                "status": "stopped",
+                "process_status": process_status,
+                "stop_nonce": stop_nonce,
+                "broker_flat": None,
+                "remaining_positions": [],
+                "detail": {
+                    "error": {
+                        "code": "FLATNESS_UNKNOWN",
+                        "message": (
+                            "Deployment stopped but the child never wrote a "
+                            "flatness report. Operator must verify broker "
+                            "positions via IB portal."
+                        ),
+                        "details": {
+                            "hint": (
+                                f"check stop_report:{stop_nonce} in Redis manually if "
+                                "needed; the 120s TTL on the key may still hold the "
+                                "report if it arrived late."
+                            ),
+                        },
+                    },
+                },
+            },
+            cacheable=False,
+            failure_kind=FailureKind.API_POLL_TIMEOUT,
+        )
+
+    @classmethod
     def spawn_failed_transient(cls, error_message: str) -> EndpointOutcome:
         """The supervisor's payload factory raised a transient error
         (Postgres briefly down, network timeout during module import,

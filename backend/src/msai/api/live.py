@@ -860,6 +860,27 @@ async def live_stop(
     with contextlib.suppress(Exception):
         await bus._redis.delete(f"inflight_stop:{deployment.id}")  # noqa: SLF001
 
+    # PR #65 Codex P1 round-3: row is terminal but no flatness report
+    # arrived. The supervisor closed out, but the wire that verifies
+    # broker positions never confirmed. Surface as 504
+    # FLATNESS_UNKNOWN per the runbook — refusing to silently report
+    # `broker_flat: null` as success.
+    if report is None:
+        log.warning(
+            "live_deployment_stopped_flatness_unknown",
+            deployment_id=str(deployment.id),
+            stop_nonce=stop_nonce,
+            process_status=row.status,
+        )
+        return _apply_outcome(
+            EndpointOutcome.flatness_unknown(
+                deployment_id=str(deployment.id),
+                stop_nonce=stop_nonce,
+                process_status=row.status,
+            )
+        )
+
+    # Past here `report` is guaranteed non-None (early returns above).
     await log_audit(
         db,
         user_id=deployment.started_by,
@@ -868,7 +889,7 @@ async def live_stop(
         resource_id=deployment.id,
         details={
             "stop_nonce": stop_nonce,
-            "broker_flat": report["broker_flat"] if report else None,
+            "broker_flat": report["broker_flat"],
         },
     )
 
@@ -876,7 +897,7 @@ async def live_stop(
         "live_deployment_stopped",
         deployment_id=str(deployment.id),
         process_status=row.status,
-        broker_flat=report["broker_flat"] if report else None,
+        broker_flat=report["broker_flat"],
         stop_nonce=stop_nonce,
     )
 
@@ -887,8 +908,8 @@ async def live_stop(
                 "status": "stopped",
                 "process_status": row.status,
                 "stop_nonce": stop_nonce,
-                "broker_flat": report["broker_flat"] if report else None,
-                "remaining_positions": (report["remaining_positions"] if report else []),
+                "broker_flat": report["broker_flat"],
+                "remaining_positions": report["remaining_positions"],
             }
         )
     )
