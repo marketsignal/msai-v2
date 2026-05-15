@@ -305,7 +305,15 @@ class TestHttpCommands:
             "msai.cli.httpx.request",
             side_effect=httpx.ReadTimeout("slow"),
         ):
-            result = runner.invoke(app, ["live", "start", "sid", "AAPL"])
+            # Codex iter-3 P2: live start now requires --ib-login-key.
+            # PR #67 Codex P2: live start now also enforces the
+            # account/paper prefix guard before HTTP — must use a DU*
+            # paper-prefix account (or U* with --no-paper) for the
+            # timeout-surfacing path to actually reach httpx.request.
+            result = runner.invoke(
+                app,
+                ["live", "start", "sid", "DU1234567", "--ib-login-key", "k"],
+            )
         assert result.exit_code != 0
         assert "timed out" in result.output.lower()
 

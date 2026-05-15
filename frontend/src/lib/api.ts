@@ -746,3 +746,179 @@ export async function deleteSymbol(
     body,
   );
 }
+
+// ──── live deployment workflow ────
+//
+// Types + fetchers for the live-portfolio deploy/stop/kill-all/resume flow,
+// plus revision-members read. Mirrors backend schemas/live.py +
+// schemas/live_portfolio.py response models (drilled 2026-05-14 — see
+// docs/plans/2026-05-15-live-deployment-workflow-ui-cli.md "T1" notes).
+//
+// Note: `getLivePositions` and `getLiveTrades` already exist above with
+// stronger typing (LivePositionItem/LiveTrade) — kept intact per the
+// "additive only" T1 constraint. New work in T7/T8 reuses those.
+
+/** Response from POST /api/v1/live/start-portfolio. */
+export interface PortfolioStartResponse {
+  /** Deployment UUID. */
+  id: string;
+  deployment_slug: string;
+  /**
+   * One of "starting" | "building" | "ready" | "running" — any active
+   * status. UI should NOT hard-reject other strings (forward compat).
+   */
+  status: string;
+  paper_trading: boolean;
+  warm_restart: boolean;
+}
+
+/**
+ * Response from POST /api/v1/live/stop. Fields after `id`/`status` are
+ * OPTIONAL — the idempotent already-stopped path returns only those two.
+ */
+export interface LiveStopResponse {
+  id: string;
+  status: string;
+  process_status?: string;
+  stop_nonce?: string;
+  /** `null` when the flatness poll timed out. */
+  broker_flat?: boolean | null;
+  remaining_positions?: Array<Record<string, unknown>>;
+}
+
+/** Per-deployment flatness entry inside the kill-all response. */
+export interface KillAllFlatnessReport {
+  deployment_id: string;
+  /** `null` on timeout. */
+  broker_flat: boolean | null;
+  remaining_positions: Array<Record<string, unknown>>;
+  /** Per-deployment nonce; nested here, NOT at top level. */
+  stop_nonce?: string | null;
+}
+
+/** Response from POST /api/v1/live/kill-all. */
+export interface LiveKillAllResponse {
+  stopped: number;
+  /** Count of publish failures (NOT a kill_nonce — there's no top-level nonce). */
+  failed_publish: number;
+  risk_halted: boolean;
+  any_non_flat: boolean;
+  flatness_reports: KillAllFlatnessReport[];
+}
+
+/** Response from POST /api/v1/live/resume. */
+export interface LiveResumeResponse {
+  resumed: boolean;
+}
+
+/** A live portfolio (control-plane container for revisions). */
+export interface LivePortfolio {
+  id: string;
+  name: string;
+  description: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** An (immutable, once frozen) revision of a live portfolio. */
+export interface LivePortfolioRevision {
+  id: string;
+  revision_number: number;
+  composition_hash: string;
+  is_frozen: boolean;
+  created_at: string;
+}
+
+/** A frozen member row inside a portfolio revision. */
+export interface LivePortfolioMemberFrozen {
+  id: string;
+  /** Strategy UUID. */
+  strategy_id: string;
+  config: Record<string, unknown>;
+  instruments: string[];
+  /** Decimal serialized as a string. */
+  weight: string;
+  order_index: number;
+}
+
+/**
+ * POST /api/v1/live/start-portfolio — deploy a portfolio revision.
+ *
+ * `idempotencyKey` is passed via the `Idempotency-Key` header to protect
+ * the deployment write from network-retry double-fires.
+ */
+export async function startPortfolio(
+  body: {
+    portfolio_revision_id: string;
+    account_id: string;
+    paper_trading: boolean;
+    ib_login_key: string;
+  },
+  idempotencyKey: string,
+  token?: string | null,
+): Promise<PortfolioStartResponse> {
+  const path = "/api/v1/live/start-portfolio";
+  const res = await apiFetch(
+    path,
+    {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify(body),
+    },
+    token,
+  );
+  if (!res.ok) {
+    let errBody: unknown = null;
+    try {
+      errBody = await res.json();
+    } catch {
+      // ignore
+    }
+    throw new ApiError(
+      `POST ${path} failed: ${res.status}`,
+      res.status,
+      errBody,
+    );
+  }
+  return (await res.json()) as PortfolioStartResponse;
+}
+
+/** POST /api/v1/live/stop — stop a single deployment (idempotent). */
+export async function stopDeployment(
+  deploymentId: string,
+  token?: string | null,
+): Promise<LiveStopResponse> {
+  return apiPost<LiveStopResponse>(
+    "/api/v1/live/stop",
+    { deployment_id: deploymentId },
+    token,
+  );
+}
+
+/** POST /api/v1/live/kill-all — emergency halt all deployments. */
+export async function killAllLive(
+  token?: string | null,
+): Promise<LiveKillAllResponse> {
+  return apiPost<LiveKillAllResponse>("/api/v1/live/kill-all", {}, token);
+}
+
+/** POST /api/v1/live/resume — clear the risk-halt flag. */
+export async function resumeLive(
+  token?: string | null,
+): Promise<LiveResumeResponse> {
+  return apiPost<LiveResumeResponse>("/api/v1/live/resume", {}, token);
+}
+
+/**
+ * GET /api/v1/live-portfolio-revisions/{revision_id}/members — frozen
+ * member rows for a portfolio revision (new endpoint from T0b).
+ */
+export async function getRevisionMembers(
+  revisionId: string,
+  token?: string | null,
+): Promise<LivePortfolioMemberFrozen[]> {
+  return apiGet<LivePortfolioMemberFrozen[]>(
+    `/api/v1/live-portfolio-revisions/${encodeURIComponent(revisionId)}/members`,
+    token,
+  );
+}

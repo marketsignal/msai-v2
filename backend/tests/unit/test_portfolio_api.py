@@ -10,10 +10,14 @@ Tests cover:
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 import pytest
 from pydantic import ValidationError
+
+if TYPE_CHECKING:
+    import httpx
 
 from msai.schemas.live_portfolio import (
     LivePortfolioAddStrategyRequest,
@@ -22,7 +26,6 @@ from msai.schemas.live_portfolio import (
     LivePortfolioResponse,
     LivePortfolioRevisionResponse,
 )
-
 
 # ---------------------------------------------------------------------------
 # 1. Schema validation
@@ -188,9 +191,9 @@ class TestEndpointSignatures:
     """Verify endpoint functions exist and have the expected parameters."""
 
     def test_create_live_portfolio_signature(self) -> None:
-        from msai.api.portfolios import create_live_portfolio
-
         import inspect
+
+        from msai.api.portfolios import create_live_portfolio
 
         sig = inspect.signature(create_live_portfolio)
         params = list(sig.parameters.keys())
@@ -200,9 +203,9 @@ class TestEndpointSignatures:
         assert "db" in params
 
     def test_list_live_portfolios_signature(self) -> None:
-        from msai.api.portfolios import list_live_portfolios
-
         import inspect
+
+        from msai.api.portfolios import list_live_portfolios
 
         sig = inspect.signature(list_live_portfolios)
         params = list(sig.parameters.keys())
@@ -210,9 +213,9 @@ class TestEndpointSignatures:
         assert "db" in params
 
     def test_get_live_portfolio_signature(self) -> None:
-        from msai.api.portfolios import get_live_portfolio
-
         import inspect
+
+        from msai.api.portfolios import get_live_portfolio
 
         sig = inspect.signature(get_live_portfolio)
         params = list(sig.parameters.keys())
@@ -221,9 +224,9 @@ class TestEndpointSignatures:
         assert "db" in params
 
     def test_add_strategy_to_portfolio_signature(self) -> None:
-        from msai.api.portfolios import add_strategy_to_portfolio
-
         import inspect
+
+        from msai.api.portfolios import add_strategy_to_portfolio
 
         sig = inspect.signature(add_strategy_to_portfolio)
         params = list(sig.parameters.keys())
@@ -233,9 +236,9 @@ class TestEndpointSignatures:
         assert "db" in params
 
     def test_snapshot_portfolio_signature(self) -> None:
-        from msai.api.portfolios import snapshot_portfolio
-
         import inspect
+
+        from msai.api.portfolios import snapshot_portfolio
 
         sig = inspect.signature(snapshot_portfolio)
         params = list(sig.parameters.keys())
@@ -244,9 +247,9 @@ class TestEndpointSignatures:
         assert "db" in params
 
     def test_list_draft_members_signature(self) -> None:
-        from msai.api.portfolios import list_draft_members
-
         import inspect
+
+        from msai.api.portfolios import list_draft_members
 
         sig = inspect.signature(list_draft_members)
         params = list(sig.parameters.keys())
@@ -307,7 +310,7 @@ class TestHTTPEndpoints:
         app.dependency_overrides.pop(get_db, None)
 
     @pytest.fixture
-    def client(self) -> "httpx.AsyncClient":
+    def client(self) -> httpx.AsyncClient:
         import httpx
 
         from msai.main import app
@@ -315,18 +318,18 @@ class TestHTTPEndpoints:
         transport = httpx.ASGITransport(app=app)
         return httpx.AsyncClient(transport=transport, base_url="http://testserver")
 
-    async def test_list_returns_200(self, client: "httpx.AsyncClient") -> None:
+    async def test_list_returns_200(self, client: httpx.AsyncClient) -> None:
         response = await client.get("/api/v1/live-portfolios")
         assert response.status_code == 200
         assert isinstance(response.json(), list)
 
-    async def test_get_nonexistent_returns_404(self, client: "httpx.AsyncClient") -> None:
+    async def test_get_nonexistent_returns_404(self, client: httpx.AsyncClient) -> None:
         fake_id = uuid4()
         response = await client.get(f"/api/v1/live-portfolios/{fake_id}")
         assert response.status_code == 404
 
     async def test_add_strategy_nonexistent_portfolio_returns_404(
-        self, client: "httpx.AsyncClient"
+        self, client: httpx.AsyncClient
     ) -> None:
         fake_id = uuid4()
         response = await client.post(
@@ -341,24 +344,207 @@ class TestHTTPEndpoints:
         assert response.status_code == 404
 
     async def test_snapshot_nonexistent_portfolio_returns_404(
-        self, client: "httpx.AsyncClient"
+        self, client: httpx.AsyncClient
     ) -> None:
         fake_id = uuid4()
         response = await client.post(f"/api/v1/live-portfolios/{fake_id}/snapshot")
         assert response.status_code == 404
 
     async def test_list_members_nonexistent_portfolio_returns_404(
-        self, client: "httpx.AsyncClient"
+        self, client: httpx.AsyncClient
     ) -> None:
         fake_id = uuid4()
         response = await client.get(f"/api/v1/live-portfolios/{fake_id}/members")
         assert response.status_code == 404
 
-    async def test_create_missing_name_returns_422(
-        self, client: "httpx.AsyncClient"
-    ) -> None:
+    async def test_create_missing_name_returns_422(self, client: httpx.AsyncClient) -> None:
         response = await client.post(
             "/api/v1/live-portfolios",
             json={},
         )
         assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# 5. Revision-keyed members endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestRevisionMembersEndpoint:
+    """Cover GET /api/v1/live-portfolio-revisions/{revision_id}/members."""
+
+    def test_revisions_router_registered(self) -> None:
+        from msai.main import app
+
+        route_paths = [r.path for r in app.routes]  # type: ignore[union-attr]
+        assert "/api/v1/live-portfolio-revisions/{revision_id}/members" in route_paths
+
+    def test_list_revision_members_signature(self) -> None:
+        import inspect
+
+        from msai.api.portfolios import list_revision_members
+
+        sig = inspect.signature(list_revision_members)
+        params = list(sig.parameters.keys())
+        assert "revision_id" in params
+        assert "claims" in params
+        assert "db" in params
+
+    def test_revisions_router_is_distinct_object(self) -> None:
+        """``revisions_router`` is its own APIRouter with the v1-revisions prefix."""
+        from msai.api.portfolios import revisions_router, router
+
+        assert revisions_router is not router
+        assert revisions_router.prefix == "/api/v1/live-portfolio-revisions"
+
+
+class TestRevisionMembersHTTP:
+    """Exercise revision-members endpoint via httpx client (HTTP-layer only)."""
+
+    @pytest.fixture(autouse=True)
+    def _override_db(self) -> None:  # type: ignore[override]
+        from collections.abc import AsyncGenerator
+
+        from msai.core.database import get_db
+        from msai.main import app
+
+        class _FakeSession:
+            async def execute(self, _stmt: object) -> _FakeSession:
+                return self
+
+            def scalars(self) -> _FakeSession:
+                return self
+
+            def all(self) -> list[object]:
+                return []
+
+            async def get(self, _model: type, _id: object) -> None:
+                return None
+
+        async def _override() -> AsyncGenerator[_FakeSession, None]:
+            yield _FakeSession()
+
+        app.dependency_overrides[get_db] = _override
+        yield
+        app.dependency_overrides.pop(get_db, None)
+
+    @pytest.fixture
+    def client(self) -> httpx.AsyncClient:
+        import httpx
+
+        from msai.main import app
+
+        transport = httpx.ASGITransport(app=app)
+        return httpx.AsyncClient(transport=transport, base_url="http://testserver")
+
+    async def test_nonexistent_revision_returns_404(self, client: httpx.AsyncClient) -> None:
+        fake_id = uuid4()
+        response = await client.get(f"/api/v1/live-portfolio-revisions/{fake_id}/members")
+        assert response.status_code == 404
+
+    async def test_invalid_uuid_returns_422(self, client: httpx.AsyncClient) -> None:
+        response = await client.get("/api/v1/live-portfolio-revisions/not-a-uuid/members")
+        assert response.status_code == 422
+
+
+class TestRevisionMembersWithData:
+    """Happy-path: stub a frozen revision + members; assert list shape + ordering."""
+
+    @pytest.fixture(autouse=True)
+    def _override_db_with_members(self) -> None:  # type: ignore[override]
+        from collections.abc import AsyncGenerator
+        from dataclasses import dataclass
+
+        from msai.core.database import get_db
+        from msai.main import app
+
+        revision_id = uuid4()
+
+        @dataclass
+        class _Member:
+            id: UUID
+            strategy_id: UUID
+            config: dict
+            instruments: list
+            weight: Decimal
+            order_index: int
+
+        members = [
+            _Member(
+                id=uuid4(),
+                strategy_id=uuid4(),
+                config={"bar_type": "1-MINUTE"},
+                instruments=["AAPL.IBKR"],
+                weight=Decimal("0.6"),
+                order_index=0,
+            ),
+            _Member(
+                id=uuid4(),
+                strategy_id=uuid4(),
+                config={"bar_type": "5-MINUTE"},
+                instruments=["MSFT.IBKR"],
+                weight=Decimal("0.4"),
+                order_index=1,
+            ),
+        ]
+
+        # Lightweight stand-in for the revision row — endpoint only
+        # checks truthiness from ``db.get``; SQLAlchemy state machinery
+        # isn't needed for this unit test.
+        @dataclass
+        class _RevisionStub:
+            id: UUID
+            is_frozen: bool = True
+
+        revision = _RevisionStub(id=revision_id)
+
+        class _ResultProxy:
+            def scalars(self) -> _ResultProxy:
+                return self
+
+            def all(self) -> list[_Member]:
+                return list(members)
+
+        class _FakeSession:
+            async def execute(self, _stmt: object) -> _ResultProxy:
+                return _ResultProxy()
+
+            async def get(self, _model: type, _id: object) -> _RevisionStub | None:
+                if _id == revision_id:
+                    return revision
+                return None
+
+        async def _override() -> AsyncGenerator[_FakeSession, None]:
+            yield _FakeSession()
+
+        app.dependency_overrides[get_db] = _override
+        # Stash revision_id on the class for the test to read.
+        self._revision_id = revision_id  # type: ignore[attr-defined]
+        yield
+        app.dependency_overrides.pop(get_db, None)
+
+    @pytest.fixture
+    def client(self) -> httpx.AsyncClient:
+        import httpx
+
+        from msai.main import app
+
+        transport = httpx.ASGITransport(app=app)
+        return httpx.AsyncClient(transport=transport, base_url="http://testserver")
+
+    async def test_existing_revision_returns_members(self, client: httpx.AsyncClient) -> None:
+        rid: UUID = self._revision_id  # type: ignore[attr-defined]
+        response = await client.get(f"/api/v1/live-portfolio-revisions/{rid}/members")
+        assert response.status_code == 200
+        body = response.json()
+        assert isinstance(body, list)
+        assert len(body) == 2
+        # Ordered by order_index ascending
+        assert body[0]["order_index"] == 0
+        assert body[1]["order_index"] == 1
+        for entry in body:
+            assert "id" in entry
+            assert "strategy_id" in entry
+            assert "config" in entry
+            assert "instruments" in entry
+            assert "weight" in entry

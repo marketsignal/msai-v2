@@ -17,7 +17,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { Play, Square } from "lucide-react";
+import { Square } from "lucide-react";
 import { useAuth } from "@/lib/auth";
 import { apiFetch, type LiveDeploymentInfo } from "@/lib/api";
 import { formatTimestamp } from "@/lib/format";
@@ -43,27 +43,6 @@ export function StrategyStatus({
   deployments,
 }: StrategyStatusProps): React.ReactElement {
   const { getToken } = useAuth();
-
-  const handleStartStrategy = async (deploymentId: string): Promise<void> => {
-    try {
-      const token = await getToken();
-      await apiFetch(
-        "/api/v1/live/start",
-        {
-          method: "POST",
-          body: JSON.stringify({
-            strategy_id: deploymentId,
-            config: {},
-            instruments: [],
-            paper_trading: true,
-          }),
-        },
-        token,
-      );
-    } catch (error) {
-      console.error("Start strategy failed:", error);
-    }
-  };
 
   const handleStopStrategy = async (deploymentId: string): Promise<void> => {
     try {
@@ -142,7 +121,9 @@ export function StrategyStatus({
                     </Badge>
                   </TableCell>
                   <TableCell>
-                    {dep.status === "running" ? (
+                    {["starting", "building", "ready", "running"].includes(
+                      dep.status,
+                    ) && (
                       <Button
                         variant="outline"
                         size="xs"
@@ -151,16 +132,6 @@ export function StrategyStatus({
                       >
                         <Square className="size-3" />
                         Stop
-                      </Button>
-                    ) : (
-                      <Button
-                        variant="outline"
-                        size="xs"
-                        className="gap-1"
-                        onClick={() => handleStartStrategy(dep.id)}
-                      >
-                        <Play className="size-3" />
-                        Start
                       </Button>
                     )}
                   </TableCell>

@@ -56,6 +56,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import uuid
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
@@ -143,6 +144,7 @@ def _api_call(
     *,
     json_body: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
+    extra_headers: dict[str, str] | None = None,
     timeout: float = 30.0,
 ) -> httpx.Response:
     """Make an authenticated request against the MSAI API.
@@ -153,13 +155,16 @@ def _api_call(
     :class:`typer.Exit` and re-raise.
     """
     url = f"{_api_base()}{path}"
+    headers = _api_headers()
+    if extra_headers:
+        headers.update(extra_headers)
     try:
         response = httpx.request(
             method,
             url,
             json=json_body,
             params=params,
-            headers=_api_headers(),
+            headers=headers,
             timeout=timeout,
         )
     except httpx.ConnectError:
@@ -451,20 +456,80 @@ def research_cancel(
 def live_start(
     portfolio_revision_id: str = typer.Argument(..., help="Portfolio revision UUID"),
     account_id: str = typer.Argument(..., help="IB account id (e.g. DU1234567)"),
-    paper: bool = typer.Option(True, help="Paper trading mode (default: True)"),
     ib_login_key: str = typer.Option(
-        "", help="IB login username (optional, server derives if empty)"
+        ...,
+        "--ib-login-key",
+        help="IB login username — REQUIRED by /api/v1/live/start-portfolio (Bug #1 trio).",
+    ),
+    paper: bool = typer.Option(True, help="Paper trading mode (default: True)"),
+    idempotency_key: str = typer.Option(
+        "",
+        "--idempotency-key",
+        help=(
+            "Stable Idempotency-Key header value. Pass the same key when "
+            "retrying after a timeout / lost response to hit the Redis "
+            "reservation. Default: fresh uuid4 per invocation (so a normal "
+            "stop+restart with identical identity is treated as a new "
+            "request, not a cached replay of the previous deploy)."
+        ),
     ),
 ) -> None:
-    """Deploy a portfolio revision to live/paper trading."""
+    """Deploy a portfolio revision to live/paper trading.
+
+    Codex code-review iter-3 P2: this older command predates the safety
+    trio (PRs #64/#65/#66). It now mirrors `start-portfolio`'s contract —
+    required `--ib-login-key`, `--no-paper` confirmation prompt, and a
+    startup-safe timeout (90s > backend's 60s START_POLL_TIMEOUT_S).
+    """
+    # PR #67 Codex bot P2: mirror start-portfolio's account/paper prefix
+    # guard. Without this, `live start <rev> U... --paper` posts paper_trading=
+    # true with a live account_id; the supervisor rejects after creating the
+    # deployment row, leaving a collision-prone (revision_id, account_id)
+    # entry that poisons later deploy attempts. Backend
+    # `ib_port_validator.IB_PAPER_PREFIXES = ("DU", "DF")`.
+    trimmed_account = account_id.strip()
+    is_paper_prefix = trimmed_account.startswith(("DU", "DF"))
+    if paper and not is_paper_prefix:
+        _fail(
+            f"account_id '{trimmed_account}' is not a paper-prefix account "
+            "(expected DU* or DF*). Pass --no-paper for real-money accounts."
+        )
+    if not paper and (is_paper_prefix or not trimmed_account.startswith("U")):
+        _fail(
+            f"account_id '{trimmed_account}' is not a live-prefix account "
+            "(expected U*, NOT DU/DF). Remove --no-paper for paper accounts."
+        )
+    if not paper:
+        typer.confirm(
+            f"This will start REAL-MONEY trading on {trimmed_account}. Continue?",
+            abort=True,
+        )
+    # Codex iter-9 P2: submit trimmed identity-bearing fields. The backend
+    # hashes account_id + ib_login_key into the deployment identity_signature
+    # and routes by the exact ib_login_key string; whitespace creates a
+    # distinct identity row and misses gateway routes.
     payload: dict[str, object] = {
         "portfolio_revision_id": portfolio_revision_id,
-        "account_id": account_id,
+        "account_id": trimmed_account,
         "paper_trading": paper,
+        "ib_login_key": ib_login_key.strip(),
     }
-    if ib_login_key:
-        payload["ib_login_key"] = ib_login_key
-    response = _api_call("POST", "/api/v1/live/start-portfolio", json_body=payload)
+    # Codex iter-7 P2 + PR #67 review: send Idempotency-Key so timeout /
+    # network retries within the same operator action hit the Redis
+    # reservation (operator passes the same --idempotency-key on retry).
+    # Default to a fresh uuid4 per invocation — PR #67 review P1 caught
+    # that a deterministic-from-identity key would break the legit
+    # stop+restart flow (cached 24h success replays instead of a new
+    # deploy). For genuine retries, operator must pass --idempotency-key
+    # explicitly (same surface as start-portfolio).
+    ikey = idempotency_key or uuid.uuid4().hex
+    response = _api_call(
+        "POST",
+        "/api/v1/live/start-portfolio",
+        json_body=payload,
+        extra_headers={"Idempotency-Key": ikey},
+        timeout=90.0,
+    )
     data = response.json()
     dep_id = data.get("id", "unknown")
     dep_status = data.get("status", "unknown")
@@ -506,6 +571,229 @@ def live_kill_all(
     response = _api_call("POST", "/api/v1/live/kill-all")
     data = response.json()
     typer.echo(f"Stopped {data['stopped']} strategies. Risk halted: {data['risk_halted']}")
+
+
+# ----------------------------------------------------------------------
+# live: portfolio compose + deploy + observability (T10)
+# Thin shims over the /api/v1/live-portfolios/* + /api/v1/live/* APIs
+# hardened by PRs #64/#65/#66 (binding-fingerprint + flatness trio).
+# ----------------------------------------------------------------------
+
+
+def _load_config_arg(raw: str) -> dict[str, Any]:
+    """Parse a ``--config`` value.
+
+    ``@/path/to/file.json`` loads JSON from the file.
+    Anything else is parsed as a literal JSON string.
+    """
+    if raw.startswith("@"):
+        path = raw[1:]
+        try:
+            with open(path) as fh:
+                payload = json.load(fh)
+        except FileNotFoundError:
+            _fail(f"config file not found: {path}")
+        except json.JSONDecodeError as exc:
+            _fail(f"invalid JSON in {path}: {exc}")
+    else:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            _fail(f"invalid JSON config: {exc}")
+    if not isinstance(payload, dict):
+        _fail("config must be a JSON object")
+    return dict(payload)
+
+
+@live_app.command("portfolio-create")
+def live_portfolio_create(
+    name: str = typer.Option(..., "--name", help="Portfolio display name"),
+    description: str = typer.Option("", "--description", help="Optional description"),
+) -> None:
+    """Create a new (draft) live portfolio."""
+    payload: dict[str, Any] = {"name": name, "description": description}
+    # Codex code-review P1: FastAPI route is registered at /api/v1/live-portfolios
+    # (no trailing slash); /api/v1/live-portfolios/ triggers a 307 redirect that
+    # httpx does not follow by default, so the create silently fails.
+    response = _api_call("POST", "/api/v1/live-portfolios", json_body=payload)
+    _emit_json(response.json())
+
+
+@live_app.command("portfolio-add-strategy")
+def live_portfolio_add_strategy(
+    portfolio_id: str = typer.Argument(..., help="Portfolio UUID"),
+    strategy_id: str = typer.Option(..., "--strategy-id", help="Strategy UUID"),
+    config: str = typer.Option(
+        ...,
+        "--config",
+        help="Strategy config: literal JSON string OR '@/path/to/file.json'",
+    ),
+    instruments: str = typer.Option(
+        ...,
+        "--instruments",
+        help="Comma-separated instrument IDs (e.g. AAPL.NASDAQ,MSFT.NASDAQ)",
+    ),
+    weight: str = typer.Option("1.0", "--weight", help="Capital weight (Decimal string)"),
+) -> None:
+    """Attach a strategy to a draft portfolio."""
+    cfg = _load_config_arg(config)
+    instrument_list = [s.strip() for s in instruments.split(",") if s.strip()]
+    if not instrument_list:
+        _fail("at least one instrument required")
+    payload: dict[str, Any] = {
+        "strategy_id": strategy_id,
+        "config": cfg,
+        "instruments": instrument_list,
+        "weight": weight,
+    }
+    response = _api_call(
+        "POST",
+        f"/api/v1/live-portfolios/{_url_id(portfolio_id)}/strategies",
+        json_body=payload,
+    )
+    _emit_json(response.json())
+
+
+@live_app.command("portfolio-snapshot")
+def live_portfolio_snapshot(
+    portfolio_id: str = typer.Argument(..., help="Portfolio UUID"),
+) -> None:
+    """Freeze the draft into an immutable portfolio revision."""
+    response = _api_call("POST", f"/api/v1/live-portfolios/{_url_id(portfolio_id)}/snapshot")
+    _emit_json(response.json())
+
+
+@live_app.command("portfolio-members")
+def live_portfolio_members(
+    revision_id: str = typer.Argument(..., help="Portfolio revision UUID"),
+) -> None:
+    """List frozen members of a portfolio revision."""
+    response = _api_call(
+        "GET",
+        f"/api/v1/live-portfolio-revisions/{_url_id(revision_id)}/members",
+    )
+    _emit_json(response.json())
+
+
+@live_app.command("start-portfolio")
+def live_start_portfolio(
+    revision: str = typer.Option(..., "--revision", help="Portfolio revision UUID"),
+    account: str = typer.Option(..., "--account", help="IB account id (e.g. DUP733213)"),
+    ib_login_key: str = typer.Option(
+        ...,
+        "--ib-login-key",
+        help="IB login username key (e.g. marin1016test). REQUIRED.",
+    ),
+    paper: bool = typer.Option(
+        True,
+        "--paper/--no-paper",
+        help="Paper trading (default). --no-paper triggers a real-money confirm.",
+    ),
+    idempotency_key: str = typer.Option(
+        "",
+        "--idempotency-key",
+        help="Idempotency key (auto-generated if omitted).",
+    ),
+) -> None:
+    """Deploy a frozen portfolio revision to live/paper trading.
+
+    Hits ``POST /api/v1/live/start-portfolio``.  On ``--no-paper`` prompts
+    for confirmation BEFORE any HTTP call.  Operators must export
+    ``MSAI_API_URL=http://localhost:8800`` + ``MSAI_API_KEY=msai-dev-key``
+    when running outside the backend container (dev compose exposes the
+    backend at host port 8800, not the CLI default 8000).
+    """
+    # Codex iter-8 P2: mirror the UI's account-prefix guard so a CLI
+    # caller can't paste an account_id that contradicts --paper / --no-paper.
+    # Without this, --account U... --paper would post paper_trading=true and
+    # the supervisor would create+reject the deployment row, leaving a
+    # collision-prone (revision_id, account_id) entry that needs manual
+    # archive. Backend `ib_port_validator.IB_PAPER_PREFIXES = ("DU", "DF")`.
+    trimmed_account = account.strip()
+    is_paper_prefix = trimmed_account.startswith(("DU", "DF"))
+    if paper and not is_paper_prefix:
+        _fail(
+            f"--account '{trimmed_account}' is not a paper-prefix account "
+            "(expected DU* or DF*). Pass --no-paper for real-money accounts."
+        )
+    if not paper and (is_paper_prefix or not trimmed_account.startswith("U")):
+        _fail(
+            f"--account '{trimmed_account}' is not a live-prefix account "
+            "(expected U*, NOT DU/DF). Remove --no-paper for paper accounts."
+        )
+    if not paper:
+        typer.confirm(
+            f"This will start REAL-MONEY trading on {trimmed_account}. Continue?",
+            abort=True,
+        )
+    ikey = idempotency_key or uuid.uuid4().hex
+    # Codex code-review P1: send Idempotency-Key as HTTP header (backend reads
+    # it via `Header(default=None, alias="Idempotency-Key")` in /start-portfolio).
+    # Embedding it in the JSON body silently bypasses the Redis reservation layer
+    # because PortfolioStartRequest doesn't define an `idempotency_key` field.
+    # Codex iter-9 P2: submit trimmed identity-bearing fields. The backend
+    # hashes account_id + ib_login_key into the deployment identity_signature
+    # and routes by the exact ib_login_key string. Leading/trailing whitespace
+    # would create a distinct identity row (collision-prone) and miss gateway
+    # routes. The prefix guard above already worked from `trimmed_account`.
+    payload: dict[str, Any] = {
+        "portfolio_revision_id": revision,
+        "account_id": trimmed_account,
+        "ib_login_key": ib_login_key.strip(),
+        "paper_trading": paper,
+    }
+    # Codex iter-3 P2: timeout must exceed backend's START_POLL_TIMEOUT_S
+    # (60s) — cold supervisor spawns can legitimately run that long while
+    # the supervisor reaches ready/failed. 30s default would surface as
+    # a CLI timeout even when the deploy is still progressing.
+    response = _api_call(
+        "POST",
+        "/api/v1/live/start-portfolio",
+        json_body=payload,
+        extra_headers={"Idempotency-Key": ikey},
+        timeout=90.0,
+    )
+    _emit_json(response.json())
+
+
+@live_app.command("resume")
+def live_resume() -> None:
+    """Clear the persistent risk-halt flag after a kill-all."""
+    response = _api_call("POST", "/api/v1/live/resume")
+    _emit_json(response.json())
+
+
+@live_app.command("positions")
+def live_positions() -> None:
+    """List open positions across all active deployments.
+
+    The backend endpoint does not filter by deployment — operators who
+    want per-deployment slices should grep the JSON output.
+    """
+    response = _api_call("GET", "/api/v1/live/positions")
+    _emit_json(response.json())
+
+
+@live_app.command("trades")
+def live_trades(
+    deployment: str = typer.Option("", "--deployment", help="Filter to a single deployment UUID"),
+    limit: int = typer.Option(100, "--limit", help="Max rows to return"),
+) -> None:
+    """List recent executed trades, optionally filtered by deployment."""
+    params: dict[str, Any] = {"limit": limit}
+    if deployment:
+        params["deployment_id"] = deployment
+    response = _api_call("GET", "/api/v1/live/trades", params=params)
+    _emit_json(response.json())
+
+
+@live_app.command("audits")
+def live_audits(
+    deployment_id: str = typer.Argument(..., help="Deployment UUID"),
+) -> None:
+    """Show the audit-event log for one deployment."""
+    response = _api_call("GET", f"/api/v1/live/audits/{_url_id(deployment_id)}")
+    _emit_json(response.json())
 
 
 # ======================================================================

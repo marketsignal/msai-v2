@@ -1,9 +1,17 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { TrendingUp, DollarSign, Wifi } from "lucide-react";
+import {
+  TrendingUp,
+  DollarSign,
+  Wifi,
+  ArrowRight,
+  AlertTriangle,
+} from "lucide-react";
 import { KillSwitch } from "@/components/live/kill-switch";
+import { ResumeButton } from "@/components/live/resume-button";
 import { StrategyStatus } from "@/components/live/strategy-status";
 import { PositionsTable } from "@/components/live/positions-table";
 import {
@@ -18,7 +26,13 @@ import { useLiveStream } from "@/lib/use-live-stream";
 
 export default function LiveTradingPage(): React.ReactElement {
   const { getToken } = useAuth();
+  // Codex iter-4 P2: track token resolution separately from the value.
+  // getToken() returns null in API-key-only dev mode (NEXT_PUBLIC_MSAI_API_KEY
+  // fallback). The previous `if (token === null) return` guards blocked the
+  // /live/status and /live/positions loads forever in that setup, hiding
+  // the risk_halted banner + ResumeButton entirely.
   const [token, setToken] = useState<string | null>(null);
+  const [tokenReady, setTokenReady] = useState<boolean>(false);
   const [apiError, setApiError] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
@@ -26,6 +40,7 @@ export default function LiveTradingPage(): React.ReactElement {
       const t = await getToken();
       if (!cancelled) {
         setToken(t);
+        setTokenReady(true);
       }
     })();
     return (): void => {
@@ -33,33 +48,31 @@ export default function LiveTradingPage(): React.ReactElement {
     };
   }, [getToken]);
 
-  // Fetch real deployments from /api/v1/live/status.
+  // Fetch real deployments + global state from /api/v1/live/status.
   const [deployments, setDeployments] = useState<LiveDeploymentInfo[]>([]);
+  const [riskHalted, setRiskHalted] = useState<boolean>(false);
+  const refreshStatus = useCallback(async (): Promise<void> => {
+    if (!tokenReady) return;
+    try {
+      const status = await getLiveStatus(token);
+      setDeployments(status.deployments);
+      setRiskHalted(status.risk_halted);
+      setApiError(null);
+    } catch {
+      setApiError("Failed to load deployments");
+      setDeployments([]);
+    }
+  }, [token, tokenReady]);
+
   useEffect(() => {
-    if (token === null) return;
-    let cancelled = false;
-    void (async (): Promise<void> => {
-      try {
-        const status = await getLiveStatus(token);
-        if (!cancelled) {
-          setDeployments(status.deployments);
-        }
-      } catch {
-        if (!cancelled) {
-          setApiError("Failed to load deployments");
-          setDeployments([]);
-        }
-      }
-    })();
-    return (): void => {
-      cancelled = true;
-    };
-  }, [token]);
+    if (!tokenReady) return;
+    void refreshStatus();
+  }, [token, tokenReady, refreshStatus]);
 
   // REST fallback: fetch positions when WebSocket not yet connected
   const [restPositions, setRestPositions] = useState<LivePositionItem[]>([]);
   useEffect(() => {
-    if (token === null) return;
+    if (!tokenReady) return;
     let cancelled = false;
     void (async (): Promise<void> => {
       try {
@@ -72,7 +85,7 @@ export default function LiveTradingPage(): React.ReactElement {
     return (): void => {
       cancelled = true;
     };
-  }, [token]);
+  }, [token, tokenReady]);
 
   const activeRealDeployment = deployments.find((d) => d.status === "running");
   const live = useLiveStream(activeRealDeployment?.id ?? null, { token });
@@ -113,6 +126,27 @@ export default function LiveTradingPage(): React.ReactElement {
 
   return (
     <div className="space-y-6">
+      {/* Deploy New Portfolio entry point */}
+      <Link
+        data-testid="live-portfolio-deploy-link"
+        href="/live-trading/portfolio"
+        className="group flex items-center justify-between rounded-lg border border-border/60 bg-card/40 p-4 transition-colors hover:border-emerald-500/50 hover:bg-emerald-500/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+      >
+        <div>
+          <p className="text-sm font-medium text-foreground">
+            Deploy New Portfolio
+          </p>
+          <p className="text-xs text-muted-foreground">
+            Pick a portfolio revision, validate risk, and start a live
+            deployment.
+          </p>
+        </div>
+        <ArrowRight
+          className="size-4 text-muted-foreground transition-transform group-hover:translate-x-0.5"
+          aria-hidden="true"
+        />
+      </Link>
+
       {/* Page header */}
       <div className="flex items-start justify-between">
         <div>
@@ -136,8 +170,41 @@ export default function LiveTradingPage(): React.ReactElement {
           </p>
         </div>
 
-        <KillSwitch activeCount={activeCount} positionCount={positionCount} />
+        <div className="flex flex-col items-end gap-3">
+          <div className="flex items-center gap-2">
+            <ResumeButton
+              riskHalted={riskHalted}
+              onResumed={() => {
+                void refreshStatus();
+              }}
+            />
+            <KillSwitch
+              activeCount={activeCount}
+              positionCount={positionCount}
+              onKilled={() => {
+                void refreshStatus();
+              }}
+            />
+          </div>
+        </div>
       </div>
+
+      {riskHalted ? (
+        <div
+          data-testid="risk-halted-banner"
+          role="alert"
+          className="flex items-start gap-2 rounded-md border border-red-500/50 bg-red-500/15 p-3 text-sm text-red-200"
+        >
+          <AlertTriangle
+            className="mt-0.5 size-4 shrink-0 text-red-300"
+            aria-hidden="true"
+          />
+          <span>
+            <strong className="font-semibold">Trading halted.</strong> Resume
+            required before new deployments can start.
+          </span>
+        </div>
+      ) : null}
 
       {/* Summary cards */}
       <div className="grid gap-4 sm:grid-cols-3">
