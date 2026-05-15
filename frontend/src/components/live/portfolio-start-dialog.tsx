@@ -363,9 +363,18 @@ export function PortfolioStartDialog(
   // alone wouldn't clear the conflict — it would just loop. The UI now
   // surfaces the real remediation in the conflict callout instead.
 
+  // PR #67 review P2: the preview path validates + the submit path
+  // sends the TRIMMED account_id (Codex iter-9 fix), so the confirm
+  // challenge must use the trimmed value on both sides too. Otherwise
+  // operator who pasted " DU... " (leading/trailing whitespace) sees
+  // a Deploy button that never enables — they'd have to type the same
+  // invisible whitespace to satisfy the raw equality check, even though
+  // the request will send the trimmed value regardless.
+  const trimmedAccountId = useMemo(() => accountId.trim(), [accountId]);
   const confirmMatches = useMemo<boolean>(
-    () => confirmInput === accountId && accountId.length > 0,
-    [confirmInput, accountId],
+    () =>
+      confirmInput.trim() === trimmedAccountId && trimmedAccountId.length > 0,
+    [confirmInput, trimmedAccountId],
   );
 
   // ── Render ──────────────────────────────────────────────────────────────
@@ -530,8 +539,9 @@ export function PortfolioStartDialog(
               className="w-full rounded-md border border-destructive/30 bg-destructive/15 px-4 py-3 text-sm text-destructive"
             >
               <strong className="font-semibold">⚠ REAL MONEY DEPLOY.</strong>{" "}
-              Type the account ID <span className="font-mono">{accountId}</span>{" "}
-              exactly to confirm.
+              Type the account ID{" "}
+              <span className="font-mono">{trimmedAccountId}</span> exactly to
+              confirm.
             </div>
 
             <div className="flex flex-col gap-2">
@@ -543,7 +553,7 @@ export function PortfolioStartDialog(
                 data-testid="portfolio-start-confirm-input"
                 value={confirmInput}
                 onChange={(e) => setConfirmInput(e.target.value)}
-                placeholder={accountId}
+                placeholder={trimmedAccountId}
                 autoComplete="off"
               />
             </div>
