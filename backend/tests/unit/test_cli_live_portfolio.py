@@ -310,6 +310,52 @@ class TestLiveStartAliasPrefixGuard:
         # DF is a valid paper prefix (FA sub-accounts)
         assert m.call_args.kwargs["json"]["account_id"] == "DF999"
 
+    def test_idempotency_key_is_deterministic_across_invocations(self, runner: CliRunner) -> None:
+        """PR #67 review P2: retries after a timeout must hit the same Redis
+        reservation, not bypass it with a fresh uuid4. The alias derives the
+        key from identity-bearing fields so two invocations with identical
+        inputs produce identical Idempotency-Key headers."""
+        body = {"id": "dep-x", "status": "starting"}
+        keys: list[str] = []
+        for _ in range(2):
+            with patch(
+                "msai.cli.httpx.request", return_value=_ok_response(body, status_code=201)
+            ) as m:
+                result = runner.invoke(
+                    app,
+                    [
+                        "live",
+                        "start",
+                        "rev-1",
+                        "DU1234567",
+                        "--ib-login-key",
+                        "marin1016test",
+                    ],
+                )
+            assert result.exit_code == 0, result.output
+            keys.append(m.call_args.kwargs["headers"]["Idempotency-Key"])
+        assert keys[0] == keys[1], "identity-derived key must be stable across retries"
+
+    def test_idempotency_key_differs_when_identity_differs(self, runner: CliRunner) -> None:
+        """Changing any identity-bearing field (account, login, paper-flag)
+        must rotate the key — that's a genuinely new request, not a retry."""
+        body = {"id": "dep-x", "status": "starting"}
+        keys: dict[str, str] = {}
+        cases = [
+            ("baseline", ["live", "start", "rev-1", "DU1234567", "--ib-login-key", "k"]),
+            ("diff-account", ["live", "start", "rev-1", "DU9999999", "--ib-login-key", "k"]),
+            ("diff-login", ["live", "start", "rev-1", "DU1234567", "--ib-login-key", "k2"]),
+        ]
+        for label, args in cases:
+            with patch(
+                "msai.cli.httpx.request", return_value=_ok_response(body, status_code=201)
+            ) as m:
+                result = runner.invoke(app, args)
+            assert result.exit_code == 0, result.output
+            keys[label] = m.call_args.kwargs["headers"]["Idempotency-Key"]
+        assert keys["baseline"] != keys["diff-account"]
+        assert keys["baseline"] != keys["diff-login"]
+
     def test_payload_trims_whitespace(self, runner: CliRunner) -> None:
         body = {"id": "dep-trim", "status": "starting"}
         with patch("msai.cli.httpx.request", return_value=_ok_response(body, status_code=201)) as m:

@@ -54,6 +54,7 @@ or the settings-level key — matches the backend's dual-mode auth in
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import uuid
@@ -503,16 +504,31 @@ def live_start(
         "paper_trading": paper,
         "ib_login_key": ib_login_key.strip(),
     }
-    # Codex iter-7 P2: send Idempotency-Key so timeout/network retries
-    # hit the Redis reservation layer instead of publishing a second
-    # START command. Auto-generated here since this alias predates the
-    # `start-portfolio` command (which exposes --idempotency-key) and we
-    # don't want to change its argument surface.
+    # Codex iter-7 P2 + PR #67 review P2: derive a DETERMINISTIC Idempotency-Key
+    # from the identity-bearing fields so a retry (after timeout / lost response)
+    # hits the same Redis reservation. A per-invocation uuid4 would bypass the
+    # reservation layer the header is meant to hit, letting a retry within the
+    # supervisor's startup window publish a second START before active-process
+    # de-dupe observes the first. The alias doesn't expose --idempotency-key
+    # (start-portfolio does for that escape hatch); if the operator genuinely
+    # wants a new deployment with the same identity they must re-graduate or
+    # use start-portfolio with a fresh --idempotency-key.
+    identity_key = hashlib.sha256(
+        "|".join(
+            [
+                "msai-live-start",
+                portfolio_revision_id,
+                trimmed_account,
+                ib_login_key.strip(),
+                "paper" if paper else "live",
+            ]
+        ).encode("utf-8")
+    ).hexdigest()
     response = _api_call(
         "POST",
         "/api/v1/live/start-portfolio",
         json_body=payload,
-        extra_headers={"Idempotency-Key": uuid.uuid4().hex},
+        extra_headers={"Idempotency-Key": identity_key},
         timeout=90.0,
     )
     data = response.json()
