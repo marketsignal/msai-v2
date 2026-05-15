@@ -267,6 +267,62 @@ class TestStartPortfolio:
         assert "idempotency_key" not in sent_body
 
 
+class TestLiveStartAliasPrefixGuard:
+    """PR #67 Codex bot P2: the legacy `live start` alias must also reject
+    account/paper mismatches before HTTP, mirroring `start-portfolio`."""
+
+    def test_paper_default_with_live_account_blocked(self, runner: CliRunner) -> None:
+        with patch("msai.cli.httpx.request") as m:
+            result = runner.invoke(
+                app,
+                ["live", "start", "rev-1", "U4705114", "--ib-login-key", "k"],
+            )
+        assert result.exit_code != 0
+        assert m.call_count == 0
+        assert "not a paper-prefix" in result.output
+
+    def test_no_paper_with_paper_account_blocked(self, runner: CliRunner) -> None:
+        with patch("msai.cli.httpx.request") as m:
+            result = runner.invoke(
+                app,
+                [
+                    "live",
+                    "start",
+                    "rev-1",
+                    "DU1234567",
+                    "--ib-login-key",
+                    "k",
+                    "--no-paper",
+                ],
+            )
+        assert result.exit_code != 0
+        assert m.call_count == 0
+        assert "not a live-prefix" in result.output
+
+    def test_paper_with_df_fa_account_allowed(self, runner: CliRunner) -> None:
+        body = {"id": "dep-fa", "status": "starting", "paper_trading": True}
+        with patch("msai.cli.httpx.request", return_value=_ok_response(body, status_code=201)) as m:
+            result = runner.invoke(
+                app,
+                ["live", "start", "rev-1", "DF999", "--ib-login-key", "k"],
+            )
+        assert result.exit_code == 0, result.output
+        # DF is a valid paper prefix (FA sub-accounts)
+        assert m.call_args.kwargs["json"]["account_id"] == "DF999"
+
+    def test_payload_trims_whitespace(self, runner: CliRunner) -> None:
+        body = {"id": "dep-trim", "status": "starting"}
+        with patch("msai.cli.httpx.request", return_value=_ok_response(body, status_code=201)) as m:
+            result = runner.invoke(
+                app,
+                ["live", "start", "rev-1", " DU1234567 ", "--ib-login-key", " key "],
+            )
+        assert result.exit_code == 0, result.output
+        sent = m.call_args.kwargs["json"]
+        assert sent["account_id"] == "DU1234567"
+        assert sent["ib_login_key"] == "key"
+
+
 class TestResume:
     def test_posts_resume_endpoint(self, runner: CliRunner) -> None:
         body = {"resumed": True}

@@ -470,16 +470,38 @@ def live_start(
     required `--ib-login-key`, `--no-paper` confirmation prompt, and a
     startup-safe timeout (90s > backend's 60s START_POLL_TIMEOUT_S).
     """
+    # PR #67 Codex bot P2: mirror start-portfolio's account/paper prefix
+    # guard. Without this, `live start <rev> U... --paper` posts paper_trading=
+    # true with a live account_id; the supervisor rejects after creating the
+    # deployment row, leaving a collision-prone (revision_id, account_id)
+    # entry that poisons later deploy attempts. Backend
+    # `ib_port_validator.IB_PAPER_PREFIXES = ("DU", "DF")`.
+    trimmed_account = account_id.strip()
+    is_paper_prefix = trimmed_account.startswith(("DU", "DF"))
+    if paper and not is_paper_prefix:
+        _fail(
+            f"account_id '{trimmed_account}' is not a paper-prefix account "
+            "(expected DU* or DF*). Pass --no-paper for real-money accounts."
+        )
+    if not paper and (is_paper_prefix or not trimmed_account.startswith("U")):
+        _fail(
+            f"account_id '{trimmed_account}' is not a live-prefix account "
+            "(expected U*, NOT DU/DF). Remove --no-paper for paper accounts."
+        )
     if not paper:
         typer.confirm(
-            f"This will start REAL-MONEY trading on {account_id}. Continue?",
+            f"This will start REAL-MONEY trading on {trimmed_account}. Continue?",
             abort=True,
         )
+    # Codex iter-9 P2: submit trimmed identity-bearing fields. The backend
+    # hashes account_id + ib_login_key into the deployment identity_signature
+    # and routes by the exact ib_login_key string; whitespace creates a
+    # distinct identity row and misses gateway routes.
     payload: dict[str, object] = {
         "portfolio_revision_id": portfolio_revision_id,
-        "account_id": account_id,
+        "account_id": trimmed_account,
         "paper_trading": paper,
-        "ib_login_key": ib_login_key,
+        "ib_login_key": ib_login_key.strip(),
     }
     # Codex iter-7 P2: send Idempotency-Key so timeout/network retries
     # hit the Redis reservation layer instead of publishing a second
