@@ -10,8 +10,11 @@
  *   Stage 4: Submit (POST /api/v1/live/start-portfolio with Idempotency-Key)
  *
  * 422 envelopes are decoded inline:
- *   - BINDING_MISMATCH    → mismatches table
- *   - LIVE_DEPLOY_CONFLICT → existing-deployment CTA that calls stopDeployment
+ *   - BINDING_MISMATCH    → mismatches table (field/member_value/candidate_value)
+ *   - LIVE_DEPLOY_CONFLICT → remediation callout (no retry CTA — Codex iter-2 P2
+ *                            found stop+retry hits the same 422 since the
+ *                            backend collision check runs against the persistent
+ *                            row regardless of active status)
  *   - other 422 codes      → red callout with body.error.message
  *
  * Accepts HTTP 200 OR 201 as success (warm-restart vs cold). `startPortfolio`
@@ -303,24 +306,21 @@ export function PortfolioStartDialog(
       onOpenChange(false);
     } catch (err) {
       if (err instanceof ApiError && err.status === 422) {
+        const errorStage: Stage = paperTrading ? "preview" : "confirm";
         if (isBindingMismatch(err.body)) {
           const env = unwrapError(err.body) as BindingMismatchEnvelope;
           setMismatches(env.error.details.mismatches);
-          setStage(paperTrading ? "preview" : "confirm");
-          return;
-        }
-        if (isLiveDeployConflict(err.body)) {
+        } else if (isLiveDeployConflict(err.body)) {
           const env = unwrapError(err.body) as LiveDeployConflictEnvelope;
           setConflict({
             existingId: env.error.details.existing_deployment_id,
             status: env.error.details.status,
           });
-          setStage(paperTrading ? "preview" : "confirm");
-          return;
+        } else {
+          const msg = genericErrorMessage(err.body);
+          setSubmitError(msg ?? "Deployment was rejected (422).");
         }
-        const msg = genericErrorMessage(err.body);
-        setSubmitError(msg ?? "Deployment was rejected (422).");
-        setStage(paperTrading ? "preview" : "confirm");
+        setStage(errorStage);
         return;
       }
       const msg =
@@ -668,9 +668,7 @@ function renderErrors(args: {
             row, OR archive the existing deployment row (manual operator step —
             there is no public archive endpoint yet).
           </p>
-          {/* Intentionally NO retry CTA — see comment above. The
-             onStopExisting prop is kept on the contract for backward
-             compat but no longer surfaced through the UI. */}
+          {/* Intentionally NO retry CTA — see comment above. */}
         </div>
       )}
 
