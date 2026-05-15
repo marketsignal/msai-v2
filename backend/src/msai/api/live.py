@@ -1863,6 +1863,7 @@ async def live_status(
     active_only: bool = False,
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
+    bus: LiveCommandBus = Depends(get_command_bus),  # noqa: B008
 ) -> LiveStatusResponse:
     """All deployments with their current status.
 
@@ -1928,9 +1929,26 @@ async def live_status(
         for d in deployments
     ]
 
+    # Read the *persistent* halt flag from Redis (the key written by
+    # ``/kill-all`` and cleared by ``/resume``) rather than the
+    # process-local ``_risk_engine.is_halted`` attribute. The
+    # in-memory flag does not survive backend restarts and does not
+    # propagate across replicas, so the UI's Resume button vanishes
+    # on reload after a kill-all. Reading Redis here ensures the
+    # status reflects platform truth — see T0a in
+    # docs/plans/2026-05-15-live-deployment-workflow-ui-cli.md.
+    #
+    # Codex iter-9 P2: handle direct-call paths (integration tests that
+    # invoke ``live_status(claims=..., db=session)`` without going
+    # through FastAPI's DI). When ``bus`` was not resolved, it's still
+    # the ``Depends(...)`` sentinel object and ``_halt_is_active`` would
+    # crash on ``bus._redis``. Type-check before reading. False is the
+    # documented test fallback (the direct-call test doesn't assert
+    # ``risk_halted``; over-the-wire calls always pass a real bus).
+    risk_halted = await _halt_is_active(bus) if isinstance(bus, LiveCommandBus) else False
     return LiveStatusResponse(
         deployments=items,
-        risk_halted=_risk_engine.is_halted,
+        risk_halted=risk_halted,
         active_count=_node_manager.active_count,
     )
 

@@ -24,6 +24,8 @@ from msai.core.auth import get_current_user, resolve_user_id
 from msai.core.database import get_db
 from msai.core.logging import get_logger
 from msai.models import LivePortfolio
+from msai.models.live_portfolio_revision import LivePortfolioRevision
+from msai.models.live_portfolio_revision_strategy import LivePortfolioRevisionStrategy
 from msai.schemas.live_portfolio import (
     LivePortfolioAddStrategyRequest,
     LivePortfolioCreateRequest,
@@ -44,6 +46,15 @@ from msai.services.live.revision_service import (
 log = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/live-portfolios", tags=["live-portfolios"])
+
+# Separate router for revision-keyed reads. FastAPI cannot mix two prefixes
+# on a single router, so endpoints that key off ``revision_id`` rather than
+# ``portfolio_id`` live on this second router. Registered alongside
+# ``router`` in ``msai.main``.
+revisions_router = APIRouter(
+    prefix="/api/v1/live-portfolio-revisions",
+    tags=["live-portfolio-revisions"],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -258,4 +269,39 @@ async def list_draft_members(
 
     svc = PortfolioService(db)
     members = await svc.list_draft_members(portfolio_id)
+    return [LivePortfolioMemberResponse.model_validate(m) for m in members]
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/live-portfolio-revisions/{revision_id}/members
+# ---------------------------------------------------------------------------
+
+
+@revisions_router.get(
+    "/{revision_id}/members",
+    response_model=list[LivePortfolioMemberResponse],
+)
+async def list_revision_members(
+    revision_id: UUID,
+    claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+) -> list[LivePortfolioMemberResponse]:
+    """List strategy members of a specific revision (draft or frozen).
+
+    Used by the UI after snapshot, when the draft-members endpoint
+    no longer returns the composition that was just frozen.
+    """
+    revision = await db.get(LivePortfolioRevision, revision_id)
+    if revision is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Live portfolio revision {revision_id} not found",
+        )
+
+    result = await db.execute(
+        select(LivePortfolioRevisionStrategy)
+        .where(LivePortfolioRevisionStrategy.revision_id == revision_id)
+        .order_by(LivePortfolioRevisionStrategy.order_index)
+    )
+    members = result.scalars().all()
     return [LivePortfolioMemberResponse.model_validate(m) for m in members]

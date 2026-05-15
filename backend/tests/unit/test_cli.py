@@ -305,7 +305,11 @@ class TestHttpCommands:
             "msai.cli.httpx.request",
             side_effect=httpx.ReadTimeout("slow"),
         ):
-            result = runner.invoke(app, ["live", "start", "sid", "AAPL"])
+            # Codex iter-3 P2: live start now requires --ib-login-key.
+            result = runner.invoke(
+                app,
+                ["live", "start", "sid", "AAPL", "--ib-login-key", "k"],
+            )
         assert result.exit_code != 0
         assert "timed out" in result.output.lower()
 
