@@ -54,7 +54,6 @@ or the settings-level key — matches the backend's dual-mode auth in
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 import uuid
@@ -463,6 +462,17 @@ def live_start(
         help="IB login username — REQUIRED by /api/v1/live/start-portfolio (Bug #1 trio).",
     ),
     paper: bool = typer.Option(True, help="Paper trading mode (default: True)"),
+    idempotency_key: str = typer.Option(
+        "",
+        "--idempotency-key",
+        help=(
+            "Stable Idempotency-Key header value. Pass the same key when "
+            "retrying after a timeout / lost response to hit the Redis "
+            "reservation. Default: fresh uuid4 per invocation (so a normal "
+            "stop+restart with identical identity is treated as a new "
+            "request, not a cached replay of the previous deploy)."
+        ),
+    ),
 ) -> None:
     """Deploy a portfolio revision to live/paper trading.
 
@@ -504,31 +514,20 @@ def live_start(
         "paper_trading": paper,
         "ib_login_key": ib_login_key.strip(),
     }
-    # Codex iter-7 P2 + PR #67 review P2: derive a DETERMINISTIC Idempotency-Key
-    # from the identity-bearing fields so a retry (after timeout / lost response)
-    # hits the same Redis reservation. A per-invocation uuid4 would bypass the
-    # reservation layer the header is meant to hit, letting a retry within the
-    # supervisor's startup window publish a second START before active-process
-    # de-dupe observes the first. The alias doesn't expose --idempotency-key
-    # (start-portfolio does for that escape hatch); if the operator genuinely
-    # wants a new deployment with the same identity they must re-graduate or
-    # use start-portfolio with a fresh --idempotency-key.
-    identity_key = hashlib.sha256(
-        "|".join(
-            [
-                "msai-live-start",
-                portfolio_revision_id,
-                trimmed_account,
-                ib_login_key.strip(),
-                "paper" if paper else "live",
-            ]
-        ).encode("utf-8")
-    ).hexdigest()
+    # Codex iter-7 P2 + PR #67 review: send Idempotency-Key so timeout /
+    # network retries within the same operator action hit the Redis
+    # reservation (operator passes the same --idempotency-key on retry).
+    # Default to a fresh uuid4 per invocation — PR #67 review P1 caught
+    # that a deterministic-from-identity key would break the legit
+    # stop+restart flow (cached 24h success replays instead of a new
+    # deploy). For genuine retries, operator must pass --idempotency-key
+    # explicitly (same surface as start-portfolio).
+    ikey = idempotency_key or uuid.uuid4().hex
     response = _api_call(
         "POST",
         "/api/v1/live/start-portfolio",
         json_body=payload,
-        extra_headers={"Idempotency-Key": identity_key},
+        extra_headers={"Idempotency-Key": ikey},
         timeout=90.0,
     )
     data = response.json()

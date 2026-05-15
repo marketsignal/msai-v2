@@ -310,16 +310,18 @@ class TestLiveStartAliasPrefixGuard:
         # DF is a valid paper prefix (FA sub-accounts)
         assert m.call_args.kwargs["json"]["account_id"] == "DF999"
 
-    def test_idempotency_key_is_deterministic_across_invocations(self, runner: CliRunner) -> None:
-        """PR #67 review P2: retries after a timeout must hit the same Redis
-        reservation, not bypass it with a fresh uuid4. The alias derives the
-        key from identity-bearing fields so two invocations with identical
-        inputs produce identical Idempotency-Key headers."""
+    def test_default_idempotency_key_is_fresh_per_invocation(self, runner: CliRunner) -> None:
+        """PR #67 review P1: a deterministic-from-identity key would break
+        the legit stop+restart flow (backend's 24h cached success replays
+        instead of starting a new deploy). Default to a fresh uuid4 per
+        invocation so each call is its own request; --idempotency-key is
+        the explicit escape hatch for retry."""
         body = {"id": "dep-x", "status": "starting"}
         keys: list[str] = []
         for _ in range(2):
             with patch(
-                "msai.cli.httpx.request", return_value=_ok_response(body, status_code=201)
+                "msai.cli.httpx.request",
+                return_value=_ok_response(body, status_code=201),
             ) as m:
                 result = runner.invoke(
                     app,
@@ -334,27 +336,32 @@ class TestLiveStartAliasPrefixGuard:
                 )
             assert result.exit_code == 0, result.output
             keys.append(m.call_args.kwargs["headers"]["Idempotency-Key"])
-        assert keys[0] == keys[1], "identity-derived key must be stable across retries"
+        assert keys[0] != keys[1]
 
-    def test_idempotency_key_differs_when_identity_differs(self, runner: CliRunner) -> None:
-        """Changing any identity-bearing field (account, login, paper-flag)
-        must rotate the key — that's a genuinely new request, not a retry."""
+    def test_explicit_idempotency_key_is_reused(self, runner: CliRunner) -> None:
+        """Operator passes the same --idempotency-key on retry-after-timeout
+        to hit the Redis reservation. Mirrors start-portfolio's contract."""
         body = {"id": "dep-x", "status": "starting"}
-        keys: dict[str, str] = {}
-        cases = [
-            ("baseline", ["live", "start", "rev-1", "DU1234567", "--ib-login-key", "k"]),
-            ("diff-account", ["live", "start", "rev-1", "DU9999999", "--ib-login-key", "k"]),
-            ("diff-login", ["live", "start", "rev-1", "DU1234567", "--ib-login-key", "k2"]),
+        args = [
+            "live",
+            "start",
+            "rev-1",
+            "DU1234567",
+            "--ib-login-key",
+            "k",
+            "--idempotency-key",
+            "operator-retry-handle-7",
         ]
-        for label, args in cases:
+        keys: list[str] = []
+        for _ in range(2):
             with patch(
-                "msai.cli.httpx.request", return_value=_ok_response(body, status_code=201)
+                "msai.cli.httpx.request",
+                return_value=_ok_response(body, status_code=201),
             ) as m:
                 result = runner.invoke(app, args)
             assert result.exit_code == 0, result.output
-            keys[label] = m.call_args.kwargs["headers"]["Idempotency-Key"]
-        assert keys["baseline"] != keys["diff-account"]
-        assert keys["baseline"] != keys["diff-login"]
+            keys.append(m.call_args.kwargs["headers"]["Idempotency-Key"])
+        assert keys == ["operator-retry-handle-7", "operator-retry-handle-7"]
 
     def test_payload_trims_whitespace(self, runner: CliRunner) -> None:
         body = {"id": "dep-trim", "status": "starting"}
