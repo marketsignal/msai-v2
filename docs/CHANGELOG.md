@@ -4,6 +4,37 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-05-15 — Live deployment workflow: UI + CLI catch-up (`feat/live-deployment-workflow-ui-cli`)
+
+Brings the operator-facing UI + CLI up to parity with the safety-trio-hardened API (PRs #64/#65/#66). Operators no longer need curl to deploy real money safely; the binding-mismatch + flatness + identity contracts all surface through ergonomic interfaces.
+
+**Backend (additive):**
+
+- New `GET /api/v1/live-portfolio-revisions/{id}/members` — second router on `api/portfolios.py` (the existing router is prefix-locked at `/api/v1/live-portfolios`). The pre-existing `/live-portfolios/{id}/members` reads the WORKING draft (empty post-snapshot); the new endpoint reads frozen-revision members.
+- `GET /api/v1/live/status` now reads the persistent Redis halt flag set by `/kill-all` instead of the in-memory `_risk_engine.is_halted`. Resume button + risk-halted banner survive page reloads + replicas. Direct-call path (integration tests that bypass FastAPI DI) gracefully returns `risk_halted=false` when the `bus` is still a `Depends(...)` sentinel.
+
+**UI (Next.js 15 + shadcn):**
+
+- New route `/live-trading/portfolio` — compose + snapshot + deploy flow.
+- `PortfolioCompose`: add members, snapshot frozen revision; locked rows (no remove — backend has no remove endpoint). Loads persisted draft members on `portfolio.id` change so the UI matches the server-side draft state. Initial-load + load-failure gates prevent snapshot against unverified state.
+- `PortfolioStartDialog`: 4-stage form/preview/confirm/submit; required `ib_login_key`; DU/DF=paper, U=live prefix validation; real-money confirmation gate (type account_id to enable); 422 BINDING_MISMATCH renders field/member_value/candidate_value diff table; LIVE_DEPLOY_CONFLICT surfaces remediation copy (no retry-loop CTA — Codex caught the loop bug); idempotency key sticky across retries (rotates only when identity-bearing inputs change).
+- `FlatnessDisplay`: `broker_flat` badge (FLAT green / NOT FLAT red / UNKNOWN orange for null timeout) + remaining_positions table; reads `quantity` (not `qty` — Codex caught the backend↔frontend field mismatch).
+- `ResumeButton`: visible only when `risk_halted=true`; AlertDialog confirm.
+- `KillSwitch`: captures `/kill-all` response into `FlatnessDisplay`; `onKilled` callback so parent refreshes `risk_halted` immediately.
+- `live-trading/page.tsx`: portfolio deploy link card; risk-halted banner; ResumeButton placement; tokenReady flag for API-key-only dev mode.
+- `strategy-status.tsx`: **deleted the 410-broken `/live/start` button** + widened Stop button enabled-condition from `running` to all active statuses (`starting | building | ready | running`) to match backend's active filter.
+
+**CLI (Typer):**
+
+- 9 new `msai live` subcommands: `portfolio-create`, `portfolio-add-strategy` (UUID `--strategy-id`, `@file.json` or literal `--config`), `portfolio-snapshot`, `portfolio-members`, `start-portfolio` (required `--ib-login-key`, `--no-paper` confirm prompt, sticky `Idempotency-Key` header, 90s timeout for cold supervisor spawns, account/paper prefix guard fires client-side before HTTP), `resume`, `positions`, `trades`, `audits`.
+- `live start` alias hardened to mirror `start-portfolio`'s contract — required `--ib-login-key`, `--no-paper` confirm, auto-generated `Idempotency-Key`, 90s timeout.
+
+**E2E use cases:** `tests/e2e/use-cases/live/portfolio-compose-deploy.md` — UC1 (UI happy path), UC2 (BINDING_MISMATCH rendering), UC3 (real-money confirm gate, operator-only), UC4 (real-money UI deploy, operator-only), UC5 (CLI portfolio CRUD), UC6 (CLI safety gates ×4). UC1/UC2/UC5/UC6 verified end-to-end via Playwright MCP + docker exec; report at `tests/e2e/reports/live-deployment-workflow-ui-cli-20260515T115100.md`. UC3/UC4 deferred — underlying binding contract drilled real-money in PR #66 on 2026-05-14.
+
+**Review history:** 4-iter Codex plan-review converged (P1 trajectory narrowed each iteration); 10-iter Codex code-review against the uncommitted diff with 2 P1 + ~21 P2 fixed in-branch (no bugs left behind). Highlights: CLI idempotency-key was in body not header (bypassed Redis reservation), `/live-portfolios/` trailing slash caused 307, kill-switch discarded response, portfolio-compose fake-removed members locally (UI/server divergence), DU paper accounts accepted but DF FA-paper rejected, dialog submitted untrimmed identity strings, account/paper mismatch reached supervisor instead of failing client-side.
+
+**Verification:** 1957 backend unit tests pass; ruff + mypy --strict clean; frontend lint + tsc + build all green (17/17 routes). 11 implementation tasks executed via parallel subagents (T0a/T0b backend → T1 types → T2 client → T3/T4 components → T5/T6 forms → T7 page → T8 wiring → T9 410 deletion; T10 CLI commands + T11 tests parallel with frontend track).
+
 ### 2026-05-13 — Snapshot binding replaces 503 LIVE_DEPLOY_BLOCKED guard (`fix/snapshot-binding-replaces-503-guard`) — **drill pending**
 
 Bug #3 of three discovered during the 2026-05-13 paper-money drill. PR #63 shipped a temporary 503 `LIVE_DEPLOY_BLOCKED` guard at `POST /api/v1/live/start-portfolio` that rejected all `paper_trading=false` deploys, pending a real per-member verification that the frozen portfolio member's `config` + `instruments` match the approved `GraduationCandidate` snapshot. Without that verification a portfolio member could carry arbitrary parameters that diverged from what was graduated, sending real-money orders against a config never actually approved.
