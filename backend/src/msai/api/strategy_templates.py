@@ -60,6 +60,20 @@ async def scaffold_template(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         ) from exc
+    except (OSError, PermissionError) as exc:
+        log.error(
+            "strategy_scaffold_io_error",
+            template_id=body.template_id,
+            module_name=body.module_name,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                f"Cannot write strategy file: {exc}. "
+                "Check STRATEGIES_ROOT is writable by the backend container."
+            ),
+        ) from exc
 
     log.info(
         "strategy_template_scaffolded",

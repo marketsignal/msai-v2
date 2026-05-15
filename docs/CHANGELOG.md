@@ -19,7 +19,12 @@ Brings the `msai` CLI to full REST parity with every public `/api/v1/*` HTTP end
 
 **Review history:** 7-iteration Codex plan-review (9 P1 + 15 P2 caught across iters 1–6, all folded into the plan before implementation began). 2-iteration code-review post-implementation (1 P2 in iter 1 — `strategy edit` truthiness vs `is not None` for clearing description; fixed). Endpoint contracts verified against actual backend schemas during plan-review — Codex caught wrong assumptions on symbols readiness/inventory query shapes, research body shapes, backtest report 2-step flow, IngestResponse shape, symbols delete 204-no-body, strategy delete 200 (not 204), template scaffold field names, alerts envelope, auth logout 200 (not 204).
 
-**Verification:** 2028 backend unit tests pass; ruff + mypy --strict clean on 188 src files. 65 new tests in `test_cli_completeness.py` (one TestClass per command family; mocks `httpx.request` to assert method + URL + body + query params).
+**E2E verification:** 28/28 commands exercised end-to-end against the live dev stack via `docker compose exec backend uv run python -m msai.cli ...` (report: `tests/e2e/reports/cli-completeness-20260515T230412Z.md` + bug-fix re-verify at `tests/e2e/reports/cli-completeness-bugfix-20260515T231053Z.md`). The initial run flagged 2 FAIL_BUG findings — both fixed in-branch per NO BUGS LEFT BEHIND:
+
+1. **`template scaffold` → 500** — backend container had `./strategies:/app/strategies:ro` mounted read-only, so `file_path.write_text(source)` raised `OSError` swallowed as an opaque 500. Fix: drop `:ro` on the backend mount (workers keep read-only via `*worker-volumes`); add defensive `except (OSError, PermissionError)` → 500 with actionable detail.
+2. **`strategy edit` silent no-op** — `sync_strategies_to_db` unconditionally overwrote `row.description = info.description` on every GET, clobbering the PATCH-saved value with the on-disk docstring. Fix: remove the overwrite from the update branch (description is set from disk on row creation, then PATCH owns it). Regression test at `test_strategy_registry.py::test_sync_preserves_user_patched_description`.
+
+**Verification:** 2029 backend unit tests pass (+1 regression test); ruff + mypy --strict clean on 188 src files. 65 new tests in `test_cli_completeness.py` (one TestClass per command family; mocks `httpx.request` to assert method + URL + body + query params).
 
 ### 2026-05-15 — Live deployment workflow: UI + CLI catch-up (`feat/live-deployment-workflow-ui-cli`)
 
