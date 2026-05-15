@@ -100,6 +100,10 @@ instruments_app = typer.Typer(
     help="Instrument registry operations",
     rich_markup_mode="rich",
 )
+alerts_app = typer.Typer(help="Operational alert history")
+auth_app = typer.Typer(help="Authentication / current-user commands")
+market_data_app = typer.Typer(help="Market data (Parquet-backed) bars, symbols, status, ingest")
+template_app = typer.Typer(help="Strategy template scaffolding")
 
 app.add_typer(strategy_app, name="strategy")
 app.add_typer(backtest_app, name="backtest")
@@ -110,6 +114,10 @@ app.add_typer(portfolio_app, name="portfolio")
 app.add_typer(account_app, name="account")
 app.add_typer(system_app, name="system")
 app.add_typer(instruments_app, name="instruments")
+app.add_typer(alerts_app, name="alerts")
+app.add_typer(auth_app, name="auth")
+app.add_typer(market_data_app, name="market-data")
+app.add_typer(template_app, name="template")
 
 
 # ----------------------------------------------------------------------
@@ -1584,6 +1592,539 @@ def instruments_bootstrap(
 
     if summary.get("failed", 0) > 0 or response.status_code != 200:
         raise typer.Exit(code=1)
+
+
+# ======================================================================
+# T1: alerts sub-app
+# ======================================================================
+
+
+@alerts_app.command("list")
+def alerts_list(
+    limit: int = typer.Option(50, "--limit", help="Max rows (server clamps to [1, 200])"),
+) -> None:
+    """List recent operational alerts (envelope: ``{alerts: [...]}``)."""
+    response = _api_call("GET", "/api/v1/alerts/", params={"limit": limit})
+    _emit_json(response.json())
+
+
+# ======================================================================
+# T2: strategy edit + delete (modifies strategy_app)
+# ======================================================================
+
+
+@strategy_app.command("edit")
+def strategy_edit(
+    strategy_id: str = typer.Argument(..., help="Strategy UUID"),
+    description: str | None = typer.Option(
+        None,
+        "--description",
+        help=(
+            "New description (omit to leave unchanged; pass an empty string "
+            "to clear). Codex code-review iter-1 P2 distinguished omission "
+            "from empty value — truthiness would have dropped --description ''."
+        ),
+    ),
+    default_config: str | None = typer.Option(
+        None,
+        "--default-config",
+        help=(
+            "Replacement default_config: literal JSON object OR '@/path/to/file.json'. "
+            "Omit to leave unchanged."
+        ),
+    ),
+) -> None:
+    """Update a strategy's description and/or default_config (PATCH)."""
+    payload: dict[str, Any] = {}
+    if description is not None:
+        payload["description"] = description
+    if default_config is not None:
+        payload["default_config"] = _load_config_arg(default_config)
+    if not payload:
+        _fail("provide at least one of --description or --default-config")
+    response = _api_call(
+        "PATCH",
+        f"/api/v1/strategies/{_url_id(strategy_id)}",
+        json_body=payload,
+    )
+    _emit_json(response.json())
+
+
+@strategy_app.command("delete")
+def strategy_delete(
+    strategy_id: str = typer.Argument(..., help="Strategy UUID"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """Delete a strategy registry row (returns 200 MessageResponse)."""
+    if not yes:
+        typer.confirm(f"Delete strategy {strategy_id}?", abort=True)
+    response = _api_call("DELETE", f"/api/v1/strategies/{_url_id(strategy_id)}")
+    _emit_json(response.json())
+
+
+# ======================================================================
+# T2: template sub-app
+# ======================================================================
+
+
+@template_app.command("list")
+def template_list() -> None:
+    """List available strategy templates."""
+    response = _api_call("GET", "/api/v1/strategy-templates/")
+    _emit_json(response.json())
+
+
+@template_app.command("scaffold")
+def template_scaffold(
+    template_id: str = typer.Option(..., "--template-id", help="Template ID from `template list`"),
+    module_name: str = typer.Option(
+        ...,
+        "--module-name",
+        help="Module name for the scaffolded strategy (e.g. ``user.my_strategy``)",
+    ),
+    description: str = typer.Option(
+        "",
+        "--description",
+        help="Optional description for the new strategy",
+    ),
+) -> None:
+    """Generate a new strategy module from a template."""
+    payload: dict[str, Any] = {
+        "template_id": template_id,
+        "module_name": module_name,
+    }
+    if description:
+        payload["description"] = description
+    response = _api_call(
+        "POST",
+        "/api/v1/strategy-templates/scaffold",
+        json_body=payload,
+    )
+    _emit_json(response.json())
+
+
+# ======================================================================
+# T3: graduation create + stage (modifies graduation_app)
+# ======================================================================
+
+
+@graduation_app.command("create")
+def graduation_create(
+    strategy_id: str = typer.Option(..., "--strategy-id", help="Strategy UUID"),
+    config: str = typer.Option(
+        ...,
+        "--config",
+        help="Strategy config: literal JSON object OR '@/path/to/file.json'",
+    ),
+    metrics: str = typer.Option(
+        "",
+        "--metrics",
+        help=(
+            "Metrics JSON: literal object OR '@/path/to/file.json'. "
+            "Server requires metrics; defaults to {} if omitted."
+        ),
+    ),
+    research_job_id: str = typer.Option(
+        "",
+        "--research-job-id",
+        help="Optional research_job UUID this candidate derives from",
+    ),
+    notes: str = typer.Option("", "--notes", help="Optional notes"),
+) -> None:
+    """Create a new graduation candidate (stage server-set to ``discovery``)."""
+    cfg = _load_config_arg(config)
+    metrics_obj: dict[str, Any] = _load_config_arg(metrics) if metrics else {}
+    payload: dict[str, Any] = {
+        "strategy_id": strategy_id,
+        "config": cfg,
+        "metrics": metrics_obj,
+    }
+    if research_job_id:
+        payload["research_job_id"] = research_job_id
+    if notes:
+        payload["notes"] = notes
+    response = _api_call(
+        "POST",
+        "/api/v1/graduation/candidates",
+        json_body=payload,
+    )
+    _emit_json(response.json())
+
+
+@graduation_app.command("stage")
+def graduation_stage(
+    candidate_id: str = typer.Argument(..., help="Graduation candidate UUID"),
+    stage: str = typer.Option(..., "--stage", help="Target stage"),
+    reason: str = typer.Option("", "--reason", help="Optional reason for the transition"),
+) -> None:
+    """Advance a candidate to ``--stage`` with an optional reason."""
+    payload: dict[str, Any] = {"stage": stage}
+    if reason:
+        payload["reason"] = reason
+    response = _api_call(
+        "POST",
+        f"/api/v1/graduation/candidates/{_url_id(candidate_id)}/stage",
+        json_body=payload,
+    )
+    _emit_json(response.json())
+
+
+# ======================================================================
+# T4: research sweep + walk-forward + promote (modifies research_app)
+# ======================================================================
+
+
+@research_app.command("sweep")
+def research_sweep(
+    config: str = typer.Option(
+        ...,
+        "--config",
+        help=(
+            "Sweep payload: literal JSON object OR '@/path/to/file.json'. "
+            "The file IS the full POST body (flat, not wrapped in {strategy_id, config})."
+        ),
+    ),
+) -> None:
+    """Launch a parameter sweep research job."""
+    payload = _load_config_arg(config)
+    response = _api_call("POST", "/api/v1/research/sweeps", json_body=payload)
+    _emit_json(response.json())
+
+
+@research_app.command("walk-forward")
+def research_walk_forward(
+    config: str = typer.Option(
+        ...,
+        "--config",
+        help=(
+            "Walk-forward payload: literal JSON object OR '@/path/to/file.json'. "
+            "The file IS the full POST body (must include train_days + test_days)."
+        ),
+    ),
+) -> None:
+    """Launch a walk-forward optimisation research job."""
+    payload = _load_config_arg(config)
+    response = _api_call("POST", "/api/v1/research/walk-forward", json_body=payload)
+    _emit_json(response.json())
+
+
+@research_app.command("promote")
+def research_promote(
+    job_id: str = typer.Option(..., "--job-id", help="Completed research_job UUID"),
+    trial_index: int = typer.Option(
+        -1,
+        "--trial-index",
+        help="Specific trial index to promote (default: server picks best)",
+    ),
+    notes: str = typer.Option("", "--notes", help="Optional notes"),
+) -> None:
+    """Promote a completed research job's result to a graduation candidate."""
+    payload: dict[str, Any] = {"research_job_id": job_id}
+    if trial_index >= 0:
+        payload["trial_index"] = trial_index
+    if notes:
+        payload["notes"] = notes
+    response = _api_call("POST", "/api/v1/research/promotions", json_body=payload)
+    _emit_json(response.json())
+
+
+# ======================================================================
+# T5: backtest report + trades (modifies backtest_app)
+# ======================================================================
+
+
+@backtest_app.command("report")
+def backtest_report(
+    backtest_id: str = typer.Argument(..., help="Backtest UUID"),
+    out: str = typer.Option("", "--out", help="Output HTML file path (default: stdout)"),
+) -> None:
+    """Download a backtest's QuantStats HTML report (two-step token flow)."""
+    safe_id = _url_id(backtest_id)
+    # Step 1: mint signed URL.
+    token_response = _api_call(
+        "POST",
+        f"/api/v1/backtests/{safe_id}/report-token",
+        timeout=60.0,
+    )
+    token_payload = token_response.json()
+    signed_url = token_payload.get("signed_url")
+    if not isinstance(signed_url, str) or not signed_url:
+        _fail("report-token response missing signed_url")
+    # Step 2: GET the signed URL — response is text/html.
+    html_response = _api_call("GET", signed_url, timeout=60.0)
+    html = html_response.text
+    if out:
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(html)
+        typer.echo(f"Report written to {out}", err=True)
+    else:
+        typer.echo(html)
+
+
+@backtest_app.command("trades")
+def backtest_trades(
+    backtest_id: str = typer.Argument(..., help="Backtest UUID"),
+    page: int = typer.Option(1, "--page", help="Page number (1-indexed)"),
+    page_size: int = typer.Option(
+        100,
+        "--page-size",
+        help="Page size (server clamps to max 500)",
+    ),
+    all_pages: bool = typer.Option(
+        False,
+        "--all",
+        help="Loop through all pages and emit a merged ``items`` list",
+    ),
+    out: str = typer.Option("", "--out", help="Output JSON file path (default: stdout)"),
+) -> None:
+    """Fetch paginated trades for a backtest."""
+    safe_id = _url_id(backtest_id)
+    if not all_pages:
+        response = _api_call(
+            "GET",
+            f"/api/v1/backtests/{safe_id}/trades",
+            params={"page": page, "page_size": page_size},
+        )
+        payload = response.json()
+        if out:
+            with open(out, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, default=str)
+            typer.echo(f"Trades written to {out}", err=True)
+        else:
+            _emit_json(payload)
+        return
+    # --all: iterate pages, terminate when returned rows < server's page_size.
+    # Use the response's page_size (server may have clamped down to 500).
+    aggregated: list[Any] = []
+    current_page = 1
+    total: int | None = None
+    while True:
+        response = _api_call(
+            "GET",
+            f"/api/v1/backtests/{safe_id}/trades",
+            params={"page": current_page, "page_size": page_size},
+        )
+        page_payload = response.json()
+        items = page_payload.get("items", [])
+        aggregated.extend(items)
+        if total is None:
+            total = page_payload.get("total")
+        server_page_size = page_payload.get("page_size", page_size)
+        if len(items) < server_page_size:
+            break
+        current_page += 1
+    merged: dict[str, Any] = {"items": aggregated, "total": total, "pages_fetched": current_page}
+    if out:
+        with open(out, "w", encoding="utf-8") as fh:
+            json.dump(merged, fh, indent=2, default=str)
+        typer.echo(f"Trades written to {out}", err=True)
+    else:
+        _emit_json(merged)
+
+
+# ======================================================================
+# T6: live status-show + portfolio list/show/draft-members (modifies live_app)
+# ======================================================================
+
+
+@live_app.command("status-show")
+def live_status_show(
+    deployment_id: str = typer.Argument(..., help="Deployment UUID"),
+) -> None:
+    """Show status for a single deployment (distinct from ``live status``)."""
+    response = _api_call(
+        "GET",
+        f"/api/v1/live/status/{_url_id(deployment_id)}",
+        timeout=10.0,
+    )
+    _emit_json(response.json())
+
+
+@live_app.command("portfolio-list")
+def live_portfolio_list() -> None:
+    """List all live portfolios."""
+    response = _api_call("GET", "/api/v1/live-portfolios")
+    _emit_json(response.json())
+
+
+@live_app.command("portfolio-show")
+def live_portfolio_show(
+    portfolio_id: str = typer.Argument(..., help="Live portfolio UUID"),
+) -> None:
+    """Show one live portfolio's detail."""
+    response = _api_call(
+        "GET",
+        f"/api/v1/live-portfolios/{_url_id(portfolio_id)}",
+    )
+    _emit_json(response.json())
+
+
+@live_app.command("portfolio-draft-members")
+def live_portfolio_draft_members(
+    portfolio_id: str = typer.Argument(..., help="Live portfolio UUID"),
+) -> None:
+    """List DRAFT members of a portfolio (use ``portfolio-members`` for frozen revisions)."""
+    response = _api_call(
+        "GET",
+        f"/api/v1/live-portfolios/{_url_id(portfolio_id)}/members",
+    )
+    _emit_json(response.json())
+
+
+# ======================================================================
+# T7: portfolio create + run-show + run-report (modifies portfolio_app)
+# ======================================================================
+
+
+@portfolio_app.command("create")
+def portfolio_create(
+    config: str = typer.Option(
+        ...,
+        "--config",
+        help=(
+            "Portfolio payload: literal JSON object OR '@/path/to/file.json'. "
+            "Required fields: name, objective, base_capital, allocations[]."
+        ),
+    ),
+) -> None:
+    """Create a new research-backtest portfolio."""
+    payload = _load_config_arg(config)
+    response = _api_call("POST", "/api/v1/portfolios", json_body=payload)
+    _emit_json(response.json())
+
+
+@portfolio_app.command("run-show")
+def portfolio_run_show(
+    run_id: str = typer.Argument(..., help="Portfolio run UUID"),
+) -> None:
+    """Show one portfolio run's detail."""
+    response = _api_call(
+        "GET",
+        f"/api/v1/portfolios/runs/{_url_id(run_id)}",
+    )
+    _emit_json(response.json())
+
+
+@portfolio_app.command("run-report")
+def portfolio_run_report(
+    run_id: str = typer.Argument(..., help="Portfolio run UUID"),
+    out: str = typer.Option("", "--out", help="Output HTML file path (default: stdout)"),
+) -> None:
+    """Download a portfolio run's HTML report."""
+    response = _api_call(
+        "GET",
+        f"/api/v1/portfolios/runs/{_url_id(run_id)}/report",
+        timeout=60.0,
+    )
+    html = response.text
+    if out:
+        with open(out, "w", encoding="utf-8") as fh:
+            fh.write(html)
+        typer.echo(f"Report written to {out}", err=True)
+    else:
+        typer.echo(html)
+
+
+# ======================================================================
+# T8: market-data sub-app
+# ======================================================================
+
+
+@market_data_app.command("bars")
+def market_data_bars(
+    symbol: str = typer.Argument(..., help="Ticker symbol (e.g. AAPL)"),
+    start: str = typer.Option(..., "--start", help="Start date YYYY-MM-DD"),
+    end: str = typer.Option(..., "--end", help="End date YYYY-MM-DD"),
+    interval: str = typer.Option("1m", "--interval", help="Bar interval (default 1m)"),
+) -> None:
+    """Fetch OHLCV bars for ``symbol`` over the date range."""
+    response = _api_call(
+        "GET",
+        f"/api/v1/market-data/bars/{_url_id(symbol)}",
+        params={"start": start, "end": end, "interval": interval},
+    )
+    _emit_json(response.json())
+
+
+@market_data_app.command("symbols")
+def market_data_symbols() -> None:
+    """List available symbols grouped by asset class."""
+    response = _api_call("GET", "/api/v1/market-data/symbols")
+    _emit_json(response.json())
+
+
+@market_data_app.command("status")
+def market_data_status() -> None:
+    """Show API-backed storage status (distinct from top-level ``data-status``)."""
+    response = _api_call("GET", "/api/v1/market-data/status")
+    _emit_json(response.json())
+
+
+@market_data_app.command("ingest")
+def market_data_ingest(
+    asset_class: str = typer.Option(
+        ...,
+        "--asset-class",
+        help="Asset class: stocks | equities | indexes | futures | options | crypto",
+    ),
+    symbols: str = typer.Option(..., "--symbols", help="Comma-separated tickers"),
+    start: str = typer.Option(..., "--start", help="Start date YYYY-MM-DD"),
+    end: str = typer.Option(..., "--end", help="End date YYYY-MM-DD"),
+    provider: str = typer.Option(
+        "auto",
+        "--provider",
+        help="Data provider: auto | databento | polygon",
+    ),
+    dataset: str = typer.Option("", "--dataset", help="Override default Databento dataset"),
+    data_schema: str = typer.Option(
+        "",
+        "--data-schema",
+        help="Override default Databento schema",
+    ),
+) -> None:
+    """Enqueue an ingestion job via the API (distinct from top-level ``ingest``)."""
+    symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
+    if not symbol_list:
+        _fail("no symbols provided")
+    body: dict[str, Any] = {
+        "asset_class": asset_class,
+        "symbols": symbol_list,
+        "start": start,
+        "end": end,
+        "provider": provider,
+    }
+    if dataset:
+        body["dataset"] = dataset
+    if data_schema:
+        body["data_schema"] = data_schema
+    response = _api_call("POST", "/api/v1/market-data/ingest", json_body=body)
+    _emit_json(response.json())
+
+
+# ======================================================================
+# T10: auth sub-app (+ top-level whoami alias)
+# ======================================================================
+
+
+@auth_app.command("me")
+def auth_me() -> None:
+    """Show the current authenticated user (JWT or X-API-Key)."""
+    response = _api_call("GET", "/api/v1/auth/me")
+    _emit_json(response.json())
+
+
+@auth_app.command("logout")
+def auth_logout() -> None:
+    """Log the current session out (server returns 200 MessageResponse)."""
+    response = _api_call("POST", "/api/v1/auth/logout")
+    _emit_json(response.json())
+
+
+@app.command("whoami")
+def whoami() -> None:
+    """Alias for ``msai auth me``."""
+    response = _api_call("GET", "/api/v1/auth/me")
+    _emit_json(response.json())
 
 
 # Register the symbols sub-app at module load time (after defining _api_call).
