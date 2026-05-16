@@ -175,8 +175,12 @@ STATUS=$(curl -s -o /tmp/stop.json -w "%{http_code}" -X POST \
   -H "X-API-Key: $MSAI_API_KEY" -H "Content-Type: application/json" \
   -d "{\"deployment_id\":\"<id>\"}" \
   https://platform.marketsignal.ai/api/v1/live/stop)
-echo "HTTP $STATUS"   # 200 = flat; 504 = FLATNESS_UNKNOWN
+echo "HTTP $STATUS"   # 200 = stop accepted (read broker_flat from body); 504 = FLATNESS_UNKNOWN
 jq '{broker_flat, remaining_positions, detail}' /tmp/stop.json
+# NB: 200 alone does NOT mean flat — body could have broker_flat=false, OR the
+# already-stopped shortcut returns 200 with only id+status (no flatness fields).
+# Always read broker_flat from the body; null/missing means the call hit the
+# already-stopped path and you should verify positions via IB portal anyway.
 
 # Or for the all-at-once kill path
 STATUS=$(curl -s -o /tmp/kill.json -w "%{http_code}" -X POST \
