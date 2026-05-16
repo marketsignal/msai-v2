@@ -177,10 +177,12 @@ STATUS=$(curl -s -o /tmp/stop.json -w "%{http_code}" -X POST \
   https://platform.marketsignal.ai/api/v1/live/stop)
 echo "HTTP $STATUS"   # 200 = stop accepted (read broker_flat from body); 504 = FLATNESS_UNKNOWN
 jq '{broker_flat, remaining_positions, detail}' /tmp/stop.json
-# NB: 200 alone does NOT mean flat — body could have broker_flat=false, OR the
-# already-stopped shortcut returns 200 with only id+status (no flatness fields).
-# Always read broker_flat from the body; null/missing means the call hit the
-# already-stopped path and you should verify positions via IB portal anyway.
+# NB: 200 alone does NOT mean flat. Three observable cases:
+#   (a) 200 + broker_flat=true        → flat, safe to proceed.
+#   (b) 200 + broker_flat=false       → residual positions; flatten in IB first.
+#   (c) 200 + no flatness fields      → already-stopped shortcut (no live child).
+#   (d) 504 + broker_flat=null + detail.error.code=FLATNESS_UNKNOWN → unknown.
+# In (c) and (d), verify residual positions via IB portal before deploying.
 
 # Or for the all-at-once kill path
 STATUS=$(curl -s -o /tmp/kill.json -w "%{http_code}" -X POST \
@@ -190,7 +192,7 @@ echo "HTTP $STATUS"   # 200 = all flat; 207 = any_non_flat / partial
 jq '{any_non_flat, flatness_reports}' /tmp/kill.json
 ```
 
-If `broker_flat=false` (or `any_non_flat=true`), flatten manually via the IB portal before re-attempting the deploy.
+If `broker_flat=false` (or `any_non_flat=true`, which may also mean _unknown_-flatness rather than confirmed-non-flat), verify residual positions via the IB portal and flatten any that remain before re-attempting the deploy.
 
 **Fresh-VM bypass:** if `curl` to `/api/v1/live/status` fails with DNS-resolution-error or connection-refused (exit code 6/7) — i.e., Caddy/backend aren't running yet — the gate normally **fails closed**. For a genuine fresh-VM bootstrap or DR rebuild, pass `-f bootstrap=true`. **Never use `bootstrap=true` for routine re-deploys** — broker subprocesses live in a separate compose profile and can keep trading even when the API listener is dead.
 
