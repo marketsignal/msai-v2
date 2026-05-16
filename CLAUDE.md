@@ -54,6 +54,17 @@ IB Gateway is behind the `broker` Compose profile:
 COMPOSE_PROFILES=broker docker compose -f docker-compose.dev.yml --env-file .env up -d
 ```
 
+### Deploying to production
+
+**Push to main auto-deploys to the Azure VM** via a two-workflow chain:
+
+1. `.github/workflows/build-and-push.yml` (Slice 2) — OIDC → ACR → docker build & push tagged `<sha7>`.
+2. `.github/workflows/deploy.yml` (Slice 3 + 4) — `workflow_run` on Slice 2 success → active-deployments gate → OIDC + transient NSG SSH rule → `scp` + `ssh sudo bash deploy-on-vm.sh` → `docker compose pull && up -d --wait` → public probes → rollback on probe failure.
+
+Manual rollback / re-deploy / rehearsal-RG dispatch use `gh workflow run deploy.yml -f git_sha=<sha>` (and full override matrix for rehearsal).
+
+**Read [`docs/how_to_deploy.md`](docs/how_to_deploy.md) first** for the deploy architecture diagram, the active-`live_deployments` safety gate, rehearsal procedure, repo-Variable matrix, and the pointer index to deep-dive runbooks (`vm-setup`, `slice-3-first-deploy`, `disaster-recovery`, `restore-from-backup`, `iac-parity-reapply`).
+
 ### File Structure
 
 ```
