@@ -86,7 +86,7 @@ Host ports: frontend `:3300`, backend `:8800`, postgres `:5433`, redis `:6380`.
 
 **When to rebuild images:**
 
-- Changed `Dockerfile.dev`, `pyproject.toml`, or `package.json`
+- Changed `Dockerfile.dev`, `pyproject.toml`, `uv.lock`, `package.json`, or `pnpm-lock.yaml`
 - **NOT for `.py` / `.tsx` source changes** — those hot-reload via volume mounts (`./backend/src:/app/src`, etc.)
 
 **After merges that touch worker code** (`src/msai/{services,workers,live_supervisor}`): run `./scripts/restart-workers.sh` to refresh stale Python imports without rebuilding.
@@ -134,7 +134,7 @@ gh workflow run deploy.yml -f git_sha=<7-char-sha>
 az acr repository show-tags -n <ACR_NAME> --repository msai-backend --orderby time_desc -o table
 ```
 
-**Auto-rollback scope.** `scripts/deploy-on-vm.sh` auto-rolls-back to the previous SHA only on **VM-local** failures: `docker compose pull`/`up`/`migrate`, VM-local `/health`, `/ready`, VM-local HTTPS `/health`, and `deploy-smoke.sh`. The runner-side **public** probes in `deploy.yml` (TLS chain, public `/health`, frontend root) fail the workflow but do **not** trigger auto-rollback — those failures usually mean DNS, NSG, or Let's Encrypt rate-limit, not bad code. If a public probe fails, run `gh workflow run deploy.yml -f git_sha=<previous>` manually.
+**Auto-rollback scope.** `scripts/deploy-on-vm.sh` auto-rolls-back to the previous SHA on any **VM-executed** probe failure: `docker compose pull`/`up`/`migrate`, VM-local `/health`, `/ready`, the VM-side HTTPS hostname probe (which can fail for DNS / NSG / Let's Encrypt reasons too, not just bad code — those still roll back), and `deploy-smoke.sh`. The runner-side public probes that fire AFTER the VM-side block returns success (TLS chain, public `/health`, frontend root in `deploy.yml`) fail the workflow but do **not** trigger auto-rollback — by that point the VM has accepted the new SHA as healthy. If a runner-side probe fails, run `gh workflow run deploy.yml -f git_sha=<previous>` manually.
 
 Manual rollback is also right for "the new code is fine but we want to revert behavior."
 
@@ -159,7 +159,13 @@ msai live stop <deployment_id>
 msai live kill-all --yes
 ```
 
-`live stop` and `kill-all` both surface `broker_flat` and `remaining_positions` in their response. If `broker_flat=false`, flatten manually via the IB portal before re-attempting the deploy.
+The CLI's current output is a short success line; the underlying API response carries `broker_flat` + `remaining_positions`. To inspect flatness directly, hit the API:
+
+```bash
+curl -sf -H "X-API-Key: $MSAI_API_KEY" https://platform.marketsignal.ai/api/v1/live/status?active_only=true | jq '.deployments[] | {id, status, broker_flat, remaining_positions}'
+```
+
+If `broker_flat=false`, flatten manually via the IB portal before re-attempting the deploy.
 
 **Fresh-VM bypass:** if `curl` to `/api/v1/live/status` fails with DNS-resolution-error or connection-refused (exit code 6/7) — i.e., Caddy/backend aren't running yet — the gate normally **fails closed**. For a genuine fresh-VM bootstrap or DR rebuild, pass `-f bootstrap=true`. **Never use `bootstrap=true` for routine re-deploys** — broker subprocesses live in a separate compose profile and can keep trading even when the API listener is dead.
 
@@ -199,7 +205,15 @@ ACR_NAME=$(jq -r '.acrLoginServer.value | split(".")[0]' <<<"$OUTS")
 ACR_LOGIN=$(jq -r .acrLoginServer.value <<<"$OUTS")
 KNOWN_HOSTS=$(ssh-keyscan -t ed25519 "$VM_IP" 2>/dev/null)
 
-# Dispatch deploy.yml with full rehearsal-override matrix
+# Dispatch deploy.yml with the rehearsal-override inputs (resource_group,
+# vm_public_ip, nsg_name, kv_name, msai_hostname, acr_name,
+# acr_login_server, vm_ssh_known_hosts_var, bootstrap). Note: DEPLOYMENT_NAME
+# is NOT an overrideable input — deploy.yml writes ${vars.DEPLOYMENT_NAME}
+# verbatim into the staged env file. For rehearsal you have two choices:
+#   (a) temporarily set the repo Variable DEPLOYMENT_NAME=msai-iac for the
+#       rehearsal run, then restore to the prod value, OR
+#   (b) accept that backup-to-blob.sh on the rehearsal VM will look up the
+#       wrong deployment — fine because rehearsal doesn't run nightly backups.
 gh workflow run deploy.yml \
   -f resource_group="$RG" \
   -f vm_public_ip="$VM_IP" \
@@ -262,7 +276,26 @@ CI needs 18 repo Variables and 2 Secrets. **Variables** are non-sensitive (visib
 | `VM_SSH_PRIVATE_KEY` | ed25519 private key for `msaiadmin@<VM>`  |
 | `MSAI_API_KEY`       | X-API-Key for the active-deployments gate |
 
-The Slice 2 acceptance step in [`docs/runbooks/vm-setup.md`](runbooks/vm-setup.md) walks through populating the 8 build-side variables (`AZURE_*`, `ACR_*`, `NEXT_PUBLIC_*`). The deploy-side variables and 2 secrets (`VM_*`, `NSG_NAME`, `KV_NAME`, `MSAI_HOSTNAME`, `MSAI_API_KEY`, `VM_SSH_PRIVATE_KEY`, etc.) are populated during the Slice 3 first-deploy procedure in [`docs/runbooks/slice-3-first-deploy.md`](runbooks/slice-3-first-deploy.md).
+The Slice 2 acceptance step in [`docs/runbooks/vm-setup.md`](runbooks/vm-setup.md) walks through populating the 8 build-side variables (`AZURE_*`, `ACR_*`, `NEXT_PUBLIC_*`). The deploy-side variables and 2 secrets (`VM_*`, `NSG_NAME`, `KV_NAME`, `MSAI_HOSTNAME`, `MSAI_API_KEY`, `VM_SSH_PRIVATE_KEY`, etc.) are **not** auto-walked through by any runbook yet — [`docs/runbooks/slice-3-first-deploy.md`](runbooks/slice-3-first-deploy.md) verifies a sample via `gh variable list | grep ...` but assumes the operator has already set them. Populate them from Slice 1 Bicep outputs:
+
+```bash
+# Capture from the prod RG (one-time)
+RG=msaiv2_rg
+OUTS=$(az deployment group show --name main --resource-group "$RG" --query 'properties.outputs' -o json)
+gh variable set VM_PUBLIC_IP --body "$(jq -r .vmPublicIp.value     <<<"$OUTS")"
+gh variable set KV_NAME      --body "$(jq -r .keyVaultName.value <<<"$OUTS")"
+gh variable set NSG_NAME     --body "$(jq -r .nsgName.value      <<<"$OUTS")"
+gh variable set VM_SSH_USER  --body "msaiadmin"
+gh variable set MSAI_HOSTNAME --body "platform.marketsignal.ai"
+gh variable set MSAI_BACKEND_IMAGE  --body "msai-backend"
+gh variable set MSAI_FRONTEND_IMAGE --body "msai-frontend"
+gh variable set DEPLOYMENT_NAME     --body "main"
+gh variable set VM_SSH_KNOWN_HOSTS  --body "$(ssh-keyscan -t ed25519 "$(jq -r .vmPublicIp.value <<<"$OUTS")" 2>/dev/null)"
+
+# Secrets
+gh secret set VM_SSH_PRIVATE_KEY < ~/.ssh/msai-prod    # private key matching the Bicep-deployed pubkey
+gh secret set MSAI_API_KEY                              # then paste the X-API-Key value (also stored in KV)
+```
 
 ---
 

@@ -141,7 +141,8 @@ jobs:
         # fast BEFORE Azure login (no OIDC mint, no NSG rule churn) so the gate is
         # the cheapest possible pre-flight. Uses public endpoint via Caddy + X-API-Key
         # (which Caddy passes through unchanged per Slice 4 research §7). No force
-        # flag — operator clears state with `msai live stop --all` first.
+        # flag — operator clears state with `msai live stop <id>` per active
+        # deployment (or `msai live kill-all --yes` for emergency) first.
         env:
           MSAI_HOST: ${{ steps.resolve.outputs.msai_hostname }}
           MSAI_API_KEY: ${{ secrets.MSAI_API_KEY }}
@@ -204,7 +205,7 @@ jobs:
           # them as inactive lets the gate fail open during the spawn window.
           active_ids=$(echo "$resp" | jq -r '[.deployments[] | select(.status == "starting" or .status == "building" or .status == "ready" or .status == "running") | .id] | join(",")')
           if [[ -n "$active_ids" ]]; then
-            echo "FAIL_ACTIVE_DEPLOYMENTS_REFUSAL: active deployments [$active_ids]. Run 'msai live stop --all' (or 'msai live kill-all' if backend is wedged) first, then re-dispatch." >&2
+            echo "FAIL_ACTIVE_DEPLOYMENTS_REFUSAL: active deployments [$active_ids]. Run 'msai live status' to inspect, then 'msai live stop <id>' for each (or 'msai live kill-all --yes' if backend is wedged) first, then re-dispatch." >&2
             exit 1
           fi
           echo "deployments[].status check: 0 active — gate clear"
