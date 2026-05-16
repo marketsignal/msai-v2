@@ -161,23 +161,26 @@ msai live kill-all --yes
 
 The CLI's current output is a short success line — flatness fields are NOT carried in the entries `/api/v1/live/status` returns. Flatness lives only on the stop/kill-all response envelopes:
 
-- `POST /api/v1/live/stop` → 200 with `broker_flat: bool` + `remaining_positions: list`, OR **504 `FLATNESS_UNKNOWN`** if the deployment stopped but the child never wrote a flatness report (operator must verify positions via IB portal in that case).
-- `POST /api/v1/live/kill-all` → 200 with `any_non_flat: bool` + `flatness_reports: list[dict]`.
+- `POST /api/v1/live/stop` → **200** with `broker_flat: bool` + `remaining_positions: list`, OR **504 `FLATNESS_UNKNOWN`** if the deployment stopped but the child never wrote a flatness report (operator must verify positions via IB portal in that case).
+- `POST /api/v1/live/kill-all` → **200** when every deployment came back flat, **207 (Multi-Status)** when `any_non_flat=true` or any publish failed partially. Body always includes `any_non_flat: bool` + `flatness_reports: list[dict]`.
 
-To inspect flatness directly, capture the stop/kill-all response. Use `curl -s` (not `-sf`) so the body is visible even on the 504 case:
+To inspect flatness directly, capture body and status code separately (piping `curl -w` directly into `jq` mixes the status line into jq's input and breaks parsing):
 
 ```bash
-# Per deployment (-w prints final status so you see the 504 if FLATNESS_UNKNOWN fires)
-curl -s -X POST -H "X-API-Key: $MSAI_API_KEY" \
-  -H "Content-Type: application/json" \
+# Per deployment — capture body to a temp file, status to a variable
+STATUS=$(curl -s -o /tmp/stop.json -w "%{http_code}" -X POST \
+  -H "X-API-Key: $MSAI_API_KEY" -H "Content-Type: application/json" \
   -d "{\"deployment_id\":\"<id>\"}" \
-  -w "\nHTTP %{http_code}\n" \
-  https://platform.marketsignal.ai/api/v1/live/stop | jq '{broker_flat, remaining_positions, detail}'
+  https://platform.marketsignal.ai/api/v1/live/stop)
+echo "HTTP $STATUS"   # 200 = flat; 504 = FLATNESS_UNKNOWN
+jq '{broker_flat, remaining_positions, detail}' /tmp/stop.json
 
 # Or for the all-at-once kill path
-curl -s -X POST -H "X-API-Key: $MSAI_API_KEY" \
-  -w "\nHTTP %{http_code}\n" \
-  https://platform.marketsignal.ai/api/v1/live/kill-all | jq '{any_non_flat, flatness_reports}'
+STATUS=$(curl -s -o /tmp/kill.json -w "%{http_code}" -X POST \
+  -H "X-API-Key: $MSAI_API_KEY" \
+  https://platform.marketsignal.ai/api/v1/live/kill-all)
+echo "HTTP $STATUS"   # 200 = all flat; 207 = any_non_flat / partial
+jq '{any_non_flat, flatness_reports}' /tmp/kill.json
 ```
 
 If `broker_flat=false` (or `any_non_flat=true`), flatten manually via the IB portal before re-attempting the deploy.

@@ -157,9 +157,9 @@ jobs:
           # supervisor.spawn). So active_count stays 0 during real broker trading
           # and the gate fails OPEN. Querying the DB-persisted status is correct;
           # status enum includes {starting, building, ready, running, stopped,
-          # failed, cancelled} per backend/src/msai/api/live.py; the active set
-          # for this gate is {starting, building, ready, running} (see
-          # ?active_only=true comment below).
+          # failed} per backend/src/msai/api/live.py; the active set for this
+          # gate is {starting, building, ready, running} (see ?active_only=true
+          # comment below).
           # Bound the request — Codex P2 review on PR #58: if backend accepts the
           # connection but stalls (e.g., DB query hanging), curl without --max-time
           # would block the gate for the runner timeout while holding the
