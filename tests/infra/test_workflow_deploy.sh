@@ -82,6 +82,16 @@ grep -q "if: always()" "$DEPLOY_YML" \
 # The fix uses github.event.workflow_run.head_sha to pin to the upstream run.
 grep -q 'github.event.workflow_run.head_sha' "$DEPLOY_YML" \
     || { echo "FAIL: deploy.yml SHA resolution must use github.event.workflow_run.head_sha for workflow_run triggers (Codex iter-8 race: GITHUB_SHA is the latest default-branch commit at deploy fire time, NOT the SHA whose images Slice 2 built — second push during build would deploy nonexistent images)" >&2; exit 1; }
+# Checkout-ref resolver must ALSO honor inputs.git_sha for manual rollback
+# dispatches. Without this, a `gh workflow run deploy.yml -f git_sha=<old-sha>`
+# pins the deployed image SHA to <old-sha> but checks out current-main config
+# files (docker-compose.prod.yml / Caddyfile / scripts/deploy-on-vm.sh) — so
+# rolling back to escape a bad-compose commit would silently re-stage the bad
+# files alongside the old image, defeating the rollback. (Codex PR-review
+# iter 1 P1 on PR #69, 2026-05-16.)
+ckref_block=$(awk '/Resolve checkout ref/,/uses: actions\/checkout/' "$DEPLOY_YML")
+echo "$ckref_block" | grep -q 'inputs.git_sha' \
+    || { echo "FAIL: deploy.yml checkout-ref resolver must honor inputs.git_sha for manual rollback dispatches (Codex PR #69 P1: rollback would pair old image with current-main config files otherwise)" >&2; exit 1; }
 
 echo "=== reap-orphan-nsg-rules.yml grep assertions ==="
 

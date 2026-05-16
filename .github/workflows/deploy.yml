@@ -98,16 +98,27 @@ jobs:
       nsg_name: ${{ steps.resolve.outputs.nsg_name }}
 
     steps:
-      - name: Resolve checkout ref (workflow_run-aware)
+      - name: Resolve checkout ref (rollback-aware + workflow_run-aware)
         id: ckref
-        # When triggered by workflow_run, default checkout would resolve to the
-        # latest default-branch commit at deploy fire time — NOT the SHA whose
-        # images Slice 2 built. We need the staged docker-compose.prod.yml /
-        # Caddyfile / scripts to match the deployed image SHA, so check out the
-        # upstream run's head_sha here too (Codex iter-9 race: image-tag pin
-        # alone is not enough if config files come from a newer commit).
+        # The staged docker-compose.prod.yml / Caddyfile / scripts MUST come
+        # from the same SHA as the deployed image, otherwise rollback pairs
+        # old images with new config (or vice versa). Resolution priority,
+        # matching the image-SHA resolver in step `resolve` below:
+        #   1. workflow_dispatch inputs.git_sha   — explicit rollback/re-deploy
+        #      target. Checkout MUST follow the image SHA, or rollback to a
+        #      bad-compose commit would pair old images with current-main
+        #      config files (Codex PR-review iter 1 P1, 2026-05-16: same root
+        #      cause as the workflow_run race below).
+        #   2. workflow_run.head_sha              — the upstream Slice 2 run's
+        #      SHA (NOT GITHUB_SHA, which is the latest default-branch HEAD
+        #      at deploy fire time and can drift if a second push lands during
+        #      the build window).
+        #   3. github.sha                         — manual workflow_dispatch
+        #      with no git_sha input (force re-deploy current main).
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+          if [[ -n "${{ inputs.git_sha }}" ]]; then
+            echo "ref=${{ inputs.git_sha }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "workflow_run" ]]; then
             echo "ref=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
           else
             echo "ref=${{ github.sha }}" >> "$GITHUB_OUTPUT"
