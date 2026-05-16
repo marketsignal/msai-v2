@@ -4,6 +4,29 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-05-16 — Deploy documentation + `deploy.yml` SHA-pin race fix (`docs/deploy-runbook`)
+
+Top-level deploy doc + memory pointers so future Claude sessions (and any new developer) understand the local-dev + prod-CI/CD story without reverse-engineering the four-slice deploy pipeline.
+
+**New:** `docs/how_to_deploy.md` (~350 lines) — orientation doc with architecture diagram (push to main → `build-and-push.yml` → `workflow_run` → `deploy.yml` → Azure VM), TL;DR command table, rollback semantics (auto on VM-executed probe failure; manual for runner-side public probe failure), active-deployments gate clearance with `/stop` and `/kill-all` HTTP envelopes (5 observable cases for `/stop` enumerated), `gh variable set` / `gh secret set` bootstrap from Bicep outputs, pre-deploy rehearsal orientation (defers heavy procedure to `slice-3-rehearsal.md` and explicitly flags the gaps that runbook doesn't cover: ACR targeting, AZURE_CLIENT_ID per-RG federated cred, DEPLOYMENT_NAME / VM_SSH_PRIVATE_KEY non-overrideable swaps, `--ref` vs federated cred AADSTS70021), failure-mode → fix table, full pointer index.
+
+**Modified:**
+
+- `CLAUDE.md` — `## Deploying to production` subsection between `## Running the stack` and `## File Structure`; corrected prod VM SKU from `D4s_v5` to `Standard_D4ds_v6` (matches `infra/main.bicep:467` Ddsv6 family with local temp disk).
+- `tests/infra/test_workflow_deploy.sh` — regression assertion for the SHA-pin fix below.
+
+**Real production bug fixed mid-branch (caught by Codex iter-8 of the deploy doc audit):** `.github/workflows/deploy.yml` SHA resolution fell back to `${GITHUB_SHA::7}` on `workflow_run` triggers — which is the **latest default-branch commit at deploy fire time**, NOT the SHA whose images `build-and-push.yml` just pushed. If a second push lands during the build window (~5-8 min), `deploy.yml` previously tried to pull an image that doesn't exist yet or raced against the in-progress newer build. Fixed by using `github.event.workflow_run.head_sha` for `workflow_run` triggers. Same race fix applied to `actions/checkout` (was unpinned to ref — staged `docker-compose.prod.yml` / `Caddyfile` / `scripts/deploy-on-vm.sh` could come from a NEWER commit than the deployed image SHA). Existed since Slice 3 shipped on 2026-05-12 (PR #57). Low probability (requires two pushes minutes apart) but high impact (failed deploy or worse — operator thinks SHA X is deployed but isn't). Regression test in `test_workflow_deploy.sh` greps for `github.event.workflow_run.head_sha` so a future edit can't silently regress.
+
+**Memory + state files** (outside the PR — not under git):
+
+- `~/.claude/projects/-Users-pablomarin-Code-msai-v2/memory/reference_deployment.md` (new) — persistent deploy-pipeline pointer.
+- `~/.claude/projects/-Users-pablomarin-Code-msai-v2/memory/MEMORY.md` — added pointer to the new reference.
+- `.claude/local/state.md` — updated to reflect Slice 1-4 all shipped (was claiming Slice 2 was the latest); "Next" now leads with UI completeness.
+
+**Review history:** 18 Codex iterations against the cumulative branch diff. ~57 real findings total, no false positives. Trajectory healthy — issues narrowed each iter from "broad correctness" (iter 1: 11 BLOCKING+WRONG including non-existent CLI flags, wrong NSG name, fake `--resource-group` flag) down to "narrow polish" (iter 18: 2 off-by-one nits in inline comments). Categories: wrong CLI/script flags (iter 1), rehearsal cross-RG wiring (iter 2-7), the SHA race (iter 8), comment correctness (iter 9-13), KV/Secret coordination (iter 11), pre-merge rehearsal --ref gotchas (iter 14), broker_flat null semantics (iter 16-18).
+
+**Verification:** `actionlint .github/workflows/deploy.yml` clean; `bash -n` clean; `tests/infra/test_workflow_deploy.sh` passes (incl. new regression). **Operational E2E NOT done** — Codex static correctness audit only; real deploy chain + rehearsal RG procedure deferred to the next operator deploy / risky-change rehearsal.
+
 ### 2026-05-15 — CLI completeness: 100% REST parity (`feat/cli-completeness`)
 
 Brings the `msai` CLI to full REST parity with every public `/api/v1/*` HTTP endpoint. After this PR, every operator task is doable from a terminal — no curl, no UI required.
