@@ -159,22 +159,24 @@ msai live stop <deployment_id>
 msai live kill-all --yes
 ```
 
-The CLI's current output is a short success line — flatness fields are NOT carried in `LiveDeploymentInfo` (the entries `/api/v1/live/status` returns). Flatness lives only on the stop/kill-all response envelopes:
+The CLI's current output is a short success line — flatness fields are NOT carried in the entries `/api/v1/live/status` returns. Flatness lives only on the stop/kill-all response envelopes:
 
-- `POST /api/v1/live/stop` → `LiveStopResponse` with `broker_flat: bool` + `remaining_positions: list`
-- `POST /api/v1/live/kill-all` → `LiveKillAllResponse` with `any_non_flat: bool` + `flatness_reports: list[dict]`
+- `POST /api/v1/live/stop` → 200 with `broker_flat: bool` + `remaining_positions: list`, OR **504 `FLATNESS_UNKNOWN`** if the deployment stopped but the child never wrote a flatness report (operator must verify positions via IB portal in that case).
+- `POST /api/v1/live/kill-all` → 200 with `any_non_flat: bool` + `flatness_reports: list[dict]`.
 
-To inspect flatness directly, capture the stop/kill-all response:
+To inspect flatness directly, capture the stop/kill-all response. Use `curl -s` (not `-sf`) so the body is visible even on the 504 case:
 
 ```bash
-# Per deployment
-curl -sf -X POST -H "X-API-Key: $MSAI_API_KEY" \
+# Per deployment (-w prints final status so you see the 504 if FLATNESS_UNKNOWN fires)
+curl -s -X POST -H "X-API-Key: $MSAI_API_KEY" \
   -H "Content-Type: application/json" \
   -d "{\"deployment_id\":\"<id>\"}" \
-  https://platform.marketsignal.ai/api/v1/live/stop | jq '{broker_flat, remaining_positions}'
+  -w "\nHTTP %{http_code}\n" \
+  https://platform.marketsignal.ai/api/v1/live/stop | jq '{broker_flat, remaining_positions, detail}'
 
 # Or for the all-at-once kill path
-curl -sf -X POST -H "X-API-Key: $MSAI_API_KEY" \
+curl -s -X POST -H "X-API-Key: $MSAI_API_KEY" \
+  -w "\nHTTP %{http_code}\n" \
   https://platform.marketsignal.ai/api/v1/live/kill-all | jq '{any_non_flat, flatness_reports}'
 ```
 
