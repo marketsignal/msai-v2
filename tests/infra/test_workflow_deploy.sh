@@ -92,6 +92,12 @@ grep -q 'github.event.workflow_run.head_sha' "$DEPLOY_YML" \
 ckref_block=$(awk '/Resolve checkout ref/,/uses: actions\/checkout/' "$DEPLOY_YML")
 echo "$ckref_block" | grep -q 'inputs.git_sha' \
     || { echo "FAIL: deploy.yml checkout-ref resolver must honor inputs.git_sha for manual rollback dispatches (Codex PR #69 P1: rollback would pair old image with current-main config files otherwise)" >&2; exit 1; }
+# inputs.git_sha is documented as a 7-char short SHA (matches the ACR image
+# tag). actions/checkout v4 ONLY accepts a full 40-char SHA, branch, or tag —
+# passing a 7-char SHA fails "ref not found" before any deploy logic runs.
+# The resolver must expand short → full via gh api before handing to checkout.
+echo "$ckref_block" | grep -qE 'gh api .*/repos/.*/commits/' \
+    || { echo "FAIL: deploy.yml checkout-ref resolver must expand inputs.git_sha (7-char) to full 40-char SHA via gh api before checkout (Codex GitHub-bot PR #69 P1 on commit e51cc19: actions/checkout v4 rejects unqualified 7-char refs as branch/tag patterns)" >&2; exit 1; }
 
 echo "=== reap-orphan-nsg-rules.yml grep assertions ==="
 

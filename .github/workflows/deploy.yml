@@ -105,19 +105,31 @@ jobs:
         # old images with new config (or vice versa). Resolution priority,
         # matching the image-SHA resolver in step `resolve` below:
         #   1. workflow_dispatch inputs.git_sha   — explicit rollback/re-deploy
-        #      target. Checkout MUST follow the image SHA, or rollback to a
-        #      bad-compose commit would pair old images with current-main
-        #      config files (Codex PR-review iter 1 P1, 2026-05-16: same root
-        #      cause as the workflow_run race below).
-        #   2. workflow_run.head_sha              — the upstream Slice 2 run's
-        #      SHA (NOT GITHUB_SHA, which is the latest default-branch HEAD
-        #      at deploy fire time and can drift if a second push lands during
-        #      the build window).
-        #   3. github.sha                         — manual workflow_dispatch
-        #      with no git_sha input (force re-deploy current main).
+        #      target. inputs.git_sha is documented as a 7-char short SHA
+        #      (for matching the ACR image tag); actions/checkout v4 only
+        #      accepts a full 40-char SHA, branch, or tag for `ref:` and
+        #      would otherwise interpret 7-char input as a branch name +
+        #      fail "ref not found". Resolve to a full SHA via gh api before
+        #      checkout (Codex GitHub-bot PR #69 P1 on commit e51cc19,
+        #      2026-05-16).
+        #   2. workflow_run.head_sha              — already a full 40-char SHA
+        #      from the GitHub event payload; no resolution needed.
+        #   3. github.sha                         — full SHA from the runner
+        #      env; no resolution needed.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [[ -n "${{ inputs.git_sha }}" ]]; then
-            echo "ref=${{ inputs.git_sha }}" >> "$GITHUB_OUTPUT"
+            # Expand the short SHA via gh api. Validates that the SHA exists
+            # on the repo and gives us the full 40-char form actions/checkout
+            # requires. Errors if the input doesn't resolve (e.g., typo or a
+            # commit that was force-pushed away).
+            full_sha=$(gh api "/repos/${{ github.repository }}/commits/${{ inputs.git_sha }}" --jq .sha 2>/dev/null || echo "")
+            if ! [[ "$full_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "FAIL_GIT_SHA_RESOLVE: inputs.git_sha='${{ inputs.git_sha }}' did not resolve to a full commit SHA on ${{ github.repository }}. Verify the 7-char SHA is correct and the commit is still reachable." >&2
+              exit 1
+            fi
+            echo "ref=$full_sha" >> "$GITHUB_OUTPUT"
           elif [[ "${{ github.event_name }}" == "workflow_run" ]]; then
             echo "ref=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
           else
