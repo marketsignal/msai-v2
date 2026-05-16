@@ -119,7 +119,7 @@ grep -q "project-name msai" "$DEPLOY_SH" \
 
 echo "=== Slice 4 deploy.yml grep assertions ==="
 
-# Active-live_deployments gate must exist + reference active_count (NOT .deployments[].status — that path doesn't include `ready` and active_count is the simpler field per LiveStatusResponse).
+# Active-live_deployments gate must exist + parse .deployments[].status (NOT active_count — Codex bot PR-review caught that active_count is backend-local _node_manager state and does NOT track supervisor-owned subprocesses; gate would fail open during real broker trading).
 grep -q "Refuse if active live_deployments" "$DEPLOY_YML" \
     || { echo "FAIL: deploy.yml missing 'Refuse if active live_deployments' step (Slice 4 T05)" >&2; exit 1; }
 grep -q "FAIL_ACTIVE_DEPLOYMENTS_REFUSAL" "$DEPLOY_YML" \

@@ -92,7 +92,24 @@ jobs:
       nsg_name: ${{ steps.resolve.outputs.nsg_name }}
 
     steps:
+      - name: Resolve checkout ref (workflow_run-aware)
+        id: ckref
+        # When triggered by workflow_run, default checkout would resolve to the
+        # latest default-branch commit at deploy fire time — NOT the SHA whose
+        # images Slice 2 built. We need the staged docker-compose.prod.yml /
+        # Caddyfile / scripts to match the deployed image SHA, so check out the
+        # upstream run's head_sha here too (Codex iter-9 race: image-tag pin
+        # alone is not enough if config files come from a newer commit).
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            echo "ref=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ steps.ckref.outputs.ref }}
 
       - name: Resolve inputs vs vars (rehearsal-aware)
         id: resolve

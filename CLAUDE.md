@@ -59,7 +59,7 @@ COMPOSE_PROFILES=broker docker compose -f docker-compose.dev.yml --env-file .env
 **Push to main auto-deploys to the Azure VM** via a two-workflow chain:
 
 1. `.github/workflows/build-and-push.yml` (Slice 2) — OIDC → ACR → docker build & push tagged `<sha7>`.
-2. `.github/workflows/deploy.yml` (Slice 3 + 4) — `workflow_run` on Slice 2 success → active-deployments gate → OIDC + transient NSG SSH rule → `scp` + `ssh sudo bash deploy-on-vm.sh` → `docker compose pull && up -d --wait` → public probes → rollback on probe failure.
+2. `.github/workflows/deploy.yml` (Slice 3 + 4) — `workflow_run` on Slice 2 success → active-deployments gate → OIDC + transient NSG SSH rule → `scp` + `ssh sudo bash deploy-on-vm.sh` → `docker compose pull && up -d --wait` → VM-executed probes (any failure here auto-rolls back to the previous SHA) → runner-side public probes (TLS chain / public `/health` / frontend root — these fail the workflow but do NOT trigger auto-rollback; manual rollback needed if they fail).
 
 Manual rollback / re-deploy / rehearsal-RG dispatch use `gh workflow run deploy.yml -f git_sha=<sha>` (and full override matrix for rehearsal).
 
