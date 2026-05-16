@@ -127,10 +127,13 @@ The full happy-path is documented in [`docs/runbooks/slice-3-first-deploy.md`](r
 ## Rollback
 
 ```bash
-# Rollback to a specific SHA (must be still present in ACR — last 5 builds kept)
+# Rollback to a specific SHA (must still be present in ACR)
 gh workflow run deploy.yml -f git_sha=<7-char-sha>
 
-# List recently-built SHAs
+# List recently-built SHAs (every push-to-main SHA stays in ACR until
+# manually deleted — there is NO automatic retention policy on the
+# Basic-SKU ACR or in the workflow, despite earlier internal claims of
+# "last 5 builds kept". Prune manually if storage cost becomes an issue.)
 az acr repository show-tags -n <ACR_NAME> --repository msai-backend --orderby time_desc -o table
 ```
 
@@ -193,7 +196,7 @@ If `broker_flat=false` (or `any_non_flat=true`), flatten manually via the IB por
 
 Council-mandated for first deploys to new infra and any change touching `docker-compose.prod.yml`, `Caddyfile`, `scripts/deploy-on-vm.sh`, or `infra/main.bicep`. Deploy to a throwaway resource group first.
 
-**The full procedure is in [`docs/runbooks/slice-3-rehearsal.md`](runbooks/slice-3-rehearsal.md) — follow it end-to-end; do NOT improvise from the orientation below.** A rehearsal cuts across more cross-RG wiring than this page can safely compress (rehearsal Bicep apply, KV secret seeding, LE rate-limit pre-flight check, `gh workflow run build-and-push.yml` to seed images, four temporary swaps to repo Variables/Secrets, the Contrarian's-gate NSG child-resource spike, the deploy itself, smoke probes, RG teardown). Skipping any of those steps tends to produce a confusing mid-deploy failure rather than a clean refusal.
+**Start from [`docs/runbooks/slice-3-rehearsal.md`](runbooks/slice-3-rehearsal.md) — that's the closest existing end-to-end procedure.** Caveat: the runbook predates Slices 3–4 hardening, so it covers the rehearsal Bicep apply, KV secret seeding, LE rate-limit pre-flight, image build, and the Contrarian's-gate NSG child-resource spike, but does NOT yet document the four temporary repo Variable/Secret swaps that Slices 3–4 introduced (`AZURE_CLIENT_ID` → rehearsal RG's UAMI client id; `DEPLOYMENT_NAME` → `msai-iac`; `VM_SSH_PRIVATE_KEY` → rehearsal private key; `ACR_NAME`+`ACR_LOGIN_SERVER` if pushing rehearsal images via build-and-push), nor the `-f bootstrap=true` dispatch flag. Use the orientation table below to fill those gaps until the runbook is updated.
 
 Orientation only — what the rehearsal looks like at a high level:
 
