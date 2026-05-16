@@ -76,6 +76,12 @@ grep -q "needs: \[deploy\]" "$DEPLOY_YML" \
     || { echo "FAIL: cleanup job must depend on deploy job" >&2; exit 1; }
 grep -q "if: always()" "$DEPLOY_YML" \
     || { echo "FAIL: cleanup job must run if: always() so cancellation triggers cleanup" >&2; exit 1; }
+# workflow_run SHA pinning regression: when triggered by Slice 2 completing,
+# falling back to GITHUB_SHA::7 can deploy a NEWER SHA than the one whose
+# images were built — second-push race produces a docker compose pull failure.
+# The fix uses github.event.workflow_run.head_sha to pin to the upstream run.
+grep -q 'github.event.workflow_run.head_sha' "$DEPLOY_YML" \
+    || { echo "FAIL: deploy.yml SHA resolution must use github.event.workflow_run.head_sha for workflow_run triggers (Codex iter-8 race: GITHUB_SHA is the latest default-branch commit at deploy fire time, NOT the SHA whose images Slice 2 built — second push during build would deploy nonexistent images)" >&2; exit 1; }
 
 echo "=== reap-orphan-nsg-rules.yml grep assertions ==="
 

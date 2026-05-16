@@ -97,8 +97,23 @@ jobs:
       - name: Resolve inputs vs vars (rehearsal-aware)
         id: resolve
         run: |
+          # SHA resolution, in priority order:
+          #   1. workflow_dispatch explicit `git_sha` input (rollback / re-deploy).
+          #   2. workflow_run trigger — pin to the upstream build-and-push run's
+          #      head_sha. GITHUB_SHA on workflow_run is the LATEST default-branch
+          #      commit at the time deploy fires, NOT the SHA whose images just
+          #      got built. If a second push lands between build-and-push start
+          #      and deploy fire, fallback to GITHUB_SHA deploys a SHA whose
+          #      images may not exist yet. Use `workflow_run.head_sha` so deploy
+          #      always pulls images that Slice 2 confirmed it pushed.
+          #      See: https://docs.github.com/actions/learn-github-actions/events-that-trigger-workflows#workflow_run
+          #   3. Last-resort fallback to GITHUB_SHA — covers manual `gh workflow
+          #      run deploy.yml` (no inputs) for non-rehearsal re-deploys.
           if [[ -n "${{ inputs.git_sha }}" ]]; then
             sha="${{ inputs.git_sha }}"
+          elif [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            sha="${{ github.event.workflow_run.head_sha }}"
+            sha="${sha:0:7}"
           else
             sha="${GITHUB_SHA::7}"
           fi
