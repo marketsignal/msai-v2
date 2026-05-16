@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -12,7 +11,6 @@ from msai.services.strategy_templates import (
     StrategyTemplateError,
     StrategyTemplateService,
 )
-
 
 # ---------------------------------------------------------------------------
 # Service: list_templates
@@ -118,9 +116,7 @@ class TestScaffold:
     def test_scaffold_force_overwrites(self, tmp_path: Path) -> None:
         svc = StrategyTemplateService(root=tmp_path)
         svc.scaffold(template_id="ema_cross", module_name="user.ow")
-        result = svc.scaffold(
-            template_id="donchian_breakout", module_name="user.ow", force=True
-        )
+        result = svc.scaffold(template_id="donchian_breakout", module_name="user.ow", force=True)
         assert result["template_id"] == "donchian_breakout"
 
     def test_scaffold_custom_description(self, tmp_path: Path) -> None:
@@ -140,10 +136,48 @@ class TestScaffold:
 
     def test_scaffold_pascal_case(self, tmp_path: Path) -> None:
         svc = StrategyTemplateService(root=tmp_path)
-        result = svc.scaffold(
-            template_id="ema_cross", module_name="user.my_cool_strategy"
-        )
+        result = svc.scaffold(template_id="ema_cross", module_name="user.my_cool_strategy")
         assert result["strategy_class"] == "MyCoolStrategyStrategy"
+
+    @pytest.mark.parametrize(
+        ("description", "label"),
+        [
+            (
+                'harmless """ + __import__("os").system("rm -rf /") + """ tail',
+                "embedded-triple-quote",
+            ),
+            ('"Fast EMA"', "wrapping-double-quotes"),
+            ('description ending in "', "trailing-double-quote"),
+            ('" leading double-quote', "leading-double-quote"),
+            ('embedded "" doubled quotes', "embedded-doubled-quotes"),
+            ("multi\nline\ndescription", "multiline"),
+            ("contains\ttabs\\and backslashes", "tabs-and-backslashes"),
+        ],
+    )
+    def test_scaffold_quoting_edge_cases_produce_valid_python(
+        self, tmp_path: Path, description: str, label: str
+    ) -> None:
+        """Scaffold must produce a syntactically valid Python file for every
+        quoting edge case. ``repr()``-based escaping handles all of these
+        without needing input rejection (Codex iter-2 P2 2026-05-15: input
+        rejection of ``\"\"\"`` is insufficient — trailing ``\"`` also
+        breaks the docstring).
+        """
+        svc = StrategyTemplateService(root=tmp_path)
+        result = svc.scaffold(
+            template_id="ema_cross",
+            module_name=f"user.case_{label.replace('-', '_')}",
+            description=description,
+        )
+        source = (tmp_path / result["file_path"]).read_text()
+        # Must compile as valid Python — the test that would have caught
+        # the original bug.
+        compile(source, result["file_path"], "exec")
+        # The literal description text must appear in the file (verbatim
+        # bytes survive ``repr()`` round-trip even if escaped).
+        # Reconstruct what ``repr()`` produces so the assertion handles
+        # both single-quoted and double-quoted literal forms.
+        assert repr(description) in source
 
 
 # ---------------------------------------------------------------------------
