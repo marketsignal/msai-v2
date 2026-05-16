@@ -163,7 +163,7 @@ jobs:
           # would block the gate for the runner timeout while holding the
           # `deploy-msai` concurrency lock, queueing subsequent prod deploys instead
           # of failing closed quickly. 10s is generous (existing probes use 5-10s).
-          # ?active_only=true filters status IN (starting,running) AND drops the
+          # ?active_only=true filters status IN (starting,building,ready,running) AND drops the
           # 50-row cap (raised to a 1000-row safety cap) so a long-running broker
           # deployment can't be pushed out of the response by 50+ subsequent stop
           # events. Codex P1 review on PR #58 caught that limit-50 bug. Backwards

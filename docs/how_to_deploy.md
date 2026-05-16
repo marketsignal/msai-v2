@@ -6,14 +6,14 @@ This is the **top-level orientation doc** — what infrastructure runs where, ho
 
 ## TL;DR
 
-| What you want to do           | How                                                                                                                   |
-| ----------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| Run locally with hot-reload   | `docker compose -f docker-compose.dev.yml up -d`                                                                      |
-| Ship a code change to prod    | `git push origin main` — CI auto-builds + deploys                                                                     |
-| Roll back to an older SHA     | `gh workflow run deploy.yml -f git_sha=<7-char-sha>`                                                                  |
-| Re-deploy current SHA (force) | `gh workflow run deploy.yml`                                                                                          |
-| First deploy to a fresh VM    | `gh workflow run deploy.yml -f bootstrap=true`                                                                        |
-| Rehearse before risky change  | `gh workflow run deploy.yml -f resource_group=msaiv2-rehearsal-<date> -f vm_public_ip=... ...` (full override matrix) |
+| What you want to do           | How                                                                                                                                                                                  |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Run locally with hot-reload   | `docker compose -f docker-compose.dev.yml up -d`                                                                                                                                     |
+| Ship a code change to prod    | `git push origin main` — CI auto-builds + deploys                                                                                                                                    |
+| Roll back to an older SHA     | `gh workflow run deploy.yml -f git_sha=<7-char-sha>`                                                                                                                                 |
+| Re-deploy current SHA (force) | `gh workflow run deploy.yml`                                                                                                                                                         |
+| First deploy to a fresh VM    | `gh workflow run deploy.yml -f bootstrap=true`                                                                                                                                       |
+| Rehearse before risky change  | `gh workflow run deploy.yml -f resource_group=msaiv2-rehearsal-<date> -f vm_public_ip=... ...` (rehearsal inputs; `DEPLOYMENT_NAME` is not overrideable — see §Pre-deploy rehearsal) |
 
 Health endpoints:
 
@@ -159,13 +159,26 @@ msai live stop <deployment_id>
 msai live kill-all --yes
 ```
 
-The CLI's current output is a short success line; the underlying API response carries `broker_flat` + `remaining_positions`. To inspect flatness directly, hit the API:
+The CLI's current output is a short success line — flatness fields are NOT carried in `LiveDeploymentInfo` (the entries `/api/v1/live/status` returns). Flatness lives only on the stop/kill-all response envelopes:
+
+- `POST /api/v1/live/stop` → `LiveStopResponse` with `broker_flat: bool` + `remaining_positions: list`
+- `POST /api/v1/live/kill-all` → `LiveKillAllResponse` with `any_non_flat: bool` + `flatness_reports: list[dict]`
+
+To inspect flatness directly, capture the stop/kill-all response:
 
 ```bash
-curl -sf -H "X-API-Key: $MSAI_API_KEY" https://platform.marketsignal.ai/api/v1/live/status?active_only=true | jq '.deployments[] | {id, status, broker_flat, remaining_positions}'
+# Per deployment
+curl -sf -X POST -H "X-API-Key: $MSAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{\"deployment_id\":\"<id>\"}" \
+  https://platform.marketsignal.ai/api/v1/live/stop | jq '{broker_flat, remaining_positions}'
+
+# Or for the all-at-once kill path
+curl -sf -X POST -H "X-API-Key: $MSAI_API_KEY" \
+  https://platform.marketsignal.ai/api/v1/live/kill-all | jq '{any_non_flat, flatness_reports}'
 ```
 
-If `broker_flat=false`, flatten manually via the IB portal before re-attempting the deploy.
+If `broker_flat=false` (or `any_non_flat=true`), flatten manually via the IB portal before re-attempting the deploy.
 
 **Fresh-VM bypass:** if `curl` to `/api/v1/live/status` fails with DNS-resolution-error or connection-refused (exit code 6/7) — i.e., Caddy/backend aren't running yet — the gate normally **fails closed**. For a genuine fresh-VM bootstrap or DR rebuild, pass `-f bootstrap=true`. **Never use `bootstrap=true` for routine re-deploys** — broker subprocesses live in a separate compose profile and can keep trading even when the API listener is dead.
 
@@ -282,6 +295,7 @@ The Slice 2 acceptance step in [`docs/runbooks/vm-setup.md`](runbooks/vm-setup.m
 # Capture from the prod RG (one-time)
 RG=msaiv2_rg
 OUTS=$(az deployment group show --name main --resource-group "$RG" --query 'properties.outputs' -o json)
+gh variable set RESOURCE_GROUP --body "$RG"
 gh variable set VM_PUBLIC_IP --body "$(jq -r .vmPublicIp.value     <<<"$OUTS")"
 gh variable set KV_NAME      --body "$(jq -r .keyVaultName.value <<<"$OUTS")"
 gh variable set NSG_NAME     --body "$(jq -r .nsgName.value      <<<"$OUTS")"
