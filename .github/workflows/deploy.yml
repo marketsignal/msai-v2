@@ -15,9 +15,13 @@ name: Deploy
 #      docker compose pull + up -d --wait, runs probes, rolls back on failure
 #   6. Runner-side public-internet probes (TLS chain, /health, frontend root)
 #   7. Cleanup job (separate, needs:[deploy], if:always()) — deletes transient SSH rule.
-#      /tmp on VM is intentionally NOT cleaned (transient SSH rule is already gone, and
-#      the per-run file names are run_id-suffixed so overwrites are safe). A failed
-#      cleanup of the NSG rule is reaped by reap-orphan-nsg-rules.yml.
+#      /tmp on VM is intentionally NOT cleaned: the transient SSH rule is already
+#      gone (so subsequent SSH would fail), and the per-run files at
+#      /tmp/deploy-{env,on-vm}-${run_id}.{env,sh} are VM_USER-owned (not root),
+#      small (~few KB each), and uniquely suffixed by run_id so they accumulate
+#      harmlessly. A future systemd-tmpfiles rule on the VM could prune them; out
+#      of scope for Slice 3. A failed cleanup of the NSG rule itself is reaped by
+#      reap-orphan-nsg-rules.yml.
 
 on:
   workflow_run:
@@ -429,7 +433,9 @@ jobs:
         # Tolerant to upstream failures — the rule may not exist if the deploy job died
         # before creating it. `--output none` + `|| true` ensures cleanup never fails
         # the workflow. If the delete legitimately fails (RBAC, network blip), the
-        # reap-orphan-nsg-rules.yml cron picks it up within 15 minutes.
+        # reap-orphan-nsg-rules.yml cron picks it up. Reaper runs every 15
+        # min and deletes rules older than 30 min — actual cleanup lands
+        # 30-45 min after the orphan was created.
         if: needs.deploy.outputs.rule_name != ''
         run: |
           az network nsg rule delete \
