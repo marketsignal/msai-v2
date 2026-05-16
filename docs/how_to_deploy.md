@@ -225,13 +225,25 @@ KNOWN_HOSTS=$(ssh-keyscan -t ed25519 "$VM_IP" 2>/dev/null)
 
 # Dispatch deploy.yml with the rehearsal-override inputs (resource_group,
 # vm_public_ip, nsg_name, kv_name, msai_hostname, acr_name,
-# acr_login_server, vm_ssh_known_hosts_var, bootstrap). Note: DEPLOYMENT_NAME
-# is NOT an overrideable input — deploy.yml writes ${vars.DEPLOYMENT_NAME}
-# verbatim into the staged env file. For rehearsal you have two choices:
-#   (a) temporarily set the repo Variable DEPLOYMENT_NAME=msai-iac for the
-#       rehearsal run, then restore to the prod value, OR
-#   (b) accept that backup-to-blob.sh on the rehearsal VM will look up the
-#       wrong deployment — fine because rehearsal doesn't run nightly backups.
+# acr_login_server, vm_ssh_known_hosts_var, bootstrap). Two non-overrideable
+# pins that the operator must work around for a rehearsal run:
+#
+#   - DEPLOYMENT_NAME: deploy.yml writes ${vars.DEPLOYMENT_NAME} verbatim
+#     into the staged env file. Either temporarily set the repo Variable
+#     DEPLOYMENT_NAME=msai-iac for the rehearsal run (then restore to the
+#     prod value), OR accept that backup-to-blob.sh on the rehearsal VM
+#     looks up the wrong deployment — fine because rehearsal doesn't run
+#     nightly backups.
+#
+#   - VM_SSH_PRIVATE_KEY: deploy.yml's ssh-agent step loads
+#     ${secrets.VM_SSH_PRIVATE_KEY} unconditionally. The rehearsal VM was
+#     provisioned with the fresh ~/.ssh/msai-rehearsal.pub keypair above
+#     (council stance: DO NOT reuse the prod key — slice-3-rehearsal.md
+#     pre-flight). Temporarily overwrite the secret with the rehearsal
+#     private key for the run, then restore to the prod private key:
+#         gh secret set VM_SSH_PRIVATE_KEY < ~/.ssh/msai-rehearsal
+#         # ... rehearsal dispatch + teardown ...
+#         gh secret set VM_SSH_PRIVATE_KEY < ~/.ssh/msai-prod
 gh workflow run deploy.yml \
   -f resource_group="$RG" \
   -f vm_public_ip="$VM_IP" \
