@@ -313,11 +313,13 @@ jobs:
 
       - name: Stage deploy env on VM
         # Build the env file via heredoc-over-ssh BEFORE invoking sudo. Avoids sudo
-        # env-strip + brittle sudoers env_keep. umask 077 makes the file
-        # VM_USER-readable only (mode 600) so other VM accounts can't read the
-        # KV-derived secrets between this step and the sudo-bash deploy step
-        # that ingests it. No scp in this step — the file is created remotely
-        # by the SSH heredoc itself.
+        # env-strip + brittle sudoers env_keep. The contents are deploy
+        # metadata only (RG / ACR names / image names / KV_NAME / hostname),
+        # NOT KV secrets — those are rendered later into /run/msai.env by
+        # render-env-from-kv.sh. umask 077 still makes this file mode 600
+        # (VM_USER-readable only) defensively, in case future fields are
+        # added. No scp in this step — the file is created remotely by the
+        # SSH heredoc itself.
         env:
           VM_USER: ${{ vars.VM_SSH_USER }}
           VM_IP: ${{ steps.resolve.outputs.vm_public_ip }}

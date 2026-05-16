@@ -22,7 +22,7 @@ This project was originally built in parallel by two AI implementations from the
 - **Frontend:** Next.js 15 + React + shadcn/ui + Tailwind CSS + TradingView Charts + Recharts
 - **Database:** PostgreSQL 16 + Parquet files + DuckDB + Redis 7
 - **Auth:** Azure Entra ID (MSAL frontend, PyJWT backend)
-- **Deploy:** Docker Compose on Azure VM (dev: single-host; prod: single-VM D4s_v5, Phase 2 splits to 2-VM for real money)
+- **Deploy:** Docker Compose on Azure VM (dev: single-host; prod: single-VM Standard_D4ds_v6, Phase 2 splits to 2-VM for real money)
 - **Data Sources:** Polygon.io (stocks/options), Databento (futures), IB Gateway (execution only)
 
 ### Ports (dev)
