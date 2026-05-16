@@ -164,7 +164,7 @@ msai live kill-all --yes
 
 The CLI's current output is a short success line — flatness fields are NOT carried in the entries `/api/v1/live/status` returns. Flatness lives only on the stop/kill-all response envelopes:
 
-- `POST /api/v1/live/stop` → **200** with `broker_flat: bool` + `remaining_positions: list`, OR **504 `FLATNESS_UNKNOWN`** if the deployment stopped but the child never wrote a flatness report (operator must verify positions via IB portal in that case).
+- `POST /api/v1/live/stop` → **200** for an actively-running deployment, with `broker_flat: bool` + `remaining_positions: list` in the body. The already-stopped shortcut (deployment was already terminal when the call arrived) ALSO returns 200 but with only `id` + `status` — no flatness fields — because there's no live child to ask. **504 `FLATNESS_UNKNOWN`** if the stop succeeded but the child never wrote a flatness report (operator must verify positions via IB portal).
 - `POST /api/v1/live/kill-all` → **200** when every deployment came back flat, **207 (Multi-Status)** when `any_non_flat=true` or any publish failed partially. Body always includes `any_non_flat: bool` + `flatness_reports: list[dict]`.
 
 To inspect flatness directly, capture body and status code separately (piping `curl -w` directly into `jq` mixes the status line into jq's input and breaks parsing):
