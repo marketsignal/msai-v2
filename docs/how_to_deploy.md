@@ -175,14 +175,15 @@ STATUS=$(curl -s -o /tmp/stop.json -w "%{http_code}" -X POST \
   -H "X-API-Key: $MSAI_API_KEY" -H "Content-Type: application/json" \
   -d "{\"deployment_id\":\"<id>\"}" \
   https://platform.marketsignal.ai/api/v1/live/stop)
-echo "HTTP $STATUS"   # 200 = stop accepted (read broker_flat from body); 504 = FLATNESS_UNKNOWN
+echo "HTTP $STATUS"   # 200 = stop accepted (read broker_flat from body); 504 = stop did not reach a clean terminal — see (d)/(e) below
 jq '{broker_flat, remaining_positions, detail}' /tmp/stop.json
-# NB: 200 alone does NOT mean flat. Three observable cases:
-#   (a) 200 + broker_flat=true        → flat, safe to proceed.
-#   (b) 200 + broker_flat=false       → residual positions; flatten in IB first.
-#   (c) 200 + no flatness fields      → already-stopped shortcut (no live child).
-#   (d) 504 + broker_flat=null + detail.error.code=FLATNESS_UNKNOWN → unknown.
-# In (c) and (d), verify residual positions via IB portal before deploying.
+# NB: 200 alone does NOT mean flat. Five observable cases:
+#   (a) 200 + broker_flat=true                                       → flat, safe to proceed.
+#   (b) 200 + broker_flat=false                                      → residual positions; flatten in IB first.
+#   (c) 200 + no flatness fields                                     → already-stopped shortcut (no live child).
+#   (d) 504 + broker_flat=null + detail.error.code=FLATNESS_UNKNOWN  → stopped, no flatness report from child.
+#   (e) 504 + detail.error.code=API_POLL_TIMEOUT                     → child never reached terminal in the poll window.
+# In (c), (d), and (e), verify residual positions via IB portal before deploying.
 
 # Or for the all-at-once kill path
 STATUS=$(curl -s -o /tmp/kill.json -w "%{http_code}" -X POST \
