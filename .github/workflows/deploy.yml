@@ -14,8 +14,10 @@ name: Deploy
 #      writes /run/msai-images.env, refreshes KV-rendered /run/msai.env, validates Caddyfile,
 #      docker compose pull + up -d --wait, runs probes, rolls back on failure
 #   6. Runner-side public-internet probes (TLS chain, /health, frontend root)
-#   7. Cleanup job (separate, needs:[deploy], if:always()) — deletes transient SSH rule,
-#      cleans /tmp on VM. A failed cleanup is reaped by reap-orphan-nsg-rules.yml.
+#   7. Cleanup job (separate, needs:[deploy], if:always()) — deletes transient SSH rule.
+#      /tmp on VM is intentionally NOT cleaned (transient SSH rule is already gone, and
+#      the per-run file names are run_id-suffixed so overwrites are safe). A failed
+#      cleanup of the NSG rule is reaped by reap-orphan-nsg-rules.yml.
 
 on:
   workflow_run:
