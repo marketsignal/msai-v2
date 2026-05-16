@@ -4,6 +4,30 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-05-15 — CLI completeness: 100% REST parity (`feat/cli-completeness`)
+
+Brings the `msai` CLI to full REST parity with every public `/api/v1/*` HTTP endpoint. After this PR, every operator task is doable from a terminal — no curl, no UI required.
+
+**28 new commands across 11 sub-apps (4 new + 7 modified):**
+
+- **New sub-apps:** `alerts list`, `auth me`/`logout` (+ top-level `whoami` alias), `market-data {bars,symbols,status,ingest}`, `template {list,scaffold}` — 9 commands.
+- **Modified sub-apps:** `strategy {edit,delete}` (PATCH only allows `description`/`default_config`; DELETE returns 200 MessageResponse), `backtest {report,trades}` (report = 2-step token→GET HTML; trades paginated with `--all` looping on server's `page_size`), `research {sweep,walk-forward,promote}` (flat JSON bodies; promote body key is `research_job_id`), `graduation {create,stage}` (create requires `metrics`; defaults to `{}`), `live {status-show,portfolio-list,portfolio-show,portfolio-draft-members}`, `portfolio {create,run-show,run-report}`, `symbols {inventory,readiness,delete}` (readiness needs both `symbol`+`asset_class`; delete returns 204 empty body) — 19 commands.
+
+**Backend changes:** none. CLI shims over already-shipped, drilled APIs.
+
+**WebSocket `/api/v1/live/stream/{deployment_id}`:** intentional N/A — CLI is one-shot RPC; long-lived event streaming has different ergonomics.
+
+**Review history:** 7-iteration Codex plan-review (9 P1 + 15 P2 caught across iters 1–6, all folded into the plan before implementation began). 2-iteration code-review post-implementation (1 P2 in iter 1 — `strategy edit` truthiness vs `is not None` for clearing description; fixed). Endpoint contracts verified against actual backend schemas during plan-review — Codex caught wrong assumptions on symbols readiness/inventory query shapes, research body shapes, backtest report 2-step flow, IngestResponse shape, symbols delete 204-no-body, strategy delete 200 (not 204), template scaffold field names, alerts envelope, auth logout 200 (not 204).
+
+**E2E verification:** 28/28 commands exercised end-to-end against the live dev stack via `docker compose exec backend uv run python -m msai.cli ...` (report: `tests/e2e/reports/cli-completeness-20260515T230412Z.md` + bug-fix re-verify at `tests/e2e/reports/cli-completeness-bugfix-20260515T231053Z.md`). The initial run flagged 2 FAIL_BUG findings — both fixed in-branch per NO BUGS LEFT BEHIND:
+
+1. **`template scaffold` → 500** — backend container had `./strategies:/app/strategies:ro` mounted read-only, so `file_path.write_text(source)` raised `OSError` swallowed as an opaque 500. Fix: drop `:ro` on the backend mount (workers keep read-only via `*worker-volumes`); both 422 and 500 paths now use `error_response()` with the canonical `{"error": {"code", "message"}}` envelope (codes `STRATEGY_SCAFFOLD_INVALID` / `STRATEGY_SCAFFOLD_IO_ERROR`).
+2. **`strategy edit` silent no-op** — `sync_strategies_to_db` unconditionally overwrote `row.description = info.description` on every GET, clobbering the PATCH-saved value with the on-disk docstring. Fix: remove the overwrite from the update branch (description is set from disk on row creation, then PATCH owns it). Regression test at `test_strategy_registry.py::test_sync_preserves_user_patched_description`.
+
+**Codex final-review loop:** 3 iterations against the cumulative branch diff. Iter-1: 2 P2 (docstring injection via `"""` once the mount went writable; error envelope contract). Iter-2: 1 residual P2 (trailing-quote edge — `"Fast EMA"` still broke the generated docstring even with `"""`-only rejection). Iter-3: **CLEAN**. Final fix uses `repr()`-based `_safe_docstring_literal()` so every quoting edge case (terminal quote, embedded triple-quotes, multi-line, backslashes) is handled by Python's own lexer rules; 7-case parametrized regression test compiles the generated file for each case.
+
+**Verification:** 2036 backend unit tests pass (+8 regression tests across the bug fixes); ruff + mypy --strict clean on 188 src files. 65 new tests in `test_cli_completeness.py` (one TestClass per command family; mocks `httpx.request` to assert method + URL + body + query params).
+
 ### 2026-05-15 — Live deployment workflow: UI + CLI catch-up (`feat/live-deployment-workflow-ui-cli`)
 
 Brings the operator-facing UI + CLI up to parity with the safety-trio-hardened API (PRs #64/#65/#66). Operators no longer need curl to deploy real money safely; the binding-mismatch + flatness + identity contracts all surface through ergonomic interfaces.

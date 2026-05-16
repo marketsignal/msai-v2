@@ -476,3 +476,44 @@ class TestSyncStrategiesToDb:
         )
 
         assert orphan_row not in session.deleted
+
+    async def test_sync_preserves_user_patched_description(
+        self, example_strategies_dir: Path
+    ) -> None:
+        """PATCH /api/v1/strategies/{id} sets ``description``; the next GET
+        calls ``sync_strategies_to_db`` first. Before this regression test,
+        the sync unconditionally overwrote ``row.description = info.description``
+        on every call, so the on-disk docstring would clobber the
+        PATCH-saved value — silent edit no-op caught by 2026-05-15 CLI
+        completeness E2E.
+        """
+        from msai.models.strategy import Strategy
+        from msai.services.strategy_registry import discover_strategies, sync_strategies_to_db
+
+        # Arrange: an existing row whose description has been user-PATCHed
+        # to something different from the on-disk docstring.
+        discovered = discover_strategies(example_strategies_dir)
+        assert discovered, "example strategies dir should yield at least one strategy"
+        info = discovered[0]
+
+        existing_row = Strategy(
+            name=info.name,
+            description="USER PATCHED DESCRIPTION — must survive sync",
+            file_path=str(info.module_path),
+            strategy_class=info.strategy_class_name,
+            config_class=info.config_class_name,
+            config_schema=info.config_schema,
+            default_config=info.default_config,
+            config_schema_status=info.config_schema_status,
+            code_hash=info.code_hash,
+        )
+        session = _FakeAsyncSession(existing=[existing_row])
+
+        # Act: trigger the same sync the GET endpoint runs.
+        await sync_strategies_to_db(
+            session,  # type: ignore[arg-type]
+            example_strategies_dir,
+        )
+
+        # Assert: description was NOT clobbered by the on-disk docstring.
+        assert existing_row.description == "USER PATCHED DESCRIPTION — must survive sync"

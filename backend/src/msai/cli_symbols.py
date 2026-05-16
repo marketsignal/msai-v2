@@ -13,6 +13,11 @@ from msai.services.symbol_onboarding.manifest import parse_manifest_file
 app = typer.Typer(name="symbols", help="Symbol onboarding — manifest-driven universe bootstrap.")
 console = Console()
 
+# Asset classes accepted by the registry (matches the readiness/inventory/delete
+# routes' ``ReadinessAssetClass`` enum). NOT ``stocks`` — that's an ingest-side
+# alias; registry uses ``equity``.
+_VALID_ASSET_CLASSES = ("equity", "futures", "fx", "option")
+
 
 @app.command()
 def onboard(
@@ -152,3 +157,122 @@ def _exit_for_status(run_status: str) -> None:
         "failed": 2,
     }
     raise typer.Exit(code=mapping.get(run_status, 3))
+
+
+# ======================================================================
+# T9: inventory / readiness / delete  (cli_symbols.py — symbols sub-app)
+# ======================================================================
+
+
+def _validate_asset_class(asset_class: str) -> None:
+    """Reject asset-class values that the readiness/inventory/delete routes
+    will 422 on (registry taxonomy: equity|futures|fx|option).
+    """
+    if asset_class not in _VALID_ASSET_CLASSES:
+        from msai.cli import _fail  # noqa: PLC0415
+
+        _fail(
+            f"--asset-class {asset_class!r} is not supported. "
+            f"Valid: {', '.join(_VALID_ASSET_CLASSES)} (NOT 'stocks' — that's an ingest alias)."
+        )
+
+
+@app.command()
+def inventory(
+    start: str = typer.Option("", "--start", help="Optional window start (YYYY-MM-DD)"),
+    end: str = typer.Option("", "--end", help="Optional window end (YYYY-MM-DD)"),
+    asset_class: str = typer.Option(
+        "",
+        "--asset-class",
+        help="Filter: equity|futures|fx|option (default: all)",
+    ),
+) -> None:
+    """Bulk readiness across all registered instruments."""
+    from msai.cli import _api_call, _emit_json  # noqa: PLC0415
+
+    params: dict[str, Any] = {}
+    if start:
+        params["start"] = start
+    if end:
+        params["end"] = end
+    if asset_class:
+        _validate_asset_class(asset_class)
+        params["asset_class"] = asset_class
+    response = _api_call("GET", "/api/v1/symbols/inventory", params=params or None)
+    _emit_json(response.json())
+
+
+@app.command()
+def readiness(
+    symbol: str = typer.Option(..., "--symbol", help="Symbol (e.g. AAPL.NASDAQ)"),
+    asset_class: str = typer.Option(
+        ...,
+        "--asset-class",
+        help="Asset class: equity|futures|fx|option",
+    ),
+    start: str = typer.Option(
+        "",
+        "--start",
+        help="Optional window start (YYYY-MM-DD); without both, backtest_data_available=null",
+    ),
+    end: str = typer.Option("", "--end", help="Optional window end (YYYY-MM-DD)"),
+) -> None:
+    """Window-scoped per-instrument readiness."""
+    from msai.cli import _api_call, _emit_json  # noqa: PLC0415
+
+    _validate_asset_class(asset_class)
+    params: dict[str, Any] = {"symbol": symbol, "asset_class": asset_class}
+    if start:
+        params["start"] = start
+    if end:
+        params["end"] = end
+    response = _api_call("GET", "/api/v1/symbols/readiness", params=params)
+    _emit_json(response.json())
+
+
+@app.command()
+def delete(
+    symbol: str = typer.Argument(
+        ...,
+        help=(
+            "Symbol to soft-delete. "
+            "NOTE: slash-bearing symbols (e.g. EUR/USD.IDEALPRO) are out of scope "
+            "— the route is /{symbol} (single segment) and percent-encoded slashes 404."
+        ),
+    ),
+    asset_class: str = typer.Option(
+        ...,
+        "--asset-class",
+        help="Asset class: equity|futures|fx|option",
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """Soft-delete a registered instrument (hidden from inventory; Parquet preserved).
+
+    The route returns HTTP 204 with an empty body — we synthesize a success
+    message instead of trying to parse JSON.
+    """
+    from msai.cli import _api_call, _url_id  # noqa: PLC0415
+
+    _validate_asset_class(asset_class)
+    if "/" in symbol:
+        from msai.cli import _fail  # noqa: PLC0415
+
+        _fail(
+            f"Slash-bearing symbols ({symbol!r}) cannot be deleted via this route. "
+            "The backend uses /{symbol} (single path segment); percent-encoded slashes 404. "
+            "Track as a follow-up (route would need /{symbol:path})."
+        )
+    if not yes:
+        typer.confirm(
+            f"Soft-delete {symbol} (asset_class={asset_class})?",
+            abort=True,
+        )
+    # 204 success → no JSON body. _api_call accepts 2xx as success; we MUST
+    # NOT call .json() on the response.
+    _api_call(
+        "DELETE",
+        f"/api/v1/symbols/{_url_id(symbol)}",
+        params={"asset_class": asset_class},
+    )
+    typer.echo(f"Deleted {symbol}")

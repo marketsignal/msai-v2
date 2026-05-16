@@ -58,8 +58,7 @@ TEMPLATES: tuple[StrategyTemplateDefinition, ...] = (
         id="ema_cross",
         label="EMA Cross",
         description=(
-            "Trend-following EMA crossover strategy with fast/slow periods"
-            " and fixed trade size."
+            "Trend-following EMA crossover strategy with fast/slow periods and fixed trade size."
         ),
         default_config={
             "fast_ema_period": 10,
@@ -71,8 +70,7 @@ TEMPLATES: tuple[StrategyTemplateDefinition, ...] = (
         id="donchian_breakout",
         label="Donchian Breakout",
         description=(
-            "Simple breakout system with independent entry/exit lookbacks"
-            " and optional shorting."
+            "Simple breakout system with independent entry/exit lookbacks and optional shorting."
         ),
         default_config={
             "entry_lookback": 20,
@@ -140,20 +138,29 @@ class StrategyTemplateService:
             raise StrategyTemplateError("Strategy module path escapes the strategies root")
 
         if file_path.exists() and not force:
-            raise StrategyTemplateError(
-                f"Strategy file already exists: {relative_path.as_posix()}"
-            )
+            raise StrategyTemplateError(f"Strategy file already exists: {relative_path.as_posix()}")
 
         class_prefix = _pascal_case(segments[-1])
         config_class = f"{class_prefix}Config"
         strategy_class = f"{class_prefix}Strategy"
         module_doc = (description or template.description).strip()
 
+        # Render the description as a properly-escaped Python string
+        # literal via ``repr()`` rather than interpolating it raw inside
+        # a triple-quoted docstring. ``repr()`` handles every edge case:
+        # description ending in ``"`` (which would close the docstring
+        # prematurely), embedded ``"""`` (injection vector), embedded
+        # newlines, backslashes, control chars. Without this, inputs
+        # like ``"Fast EMA"`` produce a syntactically invalid file that
+        # the next sync fails to import (Codex iter-2 P2 2026-05-15,
+        # after the read-only :ro mount was removed).
+        module_doc_literal = _safe_docstring_literal(module_doc)
+
         source = _render_template(
             template_id=template.id,
             strategy_class=strategy_class,
             config_class=config_class,
-            module_doc=module_doc,
+            module_doc_literal=module_doc_literal,
         )
 
         # Create directories and __init__.py files
@@ -215,20 +222,37 @@ def _ensure_package_dirs(root: Path, relative_dir: Path) -> None:
             init_file.write_text("")
 
 
+def _safe_docstring_literal(text: str) -> str:
+    """Return ``text`` as a valid Python string literal safe to embed as a docstring.
+
+    Uses :func:`repr` so every quoting edge case (terminal double-quote,
+    embedded triple-double-quotes, embedded newlines/backslashes/control
+    chars) is handled by the language's own escape rules. The returned
+    literal is single-line — multi-line descriptions become a single
+    string with escaped newlines, which is still a valid class docstring.
+    """
+    return repr(text)
+
+
 def _render_template(
     *,
     template_id: str,
     strategy_class: str,
     config_class: str,
-    module_doc: str,
+    module_doc_literal: str,
 ) -> str:
-    """Dispatch to the appropriate template renderer."""
+    """Dispatch to the appropriate template renderer.
+
+    ``module_doc_literal`` is a pre-escaped Python string literal (see
+    :func:`_safe_docstring_literal`), embedded verbatim as the class
+    body's first statement.
+    """
     if template_id == "mean_reversion_zscore":
-        return _render_mean_reversion(strategy_class, config_class, module_doc)
+        return _render_mean_reversion(strategy_class, config_class, module_doc_literal)
     if template_id == "ema_cross":
-        return _render_ema_cross(strategy_class, config_class, module_doc)
+        return _render_ema_cross(strategy_class, config_class, module_doc_literal)
     if template_id == "donchian_breakout":
-        return _render_donchian(strategy_class, config_class, module_doc)
+        return _render_donchian(strategy_class, config_class, module_doc_literal)
     raise StrategyTemplateError(f"Unsupported strategy template: {template_id}")
 
 
@@ -240,11 +264,9 @@ def _render_template(
 # ---------------------------------------------------------------------------
 
 
-def _render_mean_reversion(
-    strategy_class: str, config_class: str, module_doc: str
-) -> str:
+def _render_mean_reversion(strategy_class: str, config_class: str, module_doc_literal: str) -> str:
     return dedent(
-        f'''\
+        f"""\
         from __future__ import annotations
 
         from collections import deque
@@ -271,7 +293,7 @@ def _render_mean_reversion(
 
 
         class {strategy_class}(Strategy):
-            """{module_doc}"""
+            {module_doc_literal}
 
             def __init__(self, config: {config_class}) -> None:
                 super().__init__(config=config)
@@ -333,15 +355,13 @@ def _render_mean_reversion(
                     quantity=self.trade_size,
                 )
                 self.submit_order(order)
-        '''
+        """
     )
 
 
-def _render_ema_cross(
-    strategy_class: str, config_class: str, module_doc: str
-) -> str:
+def _render_ema_cross(strategy_class: str, config_class: str, module_doc_literal: str) -> str:
     return dedent(
-        f'''\
+        f"""\
         from __future__ import annotations
 
         from decimal import Decimal
@@ -364,7 +384,7 @@ def _render_ema_cross(
 
 
         class {strategy_class}(Strategy):
-            """{module_doc}"""
+            {module_doc_literal}
 
             def __init__(self, config: {config_class}) -> None:
                 super().__init__(config=config)
@@ -401,15 +421,13 @@ def _render_ema_cross(
                     quantity=self.trade_size,
                 )
                 self.submit_order(order)
-        '''
+        """
     )
 
 
-def _render_donchian(
-    strategy_class: str, config_class: str, module_doc: str
-) -> str:
+def _render_donchian(strategy_class: str, config_class: str, module_doc_literal: str) -> str:
     return dedent(
-        f'''\
+        f"""\
         from __future__ import annotations
 
         from collections import deque
@@ -433,7 +451,7 @@ def _render_donchian(
 
 
         class {strategy_class}(Strategy):
-            """{module_doc}"""
+            {module_doc_literal}
 
             def __init__(self, config: {config_class}) -> None:
                 super().__init__(config=config)
@@ -488,5 +506,5 @@ def _render_donchian(
                     quantity=self.trade_size,
                 )
                 self.submit_order(order)
-        '''
+        """
     )

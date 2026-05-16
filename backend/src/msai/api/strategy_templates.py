@@ -9,9 +9,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from msai.api._common import error_response
 from msai.core.auth import get_current_user
 from msai.core.logging import get_logger
 from msai.services.strategy_templates import StrategyTemplateError, StrategyTemplateService
@@ -38,15 +40,19 @@ async def list_templates(
     return svc.list_templates()
 
 
-@router.post("/scaffold", status_code=status.HTTP_201_CREATED)
+@router.post("/scaffold", status_code=status.HTTP_201_CREATED, response_model=None)
 async def scaffold_template(
     body: StrategyTemplateScaffoldRequest,
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
-) -> dict[str, Any]:
+) -> dict[str, Any] | JSONResponse:
     """Generate a new strategy file from a template.
 
-    Returns 201 with the scaffolded file metadata on success, or
-    422 if the template ID or module name is invalid.
+    Returns 201 with the scaffolded file metadata on success,
+    422 if the template ID or module name is invalid,
+    or 500 if the strategies directory is not writable.
+
+    Error paths use the project's canonical ``{"error": {"code", "message"}}``
+    envelope via :func:`msai.api._common.error_response`.
     """
     svc = StrategyTemplateService()
     try:
@@ -56,10 +62,26 @@ async def scaffold_template(
             description=body.description,
         )
     except StrategyTemplateError as exc:
-        raise HTTPException(
+        return error_response(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        ) from exc
+            code="STRATEGY_SCAFFOLD_INVALID",
+            message=str(exc),
+        )
+    except (OSError, PermissionError) as exc:
+        log.error(
+            "strategy_scaffold_io_error",
+            template_id=body.template_id,
+            module_name=body.module_name,
+            error=str(exc),
+        )
+        return error_response(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            code="STRATEGY_SCAFFOLD_IO_ERROR",
+            message=(
+                "Cannot write strategy file. "
+                "Check STRATEGIES_ROOT is writable by the backend container."
+            ),
+        )
 
     log.info(
         "strategy_template_scaffolded",

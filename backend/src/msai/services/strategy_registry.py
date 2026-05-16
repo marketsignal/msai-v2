@@ -545,8 +545,13 @@ async def sync_strategies_to_db(
             session.add(row)
         else:
             row.name = info.name
-            row.description = info.description
             row.strategy_class = info.strategy_class_name
+            # NOTE: description is NOT re-synced from disk after the row
+            # exists — it is user-editable via PATCH /api/v1/strategies/{id}
+            # and the in-DB value wins. Without this, every GET (which
+            # calls sync_strategies_to_db first) would clobber the
+            # PATCH-saved description with the docstring on disk, making
+            # the edit a silent no-op.
             # Memoize: only recompute schema when the combined hash
             # actually changed. Avoids re-running msgspec.json.schema
             # on every /api/v1/strategies/ GET.
