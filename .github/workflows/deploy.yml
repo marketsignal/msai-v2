@@ -313,8 +313,11 @@ jobs:
 
       - name: Stage deploy env on VM
         # Build the env file via heredoc-over-ssh BEFORE invoking sudo. Avoids sudo
-        # env-strip + brittle sudoers env_keep. umask 077 keeps the temp file root-only
-        # before scp lands.
+        # env-strip + brittle sudoers env_keep. umask 077 makes the file
+        # VM_USER-readable only (mode 600) so other VM accounts can't read the
+        # KV-derived secrets between this step and the sudo-bash deploy step
+        # that ingests it. No scp in this step — the file is created remotely
+        # by the SSH heredoc itself.
         env:
           VM_USER: ${{ vars.VM_SSH_USER }}
           VM_IP: ${{ steps.resolve.outputs.vm_public_ip }}
@@ -446,6 +449,9 @@ jobs:
 
       # NB: /tmp cleanup is intentionally NOT done here. The transient SSH rule is
       # deleted ABOVE, so subsequent SSH from the runner would fail. Leftover
-      # /tmp/deploy-{env,on-vm}-${run_id}.{env,sh} files are root-owned, harmless,
-      # and overwritten by the next deploy's run_id. If they accumulate, a
-      # systemd-tmpfiles rule on the VM could reap them — out of scope for Slice 3.
+      # /tmp/deploy-{env,on-vm}-${run_id}.{env,sh} files are VM_USER-owned (mode
+      # 600 for the env file via umask 077; the sh script is the public deploy
+      # helper), small (few KB each), and uniquely run_id-suffixed — so they
+      # ACCUMULATE across deploys rather than being overwritten. If accumulation
+      # becomes an issue, a systemd-tmpfiles rule on the VM could reap them —
+      # out of scope for Slice 3.
