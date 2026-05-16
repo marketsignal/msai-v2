@@ -76,6 +76,28 @@ grep -q "needs: \[deploy\]" "$DEPLOY_YML" \
     || { echo "FAIL: cleanup job must depend on deploy job" >&2; exit 1; }
 grep -q "if: always()" "$DEPLOY_YML" \
     || { echo "FAIL: cleanup job must run if: always() so cancellation triggers cleanup" >&2; exit 1; }
+# workflow_run SHA pinning regression: when triggered by Slice 2 completing,
+# falling back to GITHUB_SHA::7 can deploy a NEWER SHA than the one whose
+# images were built — second-push race produces a docker compose pull failure.
+# The fix uses github.event.workflow_run.head_sha to pin to the upstream run.
+grep -q 'github.event.workflow_run.head_sha' "$DEPLOY_YML" \
+    || { echo "FAIL: deploy.yml SHA resolution must use github.event.workflow_run.head_sha for workflow_run triggers (Codex iter-8 race: GITHUB_SHA is the latest default-branch commit at deploy fire time, NOT the SHA whose images Slice 2 built — second push during build would deploy nonexistent images)" >&2; exit 1; }
+# Checkout-ref resolver must ALSO honor inputs.git_sha for manual rollback
+# dispatches. Without this, a `gh workflow run deploy.yml -f git_sha=<old-sha>`
+# pins the deployed image SHA to <old-sha> but checks out current-main config
+# files (docker-compose.prod.yml / Caddyfile / scripts/deploy-on-vm.sh) — so
+# rolling back to escape a bad-compose commit would silently re-stage the bad
+# files alongside the old image, defeating the rollback. (Codex PR-review
+# iter 1 P1 on PR #69, 2026-05-16.)
+ckref_block=$(awk '/Resolve checkout ref/,/uses: actions\/checkout/' "$DEPLOY_YML")
+echo "$ckref_block" | grep -q 'inputs.git_sha' \
+    || { echo "FAIL: deploy.yml checkout-ref resolver must honor inputs.git_sha for manual rollback dispatches (Codex PR #69 P1: rollback would pair old image with current-main config files otherwise)" >&2; exit 1; }
+# inputs.git_sha is documented as a 7-char short SHA (matches the ACR image
+# tag). actions/checkout v4 ONLY accepts a full 40-char SHA, branch, or tag —
+# passing a 7-char SHA fails "ref not found" before any deploy logic runs.
+# The resolver must expand short → full via gh api before handing to checkout.
+echo "$ckref_block" | grep -qE 'gh api .*/repos/.*/commits/' \
+    || { echo "FAIL: deploy.yml checkout-ref resolver must expand inputs.git_sha (7-char) to full 40-char SHA via gh api before checkout (Codex GitHub-bot PR #69 P1 on commit e51cc19: actions/checkout v4 rejects unqualified 7-char refs as branch/tag patterns)" >&2; exit 1; }
 
 echo "=== reap-orphan-nsg-rules.yml grep assertions ==="
 
@@ -113,7 +135,7 @@ grep -q "project-name msai" "$DEPLOY_SH" \
 
 echo "=== Slice 4 deploy.yml grep assertions ==="
 
-# Active-live_deployments gate must exist + reference active_count (NOT .deployments[].status — that path doesn't include `ready` and active_count is the simpler field per LiveStatusResponse).
+# Active-live_deployments gate must exist + parse .deployments[].status (NOT active_count — Codex bot PR-review caught that active_count is backend-local _node_manager state and does NOT track supervisor-owned subprocesses; gate would fail open during real broker trading).
 grep -q "Refuse if active live_deployments" "$DEPLOY_YML" \
     || { echo "FAIL: deploy.yml missing 'Refuse if active live_deployments' step (Slice 4 T05)" >&2; exit 1; }
 grep -q "FAIL_ACTIVE_DEPLOYMENTS_REFUSAL" "$DEPLOY_YML" \

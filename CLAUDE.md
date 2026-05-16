@@ -22,7 +22,7 @@ This project was originally built in parallel by two AI implementations from the
 - **Frontend:** Next.js 15 + React + shadcn/ui + Tailwind CSS + TradingView Charts + Recharts
 - **Database:** PostgreSQL 16 + Parquet files + DuckDB + Redis 7
 - **Auth:** Azure Entra ID (MSAL frontend, PyJWT backend)
-- **Deploy:** Docker Compose on Azure VM (dev: single-host; prod: single-VM D4s_v5, Phase 2 splits to 2-VM for real money)
+- **Deploy:** Docker Compose on Azure VM (dev: single-host; prod: single-VM Standard_D4ds_v6, Phase 2 splits to 2-VM for real money)
 - **Data Sources:** Polygon.io (stocks/options), Databento (futures), IB Gateway (execution only)
 
 ### Ports (dev)
@@ -53,6 +53,17 @@ IB Gateway is behind the `broker` Compose profile:
 ```bash
 COMPOSE_PROFILES=broker docker compose -f docker-compose.dev.yml --env-file .env up -d
 ```
+
+### Deploying to production
+
+**Push to main auto-deploys to the Azure VM** via a two-workflow chain:
+
+1. `.github/workflows/build-and-push.yml` (Slice 2) — OIDC → ACR → docker build & push tagged `<sha7>`.
+2. `.github/workflows/deploy.yml` (Slice 3 + 4) — `workflow_run` on Slice 2 success → active-deployments gate → OIDC + transient NSG SSH rule → `scp` + `ssh sudo bash deploy-on-vm.sh` → `docker compose pull && up -d --wait` → VM-executed probes (any failure here auto-rolls back to the previous SHA) → runner-side public probes (TLS chain / public `/health` / frontend root — these fail the workflow but do NOT trigger auto-rollback; manual rollback needed if they fail).
+
+Manual rollback / re-deploy / rehearsal-RG dispatch use `gh workflow run deploy.yml -f git_sha=<sha>` (and full override matrix for rehearsal).
+
+**Read [`docs/how_to_deploy.md`](docs/how_to_deploy.md) first** for the deploy architecture diagram, the active-`live_deployments` safety gate, rehearsal procedure, repo-Variable matrix, and the pointer index to deep-dive runbooks (`vm-setup`, `slice-3-first-deploy`, `disaster-recovery`, `restore-from-backup`, `iac-parity-reapply`).
 
 ### File Structure
 

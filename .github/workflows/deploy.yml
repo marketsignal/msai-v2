@@ -14,8 +14,14 @@ name: Deploy
 #      writes /run/msai-images.env, refreshes KV-rendered /run/msai.env, validates Caddyfile,
 #      docker compose pull + up -d --wait, runs probes, rolls back on failure
 #   6. Runner-side public-internet probes (TLS chain, /health, frontend root)
-#   7. Cleanup job (separate, needs:[deploy], if:always()) — deletes transient SSH rule,
-#      cleans /tmp on VM. A failed cleanup is reaped by reap-orphan-nsg-rules.yml.
+#   7. Cleanup job (separate, needs:[deploy], if:always()) — deletes transient SSH rule.
+#      /tmp on VM is intentionally NOT cleaned: the transient SSH rule is already
+#      gone (so subsequent SSH would fail), and the per-run files at
+#      /tmp/deploy-{env,on-vm}-${run_id}.{env,sh} are VM_USER-owned (not root),
+#      small (~few KB each), and uniquely suffixed by run_id so they accumulate
+#      harmlessly. A future systemd-tmpfiles rule on the VM could prune them; out
+#      of scope for Slice 3. A failed cleanup of the NSG rule itself is reaped by
+#      reap-orphan-nsg-rules.yml.
 
 on:
   workflow_run:
@@ -92,13 +98,68 @@ jobs:
       nsg_name: ${{ steps.resolve.outputs.nsg_name }}
 
     steps:
+      - name: Resolve checkout ref (rollback-aware + workflow_run-aware)
+        id: ckref
+        # The staged docker-compose.prod.yml / Caddyfile / scripts MUST come
+        # from the same SHA as the deployed image, otherwise rollback pairs
+        # old images with new config (or vice versa). Resolution priority,
+        # matching the image-SHA resolver in step `resolve` below:
+        #   1. workflow_dispatch inputs.git_sha   — explicit rollback/re-deploy
+        #      target. inputs.git_sha is documented as a 7-char short SHA
+        #      (for matching the ACR image tag); actions/checkout v4 only
+        #      accepts a full 40-char SHA, branch, or tag for `ref:` and
+        #      would otherwise interpret 7-char input as a branch name +
+        #      fail "ref not found". Resolve to a full SHA via gh api before
+        #      checkout (Codex GitHub-bot PR #69 P1 on commit e51cc19,
+        #      2026-05-16).
+        #   2. workflow_run.head_sha              — already a full 40-char SHA
+        #      from the GitHub event payload; no resolution needed.
+        #   3. github.sha                         — full SHA from the runner
+        #      env; no resolution needed.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ -n "${{ inputs.git_sha }}" ]]; then
+            # Expand the short SHA via gh api. Validates that the SHA exists
+            # on the repo and gives us the full 40-char form actions/checkout
+            # requires. Errors if the input doesn't resolve (e.g., typo or a
+            # commit that was force-pushed away).
+            full_sha=$(gh api "/repos/${{ github.repository }}/commits/${{ inputs.git_sha }}" --jq .sha 2>/dev/null || echo "")
+            if ! [[ "$full_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "FAIL_GIT_SHA_RESOLVE: inputs.git_sha='${{ inputs.git_sha }}' did not resolve to a full commit SHA on ${{ github.repository }}. Verify the 7-char SHA is correct and the commit is still reachable." >&2
+              exit 1
+            fi
+            echo "ref=$full_sha" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            echo "ref=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ steps.ckref.outputs.ref }}
 
       - name: Resolve inputs vs vars (rehearsal-aware)
         id: resolve
         run: |
+          # SHA resolution, in priority order:
+          #   1. workflow_dispatch explicit `git_sha` input (rollback / re-deploy).
+          #   2. workflow_run trigger — pin to the upstream build-and-push run's
+          #      head_sha. GITHUB_SHA on workflow_run is the LATEST default-branch
+          #      commit at the time deploy fires, NOT the SHA whose images just
+          #      got built. If a second push lands between build-and-push start
+          #      and deploy fire, fallback to GITHUB_SHA deploys a SHA whose
+          #      images may not exist yet. Use `workflow_run.head_sha` so deploy
+          #      always pulls images that Slice 2 confirmed it pushed.
+          #      See: https://docs.github.com/actions/learn-github-actions/events-that-trigger-workflows#workflow_run
+          #   3. Last-resort fallback to GITHUB_SHA — covers manual `gh workflow
+          #      run deploy.yml` (no inputs) for non-rehearsal re-deploys.
           if [[ -n "${{ inputs.git_sha }}" ]]; then
             sha="${{ inputs.git_sha }}"
+          elif [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            sha="${{ github.event.workflow_run.head_sha }}"
+            sha="${sha:0:7}"
           else
             sha="${GITHUB_SHA::7}"
           fi
@@ -141,7 +202,8 @@ jobs:
         # fast BEFORE Azure login (no OIDC mint, no NSG rule churn) so the gate is
         # the cheapest possible pre-flight. Uses public endpoint via Caddy + X-API-Key
         # (which Caddy passes through unchanged per Slice 4 research §7). No force
-        # flag — operator clears state with `msai live stop --all` first.
+        # flag — operator clears state with `msai live stop <id>` per active
+        # deployment (or `msai live kill-all --yes` for emergency) first.
         env:
           MSAI_HOST: ${{ steps.resolve.outputs.msai_hostname }}
           MSAI_API_KEY: ${{ secrets.MSAI_API_KEY }}
@@ -155,14 +217,16 @@ jobs:
           # container, started via /api/v1/live/start-portfolio → Redis Streams →
           # supervisor.spawn). So active_count stays 0 during real broker trading
           # and the gate fails OPEN. Querying the DB-persisted status is correct;
-          # status enum is {starting, running, stopped} per backend/src/msai/api/live.py
-          # lines 421, 504, 597, 732.
+          # status enum includes {starting, building, ready, running, stopped,
+          # failed} per backend/src/msai/api/live.py; the active set for this
+          # gate is {starting, building, ready, running} (see ?active_only=true
+          # comment below).
           # Bound the request — Codex P2 review on PR #58: if backend accepts the
           # connection but stalls (e.g., DB query hanging), curl without --max-time
           # would block the gate for the runner timeout while holding the
           # `deploy-msai` concurrency lock, queueing subsequent prod deploys instead
           # of failing closed quickly. 10s is generous (existing probes use 5-10s).
-          # ?active_only=true filters status IN (starting,running) AND drops the
+          # ?active_only=true filters status IN (starting,building,ready,running) AND drops the
           # 50-row cap (raised to a 1000-row safety cap) so a long-running broker
           # deployment can't be pushed out of the response by 50+ subsequent stop
           # events. Codex P1 review on PR #58 caught that limit-50 bug. Backwards
@@ -204,7 +268,7 @@ jobs:
           # them as inactive lets the gate fail open during the spawn window.
           active_ids=$(echo "$resp" | jq -r '[.deployments[] | select(.status == "starting" or .status == "building" or .status == "ready" or .status == "running") | .id] | join(",")')
           if [[ -n "$active_ids" ]]; then
-            echo "FAIL_ACTIVE_DEPLOYMENTS_REFUSAL: active deployments [$active_ids]. Run 'msai live stop --all' (or 'msai live kill-all' if backend is wedged) first, then re-dispatch." >&2
+            echo "FAIL_ACTIVE_DEPLOYMENTS_REFUSAL: active deployments [$active_ids]. Run 'msai live status' to inspect, then 'msai live stop <id>' for each (or 'msai live kill-all --yes' if backend is wedged) first, then re-dispatch." >&2
             exit 1
           fi
           echo "deployments[].status check: 0 active — gate clear"
@@ -272,8 +336,13 @@ jobs:
 
       - name: Stage deploy env on VM
         # Build the env file via heredoc-over-ssh BEFORE invoking sudo. Avoids sudo
-        # env-strip + brittle sudoers env_keep. umask 077 keeps the temp file root-only
-        # before scp lands.
+        # env-strip + brittle sudoers env_keep. The contents are deploy
+        # metadata only (RG / ACR names / image names / KV_NAME / hostname),
+        # NOT KV secrets — those are rendered later into /run/msai.env by
+        # render-env-from-kv.sh. umask 077 still makes this file mode 600
+        # (VM_USER-readable only) defensively, in case future fields are
+        # added. No scp in this step — the file is created remotely by the
+        # SSH heredoc itself.
         env:
           VM_USER: ${{ vars.VM_SSH_USER }}
           VM_IP: ${{ steps.resolve.outputs.vm_public_ip }}
@@ -392,7 +461,9 @@ jobs:
         # Tolerant to upstream failures — the rule may not exist if the deploy job died
         # before creating it. `--output none` + `|| true` ensures cleanup never fails
         # the workflow. If the delete legitimately fails (RBAC, network blip), the
-        # reap-orphan-nsg-rules.yml cron picks it up within 15 minutes.
+        # reap-orphan-nsg-rules.yml cron picks it up. Reaper runs every 15
+        # min and deletes rules older than 30 min — actual cleanup lands
+        # 30-45 min after the orphan was created.
         if: needs.deploy.outputs.rule_name != ''
         run: |
           az network nsg rule delete \
@@ -403,6 +474,9 @@ jobs:
 
       # NB: /tmp cleanup is intentionally NOT done here. The transient SSH rule is
       # deleted ABOVE, so subsequent SSH from the runner would fail. Leftover
-      # /tmp/deploy-{env,on-vm}-${run_id}.{env,sh} files are root-owned, harmless,
-      # and overwritten by the next deploy's run_id. If they accumulate, a
-      # systemd-tmpfiles rule on the VM could reap them — out of scope for Slice 3.
+      # /tmp/deploy-{env,on-vm}-${run_id}.{env,sh} files are VM_USER-owned (mode
+      # 600 for the env file via umask 077; the sh script is the public deploy
+      # helper), small (few KB each), and uniquely run_id-suffixed — so they
+      # ACCUMULATE across deploys rather than being overwritten. If accumulation
+      # becomes an issue, a systemd-tmpfiles rule on the VM could reap them —
+      # out of scope for Slice 3.
