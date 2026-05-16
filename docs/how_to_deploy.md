@@ -193,71 +193,30 @@ If `broker_flat=false` (or `any_non_flat=true`), flatten manually via the IB por
 
 Council-mandated for first deploys to new infra and any change touching `docker-compose.prod.yml`, `Caddyfile`, `scripts/deploy-on-vm.sh`, or `infra/main.bicep`. Deploy to a throwaway resource group first.
 
-The condensed flow (full procedure with pre-flight LE rate-limit check, KV seeding, smoke probes, and teardown is in [`docs/runbooks/slice-3-rehearsal.md`](runbooks/slice-3-rehearsal.md)):
+**The full procedure is in [`docs/runbooks/slice-3-rehearsal.md`](runbooks/slice-3-rehearsal.md) — follow it end-to-end; do NOT improvise from the orientation below.** A rehearsal cuts across more cross-RG wiring than this page can safely compress (rehearsal Bicep apply, KV secret seeding, LE rate-limit pre-flight check, `gh workflow run build-and-push.yml` to seed images, four temporary swaps to repo Variables/Secrets, the Contrarian's-gate NSG child-resource spike, the deploy itself, smoke probes, RG teardown). Skipping any of those steps tends to produce a confusing mid-deploy failure rather than a clean refusal.
 
-```bash
-RG=msaiv2-rehearsal-$(date -u +%Y%m%d)
-az group create --name "$RG" --location eastus2 \
-  --tags rehearsal=true expires-by="$(date -u -d '+1 day' +%Y-%m-%d)"
+Orientation only — what the rehearsal looks like at a high level:
 
-# Apply Slice 1 IaC against the rehearsal RG (NOTE: scripts/deploy-azure.sh
-# is hard-coded to msaiv2_rg — for rehearsal use az deployment group create
-# directly with a rehearsal-only ssh keypair)
-ssh-keygen -t ed25519 -f ~/.ssh/msai-rehearsal -N '' -C "msai-rehearsal-$(date -u +%Y%m%d)"
-OPERATOR_IP=$(curl -sf https://ifconfig.me)
-OPERATOR_OID=$(az ad signed-in-user show --query id -o tsv)
-az deployment group create \
-  --name msai-iac \
-  --resource-group "$RG" \
-  --template-file infra/main.bicep \
-  --parameters infra/main.bicepparam \
-  --parameters operatorIp="$OPERATOR_IP" operatorPrincipalId="$OPERATOR_OID" \
-               vmSshPublicKey="$(cat ~/.ssh/msai-rehearsal.pub)"
+| Step       | What                                                                                                                                                                                                                                                                                                              | Where               |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------- |
+| Pre-flight | LE rate-limit headroom, DNS A record for `platform-rehearsal.marketsignal.ai`, operator IP current                                                                                                                                                                                                                | runbook §Pre-flight |
+| 1          | `az group create msaiv2-rehearsal-<date>` (tagged `expires-by`)                                                                                                                                                                                                                                                   | runbook §1          |
+| 2          | Apply Slice 1 Bicep against the rehearsal RG with a fresh `~/.ssh/msai-rehearsal` keypair (DO NOT reuse prod key)                                                                                                                                                                                                 | runbook §2          |
+| 3          | Update DNS A record → rehearsal VM IP; `ssh-keyscan` for `VM_SSH_KNOWN_HOSTS`                                                                                                                                                                                                                                     | runbook §3          |
+| 4          | Seed rehearsal KV with secrets (report signing, postgres password, Entra IDs, CORS, IB stubs)                                                                                                                                                                                                                     | runbook §4          |
+| 5          | `gh workflow run build-and-push.yml` to push images for the rehearsal SHA                                                                                                                                                                                                                                         | runbook §5          |
+| 6          | **Contrarian's spike** — prove the NSG child-resource refactor survives a Bicep reapply BEFORE deploying                                                                                                                                                                                                          | runbook §6          |
+| 7          | **Temporary swaps to repo Variables + Secrets** (each restored after teardown): `RESOURCE_GROUP`, `VM_PUBLIC_IP`, `MSAI_HOSTNAME`, `KV_NAME`, `DEPLOYMENT_NAME`, `VM_SSH_KNOWN_HOSTS`, `VM_SSH_PRIVATE_KEY`, `AZURE_CLIENT_ID` (the rehearsal RG's UAMI client id, not prod's — federated credentials are per-RG) | runbook §7          |
+| 8          | `gh workflow run deploy.yml -f bootstrap=true` (the `_f` override matrix is only used if you choose NOT to swap the repo Variables in step 7)                                                                                                                                                                     | runbook §8          |
+| 9          | Smoke probes (LE cert, public `/health`, frontend root, kill-all dry-run)                                                                                                                                                                                                                                         | runbook §9          |
+| 10         | `az group delete --no-wait` + restore all swapped Variables/Secrets                                                                                                                                                                                                                                               | runbook §10         |
 
-# Capture outputs (the runbook also seeds KV secrets here)
-OUTS=$(az deployment group show --name msai-iac --resource-group "$RG" --query 'properties.outputs' -o json)
-VM_IP=$(jq -r .vmPublicIp.value     <<<"$OUTS")
-KV_NAME=$(jq -r .keyVaultName.value <<<"$OUTS")
-NSG_NAME=$(jq -r .nsgName.value     <<<"$OUTS")     # 'msai-nsg' per Bicep
-ACR_NAME=$(jq -r '.acrLoginServer.value | split(".")[0]' <<<"$OUTS")
-ACR_LOGIN=$(jq -r .acrLoginServer.value <<<"$OUTS")
-KNOWN_HOSTS=$(ssh-keyscan -t ed25519 "$VM_IP" 2>/dev/null)
+**Two non-overrideable pins** worth calling out before you start (the runbook covers both, but they trip first-time rehearsers):
 
-# Dispatch deploy.yml with the rehearsal-override inputs (resource_group,
-# vm_public_ip, nsg_name, kv_name, msai_hostname, acr_name,
-# acr_login_server, vm_ssh_known_hosts_var, bootstrap). Two non-overrideable
-# pins that the operator must work around for a rehearsal run:
-#
-#   - DEPLOYMENT_NAME: deploy.yml writes ${vars.DEPLOYMENT_NAME} verbatim
-#     into the staged env file. Either temporarily set the repo Variable
-#     DEPLOYMENT_NAME=msai-iac for the rehearsal run (then restore to the
-#     prod value), OR accept that backup-to-blob.sh on the rehearsal VM
-#     looks up the wrong deployment — fine because rehearsal doesn't run
-#     nightly backups.
-#
-#   - VM_SSH_PRIVATE_KEY: deploy.yml's ssh-agent step loads
-#     ${secrets.VM_SSH_PRIVATE_KEY} unconditionally. The rehearsal VM was
-#     provisioned with the fresh ~/.ssh/msai-rehearsal.pub keypair above
-#     (council stance: DO NOT reuse the prod key — slice-3-rehearsal.md
-#     pre-flight). Temporarily overwrite the secret with the rehearsal
-#     private key for the run, then restore to the prod private key:
-#         gh secret set VM_SSH_PRIVATE_KEY < ~/.ssh/msai-rehearsal
-#         # ... rehearsal dispatch + teardown ...
-#         gh secret set VM_SSH_PRIVATE_KEY < ~/.ssh/msai-prod
-gh workflow run deploy.yml \
-  -f resource_group="$RG" \
-  -f vm_public_ip="$VM_IP" \
-  -f nsg_name="$NSG_NAME" \
-  -f kv_name="$KV_NAME" \
-  -f msai_hostname="platform-rehearsal.marketsignal.ai" \
-  -f acr_name="$ACR_NAME" \
-  -f acr_login_server="$ACR_LOGIN" \
-  -f vm_ssh_known_hosts_var="$KNOWN_HOSTS" \
-  -f bootstrap=true
+- `DEPLOYMENT_NAME` is hard-coded from `${vars.DEPLOYMENT_NAME}` into the staged env file (no workflow input). Either temp-swap the Variable to `msai-iac` for the rehearsal run, or accept that backup-to-blob.sh on the rehearsal VM resolves the wrong deployment — harmless if you're not running nightly backups during the rehearsal.
+- `VM_SSH_PRIVATE_KEY` is loaded unconditionally from `${secrets.VM_SSH_PRIVATE_KEY}` (no workflow input). Temp-swap to the rehearsal-only private key before dispatch; restore prod key after teardown.
 
-# After success + smoke probes, tear down
-az group delete -n "$RG" --yes --no-wait
-```
+**Also worth knowing:** `build-and-push.yml` pushes only to `${vars.ACR_LOGIN_SERVER}` (the prod ACR by default). For a rehearsal you either temp-swap those two ACR Variables before step 5 (and restore after), OR push a rehearsal image directly to the rehearsal ACR with `docker push` (the runbook documents the operator's chosen path). The `acr_name`/`acr_login_server` workflow_dispatch inputs on `deploy.yml` let the dispatch point at whichever ACR holds the image.
 
 The memory note `feedback_rehearsal_caught_real_bugs` captures why this is non-optional: the first-deploy rehearsal caught 8 production-blockers across 9 attempts.
 
