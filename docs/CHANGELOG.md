@@ -71,6 +71,19 @@ Closes every API + CLI capability gap in the UI and strips 12 user-visible fakes
 - **Issue E (P2 false-positive):** trailing-slash routing on `/live-portfolios/` was just FastAPI's default 307 redirect (curl without `-L` reports empty body). No change needed.
 - **Issue B (P2 use-case design):** TJ-9 rewritten to be role-agnostic (the dev API-key user has `role=admin`, but the original use-case asserted "no Admin badge" assuming a `viewer` user). Updated `docs/plans/2026-05-16-ui-completeness.md` §TJ-9 to assert "no HARDCODED Admin badge that contradicts backend's role field" — backend's actual role rendering IS allowed; only the lie is forbidden.
 
+**Equity-curve UX fix (Pablo flagged during iter-3 walkthrough):** the backtest results page rendered a "flat line at $100k" for low-return backtests because the Y-axis used hardcoded `±$2,000` padding that dwarfed the actual variation (e.g. $0.74 over 0.08% return on $100k). Switched the chart to plot **cumulative return %** `(equity_t / equity_0 - 1) × 100` with adaptive padding (5% of range, floor 0.001%) and adaptive tick precision (1–4 decimals based on range magnitude). Drawdown chart got the same adaptive-precision treatment. Now small/genuine returns show curvature instead of false-flatness. `frontend/src/components/backtests/results-charts.tsx`.
+
+**Portfolio compose / backtest carved out (council verdict 2026-05-17):** during the iter-3 walkthrough, Pablo rejected the live-portfolio-compose UX because it required hand-writing per-strategy Config (JSON) + fixed-weight, with no allocation-method picker, no per-strategy risk policy, and no portfolio-level backtest. Industry research (Composer, QuantConnect, Build Alpha, RealTest, AlgoTest, López de Prado HRP, Carver) confirmed MSAI's current UX is materially below convention. 5/5 council advisors + Codex research recommended **deferring portfolio redesign to a dedicated `/new-feature portfolio-backtest` PR** with its own PRD/research/council/plan cycle.
+
+In this PR the carve-out:
+
+- `/live-trading/portfolio` route HARD-DISABLED (returns 404 via `notFound()`). Original `PortfolioCompose` + `PortfolioStartDialog` wiring preserved on parent commit; recoverable via git history when redesign lands.
+- "Deploy New Portfolio" link removed from `/live-trading` page.
+- TJ-4 (paper deploy) marked **DEFERRED** in `tests/e2e/use-cases/ui-completeness/trader-journeys.md`.
+- Speculative auto-fill JSON edit on `portfolio-compose.tsx` reverted (moot now that page is disabled; Contrarian advisor's request — no unstaged sweeps without separate review).
+
+Decision doc: `docs/decisions/2026-05-17-portfolio-backtest-deferred.md` with full council transcripts + industry-pattern research + follow-up scope.
+
 **Tests after iter-4:** 2012 unit + 385 integration + 20 snapshot integration pass (TestStartIsSynchronous deselected — pre-existing hang tracked separately). Frontend `tsc --noEmit` + `pnpm lint` clean.
 
 **Phase 5.4 verify-e2e iter-2 (post-cycle) found 3 P2 product defects, all fixed in-branch:**

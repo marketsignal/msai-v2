@@ -1,15 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import Link from "next/link";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  TrendingUp,
-  DollarSign,
-  Wifi,
-  ArrowRight,
-  AlertTriangle,
-} from "lucide-react";
+import { TrendingUp, DollarSign, Wifi, AlertTriangle } from "lucide-react";
 import { KillSwitch } from "@/components/live/kill-switch";
 import { ResumeButton } from "@/components/live/resume-button";
 import { StrategyStatus } from "@/components/live/strategy-status";
@@ -153,26 +146,13 @@ export default function LiveTradingPage(): React.ReactElement {
 
   return (
     <div className="space-y-6">
-      {/* Deploy New Portfolio entry point */}
-      <Link
-        data-testid="live-portfolio-deploy-link"
-        href="/live-trading/portfolio"
-        className="group flex items-center justify-between rounded-lg border border-border/60 bg-card/40 p-4 transition-colors hover:border-emerald-500/50 hover:bg-emerald-500/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-      >
-        <div>
-          <p className="text-sm font-medium text-foreground">
-            Deploy New Portfolio
-          </p>
-          <p className="text-xs text-muted-foreground">
-            Pick a portfolio revision, validate risk, and start a live
-            deployment.
-          </p>
-        </div>
-        <ArrowRight
-          className="size-4 text-muted-foreground transition-transform group-hover:translate-x-0.5"
-          aria-hidden="true"
-        />
-      </Link>
+      {/* "Deploy New Portfolio" entry point intentionally REMOVED. The
+          /live-trading/portfolio compose route is hard-disabled (returns
+          404) per council verdict 2026-05-17 — see
+          docs/decisions/2026-05-17-portfolio-backtest-deferred.md. Live
+          deployments today are seeded via the public API + Phase 1 git-
+          file strategy registration; portfolio-from-UI compose is queued
+          for a dedicated /new-feature portfolio-backtest PR. */}
 
       {/* Page header */}
       <div className="flex items-start justify-between">
