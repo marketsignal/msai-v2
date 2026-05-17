@@ -21,6 +21,7 @@ import {
 import { Bell, AlertTriangle } from "lucide-react";
 import { AlertDetailSheet } from "@/components/alerts/alert-detail-sheet";
 import type { AlertRecord } from "@/lib/api";
+import { formatTimestamp } from "@/lib/format";
 
 interface Props {
   alerts: AlertRecord[];
@@ -66,8 +67,11 @@ export function AlertsTable({
                 <TableCell>
                   <LevelBadge level={alert.level} />
                 </TableCell>
-                <TableCell className="font-mono text-xs">
-                  {alert.created_at}
+                <TableCell
+                  className="font-mono text-xs text-muted-foreground"
+                  title={alert.created_at}
+                >
+                  {formatTimestamp(alert.created_at)}
                 </TableCell>
                 <TableCell>
                   <Badge variant="outline" className="font-mono text-xs">

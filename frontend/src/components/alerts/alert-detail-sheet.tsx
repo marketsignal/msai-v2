@@ -10,6 +10,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import type { AlertRecord } from "@/lib/api";
 import { Bell, AlertTriangle } from "lucide-react";
+import { formatTimestamp } from "@/lib/format";
 
 interface Props {
   /** The currently-selected alert snapshot. `null` closes the sheet. */
@@ -37,7 +38,13 @@ export function AlertDetailSheet({
                 <span>{alert.title}</span>
               </SheetTitle>
               <SheetDescription>
-                <time className="font-mono text-xs">{alert.created_at}</time>
+                <time
+                  className="font-mono text-xs"
+                  dateTime={alert.created_at}
+                  title={alert.created_at}
+                >
+                  {formatTimestamp(alert.created_at)}
+                </time>
               </SheetDescription>
             </SheetHeader>
             <div className="space-y-4 px-4 pb-4 pt-2">
