@@ -84,6 +84,17 @@ In this PR the carve-out:
 
 Decision doc: `docs/decisions/2026-05-17-portfolio-backtest-deferred.md` with full council transcripts + industry-pattern research + follow-up scope.
 
+**UX audit sweep (Pablo walkthrough 2026-05-17):** Pablo walked every UI surface as a trader after the council carve-out. Found + fixed in-branch:
+
+- **/live-trading Strategy column showed raw UUIDs** (`6bfccf42-2765-…`). Now joins client-side from `/api/v1/strategies/` and renders strategy names (`example.smoke_market_order`); title-attr keeps UUID for debugging. `frontend/src/components/live/strategy-status.tsx` + `frontend/src/app/live-trading/page.tsx`.
+- **/live-trading P&L cards `$0.00` looked like lies** when Dashboard shows $254k+ IB balance. Subtitles added: "From running deployments" / "MSAI positions only — see /account for full IB balance" so the operator knows which slice they're seeing.
+- **/market-data duplicate AAPL rows with no provider distinction** (databento + interactive_brokers each had AAPL/equity). Added a `Provider` column to the inventory table so duplicate rows are visually disambiguated. `frontend/src/components/market-data/inventory-table.tsx`.
+- **/market-data storage card mislabeled "FILES BY ASSET CLASS"** when the underlying value was bytes. Relabeled "Bytes by asset class" + wrapped in `formatBytes()` (`stocks 190.7 KB` instead of `stocks 195262`).
+- **/alerts timestamps were raw ISO** (`2026-05-17T11:45:02.089551+00:00`). Now formatted via `formatTimestamp` (`May 17, 2026, 01:04:52 PM`) with raw ISO retained as `title` + `<time dateTime>` for accessibility. Same fix applied to the detail Sheet.
+- **/portfolio Recent Runs Sharpe never rendered + R/DD collapsed to 0.0%**: `metricsSnippet` checked `metrics.sharpe_ratio` but the API returns `sharpe` (Sharpe was silently invisible). Also `(ratio * 100).toFixed(1)` collapsed micro-returns to "0.0%". New `pctAdaptive` helper picks decimals from magnitude: row renders `S: 1.57 | R: 0.0009% | DD: -0.0029%` (was `R: 0.0% | DD: -0.0%` with Sharpe missing).
+
+Validate dialog + Archive dialog + Notifications-bell click verified working.
+
 **Tests after iter-4:** 2012 unit + 385 integration + 20 snapshot integration pass (TestStartIsSynchronous deselected — pre-existing hang tracked separately). Frontend `tsc --noEmit` + `pnpm lint` clean.
 
 **Phase 5.4 verify-e2e iter-2 (post-cycle) found 3 P2 product defects, all fixed in-branch:**
