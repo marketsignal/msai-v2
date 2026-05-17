@@ -34,7 +34,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { PortfolioCompose } from "@/components/live/portfolio-compose";
 import { PortfolioStartDialog } from "@/components/live/portfolio-start-dialog";
 
-import { apiGet } from "@/lib/api";
+import { apiGet, describeApiError } from "@/lib/api";
 import type {
   LivePortfolio,
   LivePortfolioRevision,
@@ -87,8 +87,12 @@ export default function LivePortfolioPage(): React.ReactElement {
       setPortfolios(list);
       setPortfoliosError(null);
       return list;
-    } catch {
-      setPortfoliosError("Failed to load portfolios");
+    } catch (err) {
+      // iter-3 SF P1: bare catch swallowed the real error (a 503 from
+      // the snapshot, 401 token-refresh, network drop all collapsed to
+      // the same generic message). Surface the backend HTTPException
+      // detail via describeApiError so the operator can see why.
+      setPortfoliosError(describeApiError(err, "Failed to load portfolios"));
       setPortfolios([]);
       return null;
     }
@@ -122,9 +126,12 @@ export default function LivePortfolioPage(): React.ReactElement {
           setStrategies(data.items);
           setStrategiesError(null);
         }
-      } catch {
+      } catch (err) {
+        // iter-3 SF P1: surface real error via describeApiError.
         if (!cancelled) {
-          setStrategiesError("Failed to load strategies");
+          setStrategiesError(
+            describeApiError(err, "Failed to load strategies"),
+          );
           setStrategies([]);
         }
       }
@@ -173,9 +180,9 @@ export default function LivePortfolioPage(): React.ReactElement {
       setCreateDescription("");
       toast.success(`Portfolio "${created.name}" created`);
     } catch (err) {
-      setCreateError(
-        err instanceof Error ? err.message : "Failed to create portfolio",
-      );
+      // iter-3 describeApiError sweep: surface backend HTTPException detail
+      // (e.g. "portfolio_name_taken") instead of the raw fetch error.
+      setCreateError(describeApiError(err, "Failed to create portfolio"));
     } finally {
       setCreating(false);
     }

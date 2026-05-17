@@ -27,6 +27,7 @@ import {
   apiGet,
   apiPost,
   ApiError,
+  describeApiError,
   type GraduationCandidateResponse,
   type GraduationCandidateListResponse,
   type GraduationTransitionResponse,
@@ -150,6 +151,7 @@ interface DetailPanelProps {
   strategyName: string | undefined;
   transitions: GraduationTransitionResponse[];
   transitionsLoading: boolean;
+  transitionsError: string | null;
   onAdvance: (stage: string, reason: string) => Promise<void>;
   advancing: boolean;
   onClose: () => void;
@@ -160,6 +162,7 @@ function DetailPanel({
   strategyName,
   transitions,
   transitionsLoading,
+  transitionsError,
   onAdvance,
   advancing,
   onClose,
@@ -307,7 +310,14 @@ function DetailPanel({
         {/* Transition history */}
         <div>
           <h4 className="mb-2 text-sm font-medium">Transition History</h4>
-          {transitionsLoading ? (
+          {transitionsError ? (
+            <div
+              role="alert"
+              className="rounded-md border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-400"
+            >
+              {transitionsError}
+            </div>
+          ) : transitionsLoading ? (
             <p className="text-xs text-muted-foreground">Loading...</p>
           ) : transitions.length === 0 ? (
             <p className="text-xs text-muted-foreground">No transitions yet.</p>
@@ -369,6 +379,10 @@ export default function GraduationPage(): React.ReactElement {
     GraduationTransitionResponse[]
   >([]);
   const [transitionsLoading, setTransitionsLoading] = useState<boolean>(false);
+  // iter-4 SF P2: surface a transient transitions-fetch failure so the
+  // empty list isn't read as "confirmed empty." Renders inline next to
+  // the transitions table.
+  const [transitionsError, setTransitionsError] = useState<string | null>(null);
   const [advancing, setAdvancing] = useState<boolean>(false);
 
   // -----------------------------------------------------------------------
@@ -413,6 +427,7 @@ export default function GraduationPage(): React.ReactElement {
     async (id: string): Promise<void> => {
       setSelectedId(id);
       setTransitions([]);
+      setTransitionsError(null);
       setTransitionsLoading(true);
       try {
         const token = await getToken();
@@ -421,9 +436,16 @@ export default function GraduationPage(): React.ReactElement {
           token,
         );
         setTransitions(data.items);
-      } catch {
-        // Non-critical — just show empty transitions
+      } catch (err) {
+        // iter-4 SF P2: previously swallowed silently with comment
+        // "Non-critical — just show empty transitions." That made a
+        // 503 indistinguishable from "this candidate has no
+        // transitions yet." Surface the backend HTTPException detail
+        // via describeApiError so the user can distinguish.
         setTransitions([]);
+        setTransitionsError(
+          describeApiError(err, "Failed to load transitions"),
+        );
       } finally {
         setTransitionsLoading(false);
       }
@@ -590,6 +612,7 @@ export default function GraduationPage(): React.ReactElement {
           strategyName={strategiesById[selectedCandidate.strategy_id]?.name}
           transitions={transitions}
           transitionsLoading={transitionsLoading}
+          transitionsError={transitionsError}
           onAdvance={handleAdvance}
           advancing={advancing}
           onClose={() => setSelectedId(null)}

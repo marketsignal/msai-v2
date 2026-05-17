@@ -18,7 +18,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Zap } from "lucide-react";
-import { getLiveTrades, type LiveTrade } from "@/lib/api";
+import { describeApiError, getLiveTrades, type LiveTrade } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { formatCurrency, formatDateTime } from "@/lib/format";
 
@@ -34,8 +34,13 @@ export function RecentTrades(): React.ReactElement {
         const token = await getToken();
         const data = await getLiveTrades(token);
         if (!cancelled) setTrades(data.trades.slice(0, 10));
-      } catch {
-        if (!cancelled) setError("Failed to load trades");
+      } catch (err) {
+        // iter-4 SF P2: bare catch was the same silent-failure pattern
+        // the rest of the sweep eliminated. surface backend
+        // HTTPException detail (e.g. "ib_gateway_unreachable", 401
+        // token-expired) via describeApiError.
+        if (!cancelled)
+          setError(describeApiError(err, "Failed to load trades"));
       }
     };
     void load();

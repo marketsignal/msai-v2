@@ -89,7 +89,7 @@ class TestAlertsList:
 
 
 # ======================================================================
-# T2 — strategy edit / delete + template list / scaffold
+# T2 — strategy edit / delete
 # ======================================================================
 
 
@@ -174,65 +174,6 @@ class TestStrategyDelete:
         assert result.exit_code != 0
         assert mock.call_count == 0
 
-
-class TestTemplateList:
-    def test_gets_strategy_templates_endpoint(self, runner: CliRunner) -> None:
-        body = [{"id": "ema-cross", "label": "EMA Cross", "description": "x", "default_config": {}}]
-        with patch("msai.cli.httpx.request", return_value=_ok_response(body)) as mock:
-            result = runner.invoke(app, ["template", "list"])
-        assert result.exit_code == 0, result.output
-        args, _ = mock.call_args
-        assert args[0] == "GET"
-        assert "/api/v1/strategy-templates/" in args[1]
-        assert "ema-cross" in result.output
-
-
-class TestTemplateScaffold:
-    def test_posts_template_id_and_module_name(self, runner: CliRunner) -> None:
-        body = {"file_path": "strategies/user/my_strategy.py"}
-        with patch(
-            "msai.cli.httpx.request", return_value=_ok_response(body, status_code=201)
-        ) as mock:
-            result = runner.invoke(
-                app,
-                [
-                    "template",
-                    "scaffold",
-                    "--template-id",
-                    "ema-cross",
-                    "--module-name",
-                    "user.my_strategy",
-                ],
-            )
-        assert result.exit_code == 0, result.output
-        args, kwargs = mock.call_args
-        assert args[0] == "POST"
-        assert "/api/v1/strategy-templates/scaffold" in args[1]
-        assert kwargs["json"] == {
-            "template_id": "ema-cross",
-            "module_name": "user.my_strategy",
-        }
-
-    def test_includes_description_when_passed(self, runner: CliRunner) -> None:
-        with patch(
-            "msai.cli.httpx.request", return_value=_ok_response({}, status_code=201)
-        ) as mock:
-            result = runner.invoke(
-                app,
-                [
-                    "template",
-                    "scaffold",
-                    "--template-id",
-                    "ema-cross",
-                    "--module-name",
-                    "user.x",
-                    "--description",
-                    "desc",
-                ],
-            )
-        assert result.exit_code == 0
-        _, kwargs = mock.call_args
-        assert kwargs["json"]["description"] == "desc"
 
 
 # ======================================================================
@@ -1012,7 +953,7 @@ class TestCommandTreeRegistration:
     def test_root_help_lists_new_sub_apps(self, runner: CliRunner) -> None:
         result = runner.invoke(app, ["--help"])
         assert result.exit_code == 0
-        for sub in ("alerts", "auth", "market-data", "template"):
+        for sub in ("alerts", "auth", "market-data"):
             assert sub in result.output
 
     def test_root_help_lists_whoami_top_level(self, runner: CliRunner) -> None:
@@ -1026,7 +967,6 @@ class TestCommandTreeRegistration:
             ("alerts", {"list"}),
             ("auth", {"me", "logout"}),
             ("market-data", {"bars", "ingest", "status", "symbols"}),
-            ("template", {"list", "scaffold"}),
         ],
     )
     def test_new_sub_apps_register_expected_commands(

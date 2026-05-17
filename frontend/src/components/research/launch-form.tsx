@@ -26,7 +26,7 @@ import { useAuth } from "@/lib/auth";
 import {
   apiGet,
   apiPost,
-  ApiError,
+  describeApiError,
   type StrategyListResponse,
   type StrategyResponse,
 } from "@/lib/api";
@@ -82,11 +82,8 @@ export function LaunchResearchForm({
         }
       } catch (err) {
         if (cancelled) return;
-        const msg =
-          err instanceof ApiError
-            ? `Failed to load strategies (${err.status})`
-            : "Failed to load strategies";
-        setError(msg);
+        // iter-3 describeApiError sweep.
+        setError(describeApiError(err, "Failed to load strategies"));
       } finally {
         if (!cancelled) setStrategiesLoading(false);
       }
@@ -138,13 +135,14 @@ export function LaunchResearchForm({
       onSubmitted?.();
       onOpenChange(false);
     } catch (err) {
-      const msg =
-        err instanceof ApiError
-          ? `Failed to launch research (${err.status})`
-          : err instanceof SyntaxError
-            ? "Configuration or parameter grid JSON is invalid"
-            : "Failed to launch research";
-      setError(msg);
+      // iter-3 describeApiError sweep. SyntaxError is local JSON.parse —
+      // keep its specific message; ApiError flows through describeApiError
+      // to surface the backend's HTTPException detail.
+      if (err instanceof SyntaxError) {
+        setError("Configuration or parameter grid JSON is invalid");
+      } else {
+        setError(describeApiError(err, "Failed to launch research"));
+      }
     } finally {
       setSubmitting(false);
     }

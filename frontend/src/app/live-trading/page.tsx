@@ -15,6 +15,7 @@ import { ResumeButton } from "@/components/live/resume-button";
 import { StrategyStatus } from "@/components/live/strategy-status";
 import { PositionsTable } from "@/components/live/positions-table";
 import {
+  describeApiError,
   getLivePositions,
   getLiveStatus,
   type LivePositionItem,
@@ -51,6 +52,12 @@ export default function LiveTradingPage(): React.ReactElement {
   // Fetch real deployments + global state from /api/v1/live/status.
   const [deployments, setDeployments] = useState<LiveDeploymentInfo[]>([]);
   const [riskHalted, setRiskHalted] = useState<boolean>(false);
+  // iter-3 SF P1: positionsUnavailable distinguishes "no positions" (real
+  // empty state) from "live/positions fetch failed". Passed to PositionsTable
+  // + factored into KillSwitch's positionCount so the operator isn't told
+  // "0 positions" when the backend was actually unreachable.
+  const [positionsUnavailable, setPositionsUnavailable] =
+    useState<boolean>(false);
   const refreshStatus = useCallback(async (): Promise<void> => {
     if (!tokenReady) return;
     try {
@@ -58,8 +65,13 @@ export default function LiveTradingPage(): React.ReactElement {
       setDeployments(status.deployments);
       setRiskHalted(status.risk_halted);
       setApiError(null);
-    } catch {
-      setApiError("Failed to load deployments");
+    } catch (err) {
+      // iter-3 SF P1: bare catch swallowed the real cause. The
+      // /live/status endpoint drives the risk-halted banner + Resume
+      // button + active-deployment count — a 5xx silently degrading to
+      // "no deployments" was actively misleading. Surface the detail
+      // via describeApiError.
+      setApiError(describeApiError(err, "Failed to load deployments"));
       setDeployments([]);
     }
   }, [token, tokenReady]);
@@ -77,9 +89,24 @@ export default function LiveTradingPage(): React.ReactElement {
     void (async (): Promise<void> => {
       try {
         const data = await getLivePositions(token);
-        if (!cancelled) setRestPositions(data.positions);
-      } catch {
-        // Backend unreachable — leave empty
+        if (!cancelled) {
+          setRestPositions(data.positions);
+          setPositionsUnavailable(false);
+        }
+      } catch (err) {
+        // iter-3 SF P1: bare catch + "leave empty" comment was exactly
+        // the silent-failure pattern. positionsUnavailable flag now
+        // distinguishes a real empty list from a fetch failure so
+        // KillSwitch's positionCount doesn't lie ("0 positions" → kill
+        // is safe vs. "?" → unknown).
+        if (!cancelled) {
+          setRestPositions([]);
+          setPositionsUnavailable(true);
+          console.error(
+            "live_positions_fetch_failed",
+            describeApiError(err, "REST positions fetch failed"),
+          );
+        }
       }
     })();
     return (): void => {
@@ -181,6 +208,7 @@ export default function LiveTradingPage(): React.ReactElement {
             <KillSwitch
               activeCount={activeCount}
               positionCount={positionCount}
+              positionsUnavailable={!usingLive && positionsUnavailable}
               onKilled={() => {
                 void refreshStatus();
               }}
@@ -263,7 +291,26 @@ export default function LiveTradingPage(): React.ReactElement {
         </div>
       )}
 
-      <StrategyStatus deployments={deployments} />
+      {/* iter-4 SF P2: a /live/positions REST failure was previously
+          only visible inside the KillSwitch confirm dialog. Surface it
+          at the page top so an operator who never opens the dialog
+          isn't misled into thinking the account is flat. */}
+      {positionsUnavailable && !usingLive ? (
+        <div
+          data-testid="live-positions-unavailable-banner"
+          role="alert"
+          className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-300"
+        >
+          Open positions could not be loaded — kill-switch displays unverified
+          counts. Confirm flatness via the IB portal before relying on the count
+          below.
+        </div>
+      ) : null}
+
+      <StrategyStatus
+        deployments={deployments}
+        onDeploymentMutated={() => void refreshStatus()}
+      />
       <PositionsTable livePositions={positionsForTable} />
     </div>
   );

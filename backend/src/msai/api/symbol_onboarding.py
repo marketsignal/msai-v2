@@ -654,13 +654,24 @@ async def readiness(
             as_of_date=exchange_local_today(),
         )
     except AmbiguousSymbolError as exc:
+        # iter-5 verify-e2e Issue F (P2): the exception carries either
+        # provider-multiplicity OR asset-class-multiplicity context;
+        # surface whichever applies so the caller gets actionable advice.
+        if exc.providers:
+            message = (
+                f"Symbol {symbol!r} (asset_class={asset_class!r}) matches "
+                f"definitions under multiple providers ({sorted(exc.providers)}); "
+                "pin provider explicitly."
+            )
+        else:
+            message = (
+                f"Symbol {symbol!r} matches {len(exc.asset_classes)} asset classes "
+                f"({sorted(exc.asset_classes)}); pin asset_class explicitly."
+            )
         return error_response(
             status_code=422,
             code="AMBIGUOUS_INSTRUMENT",
-            message=(
-                f"Symbol {symbol!r} matches {len(exc.asset_classes)} asset classes "
-                f"({sorted(exc.asset_classes)}); pin asset_class explicitly."
-            ),
+            message=message,
         )
     if resolution.instrument_uid is None:
         return error_response(

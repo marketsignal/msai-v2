@@ -48,14 +48,15 @@ from msai.api.portfolios import (
 )
 from msai.api.research import router as research_router
 from msai.api.strategies import router as strategies_router
-from msai.api.strategy_templates import router as strategy_templates_router
 from msai.api.symbol_onboarding import router as symbol_onboarding_router
+from msai.api.system import router as system_router
 from msai.api.websocket import live_stream
 from msai.core.auth import _API_KEY_CLAIMS, init_validator
 from msai.core.config import settings
-from msai.core.logging import logging_middleware, setup_logging
+from msai.core.logging import get_logger, logging_middleware, setup_logging
 
 setup_logging(settings.environment)
+log = get_logger(__name__)
 
 # Initialize Entra ID JWT validator at startup (required for auth endpoints)
 if settings.azure_tenant_id and settings.azure_client_id:
@@ -89,8 +90,17 @@ async def _ensure_api_key_user() -> bool:
                 await session.commit()
             _api_key_user_ready = True
             return True
-    except Exception:
-        return False  # DB may not be ready yet (migrations pending)
+    except Exception as exc:  # noqa: BLE001
+        # iter-3 SF P2: log the actual exception type so a DB schema
+        # mismatch or programming error (FK violation on partially-
+        # migrated schema, wrong model field, etc.) leaves a forensic
+        # trail instead of every API-key request 401-ing with no clue.
+        log.warning(
+            "api_key_user_bootstrap_failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+        return False
 
 
 _projection_tasks: list[asyncio.Task[None]] = []
@@ -174,10 +184,17 @@ async def _start_projection_tasks() -> None:
                         deployment_slug=dep.deployment_slug,
                         stream_name=dep.message_bus_stream,
                     )
-    except Exception:  # noqa: BLE001
-        # DB may not be ready; consumer will start with empty registry
-        # and pick up streams as deployments are started via /api/v1/live/start
-        pass
+    except Exception as exc:  # noqa: BLE001
+        # iter-3 SF P2: a real DB error here means projection consumer
+        # starts empty and silently misses every in-flight deployment's
+        # events until manual restart. Log so the failure is forensically
+        # visible. (DB-not-ready during boot is also legitimate; the log
+        # line is "the consumer started without bootstrap" either way.)
+        log.warning(
+            "projection_registry_bootstrap_failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
 
     publisher = DualPublisher(redis=redis_text)  # publishes JSON strings
     consumer = ProjectionConsumer(
@@ -208,15 +225,22 @@ async def _stop_projection_tasks() -> None:
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Startup/shutdown lifecycle."""
     from msai.api.account import start_ib_probe_task, stop_ib_probe_task
+    from msai.core.soft_delete import register_soft_delete_listeners
+    from msai.services.ib_account_snapshot import get_snapshot
+
+    # Soft-delete listener — default-filters ``deleted_at IS NULL`` from
+    # select(Strategy); opt-out via ``execution_options(include_deleted=True)``.
+    register_soft_delete_listeners()
 
     await _ensure_api_key_user()  # best-effort, retried on /ready
     await _start_projection_tasks()
-    # IB probe periodic task — without this the /api/v1/account/health
-    # endpoint always reports ``gateway_connected=false`` because the
-    # probe's ``check_health`` is never called. Drill 2026-04-15
-    # misled me three times before this was fixed.
     await start_ib_probe_task()
+    # IBAccountSnapshot singleton — one long-lived IB connection,
+    # 30 s background refresh. ``start()`` is synchronous so startup
+    # does NOT block when IB Gateway is unreachable.
+    get_snapshot().start()
     yield
+    await get_snapshot().stop()
     await stop_ib_probe_task()
     await _stop_projection_tasks()
 
@@ -279,9 +303,9 @@ app.include_router(graduation_router)
 app.include_router(portfolio_router)
 app.include_router(live_portfolios_router)
 app.include_router(live_portfolio_revisions_router)
-app.include_router(strategy_templates_router)
 app.include_router(alerts_router)
 app.include_router(instruments_router)
+app.include_router(system_router)
 
 
 # ---------------------------------------------------------------------------

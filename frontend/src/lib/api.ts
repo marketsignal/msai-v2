@@ -23,6 +23,35 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Format an error for user-facing toast / inline alert. Prefers the
+ * backend's ``detail`` payload (FastAPI HTTPException) so the user sees
+ * the real reason ("config_schema mismatch on field X") instead of a
+ * generic "Save failed (422)". Falls back to the HTTP status, then the
+ * raw message. Per Codex iter-1 / silent-failure-hunter F4.
+ */
+export function describeApiError(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) {
+    if (
+      err.body &&
+      typeof err.body === "object" &&
+      "detail" in err.body &&
+      err.body.detail !== null
+    ) {
+      const detail = (err.body as { detail: unknown }).detail;
+      if (typeof detail === "string") return detail;
+      try {
+        return JSON.stringify(detail);
+      } catch {
+        // ignore — fall through to the status-suffixed fallback
+      }
+    }
+    return `${fallback} (${err.status})`;
+  }
+  if (err instanceof Error) return err.message || fallback;
+  return fallback;
+}
+
 export async function apiFetch(
   path: string,
   options: RequestInit = {},
@@ -40,21 +69,37 @@ export async function apiFetch(
   return fetch(`${API_BASE}${path}`, { ...options, headers });
 }
 
+/**
+ * Throw an ``ApiError`` for a non-OK ``Response``. Best-effort JSON-parses
+ * the body so consumers can pull ``detail`` via ``describeApiError``. Shared
+ * by every fetcher in this module so the "parse body, throw" pattern lives
+ * in one place.
+ */
+async function throwApiError(
+  method: string,
+  path: string,
+  res: Response,
+): Promise<never> {
+  let body: unknown = null;
+  try {
+    body = await res.json();
+  } catch {
+    // ignore — body may be empty / non-JSON
+  }
+  throw new ApiError(
+    `${method} ${path} failed: ${res.status}`,
+    res.status,
+    body,
+  );
+}
+
 /** Fetch JSON from the API, throwing ApiError on non-2xx. */
 export async function apiGet<T>(
   path: string,
   token?: string | null,
 ): Promise<T> {
   const res = await apiFetch(path, { method: "GET" }, token);
-  if (!res.ok) {
-    let body: unknown = null;
-    try {
-      body = await res.json();
-    } catch {
-      // ignore
-    }
-    throw new ApiError(`GET ${path} failed: ${res.status}`, res.status, body);
-  }
+  if (!res.ok) await throwApiError("GET", path, res);
   return (await res.json()) as T;
 }
 
@@ -69,19 +114,7 @@ export async function apiPost<T>(
     { method: "POST", body: JSON.stringify(body) },
     token,
   );
-  if (!res.ok) {
-    let errBody: unknown = null;
-    try {
-      errBody = await res.json();
-    } catch {
-      // ignore
-    }
-    throw new ApiError(
-      `POST ${path} failed: ${res.status}`,
-      res.status,
-      errBody,
-    );
-  }
+  if (!res.ok) await throwApiError("POST", path, res);
   return (await res.json()) as T;
 }
 
@@ -734,17 +767,7 @@ export async function deleteSymbol(
     `?asset_class=${encodeURIComponent(args.asset_class)}`;
   const res = await apiFetch(path, { method: "DELETE" }, token);
   if (res.status === 204) return;
-  let body: unknown = null;
-  try {
-    body = await res.json();
-  } catch {
-    // ignore
-  }
-  throw new ApiError(
-    `DELETE /api/v1/symbols/${args.symbol} failed: ${res.status}`,
-    res.status,
-    body,
-  );
+  await throwApiError("DELETE", path, res);
 }
 
 // ──── live deployment workflow ────
@@ -867,19 +890,7 @@ export async function startPortfolio(
     },
     token,
   );
-  if (!res.ok) {
-    let errBody: unknown = null;
-    try {
-      errBody = await res.json();
-    } catch {
-      // ignore
-    }
-    throw new ApiError(
-      `POST ${path} failed: ${res.status}`,
-      res.status,
-      errBody,
-    );
-  }
+  if (!res.ok) await throwApiError("POST", path, res);
   return (await res.json()) as PortfolioStartResponse;
 }
 
@@ -921,4 +932,236 @@ export async function getRevisionMembers(
     `/api/v1/live-portfolio-revisions/${encodeURIComponent(revisionId)}/members`,
     token,
   );
+}
+
+// =====================================================================
+// T5 — UI-completeness new fetchers (Wave 2)
+// Mirror of backend schemas added/extended in Wave 1 T2/T3/T4.
+// =====================================================================
+
+// ---- Alerts (GET /api/v1/alerts/) ----
+
+export interface AlertRecord {
+  type: string;
+  level: string;
+  title: string;
+  message: string;
+  /** ISO8601 UTC string from backend. */
+  created_at: string;
+  /**
+   * iter-5 verify-e2e Issue D (P2): stable opaque id derived backend-side
+   * from sha256(type|title|created_at)[:16]. Useful for client-side dedup
+   * + permalink construction. UI still iterates by array index per
+   * R19/R22 snapshot-into-local-state.
+   */
+  id: string;
+}
+
+export interface AlertListResponse {
+  alerts: AlertRecord[];
+  /**
+   * iter-5 verify-e2e Issue D: number of records in this response.
+   * Alerts don't paginate (limit-only); ``total`` == ``alerts.length``.
+   */
+  total: number;
+}
+
+export async function getAlerts(
+  token?: string | null,
+  limit: number = 50,
+): Promise<AlertListResponse> {
+  const q = new URLSearchParams({ limit: String(limit) });
+  return apiGet<AlertListResponse>(`/api/v1/alerts/?${q.toString()}`, token);
+}
+
+// ---- Account portfolio + health (snapshot-backed) ----
+
+export interface AccountPortfolioItem {
+  // Snake-case keys MATCH the backend snapshot's ``_fetch_portfolio``
+  // shape (Codex iter-1 P0 — the previous camelCase contract rendered
+  // em-dashes for every position cell). Values are numeric on the wire
+  // (IB returns floats); we keep the strict shape and tolerate the
+  // contract evolving via optional fields.
+  symbol: string;
+  position: number;
+  market_price?: number;
+  market_value?: number;
+  average_cost?: number;
+  unrealized_pnl?: number;
+  realized_pnl?: number;
+}
+
+export async function getAccountPortfolio(
+  token?: string | null,
+): Promise<AccountPortfolioItem[]> {
+  return apiGet<AccountPortfolioItem[]>("/api/v1/account/portfolio", token);
+}
+
+/**
+ * Closed enum per Codex iter-1 P1 — the previous ``... | string`` open
+ * union was collapsed to ``string`` by TypeScript and provided zero
+ * compile-time benefit. Aligned with ``SubsystemStatus.status`` values.
+ */
+export type AccountHealthStatus = "healthy" | "unhealthy" | "unknown";
+
+export interface AccountHealth {
+  status: AccountHealthStatus;
+  gateway_connected: boolean;
+  /**
+   * iter-5 verify-e2e Issue G (P2): used to be a string ("1525") which
+   * forced every reader to ``parseInt`` and risked truthy ``"0"`` bugs.
+   * Backend `/api/v1/account/health` now returns int. Consumers can use
+   * the value directly for numeric comparisons + thresholding.
+   */
+  consecutive_failures: number;
+}
+
+export async function getAccountHealth(
+  token?: string | null,
+): Promise<AccountHealth> {
+  return apiGet<AccountHealth>("/api/v1/account/health", token);
+}
+
+// ---- System health aggregator (GET /api/v1/system/health) ----
+
+export interface SubsystemStatus {
+  /** "healthy" | "unhealthy" | "unknown" — backend uses string for forward-compat. */
+  status: string;
+  /** ISO8601 UTC timestamp of latest probe. */
+  last_checked: string;
+  detail: string | null;
+  /** Subsystems may attach arbitrary extra fields (e.g. queue_depth, total_files). */
+  [key: string]: unknown;
+}
+
+export interface SystemHealthResponse {
+  subsystems: Record<string, SubsystemStatus>;
+  version: string;
+  /** 7-char short SHA. */
+  commit_sha: string;
+  uptime_seconds: number;
+}
+
+export async function getSystemHealth(
+  token?: string | null,
+): Promise<SystemHealthResponse> {
+  return apiGet<SystemHealthResponse>("/api/v1/system/health", token);
+}
+
+// ---- Strategy CRUD extensions (PATCH / validate / DELETE) ----
+
+export interface StrategyUpdate {
+  /** PATCH body — both fields optional. Per R3, `name` is NOT editable
+   *  (registry sync overwrites from disk). */
+  description?: string | null;
+  default_config?: Record<string, unknown> | null;
+}
+
+export async function patchStrategy(
+  id: string,
+  body: StrategyUpdate,
+  token?: string | null,
+): Promise<StrategyResponse> {
+  const path = `/api/v1/strategies/${encodeURIComponent(id)}`;
+  const res = await apiFetch(
+    path,
+    { method: "PATCH", body: JSON.stringify(body) },
+    token,
+  );
+  if (!res.ok) await throwApiError("PATCH", path, res);
+  return (await res.json()) as StrategyResponse;
+}
+
+export async function validateStrategy(
+  id: string,
+  token?: string | null,
+): Promise<{ message: string }> {
+  return apiPost<{ message: string }>(
+    `/api/v1/strategies/${encodeURIComponent(id)}/validate`,
+    {},
+    token,
+  );
+}
+
+export async function deleteStrategy(
+  id: string,
+  token?: string | null,
+): Promise<{ message: string }> {
+  const path = `/api/v1/strategies/${encodeURIComponent(id)}`;
+  const res = await apiFetch(path, { method: "DELETE" }, token);
+  if (!res.ok) await throwApiError("DELETE", path, res);
+  return (await res.json()) as { message: string };
+}
+
+// ---- Live audits per deployment ----
+
+/**
+ * Closed enums for trader audit fields per Codex iter-1 P1 — open string
+ * types let `side: "buyish"` silently typecheck on a real-money platform.
+ * Backend may return additional values over time (forward-compat); we
+ * accept that risk because the trader audit log surface is high-signal.
+ */
+export type LiveAuditSide = "BUY" | "SELL";
+export type LiveAuditStatus =
+  | "submitted"
+  | "filled"
+  | "partial"
+  | "cancelled"
+  | "rejected"
+  | "expired";
+
+export interface LiveAuditRow {
+  id: string;
+  client_order_id: string;
+  instrument_id: string;
+  side: LiveAuditSide;
+  /** Decimal serialized as string (precision-sensitive). */
+  quantity: string;
+  status: LiveAuditStatus;
+  strategy_code_hash: string;
+  /** ISO8601 timestamp. */
+  timestamp: string;
+}
+
+export interface LiveAuditsResponse {
+  audits: LiveAuditRow[];
+}
+
+export async function getLiveAudits(
+  deploymentId: string,
+  token?: string | null,
+): Promise<LiveAuditsResponse> {
+  return apiGet<LiveAuditsResponse>(
+    `/api/v1/live/audits/${encodeURIComponent(deploymentId)}`,
+    token,
+  );
+}
+
+// ---- Research job cancel ----
+
+export async function cancelResearchJob(
+  id: string,
+  token?: string | null,
+): Promise<ResearchJobResponse> {
+  return apiPost<ResearchJobResponse>(
+    `/api/v1/research/jobs/${encodeURIComponent(id)}/cancel`,
+    {},
+    token,
+  );
+}
+
+// ---- /auth/me — user profile from backend claims (not MSAL idTokenClaims) ----
+
+export interface UserProfile {
+  id: string;
+  entra_id: string;
+  email: string;
+  display_name: string | null;
+  role: string | null;
+}
+
+export async function getUserProfile(
+  token?: string | null,
+): Promise<UserProfile> {
+  return apiGet<UserProfile>("/api/v1/auth/me", token);
 }

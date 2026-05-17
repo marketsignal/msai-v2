@@ -410,13 +410,10 @@ class TestSyncStrategiesToDb:
     """Tests for :func:`sync_strategies_to_db` — orphan-prune branch."""
 
     async def test_sync_prunes_row_whose_file_no_longer_exists(self, tmp_path: Path) -> None:
-        """Code-review iter-2 regression for P0 (pr-review-toolkit 2026-04-21):
-
-        The ``prune_missing=True`` branch deletes rows whose ``file_path``
-        no longer exists on disk. Prior to this test, ``Path`` was only
-        imported under ``TYPE_CHECKING`` so the ``Path(path).exists()``
-        call would ``NameError`` at runtime the first time a user renamed
-        or deleted a strategy file.
+        """Soft-prune contract (plan R2 / T3): a row whose ``file_path``
+        has vanished from disk is marked archived via ``deleted_at`` —
+        NOT hard-deleted. Hard delete would orphan historical backtest
+        and deployment foreign keys.
         """
         from msai.models.strategy import Strategy
         from msai.services.strategy_registry import sync_strategies_to_db
@@ -447,10 +444,13 @@ class TestSyncStrategiesToDb:
         )
 
         assert result == []
-        assert orphan_row in session.deleted, "Orphan row (file vanished from disk) must be pruned"
+        # Soft-prune: ``deleted_at`` is stamped, row is NOT hard-deleted.
+        assert orphan_row not in session.deleted, "Soft-prune must not hard-delete the row"
+        assert orphan_row.deleted_at is not None, "Soft-prune must stamp deleted_at"
 
     async def test_sync_keeps_orphan_row_when_prune_missing_false(self, tmp_path: Path) -> None:
-        """Opt-out: ``prune_missing=False`` keeps rows whose file disappeared."""
+        """Opt-out: ``prune_missing=False`` leaves orphan rows untouched
+        (no ``deleted_at`` stamp, no hard delete)."""
         from msai.models.strategy import Strategy
         from msai.services.strategy_registry import sync_strategies_to_db
 
@@ -476,6 +476,7 @@ class TestSyncStrategiesToDb:
         )
 
         assert orphan_row not in session.deleted
+        assert orphan_row.deleted_at is None
 
     async def test_sync_preserves_user_patched_description(
         self, example_strategies_dir: Path

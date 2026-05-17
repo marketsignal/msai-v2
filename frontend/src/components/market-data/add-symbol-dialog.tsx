@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Dialog,
   DialogContent,
@@ -49,6 +49,14 @@ interface AddSymbolDialogProps {
   onSuccess: (runId: string) => void;
   defaultStart: string;
   defaultEnd: string;
+  /**
+   * iter-5 verify-e2e P2-1 (TJ-4 deep-link): symbol pre-fill for the
+   * "Onboard via Market Data" CTA flow. When the user follows the
+   * readiness-check link `/market-data?onboard=MSFT`, the parent page
+   * passes the query-param symbol here so the dialog opens with the
+   * symbol field already populated.
+   */
+  initialSymbol?: string;
 }
 
 export function AddSymbolDialog({
@@ -57,9 +65,22 @@ export function AddSymbolDialog({
   onSuccess,
   defaultStart,
   defaultEnd,
+  initialSymbol,
 }: AddSymbolDialogProps): React.ReactElement {
   const { getToken } = useAuth();
-  const [symbol, setSymbol] = useState("");
+  const [symbol, setSymbol] = useState(initialSymbol ?? "");
+
+  // iter-5 verify-e2e P2-1: sync symbol when the parent passes a new
+  // initialSymbol AND the dialog is opening. This handles the case where
+  // the dialog component stays mounted, dialog closes, and reopens with a
+  // different deep-link symbol (the `open` transition false→true plus a
+  // new initialSymbol). Only fires on open=true to preserve user typing
+  // while the dialog is open.
+  useEffect(() => {
+    if (open && initialSymbol) {
+      setSymbol(initialSymbol);
+    }
+  }, [open, initialSymbol]);
   const [assetClass, setAssetClass] = useState<AssetClass>("equity");
   // Clamp the default start to the provider data-availability floor so the
   // documented "$0 happy path" doesn't guarantee-fail at ingest. The floor

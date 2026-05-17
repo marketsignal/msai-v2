@@ -1,84 +1,50 @@
 /**
- * Auth fixture — shared setup for authenticated tests.
+ * Auth fixture — X-API-Key + E2E AppShell bypass (R8 / R13).
  *
- * ⚠️ SECURITY WARNING
- * Playwright's `storageState` captures cookies, localStorage, AND sessionStorage
- * into a JSON file on disk. If Playwright tracing or video is enabled in CI,
- * anything in that storage can leak into CI artifacts that are downloadable by
- * anyone with repo read access. The shipped playwright.config.ts defaults trace
- * and video to `off` on CI for that reason — keep it that way unless you've
- * reviewed the risk for your project.
+ * Background: MSAL `storageState` is documented-broken
+ * (microsoft/playwright#17328) — Playwright cannot reliably persist Entra
+ * ID browser auth between specs. So for MSAI v2 E2E, we authenticate API
+ * calls via the backend's `X-API-Key` header (set in
+ * `playwright.config.ts` as `extraHTTPHeaders`), and we bypass the UI's
+ * MSAL route guard via `NEXT_PUBLIC_E2E_AUTH_BYPASS=1` (also set in
+ * `playwright.config.ts` as `webServer.env`).
  *
- * Pattern: authenticate ONCE, save storage state, reuse across all specs.
- * Avoids per-test UI login (slow, flaky).
+ * That means **no explicit login fixture is required** — every spec
+ * already has X-API-Key on its requests AND the AppShell skips the
+ * /login redirect. This file is kept only to document the contract for
+ * future readers and to surface a clear startup error when the required
+ * env vars are missing.
  *
- * Usage:
- *   1. Customize the login call below to match your API.
- *   2. Wire up a `setup` project in playwright.config.ts so this fixture
- *      runs before the main suite. See the commented block in the generated
- *      playwright.config.ts (search for "setup project").
- *   3. Set `storageState: 'tests/e2e/.auth/user.json'` on the main project's
- *      `use` config (or per-test with `test.use({ storageState: ... })`).
- *   4. See https://playwright.dev/docs/auth for patterns and options.
+ * If a future feature needs *user-specific* authentication (per-user
+ * permissions, role-gated UI by a non-viewer role), revisit this file
+ * and either (a) seed the user via the backend signup/admin API, or (b)
+ * extend the X-API-Key user mapping to choose which user the key
+ * represents per spec.
  *
- * Env vars expected:
- *   TEST_USER_EMAIL + TEST_USER_PASSWORD
+ * Required env vars at Playwright run time:
+ *   TEST_API_KEY                  — backend X-API-Key value (matches MSAI_API_KEY)
+ *   NEXT_PUBLIC_E2E_AUTH_BYPASS=1 — wired automatically via playwright.config.ts webServer.env
  *
- * The default (cookie-based session login) is the secure path: the session
- * cookie goes into storageState but is typically httpOnly/Secure, and browser
- * JS cannot exfiltrate it. The API-key-in-localStorage alternative is commented
- * out below because persisting bearer tokens in client-accessible storage
- * increases the blast radius of any artifact leak.
+ * Security note: `TEST_API_KEY` is a long-lived shared secret. In CI it
+ * should be a dedicated test key with read-mostly permissions — NOT a
+ * production key. See `docs/ci-templates/e2e.yml` for the GH secret
+ * wiring.
  */
-import { test as setup, expect } from "@playwright/test";
-import path from "path";
+import { test as setup } from "@playwright/test";
 
-const authFile = path.join(__dirname, "../.auth/user.json");
-
-setup("authenticate", async ({ page, context }): Promise<void> => {
-  const email = process.env.TEST_USER_EMAIL;
-  const password = process.env.TEST_USER_PASSWORD;
-
-  if (!email || !password) {
+setup("verify-e2e-env", async (): Promise<void> => {
+  const apiKey = process.env.TEST_API_KEY;
+  if (!apiKey) {
     throw new Error(
-      "[auth] Missing credentials. Set TEST_USER_EMAIL + TEST_USER_PASSWORD. " +
-        "For API-key auth, see the commented example in this file — but read " +
-        "the security warning at the top first.",
+      "[auth] Missing TEST_API_KEY env var. Playwright cannot authenticate " +
+        "API calls without it. Set TEST_API_KEY to the value of MSAI_API_KEY " +
+        "from the backend (or your CI's dedicated test key). See " +
+        "frontend/tests/e2e/fixtures/auth.ts for the full contract.",
     );
   }
 
-  // Default: cookie/session login via API.
-  // context.request posts through the browser context so session cookies
-  // land in the browser's cookie jar (the top-level `request` fixture has
-  // a SEPARATE jar — using it here would NOT persist cookies).
-  const response = await context.request.post("/api/auth/login", {
-    data: { email, password },
-  });
-  expect(response.ok()).toBeTruthy();
-  console.log("[auth] Authenticated via email/password (session cookie)");
-
-  // Save authenticated browser state (cookies) for reuse across specs.
-  await context.storageState({ path: authFile });
-  console.log(`[auth] State saved to ${authFile}`);
-
-  /*
-   * --- INSECURE ALTERNATIVE — LOCAL DEV ONLY ---
-   *
-   * Some apps expect a bearer token in localStorage instead of a cookie.
-   * Persisting one here means it ends up in storageState on disk AND,
-   * if tracing/video is ever turned on in CI, inside CI artifacts.
-   *
-   * Only use this path on a local dev machine with a throwaway token,
-   * and NEVER commit the generated tests/e2e/.auth/*.json file
-   * (the .gitignore shipped by setup.sh --with-playwright already excludes it).
-   *
-   *   const apiKey = process.env.TEST_API_KEY;
-   *   if (apiKey) {
-   *     await page.goto('/');
-   *     await page.evaluate((token) => {
-   *       window.localStorage.setItem('auth_token', token);
-   *     }, apiKey);
-   *     await context.storageState({ path: authFile });
-   *   }
-   */
+  console.log(
+    "[auth] X-API-Key configured via playwright.config.ts extraHTTPHeaders. " +
+      "AppShell MSAL bypass active (NEXT_PUBLIC_E2E_AUTH_BYPASS=1).",
+  );
 });

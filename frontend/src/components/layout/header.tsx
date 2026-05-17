@@ -5,6 +5,7 @@ import { useAuth } from "@/lib/auth";
 import { Button } from "@/components/ui/button";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { MobileSidebarTrigger } from "./sidebar";
+import { NotificationsBell } from "./notifications-bell";
 
 function getInitials(name: string | undefined): string {
   if (!name) return "U";
@@ -26,6 +27,7 @@ export function Header(): React.ReactElement {
       </div>
 
       <div className="flex items-center gap-3">
+        <NotificationsBell />
         {user && (
           <>
             <div className="hidden items-center gap-2 sm:flex">

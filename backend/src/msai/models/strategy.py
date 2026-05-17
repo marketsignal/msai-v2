@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import (
+    datetime,  # noqa: TC003 — SQLAlchemy Mapped[datetime | None] resolves at runtime
+)
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import ForeignKey, String, Text
+from sqlalchemy import DateTime, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -55,6 +58,16 @@ class Strategy(TimestampMixin, Base):
     )
     created_by: Mapped[UUID | None] = mapped_column(
         ForeignKey("users.id"), index=True, nullable=True
+    )
+    # Soft-delete tombstone. ``NULL`` for active rows; UTC timestamp when
+    # archived via ``DELETE /api/v1/strategies/{id}``. A global SQLAlchemy
+    # ``do_orm_execute`` listener (``msai.core.soft_delete``) filters
+    # ``deleted_at IS NOT NULL`` rows out of every ``select(Strategy)`` by
+    # default; opt back in with ``execution_options(include_deleted=True)``
+    # for DETAIL / SUPERVISOR / SYNC paths (see plan revision R20 in
+    # ``docs/plans/2026-05-16-ui-completeness.md``).
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     # Relationships
