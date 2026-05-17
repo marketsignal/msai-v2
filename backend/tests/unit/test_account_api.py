@@ -33,16 +33,28 @@ def client() -> httpx.AsyncClient:
 class _StubSnapshot:
     """Minimal stand-in for IBAccountSnapshot used by dependency-override.
 
-    Carries a non-None ``last_refresh_success_at`` so the 503 cold-start
-    guard short-circuits and the cached 200 path is exercised.
+    Carries non-None per-source last-success timestamps so both 503
+    cold-start guards (summary and portfolio) short-circuit and the
+    cached 200 path is exercised.
     """
 
     def __init__(
         self,
         summary: dict[str, float] | None = None,
         portfolio: list[dict[str, object]] | None = None,
+        *,
+        summary_at: datetime | None = None,
+        portfolio_at: datetime | None = None,
     ) -> None:
-        self.last_refresh_success_at: datetime | None = datetime.now(UTC)
+        now = datetime.now(UTC)
+        self.last_summary_success_at: datetime | None = (
+            summary_at if summary_at is not None else now
+        )
+        self.last_portfolio_success_at: datetime | None = (
+            portfolio_at if portfolio_at is not None else now
+        )
+        # Back-compat alias for callers that read `last_refresh_success_at`.
+        self.last_refresh_success_at: datetime | None = now
         self._summary = summary or {
             "net_liquidation": 100000.0,
             "buying_power": 200000.0,

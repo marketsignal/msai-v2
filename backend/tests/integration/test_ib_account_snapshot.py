@@ -306,6 +306,51 @@ class TestRefreshOnce:
         # Stability: a second call from the same PID yields the same id.
         assert client_id == snap_module._resolve_client_id()  # noqa: SLF001
 
+    async def test_summary_success_independent_of_portfolio_failure(
+        self, reset_snapshot_singleton: None
+    ) -> None:
+        """Codex iter-3 P2: a single bad portfolio row must not blank a
+        working summary. Before the fix, an AttributeError during row
+        conversion fell into the broad ``except`` and left both
+        ``_last_summary_success_at`` and ``_last_portfolio_success_at``
+        stale, so ``/account/summary`` kept returning the cold-start
+        503 even though the summary data was available.
+        """
+        _ = reset_snapshot_singleton
+
+        # Build a portfolio item missing the required ``marketPrice`` attr
+        # so ``_fetch_portfolio`` raises AttributeError during the
+        # ``float(p.marketPrice)`` step — simulates a real ib_async row
+        # with an unset PnL field (the exact scenario Codex flagged).
+        class _BadItem:
+            contract = _FakeContract(symbol="AAPL")
+            position = 1.0
+            # marketPrice deliberately absent → AttributeError on float(p.marketPrice)
+
+        fake_ib = _make_fake_ib(
+            connect_counter=[0],
+            summary_tags=[_FakeAccountValue("NetLiquidation", "12345.00")],
+        )
+        # Override fake.portfolio to return the BadItem
+        fake_ib.portfolio = MagicMock(return_value=[_BadItem()])
+
+        snapshot = snap_module.IBAccountSnapshot(host="ib-gateway", port=4002)
+        snapshot._ib = fake_ib  # noqa: SLF001
+
+        await snapshot.refresh_once()
+
+        # Summary side: success committed
+        assert snapshot.last_summary_success_at is not None, (
+            "summary success must be stamped BEFORE portfolio is attempted"
+        )
+        assert snapshot.get_summary()["net_liquidation"] == pytest.approx(12345.0)
+        # Portfolio side: never succeeded (broad except absorbed the
+        # AttributeError; portfolio cache stays in zero-state)
+        assert snapshot.last_portfolio_success_at is None
+        assert snapshot.get_portfolio() == []
+        # Back-compat composite returns the summary timestamp
+        assert snapshot.last_refresh_success_at == snapshot.last_summary_success_at
+
 
 class TestPortfolioShape:
     """The portfolio response shape must stay identical to the old
@@ -437,7 +482,7 @@ class TestConcurrentRequestsShareSnapshot:
         _ = reset_snapshot_singleton
         snapshot = snap_module.IBAccountSnapshot(host="ib-gateway", port=4002)
         # Deliberately never call refresh_once — exercises the cold-start
-        # path where ``last_refresh_success_at is None``.
+        # path where ``last_summary_success_at is None``.
         app_with_account_router.dependency_overrides[_get_snapshot_dep] = lambda: snapshot
 
         response = await client.get("/api/v1/account/summary")

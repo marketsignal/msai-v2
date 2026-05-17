@@ -160,12 +160,14 @@ class IBAccountSnapshot:
         self._summary: dict[str, float] = dict(_ZERO_SUMMARY)
         self._portfolio: list[dict[str, Any]] = []
         self._connected: bool = False
-        # SF iter-2 P1: track the timestamp of the last *successful*
-        # refresh so callers (and the /account/summary endpoint) can
-        # distinguish "snapshot returned $0 because IB is unreachable
-        # and we've never connected" from "snapshot returned $0 because
-        # IB returned $0 in a real refresh." ``None`` until first success.
-        self._last_refresh_success_at: datetime | None = None
+        # SF iter-2 P1: track per-source last-success timestamps so the
+        # /summary and /portfolio handlers can each route through their
+        # own cold-start guard. Codex iter-3 P2 caught the original
+        # combined-timestamp design: a parse error on a single IB
+        # portfolio row would leave _last_refresh_success_at stale even
+        # though summary fetched fine, keeping /summary at 503 forever.
+        self._last_summary_success_at: datetime | None = None
+        self._last_portfolio_success_at: datetime | None = None
         self._refresh_task: asyncio.Task[None] | None = None
 
     # ------------------------------------------------------------------
@@ -260,15 +262,39 @@ class IBAccountSnapshot:
         return self._connected
 
     @property
-    def last_refresh_success_at(self) -> datetime | None:
-        """Timestamp of the most recent fully-successful refresh.
+    def last_summary_success_at(self) -> datetime | None:
+        """Timestamp of the most recent successful summary fetch.
 
-        ``None`` until the first successful refresh — used by handlers
-        to distinguish "snapshot is in cold-start zero-state because IB
-        is unreachable" from "snapshot returned $0 because the account
-        is really at $0." SF iter-2 P1.
+        ``None`` until the first success. Used by ``/api/v1/account/summary``
+        to gate the cold-start 503: the snapshot's zero-state values look
+        identical to a real $0 account, so we serve 503 until proven
+        otherwise. Codex iter-3 P2: split from portfolio's timestamp so a
+        failing position-row parse doesn't blank a working summary.
         """
-        return self._last_refresh_success_at
+        return self._last_summary_success_at
+
+    @property
+    def last_portfolio_success_at(self) -> datetime | None:
+        """Timestamp of the most recent successful portfolio fetch."""
+        return self._last_portfolio_success_at
+
+    @property
+    def last_refresh_success_at(self) -> datetime | None:
+        """Most recent successful refresh of EITHER source.
+
+        Returns ``None`` only if neither summary nor portfolio has ever
+        succeeded. Kept for callers that just need "did the snapshot
+        ever connect" — handlers that distinguish per-source should
+        use :attr:`last_summary_success_at` /
+        :attr:`last_portfolio_success_at` instead.
+        """
+        summary = self._last_summary_success_at
+        portfolio = self._last_portfolio_success_at
+        if summary is None:
+            return portfolio
+        if portfolio is None:
+            return summary
+        return max(summary, portfolio)
 
     @property
     def refresh_task(self) -> asyncio.Task[None] | None:
@@ -327,20 +353,21 @@ class IBAccountSnapshot:
                     pid=os.getpid(),
                 )
 
+            # Codex iter-3 P2: commit summary success independently
+            # of portfolio. A bad position row should not blank the
+            # account-value dashboard.
             new_summary = await asyncio.wait_for(
                 self._fetch_summary(),
                 timeout=_FETCH_TIMEOUT_S,
             )
+            self._summary = new_summary
+            self._last_summary_success_at = datetime.now(UTC)
             new_portfolio = await asyncio.wait_for(
                 self._fetch_portfolio(),
                 timeout=_FETCH_TIMEOUT_S,
             )
-            self._summary = new_summary
             self._portfolio = new_portfolio
-            # SF iter-2 P1: stamp the last-success timestamp so handlers
-            # can distinguish "never connected → zero-state lying" from
-            # "really connected, account is at $0."
-            self._last_refresh_success_at = datetime.now(UTC)
+            self._last_portfolio_success_at = datetime.now(UTC)
         except asyncio.CancelledError:
             # Cancellation MUST propagate so ``stop()`` can shut the task
             # down cleanly within lifespan. Without this re-raise, the

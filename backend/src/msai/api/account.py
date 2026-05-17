@@ -167,7 +167,7 @@ async def account_summary(
     transient gateway flaps (last-known-good).
     """
     _ = claims  # auth dependency only — claims are validated in get_current_user
-    if snapshot.last_refresh_success_at is None:
+    if snapshot.last_summary_success_at is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
@@ -192,7 +192,7 @@ async def account_portfolio(
     in that case surfaces the gateway outage honestly.
     """
     _ = claims
-    if snapshot.last_refresh_success_at is None:
+    if snapshot.last_portfolio_success_at is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
