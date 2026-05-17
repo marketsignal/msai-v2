@@ -525,15 +525,36 @@ function RunBacktestDialog({
 // Metric snippet helper
 // ---------------------------------------------------------------------------
 
+/**
+ * Adaptive percent formatter — for micro-return portfolio backtests
+ * the previous ``.toFixed(1)`` collapsed both Return and Drawdown to
+ * "0.0%" / "-0.0%" (e.g. total_return = 9e-06 = 0.0009%). Pick the
+ * decimal count so the displayed value is non-zero whenever the
+ * underlying ratio is.
+ */
+function pctAdaptive(ratio: number): string {
+  const pct = ratio * 100;
+  if (pct === 0) return "0%";
+  const abs = Math.abs(pct);
+  let decimals = 1;
+  if (abs < 0.01) decimals = 4;
+  else if (abs < 0.1) decimals = 3;
+  else if (abs < 1) decimals = 2;
+  return `${pct >= 0 ? "" : ""}${pct.toFixed(decimals)}%`;
+}
+
 function metricsSnippet(metrics: Record<string, unknown> | null): string {
   if (!metrics) return "--";
   const parts: string[] = [];
-  if (typeof metrics.sharpe_ratio === "number")
-    parts.push(`S: ${metrics.sharpe_ratio.toFixed(2)}`);
+  // Backend returns ``sharpe`` (not ``sharpe_ratio``); checking the
+  // wrong key meant the Sharpe ratio NEVER rendered in this snippet
+  // before — Pablo audit 2026-05-17.
+  if (typeof metrics.sharpe === "number")
+    parts.push(`S: ${metrics.sharpe.toFixed(2)}`);
   if (typeof metrics.total_return === "number")
-    parts.push(`R: ${(metrics.total_return * 100).toFixed(1)}%`);
+    parts.push(`R: ${pctAdaptive(metrics.total_return as number)}`);
   if (typeof metrics.max_drawdown === "number")
-    parts.push(`DD: ${(metrics.max_drawdown * 100).toFixed(1)}%`);
+    parts.push(`DD: ${pctAdaptive(metrics.max_drawdown as number)}`);
   return parts.length > 0 ? parts.join(" | ") : "--";
 }
 
