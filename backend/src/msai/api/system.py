@@ -239,13 +239,20 @@ def _probe_ib_gateway() -> SubsystemStatus:
     )
 
 
-# arq stores pending jobs as Redis lists keyed by queue name.
-_WORKER_QUEUES: tuple[str, ...] = (
-    "arq:queue",
-    "msai:research",
-    "msai:portfolio",
-    "msai:ingest",
-)
+def _worker_queues() -> tuple[str, ...]:
+    """Return the active arq queue names to probe.
+
+    `"arq:queue"` is the arq library default (used by the backtest
+    `WorkerSettings` which doesn't set `queue_name`). The other three
+    are operator-overridable via env vars; reading from `settings`
+    keeps the probe accurate when `RESEARCH_QUEUE_NAME` etc. are set.
+    """
+    return (
+        "arq:queue",
+        settings.research_queue_name,
+        settings.portfolio_queue_name,
+        settings.ingest_queue_name,
+    )
 
 
 async def _probe_workers() -> SubsystemStatus:
@@ -271,7 +278,7 @@ async def _probe_workers() -> SubsystemStatus:
         # accepts the gather + so asyncio can schedule the coroutines.
         from typing import cast
 
-        coros: list[Any] = [cast("Any", client.zcard(q)) for q in _WORKER_QUEUES]
+        coros: list[Any] = [cast("Any", client.zcard(q)) for q in _worker_queues()]
         depths = await asyncio.wait_for(
             asyncio.gather(*coros),
             timeout=_QUEUE_DEPTH_TIMEOUT_S,

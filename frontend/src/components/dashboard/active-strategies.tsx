@@ -67,12 +67,18 @@ export function ActiveStrategies({
             {deployments.map((dep) => (
               <Link
                 key={dep.id}
-                href={`/strategies/${dep.strategy_id}`}
+                href={
+                  dep.strategy_id
+                    ? `/strategies/${dep.strategy_id}`
+                    : "/live-trading"
+                }
                 className="flex items-center justify-between rounded-lg border border-border/50 p-3 transition-colors hover:bg-accent/50"
               >
                 <div className="space-y-1">
                   <div className="flex items-center gap-2">
-                    <p className="text-sm font-medium">{dep.strategy_id}</p>
+                    <p className="text-sm font-medium">
+                      {dep.strategy_id ?? "—"}
+                    </p>
                     <Badge
                       variant="secondary"
                       className={statusColor(dep.status)}

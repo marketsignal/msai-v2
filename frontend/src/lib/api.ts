@@ -285,7 +285,7 @@ export interface BacktestResultsResponse {
 
 export interface LiveDeploymentInfo {
   id: string;
-  strategy_id: string;
+  strategy_id: string | null;
   status: string;
   paper_trading: boolean;
   instruments: string[] | null;

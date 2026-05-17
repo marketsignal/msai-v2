@@ -163,13 +163,18 @@ export function StrategyStatus({
             </TableHeader>
             <TableBody>
               {deployments.map((dep) => {
-                const strategyName =
-                  strategiesById?.[dep.strategy_id] ??
-                  `${dep.strategy_id.slice(0, 8)}…`;
+                // strategy_id is `UUID | None` server-side — legacy/partially
+                // migrated rows can be null. Guard before slicing.
+                const strategyName = dep.strategy_id
+                  ? (strategiesById?.[dep.strategy_id] ??
+                    `${dep.strategy_id.slice(0, 8)}…`)
+                  : "—";
                 return (
                   <TableRow key={dep.id} className="border-border/50">
                     <TableCell className="font-medium">
-                      <span title={dep.strategy_id}>{strategyName}</span>
+                      <span title={dep.strategy_id ?? "no strategy_id"}>
+                        {strategyName}
+                      </span>
                     </TableCell>
                     <TableCell>
                       <div className="flex flex-wrap gap-1">
