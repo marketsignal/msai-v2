@@ -85,11 +85,21 @@ interface StrategyStatusProps {
    * iter-2 P2 #2 caught the toast-success-but-row-stays-running gap.
    */
   onDeploymentMutated?: () => void;
+  /**
+   * Pablo 2026-05-17: the table previously rendered raw strategy_id
+   * UUIDs in the Strategy column ("6bfccf42-2765-…"), forcing the
+   * trader to mentally map UUIDs to names. Parent passes a UUID → name
+   * map so we can show ``example.smoke_market_order`` instead. Fallback
+   * to the UUID prefix if the name is missing (deployment for an
+   * archived strategy whose row is no longer in the live list).
+   */
+  strategiesById?: Record<string, string>;
 }
 
 export function StrategyStatus({
   deployments,
   onDeploymentMutated,
+  strategiesById,
 }: StrategyStatusProps): React.ReactElement {
   const { getToken } = useAuth();
   const qc = useQueryClient();
@@ -152,86 +162,91 @@ export function StrategyStatus({
               </TableRow>
             </TableHeader>
             <TableBody>
-              {deployments.map((dep) => (
-                <TableRow key={dep.id} className="border-border/50">
-                  <TableCell className="font-medium">
-                    {dep.strategy_id}
-                  </TableCell>
-                  <TableCell>
-                    <div className="flex flex-wrap gap-1">
-                      {(dep.instruments ?? []).map((inst) => (
-                        <Badge
-                          key={inst}
-                          variant="outline"
-                          className="text-xs font-normal"
-                        >
-                          {inst}
-                        </Badge>
-                      ))}
-                    </div>
-                  </TableCell>
-                  <TableCell>
-                    <Badge
-                      variant="secondary"
-                      className={statusColor(dep.status)}
-                    >
-                      {statusIcon(dep.status)}
-                      {dep.status}
-                    </Badge>
-                  </TableCell>
-                  <TableCell className="text-muted-foreground">
-                    {dep.started_at ? formatTimestamp(dep.started_at) : "--"}
-                  </TableCell>
-                  <TableCell>
-                    {/* Real-money differentiation: Paper (neutral) vs
-                        Live (red-tinted) so the mode column visually
-                        screams real-money — Code Review iter-1 P1 #3. */}
-                    {dep.paper_trading ? (
-                      <Badge
-                        variant="outline"
-                        className="gap-1 text-xs font-normal text-muted-foreground"
-                      >
-                        <TestTube2 className="size-3" aria-hidden="true" />
-                        Paper
-                      </Badge>
-                    ) : (
+              {deployments.map((dep) => {
+                const strategyName =
+                  strategiesById?.[dep.strategy_id] ??
+                  `${dep.strategy_id.slice(0, 8)}…`;
+                return (
+                  <TableRow key={dep.id} className="border-border/50">
+                    <TableCell className="font-medium">
+                      <span title={dep.strategy_id}>{strategyName}</span>
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex flex-wrap gap-1">
+                        {(dep.instruments ?? []).map((inst) => (
+                          <Badge
+                            key={inst}
+                            variant="outline"
+                            className="text-xs font-normal"
+                          >
+                            {inst}
+                          </Badge>
+                        ))}
+                      </div>
+                    </TableCell>
+                    <TableCell>
                       <Badge
                         variant="secondary"
-                        className="gap-1 bg-red-500/15 text-xs font-semibold text-red-400"
+                        className={statusColor(dep.status)}
                       >
-                        <DollarSign className="size-3" aria-hidden="true" />
-                        LIVE
+                        {statusIcon(dep.status)}
+                        {dep.status}
                       </Badge>
-                    )}
-                  </TableCell>
-                  <TableCell>
-                    <div className="flex items-center gap-2">
-                      <AuditLogSheet deploymentId={dep.id} />
-                      {["starting", "building", "ready", "running"].includes(
-                        dep.status,
-                      ) && (
-                        <Button
+                    </TableCell>
+                    <TableCell className="text-muted-foreground">
+                      {dep.started_at ? formatTimestamp(dep.started_at) : "--"}
+                    </TableCell>
+                    <TableCell>
+                      {/* Real-money differentiation: Paper (neutral) vs
+                        Live (red-tinted) so the mode column visually
+                        screams real-money — Code Review iter-1 P1 #3. */}
+                      {dep.paper_trading ? (
+                        <Badge
                           variant="outline"
-                          size="xs"
-                          className="gap-1 text-red-400 hover:text-red-300"
-                          onClick={() => stopMutation.mutate(dep.id)}
-                          disabled={
-                            stopMutation.isPending &&
-                            stopMutation.variables === dep.id
-                          }
-                          data-testid={`stop-${dep.id}`}
+                          className="gap-1 text-xs font-normal text-muted-foreground"
                         >
-                          <Square className="size-3" />
-                          {stopMutation.isPending &&
-                          stopMutation.variables === dep.id
-                            ? "Stopping…"
-                            : "Stop"}
-                        </Button>
+                          <TestTube2 className="size-3" aria-hidden="true" />
+                          Paper
+                        </Badge>
+                      ) : (
+                        <Badge
+                          variant="secondary"
+                          className="gap-1 bg-red-500/15 text-xs font-semibold text-red-400"
+                        >
+                          <DollarSign className="size-3" aria-hidden="true" />
+                          LIVE
+                        </Badge>
                       )}
-                    </div>
-                  </TableCell>
-                </TableRow>
-              ))}
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex items-center gap-2">
+                        <AuditLogSheet deploymentId={dep.id} />
+                        {["starting", "building", "ready", "running"].includes(
+                          dep.status,
+                        ) && (
+                          <Button
+                            variant="outline"
+                            size="xs"
+                            className="gap-1 text-red-400 hover:text-red-300"
+                            onClick={() => stopMutation.mutate(dep.id)}
+                            disabled={
+                              stopMutation.isPending &&
+                              stopMutation.variables === dep.id
+                            }
+                            data-testid={`stop-${dep.id}`}
+                          >
+                            <Square className="size-3" />
+                            {stopMutation.isPending &&
+                            stopMutation.variables === dep.id
+                              ? "Stopping…"
+                              : "Stop"}
+                          </Button>
+                        )}
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
             </TableBody>
           </Table>
         )}

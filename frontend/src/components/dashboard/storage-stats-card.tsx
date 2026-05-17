@@ -91,20 +91,22 @@ function StorageDetails({
       {assetClasses.length > 0 && (
         <div className="space-y-2">
           <p className="text-xs uppercase tracking-wide text-muted-foreground">
-            Files by asset class
+            Bytes by asset class
           </p>
           <div
             className="flex flex-wrap gap-2"
             data-testid="storage-asset-classes"
           >
-            {assetClasses.map(([cls, count]) => (
+            {assetClasses.map(([cls, bytes]) => (
               <Badge
                 key={cls}
                 variant="secondary"
                 className="bg-muted/60 text-muted-foreground"
               >
                 <span className="font-mono">{cls}</span>
-                <span className="ml-2 font-mono text-foreground">{count}</span>
+                <span className="ml-2 font-mono text-foreground">
+                  {formatBytes(Number(bytes))}
+                </span>
               </Badge>
             ))}
           </div>

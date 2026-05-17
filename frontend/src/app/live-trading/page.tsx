@@ -8,11 +8,13 @@ import { ResumeButton } from "@/components/live/resume-button";
 import { StrategyStatus } from "@/components/live/strategy-status";
 import { PositionsTable } from "@/components/live/positions-table";
 import {
+  apiGet,
   describeApiError,
   getLivePositions,
   getLiveStatus,
   type LivePositionItem,
   type LiveDeploymentInfo,
+  type StrategyListResponse,
 } from "@/lib/api";
 import { formatCurrency, formatSignedCurrency } from "@/lib/format";
 import { useAuth } from "@/lib/auth";
@@ -51,6 +53,37 @@ export default function LiveTradingPage(): React.ReactElement {
   // "0 positions" when the backend was actually unreachable.
   const [positionsUnavailable, setPositionsUnavailable] =
     useState<boolean>(false);
+
+  // Pablo 2026-05-17: fetch strategies so we can translate `strategy_id`
+  // UUIDs to human-readable names in the deployments table. /live/status
+  // only returns the UUID; joining client-side keeps the backend contract
+  // additive-only.
+  const [strategiesById, setStrategiesById] = useState<Record<string, string>>(
+    {},
+  );
+  useEffect(() => {
+    if (!tokenReady) return;
+    let cancelled = false;
+    void (async (): Promise<void> => {
+      try {
+        const data = await apiGet<StrategyListResponse>(
+          "/api/v1/strategies/",
+          token,
+        );
+        if (cancelled) return;
+        const map: Record<string, string> = {};
+        for (const s of data.items) map[s.id] = s.name;
+        setStrategiesById(map);
+      } catch {
+        // Non-blocking: deployments still render with UUID-prefix
+        // fallback when the strategies fetch fails.
+      }
+    })();
+    return (): void => {
+      cancelled = true;
+    };
+  }, [token, tokenReady]);
+
   const refreshStatus = useCallback(async (): Promise<void> => {
     if (!tokenReady) return;
     try {
@@ -214,7 +247,12 @@ export default function LiveTradingPage(): React.ReactElement {
         </div>
       ) : null}
 
-      {/* Summary cards */}
+      {/* Summary cards — Pablo 2026-05-17 clarification: these P&L
+          values come from MSAI's running deployments' positions, NOT
+          the full IB account. With zero running deployments the cards
+          show $0.00 which is honest but confusing if you remember the
+          $254k IB balance from /dashboard. Subtitle explicitly tells
+          the operator which slice they're seeing. */}
       <div className="grid gap-4 sm:grid-cols-3">
         <Card className="border-border/50">
           <CardHeader className="flex flex-row items-center justify-between pb-2">
@@ -231,6 +269,9 @@ export default function LiveTradingPage(): React.ReactElement {
             >
               {formatSignedCurrency(totalDailyPnl)}
             </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              From running deployments
+            </p>
           </CardContent>
         </Card>
         <Card className="border-border/50">
@@ -248,6 +289,9 @@ export default function LiveTradingPage(): React.ReactElement {
             >
               {formatSignedCurrency(totalUnrealizedPnl)}
             </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              MSAI positions only — see /account for full IB balance
+            </p>
           </CardContent>
         </Card>
         <Card className="border-border/50">
@@ -261,6 +305,9 @@ export default function LiveTradingPage(): React.ReactElement {
             <div className="text-2xl font-semibold">
               {formatCurrency(totalMarketValue)}
             </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              MSAI positions only — see /account for full IB balance
+            </p>
           </CardContent>
         </Card>
       </div>
@@ -289,6 +336,7 @@ export default function LiveTradingPage(): React.ReactElement {
 
       <StrategyStatus
         deployments={deployments}
+        strategiesById={strategiesById}
         onDeploymentMutated={() => void refreshStatus()}
       />
       <PositionsTable livePositions={positionsForTable} />
