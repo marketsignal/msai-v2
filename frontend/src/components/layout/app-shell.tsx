@@ -14,9 +14,19 @@ export function AppShell({
   children: React.ReactNode;
 }): React.ReactElement {
   const _isAuthenticated = useIsAuthenticated();
-  // DEV BYPASS: skip auth for local testing
+  // Bypass the MSAL UI gate for the three documented auth modes:
+  //   - ``NODE_ENV === "development"`` — local dev loop
+  //   - ``NEXT_PUBLIC_E2E_AUTH_BYPASS === "1"`` — Playwright E2E
+  //   - ``NEXT_PUBLIC_MSAI_API_KEY`` set — API-key-only sessions
+  // Codex iter-2 P2 #3: the API-key bypass was honored by ``useAuth()``
+  // but not by this guard, so the documented API-key flow redirected
+  // to ``/login`` in production. Mirrors ``isAuthBypassed()`` from
+  // ``lib/auth.ts``.
+  const isDevBypass = process.env.NODE_ENV === "development";
+  const isE2EBypass = process.env.NEXT_PUBLIC_E2E_AUTH_BYPASS === "1";
+  const isApiKeyBypass = Boolean(process.env.NEXT_PUBLIC_MSAI_API_KEY);
   const isAuthenticated =
-    process.env.NODE_ENV === "development" ? true : _isAuthenticated;
+    isDevBypass || isE2EBypass || isApiKeyBypass ? true : _isAuthenticated;
   const pathname = usePathname();
   const router = useRouter();
   const isPublicRoute = PUBLIC_ROUTES.includes(pathname);

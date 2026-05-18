@@ -36,18 +36,25 @@ class RegistryDefinitionNotFoundError(Exception):
 
 class AmbiguousSymbolError(Exception):
     """Raised when a raw symbol matches multiple definitions and the caller
-    did not pin ``asset_class``.
+    did not pin enough to disambiguate.
 
-    Schema uniqueness is ``(raw_symbol, provider, asset_class)`` — so a
-    single ``(raw_symbol, provider)`` pair can legitimately have multiple
-    rows across asset_classes (e.g. ``SPY`` as equity AND as option
-    underlying). Without ``asset_class`` the resolver has no deterministic
-    pick, so we refuse rather than silently grab one.
+    Two kinds of ambiguity:
 
-    Callers (e.g. ``lookup_for_live``) read ``symbol`` / ``provider`` /
-    ``asset_classes`` as attributes rather than parsing the formatted
-    message, so downstream wrapping into ``AmbiguousRegistryError`` is
-    deterministic and doesn't depend on message-string stability.
+    1. **Across asset_classes** (legacy): a single ``(raw_symbol, provider)``
+       pair has rows in multiple asset_classes (e.g. ``SPY`` as equity AND
+       as option underlying). Caller needs to specify ``asset_class``.
+    2. **Across providers** (iter-5 verify-e2e Issue F): a single
+       ``(raw_symbol, asset_class)`` pair has aliases under multiple
+       providers (e.g. AAPL registered under both ``databento`` and
+       ``interactive_brokers``), each pointing at distinct instrument_uids.
+       Caller would need to specify provider — but the readiness/resolver
+       handlers don't expose that yet, so they raise with this richer
+       context instead.
+
+    Distinguish via ``providers``: empty list ⇒ asset_class ambiguity;
+    non-empty ⇒ provider ambiguity. Callers (e.g. ``lookup_for_live``,
+    API handlers) read ``symbol`` / ``provider`` / ``asset_classes`` /
+    ``providers`` as attributes rather than parsing the message.
     """
 
     def __init__(
@@ -55,15 +62,25 @@ class AmbiguousSymbolError(Exception):
         symbol: str,
         provider: Provider,
         asset_classes: list[str],
+        providers: list[str] | None = None,
     ) -> None:
         self.symbol = symbol
         self.provider = provider
         self.asset_classes = asset_classes
-        super().__init__(
-            f"Symbol {symbol!r} matches {len(asset_classes)} definitions under "
-            f"provider {provider!r} across asset_classes {sorted(asset_classes)}; "
-            "specify asset_class explicitly."
-        )
+        self.providers = providers or []
+        if self.providers:
+            msg = (
+                f"Symbol {symbol!r} (asset_class={sorted(asset_classes)!r}) "
+                f"matches definitions under multiple providers "
+                f"{sorted(self.providers)!r}; pin provider explicitly."
+            )
+        else:
+            msg = (
+                f"Symbol {symbol!r} matches {len(asset_classes)} definitions under "
+                f"provider {provider!r} across asset_classes {sorted(asset_classes)}; "
+                "specify asset_class explicitly."
+            )
+        super().__init__(msg)
 
 
 @dataclass

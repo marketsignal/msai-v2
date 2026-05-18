@@ -149,7 +149,15 @@ async def _supervisor_is_alive(bus: LiveCommandBus) -> bool:
         consumers = await bus._redis.xinfo_consumers(  # noqa: SLF001
             LIVE_COMMAND_STREAM, LIVE_COMMAND_GROUP
         )
-    except Exception:  # noqa: BLE001 — any Redis error means "can't tell, assume dead"
+    except Exception as exc:  # noqa: BLE001 — any Redis error means "can't tell, assume dead"
+        # iter-4 SF P3: log with type so a programming bug (wrong
+        # stream/group name, redis-py API change) doesn't manifest as
+        # "supervisor permanently dead" with no forensic trail.
+        log.warning(
+            "supervisor_liveness_check_failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
         return False
     if not consumers:
         return False
@@ -824,8 +832,21 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
         # -------------------------------------------------------------
         strategy_ids = [m.strategy_id for m in members]
         strategies_by_id: dict[UUID, Strategy] = {}
+        # SUPERVISOR path opts into the soft-delete filter (plan R20): an
+        # active deployment that references a now-archived strategy must
+        # still resolve its Strategy rows so status/positions endpoints
+        # keep working until the deployment is stopped. But Codex iter-1
+        # P1 flagged that POST /start-portfolio runs through this code
+        # too — for NEW starts, an archived member must be REJECTED so
+        # the soft-delete "removed from new operations" invariant holds.
         for strat_row in (
-            (await db.execute(select(Strategy).where(Strategy.id.in_(strategy_ids))))
+            (
+                await db.execute(
+                    select(Strategy)
+                    .where(Strategy.id.in_(strategy_ids))
+                    .execution_options(include_deleted=True)
+                )
+            )
             .scalars()
             .all()
         ):
@@ -836,6 +857,25 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Strategies not found: {[str(s) for s in missing]}",
+            )
+
+        # Reject NEW starts whose members include archived strategies.
+        # Active warm-restart paths reach this same code but won't trip
+        # the check unless their members were archived in the meantime —
+        # in which case rejecting is also correct (operator must
+        # explicitly stop the deployment + re-snapshot with non-archived
+        # members). The status-poll endpoints DO NOT enter this code path,
+        # so existing running deployments keep resolving their Strategy
+        # rows via the live-status / supervisor reads.
+        archived = [str(s.id) for s in strategies_by_id.values() if s.deleted_at is not None]
+        if archived:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "Cannot start a deployment whose members include "
+                    f"archived strategies: {archived}. Snapshot a new "
+                    "revision without the archived members."
+                ),
             )
 
         # Pick the first member's strategy for the deployment row's strategy_id.
@@ -1273,8 +1313,18 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
                 deployment_slug=deployment.deployment_slug,
                 stream_name=deployment.message_bus_stream,
             )
-        except Exception:  # noqa: BLE001
-            log.debug("stream_registry_register_failed")
+        except Exception as exc:  # noqa: BLE001
+            # iter-4 SF P3: DEBUG was invisible in production. A real
+            # registration failure here leaves the deployment's events
+            # unreachable to the projection consumer (status/positions
+            # stream stops flowing) — operator should see this.
+            log.warning(
+                "stream_registry_register_failed",
+                deployment_id=str(deployment.id),
+                stream_name=deployment.message_bus_stream,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
 
         # -------------------------------------------------------------
         # Poll live_node_processes for ready / failed / running
@@ -2084,6 +2134,20 @@ async def live_positions(
     return LivePositionsResponse(positions=all_positions)
 
 
+# iter-5 verify-e2e P2-2: Nautilus stores side as an enum int (1=BUY,
+# 2=SELL) and audit/trade rows propagate it. Surfacing the raw integer
+# to the UI rendered an unintelligible "1"/"2" badge — translate at the
+# API boundary so /trades and /audits both return human-readable strings.
+_ORDER_SIDE_LABELS: dict[str, str] = {"1": "BUY", "2": "SELL"}
+
+
+def _audit_side_label(raw: str | int) -> str:
+    """Coerce a Nautilus OrderSide enum int (stored as str in audit rows)
+    to the human-readable BUY / SELL label. Unknown values pass through
+    unchanged so the UI can flag any new enum values cleanly."""
+    return _ORDER_SIDE_LABELS.get(str(raw), str(raw))
+
+
 @router.get("/trades")
 async def live_trades(
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
@@ -2128,7 +2192,7 @@ async def live_trades(
             "id": str(r.id),
             "deployment_id": str(r.deployment_id) if r.deployment_id else None,
             "instrument_id": r.instrument_id,
-            "side": r.side,
+            "side": _audit_side_label(r.side),
             "quantity": str(r.quantity),
             "price": str(r.price) if r.price else None,
             "order_type": r.order_type,
@@ -2173,7 +2237,7 @@ async def live_audits(
                 "id": str(r.id),
                 "client_order_id": r.client_order_id,
                 "instrument_id": r.instrument_id,
-                "side": r.side,
+                "side": _audit_side_label(r.side),
                 "quantity": str(r.quantity),
                 "status": r.status,
                 "strategy_code_hash": r.strategy_code_hash,

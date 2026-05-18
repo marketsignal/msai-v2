@@ -1,119 +1,81 @@
-"""IB account data queries via ib_async.
+"""Thin compatibility facade over :class:`IBAccountSnapshot`.
 
-Connects to IB Gateway for account summary and portfolio data.
-Falls back to zero-valued responses if IB Gateway is unreachable
-or ib_async is not installed (e.g., running without the live profile).
+This module previously owned the per-request IB connection pattern:
+every ``GET /api/v1/account/summary`` opened a fresh ``IB()``,
+called ``connectAsync`` with a counter-bumped client id, fetched, and
+disconnected. That worked for low traffic but accrued two problems:
+
+1. **Connection churn** — concurrent dashboard polls produced
+   overlapping connects and surfaced as intermittent
+   ``ib_account_summary_failed`` warnings.
+2. **Client-id pressure** — an unbounded
+   :func:`itertools.count` counter started at 900 and wandered
+   indefinitely, increasing collision risk with live-deployment ids.
+
+The fix lives in :mod:`msai.services.ib_account_snapshot`: one
+long-lived :class:`ib_async.IB` instance, **static** client id 900,
+30-second background refresh tied to the FastAPI lifespan.
+
+This file is kept as a small facade so any in-tree caller importing
+``IBAccountService`` continues to work — it just routes through the
+snapshot cache. No new ``connectAsync`` happens on the request path.
+
+New code should depend on
+:func:`msai.services.ib_account_snapshot.get_snapshot` directly.
 """
 
 from __future__ import annotations
 
-import itertools as _itertools
-from contextlib import suppress
 from typing import Any
 
 from msai.core.logging import get_logger
+from msai.services.ib_account_snapshot import (
+    _PROBE_INTERVAL_S,  # re-exported for tests that previously imported this constant
+    IBAccountSnapshot,
+    get_snapshot,
+)
 
 log = get_logger(__name__)
 
-try:
-    from ib_async import IB
-except ImportError:
-    IB = None  # type: ignore[assignment,misc]
 
-# Dedicated client ID for read-only account queries.
-# 0 is reserved by IB as the master client; live_node_config derives
-# per-deployment IDs from the deployment_slug hash. 99 is safe.
-# Incrementing client ID avoids collision when multiple workers
-# or concurrent requests connect simultaneously. IB rejects
-# duplicate client IDs on the same gateway.
-_ACCOUNT_CLIENT_COUNTER = _itertools.count(start=900)
-
-_ZERO_SUMMARY: dict[str, float] = {
-    "net_liquidation": 0.0,
-    "buying_power": 0.0,
-    "margin_used": 0.0,
-    "available_funds": 0.0,
-    "unrealized_pnl": 0.0,
-    "realized_pnl": 0.0,
-}
+# Re-export the zero-summary shape for any historical test that imported it.
+# The constants now live on :class:`IBAccountSnapshot` but a backward
+# compatible alias avoids surprise breakage for in-flight branches.
+__all__ = [
+    "IBAccountService",
+    "_PROBE_INTERVAL_S",
+]
 
 
 class IBAccountService:
-    """Queries IB Gateway for account data.
+    """Deprecated facade — kept for backward compatibility.
 
-    Falls back gracefully to zero-valued responses if IB Gateway
-    is unreachable or ``ib_async`` is not installed.
+    Reads cached values from the process-wide :class:`IBAccountSnapshot`
+    rather than opening a fresh IB connection. The ``host`` and ``port``
+    constructor arguments are accepted for API compatibility but
+    ignored: the snapshot was already created with the right values
+    from :class:`msai.core.config.Settings` at FastAPI startup.
 
-    Args:
-        host: IB Gateway hostname (default from settings).
-        port: IB Gateway API port (default ``4002`` for paper trading).
+    Prefer calling :func:`get_snapshot` directly in new code.
     """
 
-    def __init__(self, host: str = "ib-gateway", port: int = 4002) -> None:
-        self.host = host
-        self.port = port
+    def __init__(
+        self,
+        host: str = "ib-gateway",  # noqa: ARG002 - compat only
+        port: int = 4002,  # noqa: ARG002 - compat only
+    ) -> None:
+        # ``host`` / ``port`` are no longer used here: the singleton
+        # snapshot is the source of truth and is configured from
+        # ``settings.ib_*`` in :func:`get_snapshot`. We accept the
+        # parameters so callers built against the old API still work.
+        pass
 
     async def get_summary(self) -> dict[str, float]:
-        """Return account summary. Zero-valued dict if IB unreachable."""
-        if IB is None:
-            log.debug("ib_async_not_installed")
-            return dict(_ZERO_SUMMARY)
-
-        ib = IB()
-        try:
-            await ib.connectAsync(
-                self.host, self.port, clientId=next(_ACCOUNT_CLIENT_COUNTER), timeout=5
-            )
-            import asyncio as _asyncio
-
-            tags = await _asyncio.wait_for(ib.accountSummaryAsync(), timeout=10)
-            result = dict(_ZERO_SUMMARY)
-            tag_map = {
-                "NetLiquidation": "net_liquidation",
-                "BuyingPower": "buying_power",
-                "TotalCashValue": "available_funds",
-                "MaintMarginReq": "margin_used",
-                "UnrealizedPnL": "unrealized_pnl",
-                "RealizedPnL": "realized_pnl",
-            }
-            for item in tags:
-                key = tag_map.get(item.tag)
-                if key:
-                    with suppress(ValueError, TypeError):
-                        result[key] = float(item.value)
-            return result
-        except Exception:
-            log.warning("ib_account_summary_failed", host=self.host, port=self.port)
-            return dict(_ZERO_SUMMARY)
-        finally:
-            ib.disconnect()
+        """Return the latest cached account summary."""
+        snapshot: IBAccountSnapshot = get_snapshot()
+        return snapshot.get_summary()
 
     async def get_portfolio(self) -> list[dict[str, Any]]:
-        """Return current IB portfolio positions. Empty list if unreachable."""
-        if IB is None:
-            return []
-
-        ib = IB()
-        try:
-            await ib.connectAsync(
-                self.host, self.port, clientId=next(_ACCOUNT_CLIENT_COUNTER), timeout=5
-            )
-            positions = ib.portfolio()
-            return [
-                {
-                    "symbol": p.contract.symbol,
-                    "sec_type": p.contract.secType,
-                    "position": float(p.position),
-                    "market_price": float(p.marketPrice),
-                    "market_value": float(p.marketValue),
-                    "average_cost": float(p.averageCost),
-                    "unrealized_pnl": float(p.unrealizedPNL),
-                    "realized_pnl": float(p.realizedPNL),
-                }
-                for p in positions
-            ]
-        except Exception:
-            log.warning("ib_portfolio_failed", host=self.host, port=self.port)
-            return []
-        finally:
-            ib.disconnect()
+        """Return the latest cached portfolio positions."""
+        snapshot: IBAccountSnapshot = get_snapshot()
+        return snapshot.get_portfolio()

@@ -43,7 +43,12 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useAuth } from "@/lib/auth";
-import { ApiError, getRevisionMembers, startPortfolio } from "@/lib/api";
+import {
+  ApiError,
+  describeApiError,
+  getRevisionMembers,
+  startPortfolio,
+} from "@/lib/api";
 import type {
   LivePortfolioMemberFrozen,
   LivePortfolioRevision,
@@ -263,13 +268,9 @@ export function PortfolioStartDialog(
       setMembers(rows);
       setStage("preview");
     } catch (err) {
-      const msg =
-        err instanceof ApiError
-          ? `Failed to load revision members: ${err.status}`
-          : err instanceof Error
-            ? err.message
-            : "Failed to load revision members.";
-      setFormError(msg);
+      // iter-3 describeApiError sweep: surface the backend's HTTPException
+      // detail (e.g. "revision_not_found") instead of the bare HTTP status.
+      setFormError(describeApiError(err, "Failed to load revision members."));
     } finally {
       setMembersLoading(false);
     }
@@ -323,13 +324,8 @@ export function PortfolioStartDialog(
         setStage(errorStage);
         return;
       }
-      const msg =
-        err instanceof ApiError
-          ? `Deploy failed: ${err.status}`
-          : err instanceof Error
-            ? err.message
-            : "Deploy failed.";
-      setSubmitError(msg);
+      // iter-3 describeApiError sweep: extract HTTPException detail.
+      setSubmitError(describeApiError(err, "Deploy failed."));
       setStage(paperTrading ? "preview" : "confirm");
     } finally {
       setSubmitting(false);

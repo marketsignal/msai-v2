@@ -32,6 +32,17 @@ export default defineConfig({
     // Base URL — override via PLAYWRIGHT_BASE_URL env var
     baseURL: process.env.PLAYWRIGHT_BASE_URL || "http://localhost:3300",
 
+    // X-API-Key auth bypass (R13/R8 + research finding 5).
+    // MSAL storageState is documented-broken (microsoft/playwright#17328),
+    // so Playwright authenticates API calls via the backend's X-API-Key
+    // header. `NEXT_PUBLIC_E2E_AUTH_BYPASS=1` makes the AppShell skip
+    // MSAL redirect at the UI level (see frontend/src/components/layout/app-shell.tsx).
+    // CI must set both: a `TEST_API_KEY` secret AND
+    // `NEXT_PUBLIC_E2E_AUTH_BYPASS=1` at build/dev-server time.
+    extraHTTPHeaders: {
+      "X-API-Key": process.env.TEST_API_KEY ?? "",
+    },
+
     // SECURITY: trace and video are OFF by default in CI.
     //
     // Why: storageState (see below) persists cookies + localStorage for
@@ -85,11 +96,17 @@ export default defineConfig({
     // { name: 'webkit',  use: { ...devices['Desktop Safari'] } },
   ],
 
-  // Dev server auto-start (optional — uncomment and adjust for your project)
-  // webServer: {
-  //   command: 'pnpm dev',
-  //   url: 'http://localhost:3000',
-  //   reuseExistingServer: !process.env.CI,
-  //   timeout: 120_000,
-  // },
+  // Dev server auto-start (R13). pnpm dev forwards args via `--`; the
+  // Playwright baseURL above pins port 3300 so dev-server + baseURL stay
+  // aligned. `reuseExistingServer: !CI` lets local Docker-served stacks
+  // be reused; CI starts its own dev server.
+  webServer: {
+    command: "pnpm dev -- --port 3300",
+    url: "http://localhost:3300",
+    reuseExistingServer: !process.env.CI,
+    timeout: 120_000,
+    env: {
+      NEXT_PUBLIC_E2E_AUTH_BYPASS: "1",
+    },
+  },
 });

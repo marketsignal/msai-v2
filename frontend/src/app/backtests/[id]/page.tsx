@@ -18,6 +18,7 @@ import {
   apiFetch,
   apiGet,
   ApiError,
+  describeApiError,
   type BacktestResultsResponse,
   type BacktestStatusResponse,
 } from "@/lib/api";
@@ -180,7 +181,18 @@ export default function BacktestDetailPage({
         token,
       );
       if (!res.ok) {
-        throw new Error(`Download failed: ${res.status}`);
+        // iter-3 SF P2: throw ApiError with the parsed body so the catch
+        // site's ``describeApiError`` can extract the backend's detail
+        // (e.g. "report_signing_secret_unset", "backtest_not_found").
+        // Previously the throw stripped the body and only the status
+        // survived.
+        let body: unknown = null;
+        try {
+          body = await res.json();
+        } catch {
+          // ignore — body may be empty or non-JSON; ApiError tolerates null
+        }
+        throw new ApiError(`Download failed: ${res.status}`, res.status, body);
       }
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
@@ -193,10 +205,9 @@ export default function BacktestDetailPage({
       URL.revokeObjectURL(url);
     } catch (err) {
       console.error("Report download failed:", err);
+      // iter-3 describeApiError sweep.
       setError(
-        err instanceof Error
-          ? `Report download failed: ${err.message}`
-          : "Report download failed",
+        `Report download failed: ${describeApiError(err, "Unknown error")}`,
       );
     }
   };

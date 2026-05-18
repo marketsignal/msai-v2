@@ -222,13 +222,19 @@ def _build_production_payload_factory(
                         f"has no strategy members"
                     )
 
-                # Load all Strategy rows referenced by members
+                # Load all Strategy rows referenced by members. SUPERVISOR
+                # path opts into the soft-delete filter (plan R20): a live
+                # deployment whose strategy has since been archived must
+                # still resolve its Strategy row so the supervisor can
+                # construct the TradingNode payload without crashing.
                 member_strategy_ids = [m.strategy_id for m in members]
                 strategies_by_id: dict[UUID, Strategy] = {}
                 for strat_row in (
                     (
                         await session.execute(
-                            select(Strategy).where(Strategy.id.in_(member_strategy_ids))
+                            select(Strategy)
+                            .where(Strategy.id.in_(member_strategy_ids))
+                            .execution_options(include_deleted=True)
                         )
                     )
                     .scalars()

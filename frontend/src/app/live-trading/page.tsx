@@ -1,24 +1,20 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import Link from "next/link";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  TrendingUp,
-  DollarSign,
-  Wifi,
-  ArrowRight,
-  AlertTriangle,
-} from "lucide-react";
+import { TrendingUp, DollarSign, Wifi, AlertTriangle } from "lucide-react";
 import { KillSwitch } from "@/components/live/kill-switch";
 import { ResumeButton } from "@/components/live/resume-button";
 import { StrategyStatus } from "@/components/live/strategy-status";
 import { PositionsTable } from "@/components/live/positions-table";
 import {
+  apiGet,
+  describeApiError,
   getLivePositions,
   getLiveStatus,
   type LivePositionItem,
   type LiveDeploymentInfo,
+  type StrategyListResponse,
 } from "@/lib/api";
 import { formatCurrency, formatSignedCurrency } from "@/lib/format";
 import { useAuth } from "@/lib/auth";
@@ -51,6 +47,43 @@ export default function LiveTradingPage(): React.ReactElement {
   // Fetch real deployments + global state from /api/v1/live/status.
   const [deployments, setDeployments] = useState<LiveDeploymentInfo[]>([]);
   const [riskHalted, setRiskHalted] = useState<boolean>(false);
+  // iter-3 SF P1: positionsUnavailable distinguishes "no positions" (real
+  // empty state) from "live/positions fetch failed". Passed to PositionsTable
+  // + factored into KillSwitch's positionCount so the operator isn't told
+  // "0 positions" when the backend was actually unreachable.
+  const [positionsUnavailable, setPositionsUnavailable] =
+    useState<boolean>(false);
+
+  // Pablo 2026-05-17: fetch strategies so we can translate `strategy_id`
+  // UUIDs to human-readable names in the deployments table. /live/status
+  // only returns the UUID; joining client-side keeps the backend contract
+  // additive-only.
+  const [strategiesById, setStrategiesById] = useState<Record<string, string>>(
+    {},
+  );
+  useEffect(() => {
+    if (!tokenReady) return;
+    let cancelled = false;
+    void (async (): Promise<void> => {
+      try {
+        const data = await apiGet<StrategyListResponse>(
+          "/api/v1/strategies/",
+          token,
+        );
+        if (cancelled) return;
+        const map: Record<string, string> = {};
+        for (const s of data.items) map[s.id] = s.name;
+        setStrategiesById(map);
+      } catch {
+        // Non-blocking: deployments still render with UUID-prefix
+        // fallback when the strategies fetch fails.
+      }
+    })();
+    return (): void => {
+      cancelled = true;
+    };
+  }, [token, tokenReady]);
+
   const refreshStatus = useCallback(async (): Promise<void> => {
     if (!tokenReady) return;
     try {
@@ -58,8 +91,13 @@ export default function LiveTradingPage(): React.ReactElement {
       setDeployments(status.deployments);
       setRiskHalted(status.risk_halted);
       setApiError(null);
-    } catch {
-      setApiError("Failed to load deployments");
+    } catch (err) {
+      // iter-3 SF P1: bare catch swallowed the real cause. The
+      // /live/status endpoint drives the risk-halted banner + Resume
+      // button + active-deployment count — a 5xx silently degrading to
+      // "no deployments" was actively misleading. Surface the detail
+      // via describeApiError.
+      setApiError(describeApiError(err, "Failed to load deployments"));
       setDeployments([]);
     }
   }, [token, tokenReady]);
@@ -77,9 +115,24 @@ export default function LiveTradingPage(): React.ReactElement {
     void (async (): Promise<void> => {
       try {
         const data = await getLivePositions(token);
-        if (!cancelled) setRestPositions(data.positions);
-      } catch {
-        // Backend unreachable — leave empty
+        if (!cancelled) {
+          setRestPositions(data.positions);
+          setPositionsUnavailable(false);
+        }
+      } catch (err) {
+        // iter-3 SF P1: bare catch + "leave empty" comment was exactly
+        // the silent-failure pattern. positionsUnavailable flag now
+        // distinguishes a real empty list from a fetch failure so
+        // KillSwitch's positionCount doesn't lie ("0 positions" → kill
+        // is safe vs. "?" → unknown).
+        if (!cancelled) {
+          setRestPositions([]);
+          setPositionsUnavailable(true);
+          console.error(
+            "live_positions_fetch_failed",
+            describeApiError(err, "REST positions fetch failed"),
+          );
+        }
       }
     })();
     return (): void => {
@@ -126,26 +179,13 @@ export default function LiveTradingPage(): React.ReactElement {
 
   return (
     <div className="space-y-6">
-      {/* Deploy New Portfolio entry point */}
-      <Link
-        data-testid="live-portfolio-deploy-link"
-        href="/live-trading/portfolio"
-        className="group flex items-center justify-between rounded-lg border border-border/60 bg-card/40 p-4 transition-colors hover:border-emerald-500/50 hover:bg-emerald-500/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-      >
-        <div>
-          <p className="text-sm font-medium text-foreground">
-            Deploy New Portfolio
-          </p>
-          <p className="text-xs text-muted-foreground">
-            Pick a portfolio revision, validate risk, and start a live
-            deployment.
-          </p>
-        </div>
-        <ArrowRight
-          className="size-4 text-muted-foreground transition-transform group-hover:translate-x-0.5"
-          aria-hidden="true"
-        />
-      </Link>
+      {/* "Deploy New Portfolio" entry point intentionally REMOVED. The
+          /live-trading/portfolio compose route is hard-disabled (returns
+          404) per council verdict 2026-05-17 — see
+          docs/decisions/2026-05-17-portfolio-backtest-deferred.md. Live
+          deployments today are seeded via the public API + Phase 1 git-
+          file strategy registration; portfolio-from-UI compose is queued
+          for a dedicated /new-feature portfolio-backtest PR. */}
 
       {/* Page header */}
       <div className="flex items-start justify-between">
@@ -181,6 +221,7 @@ export default function LiveTradingPage(): React.ReactElement {
             <KillSwitch
               activeCount={activeCount}
               positionCount={positionCount}
+              positionsUnavailable={!usingLive && positionsUnavailable}
               onKilled={() => {
                 void refreshStatus();
               }}
@@ -206,7 +247,12 @@ export default function LiveTradingPage(): React.ReactElement {
         </div>
       ) : null}
 
-      {/* Summary cards */}
+      {/* Summary cards — Pablo 2026-05-17 clarification: these P&L
+          values come from MSAI's running deployments' positions, NOT
+          the full IB account. With zero running deployments the cards
+          show $0.00 which is honest but confusing if you remember the
+          $254k IB balance from /dashboard. Subtitle explicitly tells
+          the operator which slice they're seeing. */}
       <div className="grid gap-4 sm:grid-cols-3">
         <Card className="border-border/50">
           <CardHeader className="flex flex-row items-center justify-between pb-2">
@@ -223,6 +269,9 @@ export default function LiveTradingPage(): React.ReactElement {
             >
               {formatSignedCurrency(totalDailyPnl)}
             </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              From running deployments
+            </p>
           </CardContent>
         </Card>
         <Card className="border-border/50">
@@ -240,6 +289,9 @@ export default function LiveTradingPage(): React.ReactElement {
             >
               {formatSignedCurrency(totalUnrealizedPnl)}
             </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              MSAI positions only — see /account for full IB balance
+            </p>
           </CardContent>
         </Card>
         <Card className="border-border/50">
@@ -253,6 +305,9 @@ export default function LiveTradingPage(): React.ReactElement {
             <div className="text-2xl font-semibold">
               {formatCurrency(totalMarketValue)}
             </div>
+            <p className="mt-1 text-xs text-muted-foreground">
+              MSAI positions only — see /account for full IB balance
+            </p>
           </CardContent>
         </Card>
       </div>
@@ -263,7 +318,27 @@ export default function LiveTradingPage(): React.ReactElement {
         </div>
       )}
 
-      <StrategyStatus deployments={deployments} />
+      {/* iter-4 SF P2: a /live/positions REST failure was previously
+          only visible inside the KillSwitch confirm dialog. Surface it
+          at the page top so an operator who never opens the dialog
+          isn't misled into thinking the account is flat. */}
+      {positionsUnavailable && !usingLive ? (
+        <div
+          data-testid="live-positions-unavailable-banner"
+          role="alert"
+          className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-300"
+        >
+          Open positions could not be loaded — kill-switch displays unverified
+          counts. Confirm flatness via the IB portal before relying on the count
+          below.
+        </div>
+      ) : null}
+
+      <StrategyStatus
+        deployments={deployments}
+        strategiesById={strategiesById}
+        onDeploymentMutated={() => void refreshStatus()}
+      />
       <PositionsTable livePositions={positionsForTable} />
     </div>
   );

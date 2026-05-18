@@ -17,7 +17,7 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { useAuth } from "@/lib/auth";
-import { resumeLive } from "@/lib/api";
+import { describeApiError, resumeLive } from "@/lib/api";
 
 interface ResumeButtonProps {
   riskHalted: boolean;
@@ -50,9 +50,9 @@ export function ResumeButton({
       toast.success("Live trading resumed");
       onResumed?.();
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Failed to resume trading";
-      toast.error(message);
+      // iter-3 describeApiError sweep: backend may return 409 (already
+      // resumed) or 503 (Redis unreachable) — surface detail.
+      toast.error(describeApiError(error, "Failed to resume trading"));
       console.error("Resume live failed:", error);
     } finally {
       setSubmitting(false);

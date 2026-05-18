@@ -25,11 +25,25 @@ import {
   apiGet,
   apiPost,
   ApiError,
+  cancelResearchJob,
+  describeApiError,
   type ResearchJobDetailResponse,
   type ResearchPromotionResponse,
   type StrategyListResponse,
   type StrategyResponse,
 } from "@/lib/api";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
+import { Ban } from "lucide-react";
 import { useAuth } from "@/lib/auth";
 import { formatDateTime } from "@/lib/format";
 import { statusColor, jobTypeLabel } from "@/lib/status";
@@ -91,11 +105,8 @@ export default function ResearchDetailPage({
       if (err instanceof ApiError && err.status === 404) {
         setNotFound(true);
       } else {
-        const msg =
-          err instanceof ApiError
-            ? `Failed to load research job (${err.status})`
-            : "Failed to load research job";
-        setError(msg);
+        // iter-3 describeApiError sweep.
+        setError(describeApiError(err, "Failed to load research job"));
       }
     } finally {
       setLoading(false);
@@ -134,11 +145,10 @@ export default function ResearchDetailPage({
       );
       setPromotionResult(result);
     } catch (err) {
-      const msg =
-        err instanceof ApiError
-          ? `Promotion failed (${err.status})`
-          : "Promotion failed";
-      setError(msg);
+      // iter-3 describeApiError sweep: 409/422 from /api/v1/research/
+      // promotions carries the reason ("candidate not optimisation-
+      // eligible") in detail; raw status code throws that away.
+      setError(describeApiError(err, "Promotion failed"));
     } finally {
       setPromoting(false);
     }
@@ -202,16 +212,26 @@ export default function ResearchDetailPage({
             </p>
           </div>
         </div>
-        {job.status === "completed" && !promotionResult && (
-          <Button
-            className="gap-1.5"
-            onClick={() => void handlePromote()}
-            disabled={promoting}
-          >
-            <Trophy className="size-3.5" />
-            {promoting ? "Promoting..." : "Promote Best Config"}
-          </Button>
-        )}
+        <div className="flex items-center gap-2">
+          {(job.status === "pending" || job.status === "running") && (
+            <CancelJobButton
+              jobId={job.id}
+              onCancelled={() => {
+                void load();
+              }}
+            />
+          )}
+          {job.status === "completed" && !promotionResult && (
+            <Button
+              className="gap-1.5"
+              onClick={() => void handlePromote()}
+              disabled={promoting}
+            >
+              <Trophy className="size-3.5" />
+              {promoting ? "Promoting..." : "Promote Best Config"}
+            </Button>
+          )}
+        </div>
       </div>
 
       {/* Progress bar for running jobs */}
@@ -365,5 +385,82 @@ export default function ResearchDetailPage({
         </Card>
       )}
     </div>
+  );
+}
+
+function CancelJobButton({
+  jobId,
+  onCancelled,
+}: {
+  jobId: string;
+  onCancelled: () => void;
+}): React.ReactElement {
+  const { getToken } = useAuth();
+  const [open, setOpen] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleCancel = async (): Promise<void> => {
+    setSubmitting(true);
+    setError(null);
+    try {
+      const token = await getToken();
+      await cancelResearchJob(jobId, token);
+      setOpen(false);
+      onCancelled();
+    } catch (err) {
+      setError(describeApiError(err, "Cancel failed"));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <AlertDialog open={open} onOpenChange={setOpen}>
+      <AlertDialogTrigger asChild>
+        <Button
+          variant="outline"
+          size="sm"
+          className="gap-1.5 text-red-400 hover:text-red-300"
+          data-testid="research-cancel"
+        >
+          <Ban className="size-3.5" aria-hidden="true" />
+          Cancel job
+        </Button>
+      </AlertDialogTrigger>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Cancel this research job?</AlertDialogTitle>
+          <AlertDialogDescription>
+            Stops the running sweep/walk-forward. Trials already completed stay
+            in history; trials in flight are abandoned. Cannot be resumed.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        {error && (
+          <p
+            className="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-400"
+            role="alert"
+          >
+            {error}
+          </p>
+        )}
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={submitting}>
+            Keep running
+          </AlertDialogCancel>
+          <AlertDialogAction
+            disabled={submitting}
+            onClick={(e) => {
+              e.preventDefault();
+              void handleCancel();
+            }}
+            className="bg-red-500/90 text-red-50 hover:bg-red-500"
+            data-testid="research-cancel-confirm"
+          >
+            {submitting ? "Cancelling…" : "Cancel job"}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
   );
 }

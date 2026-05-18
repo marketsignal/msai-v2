@@ -13,7 +13,11 @@ import {
 import { Button } from "@/components/ui/button";
 import { OctagonX, AlertTriangle } from "lucide-react";
 import { useAuth } from "@/lib/auth";
-import { killAllLive, type LiveKillAllResponse } from "@/lib/api";
+import {
+  describeApiError,
+  killAllLive,
+  type LiveKillAllResponse,
+} from "@/lib/api";
 import { FlatnessDisplay } from "@/components/live/flatness-display";
 
 interface KillSwitchProps {
@@ -27,12 +31,20 @@ interface KillSwitchProps {
    * have to manually reload to see the Resume action.
    */
   onKilled?: () => void | Promise<void>;
+  /**
+   * iter-3 SF P1: when the parent's positions fetch failed, ``positionCount``
+   * is artificially 0 but the operator should not be told "0 positions"
+   * (which reads as "kill is safe"). Set this flag to render "?" + a
+   * warning that position count is unverified.
+   */
+  positionsUnavailable?: boolean;
 }
 
 export function KillSwitch({
   activeCount,
   positionCount,
   onKilled,
+  positionsUnavailable,
 }: KillSwitchProps): React.ReactElement {
   const { getToken } = useAuth();
   const [open, setOpen] = useState(false);
@@ -51,9 +63,9 @@ export function KillSwitch({
       await onKilled?.();
     } catch (error) {
       console.error("Kill all failed:", error);
-      setKillError(
-        error instanceof Error ? error.message : "Kill-all request failed",
-      );
+      // iter-3 describeApiError sweep: surface backend HTTPException detail
+      // (e.g. "no_active_deployments") instead of the raw fetch error.
+      setKillError(describeApiError(error, "Kill-all request failed"));
     }
     setOpen(false);
   };
@@ -81,9 +93,19 @@ export function KillSwitch({
               Are you sure you want to stop all trading activity?
             </p>
             <p className="mt-1 text-xs text-red-400/80">
-              {activeCount} active deployment(s) and {positionCount} open
-              position(s) will be affected.
+              {activeCount} active deployment(s) and{" "}
+              {positionsUnavailable ? "?" : positionCount} open position(s) will
+              be affected.
             </p>
+            {positionsUnavailable ? (
+              <p
+                data-testid="kill-switch-positions-unavailable"
+                className="mt-1 text-xs text-amber-400"
+              >
+                Position count is unverified (broker fetch failed) — confirm via
+                the IB portal before relying on flatness.
+              </p>
+            ) : null}
           </div>
           <DialogFooter className="gap-2">
             <Button variant="outline" onClick={() => setOpen(false)}>

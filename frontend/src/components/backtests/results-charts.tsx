@@ -33,7 +33,7 @@ import type {
   SeriesPayload,
   SeriesStatus,
 } from "@/lib/api";
-import { formatCurrency, formatPercent } from "@/lib/format";
+import { formatPercent } from "@/lib/format";
 
 export interface ResultsChartsBacktest {
   sharpeRatio: number;
@@ -240,6 +240,94 @@ function formatTickDate(isoDate: string): string {
 /** Show roughly one X-axis tick per month on the daily series. */
 const DAILY_CHART_TICK_INTERVAL = 30;
 
+/**
+ * Compute an adaptive Y-axis domain for the equity curve.
+ *
+ * Why: hardcoded ``[dataMin - 2000, dataMax + 2000]`` made small-return
+ * backtests render as a flat line because the data range (e.g. $0.74 over
+ * a 0.08% return on $100k) was dwarfed by the ±$2,000 padding. Use the
+ * larger of (5% of range) and (0.05% of dataMin, i.e. ~$50 on a $100k
+ * account) so micro-returns still show curvature without huge-equity
+ * backtests being too tight.
+ *
+ * Returns a Recharts-compatible ``[min, max]`` tuple. Empty data → [0, 0]
+ * (Recharts handles gracefully — the chart renders no line in that case).
+ */
+/**
+ * Format a cumulative-return-% value for the equity-curve Y-axis.
+ *
+ * Pablo 2026-05-17: prefers cumulative return % over raw dollar equity
+ * because % growth compounds visibly over the backtest window — small
+ * early returns ARE visible against the rest of the trajectory rather
+ * than being dwarfed by the $-magnitude.
+ *
+ * Adaptive precision: when the cumulative-return range is large
+ * (multi-percent), 1 decimal is enough. When it's a micro-return run
+ * (<0.5% total), bump to 2–3 decimals.
+ */
+function returnTickFormatter(cumReturnPct: number[]): (v: number) => string {
+  if (cumReturnPct.length === 0) return (v) => `${v.toFixed(2)}%`;
+  let min = cumReturnPct[0];
+  let max = cumReturnPct[0];
+  for (const v of cumReturnPct) {
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+  const range = max - min;
+  // step ≈ range / 8 ticks. Pick decimals so the step is at least one
+  // unit on the displayed scale, capped at 3 decimals for readability.
+  const step = range / 8;
+  let decimals = 2;
+  if (step > 0 && step < 0.1) {
+    decimals = Math.min(3, Math.max(2, Math.ceil(-Math.log10(step))));
+  } else if (step >= 1) {
+    decimals = 1;
+  }
+  return (v: number) => `${v >= 0 ? "+" : ""}${v.toFixed(decimals)}%`;
+}
+
+/**
+ * Compute an adaptive Y-axis domain for the cumulative-return % series.
+ * Same pattern as ``equityYDomain`` but operates on percent values: pads
+ * by max(5% of range, 0.001%, ~0.01% of base scale) so a flat / micro
+ * return series still shows curvature with breathing room above/below.
+ */
+/**
+ * Drawdown tick formatter with adaptive precision. The backend stores
+ * drawdown as a ratio (-0.083 = -8.3%); pre-fix every label collapsed
+ * to "-0.0%" for micro-drawdown runs. Picks decimals from the data
+ * magnitude so small drawdowns still differentiate ticks.
+ */
+function drawdownTickFormatter(
+  daily: { drawdown: number }[],
+): (v: number) => string {
+  if (daily.length === 0) return (v) => `${(v * 100).toFixed(1)}%`;
+  let mostNegative = 0;
+  for (const p of daily) {
+    if (p.drawdown < mostNegative) mostNegative = p.drawdown;
+  }
+  // mostNegative is in ratio form; convert to displayed % magnitude.
+  const magnitudePct = Math.abs(mostNegative) * 100;
+  let decimals = 1;
+  if (magnitudePct > 0 && magnitudePct < 1) {
+    decimals = Math.min(4, Math.max(2, Math.ceil(-Math.log10(magnitudePct))));
+  }
+  return (v: number) => `${(v * 100).toFixed(decimals)}%`;
+}
+
+function returnYDomain(cumReturnPct: number[]): [number, number] {
+  if (cumReturnPct.length === 0) return [0, 0];
+  let min = cumReturnPct[0];
+  let max = cumReturnPct[0];
+  for (const v of cumReturnPct) {
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+  const range = max - min;
+  const padding = Math.max(range * 0.05, 0.001);
+  return [min - padding, max + padding];
+}
+
 // ---------------------------------------------------------------------------
 // Main component — wires equity + drawdown to series.daily
 // ---------------------------------------------------------------------------
@@ -258,6 +346,23 @@ export function ResultsCharts({
   const daily = series?.daily ?? [];
   const monthly = series?.monthly_returns ?? [];
   const hasSeries = seriesStatus === "ready" && daily.length > 0;
+
+  // Pablo 2026-05-17: equity curve is more useful as cumulative-return
+  // % over time. The raw $ equity makes small returns invisible (a 0.08%
+  // gain on $100k is $80 of variation in a ~$100k Y-axis); plotting
+  // ``(equity_t / equity_0 - 1) * 100`` shows growth proportionally
+  // regardless of starting balance. Use base = first day's equity so
+  // day-0 is exactly 0.00%.
+  const equityCurveData = (() => {
+    if (daily.length === 0) return [];
+    const base = daily[0].equity;
+    if (base <= 0) return daily.map((p) => ({ ...p, cum_return_pct: 0 }));
+    return daily.map((p) => ({
+      ...p,
+      cum_return_pct: (p.equity / base - 1) * 100,
+    }));
+  })();
+  const cumReturnSeries = equityCurveData.map((p) => p.cum_return_pct);
 
   return (
     <>
@@ -299,12 +404,12 @@ export function ResultsCharts({
         />
       </div>
 
-      {/* Equity curve */}
+      {/* Equity curve — cumulative return % over time (Pablo 2026-05-17) */}
       <Card className="border-border/50">
         <CardHeader>
           <CardTitle className="text-base">Equity Curve</CardTitle>
           <CardDescription>
-            Portfolio value over the backtest period
+            Cumulative return % from the backtest start
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -312,8 +417,8 @@ export function ResultsCharts({
             <div className="h-72" data-testid="equity-curve-chart">
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart
-                  data={daily}
-                  margin={{ top: 4, right: 4, bottom: 0, left: 0 }}
+                  data={equityCurveData}
+                  margin={{ top: 4, right: 4, bottom: 0, left: 12 }}
                 >
                   <CartesianGrid
                     strokeDasharray="3 3"
@@ -331,8 +436,14 @@ export function ResultsCharts({
                     tick={{ fontSize: 11, fill: "hsl(0 0% 63.9%)" }}
                     tickLine={false}
                     axisLine={false}
-                    tickFormatter={(v: number) => `$${(v / 1000).toFixed(0)}k`}
-                    domain={["dataMin - 2000", "dataMax + 2000"]}
+                    // % cumulative return — adaptive precision per range.
+                    tickFormatter={returnTickFormatter(cumReturnSeries)}
+                    // Small-return adaptive padding (cf. equityYDomain).
+                    // ``allowDataOverflow`` lets the line draw exactly to
+                    // the data extremes instead of being squeezed by tick
+                    // rounding when the range is sub-percent.
+                    domain={returnYDomain(cumReturnSeries)}
+                    allowDataOverflow={false}
                   />
                   <Tooltip
                     contentStyle={{
@@ -343,13 +454,13 @@ export function ResultsCharts({
                     }}
                     labelStyle={{ color: "hsl(0 0% 63.9%)" }}
                     formatter={(value: number | undefined) => [
-                      formatCurrency(value ?? 0),
-                      "Equity",
+                      `${(value ?? 0) >= 0 ? "+" : ""}${(value ?? 0).toFixed(3)}%`,
+                      "Cum. return",
                     ]}
                   />
                   <Line
                     type="monotone"
-                    dataKey="equity"
+                    dataKey="cum_return_pct"
                     stroke="hsl(142, 76%, 36%)"
                     strokeWidth={2}
                     dot={false}
@@ -415,8 +526,10 @@ export function ResultsCharts({
                     tick={{ fontSize: 11, fill: "hsl(0 0% 63.9%)" }}
                     tickLine={false}
                     axisLine={false}
-                    // drawdown is a ratio (e.g. -0.083); render as percent.
-                    tickFormatter={(v: number) => `${(v * 100).toFixed(1)}%`}
+                    // drawdown is a ratio (e.g. -0.083 = -8.3%). Same
+                    // adaptive-precision pattern as the equity curve so
+                    // micro-drawdowns aren't all rendered as "-0.0%".
+                    tickFormatter={drawdownTickFormatter(daily)}
                     domain={["dataMin", 0]}
                   />
                   <Tooltip

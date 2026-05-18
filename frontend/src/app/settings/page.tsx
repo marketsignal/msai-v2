@@ -1,6 +1,5 @@
 "use client";
 
-import { useState } from "react";
 import {
   Card,
   CardContent,
@@ -9,304 +8,166 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Separator } from "@/components/ui/separator";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
-import { User, Bell, Server, Trash2, Shield } from "lucide-react";
-import { useAuth } from "@/lib/auth";
-import { apiFetch } from "@/lib/api";
+import { Skeleton } from "@/components/ui/skeleton";
+import { User, Shield, AlertTriangle } from "lucide-react";
+import { useUserProfile } from "@/lib/hooks/use-user-profile";
+import { describeApiError } from "@/lib/api";
 
+/**
+ * Settings — Trust-First profile page.
+ *
+ * Per the audit (docs/audits/2026-05-16-ui-surface-audit.md F-1..F-5)
+ * and Revision R12, this page used to ship 8 fake elements: hardcoded
+ * "Admin" role, fake notification toggles, fake save button, 6
+ * hardcoded System Information rows, and a "Clear All Data" Danger
+ * Zone button calling a nonexistent endpoint. All removed.
+ *
+ * What remains:
+ *
+ *   - Profile card driven by GET /api/v1/auth/me via useUserProfile().
+ *     Shows real `display_name`, `email`, `role`. No fallback strings
+ *     like "Demo User" — when the fetch is in flight we render a
+ *     skeleton; if it errors we render an inline error.
+ *
+ * System Information moved to /system (T12). Notification preferences
+ * dropped entirely until a backend persists them (R12). Danger Zone
+ * cut — there is no /api/v1/admin/clear-data endpoint.
+ */
 export default function SettingsPage(): React.ReactElement {
-  const { user, getToken } = useAuth();
-  const [alertEmail, setAlertEmail] = useState(user?.email ?? "");
-  const [clearDialogOpen, setClearDialogOpen] = useState(false);
-  const [clearError, setClearError] = useState<string | null>(null);
-
-  const handleClearAllData = async (): Promise<void> => {
-    setClearError(null);
-    try {
-      const token = await getToken();
-      const response = await apiFetch(
-        "/api/v1/admin/clear-data",
-        { method: "DELETE" },
-        token,
-      );
-      if (!response.ok) {
-        setClearError(
-          "Failed to clear data. This feature may not be available yet.",
-        );
-      }
-    } catch (error) {
-      console.error("Clear all data failed:", error);
-      setClearError("Failed to clear data. The backend may not be running.");
-    }
-    setClearDialogOpen(false);
-  };
+  const profileQuery = useUserProfile();
 
   return (
     <div className="space-y-6">
-      {/* Page header */}
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
         <p className="text-sm text-muted-foreground">
-          Manage your account, preferences, and system configuration
+          Your account profile, sourced from Azure Entra ID.
         </p>
       </div>
 
       <div className="grid gap-6 lg:grid-cols-2">
-        {/* User profile */}
         <Card className="border-border/50">
           <CardHeader>
             <div className="flex items-center gap-2">
-              <User className="size-4 text-muted-foreground" />
+              <User
+                className="size-4 text-muted-foreground"
+                aria-hidden="true"
+              />
               <CardTitle className="text-base">User Profile</CardTitle>
             </div>
             <CardDescription>
-              Your account information from Azure AD
+              Read-only — values come from your Entra ID claims.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="space-y-2">
-              <Label className="text-muted-foreground">Name</Label>
-              <Input
-                value={user?.name ?? "Demo User"}
-                readOnly
-                className="bg-muted/50"
+            {profileQuery.isPending ? (
+              <ProfileSkeleton />
+            ) : profileQuery.isError ? (
+              <ProfileError
+                message={describeApiError(
+                  profileQuery.error,
+                  "Failed to load profile",
+                )}
               />
-            </div>
-            <div className="space-y-2">
-              <Label className="text-muted-foreground">Email</Label>
-              <Input
-                value={user?.email ?? "demo@msai.dev"}
-                readOnly
-                className="bg-muted/50"
+            ) : (
+              <ProfileFields
+                displayName={profileQuery.data.display_name}
+                email={profileQuery.data.email}
+                role={profileQuery.data.role}
               />
-            </div>
-            <div className="space-y-2">
-              <Label className="text-muted-foreground">Role</Label>
-              <div>
-                <Badge
-                  variant="secondary"
-                  className="bg-blue-500/15 text-blue-500"
-                >
-                  <Shield className="mr-1 size-3" />
-                  Admin
-                </Badge>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* Notification preferences */}
-        <Card className="border-border/50">
-          <CardHeader>
-            <div className="flex items-center gap-2">
-              <Bell className="size-4 text-muted-foreground" />
-              <CardTitle className="text-base">Notifications</CardTitle>
-            </div>
-            <CardDescription>
-              Configure how you receive trading alerts
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="space-y-2">
-              <Label>Alert Email</Label>
-              <Input
-                type="email"
-                value={alertEmail}
-                onChange={(e) => setAlertEmail(e.target.value)}
-                placeholder="your@email.com"
-              />
-              <p className="text-xs text-muted-foreground">
-                Receive trading alerts, error notifications, and daily summaries
-              </p>
-            </div>
-            <div className="space-y-3">
-              <div className="flex items-center justify-between rounded-lg border border-border/50 p-3">
-                <div>
-                  <p className="text-sm font-medium">Trade Execution Alerts</p>
-                  <p className="text-xs text-muted-foreground">
-                    Notify on each trade execution
-                  </p>
-                </div>
-                <Badge
-                  variant="secondary"
-                  className="bg-emerald-500/15 text-emerald-500"
-                >
-                  On
-                </Badge>
-              </div>
-              <div className="flex items-center justify-between rounded-lg border border-border/50 p-3">
-                <div>
-                  <p className="text-sm font-medium">Strategy Error Alerts</p>
-                  <p className="text-xs text-muted-foreground">
-                    Notify when a strategy encounters an error
-                  </p>
-                </div>
-                <Badge
-                  variant="secondary"
-                  className="bg-emerald-500/15 text-emerald-500"
-                >
-                  On
-                </Badge>
-              </div>
-              <div className="flex items-center justify-between rounded-lg border border-border/50 p-3">
-                <div>
-                  <p className="text-sm font-medium">Daily Summary</p>
-                  <p className="text-xs text-muted-foreground">
-                    End-of-day P&L report via email
-                  </p>
-                </div>
-                <Badge
-                  variant="secondary"
-                  className="bg-muted text-muted-foreground"
-                >
-                  Off
-                </Badge>
-              </div>
-            </div>
-            <Button size="sm">Save Preferences</Button>
-          </CardContent>
-        </Card>
-
-        {/* System info */}
-        <Card className="border-border/50">
-          <CardHeader>
-            <div className="flex items-center gap-2">
-              <Server className="size-4 text-muted-foreground" />
-              <CardTitle className="text-base">System Information</CardTitle>
-            </div>
-            <CardDescription>
-              Current system status and configuration
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="space-y-3">
-              <div className="flex items-center justify-between rounded-lg border border-border/50 p-3">
-                <span className="text-sm">Version</span>
-                <span className="font-mono text-sm">v0.1.0</span>
-              </div>
-              <div className="flex items-center justify-between rounded-lg border border-border/50 p-3">
-                <span className="text-sm">Environment</span>
-                <Badge variant="outline" className="text-xs font-normal">
-                  development
-                </Badge>
-              </div>
-              <div className="flex items-center justify-between rounded-lg border border-border/50 p-3">
-                <span className="text-sm">Uptime</span>
-                <span className="font-mono text-sm text-muted-foreground">
-                  5d 14h 32m
-                </span>
-              </div>
-              <div className="flex items-center justify-between rounded-lg border border-border/50 p-3">
-                <span className="text-sm">Disk Usage</span>
-                <span className="font-mono text-sm text-muted-foreground">
-                  17.75 GB / 100 GB
-                </span>
-              </div>
-              <div className="flex items-center justify-between rounded-lg border border-border/50 p-3">
-                <span className="text-sm">API Status</span>
-                <div className="flex items-center gap-1.5">
-                  <div className="size-2 rounded-full bg-emerald-500" />
-                  <span className="text-sm text-emerald-500">Healthy</span>
-                </div>
-              </div>
-              <div className="flex items-center justify-between rounded-lg border border-border/50 p-3">
-                <span className="text-sm">Database</span>
-                <div className="flex items-center gap-1.5">
-                  <div className="size-2 rounded-full bg-emerald-500" />
-                  <span className="text-sm text-emerald-500">Connected</span>
-                </div>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* Danger zone */}
-        <Card className="border-red-500/20">
-          <CardHeader>
-            <div className="flex items-center gap-2">
-              <Trash2 className="size-4 text-red-400" />
-              <CardTitle className="text-base text-red-400">
-                Danger Zone
-              </CardTitle>
-            </div>
-            <CardDescription>
-              Destructive actions that cannot be undone
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <Separator className="opacity-50" />
-            {clearError && (
-              <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-3">
-                <p className="text-sm text-red-400">{clearError}</p>
-              </div>
             )}
-            <div className="space-y-3">
-              <div className="rounded-lg border border-red-500/20 p-4">
-                <div className="flex items-start justify-between gap-4">
-                  <div>
-                    <p className="text-sm font-medium">Clear All Data</p>
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      Permanently delete all market data, backtest results,
-                      trade history, and strategy configurations. This action is
-                      irreversible.
-                    </p>
-                  </div>
-                  <Dialog
-                    open={clearDialogOpen}
-                    onOpenChange={setClearDialogOpen}
-                  >
-                    <DialogTrigger asChild>
-                      <Button variant="destructive" size="sm">
-                        Clear All Data
-                      </Button>
-                    </DialogTrigger>
-                    <DialogContent>
-                      <DialogHeader>
-                        <DialogTitle>Clear All Data</DialogTitle>
-                        <DialogDescription>
-                          This will permanently delete all market data, backtest
-                          results, trade history, and strategy configurations.
-                          This action cannot be undone.
-                        </DialogDescription>
-                      </DialogHeader>
-                      <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-4">
-                        <p className="text-sm text-red-400">
-                          Type &quot;DELETE&quot; to confirm this action.
-                        </p>
-                      </div>
-                      <DialogFooter className="gap-2">
-                        <Button
-                          variant="outline"
-                          onClick={() => setClearDialogOpen(false)}
-                        >
-                          Cancel
-                        </Button>
-                        <Button
-                          variant="destructive"
-                          onClick={handleClearAllData}
-                        >
-                          Clear All Data
-                        </Button>
-                      </DialogFooter>
-                    </DialogContent>
-                  </Dialog>
-                </div>
-              </div>
-            </div>
           </CardContent>
         </Card>
+      </div>
+    </div>
+  );
+}
+
+function ProfileFields({
+  displayName,
+  email,
+  role,
+}: {
+  displayName: string | null;
+  email: string;
+  role: string | null;
+}): React.ReactElement {
+  return (
+    <>
+      <div className="space-y-2">
+        <Label htmlFor="profile-display-name" className="text-muted-foreground">
+          Display name
+        </Label>
+        <Input
+          id="profile-display-name"
+          value={displayName ?? email}
+          readOnly
+          className="bg-muted/50"
+          data-testid="profile-display-name"
+        />
+      </div>
+      <div className="space-y-2">
+        <Label htmlFor="profile-email" className="text-muted-foreground">
+          Email
+        </Label>
+        <Input
+          id="profile-email"
+          value={email}
+          readOnly
+          className="bg-muted/50"
+          data-testid="profile-email"
+        />
+      </div>
+      <div className="space-y-2">
+        <Label className="text-muted-foreground">Role</Label>
+        <div>
+          <Badge
+            variant="secondary"
+            className="bg-muted text-muted-foreground"
+            data-testid="profile-role"
+          >
+            <Shield className="mr-1 size-3" aria-hidden="true" />
+            {role ?? "unassigned"}
+          </Badge>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function ProfileSkeleton(): React.ReactElement {
+  return (
+    <div className="space-y-4" aria-busy="true">
+      <div className="space-y-2">
+        <Skeleton className="h-4 w-24" />
+        <Skeleton className="h-10 w-full" />
+      </div>
+      <div className="space-y-2">
+        <Skeleton className="h-4 w-16" />
+        <Skeleton className="h-10 w-full" />
+      </div>
+      <div className="space-y-2">
+        <Skeleton className="h-4 w-12" />
+        <Skeleton className="h-6 w-24" />
+      </div>
+    </div>
+  );
+}
+
+function ProfileError({ message }: { message: string }): React.ReactElement {
+  return (
+    <div
+      className="flex items-start gap-2 rounded-md border border-red-500/30 bg-red-500/10 p-3"
+      role="alert"
+    >
+      <AlertTriangle
+        className="mt-0.5 size-4 shrink-0 text-red-400"
+        aria-hidden="true"
+      />
+      <div className="text-sm text-red-400">
+        Failed to load profile: <span className="font-mono">{message}</span>
       </div>
     </div>
   );

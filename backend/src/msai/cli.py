@@ -103,7 +103,6 @@ instruments_app = typer.Typer(
 alerts_app = typer.Typer(help="Operational alert history")
 auth_app = typer.Typer(help="Authentication / current-user commands")
 market_data_app = typer.Typer(help="Market data (Parquet-backed) bars, symbols, status, ingest")
-template_app = typer.Typer(help="Strategy template scaffolding")
 
 app.add_typer(strategy_app, name="strategy")
 app.add_typer(backtest_app, name="backtest")
@@ -117,7 +116,6 @@ app.add_typer(instruments_app, name="instruments")
 app.add_typer(alerts_app, name="alerts")
 app.add_typer(auth_app, name="auth")
 app.add_typer(market_data_app, name="market-data")
-app.add_typer(template_app, name="template")
 
 
 # ----------------------------------------------------------------------
@@ -1661,46 +1659,6 @@ def strategy_delete(
     response = _api_call("DELETE", f"/api/v1/strategies/{_url_id(strategy_id)}")
     _emit_json(response.json())
 
-
-# ======================================================================
-# T2: template sub-app
-# ======================================================================
-
-
-@template_app.command("list")
-def template_list() -> None:
-    """List available strategy templates."""
-    response = _api_call("GET", "/api/v1/strategy-templates/")
-    _emit_json(response.json())
-
-
-@template_app.command("scaffold")
-def template_scaffold(
-    template_id: str = typer.Option(..., "--template-id", help="Template ID from `template list`"),
-    module_name: str = typer.Option(
-        ...,
-        "--module-name",
-        help="Module name for the scaffolded strategy (e.g. ``user.my_strategy``)",
-    ),
-    description: str = typer.Option(
-        "",
-        "--description",
-        help="Optional description for the new strategy",
-    ),
-) -> None:
-    """Generate a new strategy module from a template."""
-    payload: dict[str, Any] = {
-        "template_id": template_id,
-        "module_name": module_name,
-    }
-    if description:
-        payload["description"] = description
-    response = _api_call(
-        "POST",
-        "/api/v1/strategy-templates/scaffold",
-        json_body=payload,
-    )
-    _emit_json(response.json())
 
 
 # ======================================================================

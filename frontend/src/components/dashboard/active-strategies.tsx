@@ -9,6 +9,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { AlertTriangle } from "lucide-react";
 import type { LiveDeploymentInfo } from "@/lib/api";
 
 function statusColor(status: string): string {
@@ -26,10 +27,18 @@ function statusColor(status: string): string {
 
 interface ActiveStrategiesProps {
   deployments: LiveDeploymentInfo[];
+  /**
+   * Codex iter-3 P2-A: when the parent's live-status query is in
+   * ``isError``, ``deployments`` defaults to ``[]`` — indistinguishable
+   * from a real "no active deployments" state. Set ``unavailable`` to
+   * render an explicit degraded panel instead.
+   */
+  unavailable?: boolean;
 }
 
 export function ActiveStrategies({
   deployments,
+  unavailable,
 }: ActiveStrategiesProps): React.ReactElement {
   return (
     <Card className="border-border/50 lg:col-span-3">
@@ -38,7 +47,18 @@ export function ActiveStrategies({
         <CardDescription>Status of all deployed strategies</CardDescription>
       </CardHeader>
       <CardContent>
-        {deployments.length === 0 ? (
+        {unavailable ? (
+          <div
+            role="status"
+            className="flex h-32 items-center justify-center gap-2 text-sm text-muted-foreground"
+          >
+            <AlertTriangle
+              className="size-4 text-amber-400"
+              aria-hidden="true"
+            />
+            Live status unavailable — see error banner above.
+          </div>
+        ) : deployments.length === 0 ? (
           <div className="flex h-32 items-center justify-center text-sm text-muted-foreground">
             No active deployments.
           </div>
@@ -47,12 +67,18 @@ export function ActiveStrategies({
             {deployments.map((dep) => (
               <Link
                 key={dep.id}
-                href={`/strategies/${dep.strategy_id}`}
+                href={
+                  dep.strategy_id
+                    ? `/strategies/${dep.strategy_id}`
+                    : "/live-trading"
+                }
                 className="flex items-center justify-between rounded-lg border border-border/50 p-3 transition-colors hover:bg-accent/50"
               >
                 <div className="space-y-1">
                   <div className="flex items-center gap-2">
-                    <p className="text-sm font-medium">{dep.strategy_id}</p>
+                    <p className="text-sm font-medium">
+                      {dep.strategy_id ?? "—"}
+                    </p>
                     <Badge
                       variant="secondary"
                       className={statusColor(dep.status)}

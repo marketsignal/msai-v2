@@ -515,9 +515,22 @@ async def sync_strategies_to_db(
     filesystem-sorted order, mirroring ``discover_strategies`` output.
     Caller is responsible for ``await session.commit()`` after calling.
     """
+    # Import deferred so the formatter co-locates ``datetime`` with its
+    # only usage below — soft-prune ``deleted_at`` stamping.
+    from datetime import UTC, datetime  # noqa: PLC0415
+
     discovered = discover_strategies(strategies_dir)
 
-    existing_rows = (await session.execute(select(Strategy))).scalars().all()
+    # SYNC path opts into the soft-delete filter (plan R20). Without
+    # ``include_deleted=True``, an archived row would be invisible to
+    # ``existing_by_path`` and sync would silently re-create a NEW
+    # active row for the same file_path on every GET — un-archiving the
+    # strategy.
+    existing_rows = (
+        (await session.execute(select(Strategy).execution_options(include_deleted=True)))
+        .scalars()
+        .all()
+    )
     existing_by_path: dict[str, Strategy] = {row.file_path: row for row in existing_rows}
 
     discovered_paths = {str(info.module_path) for info in discovered}
@@ -543,6 +556,12 @@ async def sync_strategies_to_db(
                 code_hash=combined_hash,
             )
             session.add(row)
+        elif row.deleted_at is not None:
+            # Archived row + file still on disk: leave the row archived
+            # (plan R2 — do NOT silently un-archive). Skip from the
+            # returned ``paired`` list so list views continue to hide it.
+            # Explicit operator restoration is a future PR (R2).
+            continue
         else:
             row.name = info.name
             row.strategy_class = info.strategy_class_name
@@ -564,13 +583,18 @@ async def sync_strategies_to_db(
         paired.append((row, info))
 
     # Prune orphaned rows — strategy file was renamed or deleted.
-    # Keeps the DB consistent with disk state.
+    # Soft-prune (set ``deleted_at``) instead of hard-delete so historical
+    # backtest + deployment FKs keep resolving (plan R2). Skip rows that
+    # are already archived to keep the operation idempotent.
     if prune_missing:
+        now = datetime.now(UTC)
         for path, stale_row in existing_by_path.items():
             if path in discovered_paths:
                 continue
-            if not Path(path).exists():
-                await session.delete(stale_row)
+            if Path(path).exists():
+                continue
+            if stale_row.deleted_at is None:
+                stale_row.deleted_at = now
 
     return paired
 

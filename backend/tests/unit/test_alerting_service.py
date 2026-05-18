@@ -662,7 +662,7 @@ class TestAlertsRouter:
             response = await client.get("/api/v1/alerts/")
 
         assert response.status_code == 200
-        assert response.json() == {"alerts": []}
+        assert response.json() == {"alerts": [], "total": 0}
 
     async def test_list_alerts_returns_persisted_records(
         self,
@@ -768,14 +768,16 @@ class TestAlertsRouter:
 
         monkeypatch.setattr(alerting_service, "list_alerts", _wedged_list)
 
-        async with client:
-            response = await client.get("/api/v1/alerts/")
+        try:
+            async with client:
+                response = await client.get("/api/v1/alerts/")
 
-        assert response.status_code == 200
-        assert response.json() == {"alerts": []}
-
-        # Cleanup
-        release.set()
+            assert response.status_code == 200
+            assert response.json() == {"alerts": [], "total": 0}
+        finally:
+            # Always release so the single-thread executor isn't wedged for
+            # subsequent tests, even if an assertion above raises.
+            release.set()
 
     async def test_list_alerts_runs_in_executor_not_event_loop(
         self,

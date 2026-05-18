@@ -65,10 +65,17 @@ export function InventoryTable({
     <Table>
       <TableHeader className="sticky top-0 bg-background">
         <TableRow className="border-border/50 hover:bg-transparent">
-          <TableHead className="w-[12%]">Symbol</TableHead>
-          <TableHead className="w-[10%]">Class</TableHead>
-          <TableHead className="w-[16%]">Status</TableHead>
-          <TableHead className="w-[28%]">Coverage</TableHead>
+          <TableHead className="w-[10%]">Symbol</TableHead>
+          <TableHead className="w-[8%]">Class</TableHead>
+          {/* Provider column added 2026-05-17: the inventory schema is keyed
+              on (symbol, asset_class, provider), so a single symbol like
+              AAPL/equity can legitimately appear under both
+              ``interactive_brokers`` AND ``databento``. Pre-fix the table
+              rendered these as visually identical duplicate rows; surfacing
+              the provider disambiguates them in one glance. */}
+          <TableHead className="w-[12%]">Provider</TableHead>
+          <TableHead className="w-[14%]">Status</TableHead>
+          <TableHead className="w-[24%]">Coverage</TableHead>
           {/*
             Column shows ``last_refresh_at`` which v1 sources from
             ``InstrumentDefinition.updated_at`` — advances on any row mutation
@@ -77,7 +84,7 @@ export function InventoryTable({
             Follow-up: surface a true "last successful ingest" column when the
             backend tracks it explicitly.
           */}
-          <TableHead className="w-[14%]">Last update</TableHead>
+          <TableHead className="w-[12%]">Last update</TableHead>
           <TableHead className="w-[20%] text-right" />
         </TableRow>
       </TableHeader>
@@ -100,6 +107,9 @@ export function InventoryTable({
               </TableCell>
               <TableCell className="text-muted-foreground">
                 {row.asset_class}
+              </TableCell>
+              <TableCell className="font-mono text-xs text-muted-foreground">
+                {row.provider}
               </TableCell>
               <TableCell>
                 <StatusBadge value={row.status} />

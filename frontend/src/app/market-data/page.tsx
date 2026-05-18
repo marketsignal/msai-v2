@@ -1,9 +1,10 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useEffect, useMemo, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 
 import { HeaderToolbar } from "@/components/market-data/header-toolbar";
+import { StorageStatsCard } from "@/components/dashboard/storage-stats-card";
 import { InventoryTable } from "@/components/market-data/inventory-table";
 import { RowDrawer } from "@/components/market-data/row-drawer";
 import { JobsDrawer } from "@/components/market-data/jobs-drawer";
@@ -47,6 +48,14 @@ function BackgroundJobPoller({ runId }: { runId: string }): null {
 
 export default function MarketDataPage(): React.ReactElement {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  // iter-5 verify-e2e P2-1 (TJ-4 deep-link): the readiness check on
+  // /live-trading/portfolio links to /market-data?onboard=<sym> when an
+  // instrument is missing. Honoring the query param means opening the
+  // Add Symbol dialog with the symbol pre-filled — without this, the
+  // user lands on Market Data and has to re-type. After consuming, clear
+  // the query param so a manual reload doesn't re-open the dialog.
+  const onboardSymbol = searchParams.get("onboard");
   const [assetClass, setAssetClass] = useState<AssetClass | "all">("all");
   const [windowChoice, setWindowChoice] = useState<WindowChoice>("5y");
   // Track the open drawer by instrument_uid (NOT a frozen row object) so the
@@ -58,8 +67,26 @@ export default function MarketDataPage(): React.ReactElement {
   );
   const [jobsOpen, setJobsOpen] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
+  // iter-5 verify-e2e P2-1: derived prefill consumed by AddSymbolDialog.
+  // Cleared via router.replace below once the dialog opens so a manual
+  // reload won't re-open it.
+  const [pendingOnboardSymbol, setPendingOnboardSymbol] = useState<
+    string | null
+  >(null);
   const [activeRunIds, setActiveRunIds] = useState<string[]>([]);
   const [removeTarget, setRemoveTarget] = useState<InventoryRow | null>(null);
+
+  // iter-5 verify-e2e P2-1: on first render when `?onboard=<sym>` is
+  // present, open the Add Symbol dialog with the symbol pre-filled.
+  // Strip the query param immediately so refreshing the page doesn't
+  // re-open the dialog. ``router.replace`` over ``router.push`` so the
+  // back button still works as the user expects.
+  useEffect(() => {
+    if (!onboardSymbol) return;
+    setPendingOnboardSymbol(onboardSymbol);
+    setAddOpen(true);
+    router.replace("/market-data");
+  }, [onboardSymbol, router]);
 
   const { data, isLoading, error } = useInventoryQuery({
     windowChoice,
@@ -121,6 +148,7 @@ export default function MarketDataPage(): React.ReactElement {
 
   return (
     <div className="space-y-6">
+      <StorageStatsCard />
       <HeaderToolbar
         assetClass={assetClass}
         windowChoice={windowChoice}
@@ -201,10 +229,14 @@ export default function MarketDataPage(): React.ReactElement {
 
       <AddSymbolDialog
         open={addOpen}
-        onClose={() => setAddOpen(false)}
+        onClose={() => {
+          setAddOpen(false);
+          setPendingOnboardSymbol(null);
+        }}
         onSuccess={(runId) => setActiveRunIds((prev) => [runId, ...prev])}
         defaultStart={start}
         defaultEnd={end}
+        initialSymbol={pendingOnboardSymbol ?? undefined}
       />
 
       <AlertDialog

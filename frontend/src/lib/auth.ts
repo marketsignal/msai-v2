@@ -17,6 +17,30 @@ interface AuthReturn {
   getToken: () => Promise<string | null>;
 }
 
+/**
+ * Returns ``true`` when the app should treat the session as authenticated
+ * even though no MSAL account is present. Three bypasses:
+ *
+ * - ``NODE_ENV === "development"`` — local dev loop (no Entra ID config required).
+ * - ``NEXT_PUBLIC_E2E_AUTH_BYPASS === "1"`` — Playwright E2E mode (set by
+ *   ``playwright.config.ts`` ``webServer.env``). Backend auth still gates
+ *   API calls via ``X-API-Key``; this only bypasses the UI redirect.
+ * - ``NEXT_PUBLIC_MSAI_API_KEY`` is set — dev/CI flow that uses API-key
+ *   auth without MSAL.
+ *
+ * Each of these MUST be honored by every ``useQuery`` ``enabled`` flag in
+ * the app (Codex iter-1 P1 — without this propagation, the new pages
+ * stayed permanently pending in E2E because ``useAuth().isAuthenticated``
+ * was ``false``).
+ */
+export function isAuthBypassed(): boolean {
+  return (
+    process.env.NODE_ENV === "development" ||
+    process.env.NEXT_PUBLIC_E2E_AUTH_BYPASS === "1" ||
+    Boolean(process.env.NEXT_PUBLIC_MSAI_API_KEY)
+  );
+}
+
 export function useAuth(): AuthReturn {
   const { instance, accounts } = useMsal();
   const account = useAccount(accounts[0] || null);
@@ -57,7 +81,10 @@ export function useAuth(): AuthReturn {
 
   return {
     user: account ? { name: account.name, email: account.username } : null,
-    isAuthenticated: !!account,
+    // Honor the dev / E2E / API-key bypasses so downstream
+    // ``useQuery({ enabled: isAuthenticated })`` hooks fire even when
+    // MSAL has no account (Codex iter-1 P1).
+    isAuthenticated: !!account || isAuthBypassed(),
     login,
     logout,
     getToken,

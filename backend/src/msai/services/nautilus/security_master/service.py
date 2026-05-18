@@ -1012,10 +1012,16 @@ class SecurityMaster:
                 "Provider",
                 sorted_providers[0] if sorted_providers else "interactive_brokers",
             )
+            # iter-5 verify-e2e Issue F (P2): this branch fires when the
+            # same (symbol, asset_class) has aliases under multiple
+            # providers (e.g. AAPL on databento AND interactive_brokers).
+            # Pass ``providers`` to surface the real disambiguator
+            # instead of misleading the caller about asset_class.
             raise AmbiguousSymbolError(
                 symbol=symbol,
                 provider=first_provider,
                 asset_classes=[asset_class],
+                providers=sorted_providers,
             )
         instrument_uid = next(iter(uids))
         provider_set = {r.provider for r in rows}

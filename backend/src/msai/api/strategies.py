@@ -7,6 +7,7 @@ can pass to the backtest endpoint.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
@@ -17,6 +18,7 @@ from sqlalchemy import select
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+from msai.core.audit import log_audit
 from msai.core.auth import get_current_user
 from msai.core.config import settings
 from msai.core.database import get_db
@@ -92,7 +94,13 @@ async def get_strategy(
     await sync_strategies_to_db(db, _STRATEGIES_DIR)
     await db.commit()
 
-    result = await db.execute(select(Strategy).where(Strategy.id == strategy_id))
+    # DETAIL path opts into the soft-delete filter (plan R20) so historical
+    # backtest detail pages can still resolve an archived strategy.
+    result = await db.execute(
+        select(Strategy)
+        .where(Strategy.id == strategy_id)
+        .execution_options(include_deleted=True)
+    )
     strategy: Strategy | None = result.scalar_one_or_none()
 
     if strategy is None:
@@ -200,11 +208,17 @@ async def delete_strategy(
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> MessageResponse:
-    """Soft-delete / unregister a strategy.
+    """Soft-delete (archive) a strategy by stamping ``deleted_at``.
 
-    TODO: Implement a real soft-delete flag on the Strategy model so we
-    can preserve historical backtest references.
+    Per plan revision R20, the DELETE handler keeps the default
+    soft-delete filter on its SELECT: a strategy that has already been
+    archived is invisible to this query and returns 404 (idempotent
+    DELETE semantics). Backtest history pages reach the archived row via
+    ``GET /api/v1/strategies/{id}``, which opts in to ``include_deleted``.
     """
+    # Default-filtered SELECT — an already-archived row resolves to None
+    # → 404, which is the desired idempotent behavior. No
+    # ``execution_options(include_deleted=True)`` here.
     result = await db.execute(select(Strategy).where(Strategy.id == strategy_id))
     strategy: Strategy | None = result.scalar_one_or_none()
 
@@ -214,7 +228,24 @@ async def delete_strategy(
             detail=f"Strategy {strategy_id} not found",
         )
 
-    await db.delete(strategy)
+    strategy.deleted_at = datetime.now(UTC)
     await db.commit()
 
-    return MessageResponse(message=f"Strategy {strategy_id} deleted")
+    user_id: UUID | None = None
+    raw_user_id = claims.get("sub") if isinstance(claims, dict) else None
+    if isinstance(raw_user_id, str):
+        try:
+            user_id = UUID(raw_user_id)
+        except ValueError:
+            user_id = None
+
+    await log_audit(
+        db,
+        user_id,
+        action="archive",
+        resource_type="strategy",
+        resource_id=strategy_id,
+        details={"name": strategy.name, "file_path": strategy.file_path},
+    )
+
+    return MessageResponse(message=f"Strategy {strategy_id} archived")

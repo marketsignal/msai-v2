@@ -35,12 +35,14 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { useAuth } from "@/lib/auth";
+import { InstrumentReadinessCheck } from "@/components/live/instrument-readiness-check";
 import {
   addPortfolioMember,
   listDraftMembers,
   snapshotPortfolio,
   type LivePortfolioMember,
 } from "@/lib/api/live-portfolios";
+import { describeApiError } from "@/lib/api";
 import type {
   LivePortfolio,
   LivePortfolioRevision,
@@ -149,12 +151,13 @@ export function PortfolioCompose({
           setLoadError(null);
         }
       } catch (error) {
-        // Codex iter-7 P2: surface the failure + lock composition.
+        // Codex iter-7 P2: surface the failure + lock composition. iter-3
+        // describeApiError sweep: prefer the backend's HTTPException
+        // ``detail`` over the raw "GET /api/v1/.../draft failed: 503"
+        // message so the operator sees the real reason.
         if (!cancelled) {
           setLoadError(
-            error instanceof Error
-              ? `Failed to load existing members: ${error.message}`
-              : "Failed to load existing members from server.",
+            `Failed to load existing members: ${describeApiError(error, "Server unreachable")}`,
           );
         }
       } finally {
@@ -217,9 +220,10 @@ export function PortfolioCompose({
       setForm(EMPTY_FORM);
       toast.success("Member added to draft revision");
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Failed to add member";
-      setFormError(message);
+      // iter-3 describeApiError sweep: backend 422 carries the schema /
+      // validation reason in ``detail``; raw message is "POST /add-strategy
+      // failed: 422" which is useless to the operator.
+      setFormError(describeApiError(error, "Failed to add member"));
     } finally {
       setAddSubmitting(false);
     }
@@ -241,9 +245,8 @@ export function PortfolioCompose({
       setFormError(null);
       onSnapshot?.(revision);
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Failed to snapshot portfolio";
-      toast.error(message);
+      // iter-3 describeApiError sweep.
+      toast.error(describeApiError(error, "Failed to snapshot portfolio"));
     } finally {
       setSnapshotSubmitting(false);
     }
@@ -271,8 +274,14 @@ export function PortfolioCompose({
   // after the operator clicks Snapshot, the AlertDialog confirm closes
   // but the request hasn't returned; without this gate, an Add could
   // race the snapshot and end up frozen into the revision.
+  // R16 (readiness): also block Add when instruments don't resolve in
+  // the registry — surface the missing/ambiguous list with onboard CTA.
+  const [readinessClear, setReadinessClear] = React.useState<boolean>(true);
   const canAddMember =
-    loadError === null && !initialLoading && !snapshotSubmitting;
+    loadError === null &&
+    !initialLoading &&
+    !snapshotSubmitting &&
+    readinessClear;
 
   return (
     <section className="flex flex-col gap-6 rounded-lg border border-border/50 bg-card p-6">
@@ -394,7 +403,7 @@ export function PortfolioCompose({
             </Label>
             <Input
               id="portfolio-compose-instruments"
-              placeholder="AAPL.NASDAQ, MSFT.NASDAQ"
+              placeholder="AAPL, MSFT  (or AAPL.equity to disambiguate)"
               value={form.instrumentsText}
               onChange={(e): void =>
                 setForm((prev) => ({
@@ -402,6 +411,11 @@ export function PortfolioCompose({
                   instrumentsText: e.target.value,
                 }))
               }
+              data-testid="portfolio-compose-instruments-input"
+            />
+            <InstrumentReadinessCheck
+              instrumentsText={form.instrumentsText}
+              onValidityChange={setReadinessClear}
             />
           </div>
 
