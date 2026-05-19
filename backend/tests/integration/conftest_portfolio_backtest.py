@@ -196,7 +196,7 @@ async def make_portfolio_with_strategies(
     """
     user_id = _seed_user.id
 
-    async def _make(*, n: int = 2) -> Portfolio:
+    async def _make(*, n: int = 2, **portfolio_overrides: Any) -> Portfolio:
         async with portfolio_session_factory() as session:
             strategies: list[Strategy] = []
             candidates: list[GraduationCandidate] = []
@@ -231,6 +231,7 @@ async def make_portfolio_with_strategies(
                 base_capital=100_000.0,
                 requested_leverage=1.0,
                 created_by=user_id,
+                **portfolio_overrides,
             )
             session.add(portfolio)
             await session.flush()

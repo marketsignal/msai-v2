@@ -179,3 +179,128 @@ async def test_promote_with_over_leverage_fails_risk_validation(
         detail.get("error", {}).get("message", "") if isinstance(detail, dict) else str(detail)
     ).lower()
     assert "leverage" in message, body
+
+
+@pytest.mark.asyncio
+async def test_promote_normalizes_explicit_weights_to_sum_to_one(
+    api_client_authed,
+    portfolio_session_factory,
+    _seed_user,
+):
+    """Codex-bot PR-73 P2 regression -- explicit allocation weights must be
+    normalized to sum to 1.0 in the live revision, matching the backtest
+    path's ``normalize_weights`` behavior.
+
+    Before the fix, two allocations of weight 0.8 each (sum=1.6) backtested
+    as 50/50 (normalized) but promoted as 80%/80% (raw) -- the live
+    composition diverged from what was validated.
+    """
+    from datetime import UTC, date, datetime
+    from decimal import Decimal
+    from uuid import uuid4
+
+    from sqlalchemy import select
+
+    from msai.models import LivePortfolioRevisionStrategy
+    from msai.models.graduation_candidate import GraduationCandidate
+    from msai.models.portfolio import Portfolio
+    from msai.models.portfolio_allocation import PortfolioAllocation
+    from msai.models.portfolio_enums import BacktestMode
+    from msai.models.portfolio_run import PortfolioRun
+    from msai.models.strategy import Strategy
+
+    user_id = _seed_user.id
+
+    # Arrange -- portfolio with 2 explicit allocations whose weights sum to 1.6
+    async with portfolio_session_factory() as session:
+        strategies = []
+        candidates = []
+        for i in range(2):
+            strategy = Strategy(
+                id=uuid4(),
+                name=f"weight-norm-s{i}-{uuid4().hex[:6]}",
+                file_path="strategies/example/ema_cross.py",
+                strategy_class="EMACrossStrategy",
+                default_config={"instruments": ["AAPL"]},
+                created_by=user_id,
+            )
+            session.add(strategy)
+            strategies.append(strategy)
+        await session.flush()
+        for strategy in strategies:
+            candidate = GraduationCandidate(
+                id=uuid4(),
+                strategy_id=strategy.id,
+                stage="paper_candidate",
+                config={"instruments": ["AAPL"]},
+                metrics={"sharpe": 1.0},
+            )
+            session.add(candidate)
+            candidates.append(candidate)
+        await session.flush()
+
+        portfolio = Portfolio(
+            id=uuid4(),
+            name=f"weight-norm-{uuid4().hex[:8]}",
+            objective="maximize_sharpe",
+            base_capital=100_000.0,
+            requested_leverage=1.0,
+            created_by=user_id,
+        )
+        session.add(portfolio)
+        await session.flush()
+
+        # The bug condition: two raw weights of 0.8 each, summing to 1.6.
+        for candidate in candidates:
+            session.add(
+                PortfolioAllocation(
+                    portfolio_id=portfolio.id,
+                    candidate_id=candidate.id,
+                    weight=Decimal("0.8"),
+                )
+            )
+
+        run = PortfolioRun(
+            id=uuid4(),
+            portfolio_id=portfolio.id,
+            status="completed",
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 6, 30),
+            mode=BacktestMode.QUICK,
+            metrics={"sharpe": 1.5},
+            completed_at=datetime.now(UTC),
+        )
+        session.add(run)
+        await session.commit()
+        run_id = run.id
+
+    # Act
+    response = await api_client_authed.post(
+        f"/api/v1/portfolios/runs/{run_id}/promote-to-live",
+        json={"account_id": "DUTEST123"},
+    )
+
+    # Assert
+    assert response.status_code == 201, response.text
+    body = response.json()
+    revision_id = body["live_portfolio_revision_id"]
+
+    async with portfolio_session_factory() as session:
+        members = (
+            (
+                await session.execute(
+                    select(LivePortfolioRevisionStrategy).where(
+                        LivePortfolioRevisionStrategy.revision_id == revision_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(members) == 2
+        weights = sorted(float(m.weight) for m in members)
+        # 0.8 / (0.8 + 0.8) == 0.5 each; sum == 1.0
+        assert weights == pytest.approx([0.5, 0.5]), (
+            f"explicit weights must be normalized to sum to 1.0; got {weights}"
+        )
+        assert sum(weights) == pytest.approx(1.0)

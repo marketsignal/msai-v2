@@ -261,12 +261,24 @@ class PortfolioService:
 
         # Equal weight is the simplest defensible default when an operator
         # has not pinned per-candidate weights (the F1c bridge always
-        # leaves them None). For explicit-allocation portfolios we honor
-        # the operator's weights as-is — the orchestration layer already
-        # normalizes them at backtest time.
-        explicit_weights = [float(a.weight) for a in allocations if a.weight is not None]
-        use_explicit = len(explicit_weights) == len(allocations)
+        # leaves them None). For explicit-allocation portfolios we
+        # NORMALIZE the operator's weights to sum to 1.0 before writing
+        # them into the live revision — matching what the backtest's
+        # ``normalize_weights`` does at run time.
+        #
+        # Codex-bot P2 finding on PR #73: previously the raw weights flowed
+        # through, so a portfolio with allocations ``[0.8, 0.8]`` backtested
+        # as ``50/50`` (normalized) but promoted as ``80%/80%`` (raw) — the
+        # live revision diverged from the composition that was validated.
+        explicit_weights_raw = [float(a.weight) for a in allocations if a.weight is not None]
+        use_explicit = len(explicit_weights_raw) == len(allocations)
         equal_weight = Decimal("1") / Decimal(len(allocations))
+        explicit_weight_sum = sum(explicit_weights_raw) if use_explicit else 0.0
+        # Defensive: zero or negative sums collapse to equal-weight rather than
+        # producing NaN/zero weights in the live revision. The orchestrator's
+        # ``normalize_weights`` raises in this case; here the safest fallback
+        # is parity with the F1c-bridge path (equal weight).
+        explicit_normalize = use_explicit and explicit_weight_sum > 0
 
         # ---- Create LivePortfolio + frozen revision ----
         # Append the run id suffix so re-promoting the same backtest
@@ -317,8 +329,10 @@ class PortfolioService:
                     "cannot promote a portfolio that would trade nothing."
                 )
 
-            if use_explicit and alloc.weight is not None:
-                weight = Decimal(str(float(alloc.weight)))
+            if explicit_normalize and alloc.weight is not None:
+                # Normalize to sum-to-1.0 so the live composition matches
+                # what the backtest validated.
+                weight = Decimal(str(float(alloc.weight) / explicit_weight_sum))
             else:
                 weight = equal_weight
 

@@ -593,3 +593,98 @@ async def test_full_mode_calls_optimizer_and_persists_is_oos(
         assert float(reloaded.is_metric) == pytest.approx(1.4)
         assert float(reloaded.oos_metric) == pytest.approx(1.1)
         assert reloaded.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_create_run_inherits_default_mode_from_portfolio(
+    portfolio_session_factory: async_sessionmaker[AsyncSession],
+    make_portfolio_with_strategies: Callable[..., Awaitable[Portfolio]],
+) -> None:
+    """Codex-bot PR-73 P2 regression -- when ``PortfolioRunCreate.mode`` is
+    omitted (None), the lifecycle service inherits from ``Portfolio.default_mode``.
+
+    Before the fix the schema defaulted to QUICK, so a portfolio created with
+    ``default_mode='full'`` silently launched Quick runs whenever a client
+    omitted the field.
+    """
+    from msai.schemas.portfolio import PortfolioRunCreate
+    from msai.services.portfolio.lifecycle import PortfolioLifecycle
+
+    # Arrange -- portfolio with default_mode=FULL (long enough range for Full)
+    portfolio = await make_portfolio_with_strategies(n=1, default_mode=BacktestMode.FULL)
+
+    # Act -- create run without specifying mode (should inherit FULL)
+    async with portfolio_session_factory() as session:
+        run = await PortfolioLifecycle.create_run(
+            session,
+            portfolio.id,
+            PortfolioRunCreate(
+                portfolio_id=portfolio.id,
+                start_date=date(2024, 1, 1),
+                end_date=date(2024, 12, 31),
+                # mode intentionally omitted
+            ),
+        )
+        await session.commit()
+        await session.refresh(run)
+
+    # Assert -- run inherited the portfolio's default_mode
+    assert run.mode == BacktestMode.FULL.value
+
+
+@pytest.mark.asyncio
+async def test_create_run_explicit_mode_overrides_default(
+    portfolio_session_factory: async_sessionmaker[AsyncSession],
+    make_portfolio_with_strategies: Callable[..., Awaitable[Portfolio]],
+) -> None:
+    """Explicit ``mode`` in the request body wins over the portfolio's default."""
+    from msai.schemas.portfolio import PortfolioRunCreate
+    from msai.services.portfolio.lifecycle import PortfolioLifecycle
+
+    portfolio = await make_portfolio_with_strategies(n=1, default_mode=BacktestMode.FULL)
+
+    async with portfolio_session_factory() as session:
+        run = await PortfolioLifecycle.create_run(
+            session,
+            portfolio.id,
+            PortfolioRunCreate(
+                portfolio_id=portfolio.id,
+                start_date=date(2024, 1, 1),
+                end_date=date(2024, 1, 31),
+                mode=BacktestMode.QUICK,  # explicit override -- short range is fine for Quick
+            ),
+        )
+        await session.commit()
+        await session.refresh(run)
+
+    assert run.mode == BacktestMode.QUICK.value
+
+
+@pytest.mark.asyncio
+async def test_create_run_inherited_full_mode_too_short_range_raises(
+    portfolio_session_factory: async_sessionmaker[AsyncSession],
+    make_portfolio_with_strategies: Callable[..., Awaitable[Portfolio]],
+) -> None:
+    """Inherited Full mode + too-short range raises at persist time.
+
+    The schema validator only fires on explicit ``mode=FULL`` -- when mode is
+    inherited (None in the request) the validator skips, so the lifecycle
+    enforces the 90-day minimum directly.
+    """
+    from msai.schemas.portfolio import PortfolioRunCreate
+    from msai.services.portfolio.lifecycle import PortfolioLifecycle
+
+    portfolio = await make_portfolio_with_strategies(n=1, default_mode=BacktestMode.FULL)
+
+    async with portfolio_session_factory() as session:
+        with pytest.raises(ValueError, match="Full mode .* requires at least 90 days"):
+            await PortfolioLifecycle.create_run(
+                session,
+                portfolio.id,
+                PortfolioRunCreate(
+                    portfolio_id=portfolio.id,
+                    start_date=date(2024, 1, 1),
+                    end_date=date(2024, 1, 30),  # 30-day range, too short
+                    # mode omitted -- inherits FULL from portfolio
+                ),
+            )

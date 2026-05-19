@@ -22,7 +22,7 @@ from msai.core.logging import get_logger
 from msai.models.graduation_candidate import GraduationCandidate
 from msai.models.portfolio import Portfolio
 from msai.models.portfolio_allocation import PortfolioAllocation
-from msai.models.portfolio_enums import PortfolioRunStatus
+from msai.models.portfolio_enums import BacktestMode, PortfolioRunStatus
 from msai.models.portfolio_run import PortfolioRun
 from msai.models.strategy import Strategy
 
@@ -291,17 +291,44 @@ class PortfolioLifecycle:
         if data.n_trials is not None:
             initial_metrics = {"n_trials_override": int(data.n_trials)}
 
+        # Resolve the mode: explicit per-run override wins; otherwise inherit
+        # from the parent portfolio's ``default_mode``.  Codex-bot P2 finding
+        # on PR #73 caught the previous bug: schema defaulted to ``QUICK`` so
+        # a portfolio created with ``default_mode='full'`` silently launched
+        # Quick runs whenever a client omitted ``mode``.
+        if data.mode is not None:
+            resolved_mode = data.mode
+        else:
+            # ``portfolio.default_mode`` may load as either a ``BacktestMode``
+            # enum or a raw string depending on the SQLAlchemy load path
+            # (model defaults via ``server_default`` come back as strings on
+            # some drivers). Coerce defensively so downstream ``.value``
+            # access doesn't trip on mocked/fresh rows.
+            raw = portfolio.default_mode
+            resolved_mode = raw if isinstance(raw, BacktestMode) else BacktestMode(raw)
+
+        # Schema validator on PortfolioRunCreate enforced the 90-day minimum
+        # only when ``mode=FULL`` was explicit.  When mode is inherited (None
+        # in the request body) the validator skipped — enforce here too so
+        # the worker doesn't crash mid-flight on a too-short Full range.
+        if resolved_mode is BacktestMode.FULL:
+            range_days = (data.end_date - data.start_date).days + 1
+            if range_days < 90:
+                raise ValueError(
+                    f"Full mode (inherited from portfolio default_mode) requires "
+                    f"at least 90 days between start_date and end_date "
+                    f"(got {range_days} day{'s' if range_days != 1 else ''}); "
+                    "use mode='quick' explicitly for shorter ranges or extend the window."
+                )
+
         run = PortfolioRun(
             portfolio_id=portfolio_id,
             start_date=data.start_date,
             end_date=data.end_date,
             max_parallelism=data.max_parallelism,
             status=PortfolioRunStatus.PENDING.value,
-            # F2: persist the requested mode so the orchestration's mode-branch
-            # picks Quick vs. Full from the run row (not from the parent
-            # portfolio's default_mode — which would override an explicit
-            # per-run override from the API caller).
-            mode=data.mode,
+            # F2 + Codex-bot PR-73 P2: mode resolution = explicit > portfolio default.
+            mode=resolved_mode,
             metrics=initial_metrics,
             created_by=user_id,
         )
@@ -314,7 +341,8 @@ class PortfolioLifecycle:
             portfolio_id=str(portfolio_id),
             start_date=str(data.start_date),
             end_date=str(data.end_date),
-            mode=data.mode.value,
+            mode=resolved_mode.value,
+            mode_inherited=data.mode is None,
             n_trials_override=data.n_trials,
         )
         return run

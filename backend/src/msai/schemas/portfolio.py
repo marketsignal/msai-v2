@@ -239,7 +239,11 @@ class PortfolioRunCreate(BaseModel):
     # further via ``compute_slots`` global limits.
     max_parallelism: int | None = Field(default=None, ge=1, le=32)
     # B5: Quick (single-shot) vs. Full (walk-forward + Optuna optimization).
-    mode: BacktestMode = BacktestMode.QUICK
+    # ``None`` means "inherit from ``Portfolio.default_mode``" — the lifecycle
+    # service resolves this at persistence time.  Defaulting to ``QUICK`` here
+    # would silently override the portfolio's ``default_mode='full'`` whenever
+    # a client omits the field (codex-bot P2 finding on PR #73).
+    mode: BacktestMode | None = None
     # Optional Full-mode trial-count override.  Production runs use the
     # ``settings.portfolio_full_trial_count`` default (~100).  Test/explore
     # mode: set to a small integer (2-10) to keep a smoke run inside a
@@ -259,6 +263,11 @@ class PortfolioRunCreate(BaseModel):
         # error precise (422 with a helpful message) and avoids spending
         # the work of enqueuing a job that is guaranteed to fail.
         # Quick mode is single-shot — any inclusive range is valid.
+        # When ``mode`` is None the lifecycle service inherits from the
+        # portfolio's ``default_mode`` — that resolution happens at persist
+        # time so we cannot reject here.  Validators only fire on an
+        # explicit ``mode=FULL``; the equivalent guard for inherited Full
+        # runs lives in ``PortfolioLifecycle.create_run``.
         if self.mode is BacktestMode.FULL:
             range_days = (self.end_date - self.start_date).days + 1
             if range_days < _FULL_MODE_MIN_RANGE_DAYS:

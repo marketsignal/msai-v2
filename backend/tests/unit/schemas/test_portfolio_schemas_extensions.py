@@ -59,13 +59,29 @@ def test_portfolio_run_create_accepts_mode() -> None:
     assert rc.mode == BacktestMode.FULL
 
 
-def test_portfolio_run_create_mode_defaults_to_quick() -> None:
+def test_portfolio_run_create_mode_defaults_to_none_for_inheritance() -> None:
+    """Codex-bot PR-73 P2 regression — schema default is None ('inherit
+    from portfolio.default_mode'), not QUICK. The previous QUICK default
+    silently overrode a portfolio's default_mode='full' whenever a client
+    omitted the field. The lifecycle service resolves the inheritance at
+    persist time."""
     rc = PortfolioRunCreate(
         portfolio_id="00000000-0000-0000-0000-000000000000",  # type: ignore[arg-type]
         start_date="2024-01-01",  # type: ignore[arg-type]
         end_date="2025-01-01",  # type: ignore[arg-type]
     )
-    assert rc.mode == BacktestMode.QUICK
+    assert rc.mode is None
+
+
+def test_portfolio_run_create_mode_explicit_quick_still_works() -> None:
+    """Explicit mode=quick remains supported alongside the new None default."""
+    rc = PortfolioRunCreate(
+        portfolio_id="00000000-0000-0000-0000-000000000000",  # type: ignore[arg-type]
+        start_date="2024-01-01",  # type: ignore[arg-type]
+        end_date="2025-01-01",  # type: ignore[arg-type]
+        mode=BacktestMode.QUICK,
+    )
+    assert rc.mode is BacktestMode.QUICK
 
 
 def test_portfolio_run_create_rejects_full_mode_below_minimum_range() -> None:
