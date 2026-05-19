@@ -717,6 +717,17 @@ def _prepare_strategy_config(
                 prepared["bar_type"] = f"{canonical_id}-1-MINUTE-LAST-EXTERNAL"
         else:
             prepared["bar_type"] = f"{canonical_id}-1-MINUTE-LAST-EXTERNAL"
+
+    # Empty ``order_id_tag`` produces ``"Strategy-"`` which the Rust
+    # ``StrategyId`` validator rejects with a panic — the subprocess dies
+    # before any Python error handler can write the result pickle and the
+    # parent runner surfaces an opaque ``EOFError``. The base
+    # ``StrategyConfig`` default is ``order_id_tag=None`` (which the
+    # validator accepts), so strip empties to fall back to that default.
+    # Keeps legacy stored configs runnable after a strategy file fix that
+    # removed the empty-string default.
+    if prepared.get("order_id_tag") == "":
+        del prepared["order_id_tag"]
     return prepared
 
 

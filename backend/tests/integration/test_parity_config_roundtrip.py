@@ -186,12 +186,12 @@ def test_api_and_worker_inject_identical_configs_for_omitted_defaults() -> None:
     byte-identical dicts when given the same user-submitted config +
     resolved instruments. Otherwise the persisted ``Backtest.config``
     diverges from what the worker actually runs — breaking graduation
-    parity with portfolio_service.
+    parity with the portfolio service.
 
     This is the Contrarian's hard merge gate: "omitted defaults +
     backend-injected fields normalize identically across backtest /
     portfolio / paper / live". Proven for the API ↔ worker pair here;
-    portfolio_service parity is covered by existing tests in
+    portfolio service parity is covered by existing tests in
     ``test_portfolio_full_lifecycle.py``.
     """
     from msai.api.backtests import _prepare_and_validate_backtest_config

@@ -233,6 +233,26 @@ class BacktestRunner:
             if not result_path.exists():
                 raise RuntimeError("Backtest subprocess exited without a result")
 
+            # An empty result file means the subprocess crashed before
+            # the ``except Exception`` handler in ``_run_in_subprocess``
+            # could write a pickle — typically a Rust-side panic from
+            # Nautilus's identifier validators (e.g. an empty
+            # ``order_id_tag`` producing ``StrategyId('SmokeStrategy-')``,
+            # rejected by ``strategy_id.rs``).  ``pickle.load`` on an
+            # empty file raises ``EOFError: Ran out of input``, which
+            # bubbles up as an opaque per-strategy attribution error —
+            # surface the real shape here so the operator can find the
+            # config field that triggered the panic.
+            if result_path.stat().st_size == 0:
+                exit_code = getattr(process, "exitcode", None)
+                raise RuntimeError(
+                    "Backtest subprocess crashed without writing a result "
+                    f"(exit_code={exit_code}); the Python-level error handler "
+                    "did not fire — this is typically a Rust-side panic from "
+                    "Nautilus (invalid identifier, empty order_id_tag, etc.). "
+                    "Check the worker logs for a 'thread panicked' line."
+                )
+
             with result_path.open("rb") as handle:
                 raw = cast("dict[str, Any]", pickle.load(handle))
 

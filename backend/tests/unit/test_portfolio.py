@@ -14,8 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from msai.core.database import get_db
 from msai.main import app
 from msai.schemas.portfolio import PortfolioCreate, PortfolioRunCreate
-from msai.services.portfolio_service import PortfolioService
-
+from msai.services.portfolio import PortfolioService
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -42,6 +41,11 @@ def _make_portfolio_row(
     row.downside_target = None
     row.benchmark_symbol = "SPY"
     row.account_id = None
+    # B5 safety caps + mode + allocator (defaults match the migration's server_defaults).
+    row.max_position_size = None
+    row.max_drawdown_halt = None
+    row.default_mode = "quick"
+    row.allocator_name = "equal_weight"
     row.created_by = None
     row.created_at = datetime.now(UTC)
     row.updated_at = datetime.now(UTC)
@@ -88,6 +92,12 @@ def _make_run_row(
     row.created_at = datetime.now(UTC)
     row.updated_at = datetime.now(UTC)
     row.completed_at = None
+    # B5 mode + optimizer-trace + IS/OOS (defaults match migration server_defaults).
+    row.mode = "quick"
+    row.optimization_trace = None
+    row.walk_forward_payload = None
+    row.is_metric = None
+    row.oos_metric = None
     return row
 
 

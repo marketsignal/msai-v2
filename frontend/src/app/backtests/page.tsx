@@ -1,5 +1,17 @@
 "use client";
 
+/**
+ * Backtest history — unified list of single-strategy + portfolio runs.
+ *
+ * Plan ref: `docs/plans/portfolio-backtest.md` Task H9. The G4 backend
+ * `GET /api/v1/backtests/history?type=<single|portfolio|all>` returns rows
+ * tagged with a ``type`` discriminator; this page renders a single
+ * timeline with a type filter + Type badge per row. Click-through routes:
+ *
+ *   - single → /backtests/{id}
+ *   - portfolio → /portfolio/runs/{run_id}
+ */
+
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import {
@@ -11,6 +23,13 @@ import {
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   Table,
   TableBody,
@@ -47,9 +66,35 @@ function statusColor(status: string): string {
       return "bg-amber-500/15 text-amber-500 hover:bg-amber-500/25";
     case "failed":
       return "bg-red-500/15 text-red-500 hover:bg-red-500/25";
+    case "canceled":
+      return "bg-zinc-500/15 text-zinc-400 hover:bg-zinc-500/25";
     default:
       return "bg-muted text-muted-foreground hover:bg-muted";
   }
+}
+
+type HistoryTypeFilter = "all" | "single" | "portfolio";
+
+function typeBadgeClass(type: BacktestHistoryItem["type"]): string {
+  return type === "portfolio"
+    ? "bg-violet-500/15 text-violet-500 hover:bg-violet-500/25"
+    : "bg-sky-500/15 text-sky-500 hover:bg-sky-500/25";
+}
+
+function typeLabel(type: BacktestHistoryItem["type"]): string {
+  return type === "portfolio" ? "Portfolio" : "Single";
+}
+
+/**
+ * Compute the click-through href for a history row. Portfolio rows route
+ * to the results page at ``/portfolio/runs/{id}``; single rows route to
+ * ``/backtests/{id}`` as before.
+ */
+function detailHref(item: BacktestHistoryItem): string {
+  if (item.type === "portfolio") {
+    return `/portfolio/runs/${item.id}`;
+  }
+  return `/backtests/${item.id}`;
 }
 
 export default function BacktestsPage(): React.ReactElement {
@@ -61,6 +106,7 @@ export default function BacktestsPage(): React.ReactElement {
   >({});
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+  const [typeFilter, setTypeFilter] = useState<HistoryTypeFilter>("all");
 
   const load = useCallback(async (): Promise<void> => {
     setLoading(true);
@@ -68,7 +114,10 @@ export default function BacktestsPage(): React.ReactElement {
     try {
       const token = await getToken();
       const [history, strategies] = await Promise.all([
-        apiGet<BacktestHistoryResponse>("/api/v1/backtests/history", token),
+        apiGet<BacktestHistoryResponse>(
+          `/api/v1/backtests/history?type=${encodeURIComponent(typeFilter)}`,
+          token,
+        ),
         apiGet<StrategyListResponse>("/api/v1/strategies/", token),
       ]);
       setBacktests(history.items);
@@ -84,7 +133,7 @@ export default function BacktestsPage(): React.ReactElement {
     } finally {
       setLoading(false);
     }
-  }, [getToken]);
+  }, [getToken, typeFilter]);
 
   useEffect(() => {
     void load();
@@ -97,7 +146,7 @@ export default function BacktestsPage(): React.ReactElement {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Backtests</h1>
           <p className="text-sm text-muted-foreground">
-            Run and review historical strategy backtests
+            Run and review historical strategy + portfolio backtests
           </p>
         </div>
         <RunBacktestForm
@@ -115,9 +164,47 @@ export default function BacktestsPage(): React.ReactElement {
 
       {/* Backtests table */}
       <Card className="border-border/50">
-        <CardHeader>
-          <CardTitle className="text-base">Backtest History</CardTitle>
-          <CardDescription>All backtest runs across strategies</CardDescription>
+        <CardHeader className="flex flex-row items-start justify-between gap-4">
+          <div>
+            <CardTitle className="text-base">Backtest History</CardTitle>
+            <CardDescription>
+              Unified timeline of single-strategy and portfolio backtests
+            </CardDescription>
+          </div>
+          <div className="flex items-center gap-2">
+            <label
+              htmlFor="backtest-type-filter"
+              className="text-xs text-muted-foreground"
+            >
+              Type
+            </label>
+            <Select
+              value={typeFilter}
+              onValueChange={(v) => setTypeFilter(v as HistoryTypeFilter)}
+            >
+              <SelectTrigger
+                id="backtest-type-filter"
+                className="h-8 w-[140px]"
+                data-testid="backtest-type-filter"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all" data-testid="filter-option-all">
+                  All
+                </SelectItem>
+                <SelectItem value="single" data-testid="filter-option-single">
+                  Single
+                </SelectItem>
+                <SelectItem
+                  value="portfolio"
+                  data-testid="filter-option-portfolio"
+                >
+                  Portfolio
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
         </CardHeader>
         <CardContent>
           {loading ? (
@@ -126,13 +213,16 @@ export default function BacktestsPage(): React.ReactElement {
             </div>
           ) : backtests.length === 0 ? (
             <div className="flex h-32 items-center justify-center text-sm text-muted-foreground">
-              No backtests yet. Click &quot;Run Backtest&quot; to start one.
+              {typeFilter === "all"
+                ? 'No backtests yet. Click "Run Backtest" to start one.'
+                : `No ${typeFilter} backtests yet.`}
             </div>
           ) : (
             <Table>
               <TableHeader>
                 <TableRow className="border-border/50 hover:bg-transparent">
-                  <TableHead>Strategy</TableHead>
+                  <TableHead>Type</TableHead>
+                  <TableHead>Name</TableHead>
                   <TableHead>Date Range</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead className="text-right">Created</TableHead>
@@ -141,12 +231,31 @@ export default function BacktestsPage(): React.ReactElement {
               </TableHeader>
               <TableBody>
                 {backtests.map((bt) => {
-                  const strategy = strategiesById[bt.strategy_id];
+                  const isPortfolio = bt.type === "portfolio";
+                  const name = isPortfolio
+                    ? (bt.portfolio_name ??
+                      bt.portfolio_id?.slice(0, 8) ??
+                      bt.id.slice(0, 8))
+                    : bt.strategy_id
+                      ? (strategiesById[bt.strategy_id]?.name ??
+                        bt.strategy_id.slice(0, 8))
+                      : bt.id.slice(0, 8);
                   return (
-                    <TableRow key={bt.id} className="border-border/50">
-                      <TableCell className="font-medium">
-                        {strategy?.name ?? bt.strategy_id.slice(0, 8)}
+                    <TableRow
+                      key={bt.id}
+                      className="border-border/50"
+                      data-testid={`backtest-row-${bt.id}`}
+                    >
+                      <TableCell>
+                        <Badge
+                          variant="secondary"
+                          className={typeBadgeClass(bt.type)}
+                          data-testid={`backtest-type-${bt.id}`}
+                        >
+                          {typeLabel(bt.type)}
+                        </Badge>
                       </TableCell>
+                      <TableCell className="font-medium">{name}</TableCell>
                       <TableCell className="text-muted-foreground">
                         {bt.start_date} to {bt.end_date}
                       </TableCell>
@@ -213,7 +322,7 @@ export default function BacktestsPage(): React.ReactElement {
                             }
                           >
                             <Link
-                              href={`/backtests/${bt.id}`}
+                              href={detailHref(bt)}
                               data-testid={`backtest-detail-link-${bt.id}`}
                             >
                               <ExternalLink className="size-3.5" />

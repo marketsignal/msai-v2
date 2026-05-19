@@ -1,8 +1,8 @@
 """Unit tests for portfolio orchestration helpers.
 
-Covers the pure functions in :mod:`msai.services.portfolio_service`:
-``_heuristic_weight``, ``_effective_leverage``,
-``_load_benchmark_returns``, ``_extract_returns_from_account``.
+Covers the pure functions in :mod:`msai.services.portfolio`:
+``heuristic_weight``, ``effective_leverage``,
+``load_benchmark_returns``, ``_extract_returns_from_account``.
 
 The orchestration DAG (``run_portfolio_backtest`` and friends) is covered
 by the integration test at
@@ -17,15 +17,17 @@ import pandas as pd
 import pytest
 
 from msai.models.portfolio_enums import PortfolioObjective
-from msai.services.portfolio_service import (
-    PortfolioOrchestrationError,
+from msai.services.portfolio import PortfolioOrchestrationError
+from msai.services.portfolio.computation import (
+    effective_leverage,
+    heuristic_weight,
+    load_benchmark_returns,
+    raw_benchmark_symbol,
+)
+from msai.services.portfolio.orchestration import (
     _coerce_objective,
-    _effective_leverage,
     _extract_returns_from_account,
-    _heuristic_weight,
-    _load_benchmark_returns,
     _prepare_strategy_config,
-    _raw_benchmark_symbol,
 )
 
 # ---------------------------------------------------------------------------
@@ -58,44 +60,96 @@ class TestCoerceObjective:
 
 
 # ---------------------------------------------------------------------------
-# _heuristic_weight
+# heuristic_weight
 # ---------------------------------------------------------------------------
 
 
 class TestHeuristicWeight:
     def test_maximize_sharpe_uses_sharpe_metric(self) -> None:
-        weight = _heuristic_weight({"sharpe": 1.5}, PortfolioObjective.MAXIMIZE_SHARPE)
+        weight = heuristic_weight({"sharpe": 1.5}, PortfolioObjective.MAXIMIZE_SHARPE)
         assert weight == 1.5
 
     def test_maximize_sharpe_floors_negative_at_unity(self) -> None:
         # Negative sharpe -> floor to 1.0 so the candidate survives to
         # normalization (which will proportionally down-weight it).
-        weight = _heuristic_weight({"sharpe": -0.3}, PortfolioObjective.MAXIMIZE_SHARPE)
+        weight = heuristic_weight({"sharpe": -0.3}, PortfolioObjective.MAXIMIZE_SHARPE)
         assert weight == 1.0
 
     def test_maximize_sortino_uses_sortino_metric(self) -> None:
-        assert _heuristic_weight({"sortino": 2.0}, PortfolioObjective.MAXIMIZE_SORTINO) == 2.0
+        assert heuristic_weight({"sortino": 2.0}, PortfolioObjective.MAXIMIZE_SORTINO) == 2.0
 
     def test_maximize_profit_uses_total_return(self) -> None:
-        assert _heuristic_weight({"total_return": 0.35}, PortfolioObjective.MAXIMIZE_PROFIT) == 0.35
+        assert heuristic_weight({"total_return": 0.35}, PortfolioObjective.MAXIMIZE_PROFIT) == 0.35
 
     def test_equal_weight_always_returns_unity(self) -> None:
-        assert _heuristic_weight({"sharpe": 5.0}, PortfolioObjective.EQUAL_WEIGHT) == 1.0
+        assert heuristic_weight({"sharpe": 5.0}, PortfolioObjective.EQUAL_WEIGHT) == 1.0
 
     def test_manual_returns_unity(self) -> None:
         # Manual objective means explicit weights are required; heuristic
         # is a safe "equal" default when that contract is bypassed.
-        assert _heuristic_weight({}, PortfolioObjective.MANUAL) == 1.0
+        assert heuristic_weight({}, PortfolioObjective.MANUAL) == 1.0
 
     def test_missing_metric_falls_back_to_unity(self) -> None:
-        assert _heuristic_weight({}, PortfolioObjective.MAXIMIZE_SHARPE) == 1.0
+        assert heuristic_weight({}, PortfolioObjective.MAXIMIZE_SHARPE) == 1.0
 
     def test_none_metric_falls_back_to_unity(self) -> None:
-        assert _heuristic_weight({"sharpe": None}, PortfolioObjective.MAXIMIZE_SHARPE) == 1.0
+        assert heuristic_weight({"sharpe": None}, PortfolioObjective.MAXIMIZE_SHARPE) == 1.0
+
+    def test_maximize_calmar_uses_calmar_metric_when_present(self) -> None:
+        # Explicit ``calmar`` metric on the candidate wins over the
+        # derive-from-total-return fallback.
+        assert heuristic_weight({"calmar": 2.5}, PortfolioObjective.MAXIMIZE_CALMAR) == 2.5
+
+    def test_maximize_calmar_derives_from_total_return_and_drawdown(self) -> None:
+        weight = heuristic_weight(
+            {"total_return": 0.30, "max_drawdown": -0.10},
+            PortfolioObjective.MAXIMIZE_CALMAR,
+        )
+        assert weight == pytest.approx(3.0)
+
+    def test_minimize_max_drawdown_inverts_drawdown(self) -> None:
+        weight = heuristic_weight(
+            {"max_drawdown": -0.05},
+            PortfolioObjective.MINIMIZE_MAX_DRAWDOWN,
+        )
+        # 1 / 0.05 == 20
+        assert weight == pytest.approx(20.0)
+
+    @pytest.mark.parametrize("objective", list(PortfolioObjective))
+    def test_heuristic_weight_handles_all_objectives(
+        self,
+        objective: PortfolioObjective,
+    ) -> None:
+        """Phase 5.1 P1-F — no PortfolioObjective member may silently equal-weight.
+
+        Walk every enum value with a plausible candidate-metrics dict and
+        assert the helper returns a finite positive weight. The previous
+        implementation handled only MAXIMIZE_PROFIT / SHARPE / SORTINO and
+        silently fell through to ``1.0`` (equal-weight) for the new B2
+        values (MAXIMIZE_CALMAR / MINIMIZE_MAX_DRAWDOWN) — defeating the
+        operator's chosen objective.
+
+        Adding a new PortfolioObjective member MUST also extend
+        ``heuristic_weight`` and this test will surface the gap (the new
+        value lands in the equal-weight fallback path and the parametrise
+        catches the regression).
+        """
+        import math
+
+        metrics = {
+            "total_return": 0.15,
+            "sharpe": 1.3,
+            "sortino": 1.6,
+            "calmar": 2.0,
+            "max_drawdown": -0.08,
+        }
+        weight = heuristic_weight(metrics, objective)
+        assert math.isfinite(weight)
+        assert weight > 0.0, f"objective {objective!r} must not return zero weight"
 
 
 # ---------------------------------------------------------------------------
-# _effective_leverage
+# effective_leverage
 # ---------------------------------------------------------------------------
 
 
@@ -109,7 +163,7 @@ class TestEffectiveLeverage:
     def test_no_downside_target_returns_requested_leverage(self) -> None:
         weighted = [("s", 1.0, self._series([0.01, -0.02, 0.03]))]
         assert (
-            _effective_leverage(
+            effective_leverage(
                 weighted_series=weighted,
                 requested_leverage=2.0,
                 downside_target=None,
@@ -122,7 +176,7 @@ class TestEffectiveLeverage:
         # it here and pass requested_leverage through unchanged.
         weighted = [("s", 1.0, self._series([0.01, -0.02]))]
         assert (
-            _effective_leverage(
+            effective_leverage(
                 weighted_series=weighted,
                 requested_leverage=1.5,
                 downside_target=0.0,
@@ -135,7 +189,7 @@ class TestEffectiveLeverage:
         # rather than silently upgrading to 1.0.
         weighted = [("s", 1.0, self._series([0.01, -0.02]))]
         assert (
-            _effective_leverage(
+            effective_leverage(
                 weighted_series=weighted,
                 requested_leverage=0.0,
                 downside_target=0.05,
@@ -146,7 +200,7 @@ class TestEffectiveLeverage:
     def test_high_downside_scales_leverage_down(self) -> None:
         # Large losses -> high downside risk -> leverage must scale down.
         weighted = [("s", 1.0, self._series([-0.05, -0.08, -0.06, -0.04]))]
-        lev = _effective_leverage(
+        lev = effective_leverage(
             weighted_series=weighted,
             requested_leverage=2.0,
             downside_target=0.05,
@@ -156,7 +210,7 @@ class TestEffectiveLeverage:
     def test_zero_downside_risk_preserves_requested_leverage(self) -> None:
         # All-positive series -> downside_risk is 0 -> leverage passes through.
         weighted = [("s", 1.0, self._series([0.01, 0.02, 0.015]))]
-        lev = _effective_leverage(
+        lev = effective_leverage(
             weighted_series=weighted,
             requested_leverage=3.0,
             downside_target=0.05,
@@ -166,7 +220,7 @@ class TestEffectiveLeverage:
     def test_never_scales_below_safety_floor(self) -> None:
         # Pathological downside -> still clamp to 0.1 minimum.
         weighted = [("s", 1.0, self._series([-0.5, -0.6, -0.7]))]
-        lev = _effective_leverage(
+        lev = effective_leverage(
             weighted_series=weighted,
             requested_leverage=1.0,
             downside_target=0.001,  # extremely tight target
@@ -175,7 +229,7 @@ class TestEffectiveLeverage:
 
 
 # ---------------------------------------------------------------------------
-# _load_benchmark_returns
+# load_benchmark_returns
 # ---------------------------------------------------------------------------
 
 
@@ -183,13 +237,13 @@ class TestLoadBenchmarkReturns:
     def test_empty_symbol_returns_none(self) -> None:
         mq = MagicMock()
         assert (
-            _load_benchmark_returns(
+            load_benchmark_returns(
                 mq, benchmark_symbol=None, start_date="2024-01-01", end_date="2024-01-31"
             )
             is None
         )
         assert (
-            _load_benchmark_returns(
+            load_benchmark_returns(
                 mq, benchmark_symbol="", start_date="2024-01-01", end_date="2024-01-31"
             )
             is None
@@ -202,7 +256,7 @@ class TestLoadBenchmarkReturns:
         # caller can see the try-then-strip sequence explicitly.
         mq = MagicMock()
         mq.get_bars.side_effect = [[], []]  # both return empty
-        _load_benchmark_returns(
+        load_benchmark_returns(
             mq,
             benchmark_symbol="SPY.NASDAQ",
             start_date="2024-01-01",
@@ -219,7 +273,7 @@ class TestLoadBenchmarkReturns:
             {"timestamp": "2024-01-01T00:00:00Z", "close": 100.0},
             {"timestamp": "2024-01-02T00:00:00Z", "close": 101.0},
         ]
-        result = _load_benchmark_returns(
+        result = load_benchmark_returns(
             mq,
             benchmark_symbol="BRK.B",
             start_date="2024-01-01",
@@ -238,7 +292,7 @@ class TestLoadBenchmarkReturns:
             {"timestamp": "not-a-date", "close": 100.0},
             {"timestamp": "also-bad", "close": 101.0},
         ]
-        result = _load_benchmark_returns(
+        result = load_benchmark_returns(
             mq,
             benchmark_symbol="SPY",
             start_date="2024-01-01",
@@ -249,7 +303,7 @@ class TestLoadBenchmarkReturns:
     def test_empty_bars_returns_none(self) -> None:
         mq = MagicMock()
         mq.get_bars.return_value = []
-        result = _load_benchmark_returns(
+        result = load_benchmark_returns(
             mq,
             benchmark_symbol="SPY",
             start_date="2024-01-01",
@@ -265,7 +319,7 @@ class TestLoadBenchmarkReturns:
             {"timestamp": "2024-01-02T15:00:00Z", "close": 101.0},
             {"timestamp": "2024-01-03T15:00:00Z", "close": 102.01},
         ]
-        result = _load_benchmark_returns(
+        result = load_benchmark_returns(
             mq,
             benchmark_symbol="SPY",
             start_date="2024-01-01",
@@ -282,7 +336,7 @@ class TestLoadBenchmarkReturns:
         mq = MagicMock()
         mq.get_bars.return_value = [{"timestamp": "2024-01-01T00:00:00Z"}]
         assert (
-            _load_benchmark_returns(
+            load_benchmark_returns(
                 mq, benchmark_symbol="SPY", start_date="2024-01-01", end_date="2024-01-31"
             )
             is None
@@ -382,30 +436,55 @@ class TestPrepareStrategyConfig:
         result["mutated"] = True
         assert "mutated" not in src
 
+    def test_strips_empty_order_id_tag(self) -> None:
+        """Empty ``order_id_tag`` must be removed.
+
+        Nautilus's ``Strategy`` constructor builds ``StrategyId`` as
+        ``f"{component_id}-{config.order_id_tag}"``; an empty string
+        produces ``"Strategy-"`` which the Rust validator rejects with a
+        process-killing panic.  Stored candidate configs created when a
+        strategy file shipped ``order_id_tag: str = ""`` would otherwise
+        keep crashing the backtest subprocess and surfacing an opaque
+        ``EOFError`` to the parent runner.
+        """
+        result = _prepare_strategy_config(
+            {"order_id_tag": ""},
+            ["AAPL.NASDAQ"],
+        )
+        assert "order_id_tag" not in result
+
+    def test_preserves_non_empty_order_id_tag(self) -> None:
+        """Non-empty ``order_id_tag`` (e.g. live deployment slug) is kept."""
+        result = _prepare_strategy_config(
+            {"order_id_tag": "deploy-123"},
+            ["AAPL.NASDAQ"],
+        )
+        assert result["order_id_tag"] == "deploy-123"
+
 
 # ---------------------------------------------------------------------------
-# _raw_benchmark_symbol
+# raw_benchmark_symbol
 # ---------------------------------------------------------------------------
 
 
 class TestRawBenchmarkSymbol:
     def test_strips_uppercase_venue_suffix(self) -> None:
-        assert _raw_benchmark_symbol("SPY.NASDAQ") == "SPY"
-        assert _raw_benchmark_symbol("AAPL.XNAS") == "AAPL"
-        assert _raw_benchmark_symbol("BRK.B.NYSE") == "BRK.B"
+        assert raw_benchmark_symbol("SPY.NASDAQ") == "SPY"
+        assert raw_benchmark_symbol("AAPL.XNAS") == "AAPL"
+        assert raw_benchmark_symbol("BRK.B.NYSE") == "BRK.B"
 
     def test_preserves_share_class(self) -> None:
         # Single-letter suffixes are share classes, not venues — must
         # NOT be stripped, otherwise a fallback could silently substitute
         # the parent ticker and compute alpha/beta against the wrong
         # asset if both are in the parquet store.
-        assert _raw_benchmark_symbol("BRK.B") == "BRK.B"
-        assert _raw_benchmark_symbol("RDS.A") == "RDS.A"
+        assert raw_benchmark_symbol("BRK.B") == "BRK.B"
+        assert raw_benchmark_symbol("RDS.A") == "RDS.A"
 
     def test_preserves_lowercase_and_mixed_case(self) -> None:
         # Only uppercase codes are treated as venues.
-        assert _raw_benchmark_symbol("FOO.xyz") == "FOO.xyz"
-        assert _raw_benchmark_symbol("FOO.Xyz") == "FOO.Xyz"
+        assert raw_benchmark_symbol("FOO.xyz") == "FOO.xyz"
+        assert raw_benchmark_symbol("FOO.Xyz") == "FOO.Xyz"
 
     def test_no_dot_returns_unchanged(self) -> None:
-        assert _raw_benchmark_symbol("SPY") == "SPY"
+        assert raw_benchmark_symbol("SPY") == "SPY"

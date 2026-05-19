@@ -13,15 +13,26 @@ Invariants enforced:
 
 from __future__ import annotations
 
+import hashlib
+import json
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import func, select
+from sqlalchemy.orm import selectinload
 
 from msai.models import (
     GraduationCandidate,
     LivePortfolio,
     LivePortfolioRevision,
     LivePortfolioRevisionStrategy,
+)
+from msai.models.portfolio import (
+    Portfolio as BacktestPortfolio,  # noqa: TC001 — used at runtime in materialize_from_backtest signature
+)
+from msai.models.portfolio_allocation import PortfolioAllocation
+from msai.models.portfolio_run import (
+    PortfolioRun,  # noqa: TC001 — used at runtime in materialize_from_backtest signature
 )
 from msai.services.graduation import ELIGIBLE_FOR_LIVE_PORTFOLIO
 from msai.services.live.revision_service import (
@@ -30,7 +41,6 @@ from msai.services.live.revision_service import (
 )
 
 if TYPE_CHECKING:
-    from decimal import Decimal
     from uuid import UUID
 
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -171,6 +181,206 @@ class PortfolioService:
             )
         )
         return result.scalar_one_or_none()
+
+    # ------------------------------------------------------------------
+    # G2: materialize a backtest portfolio + run into a frozen live revision.
+    # ------------------------------------------------------------------
+
+    async def materialize_from_backtest(
+        self,
+        *,
+        portfolio: BacktestPortfolio,
+        run: PortfolioRun,
+        account_id: str,
+        created_by: UUID | None,
+    ) -> tuple[LivePortfolio, LivePortfolioRevision]:
+        """Promote a completed backtest run into a frozen ``LivePortfolio`` + revision.
+
+        The backtest-side :class:`Portfolio` and :class:`PortfolioRun`
+        carry the composition that was validated by the engine. We
+        materialize that into a new ``LivePortfolio`` (one per promotion
+        — names are uniquified by appending the run id) and a single
+        ``LivePortfolioRevision`` frozen at creation. ``add_strategy``
+        is NOT called because:
+
+        1. ``add_strategy`` enforces ``ELIGIBLE_FOR_LIVE_PORTFOLIO``
+           graduation stages; default-portfolio candidates created by
+           the F1c bridge sit at ``portfolio_default`` and paper-test
+           candidates at ``paper_candidate``. Promote-to-live is the
+           Phase 1 stand-in for that graduation path and intentionally
+           bypasses the stage check.
+        2. ``add_strategy`` builds an unfrozen *draft* revision; the
+           promotion's revision is frozen at creation so the deploy path
+           sees a stable composition from the first moment.
+
+        Full-mode runs carry the winning hyperparameter set in
+        ``run.metrics["best_config"]``. When present, it is merged into
+        each member's per-strategy ``config`` dict so the live node
+        receives the optimized parameters (not the backtest defaults).
+
+        Args:
+            portfolio: The backtest-side :class:`Portfolio` row.
+            run: The :class:`PortfolioRun` row whose composition we promote.
+            account_id: IB account id (paper-only enforcement at API layer).
+            created_by: User UUID for the ``LivePortfolio.created_by`` field.
+
+        Returns:
+            A tuple ``(live_portfolio, frozen_revision)``. Both are
+            ``session.flush``-persisted but NOT committed — the caller
+            owns the transaction boundary.
+        """
+        # ---- Load the source allocations + candidates + strategies ----
+        allocations = list(
+            (
+                await self._session.execute(
+                    select(PortfolioAllocation)
+                    .where(PortfolioAllocation.portfolio_id == portfolio.id)
+                    .options(
+                        selectinload(PortfolioAllocation.candidate).selectinload(
+                            GraduationCandidate.strategy
+                        )
+                    )
+                    .order_by(PortfolioAllocation.created_at)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not allocations:
+            raise PortfolioDomainError(f"Portfolio {portfolio.id} has no allocations to promote")
+
+        # ---- Resolve per-strategy config + instruments + weights ----
+        # Full-mode runs carry the winning hyperparameters in
+        # ``metrics["best_config"]``. Merge it on top of each member's
+        # candidate config so the LIVE revision uses the optimizer's
+        # picks rather than the candidate's defaults. Quick-mode runs
+        # have no best_config; the merge degenerates to a no-op.
+        best_config: dict[str, Any] = {}
+        if run.metrics and isinstance(run.metrics.get("best_config"), dict):
+            best_config = dict(run.metrics["best_config"])
+
+        # Equal weight is the simplest defensible default when an operator
+        # has not pinned per-candidate weights (the F1c bridge always
+        # leaves them None). For explicit-allocation portfolios we honor
+        # the operator's weights as-is — the orchestration layer already
+        # normalizes them at backtest time.
+        explicit_weights = [float(a.weight) for a in allocations if a.weight is not None]
+        use_explicit = len(explicit_weights) == len(allocations)
+        equal_weight = Decimal("1") / Decimal(len(allocations))
+
+        # ---- Create LivePortfolio + frozen revision ----
+        # Append the run id suffix so re-promoting the same backtest
+        # portfolio produces a uniquely-named LivePortfolio (the
+        # ``name`` column has ``unique=True``). Operators who want to
+        # repromote with the same name should rename / archive the
+        # previous LivePortfolio first.
+        live_portfolio_name = f"{portfolio.name} (run {str(run.id)[:8]})"
+        live_portfolio = LivePortfolio(
+            name=live_portfolio_name,
+            description=(
+                f"Promoted from PortfolioRun {run.id} (account_id={account_id}, mode={run.mode})"
+            ),
+            created_by=created_by,
+        )
+        self._session.add(live_portfolio)
+        await self._session.flush()
+
+        # Build the member rows + composition hash from the canonical
+        # composition. We compute the hash deterministically so the same
+        # backtest portfolio + run + best_config always produces the same
+        # hash — useful for de-dup at the deploy-path layer.
+        member_rows: list[dict[str, Any]] = []
+        for idx, alloc in enumerate(allocations):
+            candidate = alloc.candidate
+            if candidate is None or candidate.strategy is None:
+                raise PortfolioDomainError(
+                    f"Allocation {alloc.id} is missing candidate/strategy "
+                    "rows after eager-load — DB corruption?"
+                )
+            strategy = candidate.strategy
+
+            default_config = dict(strategy.default_config or {})
+            candidate_config = dict(candidate.config or {})
+            merged_config: dict[str, Any] = {
+                **default_config,
+                **candidate_config,
+                **best_config,
+            }
+
+            instruments_raw = (
+                candidate_config.get("instruments") or default_config.get("instruments") or []
+            )
+            instruments = [str(i) for i in instruments_raw]
+            if not instruments:
+                raise PortfolioDomainError(
+                    f"Candidate {candidate.id} has no instruments configured; "
+                    "cannot promote a portfolio that would trade nothing."
+                )
+
+            if use_explicit and alloc.weight is not None:
+                weight = Decimal(str(float(alloc.weight)))
+            else:
+                weight = equal_weight
+
+            member_rows.append(
+                {
+                    "strategy_id": strategy.id,
+                    "config": merged_config,
+                    "instruments": instruments,
+                    "weight": weight,
+                    "order_index": idx,
+                }
+            )
+
+        composition_hash = self._composition_hash(member_rows)
+        revision = LivePortfolioRevision(
+            portfolio_id=live_portfolio.id,
+            revision_number=1,
+            composition_hash=composition_hash,
+            is_frozen=True,
+        )
+        self._session.add(revision)
+        await self._session.flush()
+
+        for row in member_rows:
+            self._session.add(
+                LivePortfolioRevisionStrategy(
+                    revision_id=revision.id,
+                    strategy_id=row["strategy_id"],
+                    config=row["config"],
+                    instruments=row["instruments"],
+                    weight=row["weight"],
+                    order_index=row["order_index"],
+                )
+            )
+        await self._session.flush()
+
+        return live_portfolio, revision
+
+    @staticmethod
+    def _composition_hash(member_rows: list[dict[str, Any]]) -> str:
+        """SHA256 over the canonical (strategy_id, config, instruments, weight) tuples.
+
+        Sorted by ``order_index`` (the rows are already in that order),
+        instruments sorted within each row so a re-ordering of the same
+        set of instruments produces the same hash. ``weight`` is
+        serialized as ``str(Decimal)`` to preserve precision; ``config``
+        is dumped with ``sort_keys=True``.
+        """
+        payload = []
+        for row in member_rows:
+            payload.append(
+                {
+                    "strategy_id": str(row["strategy_id"]),
+                    "config": row["config"],
+                    "instruments": sorted(row["instruments"]),
+                    "weight": str(row["weight"]),
+                    "order_index": row["order_index"],
+                }
+            )
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
 
     # ------------------------------------------------------------------
     # Internals

@@ -4,6 +4,36 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-05-18 — Portfolio backtest: form-based composer + Quick/Full modes + optimizer (`feat/portfolio-backtest`)
+
+Replaces the rejected JSON portfolio-compose UX (was 404'd in PR #70 per `docs/decisions/2026-05-17-portfolio-backtest-deferred.md`) with a form-based composer + two-mode backtest engine. Quick mode = single-shot ~3-5min. Full mode = Optuna TPE search over per-strategy risk-policy parameter space with walk-forward cross-validation (~8h cap). Operator picks an objective function (return / Sharpe / Sortino / Calmar / max DD); the optimizer finds the winning config and reports IS/OOS gap.
+
+**Backend (16 files):**
+
+- Refactor: `services/portfolio_service.py` (1100 LOC monolith) split into `services/portfolio/{orchestration,lifecycle,computation}.py` per Maintainer's council mandate (2026-05-17). Shim → swept → deleted in 4 task waves (A1-A4). 292 portfolio tests pass before/after; pure relocation.
+- New `services/portfolio_backtest/` package: `allocators.py` (Equal/Fixed/InverseVol/VolTargeted + ABC + ALLOCATORS registry), `objectives.py` (5-scorer registry mapping `PortfolioObjective` → metric scorer), `safety_caps.py` (SafetyCaps dataclass + enforce_caps validator), `per_strategy_attribution.py` (Cache.positions(strategy_id=) extractor — the cheapest falsifying test from the Approach Comparison), `results.py` (per-strategy equity / drawdown / return correlation / drawdown correlation / drawdown breakdown), `optimizer.py` (Optuna ask/tell loop + walk-forward via research_engine.build_walk_forward_windows).
+- Mode branch on existing `PortfolioService.run_portfolio_backtest`: Quick path unchanged; Full path delegates to `portfolio_backtest.optimizer.run_portfolio_walk_forward`. Returns-aggregation trial body (~50ms/trial) keeps 100 trials × 10 windows well under the 8h PRD cap; full-Nautilus replay reserved for Quick mode and the operator's final go/no-go.
+- Strategy → default-Candidate bridge: `PortfolioCreate.strategy_ids` auto-creates a `GraduationCandidate(stage="portfolio_default")` per strategy. Preserves the existing `Portfolio → Allocation → Candidate → Strategy` chain while exposing a strategy-first compose UX per PRD US-001.
+- API: `POST /portfolios/runs/{id}/cancel`, `POST /portfolios/runs/{id}/promote-to-live` (DU paper-only enforcement; existing risk-engine gate), `GET /backtests/history?type=single|portfolio|all` unified.
+- Live-side `materialize_from_backtest(portfolio, run, account_id, created_by)` builds `LivePortfolio + LivePortfolioRevision` carrying the Full-mode winning risk-policy config (merged onto each member's candidate config); frozen revision.
+- Worker: `portfolio_job.py` honors cancel flag + DB-row progress callback; mode branch dispatches.
+- DB migration `b063ef2dd543`: 4 new `Portfolio` columns (`max_position_size`, `max_drawdown_halt`, `default_mode`, `allocator_name`), 5 new `PortfolioRun` columns (`mode`, `optimization_trace`, `walk_forward_payload`, `is_metric`, `oos_metric`), 2 new `PortfolioObjective` values (`MAXIMIZE_CALMAR`, `MINIMIZE_MAX_DRAWDOWN`), `CANCELED` `PortfolioRunStatus`, new `BacktestMode` enum. Additive-only.
+- 60+ new backend tests; 2493 total pass.
+
+**Frontend (~15 files):**
+
+- New compose page `/portfolio/new` — form-based: searchable multi-select strategies (shadcn `Popover + Input` chips), allocator `<Select>` (4 options), objective `<Select>` (5 options), safety-caps form (3 numeric inputs), date range, initial capital. POSTs `strategy_ids` (not `allocations`) — bridge auto-creates default candidates. **Zero `<Textarea>` in the page** (load-bearing PRD constraint).
+- New results page `/portfolio/runs/[runId]` — combined equity chart (Recharts), per-strategy contribution (stacked area), return + drawdown correlation matrices (heatmap via `@nivo/heatmap` + sortable table side-by-side), drawdown breakdown table. Full-mode-only: IS/OOS panel with gap badge (Healthy / Watch / Overfit risk thresholds), trials table, objective scatter. Auto-polls until terminal. "Deploy as Live Portfolio" dialog → `/promote-to-live` → `/live-trading?revision=<id>`.
+- `/portfolio/page.tsx` rewritten from 26KB JSON-compose to 3.4KB list-and-redirect. `/live-trading/portfolio/page.tsx` → `redirect("/portfolio/new")`.
+- `/backtests` unified history with type filter (All | Single | Portfolio).
+- Deps: `@nivo/heatmap@^0.99.0` + `@nivo/core@^0.99.0` (heatmap primitive; Recharts has none).
+
+**Scale:** ~30 modified/new files. Net diff includes the portfolio_service.py refactor (1100 → 3 modules) so insertions and deletions roughly balance.
+
+**Plan-review loop closed at iter 3:** Codex hallucinated iter 1 (referenced an unrelated codebase); iter 2 found 4 P1s + 2 P2s on-target (3 of 4 already caught by parallel Claude review); iter 3 zero new findings (Codex rate-limited). Contrarian gate VALIDATED the default approach: extend in-house `research_engine.py` (1397 LOC TPE+walk-forward+IS/OOS already shipped) rather than greenfield a new optimizer module.
+
+**Out of scope (deferred to v2):** HRP / risk-parity / mean-variance / Black-Litterman allocators; Monte Carlo / stress tests / rolling correlation; custom blended objectives; per-strategy hard caps; cross-regime stability scoring; Nautilus 1.222→1.225 upgrade (handled in a separate PR per the contrarian-validate rationale — keep this PR focused).
+
 ### 2026-05-16 — UI completeness (Phase 4 done; awaiting Phase 5 quality gates) (`feat/ui-completeness`)
 
 Closes every API + CLI capability gap in the UI and strips 12 user-visible fakes documented in `docs/audits/2026-05-16-ui-surface-audit.md`. User-overridden single PR per `docs/decisions/2026-05-16-ui-completeness-scope.md` §13. Council's binding technical constraints (IB account caching, strategy soft-delete, Phase-1 templates policy, Playwright spec graduation) all in-scope.

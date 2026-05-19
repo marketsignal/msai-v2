@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -33,22 +34,81 @@ from msai.core.config import settings
 from msai.core.database import async_session_factory
 from msai.core.logging import get_logger
 from msai.core.queue import get_redis_pool
+from msai.models.portfolio_enums import PortfolioRunStatus
+from msai.models.portfolio_run import PortfolioRun
 from msai.services.compute_slots import (
     ComputeSlotUnavailableError,
     acquire_compute_slots,
     release_compute_slots,
     renew_compute_slots,
 )
-from msai.services.portfolio_service import (
+from msai.services.portfolio import (
     PortfolioOrchestrationError,
+    PortfolioRunMemberFailureError,
     PortfolioRunTerminalStateError,
     PortfolioService,
 )
 
 if TYPE_CHECKING:
     from arq.connections import ArqRedis
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 log = get_logger(__name__)
+
+
+async def _check_cancel_flag(session: AsyncSession, run_id: UUID) -> bool:
+    """Return True when the run row has been flipped to ``canceled``.
+
+    Consulted by the Full-mode optimizer at the top of every trial (and
+    by the Quick path's catalog warmup, future hook). Reads ``status``
+    only — no commit needed.  Returns ``False`` on missing row so the
+    optimizer's cancel loop doesn't conflate "row gone" with "cancelled"
+    (the worker's other guards surface the missing-row case separately).
+    """
+    run = await session.get(PortfolioRun, run_id)
+    return run is not None and run.status == PortfolioRunStatus.CANCELED.value
+
+
+async def _portfolio_progress_callback(
+    session: AsyncSession,
+    run_id: UUID,
+    pct: int,
+    msg: str,
+) -> None:
+    """Persist progress (% complete + message) on the run row.
+
+    Writes to ``metrics["progress"]`` / ``metrics["progress_message"]`` and
+    refreshes ``heartbeat_at``. The UI polls these fields to render a
+    progress bar without waiting for the run to land in a terminal state.
+    """
+    run = await session.get(PortfolioRun, run_id)
+    if run is None:
+        return
+    run.heartbeat_at = datetime.now(UTC)
+    metrics = dict(run.metrics or {})
+    metrics["progress"] = int(pct)
+    metrics["progress_message"] = msg
+    run.metrics = metrics
+    await session.commit()
+
+
+async def _cancel_check_via_session(run_id: UUID) -> bool:
+    """Open a session and consult :func:`_check_cancel_flag`.
+
+    Convenience wrapper for the sync-bridge inside ``run_portfolio_job``:
+    the optimizer runs in a worker thread and calls a sync callable; we
+    schedule THIS coroutine on the main event loop so the DB read stays
+    on the worker's existing async stack.
+    """
+    async with async_session_factory() as session:
+        return await _check_cancel_flag(session, run_id)
+
+
+async def _progress_via_session(run_id: UUID, pct: int, msg: str) -> None:
+    """Open a session and persist progress via :func:`_portfolio_progress_callback`."""
+    async with async_session_factory() as session:
+        await _portfolio_progress_callback(session, run_id, pct, msg)
+
 
 # Renew the compute-slot lease at roughly one-third of its TTL so it
 # never expires under load.  Settings value is in seconds.
@@ -218,7 +278,44 @@ async def run_portfolio_job(
         # service re-reads allocations in its own session and could
         # otherwise (harmlessly but wastefully) launch more threads than
         # slots we reserved.  Passing it explicitly pins the semaphore.
-        await service.run_portfolio_backtest(run_uuid, max_workers=slot_count)
+        #
+        # Cancellation + progress: the optimizer's ``cancel_check`` is a
+        # sync callable (called between trials) and ``progress_callback``
+        # is sync too.  Both need to talk to the DB.  We schedule the
+        # async helpers onto the worker's event loop via
+        # ``run_coroutine_threadsafe`` so the sync optimizer thread blocks
+        # only for the few ms each call takes.
+        worker_loop = asyncio.get_running_loop()
+
+        def _sync_cancel_check() -> bool:
+            future = asyncio.run_coroutine_threadsafe(
+                _cancel_check_via_session(run_uuid),
+                worker_loop,
+            )
+            try:
+                # Bounded wait — DB read should be <100ms; a longer hang
+                # means Postgres is sick and we should let the optimizer
+                # keep going rather than freeze the trial loop.
+                return bool(future.result(timeout=5.0))
+            except Exception:  # noqa: BLE001 — best-effort cancel poll
+                log.warning("portfolio_cancel_check_failed", run_id=run_id)
+                return False
+
+        def _sync_progress(pct: int, msg: str) -> None:
+            asyncio.run_coroutine_threadsafe(
+                _progress_via_session(run_uuid, pct, msg),
+                worker_loop,
+            )
+            # Fire-and-forget — we don't wait for the write.  If the
+            # write fails, the run still finishes; the only consequence
+            # is that the UI's progress bar will be stale.
+
+        await service.run_portfolio_backtest(
+            run_uuid,
+            max_workers=slot_count,
+            cancel_check=_sync_cancel_check,
+            progress_callback=_sync_progress,
+        )
 
         log.info(
             "portfolio_job_completed",
@@ -227,6 +324,22 @@ async def run_portfolio_job(
             worker_id=worker_id,
         )
 
+    except PortfolioRunMemberFailureError as exc:
+        # Quick-mode per-member failure with attribution — persist the
+        # structured ``per_strategy_errors`` payload onto the run row's
+        # ``metrics`` BEFORE marking failed so the failure block survives
+        # the terminal-state guard (mark_run_failed refuses to overwrite
+        # any subsequent state). PRD US-002a's contract is "operator sees
+        # which member raised" — this is the on-row evidence.
+        log.warning(
+            "portfolio_job_member_failure",
+            run_id=run_id,
+            portfolio_id=portfolio_id,
+            num_failed=len(exc.per_strategy_errors),
+            error_type=type(exc).__name__,
+        )
+        await _persist_per_strategy_errors(run_uuid, exc.per_strategy_errors)
+        await _mark_failed_safe(service, run_uuid, str(exc))
     except (PortfolioOrchestrationError, FileNotFoundError, TimeoutError) as exc:
         # Deterministic failures — retry won't help.
         #   * ``PortfolioOrchestrationError``: data-shape problem
@@ -313,6 +426,35 @@ async def _renew_lease_forever(
                 log.warning("portfolio_heartbeat_refresh_failed", run_id=run_id)
     except asyncio.CancelledError:
         raise
+
+
+async def _persist_per_strategy_errors(
+    run_id: UUID,
+    per_strategy_errors: list[dict[str, str]],
+) -> None:
+    """Persist :class:`PortfolioRunMemberFailureError`'s payload onto the run row.
+
+    Must run BEFORE :func:`_mark_failed_safe` because the lifecycle's
+    terminal-state guard refuses further status writes once ``failed`` is
+    set; persisting the diagnostic AFTER ``mark_run_failed`` would silently
+    no-op. Best-effort: a DB outage here drops the per-strategy detail but
+    the run still gets the summary error message via ``mark_run_failed``.
+    """
+    try:
+        async with async_session_factory() as session:
+            run = await session.get(PortfolioRun, run_id)
+            if run is None:
+                log.warning(
+                    "portfolio_per_strategy_errors_skip_missing_row",
+                    run_id=str(run_id),
+                )
+                return
+            metrics = dict(run.metrics or {})
+            metrics["per_strategy_errors"] = per_strategy_errors
+            run.metrics = metrics
+            await session.commit()
+    except Exception:  # noqa: BLE001 — best-effort diagnostic persistence
+        log.exception("portfolio_per_strategy_errors_persist_failed", run_id=str(run_id))
 
 
 async def _mark_failed_safe(

@@ -25,7 +25,7 @@ from msai.models.portfolio import Portfolio
 from msai.models.portfolio_allocation import PortfolioAllocation
 from msai.models.portfolio_run import PortfolioRun
 from msai.services.nautilus.backtest_runner import BacktestResult
-from msai.services.portfolio_service import PortfolioService
+from msai.services.portfolio import PortfolioService
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -239,7 +239,7 @@ async def test_run_portfolio_backtest_end_to_end(
         return [f"{s}.NASDAQ" for s in symbols]
 
     monkeypatch.setattr(
-        "msai.services.portfolio_service.ensure_catalog_data",
+        "msai.services.portfolio.orchestration.ensure_catalog_data",
         _fake_ensure,
     )
 
@@ -304,7 +304,7 @@ async def test_run_portfolio_backtest_end_to_end(
 async def test_run_portfolio_backtest_raises_when_run_missing(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    from msai.services.portfolio_service import PortfolioOrchestrationError
+    from msai.services.portfolio import PortfolioOrchestrationError
 
     service = PortfolioService()
     bogus_id = uuid4()
@@ -332,7 +332,7 @@ async def test_run_portfolio_backtest_propagates_candidate_failure(
         return [f"{s}.NASDAQ" for s in symbols]
 
     monkeypatch.setattr(
-        "msai.services.portfolio_service.ensure_catalog_data",
+        "msai.services.portfolio.orchestration.ensure_catalog_data",
         _fake_ensure,
     )
 
@@ -340,13 +340,24 @@ async def test_run_portfolio_backtest_propagates_candidate_failure(
         def run(self, **kwargs):
             raise RuntimeError("backtest subprocess crashed")
 
+    # Phase 5.1 P0-B: candidate-runner exceptions are now collected with
+    # per-strategy attribution and wrapped in PortfolioRunMemberFailureError
+    # (the worker persists the structured payload onto run.metrics so the
+    # operator sees WHICH member raised). The underlying RuntimeError lives
+    # in ``per_strategy_errors[i]["message"]``.
+    from msai.services.portfolio import PortfolioRunMemberFailureError
+
     service = PortfolioService()
-    with pytest.raises(RuntimeError, match="backtest subprocess crashed"):
+    with pytest.raises(PortfolioRunMemberFailureError) as exc_info:
         await service.run_portfolio_backtest(
             seeded_portfolio["run_id"],
             runner=_BoomRunner(),
             session_factory=session_factory,
         )
+    errs = exc_info.value.per_strategy_errors
+    assert errs, "must surface per-strategy attribution"
+    assert any("backtest subprocess crashed" in e["message"] for e in errs)
+    assert all(e["error_type"] == "RuntimeError" for e in errs)
 
 
 @pytest.mark.asyncio
@@ -354,7 +365,7 @@ async def test_run_portfolio_backtest_raises_when_allocations_missing(
     session_factory: async_sessionmaker[AsyncSession],
     tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
-    from msai.services.portfolio_service import PortfolioOrchestrationError
+    from msai.services.portfolio import PortfolioOrchestrationError
 
     # Seed a portfolio with zero allocations.
     async with session_factory() as session:

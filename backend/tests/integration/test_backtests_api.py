@@ -139,9 +139,14 @@ async def test_history_endpoint_returns_phase_when_set(
     """The list endpoint mirrors /status — lifecycle fields ride on each
     ``BacktestListItem`` so the list page can render the "Fetching data…"
     badge render.
+
+    Pinned to ``type=single`` so the unified-history portfolio branch
+    (G4) stays out of scope for this test — it is verifying that the
+    single-strategy phase/progress_message fields flow through correctly,
+    not the cross-table merge.
     """
     async with client as ac:
-        response = await ac.get("/api/v1/backtests/history")
+        response = await ac.get("/api/v1/backtests/history?type=single")
 
     assert response.status_code == 200, response.text
     body = response.json()

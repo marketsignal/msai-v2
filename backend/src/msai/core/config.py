@@ -231,6 +231,26 @@ class Settings(BaseSettings):
     optuna_enabled: bool = True
     optuna_max_trials: int = 64
 
+    # Full-mode portfolio optimizer trial budget. Default 100 keeps the
+    # 8-hour Full-mode wall-clock cap (PRD §4.1) achievable with the
+    # returns-aggregation trial body (~50ms per trial × 100 trials × ~10
+    # walk-forward windows ≈ 50s). The env var override (commonly used
+    # in tests via ``MSAI_PORTFOLIO_FULL_TRIALS=2``) lets the integration
+    # smoke test cap at 2 trials so the suite stays under 2 minutes.
+    portfolio_full_trial_count: int = Field(
+        default=100,
+        ge=1,
+        le=10_000,
+        validation_alias=AliasChoices(
+            "MSAI_PORTFOLIO_FULL_TRIALS",
+            "PORTFOLIO_FULL_TRIAL_COUNT",
+        ),
+        description=(
+            "Total trial budget for Full-mode portfolio walk-forward optimization. "
+            "Override via MSAI_PORTFOLIO_FULL_TRIALS in tests / cost-constrained envs."
+        ),
+    )
+
     # Compute slot management (Redis semaphore for concurrent job limits)
     compute_slot_limit: int = 4
     compute_slot_wait_seconds: int = 900  # max time to wait for a slot

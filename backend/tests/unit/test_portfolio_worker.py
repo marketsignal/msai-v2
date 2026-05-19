@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from msai.services.compute_slots import ComputeSlotUnavailableError
-from msai.services.portfolio_service import (
+from msai.services.portfolio import (
     PortfolioOrchestrationError,
     PortfolioRunTerminalStateError,
 )
