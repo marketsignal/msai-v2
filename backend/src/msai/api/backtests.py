@@ -435,7 +435,16 @@ async def run_backtest(
 
 @router.get("/history", response_model=BacktestListResponse)
 async def list_backtests(  # noqa: PLR0912 — three independent type-branches by design
-    page: int = Query(default=1, ge=1),
+    # Codex bot iter-13 P1 on PR #73: ``type="all"`` fetches
+    # ``page * page_size`` rows per side so the in-Python merge below
+    # can interleave by created_at. With no upper bound on ``page``,
+    # an attacker (or a deeply-paginating UI) can force very large
+    # table reads + sort, degrading latency or exhausting worker
+    # memory. Cap ``page`` at 100 → worst-case fetch is 100 × 100 ×
+    # 2 sides = 20K rows, which is comfortably bounded. Operators
+    # paginating deeper should use ``type=single`` / ``type=portfolio``
+    # (which use proper OFFSET+LIMIT and stay bounded per request).
+    page: int = Query(default=1, ge=1, le=100),
     page_size: int = Query(default=20, ge=1, le=100),
     include_smoke: bool = Query(
         default=False,
@@ -476,8 +485,21 @@ async def list_backtests(  # noqa: PLR0912 — three independent type-branches b
     total = 0
 
     # ---- Single-strategy Backtest rows ----
+    # Codex bot iter-13 P2 on PR #73: defer the heavy JSON columns
+    # (``metrics``, ``series``) on the list path. The response only
+    # uses summary fields (id, status, dates, error envelope), but
+    # ``select(Backtest)`` would otherwise pull multi-MB JSONB blobs
+    # per row — DB + serialization overhead scales linearly with the
+    # heaviest row instead of the summary projection. ``defer()``
+    # leaves the columns on the model so any later attribute access
+    # would re-fetch; we never touch them on this path.
+    from sqlalchemy.orm import defer as _defer  # noqa: PLC0415
+
     if type in ("single", "all"):
-        single_query = select(Backtest)
+        single_query = select(Backtest).options(
+            _defer(Backtest.metrics),
+            _defer(Backtest.series),
+        )
         single_count_query = select(func.count()).select_from(Backtest)
         if not include_smoke:
             single_query = single_query.where(Backtest.smoke.is_(False))
@@ -551,9 +573,21 @@ async def list_backtests(  # noqa: PLR0912 — three independent type-branches b
         from msai.models.portfolio import Portfolio
         from msai.models.portfolio_run import PortfolioRun
 
+        # Codex bot iter-13 P2 on PR #73: same shape — defer the heavy
+        # JSON columns. PortfolioRun has FOUR multi-MB candidates
+        # (``metrics`` / ``series`` / ``allocations`` /
+        # ``optimization_trace`` / ``walk_forward_payload``), so the
+        # list response benefits even more from the projection.
         portfolio_query = (
             select(PortfolioRun, Portfolio.name)
             .join(Portfolio, PortfolioRun.portfolio_id == Portfolio.id)
+            .options(
+                _defer(PortfolioRun.metrics),
+                _defer(PortfolioRun.series),
+                _defer(PortfolioRun.allocations),
+                _defer(PortfolioRun.optimization_trace),
+                _defer(PortfolioRun.walk_forward_payload),
+            )
             .order_by(PortfolioRun.created_at.desc())
         )
         portfolio_count_query = select(func.count()).select_from(PortfolioRun)

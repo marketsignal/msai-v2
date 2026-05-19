@@ -78,3 +78,23 @@ async def test_history_type_filter_returns_only_single(
     assert response.status_code == 200, response.text
     for item in response.json()["items"]:
         assert item["type"] == "single"
+
+
+@pytest.mark.asyncio
+async def test_history_rejects_page_above_cap(
+    api_client_authed,
+) -> None:
+    """Codex bot iter-13 P1 on PR #73 — ``type="all"`` fetches
+    ``page * page_size`` rows per side, so unbounded ``page`` is a DoS
+    surface (deep page → large table scan + in-memory sort). The
+    Query(le=100) cap rejects ``page > 100`` at the FastAPI layer.
+    """
+    response = await api_client_authed.get(
+        "/api/v1/backtests/history",
+        params={"page": 1000, "page_size": 100, "type": "all"},
+    )
+    # FastAPI returns 422 for query-validation failures.
+    assert response.status_code == 422, response.text
+    body = response.json()
+    detail_str = str(body.get("detail", ""))
+    assert "page" in detail_str.lower(), body
