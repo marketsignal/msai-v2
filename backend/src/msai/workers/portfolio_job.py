@@ -80,9 +80,21 @@ async def _portfolio_progress_callback(
     Writes to ``metrics["progress"]`` / ``metrics["progress_message"]`` and
     refreshes ``heartbeat_at``. The UI polls these fields to render a
     progress bar without waiting for the run to land in a terminal state.
+
+    Codex bot iter-7 P2 on PR #73: a late progress write that landed
+    AFTER ``_run_full_mode``'s completion commit could clobber the
+    final ``metrics`` (best_config + IS/OOS scores) with stale progress
+    fields because the callback's session captured the pre-completion
+    metrics snapshot. Skip terminal rows entirely so the completion
+    write is the durable last word for that run.
     """
     run = await session.get(PortfolioRun, run_id)
     if run is None:
+        return
+    if PortfolioRunStatus(run.status).is_terminal:
+        # Don't mutate completed/failed/canceled rows — the terminal write
+        # already persisted the final metrics and we would overwrite them
+        # with our stale snapshot.
         return
     run.heartbeat_at = datetime.now(UTC)
     metrics = dict(run.metrics or {})

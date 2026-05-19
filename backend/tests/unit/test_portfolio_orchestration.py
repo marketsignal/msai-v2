@@ -545,3 +545,89 @@ class TestScaledWalkForwardParams:
         for range_days in (100, 200, 300, 400, 500):
             _, test, step = _scaled_walk_forward_params(range_days=range_days)
             assert step == test, f"step != test for range_days={range_days}"
+
+
+# ---------------------------------------------------------------------------
+# _aggregate_returns_trial — Codex bot iter-7 P1 on PR #73
+# ---------------------------------------------------------------------------
+
+
+class TestAggregateReturnsTrialPositionSizeCap:
+    """Verify the trial body clips per-strategy weights at the sampled
+    ``position_size``. Without the clip, ``enforce_caps()`` would prune
+    every trial for portfolios with N < 1/max_position_size members.
+    """
+
+    @staticmethod
+    def _build_returns_cache(n_days: int = 60) -> dict[str, pd.Series]:
+        """Two strategies with deterministic returns over n_days."""
+        idx = pd.date_range("2024-01-02", periods=n_days, freq="D", tz="UTC")
+        return {
+            "sid-a": pd.Series([0.001] * n_days, index=idx, name="sid-a"),
+            "sid-b": pd.Series([0.002] * n_days, index=idx, name="sid-b"),
+        }
+
+    def test_single_strategy_clips_max_position_to_cap(self) -> None:
+        """Equal-weight allocator gives strategy weight 1.0 with N=1. The
+        clip at ``position_size=0.25`` must reduce max_position to 0.25
+        so enforce_caps would NOT prune the trial.
+        """
+        from msai.services.portfolio.orchestration import _aggregate_returns_trial
+
+        cache = self._build_returns_cache()
+        cache = {"sid-a": cache["sid-a"]}  # single strategy
+
+        result = _aggregate_returns_trial(
+            member_strategy_ids=["sid-a"],
+            allocator_name="equal_weight",
+            risk_params={"leverage": 1.0, "position_size": 0.25},
+            start_date="2024-01-02",
+            end_date="2024-03-01",
+            returns_cache=cache,
+        )
+
+        assert result["max_position"] <= 0.25 + 1e-9, (
+            f"max_position must be clipped at position_size=0.25; got {result['max_position']}"
+        )
+
+    def test_two_strategies_clips_each_weight(self) -> None:
+        """Equal-weight allocator gives both strategies 0.5. With
+        position_size=0.30, both clip to 0.30 each.
+        """
+        from msai.services.portfolio.orchestration import _aggregate_returns_trial
+
+        cache = self._build_returns_cache()
+
+        result = _aggregate_returns_trial(
+            member_strategy_ids=["sid-a", "sid-b"],
+            allocator_name="equal_weight",
+            risk_params={"leverage": 1.0, "position_size": 0.30},
+            start_date="2024-01-02",
+            end_date="2024-03-01",
+            returns_cache=cache,
+        )
+
+        assert result["max_position"] <= 0.30 + 1e-9, (
+            f"max_position must be clipped at position_size=0.30; got {result['max_position']}"
+        )
+
+    def test_position_size_zero_skips_clip(self) -> None:
+        """When position_size is 0 (the default in some risk_params shapes),
+        the clip is skipped and the raw allocator weights flow through.
+        """
+        from msai.services.portfolio.orchestration import _aggregate_returns_trial
+
+        cache = self._build_returns_cache()
+        cache = {"sid-a": cache["sid-a"]}
+
+        result = _aggregate_returns_trial(
+            member_strategy_ids=["sid-a"],
+            allocator_name="equal_weight",
+            risk_params={"leverage": 1.0, "position_size": 0.0},
+            start_date="2024-01-02",
+            end_date="2024-03-01",
+            returns_cache=cache,
+        )
+
+        # Equal weight on 1 strategy = 1.0 — unclipped.
+        assert result["max_position"] == pytest.approx(1.0)

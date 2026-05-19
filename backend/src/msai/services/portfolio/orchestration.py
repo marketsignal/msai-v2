@@ -1638,6 +1638,25 @@ def _aggregate_returns_trial(
 
     leverage = float(risk_params.get("leverage", 1.0))
     max_position_param = float(risk_params.get("position_size", 0.0))
+
+    # Codex bot iter-7 P1 on PR #73: apply the sampled ``position_size``
+    # as a per-strategy weight cap before computing metrics. The previous
+    # implementation ignored ``position_size`` entirely — the allocator's
+    # raw weights flowed through and ``max_position`` was reported as
+    # ``max(abs(w))``. For portfolios with ``N < 1/max_position_size``
+    # members, that raw value always exceeded the cap (e.g., 1 strategy
+    # equal-weight = 1.0 vs cap 0.25), so ``enforce_caps()`` pruned every
+    # trial and Full runs finished with all-zero IS/OOS scores.
+    #
+    # Treating ``position_size`` as a per-strategy concentration cap
+    # (clip ``w_i`` at ``position_size``, do NOT renormalize) makes the
+    # cap actually bind: small portfolios end up under-invested (sum of
+    # weights < 1), which is the intended semantics of a concentration
+    # limit — the safety cap forces the portfolio to leave capital in
+    # cash when it can't diversify enough to satisfy the limit.
+    if max_position_param > 0:
+        weights = {sid: min(abs(w), max_position_param) for sid, w in weights.items()}
+
     weighted = [(sid, weights[sid], returns_df[sid]) for sid in member_strategy_ids]
     combined = combine_weighted_returns(weighted, leverage=leverage)
     if combined.empty:
@@ -1652,13 +1671,9 @@ def _aggregate_returns_trial(
 
     core = compute_series_metrics(combined).as_dict()
     # ``total_leverage`` = applied leverage scaler (matches what the safety
-    # cap check expects); ``max_position`` = the trial's requested
-    # position_size — the optimizer trusts the search-space clip to keep
-    # this within bounds; we surface it back so post-eval cap-check sees
-    # a consistent value.
+    # cap check expects); ``max_position`` = the largest absolute weight
+    # after the position_size clip above — guaranteed ≤ position_size when
+    # the cap is set, which matches what enforce_caps expects.
     core["total_leverage"] = leverage
-    # Largest absolute per-strategy weight is a reasonable proxy for "max
-    # position" — operators reading the trace will see how concentrated
-    # the winning trial was without us having to track per-bar positions.
     core["max_position"] = max(abs(w) for w in weights.values())
     return core

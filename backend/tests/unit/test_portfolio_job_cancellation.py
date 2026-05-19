@@ -68,6 +68,7 @@ async def test_progress_callback_updates_metrics_and_heartbeat() -> None:
     """Progress writes ``metrics['progress']`` + refreshes ``heartbeat_at``."""
     run_id = uuid4()
     run = MagicMock()
+    run.status = PortfolioRunStatus.RUNNING.value
     run.metrics = {"existing": "value"}
     run.heartbeat_at = datetime(2026, 1, 1, tzinfo=UTC)
     session = MagicMock()
@@ -90,6 +91,7 @@ async def test_progress_callback_handles_missing_metrics_dict() -> None:
     """``metrics`` may be None on a fresh row — the callback must coerce."""
     run_id = uuid4()
     run = MagicMock()
+    run.status = PortfolioRunStatus.RUNNING.value
     run.metrics = None
     session = MagicMock()
     session.get = AsyncMock(return_value=run)
@@ -112,3 +114,39 @@ async def test_progress_callback_silently_noop_on_missing_row() -> None:
     await _portfolio_progress_callback(session, run_id, 50, "halfway")
 
     session.commit.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        PortfolioRunStatus.COMPLETED.value,
+        PortfolioRunStatus.FAILED.value,
+        PortfolioRunStatus.CANCELED.value,
+    ],
+)
+@pytest.mark.asyncio
+async def test_progress_callback_skips_terminal_rows(terminal_status: str) -> None:
+    """Codex bot iter-7 P2 on PR #73 — a late progress write that arrived
+    AFTER ``_run_full_mode`` committed the final ``best_config`` /
+    IS/OOS metrics must NOT mutate the row. The callback's session
+    captured the pre-completion metrics snapshot; committing it would
+    clobber the completion write.
+
+    The fix: skip terminal rows entirely. The completion write is the
+    durable last word for that run.
+    """
+    run_id = uuid4()
+    run = MagicMock()
+    run.status = terminal_status
+    run.metrics = {"best_config": {"leverage": 1.5}, "is_metric": 1.2}
+    run.heartbeat_at = datetime(2026, 1, 1, tzinfo=UTC)
+    session = MagicMock()
+    session.get = AsyncMock(return_value=run)
+    session.commit = AsyncMock()
+
+    await _portfolio_progress_callback(session, run_id, 99, "almost done")
+
+    # No commit issued — the row was terminal so we skipped.
+    session.commit.assert_not_called()
+    # Metrics untouched — completion's best_config + is_metric survive.
+    assert run.metrics == {"best_config": {"leverage": 1.5}, "is_metric": 1.2}
