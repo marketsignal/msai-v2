@@ -323,7 +323,20 @@ class PortfolioService:
         # ``name`` column has ``unique=True``). Operators who want to
         # repromote with the same name should rename / archive the
         # previous LivePortfolio first.
-        live_portfolio_name = f"{portfolio.name} (run {str(run.id)[:8]})"
+        #
+        # Ultrareview bug_001 on PR #73: ``portfolio.name`` is declared
+        # ``String(128)`` AND the schema permits names up to 128 chars.
+        # Naive composition appends 15 chars (`` (run XXXXXXXX)``), so
+        # a 120-char portfolio name produces a 135-char live name that
+        # PostgreSQL ``VARCHAR(128)`` rejects with ``StringDataRight-
+        # Truncation`` — surfacing to the operator as a generic
+        # ``MATERIALIZATION_FAILED`` 422 from the broad-except handler.
+        # Truncate the source name to 113 chars so the 15-char suffix
+        # always fits the column.
+        name_suffix_len = 15  # " (run XXXXXXXX)"
+        live_name_max = 128
+        truncated_name = portfolio.name[: live_name_max - name_suffix_len]
+        live_portfolio_name = f"{truncated_name} (run {str(run.id)[:8]})"
         live_portfolio = LivePortfolio(
             name=live_portfolio_name,
             description=(

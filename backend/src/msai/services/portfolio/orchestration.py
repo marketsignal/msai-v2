@@ -488,7 +488,16 @@ class PortfolioService:
             alpha, beta = compute_alpha_beta(daily_portfolio, benchmark_returns)
         metrics = {**core, "alpha": alpha, "beta": beta}
         metrics["num_strategies"] = len(strategy_results)
-        metrics["effective_leverage"] = portfolio_leverage
+        # Ultrareview merged_bug_004 on PR #73: the persisted leverage
+        # metric must reflect REALIZED portfolio leverage, not just the
+        # scalar applied to the weighted sum. ``combine_weighted_returns``
+        # computes ``sum(w_i * r_i) * leverage``, so realized portfolio
+        # leverage = ``portfolio_leverage * sum(|w_i|)``. Non-normalized
+        # allocators (``vol_targeted`` can return weights summing to >1)
+        # would otherwise silently understate live-revision risk because
+        # the metric is the operator-visible audit signal.
+        weight_sum = sum(abs(w) for _cid, w, _series in weighted_series)
+        metrics["effective_leverage"] = portfolio_leverage * weight_sum
         # Equity curve stays at the strategy's native frequency for the
         # UI chart — never resampled so intraday detail is preserved.
         series_frame = build_series_from_returns(combined_returns, base_value=base_capital)
@@ -530,46 +539,68 @@ class PortfolioService:
         )
 
         # ---- Phase 3: persist results ----
+        # Ultrareview merged_bug_009 on PR #73: write the completion via
+        # an atomic conditional UPDATE that ONLY fires from non-terminal
+        # states. The previous read-then-modify-then-commit pattern raced
+        # with the operator's atomic cancel — a cancel landing between
+        # our ``session.get`` (which cached ``status='running'``) and our
+        # ``session.commit`` (which emitted ``UPDATE ... WHERE id=:id``
+        # with no status predicate) was silently overwritten because the
+        # cached status check on the in-memory instance does NOT re-read
+        # the DB. Switching to a Core UPDATE with ``status.in_(non_term)``
+        # makes the worker's completion write commutative with the
+        # operator's cancel UPDATE at the row level.
+        from sqlalchemy import update as _sql_update  # noqa: PLC0415
+        from sqlalchemy.engine import CursorResult as _CursorResult  # noqa: PLC0415, TC002
+
         now = datetime.now(UTC)
+        non_terminal_statuses = [
+            PortfolioRunStatus.PENDING.value,
+            PortfolioRunStatus.RUNNING.value,
+        ]
         async with factory() as session:
+            update_result = await session.execute(
+                _sql_update(PortfolioRun)
+                .where(
+                    PortfolioRun.id == run_id,
+                    PortfolioRun.status.in_(non_terminal_statuses),
+                )
+                .values(
+                    status=PortfolioRunStatus.COMPLETED.value,
+                    metrics=metrics,
+                    series=dataframe_to_series_payload(series_frame),
+                    allocations=strategy_results,
+                    report_path=report_path,
+                    walk_forward_payload=results_payload,
+                    heartbeat_at=now,
+                    completed_at=now,
+                    error_message=None,
+                )
+            )
+            await session.commit()
+            rowcount = int(cast("_CursorResult[Any]", update_result).rowcount or 0)
+            if rowcount == 0:
+                # Either the row vanished or it already went terminal (e.g.
+                # operator cancel landed mid-flight). Cancel is a terminal
+                # state that MUST win; the UPDATE refused to write, so
+                # return the row as-is for the worker to treat as a
+                # successful no-op.
+                persisted_check = await session.get(PortfolioRun, run_id)
+                if persisted_check is None:
+                    raise PortfolioOrchestrationError(
+                        f"Portfolio run {run_id} disappeared during execution"
+                    )
+                log.warning(
+                    "portfolio_run_skip_completed_write_terminal",
+                    run_id=str(run_id),
+                    terminal_status=persisted_check.status,
+                )
+                return persisted_check
             persisted = await session.get(PortfolioRun, run_id)
             if persisted is None:
                 raise PortfolioOrchestrationError(
                     f"Portfolio run {run_id} disappeared during execution"
                 )
-            # Operator may have flipped the row to ``canceled`` while the
-            # backtest was running.  The cancel is a terminal state that
-            # MUST win — silently overwriting it with COMPLETED would lose
-            # the user's explicit stop signal.  Re-read here (the
-            # ``session.get`` above already issued a SELECT, so this is
-            # the freshest value available at the moment of the write).
-            if PortfolioRunStatus(persisted.status).is_terminal:
-                log.warning(
-                    "portfolio_run_skip_completed_write_terminal",
-                    run_id=str(run_id),
-                    terminal_status=persisted.status,
-                )
-                # Return the row as-is; the caller (arq worker) treats this
-                # as a successful no-op so it does not surface as a job
-                # failure that would block subsequent runs.
-                return persisted
-            persisted.status = PortfolioRunStatus.COMPLETED.value
-            persisted.metrics = metrics
-            persisted.series = dataframe_to_series_payload(series_frame)
-            persisted.allocations = strategy_results
-            persisted.report_path = report_path
-            # Repurpose ``walk_forward_payload`` as the general "results
-            # payload" for both Quick and Full modes (see Task spec).  Quick
-            # mode has no walk-forward windows, so the field carried the
-            # per-strategy enrichment only.  Full mode merges the optimizer's
-            # ``walk_forward_payload`` with the enrichment below
-            # (``_run_full_mode``).
-            persisted.walk_forward_payload = results_payload
-            persisted.heartbeat_at = now
-            persisted.completed_at = now
-            persisted.error_message = None
-            await session.commit()
-            await session.refresh(persisted)
             return persisted
 
     async def _run_full_mode(
@@ -831,48 +862,118 @@ class PortfolioService:
         merged_payload: dict[str, Any] = dict(result.walk_forward_payload or {})
         merged_payload.update(enrichment)
 
+        # ---- Ultrareview bug_010 on PR #73: persist run.allocations with
+        # ALLOCATOR-applied weights so promote-to-live materializes the
+        # validated composition (not equal-weight fallback). The Quick
+        # path already syncs allocator output into ``strategy_results``;
+        # the Full path used to leave ``run.allocations`` NULL entirely,
+        # so ``materialize_from_backtest``'s ``run_weights_by_candidate``
+        # map was empty and the F1c-bridge case (which is the canonical
+        # Full-mode compose path because Full mode requires data-driven
+        # allocators) deployed live with equal weights despite the
+        # operator selecting ``inverse_vol`` / ``vol_targeted``. Apply
+        # the chosen allocator to the cached full-window returns at
+        # ``best_config``'s risk params (the optimizer's winning trial),
+        # then update ``cached_strategy_results``' ``weight`` in place
+        # before persisting.
+        from msai.services.portfolio_backtest.allocators import (  # noqa: PLC0415
+            ALLOCATORS,
+            EqualWeightAllocator,
+        )
+
+        full_window_returns_df = pd.DataFrame(
+            {sid: series for sid, series in returns_cache.items()}
+        ).fillna(0.0)
+        best_config_params = dict(result.best_config or {})
+        try:
+            full_window_allocator_cls = ALLOCATORS.get(allocator_name, EqualWeightAllocator)
+            if full_window_allocator_cls is ALLOCATORS.get("fixed_weight"):
+                full_window_allocator_cls = EqualWeightAllocator
+            full_window_weights = full_window_allocator_cls().compute(
+                list(returns_cache.keys()), full_window_returns_df
+            )
+            # Apply position_size cap to mirror the trial body — keeps
+            # the persisted weights consistent with what the optimizer
+            # actually scored.
+            full_max_position = float(best_config_params.get("position_size", 0.0))
+            if full_max_position > 0:
+                full_window_weights = {
+                    sid: min(abs(w), full_max_position) for sid, w in full_window_weights.items()
+                }
+        except (TypeError, ValueError) as exc:
+            log.warning(
+                "full_mode_full_window_allocator_fallback",
+                allocator=allocator_name,
+                reason=str(exc),
+            )
+            full_window_weights = {}
+
+        full_mode_allocations: list[dict[str, Any]] = []
+        for entry in cached_strategy_results:
+            sid = str(entry["strategy_id"])
+            new_weight = float(full_window_weights.get(sid, entry.get("weight", 0.0)))
+            full_mode_allocations.append({**entry, "weight": new_weight})
+
         # ---- Persist IS/OOS + trace + walk-forward payload ----
+        # Ultrareview merged_bug_009 on PR #73: atomic conditional UPDATE
+        # so a concurrent operator cancel (atomic UPDATE on its side)
+        # cannot be silently overwritten by the worker's completion
+        # write.
+        from sqlalchemy import update as _sql_update_full  # noqa: PLC0415
+        from sqlalchemy.engine import CursorResult as _CursorResult_full  # noqa: PLC0415, TC002
+
         now = datetime.now(UTC)
+        non_terminal_statuses_full = [
+            PortfolioRunStatus.PENDING.value,
+            PortfolioRunStatus.RUNNING.value,
+        ]
         async with factory() as session:
+            update_result_full = await session.execute(
+                _sql_update_full(PortfolioRun)
+                .where(
+                    PortfolioRun.id == run_id,
+                    PortfolioRun.status.in_(non_terminal_statuses_full),
+                )
+                .values(
+                    status=PortfolioRunStatus.COMPLETED.value,
+                    is_metric=result.is_metric,
+                    oos_metric=result.oos_metric,
+                    optimization_trace=result.optimization_trace,
+                    walk_forward_payload=merged_payload,
+                    allocations=full_mode_allocations,
+                    metrics={
+                        "is_metric": result.is_metric,
+                        "oos_metric": result.oos_metric,
+                        "generalization_gap": result.generalization_gap,
+                        "stability_ratio": result.stability_ratio,
+                        "best_config": result.best_config,
+                    },
+                    heartbeat_at=now,
+                    completed_at=now,
+                    error_message=None,
+                )
+            )
+            await session.commit()
+            rowcount_full = int(cast("_CursorResult_full[Any]", update_result_full).rowcount or 0)
+            if rowcount_full == 0:
+                # Same skip-terminal semantics as Quick path.
+                persisted_check = await session.get(PortfolioRun, run_id)
+                if persisted_check is None:
+                    raise PortfolioOrchestrationError(
+                        f"Portfolio run {run_id} disappeared during execution"
+                    )
+                log.warning(
+                    "portfolio_run_skip_completed_write_terminal",
+                    run_id=str(run_id),
+                    terminal_status=persisted_check.status,
+                    mode="full",
+                )
+                return cast("PortfolioRun", persisted_check)
             persisted = await session.get(PortfolioRun, run_id)
             if persisted is None:
                 raise PortfolioOrchestrationError(
                     f"Portfolio run {run_id} disappeared during execution"
                 )
-            # Same cancel-guard discipline as the Quick path — operator's
-            # cancel during a long Full-mode run must NOT be silently
-            # overwritten by the completion write.  The optimizer's own
-            # ``cancel_check`` polls the row between trials and breaks out
-            # early; this guard catches the race where the cancel lands
-            # AFTER the last poll but BEFORE this commit.
-            if PortfolioRunStatus(persisted.status).is_terminal:
-                log.warning(
-                    "portfolio_run_skip_completed_write_terminal",
-                    run_id=str(run_id),
-                    terminal_status=persisted.status,
-                    mode="full",
-                )
-                return cast("PortfolioRun", persisted)
-            persisted.status = PortfolioRunStatus.COMPLETED.value
-            persisted.is_metric = result.is_metric
-            persisted.oos_metric = result.oos_metric
-            persisted.optimization_trace = result.optimization_trace
-            persisted.walk_forward_payload = merged_payload
-            persisted.metrics = {
-                "is_metric": result.is_metric,
-                "oos_metric": result.oos_metric,
-                "generalization_gap": result.generalization_gap,
-                "stability_ratio": result.stability_ratio,
-                "best_config": result.best_config,
-            }
-            persisted.heartbeat_at = now
-            persisted.completed_at = now
-            persisted.error_message = None
-            await session.commit()
-            await session.refresh(persisted)
-            # mypy can't follow Any-through-Any factory back to the
-            # concrete PortfolioRun typing — cast to silence the warning
-            # without weakening the runtime check above (None branch raises).
             return cast("PortfolioRun", persisted)
 
     async def mark_run_running(
@@ -1536,10 +1637,24 @@ def _slice_cached_returns(
     Tolerant of empty / missing series — returns an empty Series so the
     trial body's downstream "no usable data" branch can degrade gracefully
     (the optimizer keeps running and the trial scores zero).
+
+    Ultrareview bug_008 on PR #73: ``start`` and ``end`` arrive as
+    midnight-UTC timestamps (``pd.to_datetime(date_obj, utc=True)``
+    converts a bare ``date`` to ``Timestamp(... 00:00:00+00:00)``). The
+    cached returns Series are indexed at minute granularity (Full mode
+    uses the default ``1-MINUTE-LAST-EXTERNAL`` bar type). A strict
+    inclusive ``index <= end`` then drops every intraday bar on the
+    boundary day from BOTH the train slice and the subsequent test
+    slice (where ``test_start = train_end + 1 day`` puts the next
+    midnight beyond every 03-31 intraday timestamp). Shift ``end`` to
+    end-of-day so the boundary day's intraday bars land in exactly one
+    window — preserving the train/test no-overlap invariant
+    ``build_walk_forward_windows`` already enforces.
     """
     if series is None or series.empty:
         return pd.Series(dtype=float)
-    return series.loc[(series.index >= start) & (series.index <= end)]
+    end_inclusive = end + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+    return series.loc[(series.index >= start) & (series.index <= end_inclusive)]
 
 
 def _aggregate_returns_trial(
@@ -1670,10 +1785,18 @@ def _aggregate_returns_trial(
         }
 
     core = compute_series_metrics(combined).as_dict()
-    # ``total_leverage`` = applied leverage scaler (matches what the safety
-    # cap check expects); ``max_position`` = the largest absolute weight
-    # after the position_size clip above — guaranteed ≤ position_size when
-    # the cap is set, which matches what enforce_caps expects.
-    core["total_leverage"] = leverage
+    # Ultrareview merged_bug_004 on PR #73: ``total_leverage`` must
+    # report REALIZED portfolio leverage so the post-evaluation
+    # ``enforce_caps`` check can actually catch derived violations from
+    # per-strategy weights (which is its documented purpose — see
+    # ``safety_caps.py`` module docstring). Previously the scalar
+    # ``leverage`` was reported as-is and the search-space clip in
+    # ``build_search_space`` already guaranteed ``leverage <=
+    # caps.max_leverage``, making the post-eval check a tautological
+    # no-op. Realized leverage is ``leverage * sum(|w_i|)``; for non-
+    # normalized allocators (``vol_targeted`` can return weights that
+    # sum to ``N * max_weight``), the gap between the scalar and
+    # realized leverage is the entire reason the safety cap exists.
+    core["total_leverage"] = leverage * sum(abs(w) for w in weights.values())
     core["max_position"] = max(abs(w) for w in weights.values())
     return core

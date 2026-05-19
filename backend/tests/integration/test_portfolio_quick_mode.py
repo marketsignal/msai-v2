@@ -471,9 +471,14 @@ async def test_full_mode_uses_real_returns_not_synthetic(
         f"Full-mode trial body must derive metrics from REAL cached returns; "
         f"got total_return={metrics['total_return']}"
     )
-    # ``total_leverage`` must echo the trial's leverage parameter so the
-    # post-eval cap-check works.
-    assert metrics["total_leverage"] == pytest.approx(1.0)
+    # Ultrareview merged_bug_004 on PR #73: ``total_leverage`` now reports
+    # REALIZED portfolio leverage (``leverage * sum(|w|)``) so
+    # ``enforce_caps`` can catch derived-leverage violations from
+    # combined per-strategy weights — non-normalized allocators
+    # (``vol_targeted``) make this distinction load-bearing. With
+    # leverage=1.0, position_size=0.1, and 2 equal-weight strategies
+    # post-clip (each weight ≤ 0.1), the realized leverage is 1.0 * 0.2.
+    assert metrics["total_leverage"] == pytest.approx(0.2)
 
     # Sanity check: the stub runner was actually called (the cache build
     # invoked it once per member).

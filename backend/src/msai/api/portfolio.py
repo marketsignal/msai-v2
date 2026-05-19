@@ -433,13 +433,26 @@ async def cancel_portfolio_run(
         PortfolioRunStatus.PENDING.value,
         PortfolioRunStatus.RUNNING.value,
     ]
+    # Ultrareview bug_002 on PR #73: stamp ``completed_at`` alongside the
+    # status flip. Every other terminal transition in the codebase
+    # (``mark_run_failed``, Quick + Full Phase 3 completion) writes
+    # ``completed_at = datetime.now(UTC)``; the cancel endpoint used to
+    # forget it, leaving canceled rows with ``status='canceled'`` and
+    # ``completed_at=NULL`` — breaking the invariant and dropping the
+    # terminal timestamp from the UI for canceled runs.
+    from datetime import UTC  # noqa: PLC0415
+    from datetime import datetime as _dt
+
     result = await db.execute(
         sql_update(_PortfolioRunModel)
         .where(
             _PortfolioRunModel.id == run_id,
             _PortfolioRunModel.status.in_(non_terminal_statuses),
         )
-        .values(status=PortfolioRunStatus.CANCELED.value)
+        .values(
+            status=PortfolioRunStatus.CANCELED.value,
+            completed_at=_dt.now(UTC),
+        )
     )
     # ``session.execute`` on a Core UPDATE statement returns a
     # ``CursorResult`` at runtime; SQLAlchemy's static type is the

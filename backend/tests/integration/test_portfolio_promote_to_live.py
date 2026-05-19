@@ -995,3 +995,124 @@ async def test_concurrent_promotions_serialized_via_unique_index(
         assert unlinked[0].id == existing_live_id, (
             f"promotion must reuse the matching pre-existing row; got {unlinked[0].id}"
         )
+
+
+@pytest.mark.asyncio
+async def test_promote_truncates_long_portfolio_name(
+    api_client_authed,
+    portfolio_session_factory,
+    _seed_user,
+) -> None:
+    """Ultrareview bug_001 on PR #73 — a portfolio with a 128-char name
+    (schema max) used to overflow the LivePortfolio.name String(128)
+    column after appending the 15-char ``(run XXXXXXXX)`` suffix. Now
+    the source name is truncated so the suffix always fits.
+    """
+    from datetime import UTC, date, datetime
+    from uuid import uuid4
+
+    from msai.models.graduation_candidate import GraduationCandidate
+    from msai.models.portfolio import Portfolio
+    from msai.models.portfolio_allocation import PortfolioAllocation
+    from msai.models.portfolio_enums import BacktestMode
+    from msai.models.portfolio_run import PortfolioRun
+    from msai.models.strategy import Strategy
+
+    user_id = _seed_user.id
+
+    # Arrange — portfolio with the maximum-allowed name length (128).
+    long_name = "L" + ("o" * 126) + "g"  # exactly 128 chars
+    assert len(long_name) == 128
+
+    async with portfolio_session_factory() as session:
+        strategy = Strategy(
+            id=uuid4(),
+            name=f"long-name-{uuid4().hex[:6]}",
+            file_path="strategies/example/ema_cross.py",
+            strategy_class="EMACrossStrategy",
+            default_config={"instruments": ["AAPL"], "asset_class": "stocks"},
+            created_by=user_id,
+        )
+        session.add(strategy)
+        await session.flush()
+
+        candidate = GraduationCandidate(
+            id=uuid4(),
+            strategy_id=strategy.id,
+            stage="paper_candidate",
+            config={"instruments": ["AAPL"]},
+            metrics={"sharpe": 1.0},
+        )
+        session.add(candidate)
+        await session.flush()
+
+        portfolio = Portfolio(
+            id=uuid4(),
+            name=long_name,
+            objective="maximize_sharpe",
+            base_capital=100_000.0,
+            requested_leverage=1.0,
+            created_by=user_id,
+        )
+        session.add(portfolio)
+        await session.flush()
+        session.add(
+            PortfolioAllocation(
+                portfolio_id=portfolio.id,
+                candidate_id=candidate.id,
+                weight=1.0,
+            )
+        )
+
+        run = PortfolioRun(
+            id=uuid4(),
+            portfolio_id=portfolio.id,
+            status="completed",
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 6, 30),
+            mode=BacktestMode.QUICK,
+            metrics={"sharpe": 1.2},
+            completed_at=datetime.now(UTC),
+        )
+        session.add(run)
+        await session.commit()
+        run_id = run.id
+
+    # Act
+    response = await api_client_authed.post(
+        f"/api/v1/portfolios/runs/{run_id}/promote-to-live",
+        json={"account_id": "DUTEST123"},
+    )
+
+    # Assert — 201 (NOT a 422 MATERIALIZATION_FAILED from a column-overflow).
+    assert response.status_code == 201, response.text
+
+
+@pytest.mark.asyncio
+async def test_cancel_endpoint_stamps_completed_at(
+    api_client_authed,
+    make_portfolio_run,
+    portfolio_session_factory,
+) -> None:
+    """Ultrareview bug_002 on PR #73 — cancel must stamp ``completed_at``
+    in the same UPDATE as the status flip. Every other terminal
+    transition (mark_run_failed, Phase 3 completion) does; before the
+    fix the cancel endpoint left ``completed_at`` NULL, breaking the
+    terminal-row invariant and dropping the UI's terminal timestamp.
+    """
+    from msai.models.portfolio_run import PortfolioRun
+
+    run = await make_portfolio_run(status="running")
+
+    response = await api_client_authed.post(
+        f"/api/v1/portfolios/runs/{run.id}/cancel",
+    )
+    assert response.status_code == 200, response.text
+
+    async with portfolio_session_factory() as session:
+        canceled = await session.get(PortfolioRun, run.id)
+        assert canceled is not None
+        assert canceled.status == "canceled"
+        assert canceled.completed_at is not None, (
+            "cancel must stamp completed_at to preserve the terminal-row invariant"
+        )

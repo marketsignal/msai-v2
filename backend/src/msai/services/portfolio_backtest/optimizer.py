@@ -235,7 +235,6 @@ def run_portfolio_walk_forward(
                     observed_max_dd=abs(float(is_metrics.get("max_drawdown", 0.0))),
                 )
                 is_score = objective_score(is_metrics, objective)
-                in_sample_scores.append(is_score)
 
                 # OOS evaluation with the same params on the test window
                 oos_metrics = portfolio_backtest_fn(
@@ -247,6 +246,17 @@ def run_portfolio_walk_forward(
                     initial_capital=initial_capital,
                 )
                 oos_score = objective_score(oos_metrics, objective)
+
+                # Ultrareview bug_003 on PR #73: pair the IS/OOS appends.
+                # Previously ``in_sample_scores.append`` ran BEFORE OOS
+                # evaluation; any exception raised between the two would
+                # leave an orphan IS entry, drift the array lengths, and
+                # bias ``is_avg`` / ``oos_avg`` / ``generalization_gap``
+                # / ``stability_ratio`` (each uses its own denominator).
+                # Appending both AFTER both successes makes the invariant
+                # ``len(in_sample_scores) == len(out_of_sample_scores)``
+                # self-evident from the code structure.
+                in_sample_scores.append(is_score)
                 out_of_sample_scores.append(oos_score)
 
                 trace.append(

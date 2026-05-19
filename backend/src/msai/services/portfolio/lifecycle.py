@@ -13,7 +13,7 @@ and pass it in.  The class is a namespace, not a stateful service.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     import builtins
     from uuid import UUID
 
+    from sqlalchemy.engine import CursorResult as _CursorResult
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from msai.schemas.portfolio import PortfolioCreate, PortfolioRunCreate
@@ -510,24 +511,54 @@ class PortfolioLifecycle:
                 terminal state.
         """
         # Local import to avoid an import cycle with orchestration.py
+        # Ultrareview merged_bug_009 on PR #73: atomic conditional UPDATE
+        # so an operator cancel that lands between this worker's row
+        # read and its commit cannot be silently overwritten (the
+        # session-cached ``run.status`` is fresh at SELECT, NOT at
+        # COMMIT; the previous read-then-modify pattern emitted UPDATE
+        # WHERE id=:id with no status predicate). Now the UPDATE only
+        # fires from PENDING (the legal start state); RUNNING is also
+        # accepted because arq retries can re-enter this transition.
+        # rowcount==0 → row vanished or already terminal — re-read and
+        # surface the right error.
+        from sqlalchemy import update as _sql_update  # noqa: PLC0415
+
         from msai.services.portfolio.orchestration import (
             PortfolioOrchestrationError,
             PortfolioRunTerminalStateError,
         )
 
+        now = datetime.now(UTC)
+        update_result = await session.execute(
+            _sql_update(PortfolioRun)
+            .where(
+                PortfolioRun.id == run_id,
+                PortfolioRun.status.in_(
+                    [
+                        PortfolioRunStatus.PENDING.value,
+                        PortfolioRunStatus.RUNNING.value,
+                    ]
+                ),
+            )
+            .values(
+                status=PortfolioRunStatus.RUNNING.value,
+                heartbeat_at=now,
+                error_message=None,
+            )
+        )
+        await session.commit()
+        rowcount = int(cast("_CursorResult[Any]", update_result).rowcount or 0)
+        if rowcount == 0:
+            existing = await session.get(PortfolioRun, run_id)
+            if existing is None:
+                raise PortfolioOrchestrationError(f"Portfolio run {run_id} not found")
+            existing_status = PortfolioRunStatus(existing.status)
+            raise PortfolioRunTerminalStateError(
+                f"Portfolio run {run_id} is already {existing_status.value}; refusing to restart"
+            )
         run = await session.get(PortfolioRun, run_id)
         if run is None:
             raise PortfolioOrchestrationError(f"Portfolio run {run_id} not found")
-        current = PortfolioRunStatus(run.status)
-        if current.is_terminal:
-            raise PortfolioRunTerminalStateError(
-                f"Portfolio run {run_id} is already {current.value}; refusing to restart"
-            )
-        run.status = PortfolioRunStatus.RUNNING.value
-        run.heartbeat_at = datetime.now(UTC)
-        run.error_message = None
-        await session.commit()
-        await session.refresh(run)
         return run
 
     @staticmethod

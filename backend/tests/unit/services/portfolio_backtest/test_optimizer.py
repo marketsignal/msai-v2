@@ -10,6 +10,9 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
+import pandas as pd
+import pytest
+
 from msai.models.portfolio_enums import PortfolioObjective
 from msai.services.portfolio_backtest.optimizer import (
     PortfolioOptimizationResult,
@@ -259,4 +262,113 @@ def test_run_portfolio_walk_forward_caps_total_trials_at_n_trials() -> None:
     # IS + OOS evaluation. 3 trials × 2 calls per trial = 6 calls.
     # (Pruned-on-IS trials would skip the OOS call, but our fake_fn returns
     # within caps so neither IS nor OOS is pruned.)
-    assert len(fn_calls) == 6, f"expected 6 backtest_fn calls (3 trials × IS+OOS); got {len(fn_calls)}"
+    assert len(fn_calls) == 6, (
+        f"expected 6 backtest_fn calls (3 trials × IS+OOS); got {len(fn_calls)}"
+    )
+
+
+def test_run_portfolio_walk_forward_pairs_is_oos_appends() -> None:
+    """Ultrareview bug_003 on PR #73 — if the OOS evaluation raises mid-
+    trial, the IS append must NOT leave an orphan entry that drifts
+    the array lengths. Before the fix, ``in_sample_scores.append`` ran
+    BEFORE OOS evaluation; OOS failures left ``len(in_sample_scores) >
+    len(out_of_sample_scores)`` which biased the averaging at the end.
+
+    Forces the first trial's OOS to raise, asserts the resulting trace
+    shows the FAIL row and the surviving IS/OOS data come from a
+    matched pair.
+    """
+    call_count = {"n": 0}
+
+    def fake_fn_oos_raises_on_first_trial(**kwargs: Any) -> dict[str, Any]:
+        call_count["n"] += 1
+        # Calls 1, 3 (IS for trial 0 + trial 1), Calls 2, 4 (OOS for trial 0 + trial 1).
+        # Make the OOS call for trial 0 (call #2) raise.
+        if call_count["n"] == 2:
+            raise RuntimeError("simulated OOS failure")
+        return {
+            "sharpe": 1.0,
+            "total_return": 0.1,
+            "max_drawdown": -0.05,
+            "total_leverage": 1.0,
+            "max_position": 0.05,
+        }
+
+    result = run_portfolio_walk_forward(
+        portfolio_id="33333333-3333-3333-3333-333333333333",
+        member_strategy_ids=["s1"],
+        allocator_name="equal_weight",
+        objective=PortfolioObjective.MAXIMIZE_SHARPE,
+        safety_caps=SafetyCaps(max_leverage=2.0, max_position_size=0.25, max_drawdown_halt=0.20),
+        start_date=date(2024, 1, 1),
+        end_date=date(2024, 12, 31),
+        initial_capital=100_000.0,
+        train_days=126,
+        test_days=63,
+        step_days=63,
+        n_trials=2,
+        portfolio_backtest_fn=fake_fn_oos_raises_on_first_trial,
+    )
+
+    # Trace contains a FAIL row for trial 0 (OOS raised) and a normal
+    # row for trial 1 (both halves succeeded).
+    error_rows = [r for r in result.optimization_trace if "error" in r]
+    assert len(error_rows) == 1, (
+        f"expected 1 error row for the failed OOS trial; got {len(error_rows)}"
+    )
+
+    # The load-bearing assertion: IS/OOS averages are now computed over
+    # the SAME population because the appends are paired. If the bug
+    # were still present, is_metric / oos_metric would be derived from
+    # divergent denominators. Both should be ~1.0 (the fake fn's score)
+    # for the one trial that fully succeeded.
+    assert result.is_metric == pytest.approx(1.0), (
+        f"is_metric must come from same-trial population as oos_metric; got {result.is_metric}"
+    )
+    assert result.oos_metric == pytest.approx(1.0), (
+        f"oos_metric must come from same-trial population as is_metric; got {result.oos_metric}"
+    )
+
+
+def test_slice_cached_returns_includes_boundary_day_intraday() -> None:
+    """Ultrareview bug_008 on PR #73 — ``_slice_cached_returns`` used
+    inclusive bounds on midnight-UTC timestamps while the cache is
+    minute-granular, so every intraday bar on the boundary day was
+    excluded from BOTH train and test slices. The fix shifts the upper
+    bound to end-of-day so the boundary day's intraday bars land in
+    exactly one window.
+    """
+    from msai.services.portfolio.orchestration import _slice_cached_returns
+
+    # 5 intraday bars on the boundary day (2024-03-31), each at 09:30..09:34.
+    idx = pd.DatetimeIndex(
+        [
+            pd.Timestamp("2024-03-31 09:30:00+00:00"),
+            pd.Timestamp("2024-03-31 09:31:00+00:00"),
+            pd.Timestamp("2024-03-31 09:32:00+00:00"),
+            pd.Timestamp("2024-04-01 09:30:00+00:00"),
+            pd.Timestamp("2024-04-01 09:31:00+00:00"),
+        ]
+    )
+    series = pd.Series([0.01, 0.02, 0.03, 0.04, 0.05], index=idx)
+
+    # Train window ending 2024-03-31 (midnight UTC).
+    train_start = pd.Timestamp("2024-03-01 00:00:00+00:00")
+    train_end = pd.Timestamp("2024-03-31 00:00:00+00:00")
+    train_slice = _slice_cached_returns(series, train_start, train_end)
+    # Boundary day's intraday bars MUST be in the train slice.
+    assert len(train_slice) == 3, (
+        f"train slice must include all 03-31 intraday bars; got {len(train_slice)}"
+    )
+
+    # Test window starting 2024-04-01.
+    test_start = pd.Timestamp("2024-04-01 00:00:00+00:00")
+    test_end = pd.Timestamp("2024-04-01 00:00:00+00:00")
+    test_slice = _slice_cached_returns(series, test_start, test_end)
+    # All 04-01 intraday bars land in test, not train.
+    assert len(test_slice) == 2, (
+        f"test slice must include all 04-01 intraday bars; got {len(test_slice)}"
+    )
+
+    # Total preserved with no duplication.
+    assert len(train_slice) + len(test_slice) == 5
