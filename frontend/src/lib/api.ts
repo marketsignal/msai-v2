@@ -602,6 +602,8 @@ export interface PortfolioResponse {
   objective: string;
   base_capital: number;
   requested_leverage: number;
+  /** Optional downside-target scaling cap; values <= 0 collapse leverage to the safety floor. */
+  downside_target: number | null;
   benchmark_symbol: string | null;
   account_id: string | null;
   /** Safety cap: max per-position fraction of base capital (0, 1]. */
