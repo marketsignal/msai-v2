@@ -335,11 +335,24 @@ class PortfolioLifecycle:
             )
 
             objective_value = portfolio.objective
-            objective_enum = (
-                objective_value
-                if isinstance(objective_value, PortfolioObjective)
-                else PortfolioObjective(objective_value)
-            )
+            if isinstance(objective_value, PortfolioObjective):
+                objective_enum = objective_value
+            else:
+                # Codex bot iter-8 P2 on PR #73: legacy DB rows store the
+                # pre-rename ``max_sharpe`` spelling. The rest of the
+                # portfolio stack normalizes that via ``_coerce_objective``;
+                # mirror the alias here so existing portfolios can still
+                # launch Full runs after this gate landed.
+                raw_str = str(objective_value)
+                normalized = "maximize_sharpe" if raw_str == "max_sharpe" else raw_str
+                try:
+                    objective_enum = PortfolioObjective(normalized)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Full mode portfolio has an unknown objective "
+                        f"`{raw_str}`; valid values: "
+                        f"{sorted(o.value for o in PortfolioObjective)}"
+                    ) from exc
             if objective_enum not in OBJECTIVES:
                 raise ValueError(
                     f"Full mode requires an objective with a scorer "

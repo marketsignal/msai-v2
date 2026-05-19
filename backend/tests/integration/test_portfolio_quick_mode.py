@@ -933,3 +933,99 @@ async def test_api_create_full_run_with_non_optimizer_objective_returns_422(
     detail_str = detail if isinstance(detail, str) else str(detail)
     assert "Full mode" in detail_str
     assert "equal_weight" in detail_str
+
+
+@pytest.mark.asyncio
+async def test_api_create_full_run_with_legacy_max_sharpe_objective_succeeds(
+    api_client_authed,
+    portfolio_session_factory: async_sessionmaker[AsyncSession],
+    _seed_user,
+) -> None:
+    """Codex bot iter-8 P2 on PR #73 — the Fix-8 objective gate must honor
+    the legacy ``max_sharpe`` alias, which existing DB rows still store
+    (the rest of the portfolio stack already translates it to
+    ``maximize_sharpe`` via ``_coerce_objective``). Without the alias
+    handling, the gate would 422 these portfolios even though they are
+    valid Full-mode targets.
+    """
+    from uuid import uuid4
+
+    from msai.models.graduation_candidate import GraduationCandidate
+    from msai.models.portfolio import Portfolio
+    from msai.models.portfolio_allocation import PortfolioAllocation
+    from msai.models.strategy import Strategy
+
+    user_id = _seed_user.id
+
+    # Arrange — portfolio with the legacy "max_sharpe" objective string
+    # (pre-rename DB rows). The model.objective column is a plain String,
+    # so we can persist the raw alias.
+    async with portfolio_session_factory() as session:
+        strategy = Strategy(
+            id=uuid4(),
+            name=f"legacy-{uuid4().hex[:6]}",
+            file_path="strategies/example/ema_cross.py",
+            strategy_class="EMACrossStrategy",
+            default_config={"instruments": ["AAPL"], "asset_class": "stocks"},
+            created_by=user_id,
+        )
+        session.add(strategy)
+        await session.flush()
+
+        candidate = GraduationCandidate(
+            id=uuid4(),
+            strategy_id=strategy.id,
+            stage="paper_candidate",
+            config={"instruments": ["AAPL"]},
+            metrics={"sharpe": 1.0},
+        )
+        session.add(candidate)
+        await session.flush()
+
+        portfolio = Portfolio(
+            id=uuid4(),
+            name=f"legacy-{uuid4().hex[:8]}",
+            objective="max_sharpe",  # Legacy alias for maximize_sharpe
+            default_mode=BacktestMode.FULL,
+            base_capital=100_000.0,
+            requested_leverage=1.0,
+            created_by=user_id,
+        )
+        session.add(portfolio)
+        await session.flush()
+        session.add(
+            PortfolioAllocation(
+                portfolio_id=portfolio.id,
+                candidate_id=candidate.id,
+                weight=1.0,
+            )
+        )
+        await session.commit()
+        portfolio_id = portfolio.id
+
+    # Act — submit a Full-mode run satisfying the 90-day rule.
+    response = await api_client_authed.post(
+        f"/api/v1/portfolios/{portfolio_id}/runs",
+        json={
+            "portfolio_id": str(portfolio_id),
+            "start_date": "2024-01-01",
+            "end_date": "2024-04-30",
+            "mode": "full",
+        },
+    )
+
+    # Assert — Fix 12 means the lifecycle alias path no longer rejects
+    # ``max_sharpe`` as an unknown objective. The downstream enqueue may
+    # 503 because Redis isn't running in this integration shape, but the
+    # validation gate has passed. The pre-fix failure mode was a 422
+    # whose message mentions either ``Unknown`` or the legacy value
+    # itself — assert that those do NOT appear.
+    if response.status_code == 422:
+        body_text = response.text.lower()
+        assert "unknown" not in body_text and "max_sharpe" not in body_text, (
+            f"alias path produced an objective-unknown 422: {response.text}"
+        )
+    # Otherwise the request progressed past the lifecycle gate — that's
+    # all this test cares about. 201 (success) or 503 (Redis missing) are
+    # both acceptable here.
+    assert response.status_code in (201, 503), response.text

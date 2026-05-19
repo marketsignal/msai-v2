@@ -206,3 +206,57 @@ def test_run_portfolio_walk_forward_respects_cancel_check() -> None:
     )
     assert len(calls) == 0
     assert isinstance(result, PortfolioOptimizationResult)
+
+
+def test_run_portfolio_walk_forward_caps_total_trials_at_n_trials() -> None:
+    """Codex bot iter-8 P2 on PR #73 — when ``total_windows > n_trials``,
+    the optimizer must run EXACTLY ``n_trials`` total, not one per
+    window. The previous ``max(1, n_trials // total_windows)`` formula
+    ran at least one trial in every window, blowing through small
+    explicit caps (e.g., n_trials=2 with 8 windows ran 8 trials).
+    """
+    fn_calls: list[dict[str, Any]] = []
+
+    def fake_fn(**kwargs: Any) -> dict[str, Any]:
+        fn_calls.append(kwargs)
+        return {
+            "sharpe": 1.0,
+            "total_return": 0.1,
+            "max_drawdown": -0.05,
+            "total_leverage": 1.0,
+            "max_position": 0.05,
+        }
+
+    # 365-day range with 21-day train / 7-day test / 7-day step
+    # → ~50 walk-forward windows. n_trials=3 must produce 3 total trials,
+    # NOT 50.
+    result = run_portfolio_walk_forward(
+        portfolio_id="22222222-2222-2222-2222-222222222222",
+        member_strategy_ids=["s1"],
+        allocator_name="equal_weight",
+        objective=PortfolioObjective.MAXIMIZE_SHARPE,
+        safety_caps=SafetyCaps(max_leverage=2.0, max_position_size=0.25, max_drawdown_halt=0.20),
+        start_date=date(2024, 1, 1),
+        end_date=date(2024, 12, 31),
+        initial_capital=100_000.0,
+        train_days=21,
+        test_days=7,
+        step_days=7,
+        n_trials=3,
+        portfolio_backtest_fn=fake_fn,
+    )
+    # Trace rows = one per (trial, window). With n_trials=3 distributed
+    # across ~50 windows, exactly 3 windows get 1 trial each → trace
+    # length is 3.
+    trial_rows = [r for r in result.optimization_trace if "trial" in r]
+    # Group by trial number to get unique trials.
+    unique_trials = {r["trial"] for r in trial_rows}
+    assert len(unique_trials) == 3, (
+        f"n_trials=3 must produce exactly 3 unique trials; got "
+        f"{len(unique_trials)} (trace has {len(trial_rows)} rows)"
+    )
+    # And the optimizer's portfolio_backtest_fn was called for each trial's
+    # IS + OOS evaluation. 3 trials × 2 calls per trial = 6 calls.
+    # (Pruned-on-IS trials would skip the OOS call, but our fake_fn returns
+    # within caps so neither IS nor OOS is pruned.)
+    assert len(fn_calls) == 6, f"expected 6 backtest_fn calls (3 trials × IS+OOS); got {len(fn_calls)}"

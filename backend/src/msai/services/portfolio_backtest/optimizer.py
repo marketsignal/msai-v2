@@ -167,11 +167,26 @@ def run_portfolio_walk_forward(
     )
 
     total_windows = len(windows)
+    # Codex bot iter-8 P2 on PR #73: distribute exactly ``n_trials`` across
+    # windows, honoring the n_trials_override smoke-test contract. The
+    # previous ``max(1, n_trials // total_windows)`` formula ran at least
+    # one trial per window — so when ``total_windows > n_trials`` (e.g.,
+    # n_trials=4 with 8 windows), the optimizer ran 8+ total trials,
+    # blowing through small explicit caps. Use integer quotient + remainder
+    # so the first ``n_trials % total_windows`` windows get one extra
+    # trial, and the total adds up to exactly ``n_trials``. Some trailing
+    # windows may run 0 trials when ``n_trials < total_windows`` — that's
+    # the right tradeoff for a smoke run with a deliberately tiny cap.
+    base_per_window = n_trials // total_windows
+    extra_windows = n_trials % total_windows
     for w_idx, window in enumerate(windows, start=1):
         if cancel_check and cancel_check():
             break
-        # Distribute the trial budget across windows; minimum one per window.
-        trials_this_window = max(1, n_trials // total_windows)
+        # First ``extra_windows`` windows (1-indexed: w_idx <= extra_windows)
+        # get +1 to absorb the remainder.
+        trials_this_window = base_per_window + (1 if w_idx <= extra_windows else 0)
+        if trials_this_window == 0:
+            continue
         for _t_idx in range(trials_this_window):
             if cancel_check and cancel_check():
                 break
