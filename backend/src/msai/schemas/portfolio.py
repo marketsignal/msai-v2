@@ -214,6 +214,15 @@ class PortfolioAllocationResponse(BaseModel):
     created_at: datetime
 
 
+# Minimum inclusive-day range for a Full-mode run.  The orchestrator's
+# adaptive walk-forward scaler (``_scaled_walk_forward_params``) floors
+# each leg at 30 days; a 90-day range is the smallest input that yields
+# at least one walk-forward window after scaling (60d train + 30d test).
+# Anything shorter would raise ``ValueError`` inside the worker and
+# leave the caller with a generic 500 instead of a precise 422.
+_FULL_MODE_MIN_RANGE_DAYS = 90
+
+
 class PortfolioRunCreate(BaseModel):
     """Request schema for launching a portfolio backtest run.
 
@@ -239,6 +248,27 @@ class PortfolioRunCreate(BaseModel):
     # because there was no API-level way to cap trials.  Only honored when
     # ``mode == BacktestMode.FULL``; Quick mode ignores it.
     n_trials: int | None = Field(default=None, ge=1, le=1000)
+
+    @model_validator(mode="after")
+    def _full_mode_requires_minimum_range(self) -> PortfolioRunCreate:
+        # Walk-forward analysis needs enough headroom for at least one
+        # IS+OOS pair after the orchestrator's adaptive scaling
+        # (``_scaled_walk_forward_params`` floors at 30 days/leg).  A
+        # too-short Full range would raise ``ValueError("No walk-forward
+        # windows fit ...")`` inside the worker; rejecting here keeps the
+        # error precise (422 with a helpful message) and avoids spending
+        # the work of enqueuing a job that is guaranteed to fail.
+        # Quick mode is single-shot — any inclusive range is valid.
+        if self.mode is BacktestMode.FULL:
+            range_days = (self.end_date - self.start_date).days + 1
+            if range_days < _FULL_MODE_MIN_RANGE_DAYS:
+                raise ValueError(
+                    f"Full mode requires at least {_FULL_MODE_MIN_RANGE_DAYS} days "
+                    f"between start_date and end_date (got {range_days} day"
+                    f"{'s' if range_days != 1 else ''}); use mode='quick' for "
+                    "shorter ranges or extend the window."
+                )
+        return self
 
 
 class PortfolioRunResponse(BaseModel):

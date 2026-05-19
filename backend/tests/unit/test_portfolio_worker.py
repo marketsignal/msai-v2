@@ -401,6 +401,43 @@ async def test_backtest_timeout_treated_as_terminal(
     assert "TimeoutError" in kwargs["error_message"]
 
 
+async def test_value_error_from_walk_forward_marks_failed_without_raise(
+    mock_service: MagicMock,
+    mock_compute_slots: dict,
+    mock_redis_pool: MagicMock,
+    mock_session: MagicMock,
+    mock_run_id: str,
+    mock_portfolio_id: str,
+) -> None:
+    """Regression for Bug 1: ``ValueError`` from ``build_walk_forward_windows``
+    must mark the run failed on the FIRST attempt, not leak through the
+    generic ``except Exception`` retry path that previously left the row
+    stuck in ``running`` for the entire arq-retry window.
+
+    UC-PB-API-003 (Full mode, 180-day range) reproduced this: the optimizer's
+    default 252+63 walk-forward windows didn't fit, ``ValueError("No
+    walk-forward windows fit ...")`` raised, but the worker only marked
+    failed on ``job_try == max_tries``. Bug 2 fixes the underlying scaling
+    issue; this test pins the worker behaviour so future ValueError paths
+    (bad date arithmetic, invalid step_days, etc.) still surface promptly.
+    """
+    mock_service.run_portfolio_backtest.side_effect = ValueError(
+        "No walk-forward windows fit inside the requested date range"
+    )
+
+    # Non-final attempt: must STILL mark failed (the bug was that this only
+    # happened on the final attempt, leaving the row stuck in ``running``).
+    await portfolio_job.run_portfolio_job(
+        {"job_try": 1, "max_tries": 2}, mock_run_id, mock_portfolio_id
+    )
+
+    mock_service.mark_run_failed.assert_awaited_once()
+    _args, kwargs = mock_service.mark_run_failed.await_args
+    assert "ValueError" in kwargs["error_message"]
+    assert "walk-forward" in kwargs["error_message"]
+    assert len(mock_compute_slots["release"]) == 1
+
+
 async def test_infrastructure_error_reraises_without_mark_on_non_final(
     mock_service: MagicMock,
     mock_compute_slots: dict,

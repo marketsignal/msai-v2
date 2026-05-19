@@ -68,6 +68,48 @@ def test_portfolio_run_create_mode_defaults_to_quick() -> None:
     assert rc.mode == BacktestMode.QUICK
 
 
+def test_portfolio_run_create_rejects_full_mode_below_minimum_range() -> None:
+    """Bug 2 regression -- Full-mode runs require >= 90 days between
+    start_date and end_date.
+
+    Shorter ranges raise ``ValueError("No walk-forward windows fit ...")``
+    inside the worker even after the orchestrator's adaptive scaler
+    floors each leg at 30 days; the schema rejects them at the API
+    boundary so callers get a precise 422 instead of a generic 500.
+    """
+    with pytest.raises(ValueError, match="[Ff]ull mode requires"):
+        PortfolioRunCreate(
+            portfolio_id="00000000-0000-0000-0000-000000000000",  # type: ignore[arg-type]
+            start_date="2024-01-01",  # type: ignore[arg-type]
+            end_date="2024-01-31",  # type: ignore[arg-type]
+            mode=BacktestMode.FULL,
+        )
+
+
+def test_portfolio_run_create_accepts_full_mode_at_minimum_range() -> None:
+    """A 90-day range (start..start+89 inclusive) is the smallest accepted
+    Full-mode range -- exactly at the orchestrator's scaling floor."""
+    rc = PortfolioRunCreate(
+        portfolio_id="00000000-0000-0000-0000-000000000000",  # type: ignore[arg-type]
+        start_date="2024-01-01",  # type: ignore[arg-type]
+        end_date="2024-03-30",  # type: ignore[arg-type] -- 90 inclusive days
+        mode=BacktestMode.FULL,
+    )
+    assert rc.mode == BacktestMode.FULL
+
+
+def test_portfolio_run_create_quick_mode_accepts_short_range() -> None:
+    """Quick mode is single-shot — any inclusive range stays valid (the
+    minimum-range gate only applies to Full mode)."""
+    rc = PortfolioRunCreate(
+        portfolio_id="00000000-0000-0000-0000-000000000000",  # type: ignore[arg-type]
+        start_date="2024-01-01",  # type: ignore[arg-type]
+        end_date="2024-01-05",  # type: ignore[arg-type]  -- 5 days, well below 90
+        mode=BacktestMode.QUICK,
+    )
+    assert rc.mode == BacktestMode.QUICK
+
+
 def test_portfolio_create_rejects_full_mode_with_fixed_weight_allocator() -> None:
     """Phase 5.1 P1-E — Full mode + ``fixed_weight`` allocator is rejected.
 

@@ -721,6 +721,20 @@ class PortfolioService:
             if n_trials_override is not None
             else settings.portfolio_full_trial_count
         )
+        # Scale the walk-forward train/test/step trio to the requested
+        # date range.  The optimizer's defaults (252+63 days) require a
+        # 315-day minimum; without scaling, a smoke / exploratory Full
+        # run on a 6-month window raises ``ValueError("No walk-forward
+        # windows fit ...")`` from ``build_walk_forward_windows`` before
+        # the first heartbeat, leaving the run row stuck in ``running``
+        # (Bug 1's deterministic-failure path now marks it failed, but
+        # the user still gets a 0-window run with no results).  Scaling
+        # in the orchestrator (not in ``build_walk_forward_windows``)
+        # preserves the helper's tight contract — the helper is also
+        # called by ``ResearchEngine`` for strategy-singular walk-forward,
+        # whose defaults are intentionally annual.
+        range_days = max(1, (end_date - start_date).days + 1)
+        scaled_train, scaled_test, scaled_step = _scaled_walk_forward_params(range_days=range_days)
         result = await asyncio.to_thread(
             run_portfolio_walk_forward,
             portfolio_id=str(portfolio.id),
@@ -731,6 +745,9 @@ class PortfolioService:
             start_date=start_date,
             end_date=end_date,
             initial_capital=initial_capital,
+            train_days=scaled_train,
+            test_days=scaled_test,
+            step_days=scaled_step,
             n_trials=effective_n_trials,
             portfolio_backtest_fn=_trial_body,
             cancel_check=cancel_check,
@@ -1263,6 +1280,65 @@ def _build_full_mode_strategy_results(
             }
         )
     return out
+
+
+# Walk-forward defaults inside :func:`run_portfolio_walk_forward` are sized
+# for a full year of training + a quarter of test (252+63 = 315 days), which
+# is the right shape for an annual ``portfolio_full_trial_count`` run.  For
+# shorter ranges (smoke runs, exploratory windows) those defaults yield zero
+# windows and :func:`build_walk_forward_windows` raises ``ValueError`` before
+# the first heartbeat.  ``_scaled_walk_forward_params`` rescales the trio
+# proportionally to the requested ``range_days`` so any range >= 60 days
+# fits at least one IS+OOS pair.  Floors at 30 days per leg keep statistical
+# power non-zero; the schema-level 90-day minimum on ``mode=FULL`` runs
+# guarantees the floors always have room (60d+30d window step still fits in
+# a 90d range, leaving the optimizer at least one walk-forward window).
+_DEFAULT_WALK_FORWARD_TRAIN_DAYS = 252
+_DEFAULT_WALK_FORWARD_TEST_DAYS = 63
+_DEFAULT_WALK_FORWARD_TOTAL_DAYS = (
+    _DEFAULT_WALK_FORWARD_TRAIN_DAYS + _DEFAULT_WALK_FORWARD_TEST_DAYS
+)
+_WALK_FORWARD_LEG_FLOOR_DAYS = 30
+
+
+def _scaled_walk_forward_params(*, range_days: int) -> tuple[int, int, int]:
+    """Compute (train_days, test_days, step_days) sized to ``range_days``.
+
+    Keeps the defaults (252 / 63 / 63) when the range comfortably fits them
+    (``range_days >= 315``).  For shorter ranges, scales train/test
+    proportionally — ~70% train, ~20% test — with a 30-day floor per leg.
+    ``step_days`` always equals ``test_days`` so adjacent windows tile
+    without overlap (matches the default behaviour of
+    :func:`build_walk_forward_windows`).
+
+    Args:
+        range_days: Number of inclusive days in ``[start_date, end_date]``.
+
+    Returns:
+        Tuple of ``(train_days, test_days, step_days)`` suitable for
+        :func:`build_walk_forward_windows`.
+    """
+    if range_days >= _DEFAULT_WALK_FORWARD_TOTAL_DAYS:
+        return (
+            _DEFAULT_WALK_FORWARD_TRAIN_DAYS,
+            _DEFAULT_WALK_FORWARD_TEST_DAYS,
+            _DEFAULT_WALK_FORWARD_TEST_DAYS,
+        )
+
+    # 70/20 split mirrors the default ratio (252/315 ≈ 0.80, but we keep
+    # 70% to leave a step-buffer so at least one window fits when the
+    # range is close to the floor).
+    test_days = max(_WALK_FORWARD_LEG_FLOOR_DAYS, int(range_days * 0.2))
+    # Train must leave room for the test leg inside the range, otherwise
+    # no walk-forward window fits.  After flooring test_days at 30, the
+    # available train budget is (range_days - test_days); clamp the
+    # proportional train against it so the helper's contract holds even
+    # at the 90-day schema minimum (where 70% would otherwise overshoot).
+    proportional_train = int(range_days * 0.7)
+    available_train = range_days - test_days
+    train_days = max(_WALK_FORWARD_LEG_FLOOR_DAYS, min(proportional_train, available_train))
+    step_days = test_days
+    return train_days, test_days, step_days
 
 
 def _coerce_objective(raw: Any) -> PortfolioObjective:

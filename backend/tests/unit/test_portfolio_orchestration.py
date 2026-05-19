@@ -28,7 +28,13 @@ from msai.services.portfolio.orchestration import (
     _coerce_objective,
     _extract_returns_from_account,
     _prepare_strategy_config,
+    _scaled_walk_forward_params,
 )
+
+# Re-export for ruff: ``_scaled_walk_forward_params`` is consumed by the
+# TestScaledWalkForwardParams class below; the formatter strips it from
+# imports between edits when usage lands later.
+_ = _scaled_walk_forward_params
 
 # ---------------------------------------------------------------------------
 # _coerce_objective
@@ -488,3 +494,54 @@ class TestRawBenchmarkSymbol:
 
     def test_no_dot_returns_unchanged(self) -> None:
         assert raw_benchmark_symbol("SPY") == "SPY"
+
+
+# ---------------------------------------------------------------------------
+# _scaled_walk_forward_params  (Bug 2 regression)
+# ---------------------------------------------------------------------------
+
+
+class TestScaledWalkForwardParams:
+    """Verify the adaptive walk-forward sizing helper used by ``_run_full_mode``.
+
+    Without this helper the optimizer's defaults (252/63/63) require a
+    315-day minimum and ``build_walk_forward_windows`` raises
+    ``ValueError`` for shorter ranges — exactly the UC-PB-API-003 failure
+    that Bug 2 fixes.
+    """
+
+    def test_uses_defaults_when_range_fits_them(self) -> None:
+        # 365-day range comfortably exceeds 252+63 — keep the production
+        # defaults so long-range runs are unchanged.
+        train, test, step = _scaled_walk_forward_params(range_days=365)
+        assert train == 252
+        assert test == 63
+        assert step == 63
+
+    def test_scales_180_day_range_below_defaults(self) -> None:
+        # UC-PB-API-003's exact range — 180 days.  Old behaviour: ValueError.
+        # New behaviour: ~70/20 scale → 126 train + 36 test + 36 step,
+        # which fits at least one IS+OOS pair inside the range.
+        train, test, step = _scaled_walk_forward_params(range_days=180)
+        assert train < 252
+        assert test < 63
+        assert step == test
+        # At least one window must fit: train + test <= range_days.
+        assert train + test <= 180
+
+    def test_floors_each_leg_at_thirty_days(self) -> None:
+        # 90-day range is the schema minimum.  A 70/20 split would give
+        # train=63 / test=18 — but the test floor is 30, so we must see
+        # train >= 30 and test >= 30.
+        train, test, step = _scaled_walk_forward_params(range_days=90)
+        assert train >= 30
+        assert test >= 30
+        assert step == test
+        # One window must still fit at the minimum range.
+        assert train + test <= 90
+
+    def test_step_equals_test_for_tiled_windows(self) -> None:
+        # Walk-forward windows tile without overlap — step == test.
+        for range_days in (100, 200, 300, 400, 500):
+            _, test, step = _scaled_walk_forward_params(range_days=range_days)
+            assert step == test, f"step != test for range_days={range_days}"

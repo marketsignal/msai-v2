@@ -340,7 +340,7 @@ async def run_portfolio_job(
         )
         await _persist_per_strategy_errors(run_uuid, exc.per_strategy_errors)
         await _mark_failed_safe(service, run_uuid, str(exc))
-    except (PortfolioOrchestrationError, FileNotFoundError, TimeoutError) as exc:
+    except (PortfolioOrchestrationError, FileNotFoundError, TimeoutError, ValueError) as exc:
         # Deterministic failures — retry won't help.
         #   * ``PortfolioOrchestrationError``: data-shape problem
         #     (missing candidate, no instruments, etc.).
@@ -350,6 +350,15 @@ async def run_portfolio_job(
         #     ``backtest_timeout_seconds`` — rerunning will time out
         #     the same way.  Operator must tune the timeout or fix the
         #     strategy before re-running.
+        #   * ``ValueError``: invalid run inputs (e.g. Full-mode date
+        #     range too short for any walk-forward window to fit, raised
+        #     by ``build_walk_forward_windows``).  These raise BEFORE the
+        #     first progress callback / heartbeat — without this branch
+        #     the generic ``except Exception`` below would only mark the
+        #     row failed on the FINAL arq attempt, leaving the run row
+        #     stuck in ``running`` for the entire retry window.  Same
+        #     date range will fail identically on retry, so we mark
+        #     failed eagerly and skip the arq retry.
         # Mark failed + do NOT re-raise so arq does not waste a retry.
         log.warning(
             "portfolio_job_data_error",
