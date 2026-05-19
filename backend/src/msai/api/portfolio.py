@@ -365,10 +365,20 @@ class PromoteToLiveBody(BaseModel):
 
 
 class PromoteToLiveResponse(BaseModel):
-    """Response body for the promote-to-live endpoint."""
+    """Response body for the promote-to-live endpoint.
+
+    Carries enough revision metadata for the frontend to mount
+    ``PortfolioStartDialog`` directly without a follow-up fetch. Codex-bot
+    PR-73 P2 caught the UX dead-end where the promote handler redirected
+    to ``/live-trading?revision=<id>`` but no page consumed the query and
+    the dialog wasn't mounted; the user could not actually start the
+    deployment after a successful promote.
+    """
 
     live_portfolio_id: UUID
     live_portfolio_revision_id: UUID
+    revision_number: int
+    composition_hash: str
 
 
 @router.post(
@@ -576,4 +586,6 @@ async def promote_portfolio_run_to_live(
     return PromoteToLiveResponse(
         live_portfolio_id=live_portfolio.id,
         live_portfolio_revision_id=revision.id,
+        revision_number=revision.revision_number,
+        composition_hash=revision.composition_hash,
     )

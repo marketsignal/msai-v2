@@ -35,8 +35,22 @@ def _score_calmar(metrics: dict[str, Any]) -> float:
 
 
 def _score_negative_max_drawdown(metrics: dict[str, Any]) -> float:
-    """Return |max_drawdown| negated to a positive score (higher = better)."""
-    return -float(metrics.get("max_drawdown", 0.0))
+    """Score a max-drawdown metric so smaller drawdowns rank higher in
+    Optuna's ``direction='maximize'`` study.
+
+    ``compute_series_metrics`` stores max drawdown as a NON-POSITIVE float
+    (``drawdown.min()`` over the underwater series, e.g., ``-0.20`` for a
+    20% drawdown). The original implementation returned ``-max_drawdown``,
+    which produces ``+0.20`` for a 20% drawdown and ``+0.05`` for a 5%
+    drawdown — Optuna maximizes, so it preferred the WORSE drawdowns.
+    Codex-bot PR-73 P1 caught this.
+
+    The correct mapping is ``-abs(max_drawdown)``: a 20% drawdown scores
+    ``-0.20`` (low — Optuna avoids), a 5% drawdown scores ``-0.05`` (high
+    — Optuna picks). A defensive ``abs`` also handles the unlikely case
+    where an upstream regression flips the sign convention to positive.
+    """
+    return -abs(float(metrics.get("max_drawdown", 0.0)))
 
 
 OBJECTIVES: dict[PortfolioObjective, Callable[[dict[str, Any]], float]] = {

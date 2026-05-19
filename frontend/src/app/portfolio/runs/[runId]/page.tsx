@@ -84,11 +84,13 @@ import {
   apiGet,
   describeApiError,
   promotePortfolioRunToLive,
+  type LivePortfolioRevision,
   type PortfolioRunResponse,
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { formatDateTime } from "@/lib/format";
 import { statusColor } from "@/lib/status";
+import { PortfolioStartDialog } from "@/components/live/portfolio-start-dialog";
 
 const DEFAULT_PAPER_ACCOUNT = "DUTEST123";
 
@@ -211,6 +213,15 @@ export default function PortfolioRunResultsPage({
   const [accountId, setAccountId] = useState<string>(DEFAULT_PAPER_ACCOUNT);
   const [promoting, setPromoting] = useState<boolean>(false);
 
+  // After a successful promote, mount PortfolioStartDialog inline so the
+  // user can immediately deploy. Codex-bot PR-73 P2 caught the previous
+  // dead-end: the redirect to /live-trading?revision=<id> landed on a
+  // page that didn't read the query and PortfolioStartDialog wasn't
+  // mounted anywhere — the deployment was stranded.
+  const [deployRevision, setDeployRevision] =
+    useState<LivePortfolioRevision | null>(null);
+  const [deployDialogOpen, setDeployDialogOpen] = useState<boolean>(false);
+
   useEffect(() => {
     if (!isAuthenticated) return;
     let active = true;
@@ -275,11 +286,21 @@ export default function PortfolioRunResultsPage({
         { account_id: accountId.trim() },
         token,
       );
-      toast.success("Portfolio promoted to live. Opening live deployment...");
-      setPromoteOpen(false);
-      router.push(
-        `/live-trading?revision=${encodeURIComponent(result.live_portfolio_revision_id)}`,
+      toast.success(
+        "Portfolio promoted. Pick deployment options to start trading.",
       );
+      setPromoteOpen(false);
+      // Hand off to PortfolioStartDialog — the response carries the
+      // revision metadata the dialog needs (id + revision_number +
+      // composition_hash) so no follow-up fetch is required.
+      setDeployRevision({
+        id: result.live_portfolio_revision_id,
+        revision_number: result.revision_number,
+        composition_hash: result.composition_hash,
+        is_frozen: true,
+        created_at: new Date().toISOString(),
+      });
+      setDeployDialogOpen(true);
     } catch (err) {
       toast.error(describeApiError(err, "Promote failed"));
     } finally {
@@ -516,6 +537,30 @@ export default function PortfolioRunResultsPage({
             </DialogFooter>
           </DialogContent>
         </Dialog>
+
+        {/* Deploy dialog — mounted after a successful promote. Codex-bot
+            PR-73 P2 caught the previous dead-end where the promote redirect
+            stranded the user on /live-trading with no way to start the
+            deployment. The dialog handles the 4-stage flow (form → preview
+            → confirm → submit) against POST /api/v1/live/start-portfolio. */}
+        {deployRevision !== null ? (
+          <PortfolioStartDialog
+            revision={deployRevision}
+            open={deployDialogOpen}
+            onOpenChange={(next) => {
+              setDeployDialogOpen(next);
+              if (!next) {
+                setDeployRevision(null);
+              }
+            }}
+            onSuccess={() => {
+              setDeployDialogOpen(false);
+              setDeployRevision(null);
+              toast.success("Deployment started.");
+              router.push("/live-trading");
+            }}
+          />
+        ) : null}
       </div>
 
       {!isCompleted ? (

@@ -666,10 +666,18 @@ export interface PortfolioRunListResponse {
   total: number;
 }
 
-/** Response from POST /api/v1/portfolios/runs/{run_id}/promote-to-live. */
+/** Response from POST /api/v1/portfolios/runs/{run_id}/promote-to-live.
+ *
+ * Carries the revision_number + composition_hash so the frontend can
+ * mount `PortfolioStartDialog` directly without a follow-up fetch (per
+ * Codex-bot PR-73 P2 fix — previous shape stranded the user on a page
+ * that couldn't open the deploy flow).
+ */
 export interface PromoteToLiveResponse {
   live_portfolio_id: string;
   live_portfolio_revision_id: string;
+  revision_number: number;
+  composition_hash: string;
 }
 
 /** Promote a completed portfolio run to a live (paper) portfolio. */
