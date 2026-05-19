@@ -471,6 +471,41 @@ class PortfolioService:
                     break
 
             if reuse_match is None:
+                # Codex bot iter-5 P2 on PR #73: surface ambiguous-candidate
+                # conflicts at promotion time rather than letting them slip
+                # downstream as ``BINDING_AMBIGUOUS`` at start-portfolio.
+                #
+                # If the operator already has an UNLINKED ``live_candidate``
+                # for this strategy whose config/instruments don't match the
+                # member we're about to freeze, creating another unlinked
+                # ``live_candidate`` would leave two of them — and
+                # ``api/live.py``'s first-deploy lookup rejects that with
+                # ``BINDING_AMBIGUOUS``. Raising a clear domain error here
+                # tells the operator the actionable next step (archive the
+                # existing graduation OR retry promotion under matching
+                # config) before they spend time wiring up a deploy that
+                # would only fail downstream.
+                if unlinked_live:
+                    conflicts = [
+                        {
+                            "candidate_id": str(c.id),
+                            "stage": c.stage,
+                            "config_keys": sorted((c.config or {}).keys()),
+                        }
+                        for c in unlinked_live
+                    ]
+                    raise PortfolioDomainError(
+                        f"Strategy {strategy_id} already has "
+                        f"{len(unlinked_live)} unlinked `live_candidate` "
+                        f"row(s) whose config does not match the member "
+                        f"being promoted. Synthesizing another live_candidate "
+                        f"would leave the strategy ambiguous and deploy would "
+                        f"fail with BINDING_AMBIGUOUS. Either archive the "
+                        f"existing candidate(s) via the graduation pipeline "
+                        f"and retry promotion, or re-graduate them under the "
+                        f"merged config this promotion would write. "
+                        f"Conflicts: {conflicts}"
+                    )
                 self._session.add(
                     GraduationCandidate(
                         strategy_id=strategy_id,

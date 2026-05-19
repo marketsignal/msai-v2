@@ -185,11 +185,61 @@ class TestHttpCommands:
         args, kwargs = mock.call_args
         assert args[0] == "POST"
         assert "/api/v1/portfolios/pid-123/runs" in args[1]
+        # Codex bot iter-5 P2 on PR #73: ``mode`` must be explicit in the
+        # payload so the server doesn't inherit ``Portfolio.default_mode``
+        # when the operator typed ``--mode quick``. Default is Quick.
         assert kwargs["json"] == {
             "start_date": "2024-01-01",
             "end_date": "2025-01-01",
             "max_parallelism": 4,
+            "mode": "quick",
         }
+
+    def test_portfolio_run_quick_mode_sends_explicit_mode(self, runner: CliRunner) -> None:
+        """Codex bot iter-5 P2 on PR #73 — ``--mode quick`` MUST be sent
+        in the payload so the server cannot inherit ``default_mode=full``
+        from the parent portfolio and silently launch the Optuna walk-
+        forward optimizer when the operator requested Quick.
+        """
+        body = {"id": "run-9", "status": "pending"}
+        with patch("msai.cli.httpx.request", return_value=_ok_response(body)) as mock:
+            result = runner.invoke(
+                app,
+                [
+                    "portfolio",
+                    "run",
+                    "pid-123",
+                    "2024-01-01",
+                    "2025-01-01",
+                    "--mode",
+                    "quick",
+                ],
+            )
+        assert result.exit_code == 0
+        _, kwargs = mock.call_args
+        assert kwargs["json"].get("mode") == "quick", kwargs["json"]
+
+    def test_portfolio_run_full_mode_sends_explicit_mode(self, runner: CliRunner) -> None:
+        body = {"id": "run-9", "status": "pending"}
+        with patch("msai.cli.httpx.request", return_value=_ok_response(body)) as mock:
+            result = runner.invoke(
+                app,
+                [
+                    "portfolio",
+                    "run",
+                    "pid-123",
+                    "2024-01-01",
+                    "2025-01-01",
+                    "--mode",
+                    "full",
+                    "--n-trials",
+                    "10",
+                ],
+            )
+        assert result.exit_code == 0
+        _, kwargs = mock.call_args
+        assert kwargs["json"].get("mode") == "full", kwargs["json"]
+        assert kwargs["json"].get("n_trials") == 10, kwargs["json"]
 
     def test_live_kill_all_requires_confirmation(self, runner: CliRunner) -> None:
         # Without --yes, Typer's confirm prompt aborts when user declines.

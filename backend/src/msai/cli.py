@@ -930,15 +930,15 @@ def portfolio_run(
     payload: dict[str, object] = {"start_date": start, "end_date": end}
     if max_parallelism > 0:
         payload["max_parallelism"] = max_parallelism
-    # Only include ``mode`` in the payload when explicitly Full; the server
-    # default is Quick, so omitting matches the legacy contract — keeps the
-    # existing ``test_portfolio_run_posts_dates`` exact-equality assertion
-    # green and avoids surprising downstream callers that match on the
-    # payload shape.
-    if mode_normalized == "full":
-        payload["mode"] = "full"
-        if n_trials > 0:
-            payload["n_trials"] = n_trials
+    # Always send the requested mode explicitly. Omitting it makes the
+    # server inherit ``Portfolio.default_mode``, so a portfolio whose
+    # default is ``full`` would launch the Optuna walk-forward optimizer
+    # even when the operator typed ``--mode quick``. Codex bot iter-5 P2
+    # on PR #73 caught the silent escalation. ``--n-trials`` still only
+    # applies to Full mode.
+    payload["mode"] = mode_normalized
+    if mode_normalized == "full" and n_trials > 0:
+        payload["n_trials"] = n_trials
     response = _api_call(
         "POST",
         f"/api/v1/portfolios/{_url_id(portfolio_id)}/runs",

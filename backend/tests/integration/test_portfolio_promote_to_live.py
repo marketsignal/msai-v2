@@ -287,6 +287,117 @@ async def test_promote_full_mode_flows_strategy_level_tunables_through(
 
 
 @pytest.mark.asyncio
+async def test_promote_raises_when_unlinked_live_candidate_conflicts(
+    api_client_authed,
+    portfolio_session_factory,
+    _seed_user,
+):
+    """Codex bot iter-5 P2 on PR #73 — when a strategy already has an
+    UNLINKED ``live_candidate`` whose config does NOT match the member
+    being promoted, ``materialize_from_backtest`` must surface the
+    conflict at promotion time (422 + ``MATERIALIZATION_FAILED``) rather
+    than silently creating a second ``live_candidate`` that would later
+    fail with ``BINDING_AMBIGUOUS`` at the deploy step.
+    """
+    from datetime import UTC, date, datetime
+    from decimal import Decimal
+    from uuid import uuid4
+
+    from msai.models.graduation_candidate import GraduationCandidate
+    from msai.models.portfolio import Portfolio
+    from msai.models.portfolio_allocation import PortfolioAllocation
+    from msai.models.portfolio_enums import BacktestMode
+    from msai.models.portfolio_run import PortfolioRun
+    from msai.models.strategy import Strategy
+
+    user_id = _seed_user.id
+
+    # Arrange — strategy with both:
+    #   1) a paper_candidate used by the portfolio (will become member).
+    #   2) a PRE-EXISTING unlinked live_candidate with DIFFERENT config —
+    #      simulating an operator who graduated the strategy manually
+    #      with a different config before/alongside the portfolio flow.
+    async with portfolio_session_factory() as session:
+        strategy = Strategy(
+            id=uuid4(),
+            name=f"conflict-{uuid4().hex[:6]}",
+            file_path="strategies/example/ema_cross.py",
+            strategy_class="EMACrossStrategy",
+            default_config={"instruments": ["AAPL"], "asset_class": "stocks"},
+            created_by=user_id,
+        )
+        session.add(strategy)
+        await session.flush()
+
+        # The portfolio's allocation candidate (matches strategy default).
+        portfolio_candidate = GraduationCandidate(
+            id=uuid4(),
+            strategy_id=strategy.id,
+            stage="paper_candidate",
+            config={"instruments": ["AAPL"]},
+            metrics={"sharpe": 1.0},
+        )
+        # Operator's pre-existing unlinked live_candidate with a different
+        # instrument set — this is the conflict trigger.
+        operator_live_cand = GraduationCandidate(
+            id=uuid4(),
+            strategy_id=strategy.id,
+            stage="live_candidate",
+            config={"instruments": ["SPY"], "fast_period": 99},
+            metrics={"sharpe": 1.5},
+            deployment_id=None,
+        )
+        session.add_all([portfolio_candidate, operator_live_cand])
+        await session.flush()
+
+        portfolio = Portfolio(
+            id=uuid4(),
+            name=f"conflict-{uuid4().hex[:8]}",
+            objective="maximize_sharpe",
+            base_capital=100_000.0,
+            requested_leverage=1.0,
+            created_by=user_id,
+        )
+        session.add(portfolio)
+        await session.flush()
+        session.add(
+            PortfolioAllocation(
+                portfolio_id=portfolio.id,
+                candidate_id=portfolio_candidate.id,
+                weight=Decimal("1.0"),
+            )
+        )
+
+        run = PortfolioRun(
+            id=uuid4(),
+            portfolio_id=portfolio.id,
+            status="completed",
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 6, 30),
+            mode=BacktestMode.QUICK,
+            metrics={"sharpe": 1.2},
+            completed_at=datetime.now(UTC),
+        )
+        session.add(run)
+        await session.commit()
+        run_id = run.id
+
+    # Act
+    response = await api_client_authed.post(
+        f"/api/v1/portfolios/runs/{run_id}/promote-to-live",
+        json={"account_id": "DUTEST123"},
+    )
+
+    # Assert — 422 + clear message about the ambiguous-candidate conflict.
+    assert response.status_code == 422, response.text
+    body = response.json()
+    detail = body.get("detail", body)
+    msg = detail.get("error", {}).get("message", "") if isinstance(detail, dict) else str(detail)
+    assert "unlinked" in msg.lower() and "live_candidate" in msg.lower(), body
+    assert "BINDING_AMBIGUOUS" in msg, body
+
+
+@pytest.mark.asyncio
 async def test_promote_creates_live_candidate_per_member_for_first_deploy(
     api_client_authed,
     make_completed_portfolio_run,
