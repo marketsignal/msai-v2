@@ -296,6 +296,26 @@ class PortfolioService:
         # is parity with the F1c-bridge path (equal weight).
         explicit_normalize = use_explicit and explicit_weight_sum > 0
 
+        # Codex bot iter-6 P2 on PR #73: prefer the weights the RUN actually
+        # used. Quick mode's data-driven allocator branch (orchestration.py)
+        # syncs allocator output into ``run.allocations[i]["weight"]`` after
+        # the per-strategy backtests complete, so a portfolio with
+        # ``allocator_name="inverse_vol"`` could be backtested as 70/30 but
+        # — with only the compose-time ``PortfolioAllocation.weight``
+        # visible here — would be materialized as 50/50 (equal_weight
+        # fallback for the bridge case). Build a candidate_id → weight
+        # map so the live revision uses the validated composition.
+        # Missing entries fall back to the legacy explicit/equal path.
+        run_weights_by_candidate: dict[str, float] = {}
+        run_allocations_payload = run.allocations or []
+        for item in run_allocations_payload:
+            if not isinstance(item, dict):
+                continue
+            cid = item.get("candidate_id")
+            w = item.get("weight")
+            if cid is not None and isinstance(w, (int, float)):
+                run_weights_by_candidate[str(cid)] = float(w)
+
         # ---- Create LivePortfolio + frozen revision ----
         # Append the run id suffix so re-promoting the same backtest
         # portfolio produces a uniquely-named LivePortfolio (the
@@ -366,7 +386,14 @@ class PortfolioService:
                     "cannot promote a portfolio that would trade nothing."
                 )
 
-            if explicit_normalize and alloc.weight is not None:
+            run_weight_for_candidate = run_weights_by_candidate.get(str(candidate.id))
+            if run_weight_for_candidate is not None and run_weight_for_candidate > 0:
+                # Trust the run's recorded weight: it incorporates Quick-mode
+                # allocator output (inverse_vol / vol_targeted) and the
+                # orchestrator's ``normalize_weights`` step, so it already
+                # represents the validated live composition.
+                weight = Decimal(str(run_weight_for_candidate))
+            elif explicit_normalize and alloc.weight is not None:
                 # Normalize to sum-to-1.0 so the live composition matches
                 # what the backtest validated.
                 weight = Decimal(str(float(alloc.weight) / explicit_weight_sum))

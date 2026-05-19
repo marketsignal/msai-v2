@@ -287,6 +287,156 @@ async def test_promote_full_mode_flows_strategy_level_tunables_through(
 
 
 @pytest.mark.asyncio
+async def test_promote_uses_run_allocations_weights_over_compose_time_weights(
+    api_client_authed,
+    portfolio_session_factory,
+    _seed_user,
+):
+    """Codex bot iter-6 P2 on PR #73 — when ``run.allocations`` carries
+    weights different from ``PortfolioAllocation.weight`` (e.g., a Quick
+    run with an inverse_vol allocator reweighted post-backtest), promotion
+    must use the RUN's weights so the live composition matches what the
+    backtest actually validated.
+
+    Without this fix, a portfolio backtested as 70/30 by inverse_vol on
+    realized vols would deploy as 50/50 (the bridge's compose-time
+    equal-weight fallback), silently diverging from the validated result.
+    """
+    from datetime import UTC, date, datetime
+    from uuid import uuid4
+
+    from sqlalchemy import select
+
+    from msai.models import LivePortfolioRevisionStrategy
+    from msai.models.graduation_candidate import GraduationCandidate
+    from msai.models.portfolio import Portfolio
+    from msai.models.portfolio_allocation import PortfolioAllocation
+    from msai.models.portfolio_enums import BacktestMode
+    from msai.models.portfolio_run import PortfolioRun
+    from msai.models.strategy import Strategy
+
+    user_id = _seed_user.id
+
+    # Arrange — 2-strategy portfolio with bridge-style allocations
+    # (weight=None at compose time), then a Quick run whose
+    # ``allocations`` payload encodes 0.7 / 0.3 (simulating inverse_vol
+    # output). Promotion must materialize those weights, not 0.5 / 0.5.
+    async with portfolio_session_factory() as session:
+        strategies = []
+        candidates = []
+        for i in range(2):
+            strategy = Strategy(
+                id=uuid4(),
+                name=f"rw-{i}-{uuid4().hex[:6]}",
+                file_path="strategies/example/ema_cross.py",
+                strategy_class="EMACrossStrategy",
+                default_config={"instruments": ["AAPL"], "asset_class": "stocks"},
+                created_by=user_id,
+            )
+            session.add(strategy)
+            strategies.append(strategy)
+        await session.flush()
+
+        for strategy in strategies:
+            candidate = GraduationCandidate(
+                id=uuid4(),
+                strategy_id=strategy.id,
+                stage="paper_candidate",
+                config={"instruments": ["AAPL"]},
+                metrics={"sharpe": 1.0},
+            )
+            session.add(candidate)
+            candidates.append(candidate)
+        await session.flush()
+
+        portfolio = Portfolio(
+            id=uuid4(),
+            name=f"rw-{uuid4().hex[:8]}",
+            objective="maximize_sharpe",
+            allocator_name="inverse_vol",
+            base_capital=100_000.0,
+            requested_leverage=1.0,
+            created_by=user_id,
+        )
+        session.add(portfolio)
+        await session.flush()
+        # Bridge case: compose-time weights are None.
+        for candidate in candidates:
+            session.add(
+                PortfolioAllocation(
+                    portfolio_id=portfolio.id,
+                    candidate_id=candidate.id,
+                    weight=None,
+                )
+            )
+
+        # Run's allocations payload carries the post-allocator weights.
+        run_allocations = [
+            {
+                "candidate_id": str(candidates[0].id),
+                "strategy_id": str(strategies[0].id),
+                "weight": 0.7,
+                "timestamps": [],
+                "returns": [],
+            },
+            {
+                "candidate_id": str(candidates[1].id),
+                "strategy_id": str(strategies[1].id),
+                "weight": 0.3,
+                "timestamps": [],
+                "returns": [],
+            },
+        ]
+        run = PortfolioRun(
+            id=uuid4(),
+            portfolio_id=portfolio.id,
+            status="completed",
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 6, 30),
+            mode=BacktestMode.QUICK,
+            metrics={"sharpe": 1.5},
+            allocations=run_allocations,
+            completed_at=datetime.now(UTC),
+        )
+        session.add(run)
+        await session.commit()
+        run_id = run.id
+
+    # Act
+    response = await api_client_authed.post(
+        f"/api/v1/portfolios/runs/{run_id}/promote-to-live",
+        json={"account_id": "DUTEST123"},
+    )
+
+    # Assert — live revision uses the run's weights (0.7 / 0.3), not
+    # the bridge's compose-time equal-weight fallback (0.5 / 0.5).
+    assert response.status_code == 201, response.text
+    body = response.json()
+    revision_id = body["live_portfolio_revision_id"]
+
+    async with portfolio_session_factory() as session:
+        members = (
+            (
+                await session.execute(
+                    select(LivePortfolioRevisionStrategy).where(
+                        LivePortfolioRevisionStrategy.revision_id == revision_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(members) == 2
+        weights_by_strategy = {str(m.strategy_id): float(m.weight) for m in members}
+        assert weights_by_strategy[str(strategies[0].id)] == pytest.approx(0.7), (
+            f"strategy 0 should get run's 0.7 weight; got {weights_by_strategy}"
+        )
+        assert weights_by_strategy[str(strategies[1].id)] == pytest.approx(0.3), (
+            f"strategy 1 should get run's 0.3 weight; got {weights_by_strategy}"
+        )
+
+
+@pytest.mark.asyncio
 async def test_promote_raises_when_unlinked_live_candidate_conflicts(
     api_client_authed,
     portfolio_session_factory,

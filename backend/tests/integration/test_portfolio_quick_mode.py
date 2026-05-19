@@ -841,3 +841,95 @@ async def test_quick_mode_honors_inverse_vol_allocator_choice(
     assert weights[0] > weights[1], (
         f"inverse_vol should weight the low-vol strategy higher; got {weights}"
     )
+
+
+@pytest.mark.asyncio
+async def test_api_create_full_run_with_non_optimizer_objective_returns_422(
+    api_client_authed,
+    portfolio_session_factory: async_sessionmaker[AsyncSession],
+    _seed_user,
+) -> None:
+    """Codex bot iter-6 P2 on PR #73 — Full mode with an objective that has
+    no scorer in the OBJECTIVES registry (``equal_weight`` / ``manual``)
+    must be rejected with 422 at run-creation time.
+
+    Without the gate, every Optuna trial raises ValueError (objective_score
+    rejects unregistered objectives), the optimizer catches and marks the
+    trial FAIL, and the run finishes "completed" with all-zero IS/OOS
+    scores — silently useless.
+    """
+    from uuid import uuid4
+
+    from msai.models.graduation_candidate import GraduationCandidate
+    from msai.models.portfolio import Portfolio
+    from msai.models.portfolio_allocation import PortfolioAllocation
+    from msai.models.strategy import Strategy
+
+    user_id = _seed_user.id
+
+    # Arrange — portfolio whose objective is equal_weight (no scorer)
+    # AND default_mode=full. Inline construction so we can override the
+    # fixture's hardcoded ``objective="maximize_sharpe"``.
+    async with portfolio_session_factory() as session:
+        strategy = Strategy(
+            id=uuid4(),
+            name=f"obj-{uuid4().hex[:6]}",
+            file_path="strategies/example/ema_cross.py",
+            strategy_class="EMACrossStrategy",
+            default_config={"instruments": ["AAPL"], "asset_class": "stocks"},
+            created_by=user_id,
+        )
+        session.add(strategy)
+        await session.flush()
+
+        candidate = GraduationCandidate(
+            id=uuid4(),
+            strategy_id=strategy.id,
+            stage="paper_candidate",
+            config={"instruments": ["AAPL"]},
+            metrics={"sharpe": 1.0},
+        )
+        session.add(candidate)
+        await session.flush()
+
+        portfolio = Portfolio(
+            id=uuid4(),
+            name=f"obj-{uuid4().hex[:8]}",
+            objective="equal_weight",  # No scorer in OBJECTIVES registry.
+            default_mode=BacktestMode.FULL,
+            base_capital=100_000.0,
+            requested_leverage=1.0,
+            created_by=user_id,
+        )
+        session.add(portfolio)
+        await session.flush()
+        session.add(
+            PortfolioAllocation(
+                portfolio_id=portfolio.id,
+                candidate_id=candidate.id,
+                weight=1.0,
+            )
+        )
+        await session.commit()
+        portfolio_id = portfolio.id
+
+    # Act — submit a Full-mode run over a 100-day range (satisfies the
+    # 90-day rule so the only remaining gate is the objective check).
+    response = await api_client_authed.post(
+        f"/api/v1/portfolios/{portfolio_id}/runs",
+        json={
+            "portfolio_id": str(portfolio_id),
+            "start_date": "2024-01-01",
+            "end_date": "2024-04-30",
+            "mode": "full",
+        },
+    )
+
+    # Assert — 422 with a message naming the offending objective + the
+    # valid scorer set.
+    assert response.status_code == 422, response.text
+    body = response.json()
+    detail = body.get("detail", "")
+    detail_str = detail if isinstance(detail, str) else str(detail)
+    assert "Full mode" in detail_str
+    assert "equal_weight" in detail_str

@@ -22,7 +22,7 @@ from msai.core.logging import get_logger
 from msai.models.graduation_candidate import GraduationCandidate
 from msai.models.portfolio import Portfolio
 from msai.models.portfolio_allocation import PortfolioAllocation
-from msai.models.portfolio_enums import BacktestMode, PortfolioRunStatus
+from msai.models.portfolio_enums import BacktestMode, PortfolioObjective, PortfolioRunStatus
 from msai.models.portfolio_run import PortfolioRun
 from msai.models.strategy import Strategy
 
@@ -319,6 +319,35 @@ class PortfolioLifecycle:
                     f"at least 90 days between start_date and end_date "
                     f"(got {range_days} day{'s' if range_days != 1 else ''}); "
                     "use mode='quick' explicitly for shorter ranges or extend the window."
+                )
+
+            # Codex bot iter-6 P2 on PR #73: reject objectives that have no
+            # scorer in ``OBJECTIVES`` (``equal_weight`` and ``manual``).
+            # The Optuna trial body calls ``objective_score(metrics, obj)``
+            # which raises ``ValueError`` for unregistered objectives;
+            # the optimizer's bare-except catches every trial and the run
+            # finishes "completed" with all-zero IS/OOS scores and no
+            # usable best_config — silently useless. Surface the
+            # incompatibility at run-creation time with an actionable
+            # message instead.
+            from msai.services.portfolio_backtest.objectives import (  # noqa: PLC0415
+                OBJECTIVES,
+            )
+
+            objective_value = portfolio.objective
+            objective_enum = (
+                objective_value
+                if isinstance(objective_value, PortfolioObjective)
+                else PortfolioObjective(objective_value)
+            )
+            if objective_enum not in OBJECTIVES:
+                raise ValueError(
+                    f"Full mode requires an objective with a scorer "
+                    f"(one of {sorted(o.value for o in OBJECTIVES)}); "
+                    f"portfolio objective is `{objective_enum.value}`, "
+                    "which has no optimizer scoring function. Re-create "
+                    "the portfolio with a maximize_* / minimize_* objective "
+                    "or run in Quick mode."
                 )
 
         run = PortfolioRun(
