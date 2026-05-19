@@ -226,14 +226,27 @@ export default function PortfolioPage(): React.ReactElement {
                     data-testid={`portfolio-row-${pf.id}`}
                   >
                     <TableCell>
-                      <div>
-                        <p className="font-medium">{pf.name}</p>
+                      {/*
+                        Codex bot iter-12 P2 on PR #73: link to the detail
+                        page. The portfolio composer's run trigger lives on
+                        ``/portfolio/[id]`` now, so without a clickable
+                        path here the operator can't start a new backtest
+                        for an existing portfolio from the dashboard.
+                      */}
+                      <Link
+                        href={`/portfolio/${pf.id}`}
+                        className="group block"
+                        data-testid={`portfolio-link-${pf.id}`}
+                      >
+                        <p className="font-medium underline-offset-4 group-hover:underline">
+                          {pf.name}
+                        </p>
                         {pf.description && (
                           <p className="max-w-xs truncate text-xs text-muted-foreground">
                             {pf.description}
                           </p>
                         )}
-                      </div>
+                      </Link>
                     </TableCell>
                     <TableCell>
                       <Badge
