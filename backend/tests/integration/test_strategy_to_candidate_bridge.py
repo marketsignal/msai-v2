@@ -351,3 +351,81 @@ async def test_create_portfolio_rejects_duplicate_strategy_in_allocations(
     # Assert — rejected (NOT 201). The error must name the duplicate strategy.
     assert response.status_code != 201, response.text
     assert "Duplicate strategy" in response.text or "duplicate" in response.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_bridge_calls_idempotent_via_unique_index(
+    make_strategy: Callable[..., Awaitable[Strategy]],
+    portfolio_session_factory: Any,
+) -> None:
+    """Codex bot iter-10 P1 on PR #73 — the partial unique index
+    ``uq_portfolio_default_candidate_per_strategy`` (migration
+    ``72ea2fd4dda2``) plus the IntegrityError handler in
+    ``_get_or_create_default_candidate`` must keep the bridge
+    idempotent under contention. Two concurrent callers both observing
+    "no existing row" used to both insert; now the loser hits the
+    unique index, re-reads the winner, and returns it.
+
+    Simulating the race by manually inserting a portfolio_default
+    candidate, THEN calling ``_get_or_create_default_candidate`` — the
+    helper must return the pre-existing row, not insert a duplicate
+    (which would now fail with IntegrityError, but the helper catches
+    that path and re-reads).
+    """
+    from uuid import uuid4
+
+    from sqlalchemy import select
+
+    from msai.models.graduation_candidate import GraduationCandidate
+    from msai.services.portfolio.lifecycle import _get_or_create_default_candidate
+
+    # Arrange
+    strategy = await make_strategy(
+        name="concurrent-bridge",
+        default_config={"instruments": ["AAPL"], "asset_class": "stocks"},
+    )
+
+    async with portfolio_session_factory() as session:
+        # Pre-existing portfolio_default candidate — simulates the
+        # winner of a prior concurrent bridge call.
+        existing = GraduationCandidate(
+            id=uuid4(),
+            strategy_id=strategy.id,
+            stage="portfolio_default",
+            config={"instruments": ["AAPL"], "asset_class": "stocks"},
+            metrics={},
+        )
+        session.add(existing)
+        await session.commit()
+        existing_id = existing.id
+
+    # Act — call the helper. The select-then-flush path now sees the
+    # pre-existing row and returns it directly. If the select were to
+    # miss (e.g., stale session cache) and the insert tried, the unique
+    # index would catch it and the handler would re-read.
+    async with portfolio_session_factory() as session:
+        candidate = await _get_or_create_default_candidate(session, strategy.id)
+        await session.commit()
+
+    # Assert — same row, no duplicate inserted.
+    assert candidate.id == existing_id, (
+        f"bridge must return pre-existing portfolio_default candidate; got {candidate.id}"
+    )
+
+    # And only ONE portfolio_default row exists for this strategy.
+    async with portfolio_session_factory() as session:
+        count = (
+            (
+                await session.execute(
+                    select(GraduationCandidate).where(
+                        GraduationCandidate.strategy_id == strategy.id,
+                        GraduationCandidate.stage == "portfolio_default",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(count) == 1, (
+            f"unique index must prevent duplicates; found {len(count)} portfolio_default rows"
+        )

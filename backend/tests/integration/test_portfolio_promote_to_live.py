@@ -857,3 +857,141 @@ async def test_progress_callback_jsonb_merge_preserves_best_config(
         # New keys merged on top.
         assert merged.get("progress") == 50, merged
         assert merged.get("progress_message") == "halfway", merged
+
+
+@pytest.mark.asyncio
+async def test_concurrent_promotions_serialized_via_unique_index(
+    api_client_authed,
+    portfolio_session_factory,
+    _seed_user,
+) -> None:
+    """Codex bot iter-10 P1 on PR #73 — the partial unique index
+    ``uq_unlinked_live_candidate_per_strategy`` (migration
+    ``72ea2fd4dda2``) plus the IntegrityError handler in
+    ``materialize_from_backtest`` must keep promotion idempotent under
+    contention.
+
+    Simulates the race: pre-insert an unlinked live_candidate whose
+    config MATCHES what promotion would synthesize, then promote. The
+    promote path's select-then-insert sees the existing row first and
+    reuses it; but even if the SELECT missed (stale cache) and the
+    INSERT tried, the unique index would catch it and the handler
+    would re-read the winner. Either way, exactly ONE unlinked
+    live_candidate remains.
+    """
+    from datetime import UTC, date, datetime
+    from uuid import uuid4
+
+    from sqlalchemy import select
+
+    from msai.models.graduation_candidate import GraduationCandidate
+    from msai.models.portfolio import Portfolio
+    from msai.models.portfolio_allocation import PortfolioAllocation
+    from msai.models.portfolio_enums import BacktestMode
+    from msai.models.portfolio_run import PortfolioRun
+    from msai.models.strategy import Strategy
+
+    user_id = _seed_user.id
+
+    # Arrange — strategy + portfolio + completed Quick run, plus a
+    # pre-existing unlinked live_candidate that matches the member
+    # config that promotion would produce.
+    async with portfolio_session_factory() as session:
+        strategy = Strategy(
+            id=uuid4(),
+            name=f"concurrent-promo-{uuid4().hex[:6]}",
+            file_path="strategies/example/ema_cross.py",
+            strategy_class="EMACrossStrategy",
+            default_config={"instruments": ["AAPL"], "asset_class": "stocks"},
+            created_by=user_id,
+        )
+        session.add(strategy)
+        await session.flush()
+
+        paper_cand = GraduationCandidate(
+            id=uuid4(),
+            strategy_id=strategy.id,
+            stage="paper_candidate",
+            config={"instruments": ["AAPL"]},
+            metrics={"sharpe": 1.0},
+        )
+        # Pre-existing concurrent-winner live_candidate with matching
+        # config so the promotion path reuses it.
+        existing_live = GraduationCandidate(
+            id=uuid4(),
+            strategy_id=strategy.id,
+            stage="live_candidate",
+            config={
+                "instruments": ["AAPL"],
+                "asset_class": "stocks",
+            },
+            metrics={},
+            deployment_id=None,
+        )
+        session.add_all([paper_cand, existing_live])
+        await session.flush()
+
+        portfolio = Portfolio(
+            id=uuid4(),
+            name=f"concurrent-promo-{uuid4().hex[:8]}",
+            objective="maximize_sharpe",
+            base_capital=100_000.0,
+            requested_leverage=1.0,
+            created_by=user_id,
+        )
+        session.add(portfolio)
+        await session.flush()
+        session.add(
+            PortfolioAllocation(
+                portfolio_id=portfolio.id,
+                candidate_id=paper_cand.id,
+                weight=1.0,
+            )
+        )
+
+        run = PortfolioRun(
+            id=uuid4(),
+            portfolio_id=portfolio.id,
+            status="completed",
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 6, 30),
+            mode=BacktestMode.QUICK,
+            metrics={"sharpe": 1.2},
+            completed_at=datetime.now(UTC),
+        )
+        session.add(run)
+        await session.commit()
+        run_id = run.id
+        existing_live_id = existing_live.id
+
+    # Act
+    response = await api_client_authed.post(
+        f"/api/v1/portfolios/runs/{run_id}/promote-to-live",
+        json={"account_id": "DUTEST123"},
+    )
+
+    # Assert — 201, and only ONE unlinked live_candidate exists (the
+    # original; the promotion reused it).
+    assert response.status_code == 201, response.text
+
+    async with portfolio_session_factory() as session:
+        unlinked = list(
+            (
+                await session.execute(
+                    select(GraduationCandidate).where(
+                        GraduationCandidate.strategy_id == strategy.id,
+                        GraduationCandidate.stage == "live_candidate",
+                        GraduationCandidate.deployment_id.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(unlinked) == 1, (
+            f"unique index must prevent duplicate unlinked live_candidates; "
+            f"found {len(unlinked)}"
+        )
+        assert unlinked[0].id == existing_live_id, (
+            f"promotion must reuse the matching pre-existing row; got {unlinked[0].id}"
+        )

@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import defer
 
 from msai.core.logging import get_logger
@@ -679,6 +680,13 @@ async def _get_or_create_default_candidate(
     # from silently retro-routing existing candidates.
     candidate_config.setdefault("asset_class", "stocks")
 
+    # Codex bot iter-10 P1 on PR #73: wrap the INSERT in a SAVEPOINT
+    # (``session.begin_nested``) so an IntegrityError from the partial
+    # unique index (``uq_portfolio_default_candidate_per_strategy``,
+    # migration ``72ea2fd4dda2``) rolls back ONLY this INSERT — not the
+    # whole portfolio creation transaction. The loser re-reads and
+    # returns the winning candidate; the helper stays idempotent under
+    # concurrent contention.
     candidate = GraduationCandidate(
         strategy_id=strategy_id,
         stage=_PORTFOLIO_DEFAULT_STAGE,
@@ -687,8 +695,22 @@ async def _get_or_create_default_candidate(
         # equal-weight; promote-to-live gating treats this as "untested".
         metrics={},
     )
-    session.add(candidate)
-    await session.flush()
+    try:
+        async with session.begin_nested():
+            session.add(candidate)
+    except IntegrityError:
+        # The losing concurrent caller. Re-read the winning row.
+        existing = (await session.execute(stmt)).scalar_one_or_none()
+        if existing is None:
+            # Index violated but the row vanished — operator-driven race
+            # (e.g. concurrent delete). Re-raise so the caller sees it.
+            raise
+        log.info(
+            "portfolio_default_candidate_reused_after_conflict",
+            strategy_id=str(strategy_id),
+            candidate_id=str(existing.id),
+        )
+        return existing
     log.info(
         "portfolio_default_candidate_created",
         strategy_id=str(strategy_id),

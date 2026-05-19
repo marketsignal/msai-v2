@@ -20,6 +20,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from msai.models import (
@@ -533,21 +534,67 @@ class PortfolioService:
                         f"merged config this promotion would write. "
                         f"Conflicts: {conflicts}"
                     )
-                self._session.add(
-                    GraduationCandidate(
-                        strategy_id=strategy_id,
-                        stage="live_candidate",
-                        config=target_candidate_config,
-                        # Empty metrics — this candidate was synthesized as
-                        # part of promotion, not graduated through paper
-                        # testing. The promotion path is the Phase 1 stand-in
-                        # for graduation; metrics would come from a real
-                        # graduation pipeline run.
-                        metrics={},
-                        promoted_by=created_by,
-                        promoted_at=promotion_ts,
-                    )
+                # Codex bot iter-10 P1 on PR #73: wrap the insert in a
+                # SAVEPOINT (``session.begin_nested``) so an
+                # ``IntegrityError`` from the partial unique index
+                # ``uq_unlinked_live_candidate_per_strategy`` (migration
+                # ``72ea2fd4dda2``) rolls back ONLY this candidate row,
+                # not the LivePortfolio / LivePortfolioRevision / members
+                # we just persisted above.
+                #
+                # On conflict, a concurrent promotion already inserted a
+                # live_candidate for this strategy. Re-read it and
+                # decide: matching config → reuse silently; non-matching
+                # → surface as ``PortfolioDomainError`` so the operator
+                # sees the same actionable conflict message Fix 7
+                # produces in the non-concurrent path.
+                new_cand = GraduationCandidate(
+                    strategy_id=strategy_id,
+                    stage="live_candidate",
+                    config=target_candidate_config,
+                    # Empty metrics — this candidate was synthesized as
+                    # part of promotion, not graduated through paper
+                    # testing. The promotion path is the Phase 1 stand-in
+                    # for graduation; metrics would come from a real
+                    # graduation pipeline run.
+                    metrics={},
+                    promoted_by=created_by,
+                    promoted_at=promotion_ts,
                 )
+                try:
+                    async with self._session.begin_nested():
+                        self._session.add(new_cand)
+                except IntegrityError:
+                    winner = (
+                        await self._session.execute(
+                            select(GraduationCandidate).where(
+                                GraduationCandidate.strategy_id == strategy_id,
+                                GraduationCandidate.stage == "live_candidate",
+                                GraduationCandidate.deployment_id.is_(None),
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    if winner is None:
+                        # Index violated but the row vanished — re-raise.
+                        raise
+                    winner_cfg = winner.config or {}
+                    winner_instruments = [str(x) for x in winner_cfg.get("instruments", [])]
+                    if _canonical_config_for_binding(
+                        winner_cfg
+                    ) == target_canonical and instruments_match(
+                        winner_instruments, member_instruments
+                    ):
+                        # Concurrent winner has the same config — silently
+                        # reuse; the deploy path will still bind cleanly.
+                        continue
+                    raise PortfolioDomainError(
+                        f"Strategy {strategy_id} has a concurrently-created "
+                        f"unlinked `live_candidate` ({winner.id}) whose config "
+                        "does not match the member being promoted. Either "
+                        "archive the conflicting candidate, retry promotion, "
+                        "or re-graduate under the merged config this promotion "
+                        "would write."
+                    ) from None
         await self._session.flush()
 
         return live_portfolio, revision
