@@ -7,13 +7,14 @@ and combined backtest runs.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID  # noqa: TC003 -- FastAPI resolves path param types at runtime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.responses import FileResponse
 
 if TYPE_CHECKING:
+    from sqlalchemy.engine import CursorResult
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -412,29 +413,62 @@ async def cancel_portfolio_run(
     we set it ``canceled``, it raises ``PortfolioRunTerminalStateError``
     and aborts cleanly.
     """
-    try:
-        run = await PortfolioLifecycle.get_run(db, run_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Portfolio run {run_id} not found",
-        ) from None
+    # Codex bot iter-11 P1 on PR #73: cancel via an atomic conditional
+    # UPDATE that only succeeds from non-terminal states. The previous
+    # read-then-modify-then-commit pattern had a TOCTOU race with the
+    # worker's completion write — whichever transaction commits last
+    # could clobber the other, so a finished run could end up marked
+    # ``canceled`` (or an operator cancel could be lost).
+    #
+    # ``UPDATE ... WHERE status IN ('pending', 'running')`` only fires
+    # when the row is still in a non-terminal state at write time;
+    # rowcount==0 means the worker beat us to a terminal state (or the
+    # row doesn't exist), and we surface that as 404/409 based on a
+    # follow-up read.
+    from sqlalchemy import update as sql_update  # noqa: PLC0415
 
-    current = PortfolioRunStatus(run.status)
-    if current.is_terminal:
+    from msai.models.portfolio_run import PortfolioRun as _PortfolioRunModel  # noqa: PLC0415
+
+    non_terminal_statuses = [
+        PortfolioRunStatus.PENDING.value,
+        PortfolioRunStatus.RUNNING.value,
+    ]
+    result = await db.execute(
+        sql_update(_PortfolioRunModel)
+        .where(
+            _PortfolioRunModel.id == run_id,
+            _PortfolioRunModel.status.in_(non_terminal_statuses),
+        )
+        .values(status=PortfolioRunStatus.CANCELED.value)
+    )
+    # ``session.execute`` on a Core UPDATE statement returns a
+    # ``CursorResult`` at runtime; SQLAlchemy's static type is the
+    # base ``Result[Any]`` which mypy doesn't see ``rowcount`` on.
+    # Cast to surface the attribute.
+    rowcount = int(cast("CursorResult[Any]", result).rowcount or 0)
+    await db.commit()
+
+    if rowcount == 0:
+        # Atomic UPDATE didn't fire — either the row is missing or it's
+        # already terminal. Distinguish via a fresh read so the operator
+        # sees the right HTTP code.
+        try:
+            existing = await PortfolioLifecycle.get_run(db, run_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Portfolio run {run_id} not found",
+            ) from None
+        existing_status = PortfolioRunStatus(existing.status)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Portfolio run {run_id} is {current.value}; cannot cancel",
+            detail=(f"Portfolio run {run_id} is {existing_status.value}; cannot cancel"),
         )
 
-    run.status = PortfolioRunStatus.CANCELED.value
-    await db.commit()
-    await db.refresh(run)
-
+    run = await PortfolioLifecycle.get_run(db, run_id)
     log.info(
         "portfolio_run_canceled",
         run_id=str(run_id),
-        previous_status=current.value,
     )
     return PortfolioRunResponse.model_validate(run)
 

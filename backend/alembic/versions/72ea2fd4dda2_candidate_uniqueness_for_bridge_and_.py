@@ -50,13 +50,21 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
+# Codex bot iter-11 P2 on PR #73: tie-break on ``id`` after ``created_at``
+# so duplicates that share an exact timestamp (e.g., bulk inserts or
+# same-tick server defaults) still get pruned down to exactly ONE row.
+# A strict ``created_at > created_at`` comparison alone would leave both
+# tied rows behind and the unique index creation would still fail.
+# PostgreSQL's row-tuple comparison ``(a.col1, a.col2) > (b.col1, b.col2)``
+# is lexicographic — same created_at falls through to the id comparison,
+# which is a UUID (guaranteed distinct per row).
 _DEDUPE_PORTFOLIO_DEFAULT = """
 DELETE FROM graduation_candidates a
 USING graduation_candidates b
 WHERE a.stage = 'portfolio_default'
   AND b.stage = 'portfolio_default'
   AND a.strategy_id = b.strategy_id
-  AND a.created_at > b.created_at;
+  AND (a.created_at, a.id) > (b.created_at, b.id);
 """
 
 _DEDUPE_UNLINKED_LIVE = """
@@ -67,7 +75,7 @@ WHERE a.stage = 'live_candidate'
   AND a.deployment_id IS NULL
   AND b.deployment_id IS NULL
   AND a.strategy_id = b.strategy_id
-  AND a.created_at > b.created_at;
+  AND (a.created_at, a.id) > (b.created_at, b.id);
 """
 
 

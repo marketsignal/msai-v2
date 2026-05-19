@@ -276,3 +276,53 @@ async def test_cancel_running_portfolio_run_actually_persists_canceled_status(
     # may need to reach into alembic.ini).
     _ = Path
     _ = UUID
+
+
+@pytest.mark.asyncio
+async def test_cancel_is_atomic_against_concurrent_terminal_write(
+    api_client_authed,
+    make_portfolio_run,
+    portfolio_session_factory,
+):
+    """Codex bot iter-11 P1 on PR #73 — cancel must be atomic against
+    concurrent terminal writes.
+
+    Pre-fix flow: get_run → check non-terminal → set status=canceled →
+    commit. The read-then-modify-then-commit pattern raced with the
+    worker's completion write — whichever commits last wins, so a
+    finished run could end up marked ``canceled``, or an operator
+    cancel could be lost.
+
+    With the fix, cancel is a single atomic conditional UPDATE
+    (``WHERE status IN ('pending','running')``). If the worker
+    completed first, rowcount=0 → cancel returns 409 + the row's
+    current terminal state is preserved.
+    """
+    from msai.models.portfolio_run import PortfolioRun
+
+    # Arrange — pre-set the run to ``completed`` BEFORE we cancel. This
+    # simulates the race where the worker's commit lands first. With
+    # the atomic UPDATE, cancel must NOT overwrite the terminal state.
+    run = await make_portfolio_run(status="running")
+    async with portfolio_session_factory() as session:
+        reloaded = await session.get(PortfolioRun, run.id)
+        assert reloaded is not None
+        reloaded.status = "completed"
+        await session.commit()
+
+    # Act
+    response = await api_client_authed.post(
+        f"/api/v1/portfolios/runs/{run.id}/cancel",
+    )
+
+    # Assert — 409 (terminal state preserved); the row's status MUST
+    # still be ``completed``, not ``canceled``.
+    assert response.status_code == 409, response.text
+
+    async with portfolio_session_factory() as session:
+        final = await session.get(PortfolioRun, run.id)
+        assert final is not None
+        assert final.status == "completed", (
+            f"atomic cancel must NOT clobber the worker's terminal "
+            f"write; got status={final.status}"
+        )
