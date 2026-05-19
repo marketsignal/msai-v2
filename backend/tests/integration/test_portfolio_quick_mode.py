@@ -688,3 +688,42 @@ async def test_create_run_inherited_full_mode_too_short_range_raises(
                     # mode omitted -- inherits FULL from portfolio
                 ),
             )
+
+
+@pytest.mark.asyncio
+async def test_api_create_run_inherited_full_mode_too_short_range_returns_422(
+    api_client_authed,
+    make_portfolio_with_strategies: Callable[..., Awaitable[Portfolio]],
+) -> None:
+    """Codex bot iter-3 P2 on PR #73 — when the request body omits ``mode``
+    and the portfolio's ``default_mode`` is FULL with a <90-day range, the
+    API must return 422 with the actionable validation message — NOT 404.
+
+    The pre-fix handler caught every ``ValueError`` from
+    ``PortfolioLifecycle.create_run`` and converted it to
+    ``404 "Portfolio {id} not found"``, which was both misleading (the
+    portfolio exists) and unactionable (the user has no idea the 90-day
+    rule is what's failing).
+    """
+    # Arrange — portfolio whose default_mode is FULL.
+    portfolio = await make_portfolio_with_strategies(n=1, default_mode=BacktestMode.FULL)
+
+    # Act — submit a run without ``mode`` (inherits FULL) over a 30-day
+    # range, below the 90-day minimum.
+    response = await api_client_authed.post(
+        f"/api/v1/portfolios/{portfolio.id}/runs",
+        json={
+            "portfolio_id": str(portfolio.id),
+            "start_date": "2024-01-01",
+            "end_date": "2024-01-30",
+            # mode intentionally omitted
+        },
+    )
+
+    # Assert — 422 with the validation message; not a misleading 404.
+    assert response.status_code == 422, response.text
+    body = response.json()
+    detail = body.get("detail", "")
+    detail_str = detail if isinstance(detail, str) else str(detail)
+    assert "Full mode" in detail_str
+    assert "90 days" in detail_str

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -39,11 +40,26 @@ from msai.services.live.revision_service import (
     PortfolioDomainError,
     RevisionImmutableError,
 )
+from msai.services.live.snapshot_binding import (
+    instruments_match,
+    strip_for_comparison,
+)
 
 if TYPE_CHECKING:
     from uuid import UUID
 
     from sqlalchemy.ext.asyncio import AsyncSession
+
+
+def _canonical_config_for_binding(config: dict[str, Any]) -> str:
+    """Canonical JSON of ``strip_for_comparison(config)`` — same shape
+    ``verify_member_matches_candidate`` uses to compare member.config
+    against candidate.config. Wrapping it here keeps the equality logic
+    in one place: the live_candidate we synthesize during promotion is
+    only considered "matching" when this canonical form is identical to
+    the member's, so the downstream binding check is guaranteed to pass.
+    """
+    return json.dumps(strip_for_comparison(config), sort_keys=True, separators=(",", ":"))
 
 
 class StrategyNotGraduatedError(PortfolioDomainError):
@@ -313,10 +329,31 @@ class PortfolioService:
 
             default_config = dict(strategy.default_config or {})
             candidate_config = dict(candidate.config or {})
+
+            # Codex bot iter-3 P1 on PR #73: ``best_config`` from a Full-mode
+            # run contains the optimizer's PORTFOLIO-level params
+            # (``leverage``, ``position_size`` — see
+            # ``services/portfolio_backtest/optimizer.py::build_search_space``).
+            # Those are not part of each strategy's ``default_config`` and
+            # must NOT leak into per-strategy member configs — if they did,
+            # the downstream ``verify_member_matches_candidate`` (which
+            # compares strict-equality on ``strip_for_comparison(config)``)
+            # would reject the binding with ``BINDING_MISMATCH``.
+            #
+            # Filter ``best_config`` to keys the strategy already knows about
+            # (i.e., that appear in ``default_config``). This lets per-strategy
+            # tunables — which would by convention be added to a strategy's
+            # ``default_config`` — flow through, while keeping pure portfolio
+            # risk controls (``leverage`` / ``position_size``) at the
+            # portfolio layer where they belong.
+            strategy_param_keys = set(default_config.keys())
+            best_config_for_member = {
+                k: v for k, v in best_config.items() if k in strategy_param_keys
+            }
             merged_config: dict[str, Any] = {
                 **default_config,
                 **candidate_config,
-                **best_config,
+                **best_config_for_member,
             }
 
             instruments_raw = (
@@ -367,6 +404,88 @@ class PortfolioService:
                     order_index=row["order_index"],
                 )
             )
+        await self._session.flush()
+
+        # Codex bot iter-3 P1 on PR #73: ensure each promoted member has a
+        # deployable ``GraduationCandidate`` at ``stage="live_candidate"``
+        # so the downstream ``/api/v1/live/start-portfolio`` first-deploy
+        # binding lookup succeeds.
+        #
+        # WHY: ``materialize_from_backtest`` intentionally bypasses
+        # ``add_strategy``'s ``ELIGIBLE_FOR_LIVE_PORTFOLIO`` check
+        # (default-portfolio candidates created by the F1c bridge sit at
+        # ``portfolio_default``, paper-test candidates at ``paper_candidate``
+        # — neither is in ``ELIGIBLE_FOR_LIVE_PORTFOLIO``). Promote-to-live
+        # IS the Phase 1 stand-in for the graduation path, so it must also
+        # MATERIALIZE the live-eligible candidate row rather than just
+        # bypassing the check at compose time. Without this step, every
+        # promoted revision would 422 with ``BINDING_NOT_GRADUATED`` on
+        # the very first ``start-portfolio`` attempt.
+        #
+        # HOW: For each member, look for an existing unlinked
+        # ``live_candidate`` (``deployment_id IS NULL``) whose config and
+        # instruments match the frozen member. If one matches, reuse it
+        # (avoids manufacturing duplicates when an operator pre-graduated
+        # the strategy through the canonical pipeline). Otherwise create
+        # a fresh ``live_candidate`` mirroring the member exactly, with
+        # ``instruments`` stamped into ``config`` so
+        # ``candidate_instruments(candidate)`` and
+        # ``verify_member_matches_candidate(member, candidate)`` both
+        # succeed on the first deploy attempt.
+        promotion_ts = datetime.now(UTC)
+        for row in member_rows:
+            strategy_id = row["strategy_id"]
+            member_config: dict[str, Any] = row["config"]
+            member_instruments: list[str] = row["instruments"]
+
+            # The candidate's config must include ``instruments`` (that's
+            # the contract ``candidate_instruments(candidate)`` reads).
+            target_candidate_config: dict[str, Any] = {
+                **member_config,
+                "instruments": list(member_instruments),
+            }
+            target_canonical = _canonical_config_for_binding(target_candidate_config)
+
+            unlinked_live = list(
+                (
+                    await self._session.execute(
+                        select(GraduationCandidate).where(
+                            GraduationCandidate.strategy_id == strategy_id,
+                            GraduationCandidate.stage == "live_candidate",
+                            GraduationCandidate.deployment_id.is_(None),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+            reuse_match: GraduationCandidate | None = None
+            for existing in unlinked_live:
+                existing_cfg = existing.config or {}
+                existing_instruments = [str(x) for x in existing_cfg.get("instruments", [])]
+                if _canonical_config_for_binding(existing_cfg) == target_canonical and (
+                    instruments_match(existing_instruments, member_instruments)
+                ):
+                    reuse_match = existing
+                    break
+
+            if reuse_match is None:
+                self._session.add(
+                    GraduationCandidate(
+                        strategy_id=strategy_id,
+                        stage="live_candidate",
+                        config=target_candidate_config,
+                        # Empty metrics — this candidate was synthesized as
+                        # part of promotion, not graduated through paper
+                        # testing. The promotion path is the Phase 1 stand-in
+                        # for graduation; metrics would come from a real
+                        # graduation pipeline run.
+                        metrics={},
+                        promoted_by=created_by,
+                        promoted_at=promotion_ts,
+                    )
+                )
         await self._session.flush()
 
         return live_portfolio, revision

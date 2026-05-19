@@ -305,11 +305,18 @@ async def create_portfolio_run(
 
     try:
         run = await _service.create_run(db, portfolio_id, body, user_id=user_id)
-    except ValueError:
+    except ValueError as exc:
+        # Portfolio existence was already verified above (line ~284). Any
+        # ValueError raised by ``create_run`` at this point is a validation
+        # failure (e.g. the 90-day minimum when ``mode=full`` is inherited
+        # from ``portfolio.default_mode``), not a missing-row error. Surface
+        # the actionable message at 422 so the UI/CLI tells the user how to
+        # fix the request rather than misleadingly claiming the portfolio
+        # doesn't exist. Codex bot iter-3 P2 on PR #73.
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Portfolio {portfolio_id} not found",
-        ) from None
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
 
     # Enqueue to arq BEFORE commit -- if enqueue fails, rollback the row
     try:

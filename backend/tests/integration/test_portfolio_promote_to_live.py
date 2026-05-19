@@ -86,27 +86,33 @@ async def test_promote_with_non_paper_account_returns_422(
 
 
 @pytest.mark.asyncio
-async def test_promote_full_mode_run_materializes_best_config(
+async def test_promote_full_mode_filters_portfolio_level_optimizer_params(
     api_client_authed,
     make_portfolio_run,
     portfolio_session_factory,
 ):
-    """Full-mode promotion merges ``best_config`` into the live revision.
+    """Codex bot iter-3 P1 on PR #73 — Full-mode promotion must NOT merge
+    portfolio-level optimizer search-space params (``leverage``,
+    ``position_size``) into per-strategy member configs.
 
-    Reviewers (Phase 5.1) flagged that the optimizer's winning params were
-    not being verified against the materialized live revision. This test
-    creates a completed Full-mode run with a concrete ``best_config``, calls
-    promote-to-live, and asserts the new
-    :class:`LivePortfolioRevisionStrategy` carries those keys in its
-    ``config`` dict.
+    These keys are PORTFOLIO-level risk controls — see
+    ``services/portfolio_backtest/optimizer.py::build_search_space``. They
+    are not part of any individual strategy's ``default_config``. If they
+    leaked into ``LivePortfolioRevisionStrategy.config``, the downstream
+    ``verify_member_matches_candidate`` would reject the first deploy with
+    ``BINDING_MISMATCH`` (the synthesized ``live_candidate``'s config is
+    seeded from the member, so the mismatch surfaces against any pre-
+    existing graduation-pipeline candidate the operator might have).
     """
     from sqlalchemy import select
 
     from msai.models import LivePortfolioRevisionStrategy
     from msai.models.portfolio_enums import BacktestMode
 
-    # Arrange — Full-mode run with a best_config that should flow into the
-    # live revision's per-strategy config dict.
+    # Arrange — Full-mode run carrying the optimizer's winning portfolio-
+    # level params. The fixture's strategies have
+    # ``default_config = {"instruments": ["AAPL"], "asset_class": "stocks"}``
+    # so neither key is a strategy param.
     best_config = {"leverage": 1.5, "position_size": 0.2}
     run = await make_portfolio_run(
         status="completed",
@@ -124,7 +130,8 @@ async def test_promote_full_mode_run_materializes_best_config(
         json={"account_id": "DUTEST123"},
     )
 
-    # Assert — 201 + the live revision's members carry the best_config keys.
+    # Assert — 201 + the live revision's members do NOT carry the
+    # portfolio-level keys.
     assert response.status_code == 201, response.text
     body = response.json()
     revision_id = body["live_portfolio_revision_id"]
@@ -144,8 +151,218 @@ async def test_promote_full_mode_run_materializes_best_config(
         assert members, "promote-to-live must materialize at least one member"
         for member in members:
             cfg = dict(member.config or {})
-            assert cfg.get("leverage") == 1.5, cfg
-            assert cfg.get("position_size") == 0.2, cfg
+            assert "leverage" not in cfg, (
+                f"portfolio-level ``leverage`` must not leak into member config: {cfg}"
+            )
+            assert "position_size" not in cfg, (
+                f"portfolio-level ``position_size`` must not leak into member config: {cfg}"
+            )
+
+
+@pytest.mark.asyncio
+async def test_promote_full_mode_flows_strategy_level_tunables_through(
+    api_client_authed,
+    portfolio_session_factory,
+    _seed_user,
+):
+    """Companion to the filter test — strategy-level best_config keys that
+    appear in the strategy's ``default_config`` MUST flow through to member
+    configs. This proves Fix 2 is a filter, not a blanket drop.
+    """
+    from datetime import UTC, date, datetime
+    from decimal import Decimal
+    from uuid import uuid4
+
+    from sqlalchemy import select
+
+    from msai.models import LivePortfolioRevisionStrategy
+    from msai.models.graduation_candidate import GraduationCandidate
+    from msai.models.portfolio import Portfolio
+    from msai.models.portfolio_allocation import PortfolioAllocation
+    from msai.models.portfolio_enums import BacktestMode
+    from msai.models.portfolio_run import PortfolioRun
+    from msai.models.strategy import Strategy
+
+    user_id = _seed_user.id
+
+    # Arrange — strategy whose default_config includes a tunable param
+    # (fast_period) that the optimizer would search over.
+    async with portfolio_session_factory() as session:
+        strategy = Strategy(
+            id=uuid4(),
+            name=f"tunable-{uuid4().hex[:6]}",
+            file_path="strategies/example/ema_cross.py",
+            strategy_class="EMACrossStrategy",
+            default_config={
+                "instruments": ["AAPL"],
+                "asset_class": "stocks",
+                "fast_period": 10,  # strategy-level tunable
+            },
+            created_by=user_id,
+        )
+        session.add(strategy)
+        await session.flush()
+
+        candidate = GraduationCandidate(
+            id=uuid4(),
+            strategy_id=strategy.id,
+            stage="paper_candidate",
+            config={"instruments": ["AAPL"]},
+            metrics={"sharpe": 1.0},
+        )
+        session.add(candidate)
+        await session.flush()
+
+        portfolio = Portfolio(
+            id=uuid4(),
+            name=f"tunable-{uuid4().hex[:8]}",
+            objective="maximize_sharpe",
+            base_capital=100_000.0,
+            requested_leverage=1.0,
+            created_by=user_id,
+        )
+        session.add(portfolio)
+        await session.flush()
+        session.add(
+            PortfolioAllocation(
+                portfolio_id=portfolio.id,
+                candidate_id=candidate.id,
+                weight=Decimal("1.0"),
+            )
+        )
+
+        # best_config carries both a strategy-level tunable AND
+        # portfolio-level params. Only the strategy-level one should land
+        # in the member config.
+        run = PortfolioRun(
+            id=uuid4(),
+            portfolio_id=portfolio.id,
+            status="completed",
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 6, 30),
+            mode=BacktestMode.FULL,
+            metrics={
+                "is_metric": 1.4,
+                "oos_metric": 1.1,
+                "best_config": {
+                    "fast_period": 25,  # strategy-level — should flow through
+                    "leverage": 2.0,  # portfolio-level — should be filtered
+                },
+            },
+            completed_at=datetime.now(UTC),
+        )
+        session.add(run)
+        await session.commit()
+        run_id = run.id
+
+    # Act
+    response = await api_client_authed.post(
+        f"/api/v1/portfolios/runs/{run_id}/promote-to-live",
+        json={"account_id": "DUTEST123"},
+    )
+
+    # Assert
+    assert response.status_code == 201, response.text
+    body = response.json()
+    revision_id = body["live_portfolio_revision_id"]
+
+    async with portfolio_session_factory() as session:
+        members = (
+            (
+                await session.execute(
+                    select(LivePortfolioRevisionStrategy).where(
+                        LivePortfolioRevisionStrategy.revision_id == revision_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(members) == 1
+        cfg = dict(members[0].config or {})
+        assert cfg.get("fast_period") == 25, (
+            f"strategy-level tunable must flow through from best_config: {cfg}"
+        )
+        assert "leverage" not in cfg, f"portfolio-level params must still be filtered: {cfg}"
+
+
+@pytest.mark.asyncio
+async def test_promote_creates_live_candidate_per_member_for_first_deploy(
+    api_client_authed,
+    make_completed_portfolio_run,
+    portfolio_session_factory,
+):
+    """Codex bot iter-3 P1 on PR #73 — promote-to-live MUST materialize a
+    deployable ``live_candidate`` GraduationCandidate for each member.
+
+    Without it, the next ``POST /api/v1/live/start-portfolio`` would hit
+    ``BINDING_NOT_GRADUATED`` because the start path's first-deploy
+    lookup filters by ``stage == "live_candidate" AND deployment_id IS NULL``.
+    The pre-fix promote path only created the revision; the bridge
+    candidates sat at ``portfolio_default`` and were invisible to start.
+    """
+    from sqlalchemy import select
+
+    from msai.models import LivePortfolioRevisionStrategy
+    from msai.models.graduation_candidate import GraduationCandidate
+
+    # Arrange
+    run = await make_completed_portfolio_run()
+
+    # Act
+    response = await api_client_authed.post(
+        f"/api/v1/portfolios/runs/{run.id}/promote-to-live",
+        json={"account_id": "DUTEST123"},
+    )
+
+    # Assert — 201 plus a live_candidate per member ready for start-portfolio.
+    assert response.status_code == 201, response.text
+    body = response.json()
+    revision_id = body["live_portfolio_revision_id"]
+
+    async with portfolio_session_factory() as session:
+        members = list(
+            (
+                await session.execute(
+                    select(LivePortfolioRevisionStrategy).where(
+                        LivePortfolioRevisionStrategy.revision_id == revision_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert members, "promotion must materialize at least one member"
+
+        for member in members:
+            unlinked_live = list(
+                (
+                    await session.execute(
+                        select(GraduationCandidate).where(
+                            GraduationCandidate.strategy_id == member.strategy_id,
+                            GraduationCandidate.stage == "live_candidate",
+                            GraduationCandidate.deployment_id.is_(None),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(unlinked_live) == 1, (
+                f"expected exactly one unlinked live_candidate for strategy "
+                f"{member.strategy_id}; got {len(unlinked_live)}"
+            )
+            cand = unlinked_live[0]
+            # Candidate config must include ``instruments`` so
+            # ``candidate_instruments(candidate)`` succeeds at start time.
+            assert "instruments" in (cand.config or {}), cand.config
+            # And the candidate's instruments + non-instruments config must
+            # match the frozen member exactly so
+            # ``verify_member_matches_candidate`` will pass.
+            assert set(cand.config.get("instruments", [])) == set(member.instruments), (
+                f"candidate instruments {cand.config.get('instruments')} "
+                f"must match member instruments {member.instruments}"
+            )
 
 
 @pytest.mark.asyncio
