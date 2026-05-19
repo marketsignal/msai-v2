@@ -30,6 +30,9 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
+from sqlalchemy import cast, func, update
+from sqlalchemy.dialects.postgresql import JSONB
+
 from msai.core.config import settings
 from msai.core.database import async_session_factory
 from msai.core.logging import get_logger
@@ -81,26 +84,50 @@ async def _portfolio_progress_callback(
     refreshes ``heartbeat_at``. The UI polls these fields to render a
     progress bar without waiting for the run to land in a terminal state.
 
-    Codex bot iter-7 P2 on PR #73: a late progress write that landed
-    AFTER ``_run_full_mode``'s completion commit could clobber the
-    final ``metrics`` (best_config + IS/OOS scores) with stale progress
-    fields because the callback's session captured the pre-completion
-    metrics snapshot. Skip terminal rows entirely so the completion
-    write is the durable last word for that run.
+    Codex bot iter-9 P2 on PR #73: progress writes must NOT clobber
+    completion metrics (best_config / IS / OOS). The previous
+    "session.get + modify metrics dict + session.commit" approach
+    captured the pre-completion metrics snapshot and overwrote terminal
+    metrics on commit even with the iter-7 terminal-status early
+    return — that guard only catches the case where the read sees the
+    terminal status, not the race where the read precedes the
+    completion commit AND the progress commit follows it.
+    Two-layered fix:
+
+    1. **Terminal-row early return** — defense in depth for late
+       progress writes that fire AFTER completion already landed. The
+       row's status is the cheapest signal of "stop, the run is done."
+    2. **JSONB merge UPDATE** — the actual write is now a single
+       PostgreSQL atomic UPDATE that uses ``metrics || {...}`` to
+       MERGE the progress keys into whatever is currently in the row,
+       instead of replacing the whole ``metrics`` JSONB blob. So
+       progress writes and completion writes are commutative at the
+       row level: progress before completion → completion replaces;
+       completion before progress → progress merges its keys onto
+       terminal metrics (terminal-row return catches that path before
+       any merge).
     """
     run = await session.get(PortfolioRun, run_id)
     if run is None:
         return
     if PortfolioRunStatus(run.status).is_terminal:
-        # Don't mutate completed/failed/canceled rows — the terminal write
-        # already persisted the final metrics and we would overwrite them
-        # with our stale snapshot.
         return
-    run.heartbeat_at = datetime.now(UTC)
-    metrics = dict(run.metrics or {})
-    metrics["progress"] = int(pct)
-    metrics["progress_message"] = msg
-    run.metrics = metrics
+
+    # Atomic JSONB merge: ``metrics = COALESCE(metrics, '{}'::jsonb) || {progress, ...}::jsonb``.
+    # PostgreSQL's ``||`` operator concatenates JSONB objects, with the right
+    # side winning on key collision. So this preserves any keys that landed
+    # between our session.get above and the UPDATE here — e.g., if Phase 3
+    # commits ``best_config`` mid-flight, it will not be wiped by this write.
+    await session.execute(
+        update(PortfolioRun)
+        .where(PortfolioRun.id == run_id)
+        .values(
+            metrics=func.coalesce(PortfolioRun.metrics, cast({}, JSONB)).op("||")(
+                cast({"progress": int(pct), "progress_message": msg}, JSONB)
+            ),
+            heartbeat_at=datetime.now(UTC),
+        )
+    )
     await session.commit()
 
 

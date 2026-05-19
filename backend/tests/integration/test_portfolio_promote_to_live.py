@@ -782,3 +782,78 @@ async def test_promote_normalizes_explicit_weights_to_sum_to_one(
             f"explicit weights must be normalized to sum to 1.0; got {weights}"
         )
         assert sum(weights) == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+async def test_progress_callback_jsonb_merge_preserves_best_config(
+    portfolio_session_factory,
+    _seed_user,
+) -> None:
+    """Codex bot iter-9 P2 on PR #73 — the progress writer's JSONB merge
+    UPDATE must preserve any keys (e.g., ``best_config``) that the
+    completion write landed between the progress coroutine's
+    ``session.get`` and its UPDATE. Without the merge, the prior
+    "set metrics = {...}" pattern overwrote them.
+
+    Real-DB integration test: the semantic guarantee is at the SQL
+    layer (PostgreSQL's ``metrics || {...}::jsonb`` operator).
+    """
+    from datetime import UTC, date, datetime
+    from uuid import uuid4
+
+    from msai.models.portfolio import Portfolio
+    from msai.models.portfolio_enums import BacktestMode, PortfolioRunStatus
+    from msai.models.portfolio_run import PortfolioRun
+    from msai.workers.portfolio_job import _portfolio_progress_callback
+
+    # Arrange — seed a running portfolio run that already carries the
+    # terminal-shape metrics dict, mimicking the race where Phase 3's
+    # completion commit lands BEFORE the progress UPDATE runs.
+    async with portfolio_session_factory() as session:
+        portfolio = Portfolio(
+            id=uuid4(),
+            name=f"jsonb-merge-{uuid4().hex[:8]}",
+            objective="maximize_sharpe",
+            base_capital=100_000.0,
+            requested_leverage=1.0,
+            created_by=_seed_user.id,
+        )
+        session.add(portfolio)
+        await session.flush()
+
+        run = PortfolioRun(
+            id=uuid4(),
+            portfolio_id=portfolio.id,
+            status=PortfolioRunStatus.RUNNING.value,
+            start_date=date(2024, 1, 1),
+            end_date=date(2024, 6, 30),
+            mode=BacktestMode.FULL,
+            metrics={
+                "best_config": {"leverage": 1.5},
+                "is_metric": 1.2,
+                "oos_metric": 1.1,
+            },
+            heartbeat_at=datetime.now(UTC),
+        )
+        session.add(run)
+        await session.commit()
+        run_id = run.id
+
+    # Act — call the progress callback. It must MERGE its progress
+    # keys onto the existing metrics dict, not replace it.
+    async with portfolio_session_factory() as session:
+        await _portfolio_progress_callback(session, run_id, 50, "halfway")
+
+    # Assert — both the pre-existing keys AND the new progress keys are
+    # present after the JSONB merge.
+    async with portfolio_session_factory() as session:
+        reloaded = await session.get(PortfolioRun, run_id)
+        assert reloaded is not None
+        merged = reloaded.metrics or {}
+        # Load-bearing assertion: pre-existing keys preserved.
+        assert merged.get("best_config") == {"leverage": 1.5}, merged
+        assert merged.get("is_metric") == 1.2, merged
+        assert merged.get("oos_metric") == 1.1, merged
+        # New keys merged on top.
+        assert merged.get("progress") == 50, merged
+        assert merged.get("progress_message") == "halfway", merged

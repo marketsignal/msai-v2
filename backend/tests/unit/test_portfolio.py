@@ -166,8 +166,15 @@ class TestCreatePortfolio:
     ) -> None:
         """create returns a portfolio and creates allocation rows."""
 
-        # Arrange: session.get returns a mock candidate for validation
-        mock_db.get.return_value = MagicMock()
+        # Arrange: session.get returns a candidate mock with a unique
+        # strategy_id per call so the iter-9 P1 duplicate-strategy check
+        # does not collapse the two allocations onto one strategy id.
+        def _make_candidate(*_: object, **__: object) -> MagicMock:
+            cand = MagicMock()
+            cand.strategy_id = uuid4()
+            return cand
+
+        mock_db.get.side_effect = _make_candidate
 
         # Arrange: flush assigns an id
         async def _flush() -> None:
@@ -200,7 +207,13 @@ class TestCreatePortfolio:
         self, service: PortfolioService, mock_db: AsyncMock
     ) -> None:
         """create sets created_by when user_id is provided."""
-        mock_db.get.return_value = MagicMock()
+
+        def _make_candidate(*_: object, **__: object) -> MagicMock:
+            cand = MagicMock()
+            cand.strategy_id = uuid4()
+            return cand
+
+        mock_db.get.side_effect = _make_candidate
 
         async def _flush() -> None:
             for call_args in mock_db.add.call_args_list:

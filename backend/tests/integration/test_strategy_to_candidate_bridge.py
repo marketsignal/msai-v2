@@ -288,3 +288,66 @@ async def test_bridge_raises_when_strategy_default_config_has_no_instrument(
         f"Bridge must fail compose when strategy default_config lacks instrument shape, "
         f"got {r.status_code}: {r.text}"
     )
+
+
+@pytest.mark.asyncio
+async def test_create_portfolio_rejects_duplicate_strategy_in_allocations(
+    api_client_authed: httpx.AsyncClient,
+    make_strategy: Callable[..., Awaitable[Strategy]],
+    portfolio_session_factory: Any,
+) -> None:
+    """Codex bot iter-9 P1 on PR #73 — when two allocations point at
+    DIFFERENT candidates of the SAME strategy, ``create_portfolio`` must
+    reject the composition. Full-mode optimization's ``returns_cache``
+    keys by strategy_id, so duplicate strategy_ids collapse the cache
+    and silently corrupt IS/OOS scores. Surface the conflict at compose
+    time instead.
+    """
+    from uuid import uuid4
+
+    from msai.models.graduation_candidate import GraduationCandidate
+
+    # Arrange — one strategy + two distinct candidates of it.
+    strategy = await make_strategy(
+        name="dup-strategy",
+        default_config={"instruments": ["AAPL"], "asset_class": "stocks"},
+    )
+
+    async with portfolio_session_factory() as session:
+        cand_a = GraduationCandidate(
+            id=uuid4(),
+            strategy_id=strategy.id,
+            stage="paper_candidate",
+            config={"instruments": ["AAPL"], "variant": "A"},
+            metrics={"sharpe": 1.0},
+        )
+        cand_b = GraduationCandidate(
+            id=uuid4(),
+            strategy_id=strategy.id,
+            stage="paper_candidate",
+            config={"instruments": ["AAPL"], "variant": "B"},
+            metrics={"sharpe": 1.2},
+        )
+        session.add_all([cand_a, cand_b])
+        await session.commit()
+        cand_a_id = cand_a.id
+        cand_b_id = cand_b.id
+
+    # Act — compose with both candidates of the same strategy.
+    response = await api_client_authed.post(
+        "/api/v1/portfolios",
+        json={
+            "name": f"dup-{uuid4().hex[:8]}",
+            "objective": "maximize_sharpe",
+            "base_capital": 100_000.0,
+            "default_mode": "quick",
+            "allocations": [
+                {"candidate_id": str(cand_a_id), "weight": 0.5},
+                {"candidate_id": str(cand_b_id), "weight": 0.5},
+            ],
+        },
+    )
+
+    # Assert — rejected (NOT 201). The error must name the duplicate strategy.
+    assert response.status_code != 201, response.text
+    assert "Duplicate strategy" in response.text or "duplicate" in response.text.lower()

@@ -160,6 +160,28 @@ class PortfolioLifecycle:
             if candidate_row is None:
                 raise ValueError(f"Graduation candidate {alloc.candidate_id} not found")
 
+        # Codex bot iter-9 P1 on PR #73: reject duplicate ``strategy_id``
+        # across allocations, mirroring the strategy_ids-compose path's
+        # check. Full-mode optimization's ``returns_cache`` keys by
+        # strategy_id (see ``_run_full_mode``), so two allocations
+        # pointing at different candidates of the SAME strategy would
+        # collapse — later entries overwrite earlier ones, dropping one
+        # member's returns and silently corrupting IS/OOS scores +
+        # best_config. Surface the duplicate at compose time so the
+        # optimizer never sees an ill-formed composition.
+        seen_strategy_ids_alloc: set[UUID] = set()
+        for alloc in data.allocations:
+            candidate_row = await session.get(GraduationCandidate, alloc.candidate_id)
+            assert candidate_row is not None  # noqa: S101 — checked above
+            if candidate_row.strategy_id in seen_strategy_ids_alloc:
+                raise ValueError(
+                    f"Duplicate strategy {candidate_row.strategy_id} across allocations "
+                    f"(via candidate {alloc.candidate_id}); a strategy may only appear "
+                    "ONCE per portfolio so Full-mode optimization's per-strategy "
+                    "returns_cache doesn't collapse distinct allocations."
+                )
+            seen_strategy_ids_alloc.add(candidate_row.strategy_id)
+
         for alloc in data.allocations:
             session.add(
                 PortfolioAllocation(
