@@ -53,7 +53,20 @@ function normalizeTrials(
   if (!raw) return [];
   return raw.map((row, i) => {
     const rawWindow = row.window_index ?? row.window;
-    const rawScore = row.score ?? row.objective_value ?? row.value;
+    // The Full-mode optimizer emits ``is_score`` (Optuna's objective —
+    // in-sample) and ``oos_score`` (out-of-sample held-out validation)
+    // per trial. Earlier reviewers only looked for ``score`` /
+    // ``objective_value`` / ``value`` so every trial collapsed to "—".
+    // Codex bot iter-4 P2 on PR #73. Prefer ``is_score`` because the
+    // table's primary ranking is "which trial Optuna picked," with
+    // ``oos_score`` falling back when only OOS was emitted. Legacy
+    // keys remain in the chain for back-compat with older traces.
+    const rawScore =
+      row.is_score ??
+      row.oos_score ??
+      row.score ??
+      row.objective_value ??
+      row.value;
     const rawParams = row.params;
     return {
       index: i,

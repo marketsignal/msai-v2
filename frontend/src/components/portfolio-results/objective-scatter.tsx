@@ -45,7 +45,18 @@ function normalizePoints(
   if (!raw) return [];
   const out: ScatterPoint[] = [];
   raw.forEach((row, i) => {
-    const score = row.score ?? row.objective_value ?? row.value;
+    // The Full-mode optimizer emits ``is_score`` (what Optuna actually
+    // optimizes against — IS == in-sample) and ``oos_score`` (out-of-sample
+    // held-out validation) per trial. Earlier reviewers only looked for
+    // ``score`` / ``objective_value`` / ``value`` so every Full-mode trace
+    // row collapsed to "no score recorded" and the chart rendered empty.
+    // Codex bot iter-4 P2 on PR #73.
+    //
+    // Prefer ``is_score`` because that's the Optuna-visible signal driving
+    // convergence — the scatter's whole point is to show whether Optuna
+    // converged. Fall back through legacy keys for back-compat with any
+    // pre-iter-4 traces that may already be persisted on disk.
+    const score = row.is_score ?? row.score ?? row.objective_value ?? row.value;
     if (typeof score === "number" && Number.isFinite(score)) {
       out.push({ index: i, score });
     }

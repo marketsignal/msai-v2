@@ -340,6 +340,14 @@ class PortfolioService:
             )
             benchmark_symbol = portfolio.benchmark_symbol
             base_capital = float(portfolio.base_capital)
+            # Codex bot iter-4 P2 on PR #73: capture the user's allocator
+            # choice for the post-backtest reweight branch below. Quick
+            # mode previously relied solely on objective-driven heuristic
+            # weights, which silently collapsed ``inverse_vol`` /
+            # ``vol_targeted`` selections to equal-weight (the bridge
+            # leaves ``allocation.weight=None`` with empty candidate
+            # metrics). Honor the persisted choice using realized returns.
+            allocator_name = portfolio.allocator_name or "equal_weight"
 
         # ---- Phase 2: run the backtests (no DB session held) ----
         # Caller-supplied ``max_workers`` is the reserved slot count and
@@ -400,6 +408,52 @@ class PortfolioService:
             )
             for item in strategy_results
         ]
+
+        # Codex bot iter-4 P2 on PR #73: honor ``portfolio.allocator_name``
+        # for the data-driven allocators (``inverse_vol`` / ``vol_targeted``).
+        # Quick mode previously dropped this choice on the floor; the
+        # objective-driven heuristic flow at ``_resolve_allocations`` time
+        # collapsed to equal-weight whenever candidate metrics were empty
+        # (the F1c bridge case). Now that the per-strategy backtests have
+        # produced realized returns, recompute weights via the allocator.
+        # ``equal_weight`` is the heuristic default (no override needed);
+        # ``fixed_weight`` is operator-specified per allocation and already
+        # flowed through verbatim in ``_resolve_allocations``.
+        if allocator_name in ("inverse_vol", "vol_targeted") and weighted_series:
+            from msai.services.portfolio_backtest.allocators import (  # noqa: PLC0415
+                ALLOCATORS,
+            )
+
+            candidate_ids = [cid for cid, _, _ in weighted_series]
+            returns_df = pd.DataFrame({cid: series for cid, _, series in weighted_series}).fillna(
+                0.0
+            )
+            try:
+                new_weights = ALLOCATORS[allocator_name]().compute(candidate_ids, returns_df)
+                weighted_series = [
+                    (cid, new_weights[cid], series) for cid, _, series in weighted_series
+                ]
+                # Sync the new weights back into ``strategy_results`` so the
+                # persisted ``PortfolioRun.allocations`` payload (and the
+                # results-page enrichment built from it) reflects the
+                # weights the allocator actually used. Without this sync
+                # the UI shows the pre-allocator heuristic weights even
+                # though the portfolio metrics were computed from the
+                # allocator's output — silently divergent display.
+                for item in strategy_results:
+                    cid = str(item["candidate_id"])
+                    if cid in new_weights:
+                        item["weight"] = float(new_weights[cid])
+            except (TypeError, ValueError) as exc:
+                # Allocator preconditions not met for these realized returns
+                # (e.g. every strategy zero-vol). Keep the heuristic weights
+                # so the run still produces a portfolio metric — log so the
+                # operator can see the fallback in audit.
+                log.warning(
+                    "quick_mode_allocator_fallback",
+                    allocator=allocator_name,
+                    reason=str(exc),
+                )
 
         # Local variable kept distinct from the imported ``effective_leverage``
         # function to avoid shadowing — the function is used in tests / future

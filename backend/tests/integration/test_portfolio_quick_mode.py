@@ -727,3 +727,117 @@ async def test_api_create_run_inherited_full_mode_too_short_range_returns_422(
     detail_str = detail if isinstance(detail, str) else str(detail)
     assert "Full mode" in detail_str
     assert "90 days" in detail_str
+
+
+@pytest.mark.asyncio
+async def test_quick_mode_honors_inverse_vol_allocator_choice(
+    monkeypatch: pytest.MonkeyPatch,
+    portfolio_session_factory: async_sessionmaker[AsyncSession],
+    make_portfolio_with_strategies: Callable[..., Awaitable[Portfolio]],
+    tmp_path: Any,
+) -> None:
+    """Codex bot iter-4 P2 on PR #73 — Quick mode must honor
+    ``portfolio.allocator_name`` (``inverse_vol`` / ``vol_targeted``).
+
+    Previously, the objective-driven heuristic flow collapsed to
+    equal-weight whenever candidate metrics were empty (the F1c-bridge
+    case), so the operator's allocator selection was silently dropped.
+    With the fix, the realized per-strategy returns drive the allocator
+    after the per-strategy backtests complete and the saved member
+    weights reflect the inverse-vol choice.
+    """
+    from msai.services.portfolio import PortfolioService
+
+    # Arrange — portfolio with allocator_name=inverse_vol and 2 strategies.
+    portfolio = await make_portfolio_with_strategies(n=2, allocator_name="inverse_vol")
+    run = await _create_run(portfolio_session_factory, portfolio.id, BacktestMode.QUICK)
+
+    # Replace _execute_candidate_backtests with a canned shim that emits
+    # distinct return profiles per candidate: strategy 0 is low-vol
+    # (constant +0.01), strategy 1 is high-vol (oscillating ±0.05). The
+    # inverse_vol allocator should put MORE weight on the low-vol strategy
+    # — that's the definitional behavior.
+    timestamps_iso = [
+        t.isoformat() for t in pd.date_range("2024-01-02", periods=10, freq="D", tz="UTC")
+    ]
+    # Strategy 0 = low vol (mostly stable +0.01); strategy 1 = high vol
+    # (oscillating ±0.05). inverse_vol must weight strategy 0 higher.
+    low_vol_returns = [0.011, 0.009, 0.010, 0.011, 0.009, 0.010, 0.011, 0.009, 0.010, 0.011]
+    high_vol_returns = [0.05, -0.05, 0.05, -0.05, 0.05, -0.05, 0.05, -0.05, 0.05, -0.05]
+
+    async def _fake_execute_candidate_backtests(
+        self: Any,
+        *,
+        runner: Any,
+        allocations: list[dict[str, Any]],
+        start_date: str,
+        end_date: str,
+        max_parallelism: int | None,
+    ) -> list[dict[str, Any]]:
+        results = []
+        for i, allocation in enumerate(allocations):
+            returns = low_vol_returns if i == 0 else high_vol_returns
+            results.append(
+                {
+                    "candidate_id": allocation["candidate_id"],
+                    "strategy_id": allocation["strategy_id"],
+                    "strategy_name": allocation["strategy_name"],
+                    "instruments": allocation["instruments"],
+                    "weight": allocation["weight"],
+                    "metrics": {"total_return": 0.05, "sharpe": 1.2},
+                    "timestamps": timestamps_iso,
+                    "returns": returns,
+                    "config": allocation["config"],
+                }
+            )
+        return results
+
+    monkeypatch.setattr(
+        "msai.services.portfolio.orchestration.PortfolioService._execute_candidate_backtests",
+        _fake_execute_candidate_backtests,
+    )
+
+    def _fake_ensure(
+        *,
+        symbols: list[str],
+        raw_parquet_root: Any,
+        catalog_root: Any,
+        asset_class: str,
+    ) -> list[str]:
+        return [f"{s}.NASDAQ" for s in symbols]
+
+    monkeypatch.setattr(
+        "msai.services.portfolio.orchestration.ensure_catalog_data",
+        _fake_ensure,
+    )
+
+    # Act
+    svc = PortfolioService()
+    completed = await svc.run_portfolio_backtest(
+        run.id,
+        runner=_StubRunner(),
+        report_generator=_StubReportGenerator(tmp_path),
+        session_factory=portfolio_session_factory,
+    )
+
+    # Assert — inverse_vol assigns MORE weight to the lower-vol strategy.
+    # The objective-driven heuristic would have produced 50/50; the fix
+    # makes the actual weights reflect realized vol.
+    assert completed.status == "completed"
+    assert completed.allocations is not None
+    weights = [a["weight"] for a in completed.allocations]
+    assert len(weights) == 2
+    # Low-vol (strategy 0) has near-zero std → inverse_vol allocator
+    # collapses to equal-weight only when std is exactly 0 for ALL
+    # strategies (see ``InverseVolAllocator.compute``). Here strategy 1
+    # has non-zero std, so strategy 0's huge 1/eps dominates. The
+    # important assertion is "weights are not equal" — equal would mean
+    # the allocator branch was skipped.
+    assert weights[0] != pytest.approx(weights[1], rel=1e-3), (
+        f"inverse_vol should produce non-equal weights for differently-vol "
+        f"strategies; got {weights}"
+    )
+    # And the low-vol strategy should get the larger weight.
+    assert weights[0] > weights[1], (
+        f"inverse_vol should weight the low-vol strategy higher; got {weights}"
+    )
