@@ -51,6 +51,86 @@ If still ambiguous, report the ambiguity and stop — do not guess.
 
 **Smoke mode:** Same as regression but filter to use cases tagged `@smoke`.
 
+### Step 2b: Validate use-case shape (BEFORE health check — no server needed)
+
+Before running any UC against a live system, validate that each UC has user-journey shape and a defensible interface choice. Invalid UCs are not a transient infra problem; they cannot be salvaged by retrying against a healthy app. Catch them here so the caller fixes test design before infrastructure is touched.
+
+For each UC loaded in Step 2, classify it as `VALID` or `FAIL_INVALID_USE_CASE`:
+
+**Check 1 — `NOT_USER_JOURNEY` (Intent and Verification shape):**
+
+- The Intent names a real user goal in plain language. RED FLAG if Intent contains: a literal HTTP method + path (`POST /api/...`), a function/class/component name, a database table or column name, a status code or HTTP header as the goal, or phrases like "verify that ... returns ...", "test that ... renders ...", "check that ... endpoint ...".
+- The UC has at least 2 user actions (Steps span a sequence, not a single isolated call).
+- The Verification observes something the user would see through the chosen interface (UI text/element, API response body/status, CLI stdout/exit). RED FLAG if Verification mentions database rows, internal logs, function return values, or implementation details the user cannot observe.
+- The UC has a Persistence step (reload, re-request, or re-invoke). Missing Persistence is a smell that the UC tests a single contract, not a journey.
+
+**Check 2 — `WRONG_INTERFACE` (interface vs feature surface):**
+
+- The declared Interface (UI / API / CLI) must match the surface the user touches for this feature.
+- If the feature description mentions a UI page/form/flow → Interface MUST be UI (not API, even if an API call backs the page — that's an internal seam).
+- If the feature description names a public/product API endpoint as the deliverable → Interface MUST be API.
+- If the feature description names a CLI command/flag → Interface MUST be CLI.
+- Cross-surface features (auth, billing) MAY declare both API and UI UCs.
+- Use available context to determine the feature surface: the plan file's feature description, the UC's Intent text, the file paths the implementation touched (if visible in the plan), and `CLAUDE.md ## E2E Configuration` for the capability envelope.
+
+**When in genuine doubt**, prefer to mark the UC valid and let it execute — false positives on `FAIL_INVALID_USE_CASE` are more disruptive than false negatives (a borderline UC still tests SOMETHING; an over-zealous bounce-back blocks a passing UC).
+
+For each UC marked `FAIL_INVALID_USE_CASE`, record:
+
+- The reason: `NOT_USER_JOURNEY` or `WRONG_INTERFACE` (one primary reason per UC; note secondary in the rationale)
+- A 1-2 sentence rationale citing the exact text or absent element that failed the check
+- A concrete suggestion for the rewrite (e.g., "Restate Intent as a user goal — 'Authenticated user creates an order and finds it in their history' — and add a Persistence step that re-fetches the order list.")
+
+**If any UC is `FAIL_INVALID_USE_CASE`:** skip Step 3 (health check) and Step 4 (execution) for the invalid UCs — they cannot be meaningfully executed. Still execute VALID UCs and run health check for them. Report mixed results normally.
+
+**If ALL UCs are `FAIL_INVALID_USE_CASE`:** skip Step 3 entirely and proceed directly to Step 5 with all UCs classified.
+
+### Step 2c: Surface coverage check (soft warning, feature mode only)
+
+Surfaced 2026-05-18 from msai-v2 portfolio-backtest soak: the agent designed UI + API UCs and silently skipped CLI even though the project's CLI exposed the same capability area. The fix landed in v5.31 (feature-surface-driven interface) and v5.33 (this step) — Phase 3.2b now requires a "Surface coverage decision" sub-block, and verify-e2e backstops it.
+
+**Mode gating (Codex P2-3, v5.33 review):** This step ONLY runs in `feature` mode. In `regression` and `smoke` modes the UCs are the accumulated history from `tests/e2e/use-cases/` — there is no current-feature plan and no Surface coverage decision block. A regression suite that happens to be all-UI (because all past features were UI-only) would otherwise warn about missing API/CLI on every run, creating noise unrelated to the current change. **If `mode != feature`, skip this step entirely.**
+
+**Process:**
+
+1. Read `CLAUDE.md ## E2E Configuration` to enumerate every interface the project exposes.
+   - **First** look for an explicit `surfaces:` line (e.g., `surfaces: [UI, API, CLI]`). If present, it is authoritative — use it verbatim and do not fall back to interface_type defaults.
+   - **Only if `surfaces:` is absent**, derive from `interface_type`: `fullstack` → UI + API; `api` → API; `cli` → CLI; `hybrid` → treat every interface named anywhere in the section as exposed.
+   - **CLI detection regardless of config** (Codex P2-5 + P2-6, v5.33 review): a fullstack project that also ships a CLI is misrepresented by `interface_type: fullstack` alone (default = UI + API, no CLI). To prevent silent passthrough, **also** check for CLI entrypoint signals in the repo even when CLAUDE.md doesn't list CLI:
+     - **Python:** `pyproject.toml` with `[project.scripts]` or `[tool.poetry.scripts]`; `setup.cfg` with `[options.entry_points]` containing `console_scripts`; `setup.py` with `entry_points={'console_scripts': [...]}`; a top-level `cli.py` or `cli/` package
+     - **Node:** `package.json` with a `bin` field
+     - **Rust:** `Cargo.toml` with `[[bin]]`, OR the default binary target `src/main.rs`, OR Cargo's auto-discovered binaries under `src/bin/*.rs` or `src/bin/*/main.rs` (all without needing an explicit `[[bin]]`)
+     - **Go:** `go.mod` plus any `cmd/*/main.go` (the standard `cmd/` layout — wildcarded, since `<binary>` may not match the project name and a repo may ship multiple `cmd/*` binaries)
+     - **Any language:** a `bin/` directory containing executable files at the repo root
+   - **Non-exhaustive list:** if you find evidence of any user-facing CLI in the repo that isn't covered above (shell-script entrypoints, language-specific build outputs, etc.), treat CLI as exposed and emit the warnings as if it were listed. The list above covers the common conventions but is not authoritative; the principle is "if the project ships a CLI to users, the user surface includes CLI." Users with non-standard conventions should declare `surfaces:` explicitly in CLAUDE.md to skip this auto-detection.
+   - If ANY of those signals exist but CLI is NOT in the derived/declared `surfaces:` set, **add CLI to the exposed surfaces set for this run** so Step 2c emits the canonical `SURFACE_COVERAGE_WARNING` for missing CLI coverage. Also emit a `CONFIG_DRIFT` note in the report telling the user to add `surfaces: [..., CLI]` to CLAUDE.md. **Why unify on SURFACE_COVERAGE_WARNING:** Step 4b in both callers only scans for that one marker; emitting CONFIG_DRIFT alone would let an autonomous PASS proceed with the gap unaddressed.
+2. Tally which interfaces appear in the loaded UCs' `Interface` field.
+3. Check the plan file (or `docs/plans/<bug-name>-use-cases.md` for simple-fix staging) for a **Surface coverage decision** sub-block. Recognize lines of the shape `<Interface>: N/A — <justification>` as pre-justified exclusions.
+4. For each exposed interface that is **(a) not covered by any UC** AND **(b) not in the Surface coverage decision sub-block as N/A**, emit a warning in the report.
+
+**Warning format** (one line per missing interface) — appears in a dedicated `## Surface Coverage` section in the report:
+
+```
+SURFACE_COVERAGE_WARNING: Project exposes <SET>. UCs cover <COVERED>. Missing surface: <X>. No N/A justification found in plan. Confirm with the human reviewer whether <X> coverage is intentionally out of scope or this is a missed surface.
+```
+
+**Crucially:** this is a SOFT warning. Do NOT classify any UC as `FAIL_INVALID_USE_CASE` for this. The exclusion may be legitimate (a UI-only visual element genuinely doesn't need CLI coverage). Surface as informational so the human reviewer — or, during an autonomous `/forge-goal` run, the agent's `/council` consultation — can decide.
+
+**Verdict impact:** SURFACE_COVERAGE_WARNING does NOT change the verdict on its own. A run with all UCs PASS + a SURFACE_COVERAGE_WARNING still returns `VERDICT: PASS`. The warning shows up in the report body for human/council review.
+
+**When the warning fires alongside other issues:** still report it. The reviewer needs the full picture.
+
+**Pre-justified exclusions** — recognize these forms in the Surface coverage decision sub-block:
+
+- `CLI: N/A — feature is admin-only via UI by product decision`
+- `API: N/A — feature is a UI-only UX refinement (no contract change)`
+- `CLI: N/A — Full mode requires interactive risk-policy preview; deferred to v2 with --full-config FILE escape hatch tracked in TODO #1234`
+
+**NOT recognized as pre-justified** (still triggers the warning):
+
+- `CLI: N/A — no CLI changes in my diff` — implementation description, not user-facing scope
+- `CLI: N/A — not needed` — too vague
+
 ### Step 3: Health check
 
 - **API:** `curl -fsS $API_URL/health` (or documented health endpoint)
@@ -68,14 +148,15 @@ For each use case:
 2. Execute Steps through the declared interface
 3. Verify the outcome
 4. If `Persist` specified, reload/re-request and confirm
-5. Classify: PASS | FAIL_BUG | FAIL_STALE | FAIL_INFRA
+5. Classify: PASS | FAIL_BUG | FAIL_STALE | FAIL_INFRA (FAIL_INVALID_USE_CASE was already assigned in Step 2b — never assigned here)
 
 **Classification rules:**
 
 - **PASS:** All steps completed, all assertions passed
 - **FAIL_BUG:** Unexpected behavior (wrong status, missing element, incorrect data) — a user would hit this
-- **FAIL_STALE:** Use case references endpoint/page/selector that no longer exists or was renamed — the product isn't wrong, the use case is
+- **FAIL_STALE:** Use case references endpoint/page/selector that no longer exists or was renamed — the product isn't wrong, the use case is (but the use case shape is fine)
 - **FAIL_INFRA:** Environmental issue (timeout, connection refused, Playwright crash). Retry once before classifying. Still failing → FAIL_INFRA.
+- **FAIL_INVALID_USE_CASE:** Classified in Step 2b (not Step 4). UC fails authoring discipline. Sub-reason is one of `NOT_USER_JOURNEY` (Intent reads as integration/contract/component test, or Verification observes non-user-visible state, or Persistence missing) or `WRONG_INTERFACE` (declared Interface doesn't match the feature surface the user touches). Test-design failure — bounces back to the main agent to rewrite the UC before re-running. Never the result of running the UC against the product.
 
 ### Step 5: Produce the report
 
@@ -132,6 +213,22 @@ SUGGESTED_PATH: tests/e2e/reports/YYYY-MM-DD-HH-MM-<feature-or-mode>.md
 - **Evidence:** [response excerpt, screenshot path, stderr]
 - **Severity:** Blocks ship — [why]
 
+### UC3: [Intent] — FAIL_INVALID_USE_CASE
+
+- **Reason:** NOT_USER_JOURNEY | WRONG_INTERFACE
+- **Rationale:** [1-2 sentences citing the exact text or absent element that failed Step 2b validation]
+- **Suggested rewrite:** [concrete rewrite hint the caller can apply, e.g., "Restate Intent as 'Authenticated user creates an order and finds it in their history' and add a Persistence step that re-fetches the order list."]
+- **Severity:** Blocks ship — test-design failure, not a product bug. Fix the UC, not the product code.
+
+## Surface Coverage
+
+[Always include this section. Populate from Step 2c.]
+
+- **Project exposes:** [UI, API, CLI — from CLAUDE.md ## E2E Configuration]
+- **UCs cover:** [the subset of exposed interfaces that have at least one UC]
+- **Pre-justified exclusions:** [any `<Interface>: N/A — <reason>` lines from the plan's Surface coverage decision sub-block]
+- **Warnings:** [zero or more `SURFACE_COVERAGE_WARNING` lines per missing-and-not-pre-justified interface]
+
 ## Files Read
 
 - [every file read during execution, excluding reports]
@@ -141,12 +238,15 @@ SUGGESTED_PATH: tests/e2e/reports/YYYY-MM-DD-HH-MM-<feature-or-mode>.md
 [Why PASS/FAIL/PARTIAL — cite classifications]
 ```
 
-**Verdict rules:**
+**Verdict rules** (top-level VERDICT enum stays at `PASS | FAIL | PARTIAL` — no new top-level value):
 
-- Any FAIL_BUG → `FAIL`
-- Only FAIL_STALE, no FAIL_BUG → `PARTIAL` (maintenance flag)
-- Only FAIL_INFRA after retry, no FAIL_BUG → `PARTIAL` (human decides)
-- All PASS → `PASS`
+- Any `FAIL_BUG` → `FAIL`
+- Any `FAIL_INVALID_USE_CASE` → `FAIL` (the E2E gate cannot be satisfied until the UC is rewritten; it is a test-design failure but still blocks the gate)
+- Only `FAIL_STALE`, no `FAIL_BUG`, no `FAIL_INVALID_USE_CASE` → `PARTIAL` (maintenance flag)
+- Only `FAIL_INFRA` after retry, no `FAIL_BUG`, no `FAIL_INVALID_USE_CASE` → `PARTIAL` (human decides)
+- All `PASS` → `PASS`
+
+When the verdict is `FAIL` due to `FAIL_INVALID_USE_CASE` (and no `FAIL_BUG`), include a clear note in the **Verdict Reasoning** section that this is a test-design failure, not a product defect — so the caller does not waste cycles debugging the product code.
 
 ### Step 6: What the caller does
 

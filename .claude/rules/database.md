@@ -66,9 +66,9 @@ async with session.begin():
     # Auto-commits on exit, auto-rollbacks on exception
 ```
 
-## Migrations — additive-only discipline (Slice 3 deploy-pipeline rollback safety)
+## Migrations — additive-only discipline
 
-The deploy pipeline (`scripts/deploy-on-vm.sh`) rolls back to the last-good image SHA on probe failure but does NOT roll back the database schema (architecture verdict §5a: forward-only migrations; DB downgrades not supported). For rollback to leave the prior image's code talking safely to an advanced schema, **migrations must be additive-only**:
+If your deploy pipeline rolls back image SHAs but not DB schema (a common production pattern, since DB downgrades are rarely reversible), migrations must be **additive-only** — old code from the prior release must be able to safely talk to the newer schema after a rollback.
 
 - ✅ ADD column with DEFAULT or NULL (old code ignores the new column)
 - ✅ ADD table (old code ignores the new table)
@@ -79,15 +79,15 @@ The deploy pipeline (`scripts/deploy-on-vm.sh`) rolls back to the last-good imag
 - ❌ NOT-NULL constraint added without backfill+default — old code's INSERTs may break
 - ❌ Type narrowing (e.g. `VARCHAR(255)` → `VARCHAR(64)`) — old code's longer strings break
 
-For a destructive change, use the **expand-contract pattern** across two deploys:
+For a destructive change, use the **expand-contract pattern** across three releases:
 
-1. **Expand** (release N): add the new column/table; old code keeps writing the old shape; new code dual-writes both.
+1. **Expand** (release N): add the new column/table; old code keeps writing the old shape; new code dual-writes to both.
 2. **Backfill + cutover** (release N+1): new code reads from the new shape only; old shape still exists but unused.
 3. **Contract** (release N+2): drop the old column/table.
 
-This guarantees that any rollback within one release is safe (release N can always roll back to N-1 because N is purely additive over N-1).
+Each release is purely additive over the previous one, so a rollback within any single release stays safe.
 
-If a destructive change is genuinely required without expand-contract (e.g. emergency security fix), the deploy must be `workflow_dispatch` with explicit `drain=true` (Slice 4+ feature) — no auto-rollback on probe failure.
+If a destructive change is genuinely required (e.g. emergency security fix), coordinate with the team to disable auto-rollback for that deploy — treat it as a one-way migration with a maintenance window.
 
 ## Rules
 
@@ -95,7 +95,7 @@ If a destructive change is genuinely required without expand-contract (e.g. emer
 2. ALWAYS index foreign key columns
 3. ALWAYS use eager loading (`selectinload`/`joinedload`) to prevent N+1
 4. ALWAYS use parameterized queries (ORMs do this automatically)
-5. ALWAYS write additive-only migrations OR use expand-contract for destructive changes (see "Migrations" section above)
+5. ALWAYS write additive-only migrations — use expand-contract for destructive changes (see "Migrations" section above)
 6. NEVER use `len()` on query results — use `func.count()`
 7. NEVER build SQL with string concatenation
 8. PREFER UUID primary keys for distributed systems
