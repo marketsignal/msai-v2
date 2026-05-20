@@ -23,7 +23,7 @@ This project was originally built in parallel by two AI implementations from the
 - **Database:** PostgreSQL 16 + Parquet files + DuckDB + Redis 7
 - **Auth:** Azure Entra ID (MSAL frontend, PyJWT backend)
 - **Deploy:** Docker Compose on Azure VM (dev: single-host; prod: single-VM Standard_D4ds_v6, Phase 2 splits to 2-VM for real money)
-- **Data Sources:** Polygon.io (stocks/options), Databento (futures), IB Gateway (execution only)
+- **Data Sources:** Databento (equities + futures + options historical), IB Gateway (execution only)
 
 ### Ports (dev)
 
@@ -193,7 +193,7 @@ All endpoints except `/health` and `/ready` require Azure Entra ID JWT authentic
 
 ### Data Flow
 
-- **Historical data**: Polygon/Databento → Python ingestion → atomic Parquet writes → `{DATA_ROOT}/parquet/{asset_class}/{symbol}/{YYYY}/{MM}.parquet`
+- **Historical data**: Databento → Python ingestion → atomic Parquet writes → `{DATA_ROOT}/parquet/{asset_class}/{symbol}/{YYYY}/{MM}.parquet`
 - **Backtesting**: FastAPI → arq queue → backtest worker → NautilusTrader BacktestRunner → QuantStats report → results in PostgreSQL
 - **Live trading**: FastAPI → risk engine validation → `live_supervisor` spawns TradingNode subprocess → NautilusTrader → IB Gateway. Supervisor owns heartbeat monitor + command bus (Redis Streams + consumer groups + PEL recovery + DLQ).
 - **Dashboard queries**: Frontend → FastAPI → DuckDB (in-memory, reads Parquet) → JSON response
@@ -238,7 +238,6 @@ AZURE_CLIENT_ID=your-client-id
 JWT_TENANT_ID=your-tenant-id
 JWT_CLIENT_ID=your-client-id
 CORS_ORIGINS=["http://localhost:3000"]
-POLYGON_API_KEY=your-key
 DATABENTO_API_KEY=your-key
 IB_GATEWAY_HOST=ib-gateway
 IB_GATEWAY_PORT_PAPER=4004              # client-side socat proxy port (gateway binds 4002 internally)
