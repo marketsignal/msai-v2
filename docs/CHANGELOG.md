@@ -4,6 +4,20 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-05-20 — Fix: MSAL frontend requested Graph scope; backend rejected token (PROD OUTAGE) (`fix/msal-backend-scope`)
+
+**Severity:** P0 — every authenticated `/api/v1/*` endpoint returned 401 "Invalid token: Signature verification failed" in production. No one could log in and use the app. Latent for ~6 weeks since MSAL was first wired into the frontend; surfaced 2026-05-20 by a manual UI smoke after PR #73's portfolio-backtest deploy.
+
+**Root cause:** `frontend/src/lib/msal-config.ts` requested `["User.Read", "openid", "profile", "email"]` — `User.Read` is a Microsoft Graph scope, so MSAL returned a Graph access token (aud `00000003-0000-0000-c000-000000000000`) that's opaque to third parties. Backend (`PyJWT` via `EntraIDValidator`) couldn't decode it.
+
+**Fix:** Swap to `["openid", "profile", "email", \`api://${NEXT_PUBLIC_AZURE_CLIENT_ID}/.default\`]`. The `.default`scope produces an access token whose`aud`equals the backend's`JWT_CLIENT_ID`(this project uses a single Entra ID app registration shared by SPA + API), signed by the tenant's keys — PyJWT decodes it.`openid`/`profile`/`email` are kept because they govern ID-token claims (`account.name`, `account.username` shown in the user header).
+
+**Why tests didn't catch it (the deeper gap):** every test layer has an auth bypass — frontend dev mode (`isAuthBypassed === true`), backend `X-API-Key`, verify-e2e API key, deploy.yml probes. The MSAL → PyJWT path was never exercised end-to-end in any test environment. Documented in `docs/solutions/auth/msal-graph-scope-produces-unverifiable-token.md` with three layered prevention strategies; follow-up: enable the UI E2E auth setup deferred from PR #49.
+
+**Files changed:** 1 (`frontend/src/lib/msal-config.ts` — 1-line scope swap + comment). Solution doc + memory entry added separately.
+
+---
+
 ### 2026-05-18 — Portfolio backtest: form-based composer + Quick/Full modes + optimizer (`feat/portfolio-backtest`)
 
 Replaces the rejected JSON portfolio-compose UX (was 404'd in PR #70 per `docs/decisions/2026-05-17-portfolio-backtest-deferred.md`) with a form-based composer + two-mode backtest engine. Quick mode = single-shot ~3-5min. Full mode = Optuna TPE search over per-strategy risk-policy parameter space with walk-forward cross-validation (~8h cap). Operator picks an objective function (return / Sharpe / Sortino / Calmar / max DD); the optimizer finds the winning config and reports IS/OOS gap.
