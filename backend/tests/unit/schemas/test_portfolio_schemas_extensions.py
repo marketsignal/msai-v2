@@ -8,6 +8,7 @@ Verifies:
 
 from __future__ import annotations
 
+from datetime import date
 from uuid import uuid4
 
 import pytest
@@ -142,4 +143,30 @@ def test_portfolio_create_rejects_full_mode_with_fixed_weight_allocator() -> Non
             default_mode=BacktestMode.FULL,
             allocator_name="fixed_weight",
             allocations=[PortfolioAllocationInput(candidate_id=uuid4(), weight=1.0)],
+        )
+
+
+def test_portfolio_run_create_rejects_reversed_date_range() -> None:
+    """Codex bot iter-14 P2 on PR #73 — reject ``end_date < start_date``
+    at the schema layer for BOTH modes. An inverted range is meaningless
+    and would otherwise enqueue work that fails later in the worker
+    with a less actionable error.
+    """
+    from msai.schemas.portfolio import PortfolioRunCreate
+
+    with pytest.raises(ValueError, match="end_date.*must be.*start_date"):
+        PortfolioRunCreate(
+            portfolio_id=uuid4(),
+            start_date=date(2024, 6, 30),
+            end_date=date(2024, 1, 1),  # reversed
+            mode=BacktestMode.QUICK,
+        )
+
+    # And the same rejection in Full mode.
+    with pytest.raises(ValueError, match="end_date.*must be.*start_date"):
+        PortfolioRunCreate(
+            portfolio_id=uuid4(),
+            start_date=date(2024, 6, 30),
+            end_date=date(2024, 1, 1),  # reversed
+            mode=BacktestMode.FULL,
         )

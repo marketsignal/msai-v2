@@ -428,15 +428,31 @@ class PortfolioLifecycle:
             limit: Maximum number of rows to return.
 
         Returns:
-            A list of :class:`PortfolioRun` rows.  ``series`` and
-            ``allocations`` are **not** loaded (defer) — those columns
-            can be multi-MB JSONB for completed intraday runs, and a
-            list-history view doesn't need them.  Callers that require
-            the full payload should use :meth:`get_run` with the row id.
+            A list of :class:`PortfolioRun` rows.  ``series``,
+            ``allocations``, ``optimization_trace``, and
+            ``walk_forward_payload`` are **not** loaded (defer) — those
+            columns can be multi-MB JSONB for completed Full-mode and
+            intraday runs, and a list-history view doesn't need them.
+            Callers that require the full payload should use
+            :meth:`get_run` with the row id.
+
+            Codex bot iter-14 P2 on PR #73: previously only ``series``
+            and ``allocations`` were deferred, leaving Full-mode runs'
+            ``optimization_trace`` (one entry per trial × window) +
+            ``walk_forward_payload`` (per-strategy correlations,
+            drawdowns, etc.) on every listing row. The dashboard
+            ``GET /api/v1/portfolios/runs`` would pull and serialize
+            multi-MB JSON per row at history scale; the defer now
+            covers all four heavy columns.
         """
         stmt = (
             select(PortfolioRun)
-            .options(defer(PortfolioRun.series), defer(PortfolioRun.allocations))
+            .options(
+                defer(PortfolioRun.series),
+                defer(PortfolioRun.allocations),
+                defer(PortfolioRun.optimization_trace),
+                defer(PortfolioRun.walk_forward_payload),
+            )
             .order_by(PortfolioRun.created_at.desc())
             .limit(limit)
         )
@@ -452,6 +468,8 @@ class PortfolioLifecycle:
             session.expunge(row)
             row.series = None
             row.allocations = None
+            row.optimization_trace = None
+            row.walk_forward_payload = None
         return rows
 
     @staticmethod

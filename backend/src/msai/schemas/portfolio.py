@@ -254,7 +254,17 @@ class PortfolioRunCreate(BaseModel):
     n_trials: int | None = Field(default=None, ge=1, le=1000)
 
     @model_validator(mode="after")
-    def _full_mode_requires_minimum_range(self) -> PortfolioRunCreate:
+    def _validate_date_range(self) -> PortfolioRunCreate:
+        # Codex bot iter-14 P2 on PR #73: reject reversed ranges
+        # (``end_date < start_date``) at the schema layer instead of
+        # letting the worker fail with a less actionable error after
+        # consuming queue/compute capacity. Applies to BOTH modes since
+        # an inverted range is meaningless regardless of mode.
+        if self.end_date < self.start_date:
+            raise ValueError(
+                f"end_date ({self.end_date}) must be >= start_date ({self.start_date})"
+            )
+
         # Walk-forward analysis needs enough headroom for at least one
         # IS+OOS pair after the orchestrator's adaptive scaling
         # (``_scaled_walk_forward_params`` floors at 30 days/leg).  A
