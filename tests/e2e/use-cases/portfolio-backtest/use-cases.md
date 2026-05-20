@@ -72,7 +72,7 @@
 1. `POST .../{id}/runs` body `{"start_date": "2024-01-02", "end_date": "2024-12-31", "mode": "full", "n_trials": 2}` → 201.
 2. Poll until completed (within ~5 min for 2 trials; cache warmup runs each strategy once before optimization).
 
-**Verify:** `is_metric` + `oos_metric` numeric; `optimization_trace` length matches `n_trials` (2); `walk_forward_payload` includes `windows`, `in_sample_scores`, `out_of_sample_scores`, `per_strategy_equity`, `return_correlation`, `drawdown_correlation`, `drawdown_breakdown`. `metrics.n_trials_override == 2`.
+**Verify:** `is_metric` + `oos_metric` numeric; `optimization_trace` length matches `n_trials` (2); `walk_forward_payload` includes `windows`, `in_sample_scores`, `out_of_sample_scores`, `per_strategy_equity`, `return_correlation`, `drawdown_correlation`, `drawdown_breakdown`. (Note: at completion the optimizer overwrites `metrics` with the per-trial output keys, so `metrics.n_trials_override` is not present in the final payload — assert via `optimization_trace` length instead.)
 
 **Persistence:** Reload; same payload.
 
@@ -182,9 +182,7 @@
 2. In the "Promote to Live (Paper)" modal, leave the default `DUTEST123` in `[data-testid="promote-account-input"]`.
 3. Click "Promote".
 
-**Verify:** Toast `"Portfolio promoted to live..."` appears. `GET /api/v1/live-portfolios/` lists a new entry with name `"<portfolio name> (run <run_id_first_8>)"` and description referencing the source run + `account_id=DUTEST123, mode=quick`.
-
-**Known v1.1 hygiene gap:** post-promote `router.push('/live-trading?revision=<revision_id>')` doesn't highlight the new entity on the deployments list page (the list shows `LiveDeployment` runtime entities, not `LivePortfolio` specs). LivePortfolio is correctly created; deploy flow continues via `/live-trading/portfolios/<id>` (TBD).
+**Verify:** Toast `"Portfolio promoted. Pick deployment options to start trading."` appears, then the inline `PortfolioStartDialog` opens for deployment-options entry. `GET /api/v1/live-portfolios/` lists a new entry with name `"<portfolio name> (run <run_id_first_8>)"` and description referencing the source run + `account_id=DUTEST123, mode=quick`.
 
 ---
 
@@ -223,10 +221,86 @@
 
 ---
 
+## UC-PB-CLI-001: Operator composes a portfolio from existing strategies via CLI
+
+**Interface:** CLI
+**Intent:** An operator at a terminal composes a multi-strategy portfolio without opening a browser, then sees it listed back.
+
+**Setup (sanctioned):** ≥2 strategies registered with `default_config` containing `instrument_id` and `bar_type` (the same fixtures UC-PB-API-001 expects).
+
+**Steps:**
+
+1. `msai portfolio create-from-strategies --name "CLI Smoke" --strategy-id <s1> --strategy-id <s2> --base-capital 100000 --max-position-size 0.25 --max-drawdown-halt 0.2 --objective maximize_sharpe --default-mode quick`
+2. `msai portfolio list`
+
+**Verify:** Step 1 stdout is a JSON object with the new portfolio's `id`, `name == "CLI Smoke"`, `default_mode == "quick"`, `max_position_size == 0.25`, exit code 0. Step 2 stdout lists a row matching the new id.
+
+**Persistence:** Start a fresh shell and run `msai portfolio list` → the new portfolio is still listed.
+
+---
+
+## UC-PB-CLI-002: Operator runs a Quick backtest end-to-end via CLI
+
+**Interface:** CLI
+**Intent:** An operator launches a Quick-mode portfolio backtest from the terminal and inspects results — never touching the UI.
+
+**Setup:** Portfolio from UC-PB-CLI-001 + ingested AAPL daily bars (via `msai ingest stocks AAPL 2024-01-01 2024-12-31`).
+
+**Steps:**
+
+1. `msai portfolio run <portfolio_id> 2024-01-02 2024-12-31 --mode quick` → exit 0; stdout contains the new `run_id`.
+2. Loop `msai portfolio run-show <run_id>` until stdout's `status == "completed"` (within 5 min).
+3. `msai portfolio run-report <run_id>` → QuantStats HTML report streamed to stdout (exit 0).
+
+**Verify:** Step 2's `run-show` payload exposes numeric `metrics.sharpe`, `metrics.total_return`, `metrics.max_drawdown`. Step 3 emits the HTML report with exit 0 (the report body is the contract of `/api/v1/backtests/{id}/report`; the metrics surface for the operator is `run-show`, not `run-report`).
+
+**Persistence:** New shell, `msai portfolio run-show <run_id>` → still `completed` with the same metrics.
+
+---
+
+## UC-PB-CLI-003: Operator cancels a running Full backtest via CLI
+
+**Interface:** CLI
+**Intent:** An operator who launched an expensive Full backtest decides to abort it from the terminal and confirms it stayed canceled.
+
+**Setup:** A separate portfolio with `--default-mode full` + AAPL bars from UC-PB-CLI-002.
+
+**Steps:**
+
+1. `msai portfolio run <portfolio_id> 2024-01-02 2024-12-31 --mode full --n-trials 500` → exit 0; stdout `run_id`. (Use ≥500 trials so the cancel-window stays open long enough on dev/CI stacks — `--n-trials 50` can complete in seconds and race the cancel.)
+2. While the next `msai portfolio run-show <run_id>` reports `status` ∈ `{queued, running}`, run `msai portfolio cancel <run_id>` → exit 0; stdout JSON has `status == "canceled"`.
+3. `msai portfolio run-show <run_id>` → `status == "canceled"`.
+
+**Verify:** Cancel command exits 0 and prints `"status": "canceled"`. (This is exactly the path iter-15 hardened via `_execute_candidate_backtests` cancel_check — terminal-state guard refuses to lift the run back to running.)
+
+**Persistence:** Open a new shell, `msai portfolio run-show <run_id>` → still `canceled`.
+
+---
+
+## UC-PB-CLI-004: Operator promotes a completed run to a paper live portfolio via CLI
+
+**Interface:** CLI
+**Intent:** An operator promotes a finished Quick run to a paper LivePortfolio via the terminal, mirroring the UI promote flow.
+
+**Setup:** Completed Quick run from UC-PB-CLI-002.
+
+**Steps:**
+
+1. `msai portfolio promote-to-live <run_id> --account-id DUTEST123` → exit 0; stdout is a JSON object representing the new LivePortfolio.
+2. `msai live-portfolio list` (or the equivalent listing command shipped in the project's `live-portfolio` sub-app).
+
+**Verify:** Step 1 stdout has `name` ending in `"(run <run_id_first_8>)"`, `description` referencing the source run id + `account_id=DUTEST123, mode=quick`; exit 0. Step 2 stdout lists the new LivePortfolio.
+
+**Negative path (same command, real-money id):** `msai portfolio promote-to-live <run_id> --account-id U1234567` exits non-zero, stderr contains `PAPER_ONLY_ENFORCED` or HTTP 422 with that error code in the body.
+
+**Persistence:** New shell, list live portfolios → the new entry is still listed.
+
+---
+
 ## Smoke vs full coverage
 
-- **Smoke set** (~2 min wall clock; OK for PR CI): UC-PB-API-001, UC-PB-API-004, UC-PB-API-006, UC-PB-UI-004 (no backtest execution; just contract validation).
-- **Full set** (~15 min wall clock; OK for nightly): all 11 use cases including the Full-mode optimization at `n_trials=2`.
+- **Smoke set** (~2 min wall clock; OK for PR CI): UC-PB-API-001, UC-PB-API-004, UC-PB-API-006, UC-PB-UI-004, UC-PB-CLI-001 (no backtest execution; just contract validation).
+- **Full set** (~20 min wall clock; OK for nightly): all 15 use cases including the Full-mode optimization at `n_trials=2` and the CLI cancel/promote paths.
 
 ## Cross-references
 
