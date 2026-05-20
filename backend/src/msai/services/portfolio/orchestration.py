@@ -395,6 +395,7 @@ class PortfolioService:
             start_date=start_date,
             end_date=end_date,
             max_parallelism=effective_max_workers,
+            cancel_check=cancel_check,
         )
 
         weighted_series = [
@@ -755,6 +756,7 @@ class PortfolioService:
             start_date=full_start_date,
             end_date=full_end_date,
             max_parallelism=effective_max_workers,
+            cancel_check=cancel_check,
         )
 
         # Build the per-strategy returns cache, keyed by strategy_id so the
@@ -1101,6 +1103,7 @@ class PortfolioService:
         start_date: str,
         end_date: str,
         max_parallelism: int | None,
+        cancel_check: Any = None,
     ) -> builtins.list[dict[str, Any]]:
         """Run every allocation's backtest, in parallel when configured.
 
@@ -1120,7 +1123,24 @@ class PortfolioService:
         entire portfolio run fails.  This is intentional — a broken
         candidate would silently dilute the portfolio with a zero-return
         stream and lie about ``num_strategies`` in metrics.
+
+        **Cancel polling (Codex bot iter-15 P2 on PR #73):** if
+        ``cancel_check`` returns ``True`` BEFORE the fan-out launches,
+        raise ``PortfolioOrchestrationError("Run was canceled by
+        operator")``. The worker's deterministic-failure handler then
+        attempts ``mark_run_failed`` which the terminal-state guard
+        rejects (canceled wins over failed), and the run terminates in
+        ``canceled`` without consuming the compute slots a full fan-out
+        would have held. Subprocess-level cancellation mid-flight is
+        the deeper follow-up the comment below tracks; this hook gives
+        operators a cheap escape valve during catalog warmup (when the
+        Nautilus subprocesses haven't started yet).
         """
+        if cancel_check is not None and cancel_check():
+            raise PortfolioOrchestrationError(
+                "Portfolio run was canceled by operator before candidate "
+                "backtest fan-out; skipping execution to release compute slots."
+            )
         requested = int(max_parallelism or 1)
         worker_count = max(
             1,

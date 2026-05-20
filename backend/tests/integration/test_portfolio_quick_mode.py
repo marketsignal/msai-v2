@@ -778,6 +778,7 @@ async def test_quick_mode_honors_inverse_vol_allocator_choice(
         start_date: str,
         end_date: str,
         max_parallelism: int | None,
+        cancel_check: Any = None,  # accept the iter-15 pre-flight kwarg
     ) -> list[dict[str, Any]]:
         results = []
         for i, allocation in enumerate(allocations):
@@ -1034,3 +1035,72 @@ async def test_api_create_full_run_with_legacy_max_sharpe_objective_succeeds(
     # all this test cares about. 201 (success) or 503 (Redis missing) are
     # both acceptable here.
     assert response.status_code in (201, 503), response.text
+
+
+@pytest.mark.asyncio
+async def test_quick_mode_skips_fanout_when_cancel_check_fires_before(
+    monkeypatch: pytest.MonkeyPatch,
+    portfolio_session_factory: async_sessionmaker[AsyncSession],
+    make_portfolio_with_strategies: Callable[..., Awaitable[Portfolio]],
+    tmp_path: Any,
+) -> None:
+    """Codex bot iter-15 P2 on PR #73 — a ``cancel_check`` that returns
+    True BEFORE the fan-out launches must skip the per-strategy
+    backtests entirely so canceled runs don't keep holding compute
+    slots through every Nautilus subprocess.
+
+    Setup: portfolio with 2 strategies, ``cancel_check`` returns True
+    immediately (operator canceled during catalog warmup). The fan-out
+    short-circuits via ``PortfolioOrchestrationError``, the worker's
+    deterministic-failure handler attempts ``mark_run_failed`` which
+    the terminal-state guard rejects in favor of ``canceled``, and the
+    run row remains canceled with no candidate backtests executed.
+    """
+    from msai.services.portfolio import (
+        PortfolioOrchestrationError,
+        PortfolioService,
+    )
+
+    portfolio = await make_portfolio_with_strategies(n=2)
+    run = await _create_run(portfolio_session_factory, portfolio.id, BacktestMode.QUICK)
+
+    # Track whether the stub runner is ever invoked — assertion below.
+    stub_runner = _StubRunner()
+
+    def _fake_ensure(
+        *,
+        symbols: list[str],
+        raw_parquet_root: Any,
+        catalog_root: Any,
+        asset_class: str,
+    ) -> list[str]:
+        return [f"{s}.NASDAQ" for s in symbols]
+
+    monkeypatch.setattr(
+        "msai.services.portfolio.orchestration.ensure_catalog_data",
+        _fake_ensure,
+    )
+
+    # Cancel check returns True immediately — simulates operator's
+    # atomic cancel landing during catalog warmup, before fan-out.
+    def _always_canceled() -> bool:
+        return True
+
+    svc = PortfolioService()
+
+    with pytest.raises(PortfolioOrchestrationError, match="canceled by operator"):
+        await svc.run_portfolio_backtest(
+            run.id,
+            runner=stub_runner,
+            report_generator=_StubReportGenerator(tmp_path),
+            session_factory=portfolio_session_factory,
+            cancel_check=_always_canceled,
+        )
+
+    # Load-bearing assertion: the stub runner must NOT have been called.
+    # If pre-flight cancel-check were missing, fan-out would have
+    # dispatched 2 candidate backtests and the runner would have run
+    # twice.
+    assert len(stub_runner.calls) == 0, (
+        f"pre-flight cancel must skip fan-out; got {len(stub_runner.calls)} runner invocations"
+    )
