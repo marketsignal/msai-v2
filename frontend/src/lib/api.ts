@@ -199,8 +199,15 @@ export interface ErrorEnvelope {
 
 export interface BacktestHistoryItem {
   id: string;
-  strategy_id: string;
-  status: "pending" | "running" | "completed" | "failed";
+  // Discriminator added by the G4 unified-history endpoint. Single-strategy
+  // rows carry ``strategy_id``; portfolio rows carry ``portfolio_id`` +
+  // ``portfolio_name`` instead. Default to ``"single"`` so any pre-G4 cached
+  // response still renders.
+  type?: "single" | "portfolio";
+  strategy_id?: string | null;
+  portfolio_id?: string | null;
+  portfolio_name?: string | null;
+  status: "pending" | "running" | "completed" | "failed" | "canceled";
   start_date: string;
   end_date: string;
   created_at: string;
@@ -595,8 +602,18 @@ export interface PortfolioResponse {
   objective: string;
   base_capital: number;
   requested_leverage: number;
+  /** Optional downside-target scaling cap; values <= 0 collapse leverage to the safety floor. */
+  downside_target: number | null;
   benchmark_symbol: string | null;
   account_id: string | null;
+  /** Safety cap: max per-position fraction of base capital (0, 1]. */
+  max_position_size?: number | null;
+  /** Safety cap: portfolio-level drawdown halt threshold (0, 1]. */
+  max_drawdown_halt?: number | null;
+  /** "quick" (single-shot) or "full" (walk-forward + optimization). */
+  default_mode?: PortfolioBacktestMode;
+  /** "equal_weight" | "fixed_weight" | "inverse_vol" | "vol_targeted". */
+  allocator_name?: string;
   created_at: string;
   updated_at: string;
 }
@@ -606,21 +623,74 @@ export interface PortfolioListResponse {
   total: number;
 }
 
+export type PortfolioBacktestMode = "quick" | "full";
+
 export interface PortfolioRunResponse {
   id: string;
   portfolio_id: string;
   status: string;
   metrics: Record<string, unknown> | null;
+  /**
+   * Combined-portfolio equity series. Each entry is a dict with at least
+   * ``timestamp`` (ISO) and ``equity`` (number); additional fields like
+   * ``drawdown`` may be present. ``null`` when the run hasn't materialized
+   * series data yet (pending / running / failed).
+   */
+  series: Array<Record<string, unknown>> | null;
+  allocations: Array<Record<string, unknown>> | null;
   report_path: string | null;
   start_date: string;
   end_date: string;
   created_at: string;
   completed_at: string | null;
+  /** Populated when the run terminated with `status="failed"`. */
+  error_message?: string | null;
+  /** "quick" (single-shot) or "full" (walk-forward). */
+  mode: PortfolioBacktestMode;
+  /**
+   * Full-mode optimizer trace — one entry per trial. ``null`` for Quick.
+   * Each entry typically carries ``params``, ``score``, ``window_index``.
+   */
+  optimization_trace: Array<Record<string, unknown>> | null;
+  /**
+   * Full-mode walk-forward payload — ``{ windows, in_sample_scores,
+   * out_of_sample_scores }``. ``null`` for Quick.
+   */
+  walk_forward_payload: Record<string, unknown> | null;
+  is_metric: number | null;
+  oos_metric: number | null;
 }
 
 export interface PortfolioRunListResponse {
   items: PortfolioRunResponse[];
   total: number;
+}
+
+/** Response from POST /api/v1/portfolios/runs/{run_id}/promote-to-live.
+ *
+ * Carries the revision_number + composition_hash so the frontend can
+ * mount `PortfolioStartDialog` directly without a follow-up fetch (per
+ * Codex-bot PR-73 P2 fix — previous shape stranded the user on a page
+ * that couldn't open the deploy flow).
+ */
+export interface PromoteToLiveResponse {
+  live_portfolio_id: string;
+  live_portfolio_revision_id: string;
+  revision_number: number;
+  composition_hash: string;
+}
+
+/** Promote a completed portfolio run to a live (paper) portfolio. */
+export async function promotePortfolioRunToLive(
+  runId: string,
+  body: { account_id: string },
+  token?: string | null,
+): Promise<PromoteToLiveResponse> {
+  return apiPost<PromoteToLiveResponse>(
+    `/api/v1/portfolios/runs/${encodeURIComponent(runId)}/promote-to-live`,
+    body,
+    token,
+  );
 }
 
 // ─── Inventory + symbol-onboarding types (universe-page) ───────────────────

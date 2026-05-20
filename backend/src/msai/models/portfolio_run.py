@@ -6,11 +6,12 @@ from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Date, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Date, DateTime, ForeignKey, Integer, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from msai.models.base import Base
+from msai.models.portfolio_enums import BACKTEST_MODE_DB_TYPE, BacktestMode
 
 if TYPE_CHECKING:
     from msai.models.portfolio import Portfolio
@@ -26,6 +27,13 @@ class PortfolioRun(Base):
     the equity/drawdown curve, ``allocations`` captures the per-candidate
     results, and ``heartbeat_at`` tracks worker liveness for stale-job
     detection.
+
+    ``mode`` selects Quick (single-shot) vs. Full (walk-forward +
+    optimization).  ``optimization_trace`` stores the Optuna trial log for
+    Full-mode runs (None for Quick).  ``walk_forward_payload`` captures the
+    per-window fold breakdown.  ``is_metric`` and ``oos_metric`` are the
+    in-sample / out-of-sample scalars used by the results UI and
+    Promote-to-Live gating.
     """
 
     __tablename__ = "portfolio_runs"
@@ -44,6 +52,19 @@ class PortfolioRun(Base):
     max_parallelism: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # B4 mode + optimizer trace + IS/OOS metrics.
+    # Shared BACKTEST_MODE_DB_TYPE with Portfolio.default_mode — see comment
+    # in :mod:`msai.models.portfolio_enums`.
+    mode: Mapped[BacktestMode] = mapped_column(
+        BACKTEST_MODE_DB_TYPE,
+        nullable=False,
+        default=BacktestMode.QUICK,
+        server_default=BacktestMode.QUICK.value,
+    )
+    optimization_trace: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
+    walk_forward_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    is_metric: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    oos_metric: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
     created_by: Mapped[UUID | None] = mapped_column(
         ForeignKey("users.id"), index=True, nullable=True
     )

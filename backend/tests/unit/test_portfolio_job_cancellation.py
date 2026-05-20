@@ -1,0 +1,140 @@
+"""F2 unit tests for the cancellation + progress helpers in ``portfolio_job``.
+
+The helpers themselves are tiny (a ``session.get`` + status compare; or a
+``run.metrics`` patch + heartbeat refresh) — these tests just lock the
+contract so the optimizer-side wiring (in
+:mod:`msai.services.portfolio.orchestration`) and the worker-side sync
+bridge (``_sync_cancel_check`` / ``_sync_progress`` inside
+``run_portfolio_job``) can rely on them.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
+
+import pytest
+
+from msai.models.portfolio_enums import PortfolioRunStatus
+from msai.workers.portfolio_job import (
+    _check_cancel_flag,
+    _portfolio_progress_callback,
+)
+
+
+@pytest.mark.asyncio
+async def test_check_cancel_flag_returns_false_when_status_is_running() -> None:
+    """A run still ``running`` is not cancelled."""
+    run_id = uuid4()
+    run = MagicMock()
+    run.status = PortfolioRunStatus.RUNNING.value
+    session = MagicMock()
+    session.get = AsyncMock(return_value=run)
+
+    assert await _check_cancel_flag(session, run_id) is False
+
+
+@pytest.mark.asyncio
+async def test_check_cancel_flag_returns_true_when_status_is_canceled() -> None:
+    """Operator-cancelled run is detected via the canonical ``canceled`` status."""
+    run_id = uuid4()
+    run = MagicMock()
+    run.status = PortfolioRunStatus.CANCELED.value
+    session = MagicMock()
+    session.get = AsyncMock(return_value=run)
+
+    assert await _check_cancel_flag(session, run_id) is True
+
+
+@pytest.mark.asyncio
+async def test_check_cancel_flag_returns_false_when_row_missing() -> None:
+    """Missing row is not "cancelled" — the worker has other guards for that case.
+
+    The optimizer's cancel loop calls this every trial; returning ``True`` on
+    a missing row would silently break (the row may have been deleted but
+    the trial loop should not stop; the worker's enclosing exception
+    handlers surface the missing-row case).
+    """
+    run_id = uuid4()
+    session = MagicMock()
+    session.get = AsyncMock(return_value=None)
+
+    assert await _check_cancel_flag(session, run_id) is False
+
+
+@pytest.mark.asyncio
+async def test_progress_callback_issues_update_when_not_terminal() -> None:
+    """Codex bot iter-9 P2 on PR #73 — the progress write is now a single
+    atomic UPDATE that JSONB-merges progress fields into the existing
+    metrics. This test locks the call shape: ``session.get`` for the
+    terminal check, then ``session.execute`` with the UPDATE statement,
+    then ``session.commit``. The actual JSONB-merge semantics (preserves
+    pre-existing keys like ``best_config``) are covered by a real-DB
+    integration test elsewhere — here we just verify the wiring.
+    """
+    run_id = uuid4()
+    run = MagicMock()
+    run.status = PortfolioRunStatus.RUNNING.value
+    session = MagicMock()
+    session.get = AsyncMock(return_value=run)
+    session.execute = AsyncMock()
+    session.commit = AsyncMock()
+
+    await _portfolio_progress_callback(session, run_id, 42, "window 3/10")
+
+    session.execute.assert_awaited_once()
+    session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_progress_callback_silently_noop_on_missing_row() -> None:
+    """Missing row is a benign race — write skipped, no exception, no commit."""
+    run_id = uuid4()
+    session = MagicMock()
+    session.get = AsyncMock(return_value=None)
+    session.execute = AsyncMock()
+    session.commit = AsyncMock()
+
+    await _portfolio_progress_callback(session, run_id, 50, "halfway")
+
+    session.execute.assert_not_called()
+    session.commit.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        PortfolioRunStatus.COMPLETED.value,
+        PortfolioRunStatus.FAILED.value,
+        PortfolioRunStatus.CANCELED.value,
+    ],
+)
+@pytest.mark.asyncio
+async def test_progress_callback_skips_terminal_rows(terminal_status: str) -> None:
+    """Codex bot iter-7 P2 on PR #73 — a late progress write that arrived
+    AFTER ``_run_full_mode`` committed the final ``best_config`` /
+    IS/OOS metrics must NOT mutate the row. The callback's session
+    captured the pre-completion metrics snapshot; committing it would
+    clobber the completion write.
+
+    The fix: skip terminal rows entirely. The completion write is the
+    durable last word for that run.
+    """
+    run_id = uuid4()
+    run = MagicMock()
+    run.status = terminal_status
+    run.metrics = {"best_config": {"leverage": 1.5}, "is_metric": 1.2}
+    run.heartbeat_at = datetime(2026, 1, 1, tzinfo=UTC)
+    session = MagicMock()
+    session.get = AsyncMock(return_value=run)
+    session.execute = AsyncMock()
+    session.commit = AsyncMock()
+
+    await _portfolio_progress_callback(session, run_id, 99, "almost done")
+
+    # No UPDATE issued — the row was terminal so we skipped before the merge.
+    session.execute.assert_not_called()
+    session.commit.assert_not_called()
+    # Metrics untouched — completion's best_config + is_metric survive.
+    assert run.metrics == {"best_config": {"leverage": 1.5}, "is_metric": 1.2}

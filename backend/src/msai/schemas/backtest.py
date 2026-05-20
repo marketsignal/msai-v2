@@ -89,10 +89,26 @@ class BacktestResultsResponse(BaseModel):
 
 
 class BacktestListItem(BaseModel):
-    """Summary schema for a backtest in list responses."""
+    """Summary schema for a backtest in list responses.
+
+    Carries a ``type`` discriminator so the unified
+    ``GET /api/v1/backtests/history`` endpoint can return single-strategy
+    Backtests AND PortfolioRuns in the same list, with frontend code
+    routing per-row rendering off the field. Single-strategy rows leave
+    ``portfolio_id`` / ``portfolio_name`` null; portfolio rows leave
+    ``strategy_id`` null and populate the portfolio fields.
+    """
 
     id: UUID
-    strategy_id: UUID
+    # Discriminator (G4). ``"single"`` is the legacy default — existing
+    # frontend clients ignoring the field keep working because the
+    # strategy_id + error envelopes still populate as before.
+    type: Literal["single", "portfolio"] = "single"
+    # Nullable for portfolio rows (which have N strategies, no single FK).
+    strategy_id: UUID | None = None
+    # Populated for portfolio rows only.
+    portfolio_id: UUID | None = None
+    portfolio_name: str | None = None
     status: str
     start_date: date
     end_date: date

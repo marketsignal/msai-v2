@@ -1,6 +1,22 @@
 "use client";
 
+/**
+ * Portfolios — list-and-redirect page.
+ *
+ * Plan ref: `docs/plans/portfolio-backtest.md` Task H8. The previous
+ * implementation embedded a 26KB JSON-config compose dialog rejected by
+ * Pablo during the iter-3 walkthrough (quote in
+ * `docs/decisions/2026-05-17-portfolio-backtest-deferred.md`). Composition
+ * now lives at `/portfolio/new` (form-based, no JSON), and run results at
+ * `/portfolio/runs/[runId]`.
+ *
+ * This page is the dashboard entry point: it lists portfolios + recent
+ * runs and pushes users to `/portfolio/new` for create. Zero `<Textarea>`
+ * by design.
+ */
+
 import { useEffect, useState, useCallback } from "react";
+import Link from "next/link";
 import {
   Card,
   CardContent,
@@ -10,25 +26,6 @@ import {
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
 import {
   Table,
   TableBody,
@@ -37,10 +34,9 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { PieChart, Plus, Play, Trash2, Loader2, Briefcase } from "lucide-react";
+import { PieChart, Plus, Briefcase, ExternalLink } from "lucide-react";
 import {
   apiGet,
-  apiPost,
   ApiError,
   type PortfolioResponse,
   type PortfolioListResponse,
@@ -77,454 +73,6 @@ function objectiveColor(objective: string): string {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Allocation row type
-// ---------------------------------------------------------------------------
-
-interface AllocationRow {
-  candidate_id: string;
-  weight: string;
-}
-
-// ---------------------------------------------------------------------------
-// Create Portfolio Dialog
-// ---------------------------------------------------------------------------
-
-interface CreatePortfolioDialogProps {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  onCreated: () => void;
-}
-
-function CreatePortfolioDialog({
-  open,
-  onOpenChange,
-  onCreated,
-}: CreatePortfolioDialogProps): React.ReactElement {
-  const { getToken } = useAuth();
-  const [submitting, setSubmitting] = useState<boolean>(false);
-  const [formError, setFormError] = useState<string | null>(null);
-
-  const [name, setName] = useState<string>("");
-  const [description, setDescription] = useState<string>("");
-  const [objective, setObjective] = useState<string>("maximize_sharpe");
-  const [baseCapital, setBaseCapital] = useState<string>("100000");
-  const [leverage, setLeverage] = useState<string>("1.0");
-  const [benchmark, setBenchmark] = useState<string>("");
-  const [allocations, setAllocations] = useState<AllocationRow[]>([]);
-
-  const resetForm = useCallback((): void => {
-    setName("");
-    setDescription("");
-    setObjective("maximize_sharpe");
-    setBaseCapital("100000");
-    setLeverage("1.0");
-    setBenchmark("");
-    setAllocations([]);
-    setFormError(null);
-  }, []);
-
-  const addAllocation = (): void => {
-    // Seed weight as empty string — the backend treats a missing weight
-    // as a request for heuristic derivation (Sharpe-/Sortino-/profit-
-    // weighted per the objective).  A fixed ``0.5`` default defeated
-    // that path for every objective except ``manual``.  For ``manual``
-    // objective, a backend ``model_validator`` rejects omitted weights
-    // with a clear error, so the form still fails loudly when required.
-    setAllocations((prev) => [...prev, { candidate_id: "", weight: "" }]);
-  };
-
-  const removeAllocation = (idx: number): void => {
-    setAllocations((prev) => prev.filter((_, i) => i !== idx));
-  };
-
-  const updateAllocation = (
-    idx: number,
-    field: keyof AllocationRow,
-    value: string,
-  ): void => {
-    setAllocations((prev) =>
-      prev.map((row, i) => (i === idx ? { ...row, [field]: value } : row)),
-    );
-  };
-
-  const handleSubmit = async (): Promise<void> => {
-    if (!name.trim()) {
-      setFormError("Name is required.");
-      return;
-    }
-    const capital = parseFloat(baseCapital);
-    const lev = parseFloat(leverage);
-    if (isNaN(capital) || capital <= 0) {
-      setFormError("Base capital must be a positive number.");
-      return;
-    }
-    if (isNaN(lev) || lev <= 0) {
-      setFormError("Leverage must be a positive number.");
-      return;
-    }
-
-    // Serialize an empty or unparseable weight as ``null`` so the
-    // backend applies its heuristic-by-objective derivation.  The
-    // previous ``|| 0`` fallback was silently rejected by the tightened
-    // ``gt=0.0`` Pydantic validator and, before that, silently
-    // equal-weighted every allocation regardless of objective.
-    const parsedAllocations = allocations
-      .filter((a) => a.candidate_id.trim())
-      .map((a) => {
-        const trimmed = a.weight.trim();
-        const parsed = trimmed === "" ? null : parseFloat(trimmed);
-        return {
-          candidate_id: a.candidate_id.trim(),
-          weight:
-            parsed !== null && Number.isFinite(parsed) && parsed > 0
-              ? parsed
-              : null,
-        };
-      });
-
-    setSubmitting(true);
-    setFormError(null);
-    try {
-      const token = await getToken();
-      await apiPost<PortfolioResponse>(
-        "/api/v1/portfolios",
-        {
-          name: name.trim(),
-          description: description.trim() || null,
-          objective,
-          base_capital: capital,
-          requested_leverage: lev,
-          benchmark_symbol: benchmark.trim() || null,
-          allocations: parsedAllocations,
-        },
-        token,
-      );
-      resetForm();
-      onOpenChange(false);
-      onCreated();
-    } catch (err) {
-      const msg =
-        err instanceof ApiError
-          ? `Failed to create portfolio (${err.status})`
-          : "Failed to create portfolio";
-      setFormError(msg);
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <Dialog
-      open={open}
-      onOpenChange={(v) => {
-        if (!v) resetForm();
-        onOpenChange(v);
-      }}
-    >
-      <DialogTrigger asChild>
-        <Button size="sm">
-          <Plus className="mr-1.5 size-3.5" />
-          Create Portfolio
-        </Button>
-      </DialogTrigger>
-      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>Create Portfolio</DialogTitle>
-          <DialogDescription>
-            Define a weighted strategy allocation with backtest configuration.
-          </DialogDescription>
-        </DialogHeader>
-
-        {formError && (
-          <div className="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-400">
-            {formError}
-          </div>
-        )}
-
-        <div className="space-y-4">
-          {/* Name */}
-          <div className="space-y-1.5">
-            <Label htmlFor="pf-name">Name</Label>
-            <Input
-              id="pf-name"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="e.g. Momentum Basket Q2"
-            />
-          </div>
-
-          {/* Description */}
-          <div className="space-y-1.5">
-            <Label htmlFor="pf-desc">Description (optional)</Label>
-            <Textarea
-              id="pf-desc"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              placeholder="Portfolio rationale..."
-              rows={2}
-              className="resize-none"
-            />
-          </div>
-
-          {/* Objective */}
-          <div className="space-y-1.5">
-            <Label htmlFor="pf-objective">Objective</Label>
-            <Select value={objective} onValueChange={setObjective}>
-              <SelectTrigger id="pf-objective">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="maximize_sharpe">Maximize Sharpe</SelectItem>
-                <SelectItem value="equal_weight">Equal Weight</SelectItem>
-                <SelectItem value="manual">Manual</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-
-          {/* Capital + Leverage */}
-          <div className="grid grid-cols-2 gap-4">
-            <div className="space-y-1.5">
-              <Label htmlFor="pf-capital">Base Capital ($)</Label>
-              <Input
-                id="pf-capital"
-                type="number"
-                value={baseCapital}
-                onChange={(e) => setBaseCapital(e.target.value)}
-                min={0}
-                step={1000}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="pf-leverage">Leverage</Label>
-              <Input
-                id="pf-leverage"
-                type="number"
-                value={leverage}
-                onChange={(e) => setLeverage(e.target.value)}
-                min={0}
-                step={0.1}
-              />
-            </div>
-          </div>
-
-          {/* Benchmark */}
-          <div className="space-y-1.5">
-            <Label htmlFor="pf-benchmark">Benchmark Symbol (optional)</Label>
-            <Input
-              id="pf-benchmark"
-              value={benchmark}
-              onChange={(e) => setBenchmark(e.target.value)}
-              placeholder="SPY"
-            />
-          </div>
-
-          {/* Allocations */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <Label>Allocations</Label>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={addAllocation}
-              >
-                <Plus className="mr-1 size-3" />
-                Add Allocation
-              </Button>
-            </div>
-            {allocations.length === 0 ? (
-              <p className="text-xs text-muted-foreground">
-                At least one allocation is required. Weight is optional — leave
-                blank to let the portfolio objective derive it from candidate
-                metrics.
-              </p>
-            ) : (
-              <div className="space-y-2">
-                {allocations.map((alloc, idx) => (
-                  <div key={idx} className="flex items-end gap-2">
-                    <div className="flex-1 space-y-1">
-                      {idx === 0 && (
-                        <span className="text-xs text-muted-foreground">
-                          Candidate ID
-                        </span>
-                      )}
-                      <Input
-                        value={alloc.candidate_id}
-                        onChange={(e) =>
-                          updateAllocation(idx, "candidate_id", e.target.value)
-                        }
-                        placeholder="UUID"
-                        className="font-mono text-xs"
-                      />
-                    </div>
-                    <div className="w-24 space-y-1">
-                      {idx === 0 && (
-                        <span className="text-xs text-muted-foreground">
-                          Weight
-                        </span>
-                      )}
-                      <Input
-                        type="number"
-                        value={alloc.weight}
-                        onChange={(e) =>
-                          updateAllocation(idx, "weight", e.target.value)
-                        }
-                        min={0}
-                        max={1}
-                        step={0.05}
-                      />
-                    </div>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => removeAllocation(idx)}
-                      className="shrink-0"
-                    >
-                      <Trash2 className="size-3.5 text-muted-foreground" />
-                    </Button>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-
-        <DialogFooter>
-          <Button
-            variant="outline"
-            onClick={() => onOpenChange(false)}
-            disabled={submitting}
-          >
-            Cancel
-          </Button>
-          <Button onClick={() => void handleSubmit()} disabled={submitting}>
-            {submitting && <Loader2 className="mr-1.5 size-3.5 animate-spin" />}
-            Create
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Run Backtest Dialog
-// ---------------------------------------------------------------------------
-
-interface RunBacktestDialogProps {
-  portfolio: PortfolioResponse;
-  onCreated: () => void;
-}
-
-function RunBacktestDialog({
-  portfolio,
-  onCreated,
-}: RunBacktestDialogProps): React.ReactElement {
-  const { getToken } = useAuth();
-  const [open, setOpen] = useState<boolean>(false);
-  const [submitting, setSubmitting] = useState<boolean>(false);
-  const [formError, setFormError] = useState<string | null>(null);
-  const [startDate, setStartDate] = useState<string>("2024-01-01");
-  const [endDate, setEndDate] = useState<string>("2025-01-01");
-
-  const handleSubmit = async (): Promise<void> => {
-    if (!startDate || !endDate) {
-      setFormError("Start and end dates are required.");
-      return;
-    }
-    if (startDate >= endDate) {
-      setFormError("Start date must be before end date.");
-      return;
-    }
-    setSubmitting(true);
-    setFormError(null);
-    try {
-      const token = await getToken();
-      await apiPost<PortfolioRunResponse>(
-        `/api/v1/portfolios/${portfolio.id}/runs`,
-        { start_date: startDate, end_date: endDate },
-        token,
-      );
-      setOpen(false);
-      onCreated();
-    } catch (err) {
-      const msg =
-        err instanceof ApiError
-          ? `Failed to launch run (${err.status})`
-          : "Failed to launch run";
-      setFormError(msg);
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        <Button variant="outline" size="sm">
-          <Play className="mr-1 size-3" />
-          Run Backtest
-        </Button>
-      </DialogTrigger>
-      <DialogContent className="sm:max-w-md">
-        <DialogHeader>
-          <DialogTitle>Run Portfolio Backtest</DialogTitle>
-          <DialogDescription>
-            Launch a combined backtest for &ldquo;{portfolio.name}&rdquo;
-          </DialogDescription>
-        </DialogHeader>
-
-        {formError && (
-          <div className="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-400">
-            {formError}
-          </div>
-        )}
-
-        <div className="grid grid-cols-2 gap-4">
-          <div className="space-y-1.5">
-            <Label htmlFor={`run-start-${portfolio.id}`}>Start Date</Label>
-            <Input
-              id={`run-start-${portfolio.id}`}
-              type="date"
-              value={startDate}
-              onChange={(e) => setStartDate(e.target.value)}
-            />
-          </div>
-          <div className="space-y-1.5">
-            <Label htmlFor={`run-end-${portfolio.id}`}>End Date</Label>
-            <Input
-              id={`run-end-${portfolio.id}`}
-              type="date"
-              value={endDate}
-              onChange={(e) => setEndDate(e.target.value)}
-            />
-          </div>
-        </div>
-
-        <DialogFooter>
-          <Button
-            variant="outline"
-            onClick={() => setOpen(false)}
-            disabled={submitting}
-          >
-            Cancel
-          </Button>
-          <Button onClick={() => void handleSubmit()} disabled={submitting}>
-            {submitting && <Loader2 className="mr-1.5 size-3.5 animate-spin" />}
-            Launch
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Metric snippet helper
-// ---------------------------------------------------------------------------
-
 /**
  * Adaptive percent formatter — for micro-return portfolio backtests
  * the previous ``.toFixed(1)`` collapsed both Return and Drawdown to
@@ -540,7 +88,7 @@ function pctAdaptive(ratio: number): string {
   if (abs < 0.01) decimals = 4;
   else if (abs < 0.1) decimals = 3;
   else if (abs < 1) decimals = 2;
-  return `${pct >= 0 ? "" : ""}${pct.toFixed(decimals)}%`;
+  return `${pct.toFixed(decimals)}%`;
 }
 
 function metricsSnippet(metrics: Record<string, unknown> | null): string {
@@ -558,21 +106,12 @@ function metricsSnippet(metrics: Record<string, unknown> | null): string {
   return parts.length > 0 ? parts.join(" | ") : "--";
 }
 
-// ---------------------------------------------------------------------------
-// Main page
-// ---------------------------------------------------------------------------
-
 export default function PortfolioPage(): React.ReactElement {
   const { getToken } = useAuth();
   const [portfolios, setPortfolios] = useState<PortfolioResponse[]>([]);
   const [runs, setRuns] = useState<PortfolioRunResponse[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
-  const [createOpen, setCreateOpen] = useState<boolean>(false);
-
-  // -----------------------------------------------------------------------
-  // Data loading
-  // -----------------------------------------------------------------------
 
   const load = useCallback(async (): Promise<void> => {
     try {
@@ -607,24 +146,16 @@ export default function PortfolioPage(): React.ReactElement {
     };
   }, [load]);
 
-  // -----------------------------------------------------------------------
-  // Derived: portfolio name lookup for runs table
-  // -----------------------------------------------------------------------
-
-  const portfolioNameById: Record<string, string> = {};
-  for (const pf of portfolios) {
-    portfolioNameById[pf.id] = pf.name;
-  }
-
   // Sort runs newest-first
   const sortedRuns = [...runs].sort(
     (a, b) =>
       new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
   );
 
-  // -----------------------------------------------------------------------
-  // Render
-  // -----------------------------------------------------------------------
+  const portfolioNameById: Record<string, string> = {};
+  for (const pf of portfolios) {
+    portfolioNameById[pf.id] = pf.name;
+  }
 
   return (
     <div className="space-y-6">
@@ -636,11 +167,12 @@ export default function PortfolioPage(): React.ReactElement {
             Weighted strategy allocations with combined backtest runs
           </p>
         </div>
-        <CreatePortfolioDialog
-          open={createOpen}
-          onOpenChange={setCreateOpen}
-          onCreated={() => void load()}
-        />
+        <Button asChild size="sm" data-testid="portfolio-new-link">
+          <Link href="/portfolio/new">
+            <Plus className="mr-1.5 size-3.5" />
+            New Portfolio
+          </Link>
+        </Button>
       </div>
 
       {/* Error banner */}
@@ -664,11 +196,15 @@ export default function PortfolioPage(): React.ReactElement {
               Loading portfolios...
             </div>
           ) : portfolios.length === 0 ? (
-            <div className="flex h-32 flex-col items-center justify-center gap-2 text-sm text-muted-foreground">
+            <div className="flex h-40 flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
               <Briefcase className="size-8 opacity-40" />
-              <p>
-                No portfolios yet. Click &quot;Create Portfolio&quot; to start.
-              </p>
+              <p>No portfolios yet.</p>
+              <Button asChild size="sm" variant="outline">
+                <Link href="/portfolio/new">
+                  <Plus className="mr-1.5 size-3.5" />
+                  Compose your first portfolio
+                </Link>
+              </Button>
             </div>
           ) : (
             <Table>
@@ -680,21 +216,37 @@ export default function PortfolioPage(): React.ReactElement {
                   <TableHead className="text-right">Leverage</TableHead>
                   <TableHead>Benchmark</TableHead>
                   <TableHead className="text-right">Created</TableHead>
-                  <TableHead className="w-32" />
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {portfolios.map((pf) => (
-                  <TableRow key={pf.id} className="border-border/50">
+                  <TableRow
+                    key={pf.id}
+                    className="border-border/50"
+                    data-testid={`portfolio-row-${pf.id}`}
+                  >
                     <TableCell>
-                      <div>
-                        <p className="font-medium">{pf.name}</p>
+                      {/*
+                        Codex bot iter-12 P2 on PR #73: link to the detail
+                        page. The portfolio composer's run trigger lives on
+                        ``/portfolio/[id]`` now, so without a clickable
+                        path here the operator can't start a new backtest
+                        for an existing portfolio from the dashboard.
+                      */}
+                      <Link
+                        href={`/portfolio/${pf.id}`}
+                        className="group block"
+                        data-testid={`portfolio-link-${pf.id}`}
+                      >
+                        <p className="font-medium underline-offset-4 group-hover:underline">
+                          {pf.name}
+                        </p>
                         {pf.description && (
                           <p className="max-w-xs truncate text-xs text-muted-foreground">
                             {pf.description}
                           </p>
                         )}
-                      </div>
+                      </Link>
                     </TableCell>
                     <TableCell>
                       <Badge
@@ -715,12 +267,6 @@ export default function PortfolioPage(): React.ReactElement {
                     </TableCell>
                     <TableCell className="text-right text-muted-foreground">
                       {formatDateTime(pf.created_at)}
-                    </TableCell>
-                    <TableCell>
-                      <RunBacktestDialog
-                        portfolio={pf}
-                        onCreated={() => void load()}
-                      />
                     </TableCell>
                   </TableRow>
                 ))}
@@ -746,7 +292,7 @@ export default function PortfolioPage(): React.ReactElement {
           ) : sortedRuns.length === 0 ? (
             <div className="flex h-32 flex-col items-center justify-center gap-2 text-sm text-muted-foreground">
               <PieChart className="size-8 opacity-40" />
-              <p>No runs yet. Launch a backtest from a portfolio above.</p>
+              <p>No runs yet. Compose a portfolio to backtest it.</p>
             </div>
           ) : (
             <Table>
@@ -757,6 +303,7 @@ export default function PortfolioPage(): React.ReactElement {
                   <TableHead>Date Range</TableHead>
                   <TableHead>Metrics</TableHead>
                   <TableHead className="text-right">Created</TableHead>
+                  <TableHead className="w-10" />
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -782,6 +329,21 @@ export default function PortfolioPage(): React.ReactElement {
                     </TableCell>
                     <TableCell className="text-right text-muted-foreground">
                       {formatDateTime(run.created_at)}
+                    </TableCell>
+                    <TableCell>
+                      <Button
+                        asChild
+                        variant="ghost"
+                        size="icon-xs"
+                        aria-label="View portfolio run results"
+                      >
+                        <Link
+                          href={`/portfolio/runs/${run.id}`}
+                          data-testid={`portfolio-run-link-${run.id}`}
+                        >
+                          <ExternalLink className="size-3.5" />
+                        </Link>
+                      </Button>
                     </TableCell>
                   </TableRow>
                 ))}

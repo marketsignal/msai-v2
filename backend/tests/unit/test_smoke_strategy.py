@@ -78,13 +78,23 @@ class TestSmokeConfig:
         """The config's ``manage_stop`` default is True so a manually
         constructed config still gets the flatten-on-stop behavior
         (production always overrides it via Task 1.10's config
-        injection but the default matches)."""
+        injection but the default matches).
+
+        ``order_id_tag`` is inherited from the base ``StrategyConfig``
+        with default ``None``; the smoke fixture no longer redeclares
+        it with ``""`` because the Rust ``StrategyId`` validator rejects
+        an empty tag (``"Strategy-"``) and crashes the backtest
+        subprocess (E2E iter-2 EOFError root cause).
+        """
         cfg = SmokeMarketOrderConfig(
             instrument_id=InstrumentId.from_str("AAPL.NASDAQ"),
             bar_type=BarType.from_str("AAPL.NASDAQ-1-MINUTE-LAST-INTERNAL"),
         )
         assert cfg.manage_stop is True
-        assert cfg.order_id_tag == ""
+        # Base-class default is ``None``; subclass no longer overrides
+        # it with an empty string (would crash Nautilus's identifier
+        # validator on backtest spawn).
+        assert cfg.order_id_tag is None
 
 
 # ---------------------------------------------------------------------------

@@ -14,8 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from msai.core.database import get_db
 from msai.main import app
 from msai.schemas.portfolio import PortfolioCreate, PortfolioRunCreate
-from msai.services.portfolio_service import PortfolioService
-
+from msai.services.portfolio import PortfolioService
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -42,6 +41,11 @@ def _make_portfolio_row(
     row.downside_target = None
     row.benchmark_symbol = "SPY"
     row.account_id = None
+    # B5 safety caps + mode + allocator (defaults match the migration's server_defaults).
+    row.max_position_size = None
+    row.max_drawdown_halt = None
+    row.default_mode = "quick"
+    row.allocator_name = "equal_weight"
     row.created_by = None
     row.created_at = datetime.now(UTC)
     row.updated_at = datetime.now(UTC)
@@ -88,6 +92,12 @@ def _make_run_row(
     row.created_at = datetime.now(UTC)
     row.updated_at = datetime.now(UTC)
     row.completed_at = None
+    # B5 mode + optimizer-trace + IS/OOS (defaults match migration server_defaults).
+    row.mode = "quick"
+    row.optimization_trace = None
+    row.walk_forward_payload = None
+    row.is_metric = None
+    row.oos_metric = None
     return row
 
 
@@ -156,8 +166,15 @@ class TestCreatePortfolio:
     ) -> None:
         """create returns a portfolio and creates allocation rows."""
 
-        # Arrange: session.get returns a mock candidate for validation
-        mock_db.get.return_value = MagicMock()
+        # Arrange: session.get returns a candidate mock with a unique
+        # strategy_id per call so the iter-9 P1 duplicate-strategy check
+        # does not collapse the two allocations onto one strategy id.
+        def _make_candidate(*_: object, **__: object) -> MagicMock:
+            cand = MagicMock()
+            cand.strategy_id = uuid4()
+            return cand
+
+        mock_db.get.side_effect = _make_candidate
 
         # Arrange: flush assigns an id
         async def _flush() -> None:
@@ -190,7 +207,13 @@ class TestCreatePortfolio:
         self, service: PortfolioService, mock_db: AsyncMock
     ) -> None:
         """create sets created_by when user_id is provided."""
-        mock_db.get.return_value = MagicMock()
+
+        def _make_candidate(*_: object, **__: object) -> MagicMock:
+            cand = MagicMock()
+            cand.strategy_id = uuid4()
+            return cand
+
+        mock_db.get.side_effect = _make_candidate
 
         async def _flush() -> None:
             for call_args in mock_db.add.call_args_list:

@@ -899,11 +899,46 @@ def portfolio_run(
     max_parallelism: int = typer.Option(
         0, help="Parallel candidate backtests (0 = backend default)"
     ),
+    mode: str = typer.Option(
+        "quick",
+        "--mode",
+        help=(
+            "Backtest mode: 'quick' (single-shot) or 'full' (walk-forward + Optuna). "
+            "Defaults to 'quick'; passes through to the API unchanged."
+        ),
+    ),
+    n_trials: int = typer.Option(
+        0,
+        "--n-trials",
+        help=(
+            "Full-mode trial-count override (1-1000). Ignored unless --mode=full; "
+            "0 (the default) sends no override and the backend uses its configured "
+            "default (~100 trials)."
+        ),
+    ),
 ) -> None:
-    """Trigger a portfolio-level backtest run."""
+    """Trigger a portfolio-level backtest run.
+
+    ``--mode`` selects Quick (default) vs. Full backtest semantics on the
+    server. ``--n-trials`` caps the Full-mode Optuna search (1-1000); it is
+    only forwarded when ``--mode=full`` and non-zero so smoke-test callers
+    can run a fast Full pass without bumping the per-portfolio default.
+    """
+    mode_normalized = mode.strip().lower()
+    if mode_normalized not in {"quick", "full"}:
+        _fail(f"--mode must be 'quick' or 'full' (got {mode!r})")
     payload: dict[str, object] = {"start_date": start, "end_date": end}
     if max_parallelism > 0:
         payload["max_parallelism"] = max_parallelism
+    # Always send the requested mode explicitly. Omitting it makes the
+    # server inherit ``Portfolio.default_mode``, so a portfolio whose
+    # default is ``full`` would launch the Optuna walk-forward optimizer
+    # even when the operator typed ``--mode quick``. Codex bot iter-5 P2
+    # on PR #73 caught the silent escalation. ``--n-trials`` still only
+    # applies to Full mode.
+    payload["mode"] = mode_normalized
+    if mode_normalized == "full" and n_trials > 0:
+        payload["n_trials"] = n_trials
     response = _api_call(
         "POST",
         f"/api/v1/portfolios/{_url_id(portfolio_id)}/runs",
@@ -1660,7 +1695,6 @@ def strategy_delete(
     _emit_json(response.json())
 
 
-
 # ======================================================================
 # T3: graduation create + stage (modifies graduation_app)
 # ======================================================================
@@ -1981,6 +2015,160 @@ def portfolio_run_report(
         typer.echo(f"Report written to {out}", err=True)
     else:
         typer.echo(html)
+
+
+# ======================================================================
+# Portfolio-backtest CLI surface (PR companion to API+UI shipping):
+#   - create-from-strategies : F1c bridge POST /portfolios (strategy_ids path)
+#   - cancel                 : POST /portfolios/runs/{id}/cancel
+#   - promote-to-live        : POST /portfolios/runs/{id}/promote-to-live
+#
+# The ``portfolio create`` command above remains the JSON-body escape
+# hatch for legacy ``allocations[]`` callers and arbitrary payload shapes.
+# ``create-from-strategies`` is the convenience wrapper that exposes the
+# F1c strategy-first compose path with named flags so operators don't
+# have to hand-roll the JSON for the common case.
+# ======================================================================
+
+
+@portfolio_app.command("create-from-strategies")
+def portfolio_create_from_strategies(
+    name: str = typer.Option(..., "--name", help="Portfolio name (max 128 chars)"),
+    strategy_id: list[str] = typer.Option(
+        ...,
+        "--strategy-id",
+        help=(
+            "Strategy UUID to include in the portfolio. Pass once per "
+            "strategy: --strategy-id <uuid> --strategy-id <uuid> ..."
+        ),
+    ),
+    objective: str = typer.Option(
+        "maximize_sharpe",
+        "--objective",
+        help=(
+            "Objective: equal_weight, manual, maximize_profit, maximize_sharpe, "
+            "maximize_sortino, maximize_calmar, minimize_max_drawdown."
+        ),
+    ),
+    base_capital: float = typer.Option(
+        100000.0,
+        "--base-capital",
+        help="Base capital in account currency (must be > 0).",
+    ),
+    allocator: str = typer.Option(
+        "equal_weight",
+        "--allocator",
+        help=(
+            "Weight allocator: equal_weight, inverse_vol, vol_targeted, "
+            "fixed_weight (Quick mode only)."
+        ),
+    ),
+    default_mode: str = typer.Option(
+        "quick",
+        "--default-mode",
+        help="Default backtest mode for /runs: 'quick' or 'full'.",
+    ),
+    max_position_size: float = typer.Option(
+        0.0,
+        "--max-position-size",
+        help="Safety cap: max fraction of base capital per position (0,1]. 0 = no override.",
+    ),
+    max_drawdown_halt: float = typer.Option(
+        0.0,
+        "--max-drawdown-halt",
+        help=("Safety cap: drawdown threshold (0,1] that triggers a halt. 0 = no override."),
+    ),
+    description: str = typer.Option("", "--description", help="Optional description."),
+) -> None:
+    """Create a portfolio via the F1c strategy-first bridge.
+
+    POSTs to ``/api/v1/portfolios`` with the ``strategy_ids`` shape — the
+    orchestration layer auto-derives default :class:`GraduationCandidate`
+    rows from each strategy roster entry (one Candidate per Strategy,
+    idempotent on repeat compose).  No need to pre-graduate candidates or
+    hand-roll an ``allocations[]`` payload for the common case.
+
+    For the legacy explicit-Candidate path (custom weights, manual
+    objective with per-allocation overrides), use ``portfolio create
+    --config @payload.json`` instead.
+    """
+    mode_normalized = default_mode.strip().lower()
+    if mode_normalized not in {"quick", "full"}:
+        _fail(f"--default-mode must be 'quick' or 'full' (got {default_mode!r})")
+    if not strategy_id:
+        _fail("at least one --strategy-id is required")
+    payload: dict[str, object] = {
+        "name": name,
+        "objective": objective,
+        "base_capital": base_capital,
+        "strategy_ids": strategy_id,
+        "allocator_name": allocator,
+        "default_mode": mode_normalized,
+    }
+    if description:
+        payload["description"] = description
+    if max_position_size > 0:
+        payload["max_position_size"] = max_position_size
+    if max_drawdown_halt > 0:
+        payload["max_drawdown_halt"] = max_drawdown_halt
+    response = _api_call("POST", "/api/v1/portfolios", json_body=payload)
+    _emit_json(response.json())
+
+
+@portfolio_app.command("cancel")
+def portfolio_cancel(
+    run_id: str = typer.Argument(..., help="Portfolio run UUID to cancel"),
+) -> None:
+    """Cancel a non-terminal portfolio backtest run.
+
+    POSTs to ``/api/v1/portfolios/runs/{run_id}/cancel``. Returns 200 +
+    the updated run JSON on success, 404 if the run id doesn't exist,
+    or 409 if the run is already in a terminal state (completed /
+    failed / canceled). The worker's status-transition guard refuses
+    to lift a canceled run back to running, so the flip is safe even
+    under an arq retry race.
+    """
+    response = _api_call(
+        "POST",
+        f"/api/v1/portfolios/runs/{_url_id(run_id)}/cancel",
+    )
+    _emit_json(response.json())
+
+
+@portfolio_app.command("promote-to-live")
+def portfolio_promote_to_live(
+    run_id: str = typer.Argument(..., help="Portfolio run UUID (must be 'completed')"),
+    account_id: str = typer.Option(
+        ...,
+        "--account-id",
+        help=(
+            "IB account id to bind to the new live portfolio. Phase 1 paper-only: "
+            "must start with 'DU' (paper accounts). Real-money 'U...' ids are "
+            "rejected at the API with a 422 PAPER_ONLY_ENFORCED error."
+        ),
+    ),
+) -> None:
+    """Promote a completed portfolio run to a paper live portfolio.
+
+    POSTs to ``/api/v1/portfolios/runs/{run_id}/promote-to-live`` with
+    ``{"account_id": "DU..."}``. On success emits the new
+    ``live_portfolio_id`` + ``live_portfolio_revision_id`` so the
+    operator can immediately POST to ``/api/v1/live/start-portfolio``
+    with the revision id.
+
+    Phase 1 enforcement:
+
+    - run status must be ``completed`` (422 otherwise)
+    - ``account_id`` must start with ``DU`` (422 otherwise — paper only)
+    - the resulting composition must pass RiskEngine validation (422 otherwise)
+    """
+    payload: dict[str, object] = {"account_id": account_id}
+    response = _api_call(
+        "POST",
+        f"/api/v1/portfolios/runs/{_url_id(run_id)}/promote-to-live",
+        json_body=payload,
+    )
+    _emit_json(response.json())
 
 
 # ======================================================================

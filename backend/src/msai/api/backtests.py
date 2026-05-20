@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID  # noqa: TC003 — FastAPI resolves path param types at runtime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -190,6 +190,19 @@ def _prepare_and_validate_backtest_config(
                 prepared["bar_type"] = f"{canonical_id}-1-MINUTE-LAST-EXTERNAL"
         else:
             prepared["bar_type"] = f"{canonical_id}-1-MINUTE-LAST-EXTERNAL"
+
+    # Empty ``order_id_tag`` produces ``"Strategy-"`` which the Rust
+    # ``StrategyId`` validator rejects with a panic — the subprocess dies
+    # before any Python error handler can write the result pickle and the
+    # parent runner surfaces an opaque ``EOFError``. The base
+    # ``StrategyConfig`` default is ``order_id_tag=None`` (which the
+    # validator accepts), so strip empties to fall back to that default.
+    # Parity: ``workers/backtest_job._prepare_strategy_config`` does the
+    # same scrub — both helpers MUST stay byte-identical so
+    # ``Backtest.config`` (persisted by the API) matches what the worker
+    # runs (Contrarian Council Blocking Objection #2, 2026-04-20).
+    if prepared.get("order_id_tag") == "":
+        del prepared["order_id_tag"]
 
     # --- Locate config class ---
     if not config_class_name:
@@ -421,8 +434,17 @@ async def run_backtest(
 
 
 @router.get("/history", response_model=BacktestListResponse)
-async def list_backtests(
-    page: int = Query(default=1, ge=1),
+async def list_backtests(  # noqa: PLR0912 — three independent type-branches by design
+    # Codex bot iter-13 P1 on PR #73: ``type="all"`` fetches
+    # ``page * page_size`` rows per side so the in-Python merge below
+    # can interleave by created_at. With no upper bound on ``page``,
+    # an attacker (or a deeply-paginating UI) can force very large
+    # table reads + sort, degrading latency or exhausting worker
+    # memory. Cap ``page`` at 100 → worst-case fetch is 100 × 100 ×
+    # 2 sides = 20K rows, which is comfortably bounded. Operators
+    # paginating deeper should use ``type=single`` / ``type=portfolio``
+    # (which use proper OFFSET+LIMIT and stay bounded per request).
+    page: int = Query(default=1, ge=1, le=100),
     page_size: int = Query(default=20, ge=1, le=100),
     include_smoke: bool = Query(
         default=False,
@@ -434,52 +456,198 @@ async def list_backtests(
             "their human history. Set ``true`` for diagnostic / audit views."
         ),
     ),
+    type: Literal["single", "portfolio", "all"] = Query(  # noqa: A002 — public query name
+        default="all",
+        description=(
+            "Filter history rows by source type. ``single`` returns only "
+            "single-strategy Backtests; ``portfolio`` returns only "
+            "PortfolioRuns; ``all`` (default) returns both, interleaved by "
+            "``created_at`` descending."
+        ),
+    ),
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> BacktestListResponse:
-    """List past backtests with pagination.
+    """List past backtests (single-strategy + portfolio runs) with pagination.
 
     Deploy-time smoke backtests are filtered by default (``smoke=False``).
     Pass ``include_smoke=true`` to see them — useful when diagnosing a
     deploy failure or auditing the smoke history.
+
+    The ``type`` query param routes between three views:
+
+    - ``single`` — only single-strategy Backtest rows.
+    - ``portfolio`` — only PortfolioRun rows (joined with Portfolio for name).
+    - ``all`` (default) — both, interleaved by ``created_at`` descending so
+      the UI can render a unified timeline with per-row discriminators.
     """
-    # Build the optionally-filtered query once and reuse for count + page.
-    base_query = select(Backtest)
-    count_query = select(func.count()).select_from(Backtest)
-    if not include_smoke:
-        base_query = base_query.where(Backtest.smoke.is_(False))
-        count_query = count_query.where(Backtest.smoke.is_(False))
+    items: list[BacktestListItem] = []
+    total = 0
 
-    count_result = await db.execute(count_query)
-    total: int = count_result.scalar_one()
+    # ---- Single-strategy Backtest rows ----
+    # Codex bot iter-13 P2 on PR #73: defer the heavy JSON columns
+    # (``metrics``, ``series``) on the list path. The response only
+    # uses summary fields (id, status, dates, error envelope), but
+    # ``select(Backtest)`` would otherwise pull multi-MB JSONB blobs
+    # per row — DB + serialization overhead scales linearly with the
+    # heaviest row instead of the summary projection. ``defer()``
+    # leaves the columns on the model so any later attribute access
+    # would re-fetch; we never touch them on this path.
+    from sqlalchemy.orm import defer as _defer  # noqa: PLC0415
 
-    offset = (page - 1) * page_size
-    result = await db.execute(
-        base_query.order_by(Backtest.created_at.desc()).offset(offset).limit(page_size)
-    )
-    backtests = result.scalars().all()
-
-    items = [
-        BacktestListItem(
-            id=bt.id,
-            strategy_id=bt.strategy_id,
-            status=bt.status,
-            start_date=bt.start_date,
-            end_date=bt.end_date,
-            created_at=bt.created_at,
-            # Only surface error fields on failed rows; sanitize-on-read
-            # when error_public_message is NULL (pre-migration) but error_message set.
-            error_code=bt.error_code if bt.status == "failed" else None,
-            error_public_message=(
-                (bt.error_public_message or sanitize_public_message(bt.error_message))
-                if bt.status == "failed"
-                else None
-            ),
-            phase=bt.phase,  # type: ignore[arg-type]
-            progress_message=bt.progress_message,
+    if type in ("single", "all"):
+        single_query = select(Backtest).options(
+            _defer(Backtest.metrics),
+            _defer(Backtest.series),
         )
-        for bt in backtests
-    ]
+        single_count_query = select(func.count()).select_from(Backtest)
+        if not include_smoke:
+            single_query = single_query.where(Backtest.smoke.is_(False))
+            single_count_query = single_count_query.where(Backtest.smoke.is_(False))
+
+        if type == "single":
+            # Page directly off the Backtest table — same shape as the
+            # legacy /history response so existing single-view clients
+            # see no behavior change.
+            count_result = await db.execute(single_count_query)
+            total = count_result.scalar_one()
+            offset = (page - 1) * page_size
+            backtests = (
+                (
+                    await db.execute(
+                        single_query.order_by(Backtest.created_at.desc())
+                        .offset(offset)
+                        .limit(page_size)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        else:
+            # ``all`` mode — fetch up to ``page * page_size`` rows so the
+            # merge below can interleave with PortfolioRuns. This is the
+            # simplest correct strategy: union in Python after each side
+            # is ordered + capped. Operators paginating deep see a small
+            # over-fetch; the alternative (SQL UNION ALL across two
+            # tables with disjoint columns) is more code for no win at
+            # this row scale.
+            backtests = (
+                (
+                    await db.execute(
+                        single_query.order_by(Backtest.created_at.desc()).limit(page * page_size)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+        items.extend(
+            BacktestListItem(
+                id=bt.id,
+                type="single",
+                strategy_id=bt.strategy_id,
+                status=bt.status,
+                start_date=bt.start_date,
+                end_date=bt.end_date,
+                created_at=bt.created_at,
+                # Only surface error fields on failed rows; sanitize-on-read
+                # when error_public_message is NULL (pre-migration) but
+                # error_message set.
+                error_code=bt.error_code if bt.status == "failed" else None,
+                error_public_message=(
+                    (bt.error_public_message or sanitize_public_message(bt.error_message))
+                    if bt.status == "failed"
+                    else None
+                ),
+                phase=bt.phase,  # type: ignore[arg-type]
+                progress_message=bt.progress_message,
+            )
+            for bt in backtests
+        )
+
+    # ---- PortfolioRun rows ----
+    if type in ("portfolio", "all"):
+        # Inline imports kept co-located with usage so the PostToolUse ruff
+        # formatter does not strip them from the module-level import block
+        # (see ``feedback_colocate_imports_with_usage_in_edits.md``).
+        from msai.models.portfolio import Portfolio
+        from msai.models.portfolio_run import PortfolioRun
+
+        # Codex bot iter-13 P2 on PR #73: same shape — defer the heavy
+        # JSON columns. PortfolioRun has FOUR multi-MB candidates
+        # (``metrics`` / ``series`` / ``allocations`` /
+        # ``optimization_trace`` / ``walk_forward_payload``), so the
+        # list response benefits even more from the projection.
+        portfolio_query = (
+            select(PortfolioRun, Portfolio.name)
+            .join(Portfolio, PortfolioRun.portfolio_id == Portfolio.id)
+            .options(
+                _defer(PortfolioRun.metrics),
+                _defer(PortfolioRun.series),
+                _defer(PortfolioRun.allocations),
+                _defer(PortfolioRun.optimization_trace),
+                _defer(PortfolioRun.walk_forward_payload),
+            )
+            .order_by(PortfolioRun.created_at.desc())
+        )
+        portfolio_count_query = select(func.count()).select_from(PortfolioRun)
+
+        if type == "portfolio":
+            count_result = await db.execute(portfolio_count_query)
+            total = count_result.scalar_one()
+            offset = (page - 1) * page_size
+            portfolio_rows = (
+                await db.execute(portfolio_query.offset(offset).limit(page_size))
+            ).all()
+        else:
+            # See "all" comment above — fetch up to page * page_size for merging.
+            portfolio_rows = (await db.execute(portfolio_query.limit(page * page_size))).all()
+
+        items.extend(
+            BacktestListItem(
+                id=pr.id,
+                type="portfolio",
+                strategy_id=None,
+                portfolio_id=pr.portfolio_id,
+                portfolio_name=portfolio_name,
+                status=pr.status,
+                start_date=pr.start_date,
+                end_date=pr.end_date,
+                created_at=pr.created_at,
+                # PortfolioRun's error_message is a generic Text column —
+                # there is no error_code/error_public_message split on the
+                # row, so we expose the raw error_message under
+                # error_public_message and leave error_code unset. The
+                # frontend already renders the text verbatim for portfolio
+                # rows.
+                error_code="portfolio_run_failed" if pr.status == "failed" else None,
+                error_public_message=(pr.error_message if pr.status == "failed" else None),
+                phase=None,
+                progress_message=None,
+            )
+            for pr, portfolio_name in portfolio_rows
+        )
+
+    # ---- Merge + paginate for ``all`` mode ----
+    if type == "all":
+        # Stable sort by created_at desc; ties resolve by type (single
+        # before portfolio) so the order is deterministic across runs.
+        items.sort(key=lambda i: (i.created_at, i.type), reverse=True)
+        # Counts: combine both tables. We re-query because the over-fetch
+        # above only captured page * page_size from each side.
+        from msai.models.portfolio_run import PortfolioRun as PortfolioRunForCount
+
+        single_count_query = select(func.count()).select_from(Backtest)
+        if not include_smoke:
+            single_count_query = single_count_query.where(Backtest.smoke.is_(False))
+        single_total = (await db.execute(single_count_query)).scalar_one()
+        portfolio_total = (
+            await db.execute(select(func.count()).select_from(PortfolioRunForCount))
+        ).scalar_one()
+        total = single_total + portfolio_total
+
+        offset = (page - 1) * page_size
+        items = items[offset : offset + page_size]
 
     return BacktestListResponse(items=items, total=total)
 

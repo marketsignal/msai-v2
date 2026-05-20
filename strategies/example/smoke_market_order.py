@@ -39,10 +39,23 @@ class SmokeMarketOrderConfig(StrategyConfig, frozen=True, kw_only=True):
     """Config for :class:`SmokeMarketOrderStrategy`.
 
     ``instrument_id`` + ``bar_type`` are required. ``manage_stop`` and
-    ``order_id_tag`` are the two fields the ``build_live_trading_node_config``
-    builder injects at startup (Task 1.10) — they live here with
-    defaults so unit tests that instantiate the config directly don't
-    need to supply them, but production always passes real values.
+    ``order_id_tag`` are inherited from the base
+    :class:`nautilus_trader.trading.config.StrategyConfig` and injected at
+    runtime by ``build_live_trading_node_config`` (Task 1.10) with real
+    values; backtests rely on the base class default ``order_id_tag=None``.
+
+    Why we DON'T redeclare ``order_id_tag`` with a default of ``""``:
+    Nautilus's strategy constructor builds ``StrategyId`` as
+    ``f"{component_id}-{config.order_id_tag}"`` (``trading/strategy.pyx:149``).
+    An empty-string ``order_id_tag`` produces ``"SmokeMarketOrderStrategy-"``
+    which the Rust ``StrategyId`` validator rejects with
+    ``Condition failed: 'value' tag part (after '-') cannot be empty`` —
+    the subprocess panics before it can write a result pickle, so the
+    parent BacktestRunner sees an empty file and raises ``EOFError: Ran
+    out of input``. Leaving ``order_id_tag`` inherited (default ``None``)
+    produces ``"SmokeMarketOrderStrategy-None"`` which the validator
+    accepts, and production live deployments always inject a real value
+    via the live config builder.
 
     ``kw_only=True`` is required because ``StrategyConfig`` (the base)
     has fields with defaults, and msgspec refuses required positional
@@ -53,7 +66,6 @@ class SmokeMarketOrderConfig(StrategyConfig, frozen=True, kw_only=True):
     instrument_id: InstrumentId
     bar_type: BarType
     manage_stop: bool = True
-    order_id_tag: str = ""
 
 
 class SmokeMarketOrderStrategy(Strategy):

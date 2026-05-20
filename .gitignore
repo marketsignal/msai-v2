@@ -85,3 +85,9 @@ data/databento_definitions/
 
 # Superpowers brainstorming visual companion (per-session mockups)
 .superpowers/
+
+# Optimizer journal files (Optuna)
+data/research/
+
+# Subdirectory .claude/local (shouldn't exist; defensive)
+backend/.claude/
