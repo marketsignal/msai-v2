@@ -4,6 +4,26 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-05-20 — Fix-2: MSAL scope `.default` → `access_as_user` (still PROD OUTAGE) (`fix/msal-scope-access-as-user`)
+
+**Why a second fix:** PR #74's `.default` choice failed in prod with AADSTS500011 (`invalid_resource`) — Codex `/codex` second opinion with live Microsoft docs lookup identified two problems:
+
+1. **Application ID URI was not configured** on the Entra ID app registration `24a60bec...`. Pablo added the URI + a delegated scope `access_as_user` via the portal (Entra ID → App registrations → Expose an API).
+2. **`.default` is the wrong scope for a SPA calling its OWN API** — Microsoft's `scopes-oidc` docs explicitly say `.default` can return an ID token instead of an access token in this scenario; "new clients shouldn't use that setup." `.default` is intended for static/admin-consent flows (OBO, client-credentials), not interactive SPA→own-API.
+
+**Fix:** Swap `.default` → `access_as_user` (explicit delegated scope, defined under Expose an API in the portal):
+
+```diff
+-`api://${NEXT_PUBLIC_AZURE_CLIENT_ID}/.default`
++`api://${NEXT_PUBLIC_AZURE_CLIENT_ID}/access_as_user`
+```
+
+**Process correction:** PR #74's plan reviewed Option A (`access_as_user`) vs Option B (`.default`) and chose B on recovery-latency grounds — incorrect, both options needed the same portal step AND `.default` had documented semantic issues for this scenario. The corrected plan keeps Option A and pairs it with the portal config.
+
+**Files changed:** 1 (`frontend/src/lib/msal-config.ts` — single literal swap).
+
+---
+
 ### 2026-05-20 — Fix: MSAL frontend requested Graph scope; backend rejected token (PROD OUTAGE) (`fix/msal-backend-scope`)
 
 **Severity:** P0 — every authenticated `/api/v1/*` endpoint returned 401 "Invalid token: Signature verification failed" in production. No one could log in and use the app. Latent for ~6 weeks since MSAL was first wired into the frontend; surfaced 2026-05-20 by a manual UI smoke after PR #73's portfolio-backtest deploy.
