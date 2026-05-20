@@ -16,10 +16,8 @@ import os
 # behavior) still wins.
 os.environ.setdefault("ENVIRONMENT", "test")
 
-from collections.abc import Callable, Generator  # noqa: E402
 from datetime import UTC, datetime  # noqa: E402
-from pathlib import Path  # noqa: E402
-from typing import Any  # noqa: E402
+from typing import TYPE_CHECKING, Any  # noqa: E402
 
 import httpx  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -30,6 +28,10 @@ import pytest  # noqa: E402
 from msai.core.auth import get_current_user  # noqa: E402
 from msai.main import app  # noqa: E402
 from msai.services.symbol_onboarding.partition_index import PartitionRow  # noqa: E402
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Generator
+    from pathlib import Path
 
 # setup_logging() (called at msai.main import) disables
 # cache_logger_on_first_use when ENVIRONMENT=="test", which the env-setdefault
