@@ -97,9 +97,7 @@ async def get_strategy(
     # DETAIL path opts into the soft-delete filter (plan R20) so historical
     # backtest detail pages can still resolve an archived strategy.
     result = await db.execute(
-        select(Strategy)
-        .where(Strategy.id == strategy_id)
-        .execution_options(include_deleted=True)
+        select(Strategy).where(Strategy.id == strategy_id).execution_options(include_deleted=True)
     )
     strategy: Strategy | None = result.scalar_one_or_none()
 
@@ -124,6 +122,18 @@ async def get_strategy(
     )
 
 
+# Keys that the portfolio orchestrator injects at backtest dispatch from the
+# candidate's ``instruments`` list + the platform's canonical bar_type. Setting
+# these on ``strategy.default_config`` silently snapshots into every
+# GraduationCandidate.config created during the buggy window — even after the
+# operator reverts the default_config, the merge order at
+# ``services/portfolio/orchestration.py:1062`` puts candidate.config on top
+# and the poison persists. See memory entry
+# ``feedback_candidate_config_snapshots_stale_default_config.md`` for the full
+# 4-hour chain from 2026-05-20 night.
+_MANAGED_DEFAULT_CONFIG_KEYS: frozenset[str] = frozenset({"instrument_id", "bar_type"})
+
+
 @router.patch("/{strategy_id}", response_model=StrategyResponse)
 async def update_strategy(
     strategy_id: UUID,
@@ -131,7 +141,41 @@ async def update_strategy(
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> StrategyResponse:
-    """Update a strategy's default_config and/or description."""
+    """Update a strategy's default_config and/or description.
+
+    Rejects 422 if ``default_config`` contains ``instrument_id`` or
+    ``bar_type`` — these are dispatch-time fields injected by the portfolio
+    orchestrator at runtime, not strategy-level defaults. Setting them on
+    ``default_config`` silently poisons every GraduationCandidate created
+    during the buggy window.
+    """
+    if body.default_config is not None:
+        rejected = sorted(_MANAGED_DEFAULT_CONFIG_KEYS.intersection(body.default_config.keys()))
+        if rejected:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": {
+                        "code": "MANAGED_CONFIG_KEY",
+                        "message": (
+                            f"Cannot set {sorted(_MANAGED_DEFAULT_CONFIG_KEYS)} on "
+                            "strategy default_config. These are dispatch-time fields "
+                            "injected by the portfolio orchestrator from the "
+                            "candidate's `instruments` list plus the platform's "
+                            "canonical bar_type. Setting them on default_config "
+                            "silently snapshots into every candidate created during "
+                            "this window and breaks subsequent backtests when reverted."
+                        ),
+                        "details": [
+                            {
+                                "field": "default_config",
+                                "rejected_keys": rejected,
+                            }
+                        ],
+                    }
+                },
+            )
+
     result = await db.execute(select(Strategy).where(Strategy.id == strategy_id))
     strategy: Strategy | None = result.scalar_one_or_none()
 
