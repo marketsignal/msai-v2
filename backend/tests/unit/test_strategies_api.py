@@ -230,3 +230,165 @@ class TestValidateStrategy:
 
         # Assert
         assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Tests: PATCH /api/v1/strategies/{id} rejects dispatch-time fields
+# ---------------------------------------------------------------------------
+
+
+class TestPatchStrategyRejectsManagedKeys:
+    """The PATCH endpoint must reject ``default_config`` payloads that try to
+    set ``instrument_id`` or ``bar_type``.
+
+    These are dispatch-time fields injected by the portfolio orchestrator at
+    runtime from the candidate's ``instruments`` list plus the platform's
+    canonical bar_type. Setting them on ``strategy.default_config`` silently
+    snapshots into every GraduationCandidate.config created during the
+    buggy window (per ``services/portfolio/orchestration.py:1062`` merge
+    order ``{**default_config, **candidate.config}`` puts candidate ON TOP).
+    Reverting the default_config doesn't help — candidate snapshots persist.
+
+    Repro chain: 2026-05-20 night EMA Cross backtest produced 0 events for
+    4 hours until the operator psql-edited the poisoned candidate. See
+    ``memory/feedback_candidate_config_snapshots_stale_default_config.md``.
+    """
+
+    def _make_strategy(self) -> Strategy:
+        return Strategy(
+            id=uuid4(),
+            name="example.ema_cross",
+            description="EMA Cross",
+            file_path="/app/strategies/example/ema_cross.py",
+            strategy_class="EMACrossStrategy",
+            config_class="EMACrossConfig",
+            config_schema={
+                "type": "object",
+                "properties": {
+                    "instrument_id": {"type": "string"},
+                    "bar_type": {"type": "string"},
+                    "fast_ema_period": {"type": "integer", "default": 10},
+                },
+            },
+            default_config={"fast_ema_period": 10},
+            config_schema_status="ready",
+            code_hash="hash",
+            created_at=datetime.now(UTC),
+        )
+
+    async def test_patch_with_instrument_id_in_default_config_returns_422(
+        self, client: httpx.AsyncClient, fake_db_session: _FakeSession
+    ) -> None:
+        """PATCH with default_config containing instrument_id is rejected."""
+        # Arrange
+        strategy = self._make_strategy()
+        fake_db_session._rows.append(strategy)
+
+        # Act
+        response = await client.patch(
+            f"/api/v1/strategies/{strategy.id}",
+            json={"default_config": {"instrument_id": "AAPL.NASDAQ"}},
+        )
+
+        # Assert
+        assert response.status_code == 422
+        body = response.json()
+        detail = body.get("detail", body)
+        error = detail.get("error", detail)
+        assert error.get("code") == "MANAGED_CONFIG_KEY"
+        rejected = error.get("details", [{}])[0].get("rejected_keys", [])
+        assert "instrument_id" in rejected
+        # Strategy state unchanged
+        assert strategy.default_config == {"fast_ema_period": 10}
+
+    async def test_patch_with_bar_type_in_default_config_returns_422(
+        self, client: httpx.AsyncClient, fake_db_session: _FakeSession
+    ) -> None:
+        """PATCH with default_config containing bar_type is rejected."""
+        # Arrange
+        strategy = self._make_strategy()
+        fake_db_session._rows.append(strategy)
+
+        # Act
+        response = await client.patch(
+            f"/api/v1/strategies/{strategy.id}",
+            json={
+                "default_config": {"bar_type": "AAPL.NASDAQ-1-DAY-LAST-EXTERNAL"}
+            },
+        )
+
+        # Assert
+        assert response.status_code == 422
+        body = response.json()
+        detail = body.get("detail", body)
+        error = detail.get("error", detail)
+        assert error.get("code") == "MANAGED_CONFIG_KEY"
+        rejected = error.get("details", [{}])[0].get("rejected_keys", [])
+        assert "bar_type" in rejected
+        # Strategy state unchanged
+        assert strategy.default_config == {"fast_ema_period": 10}
+
+    async def test_patch_with_both_managed_keys_lists_both_in_error(
+        self, client: httpx.AsyncClient, fake_db_session: _FakeSession
+    ) -> None:
+        """PATCH with both managed keys returns 422 listing both in the error."""
+        # Arrange
+        strategy = self._make_strategy()
+        fake_db_session._rows.append(strategy)
+
+        # Act
+        response = await client.patch(
+            f"/api/v1/strategies/{strategy.id}",
+            json={
+                "default_config": {
+                    "instrument_id": "AAPL.NASDAQ",
+                    "bar_type": "AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL",
+                    "fast_ema_period": 20,
+                }
+            },
+        )
+
+        # Assert
+        assert response.status_code == 422
+        body = response.json()
+        detail = body.get("detail", body)
+        error = detail.get("error", detail)
+        assert error.get("code") == "MANAGED_CONFIG_KEY"
+        rejected = set(error.get("details", [{}])[0].get("rejected_keys", []))
+        assert rejected == {"instrument_id", "bar_type"}
+
+    async def test_patch_legitimate_field_still_works(
+        self, client: httpx.AsyncClient, fake_db_session: _FakeSession
+    ) -> None:
+        """PATCH with a non-managed default_config field still succeeds (control test)."""
+        # Arrange
+        strategy = self._make_strategy()
+        fake_db_session._rows.append(strategy)
+
+        # Act
+        response = await client.patch(
+            f"/api/v1/strategies/{strategy.id}",
+            json={"default_config": {"fast_ema_period": 25}},
+        )
+
+        # Assert
+        assert response.status_code == 200
+        assert strategy.default_config == {"fast_ema_period": 25}
+
+    async def test_patch_description_without_default_config_works(
+        self, client: httpx.AsyncClient, fake_db_session: _FakeSession
+    ) -> None:
+        """PATCH that only touches description doesn't trigger the validator."""
+        # Arrange
+        strategy = self._make_strategy()
+        fake_db_session._rows.append(strategy)
+
+        # Act
+        response = await client.patch(
+            f"/api/v1/strategies/{strategy.id}",
+            json={"description": "Updated description"},
+        )
+
+        # Assert
+        assert response.status_code == 200
+        assert strategy.description == "Updated description"
