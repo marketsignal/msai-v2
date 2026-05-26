@@ -45,6 +45,7 @@ import {
 } from "@/components/ui/tooltip";
 import { ExternalLink } from "lucide-react";
 import { RunBacktestForm } from "@/components/backtests/run-form";
+import { RunSmokeButton } from "@/components/backtests/run-smoke-button";
 import {
   apiGet,
   ApiError,
@@ -149,11 +150,14 @@ export default function BacktestsPage(): React.ReactElement {
             Run and review historical strategy + portfolio backtests
           </p>
         </div>
-        <RunBacktestForm
-          open={runDialogOpen}
-          onOpenChange={setRunDialogOpen}
-          onSubmitted={() => void load()}
-        />
+        <div className="flex items-center gap-2">
+          <RunSmokeButton />
+          <RunBacktestForm
+            open={runDialogOpen}
+            onOpenChange={setRunDialogOpen}
+            onSubmitted={() => void load()}
+          />
+        </div>
       </div>
 
       {error && (
