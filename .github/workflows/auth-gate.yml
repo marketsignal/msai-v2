@@ -1,0 +1,76 @@
+name: Auth Regression Gate
+
+# PR-time gate that catches the May 20 MSAL outage class. See
+# docs/plans/2026-05-25-ui-e2e-auth-setup.md for the full design.
+#
+# Three gates wrapped in two parallel jobs:
+#   - frontend-lint   = Gate 1 (MSAL scope AST lint, msai/msal-scopes-* rule)
+#   - backend-auth-gate = Gates 2 + 3 (synthetic-JWT middleware contract +
+#                                       identity-contract cross-file lint)
+#
+# Both gates must pass for merge to main. No network access during gates.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: auth-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend-lint:
+    name: Gate 1 — MSAL scope lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: ESLint (msai/msal-scopes-must-be-api-or-oidc)
+        working-directory: frontend
+        run: pnpm lint
+
+      - name: RuleTester (test the rule itself)
+        working-directory: frontend
+        run: node --test eslint-rules/__tests__/msal-scopes.test.mjs
+
+  backend-auth-gate:
+    name: Gates 2+3 — JWT contract + identity-contract lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: uv sync --extra dev
+
+      - name: Pytest (Gate 2 — JWT contract + WS path)
+        working-directory: backend
+        run: uv run pytest tests/integration/auth_gate/test_auth_contract.py -v
+
+      - name: Pytest (Gate 3 — identity contract lint)
+        working-directory: backend
+        run: uv run pytest tests/integration/auth_gate/test_identity_contract.py -v
