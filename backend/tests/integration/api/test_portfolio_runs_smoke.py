@@ -17,6 +17,7 @@ PRD docs/prds/ingest-backtest-smoke-test.md v1.3.
 from __future__ import annotations
 
 import pytest
+import pytest_asyncio
 
 
 @pytest.fixture
@@ -83,3 +84,181 @@ async def test_create_portfolio_run_smoke_defaults_false(
     # Assert
     assert response.status_code == 201, response.text
     assert response.json()["smoke"] is False
+
+
+# ---------------------------------------------------------------------------
+# T7: POST /api/v1/portfolios/smoke/runs?config=fast shortcut endpoint
+#
+# The route is registered BEFORE ``/{portfolio_id}/runs`` so FastAPI does not
+# try to bind ``'smoke'`` as a UUID path parameter and emit a 422. The route
+# delegates to ``services.smoke.runner.run_smoke()`` (no HTTP-to-self), which:
+#   1) pre-ingests AAPL+SPY via ``data_ingestion.ingest_symbols`` -- mocked
+#      out here so the test does not hit Databento,
+#   2) bootstraps the canonical ``__msai_smoke__`` Portfolio (requires the
+#      4 pre-seeded smoke Strategy rows; the Alembic seed migration is not
+#      applied in the test DB which uses ``Base.metadata.create_all``, so
+#      the fixture below seeds them by hand via the standard ORM),
+#   3) creates a ``PortfolioRun`` with ``smoke=True`` and enqueues it -- the
+#      enqueue path is the same one the existing ``_mock_enqueue`` fixture
+#      monkeypatches in this file.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _mock_ingest(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub ``ingest_symbols`` to a no-op so the smoke route never hits Databento.
+
+    The smoke runner imports ``ingest_symbols`` at module load time, so the
+    patch must target the name in ``services.smoke.runner``'s namespace.
+    """
+    from msai.services.data_ingestion import IngestResult
+
+    async def _stub_ingest_symbols(  # noqa: ANN401
+        _asset_class: str,
+        symbols: list[str],
+        _start: str,
+        _end: str,
+        **_kwargs: object,
+    ) -> IngestResult:
+        return IngestResult(
+            bars_written=0,
+            symbols_covered=list(symbols),
+            empty_symbols=[],
+        )
+
+    monkeypatch.setattr("msai.services.smoke.runner.ingest_symbols", _stub_ingest_symbols)
+
+
+@pytest.fixture
+def _mock_smoke_redis(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub the Redis pool + ingest-lock helpers used by the smoke runner.
+
+    ``runner._ensure_ingested`` calls ``get_redis_pool`` + the mutex helpers
+    on its own (not via the API router's imports), so the route-side
+    ``_mock_enqueue`` fixture doesn't cover them.
+    """
+
+    class _StubPool:
+        async def close(self) -> None:
+            return None
+
+    async def _stub_get_pool() -> _StubPool:
+        return _StubPool()
+
+    async def _stub_acquire(  # noqa: ANN401
+        _pool: object,
+        *,
+        symbol: str,
+        window_start: object,
+        ttl_seconds: int,
+        wait_timeout_seconds: int,
+    ) -> str:
+        return f"stub-token-{symbol}"
+
+    async def _stub_release(  # noqa: ANN401
+        _pool: object,
+        *,
+        symbol: str,
+        window_start: object,
+        token: str,
+    ) -> bool:
+        return True
+
+    async def _stub_enqueue(_pool: object, _run_id: str, _portfolio_id: str) -> str:
+        return "stub-job-id"
+
+    monkeypatch.setattr("msai.services.smoke.runner.get_redis_pool", _stub_get_pool)
+    monkeypatch.setattr("msai.services.smoke.runner.acquire_ingest_lock", _stub_acquire)
+    monkeypatch.setattr("msai.services.smoke.runner.release_ingest_lock", _stub_release)
+    # The runner imports enqueue_portfolio_run directly from msai.core.queue
+    # (NOT via msai.api.portfolio's namespace), so _mock_enqueue's patch
+    # doesn't cover this path. Patch the runner's local binding too.
+    monkeypatch.setattr("msai.services.smoke.runner.enqueue_portfolio_run", _stub_enqueue)
+
+
+@pytest_asyncio.fixture
+async def _seed_smoke_strategies(
+    portfolio_session_factory,
+) -> None:
+    """Seed the 4 canonical smoke Strategy rows the runner expects to find.
+
+    The Alembic seed migration (Task 1) populates these in production. The
+    test DB is built via ``Base.metadata.create_all`` (no Alembic), so the
+    rows must be inserted here for ``_get_or_create_canonical_portfolio``
+    to succeed.
+    """
+    from msai.models.strategy import Strategy
+
+    rows = [
+        {
+            "name": "__smoke__/smoke_market_order/AAPL",
+            "file_path": "strategies/example/smoke_market_order.py",
+            "strategy_class": "SmokeMarketOrderStrategy",
+            "config_class": "SmokeMarketOrderConfig",
+            "default_config": {
+                "instrument_id": "AAPL.NASDAQ",
+                "bar_type": "AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL",
+            },
+        },
+        {
+            "name": "__smoke__/smoke_market_order/SPY",
+            "file_path": "strategies/example/smoke_market_order.py",
+            "strategy_class": "SmokeMarketOrderStrategy",
+            "config_class": "SmokeMarketOrderConfig",
+            "default_config": {
+                "instrument_id": "SPY.NASDAQ",
+                "bar_type": "SPY.NASDAQ-1-MINUTE-LAST-EXTERNAL",
+            },
+        },
+        {
+            "name": "__smoke__/ema_cross/AAPL",
+            "file_path": "strategies/example/ema_cross.py",
+            "strategy_class": "EMACrossStrategy",
+            "config_class": "EMACrossConfig",
+            "default_config": {
+                "instrument_id": "AAPL.NASDAQ",
+                "bar_type": "AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL",
+                "fast_ema_period": 10,
+                "slow_ema_period": 20,
+                "trade_size": 1,
+            },
+        },
+        {
+            "name": "__smoke__/ema_cross/SPY",
+            "file_path": "strategies/example/ema_cross.py",
+            "strategy_class": "EMACrossStrategy",
+            "config_class": "EMACrossConfig",
+            "default_config": {
+                "instrument_id": "SPY.NASDAQ",
+                "bar_type": "SPY.NASDAQ-1-MINUTE-LAST-EXTERNAL",
+                "fast_ema_period": 10,
+                "slow_ema_period": 20,
+                "trade_size": 1,
+            },
+        },
+    ]
+    async with portfolio_session_factory() as session:
+        for row in rows:
+            session.add(Strategy(**row))
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_smoke_endpoint_creates_run_and_returns_201(
+    api_client_authed,
+    _seed_smoke_strategies: None,
+    _mock_enqueue: None,
+    _mock_ingest: None,
+    _mock_smoke_redis: None,
+) -> None:
+    # Act
+    response = await api_client_authed.post(
+        "/api/v1/portfolios/smoke/runs?config=fast",
+    )
+
+    # Assert
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["smoke"] is True
+    assert body["status"], "status field should be non-empty"
+    assert body["status"] in {"pending", "running"}

@@ -33,6 +33,7 @@ from msai.schemas.portfolio import (
     PortfolioRunResponse,
 )
 from msai.services.portfolio import PortfolioService
+from msai.services.smoke.config import SmokeConfigName
 
 log = get_logger(__name__)
 
@@ -251,6 +252,56 @@ async def list_portfolio_allocations(
         ) from None
     allocations = await _service.get_allocations(db, portfolio_id)
     return [PortfolioAllocationResponse.model_validate(a) for a in allocations]
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/portfolios/smoke/runs -- canonical smoke run (no portfolio_id)
+#
+# Registered BEFORE /{portfolio_id}/runs so FastAPI doesn't try to bind
+# 'smoke' as a UUID path parameter (Codex plan-review iter-1 P1 finding;
+# FastAPI matches routes in declaration order — the dynamic UUID route
+# would swallow this static path otherwise and emit 422).
+#
+# Delegates to ``services.smoke.runner.run_smoke()`` in-process (no
+# HTTP-to-self). The runner pre-ingests AAPL+SPY for the configured
+# window, bootstraps the canonical ``__msai_smoke__`` Portfolio if
+# absent, then enqueues the existing arq portfolio-run job.
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/smoke/runs",
+    status_code=status.HTTP_201_CREATED,
+    response_model=PortfolioRunResponse,
+)
+async def start_smoke_run(
+    config: SmokeConfigName = Query(default="fast"),  # noqa: B008
+    claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+) -> PortfolioRunResponse:
+    """Authenticated shortcut for the canonical operational smoke run.
+
+    Bootstraps the ``__msai_smoke__`` Portfolio if absent, pre-ingests
+    AAPL+SPY for the configured window, then fires a ``PortfolioRun``
+    with ``smoke=True`` via the existing lifecycle. Returns the persisted
+    run row so the caller can poll
+    ``GET /api/v1/portfolios/runs/{run_id}`` for terminal status.
+
+    The ``config`` query parameter is typed as ``SmokeConfigName`` (the
+    ``Literal["fast", "nightly"]`` alias exported from
+    ``services.smoke.config``) — reusing the canonical alias keeps the
+    pydantic-driven 422 validation on bad values consistent with the
+    runner's own argument typing.
+
+    PRD docs/prds/ingest-backtest-smoke-test.md v1.3 US-001 / US-002.
+    """
+    # Local import — runner pulls in the smoke service module which we
+    # don't want to load at API startup if the smoke surface is unused.
+    from msai.services.smoke.runner import run_smoke  # noqa: PLC0415
+
+    user_id = await resolve_user_id(db, claims)
+    run = await run_smoke(db=db, config_name=config, user_id=user_id)
+    return PortfolioRunResponse.model_validate(run)
 
 
 # ---------------------------------------------------------------------------
