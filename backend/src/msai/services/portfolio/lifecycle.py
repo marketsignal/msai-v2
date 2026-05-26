@@ -396,6 +396,11 @@ class PortfolioLifecycle:
             # F2 + Codex-bot PR-73 P2: mode resolution = explicit > portfolio default.
             mode=resolved_mode,
             metrics=initial_metrics,
+            # Operational smoke marker — see ``PortfolioRunCreate.smoke``.
+            # Defaults to False so the column stays additive for callers
+            # that omit the field (PR #73 + earlier tests). The G5 metrics
+            # enrichment in orchestration.py branches on this flag.
+            smoke=data.smoke,
             created_by=user_id,
         )
         session.add(run)

@@ -252,6 +252,14 @@ class PortfolioRunCreate(BaseModel):
     # because there was no API-level way to cap trials.  Only honored when
     # ``mode == BacktestMode.FULL``; Quick mode ignores it.
     n_trials: int | None = Field(default=None, ge=1, le=1000)
+    # Operational smoke-test marker. Defaults to False so existing callers
+    # (UI compose, /backtests/history, all PR-#73 tests) stay unaffected.
+    # When True, the worker's metrics-emit path enriches ``run.metrics``
+    # with the G5 block (pnl / trade_count_by_strategy / trade_count_total
+    # / benchmark_symbol / smoke_config) — see
+    # ``services/portfolio/orchestration.py::enrich_smoke_metrics``.
+    # PRD docs/prds/ingest-backtest-smoke-test.md v1.3.
+    smoke: bool = False
 
     @model_validator(mode="after")
     def _validate_date_range(self) -> PortfolioRunCreate:
@@ -318,6 +326,11 @@ class PortfolioRunResponse(BaseModel):
     walk_forward_payload: dict[str, Any] | None = None
     is_metric: float | None = None
     oos_metric: float | None = None
+    # Operational smoke-test marker. Mirrors ``PortfolioRunCreate.smoke``;
+    # defaults to False for non-smoke runs. Distinguishes operator-driven
+    # canonical smoke runs (per ``/api/v1/backtests/history?smoke_only=true``)
+    # from ordinary portfolio backtests. PRD v1.3.
+    smoke: bool = False
 
 
 class PortfolioRunListResponse(BaseModel):
