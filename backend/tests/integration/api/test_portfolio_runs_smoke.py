@@ -262,3 +262,136 @@ async def test_smoke_endpoint_creates_run_and_returns_201(
     assert body["smoke"] is True
     assert body["status"], "status field should be non-empty"
     assert body["status"] in {"pending", "running"}
+
+
+# ---------------------------------------------------------------------------
+# Code-review iter-1 fix #4 — POST 201 must include a Location header
+# pointing at the run-detail endpoint (api-design.md rule 4).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_smoke_endpoint_returns_location_header_pointing_at_run_detail(
+    api_client_authed,
+    _seed_smoke_strategies: None,
+    _mock_enqueue: None,
+    _mock_ingest: None,
+    _mock_smoke_redis: None,
+) -> None:
+    # Act
+    response = await api_client_authed.post(
+        "/api/v1/portfolios/smoke/runs?config=fast",
+    )
+
+    # Assert
+    assert response.status_code == 201, response.text
+    location = response.headers.get("Location")
+    assert location is not None, "POST 201 must set Location header"
+    body = response.json()
+    assert location == f"/api/v1/portfolios/runs/{body['id']}"
+
+
+# ---------------------------------------------------------------------------
+# Code-review iter-1 fix #5 — IngestLockTimeoutError must surface as
+# 409 with a structured INGEST_IN_PROGRESS body (NOT a generic 500).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _mock_ingest_lock_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the smoke runner to raise IngestLockTimeoutError mid-flow."""
+    from msai.services.smoke.ingest_lock import IngestLockTimeoutError
+
+    async def _stub_acquire_raises(  # noqa: ANN401
+        _pool: object,
+        *,
+        symbol: str,
+        window_start: object,
+        ttl_seconds: int,
+        wait_timeout_seconds: int,
+    ) -> str:
+        raise IngestLockTimeoutError(f"Could not acquire ingest lock for {symbol} (forced in test)")
+
+    monkeypatch.setattr("msai.services.smoke.runner.acquire_ingest_lock", _stub_acquire_raises)
+
+
+@pytest.mark.asyncio
+async def test_smoke_endpoint_returns_409_on_ingest_lock_timeout(
+    api_client_authed,
+    _seed_smoke_strategies: None,
+    _mock_enqueue: None,
+    _mock_ingest: None,
+    _mock_smoke_redis: None,
+    _mock_ingest_lock_timeout: None,
+) -> None:
+    # Act
+    response = await api_client_authed.post(
+        "/api/v1/portfolios/smoke/runs?config=fast",
+    )
+
+    # Assert
+    assert response.status_code == 409, response.text
+    body = response.json()
+    # FastAPI wraps `detail` dicts as-is on HTTPException(detail=dict).
+    detail = body["detail"]
+    assert detail["code"] == "INGEST_IN_PROGRESS", detail
+    assert "retry shortly" in detail["message"].lower(), detail
+
+
+# ---------------------------------------------------------------------------
+# Test-analyzer P0 fix #7 — route-ordering regression test
+#
+# /smoke/runs is a STATIC sub-path of the dynamic /{portfolio_id}/runs route.
+# FastAPI resolves routes in declaration order; if the dynamic route is
+# declared first, FastAPI tries to bind ``"smoke"`` as a UUID and emits 422,
+# which masks the canonical-smoke endpoint entirely. Pin the declaration
+# order with a regression test that posts both URLs in one test invocation.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_smoke_static_route_is_declared_before_dynamic_uuid_route(
+    api_client_authed,
+    _seed_smoke_strategies: None,
+    _mock_enqueue: None,
+    _mock_ingest: None,
+    _mock_smoke_redis: None,
+) -> None:
+    """The /smoke/runs static route must win over /{portfolio_id}/runs.
+
+    Two POSTs in one test:
+      1. POST /api/v1/portfolios/00000000-0000-0000-0000-000000000123/runs
+         — a UUID that's not in the DB. The dynamic route fires and the
+         service raises ValueError -> 404 (or 422 if FastAPI accepts the
+         UUID syntactically but the lifecycle rejects the missing portfolio).
+      2. POST /api/v1/portfolios/smoke/runs — the static route fires and
+         returns 201 with smoke=True.
+
+    If the static route were declared AFTER the dynamic route, step 2 would
+    return 422 ("Input should be a valid UUID") because FastAPI would have
+    tried to parse "smoke" as a UUID path parameter.
+    """
+    bogus_uuid = "00000000-0000-0000-0000-000000000123"
+
+    # Step 1 — dynamic route fires for a non-existent UUID portfolio_id.
+    dyn = await api_client_authed.post(
+        f"/api/v1/portfolios/{bogus_uuid}/runs",
+        json={
+            "start_date": "2024-12-01",
+            "end_date": "2024-12-31",
+            "smoke": False,
+        },
+    )
+    assert dyn.status_code in {404, 422}, (
+        f"Expected 404/422 on unknown portfolio UUID, got {dyn.status_code}: {dyn.text}"
+    )
+
+    # Step 2 — static /smoke/runs must still resolve to the smoke endpoint.
+    smoke = await api_client_authed.post(
+        "/api/v1/portfolios/smoke/runs?config=fast",
+    )
+    assert smoke.status_code == 201, (
+        f"Static /smoke/runs route did not win route ordering — got "
+        f"{smoke.status_code}: {smoke.text}"
+    )
+    assert smoke.json()["smoke"] is True

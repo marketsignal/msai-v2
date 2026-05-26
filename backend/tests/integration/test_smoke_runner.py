@@ -187,3 +187,78 @@ async def test_runner_bootstraps_portfolio_idempotently_and_returns_run_row(
     # Assert: smoke marker carried through the lifecycle.
     assert run_1.smoke is True
     assert run_2.smoke is True
+
+
+# ---------------------------------------------------------------------------
+# Code-review iter-1 fix #3 — concurrent ``run_smoke`` invocations must NOT
+# create duplicate canonical portfolios. The partial unique index added by
+# migration ``c3d4e5f6a7b8`` (mirrored in the model's ``__table_args__`` so
+# ``Base.metadata.create_all`` picks it up here) lets exactly one bootstrap
+# win; the loser's ``flush`` raises ``IntegrityError`` and the runner
+# catches it + re-SELECTs the winner's row.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_concurrent_run_smoke_invocations_share_canonical_portfolio(
+    portfolio_session_factory,
+    _seed_smoke_strategies: None,
+    _mock_runner_externals: None,
+) -> None:
+    """Two concurrent run_smoke calls in distinct sessions resolve to one Portfolio.
+
+    Each ``run_smoke`` gets its own ``AsyncSession`` (mirroring two
+    independent HTTP requests). Both call the bootstrap helper at the
+    same time via ``asyncio.gather``; the partial unique index lets
+    exactly one INSERT commit and forces the loser into the re-SELECT
+    branch.
+    """
+    # Arrange
+    import asyncio as _asyncio
+
+    from msai.services.smoke.runner import run_smoke
+
+    async def _run_once() -> tuple[uuid.UUID, uuid.UUID]:
+        async with portfolio_session_factory() as session:
+            run = await run_smoke(db=session, config_name="fast")
+            return (run.id, run.portfolio_id)
+
+    # Act — fire both invocations into the loop in the same tick.
+    (id_a, pid_a), (id_b, pid_b) = await _asyncio.gather(_run_once(), _run_once())
+
+    # Assert — distinct run ids; same canonical portfolio id; both rows
+    # carry smoke=True (re-read from a fresh session to confirm the
+    # commit reached the DB).
+    assert id_a != id_b, "Two concurrent calls must produce distinct PortfolioRuns"
+    assert pid_a == pid_b, (
+        f"Both calls must share the canonical __msai_smoke__ Portfolio (got {pid_a} vs {pid_b})"
+    )
+
+    from sqlalchemy import func
+    from sqlalchemy import select as _select
+
+    from msai.models.portfolio import Portfolio as _Portfolio
+    from msai.models.portfolio_run import PortfolioRun as _PortfolioRun
+
+    async with portfolio_session_factory() as verify:
+        count = (
+            await verify.execute(
+                _select(func.count())
+                .select_from(_Portfolio)
+                .where(_Portfolio.name == "__msai_smoke__")
+            )
+        ).scalar_one()
+        assert count == 1, f"Expected exactly one canonical smoke Portfolio after race, got {count}"
+
+        runs = (
+            (
+                await verify.execute(
+                    _select(_PortfolioRun).where(_PortfolioRun.portfolio_id == pid_a)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(runs) == 2, f"Expected 2 runs against the canonical portfolio, got {len(runs)}"
+        assert all(r.smoke is True for r in runs), "Both runs must carry smoke=True"

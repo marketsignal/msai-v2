@@ -11,6 +11,7 @@ dev extras as ``fakeredis[lua]>=2.20``).
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 
 import pytest
@@ -22,6 +23,14 @@ from msai.services.smoke.ingest_lock import (
     acquire_ingest_lock,
     release_ingest_lock,
 )
+
+# Pre-bind ``asyncio.gather`` so the PostToolUse ruff formatter does NOT
+# strip the ``import asyncio`` above between subagent edits (see
+# ``feedback_colocate_imports_with_usage_in_edits.md``). The concurrency
+# test below dispatches the two coroutines via ``asyncio.gather`` —
+# binding to a module-level alias keeps ``asyncio`` "used" even after a
+# formatter pass that runs before the gather() call lands.
+_gather = asyncio.gather
 
 
 @pytest.mark.asyncio
@@ -174,3 +183,55 @@ async def test_release_ingest_lock_no_op_when_token_does_not_match() -> None:
             ttl_seconds=60,
             wait_timeout_seconds=1,
         )
+
+
+# ---------------------------------------------------------------------------
+# Test-analyzer P0 fix #8 — real-concurrency assertion under asyncio.gather.
+#
+# The existing tests acquire SEQUENTIALLY (first call returns, then a second
+# call is issued); that exercises only the "second caller already sees the
+# key" branch. The mutex's CORRECTNESS claim is "two truly simultaneous
+# acquires resolve to exactly-one winner" — without an asyncio.gather case,
+# a future refactor that broke ``SET NX EX`` atomicity (e.g., by replacing
+# the single SET with a GET-then-SET pair) could pass the existing tests.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_acquire_ingest_lock_concurrent_gather_exactly_one_wins() -> None:
+    """Two simultaneous ``acquire`` calls on the same (symbol, window): exactly one wins.
+
+    ``wait_timeout_seconds=0`` makes this a fail-fast race — no polling
+    window means the loser raises immediately, so we don't have to time
+    out the test. The Redis primitive ``SET key value NX EX ttl`` is what
+    guarantees the race winner is unique, even when both ``acquire`` calls
+    are scheduled into the event loop in the same tick.
+    """
+    # Arrange
+    redis = FakeRedis()
+    window = date(2024, 12, 20)
+
+    async def _try_acquire() -> str | None:
+        try:
+            return await acquire_ingest_lock(
+                redis,
+                symbol="AAPL",
+                window_start=window,
+                ttl_seconds=60,
+                wait_timeout_seconds=0,
+            )
+        except IngestLockTimeoutError:
+            return None
+
+    # Act — gather both tasks so they're scheduled together on the loop.
+    a, b = await _gather(_try_acquire(), _try_acquire())
+
+    # Assert — exactly one returns a token; the other returned None
+    # (translated from IngestLockTimeoutError by the local helper).
+    results = [r for r in (a, b) if r is not None]
+    assert len(results) == 1, f"Expected exactly one winner, got {len(results)}: a={a!r} b={b!r}"
+    # The winner's token is the one stored under the key.
+    raw = await redis.get(f"{INGEST_LOCK_KEY_PREFIX}AAPL:2024-12")
+    assert raw is not None
+    stored = raw.decode() if isinstance(raw, bytes) else str(raw)
+    assert stored == results[0]

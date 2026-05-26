@@ -275,6 +275,7 @@ async def list_portfolio_allocations(
     response_model=PortfolioRunResponse,
 )
 async def start_smoke_run(
+    response: Response,
     config: SmokeConfigName = Query(default="fast"),  # noqa: B008
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
@@ -283,9 +284,9 @@ async def start_smoke_run(
 
     Bootstraps the ``__msai_smoke__`` Portfolio if absent, pre-ingests
     AAPL+SPY for the configured window, then fires a ``PortfolioRun``
-    with ``smoke=True`` via the existing lifecycle. Returns the persisted
-    run row so the caller can poll
-    ``GET /api/v1/portfolios/runs/{run_id}`` for terminal status.
+    with ``smoke=True`` via the existing lifecycle. Returns 201 + the
+    persisted run row + a ``Location`` header pointing at the run-detail
+    endpoint so the caller can poll terminal status.
 
     The ``config`` query parameter is typed as ``SmokeConfigName`` (the
     ``Literal["fast", "nightly"]`` alias exported from
@@ -293,14 +294,36 @@ async def start_smoke_run(
     pydantic-driven 422 validation on bad values consistent with the
     runner's own argument typing.
 
+    Code-review iter-1 fix #4 (Location header — api-design.md rule 4)
+    + iter-1 fix #5 (409 when an overlapping ingest is already running
+    on the same ``(symbol, YYYY-MM)`` mutex window).
+
     PRD docs/prds/ingest-backtest-smoke-test.md v1.3 US-001 / US-002.
     """
     # Local import — runner pulls in the smoke service module which we
     # don't want to load at API startup if the smoke surface is unused.
+    from msai.services.smoke.ingest_lock import IngestLockTimeoutError  # noqa: PLC0415
     from msai.services.smoke.runner import run_smoke  # noqa: PLC0415
 
     user_id = await resolve_user_id(db, claims)
-    run = await run_smoke(db=db, config_name=config, user_id=user_id)
+    try:
+        run = await run_smoke(db=db, config_name=config, user_id=user_id)
+    except IngestLockTimeoutError as exc:
+        # Another smoke invocation (CLI + UI + scheduler can all hit this
+        # path) is fetching the same Databento window. Surface a
+        # structured 409 so the client can retry shortly instead of
+        # getting a generic 500 with the stack-trace text in `detail`.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "INGEST_IN_PROGRESS",
+                "message": (
+                    "Another smoke run is fetching the same Databento window; retry shortly."
+                ),
+            },
+        ) from exc
+
+    response.headers["Location"] = f"/api/v1/portfolios/runs/{run.id}"
     return PortfolioRunResponse.model_validate(run)
 
 

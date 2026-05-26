@@ -646,3 +646,73 @@ class TestSystemSmokeAlertCommand:
         assert invocation.exit_code == 0, invocation.output
         _, kwargs = mock.call_args
         assert kwargs["level"] == "error"
+
+    # -----------------------------------------------------------------
+    # Silent-failure iter-1 fix #2 — corrupt / missing result file MUST
+    # still dispatch a level=error alert with a synthetic failure body
+    # (NOT raise JSONDecodeError that the workflow's `|| echo` would
+    # swallow into a silent warning).
+    # -----------------------------------------------------------------
+
+    def test_corrupt_json_in_result_file_synthesizes_failure_alert(
+        self, runner: CliRunner, tmp_path
+    ) -> None:
+        # Arrange — non-JSON content (e.g., a Python traceback that landed
+        # in the file before 2>${RESULT}.stderr was added).
+        result_file = tmp_path / "smoke-result.json"
+        result_file.write_text(
+            "Traceback (most recent call last):\n"
+            '  File "/app/...", line 1, in <module>\n'
+            "    raise RuntimeError('something blew up')\n"
+            "RuntimeError: something blew up\n"
+        )
+
+        # Act
+        with patch("msai.services.alerting.AlertingService.send_alert") as mock:
+            invocation = runner.invoke(app, ["system", "smoke-alert", str(result_file)])
+
+        # Assert
+        assert invocation.exit_code == 0, invocation.output
+        assert mock.call_count == 1, "alert must dispatch even when JSON is corrupt"
+        _, kwargs = mock.call_args
+        assert kwargs["level"] == "error"
+        assert "corrupt" in kwargs["title"].lower()
+        # The synthesized body must mention the failure mode so the CI/
+        # operator can diagnose without SSHing into the VM.
+        message_body = json.loads(kwargs["message"])
+        problems = message_body.get("structural_problems") or []
+        assert any("corrupt" in p.lower() for p in problems), problems
+
+    def test_missing_result_file_synthesizes_failure_alert(
+        self, runner: CliRunner, tmp_path
+    ) -> None:
+        # Arrange — path that doesn't exist (OSError on read_text).
+        result_file = tmp_path / "does-not-exist.json"
+
+        # Act
+        with patch("msai.services.alerting.AlertingService.send_alert") as mock:
+            invocation = runner.invoke(app, ["system", "smoke-alert", str(result_file)])
+
+        # Assert
+        assert invocation.exit_code == 0, invocation.output
+        assert mock.call_count == 1
+        _, kwargs = mock.call_args
+        assert kwargs["level"] == "error"
+
+    def test_alerting_backend_failure_exits_with_code_2(self, runner: CliRunner, tmp_path) -> None:
+        """If ``send_alert`` itself raises, the CLI must exit code 2 (not 0)."""
+        # Arrange — valid PASS body so the path reaches send_alert.
+        result_file = tmp_path / "smoke-result.json"
+        body = _smoke_completed_body()
+        body["structural_problems"] = []
+        result_file.write_text(json.dumps(body))
+
+        # Act
+        with patch(
+            "msai.services.alerting.AlertingService.send_alert",
+            side_effect=RuntimeError("disk full"),
+        ):
+            invocation = runner.invoke(app, ["system", "smoke-alert", str(result_file)])
+
+        # Assert — non-zero exit so the workflow sees the failure.
+        assert invocation.exit_code == 2, invocation.output

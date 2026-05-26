@@ -168,13 +168,27 @@ jobs:
 
           # Run smoke inside the backend container; the CLI overwrites the
           # pre-seeded file with its real --json payload on success or on any
-          # failure that reaches the JSON-emit stage.
-          docker exec -i "$CID" bash -c "msai backtest smoke --config '$CONFIG' --json > $RESULT_PATH 2>&1" || true
+          # failure that reaches the JSON-emit stage. Redirect stderr to a
+          # SEPARATE file so a Python traceback (which goes to stderr) does
+          # NOT corrupt the JSON file (silent-failure iter-1 fix: 2>&1 made
+          # smoke_alert_cmd raise JSONDecodeError on the next exec and the
+          # workflow lost the traceback).
+          docker exec -i "$CID" bash -c "msai backtest smoke --config '$CONFIG' --json > $RESULT_PATH 2>${RESULT_PATH}.stderr" || true
 
           # ALWAYS dispatch the alert from inside the same container, where
-          # the JSON file is reachable.
+          # the JSON file is reachable. smoke_alert_cmd is now corrupt-JSON
+          # tolerant (synthesizes a failure payload + dispatches level=error
+          # on JSONDecodeError) so an empty/garbled file no longer prevents
+          # the alert.
           docker exec -i "$CID" msai system smoke-alert "$RESULT_PATH" \
             || echo "::warning::smoke-alert dispatch failed; check VM logs"
+
+          # If the CLI emitted a stderr traceback, surface it to the CI log
+          # so reviewers can diagnose without SSHing to the VM. Best-effort:
+          # the file may not exist if the CLI never wrote stderr.
+          echo "----- smoke CLI stderr -----"
+          docker exec -i "$CID" bash -c "test -s ${RESULT_PATH}.stderr && cat ${RESULT_PATH}.stderr || echo '(empty)'"
+          echo "----- end smoke CLI stderr -----"
 
           # Workflow exit = smoke result. Re-derive from the JSON the CLI
           # wrote — this avoids relying on docker-exec's RC propagation

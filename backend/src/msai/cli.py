@@ -1062,12 +1062,36 @@ def smoke_alert_cmd(
     structural assertions (G5 key presence, trade-count floor >= 2,
     non-empty ``report_path``) must also hold.  The smoke CLI already
     writes a ``structural_problems`` list to the JSON; we honor it.
+
+    Silent-failure iter-1 fix #2: this command MUST always dispatch an
+    alert. If the result file is missing, unreadable, or contains
+    corrupt/non-JSON output (e.g., a CLI traceback that landed in the
+    file before ``2>${RESULT}.stderr`` was added), synthesize a minimal
+    failure payload + dispatch level=error so the CI/operator sees the
+    breakage instead of a silent ``raise JSONDecodeError`` that the
+    workflow's ``|| echo`` would swallow into a warning. Also wrap the
+    ``send_alert`` call itself so a downstream alerting failure exits
+    with code 2 (workflow visible) rather than a Python traceback.
     """
+    import logging
     from pathlib import Path
 
     from msai.services.alerting import AlertingService
 
-    payload = json.loads(Path(result_file).read_text(encoding="utf-8"))
+    # --- read + parse the JSON, synthesizing on any failure ---
+    payload: dict[str, Any]
+    synth_problem: str | None = None
+    try:
+        raw = Path(result_file).read_text(encoding="utf-8")
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        synth_problem = f"smoke result file corrupt: {type(exc).__name__}: {exc}"
+        payload = {
+            "status": "failed",
+            "structural_problems": [synth_problem],
+            "metrics": None,
+        }
+
     structural_problems = payload.get("structural_problems") or []
     is_pass = payload.get("status") == "completed" and not structural_problems
 
@@ -1075,6 +1099,8 @@ def smoke_alert_cmd(
     if is_pass:
         smoke_config = (payload.get("metrics") or {}).get("smoke_config", "fast")
         title = f"Smoke PASS — {smoke_config}"
+    elif synth_problem is not None:
+        title = "Smoke FAIL (result file corrupt)"
     elif structural_problems:
         title = f"Smoke FAIL (structural) — {len(structural_problems)} problem(s)"
     else:
@@ -1090,7 +1116,20 @@ def smoke_alert_cmd(
         body["error_message"] = payload["error_message"]
     message = json.dumps(body, sort_keys=True)
 
-    AlertingService().send_alert(level=level, title=title, message=message)
+    # AlertingService backends may fail (disk full, file lock contention,
+    # future remote sink). Wrap so the workflow sees a non-zero exit code
+    # instead of a Python traceback — exit 2 distinguishes alerting
+    # failure from a normal "smoke failed" exit 0 with level=error.
+    try:
+        AlertingService().send_alert(level=level, title=title, message=message)
+    except Exception as exc:  # noqa: BLE001 — log any backend error then exit
+        logging.error(
+            "smoke_alert_dispatch_failed",
+            exc_info=True,
+        )
+        typer.echo(f"alert dispatch FAILED: {type(exc).__name__}: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+
     typer.echo(f"alert dispatched: {title}")
 
 
@@ -2001,6 +2040,15 @@ _SMOKE_TRADE_FLOOR: int = 2
 # upstream budget (~60 min for a cold nightly window).
 _SMOKE_HTTP_TIMEOUT_SECONDS: float = 3700.0
 
+# After the create POST returns, the worker has at most this long to
+# transition the run to a terminal status. Decoupled from the
+# create-call timeout (silent-failure iter-1 fix #6): the previous code
+# used _SMOKE_HTTP_TIMEOUT_SECONDS for BOTH the create call AND the
+# poll deadline, giving a worst-case 2h block (3700s + 3700s) on a
+# hung worker. By the time the create POST returns, ingest is done and
+# the worker should reach terminal in well under 10 minutes.
+_SMOKE_POLL_DEADLINE_SECONDS: float = 600.0
+
 
 @backtest_app.command("smoke")
 def smoke_cmd(
@@ -2046,23 +2094,41 @@ def smoke_cmd(
     # the create-response body shape.  Terminal states match
     # ``PortfolioRunStatus`` (portfolio_enums.py:53) — note the
     # single-L spelling of ``canceled``.
+    #
+    # Poll deadline is decoupled from the create-call timeout
+    # (silent-failure iter-1 fix #6). KeyboardInterrupt during the poll
+    # leaves the run in-flight on the server side — surface the run id
+    # so the operator can manually poll
+    # ``GET /api/v1/portfolios/runs/<id>`` later instead of losing it
+    # to a swallowed ^C.
     terminal = {"completed", "failed", "canceled"}
-    timeout_at = time.monotonic() + _SMOKE_HTTP_TIMEOUT_SECONDS
-    while True:
-        if time.monotonic() > timeout_at:
-            typer.echo(
-                f"FAIL @ poll: timed out waiting for run {run_id}",
-                err=True,
+    timeout_at = time.monotonic() + _SMOKE_POLL_DEADLINE_SECONDS
+    try:
+        while True:
+            if time.monotonic() > timeout_at:
+                typer.echo(
+                    f"FAIL @ poll: timed out waiting for run {run_id} "
+                    f"(deadline={_SMOKE_POLL_DEADLINE_SECONDS}s after create)",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            status_resp = _api_call(
+                "GET",
+                f"/api/v1/portfolios/runs/{_url_id(run_id)}",
             )
-            raise typer.Exit(code=1)
-        status_resp = _api_call(
-            "GET",
-            f"/api/v1/portfolios/runs/{_url_id(run_id)}",
+            run = status_resp.json()
+            if run.get("status") in terminal:
+                break
+            time.sleep(2)
+    except KeyboardInterrupt:
+        typer.echo(
+            f"RAN_AS_PENDING: smoke run {run_id} was enqueued but the CLI was "
+            f"interrupted before the worker reached terminal. Poll manually "
+            f"with `msai portfolio runs` or "
+            f"GET /api/v1/portfolios/runs/{run_id}.",
+            err=True,
         )
-        run = status_resp.json()
-        if run.get("status") in terminal:
-            break
-        time.sleep(2)
+        raise typer.Exit(code=130) from None
 
     metrics: dict[str, Any] = run.get("metrics") or {}
     structural_problems: list[str] = []

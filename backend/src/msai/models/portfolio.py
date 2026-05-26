@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
-from sqlalchemy import ForeignKey, Numeric, String, Text
+from sqlalchemy import ForeignKey, Index, Numeric, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from msai.models.base import Base, TimestampMixin
@@ -13,6 +13,23 @@ from msai.models.portfolio_enums import BACKTEST_MODE_DB_TYPE, BacktestMode
 
 if TYPE_CHECKING:
     from msai.models.user import User
+
+
+# Partial unique index scoped to the smoke sentinel name. Code-review iter-1
+# fix #3: the smoke runner's SELECT-or-CREATE bootstrap is racy without a
+# database-level uniqueness constraint — two concurrent run_smoke calls can
+# each miss the lookup and create their own canonical row. Operator-created
+# portfolios are NOT affected (the partial-index WHERE clause restricts the
+# constraint to the literal sentinel only). Mirrors the c3d4e5f6a7b8
+# migration so Base.metadata.create_all (testcontainer schema) also enforces
+# the constraint; the model is the single source of truth for this index.
+_SMOKE_SENTINEL_NAME = "__msai_smoke__"
+
+# The partial-index WHERE clause is built with ``text(...)`` so SQLAlchemy
+# emits exactly the SQL fragment we want regardless of whether ``name``
+# evaluates to a ``MappedColumn`` (class-body) or an
+# ``InstrumentedAttribute`` (post-Mapper-configure) at metadata-build time.
+_SMOKE_SENTINEL_WHERE = text(f"name = '{_SMOKE_SENTINEL_NAME}'")
 
 
 class Portfolio(TimestampMixin, Base):
@@ -71,6 +88,21 @@ class Portfolio(TimestampMixin, Base):
     )
     created_by: Mapped[UUID | None] = mapped_column(
         ForeignKey("users.id"), index=True, nullable=True
+    )
+
+    # See module-level docstring for ``_SMOKE_SENTINEL_NAME``. Declared via
+    # ``__table_args__`` (not ``mapped_column(unique=True)``) because the
+    # constraint is PARTIAL — operator portfolios share the ``name`` column
+    # without a uniqueness requirement, but two concurrent smoke bootstraps
+    # race here on the database side so exactly one wins; the loser catches
+    # IntegrityError and re-SELECTs in ``services/smoke/runner.py``.
+    __table_args__ = (
+        Index(
+            "uq_portfolios_smoke_sentinel",
+            "name",
+            unique=True,
+            postgresql_where=_SMOKE_SENTINEL_WHERE,
+        ),
     )
 
     # Relationships

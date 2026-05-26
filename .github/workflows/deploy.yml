@@ -205,7 +205,15 @@ jobs:
           echo '{"status":"failed","structural_problems":["pre-CLI-launch failure (smoke CLI did not emit JSON)"],"metrics":null}' \
             | docker exec -i "$CID" bash -c "cat > $RESULT_PATH"
 
-          docker exec -i "$CID" bash -c "msai backtest smoke --config fast --json > $RESULT_PATH 2>&1" || true
+          # Redirect stderr to a SEPARATE file so a Python traceback never
+          # corrupts the JSON file (silent-failure iter-1 fix #1).
+          docker exec -i "$CID" bash -c "msai backtest smoke --config fast --json > $RESULT_PATH 2>${RESULT_PATH}.stderr" || true
+
+          # Surface any stderr traceback to the CI log so the gate failure
+          # is diagnosable without SSHing to the VM.
+          echo "----- smoke preflight stderr -----"
+          docker exec -i "$CID" bash -c "test -s ${RESULT_PATH}.stderr && cat ${RESULT_PATH}.stderr || echo '(empty)'"
+          echo "----- end smoke preflight stderr -----"
 
           STATUS=$(docker exec -i "$CID" python -c "import json;print(json.load(open('$RESULT_PATH')).get('status'))")
           PROBLEMS=$(docker exec -i "$CID" python -c "import json;d=json.load(open('$RESULT_PATH'));print(len(d.get('structural_problems') or []))")

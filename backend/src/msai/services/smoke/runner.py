@@ -20,11 +20,22 @@ Plan-review iter-4 pinned shapes consulted during implementation:
   ``acquire_ingest_lock(redis, *, symbol, window_start, ttl_seconds,
   wait_timeout_seconds)`` returns a token; release takes the token back.
 
-Race note: ``Portfolio.name`` has no DB-level uniqueness. Two parallel smoke
-invocations that both miss the sentinel lookup could each create their own
-``__msai_smoke__`` row. Accepted as a known low-priority gap for v1 -- the
-downstream pipeline still runs each backtest correctly even if two canonical
-portfolios briefly co-exist; revisit if smoke volume rises.
+Race note (code-review iter-1 fix #3): two parallel smoke invocations
+(CLI + UI + scheduler can all hit this) used to be able to each miss
+the sentinel-name lookup and create their own ``__msai_smoke__`` row,
+which left the table with duplicate canonical portfolios.  Subsequent
+``scalar_one_or_none()`` calls then raised ``MultipleResultsFound``.
+Migration ``c3d4e5f6a7b8`` adds a partial unique index scoped to the
+``__msai_smoke__`` sentinel; the runner catches the loser's
+``IntegrityError`` on ``flush`` + re-SELECTs to find the winner's row.
+
+Transaction semantics (code-review iter-1 fix #3):
+``_get_or_create_canonical_portfolio`` NO LONGER COMMITS on its own —
+the inner commit used to leave a partial-state window where a portfolio
+was persisted but the subsequent enqueue could fail and leave no run
+behind to roll back to.  ``run_smoke`` now owns the single commit and
+issues it AFTER the enqueue succeeds; an enqueue failure rolls back
+the portfolio + run together.
 
 PRD docs/prds/ingest-backtest-smoke-test.md v1.3.
 """
@@ -35,6 +46,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from msai.core.logging import get_logger
 from msai.core.queue import enqueue_portfolio_run, get_redis_pool
@@ -61,6 +73,15 @@ if TYPE_CHECKING:
 
     from msai.models.portfolio_run import PortfolioRun
 
+# Module alias for ``IntegrityError``. Code-review iter-1 fix #3 uses this
+# in ``_get_or_create_canonical_portfolio`` to detect the partial-unique-
+# index race winner. Aliasing keeps the import "consumed" at the module
+# level so the PostToolUse ruff formatter does not strip the import as
+# "unused" between subagent edits (see
+# ``feedback_colocate_imports_with_usage_in_edits.md``). Removing this
+# alias broke the runner once already during this fix.
+_PortfolioSentinelRaceError = IntegrityError
+
 log = get_logger(__name__)
 
 SMOKE_PORTFOLIO_NAME = "__msai_smoke__"
@@ -82,6 +103,13 @@ _SMOKE_STRATEGY_NAMES: tuple[str, ...] = (
 _service = PortfolioService()
 
 
+async def _select_canonical_portfolio(db: AsyncSession) -> Portfolio | None:
+    """SELECT the canonical smoke portfolio by sentinel name, or None."""
+    return (
+        await db.execute(select(Portfolio).where(Portfolio.name == SMOKE_PORTFOLIO_NAME))
+    ).scalar_one_or_none()
+
+
 async def _get_or_create_canonical_portfolio(
     db: AsyncSession, *, user_id: UUID | None
 ) -> Portfolio:
@@ -91,10 +119,23 @@ async def _get_or_create_canonical_portfolio(
     smoke Strategy rows under ``equal_weight`` allocation. Subsequent
     invocations find the existing row via the sentinel-name lookup and
     return it verbatim -- callers must NOT mutate the returned Portfolio.
+
+    Code-review iter-1 fix #3 (race):
+    Two concurrent ``run_smoke`` invocations could both miss the SELECT and
+    both call ``PortfolioLifecycle.create``. Migration ``c3d4e5f6a7b8`` adds
+    a partial unique index on ``portfolios.name = '__msai_smoke__'`` so the
+    loser's ``flush()`` raises :class:`IntegrityError`. We catch it,
+    rollback the failed transaction, and re-SELECT the row the winner
+    committed. Both callers see the same canonical Portfolio.
+
+    Code-review iter-1 fix #3 (partial commit):
+    This helper NO LONGER commits. ``run_smoke`` owns the single commit at
+    the bottom of the flow so a downstream enqueue failure can roll back the
+    portfolio + run together. The previous inner ``await db.commit()`` left a
+    half-state window where the portfolio was visible to other sessions but
+    no PortfolioRun existed yet.
     """
-    existing = (
-        await db.execute(select(Portfolio).where(Portfolio.name == SMOKE_PORTFOLIO_NAME))
-    ).scalar_one_or_none()
+    existing = await _select_canonical_portfolio(db)
     if existing is not None:
         return existing
 
@@ -128,10 +169,36 @@ async def _get_or_create_canonical_portfolio(
         allocator_name="equal_weight",
         strategy_ids=strategy_ids,
     )
-    # ``PortfolioLifecycle.create`` is a static method -- pass session first.
-    portfolio = await PortfolioLifecycle.create(db, create, user_id=user_id)
-    await db.commit()
-    await db.refresh(portfolio)
+    try:
+        # ``PortfolioLifecycle.create`` is a static method -- pass session first.
+        # ``create`` flushes but does not commit; we defer the commit to
+        # ``run_smoke`` so a downstream enqueue failure can roll back the
+        # portfolio + run together.
+        portfolio = await PortfolioLifecycle.create(db, create, user_id=user_id)
+    except _PortfolioSentinelRaceError:
+        # Lost the partial-unique-index race against another concurrent
+        # caller. The loser's transaction is poisoned by the failed flush;
+        # rollback to a clean state, then re-SELECT the row the winner just
+        # committed. Use a fresh nested logical SELECT — the winner is
+        # guaranteed visible because the partial unique index commit is
+        # atomic with the row insert.
+        await db.rollback()
+        log.info(
+            "smoke_portfolio_bootstrap_lost_race",
+            sentinel=SMOKE_PORTFOLIO_NAME,
+        )
+        winner = await _select_canonical_portfolio(db)
+        if winner is None:
+            # Pathological: the IntegrityError fired but SELECT can't find
+            # the winner. Either the partial unique index is misconfigured
+            # or the winner rolled back too — surface a clear error rather
+            # than retry-loop forever.
+            raise RuntimeError(
+                "Smoke portfolio bootstrap lost the unique-index race, but "
+                "no canonical __msai_smoke__ row is visible after rollback. "
+                "Check the c3d4e5f6a7b8 migration was applied."
+            ) from None
+        return winner
     return portfolio
 
 
@@ -220,6 +287,13 @@ async def run_smoke(
     The arq-enqueue step mirrors ``api/portfolio.py:322-335``: enqueue
     BEFORE commit, and roll back the row if the enqueue raises so the
     caller never sees a "pending" PortfolioRun that no worker will pick up.
+
+    Code-review iter-1 fix #3 (partial commit):
+    Both the canonical portfolio (if newly created in this call) AND the
+    new PortfolioRun live in the same uncommitted transaction. A failure
+    in ``create_run`` or ``enqueue_portfolio_run`` rolls back the whole
+    transaction — including a fresh Portfolio row — so we never leave
+    half-state behind.
     """
     config = SMOKE_CONFIGS[config_name]
 
@@ -230,7 +304,8 @@ async def run_smoke(
         config.end_date.isoformat(),
     )
 
-    # 2. Idempotent canonical Portfolio bootstrap.
+    # 2. Idempotent canonical Portfolio bootstrap (no commit; rolled back
+    # together with the run on any downstream failure).
     portfolio = await _get_or_create_canonical_portfolio(db, user_id=user_id)
 
     # 3. Create the PortfolioRun via the lifecycle, with ``smoke=True``
@@ -240,7 +315,19 @@ async def run_smoke(
         end_date=config.end_date,
         smoke=True,
     )
-    run = await _service.create_run(db, portfolio.id, body, user_id=user_id)
+    try:
+        run = await _service.create_run(db, portfolio.id, body, user_id=user_id)
+    except Exception as exc:
+        # Roll back the (possibly newly-created) portfolio together with
+        # the failed run-create so we never leave a dangling __msai_smoke__
+        # row with no run behind it.
+        await db.rollback()
+        log.error(
+            "smoke_portfolio_run_create_failed",
+            portfolio_id=str(portfolio.id),
+            error=str(exc),
+        )
+        raise
 
     # 4. Enqueue BEFORE commit -- if Redis is unreachable, roll back the
     # row so we don't leave a stranded "pending" run that no worker owns.
@@ -257,6 +344,8 @@ async def run_smoke(
         )
         raise
 
+    # Single commit at the end — portfolio + run are now atomically
+    # persisted alongside a successful enqueue.
     await db.commit()
     await db.refresh(run)
     log.info(
