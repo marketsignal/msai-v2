@@ -55,6 +55,7 @@ from msai.core.queue import enqueue_portfolio_run, get_redis_pool
 from msai.models.portfolio import Portfolio
 from msai.models.portfolio_enums import BacktestMode, PortfolioObjective
 from msai.models.strategy import Strategy
+from msai.models.user import User
 from msai.schemas.portfolio import (
     PortfolioCreate,
     PortfolioRunCreate,
@@ -407,6 +408,23 @@ async def run_smoke(
     # 2. Idempotent canonical Portfolio bootstrap (no commit; rolled back
     # together with the run on any downstream failure).
     portfolio = await _get_or_create_canonical_portfolio(db, user_id=user_id)
+
+    # 2b. FK-orphan guard (code-review clean-pass P2). If the bootstrap took
+    # the race-loser path, it issued ``db.rollback()`` — which also discards a
+    # User row that ``resolve_user_id`` may have flushed-but-not-committed for
+    # a first-ever login. Passing that now-phantom ``user_id`` into create_run
+    # would fail the ``created_by`` FK at the final commit (500). Re-validate
+    # the user still exists post-bootstrap; if it was rolled back, fall back to
+    # NULL attribution (``created_by`` is nullable) rather than crash. The
+    # common (non-race) path leaves ``user_id`` intact.
+    if user_id is not None:
+        user_still_present = await db.get(User, user_id)
+        if user_still_present is None:
+            log.info(
+                "smoke_user_rolled_back_by_race_falling_back_to_null_attribution",
+                user_id=str(user_id),
+            )
+            user_id = None
 
     # 3. Create the PortfolioRun via the lifecycle, with ``smoke=True``
     # so the metrics-enrichment branch in orchestration.py engages.
