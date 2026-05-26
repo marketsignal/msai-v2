@@ -331,9 +331,25 @@ async def _ensure_ingested(symbols: tuple[str, ...], start: str, end: str) -> No
                     wait_timeout_seconds=600,
                 )
                 tokens.append((symbol, month_start, token))
+
+        # Re-check coverage AFTER acquiring every lock. Codex review P2:
+        # two cold-window runs both compute gaps before locking; the loser
+        # blocks on the winner's locks, and without this re-check would then
+        # fetch the now-covered window again (duplicate Databento spend). By
+        # the time we hold all locks, the winner has finished + released, so
+        # a fresh scan reflects the just-ingested data.
+        still_gapped = await _symbols_with_gaps(tuple(gapped_symbols), start_date, end_date)
+        if not still_gapped:
+            log.info(
+                "smoke_ensure_ingested_covered_after_lock_wait_skip",
+                symbols=list(gapped_symbols),
+                start=start,
+                end=end,
+            )
+            return
         await ingest_symbols(
             "stocks",
-            list(gapped_symbols),
+            list(still_gapped),
             start,
             end,
             provider="databento",

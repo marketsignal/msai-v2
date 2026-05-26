@@ -185,8 +185,16 @@ jobs:
           # tolerant (synthesizes a failure payload + dispatches level=error
           # on JSONDecodeError) so an empty/garbled file no longer prevents
           # the alert.
-          docker exec -i "$CID" python -m msai.cli system smoke-alert "$RESULT_PATH" \
-            || echo "::warning::smoke-alert dispatch failed; check VM logs"
+          # Capture the alert-dispatch exit. Alerting is a GUARANTEE, not
+          # best-effort: if dispatch fails (code 2), the nightly must go RED
+          # even when the smoke itself passed — otherwise a silent alerting
+          # outage looks green and the operator never learns the smoke ran.
+          # (Codex review P2: the old `|| echo ::warning` swallowed this.)
+          ALERT_RC=0
+          docker exec -i "$CID" python -m msai.cli system smoke-alert "$RESULT_PATH" || ALERT_RC=$?
+          if [ "$ALERT_RC" -ne 0 ]; then
+            echo "::error::smoke-alert dispatch failed (rc=$ALERT_RC) — alerting guarantee broken"
+          fi
 
           # If the CLI emitted a stderr traceback, surface it to the CI log
           # so reviewers can diagnose without SSHing to the VM. Best-effort:
@@ -195,12 +203,12 @@ jobs:
           docker exec -i "$CID" bash -c "test -s ${RESULT_PATH}.stderr && cat ${RESULT_PATH}.stderr || echo '(empty)'"
           echo "----- end smoke CLI stderr -----"
 
-          # Workflow exit = smoke result. Re-derive from the JSON the CLI
-          # wrote — this avoids relying on docker-exec's RC propagation
-          # (which Docker swallows for non-TTY exec sometimes per #4717).
+          # Workflow exit = smoke structural PASS *and* alert dispatched.
+          # Re-derive smoke status from the JSON (avoids docker-exec RC
+          # swallow per moby/moby#4717) and AND it with the alert exit.
           STATUS=$(docker exec -i "$CID" python -c "import json;print(json.load(open('$RESULT_PATH')).get('status'))")
           PROBLEMS=$(docker exec -i "$CID" python -c "import json;d=json.load(open('$RESULT_PATH'));print(len(d.get('structural_problems') or []))")
-          test "$STATUS" = "completed" && test "$PROBLEMS" = "0"
+          test "$STATUS" = "completed" && test "$PROBLEMS" = "0" && test "$ALERT_RC" -eq 0
           EOF
 
       - name: Smoke summary

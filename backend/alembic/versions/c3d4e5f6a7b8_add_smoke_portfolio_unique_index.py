@@ -33,6 +33,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import sqlalchemy as sa
+
 from alembic import op
 
 if TYPE_CHECKING:
@@ -55,14 +57,17 @@ def upgrade() -> None:
     # clause is what makes the constraint apply ONLY to the smoke
     # canonical row — operator-created portfolios with any other name
     # (including duplicates among themselves) are untouched. Alembic
-    # accepts a raw SQL string here and emits it verbatim into the
-    # ``CREATE UNIQUE INDEX ... WHERE <expr>`` DDL.
+    # accepts a raw SQL string here, but wrap in ``sa.text(...)`` to match
+    # every sibling partial-index migration (72ea2fd4dda2, c7d8e9f1a2b3,
+    # b1c2d3e4f5a6, k9e0f1g2h3i4) and feed the DDL compiler a real SQL
+    # expression rather than a bare str. The sentinel name is a hard-coded
+    # constant (no user input → no injection risk).
     op.create_index(
         _INDEX_NAME,
         "portfolios",
         ["name"],
         unique=True,
-        postgresql_where=f"name = '{_SENTINEL_NAME}'",
+        postgresql_where=sa.text(f"name = '{_SENTINEL_NAME}'"),
     )
 
 
