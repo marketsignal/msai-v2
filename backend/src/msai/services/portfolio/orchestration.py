@@ -116,6 +116,42 @@ class PortfolioRunMemberFailureError(PortfolioOrchestrationError):
         super().__init__(summary)
 
 
+def enrich_smoke_metrics(
+    *,
+    core_metrics: dict[str, float | None],
+    base_capital: float,
+    trade_counts_by_strategy: dict[str, int],
+    benchmark_symbol: str,
+    smoke_config: str,
+) -> dict[str, object]:
+    """Enrich the existing SeriesMetrics.as_dict() output with G5 smoke fields.
+
+    Adds:
+      * pnl (dollar value, derived from total_return and base_capital)
+      * trade_count_by_strategy (caller pre-aggregates by strategy_name)
+      * trade_count_total
+      * benchmark_symbol
+      * smoke_config ('fast' | 'nightly')
+
+    PRD docs/prds/ingest-backtest-smoke-test.md v1.3 G5.
+
+    Iter-3 fix: takes pre-aggregated counts dict (NOT orders_df) because
+    orders_df is not in scope at the orchestration metrics-emit site
+    (see ``_run_candidate_backtest`` — discards ``result.orders_df``). The
+    caller aggregates from ``strategy_results`` using each result's new
+    ``trade_count`` + ``strategy_name`` fields.
+    """
+    enriched: dict[str, object] = dict(core_metrics)
+    total_return = float(core_metrics.get("total_return") or 0.0)
+    enriched["pnl"] = float(base_capital) * total_return
+    by_strategy = {str(k): int(v) for k, v in (trade_counts_by_strategy or {}).items()}
+    enriched["trade_count_by_strategy"] = by_strategy
+    enriched["trade_count_total"] = int(sum(by_strategy.values()))
+    enriched["benchmark_symbol"] = benchmark_symbol
+    enriched["smoke_config"] = smoke_config
+    return enriched
+
+
 class PortfolioService:
     """Manages portfolio lifecycle: creation, allocation, and combined backtest runs."""
 
@@ -487,7 +523,7 @@ class PortfolioService:
                 combined_returns.resample("1D").apply(lambda r: (1.0 + r).prod() - 1.0).dropna()
             )
             alpha, beta = compute_alpha_beta(daily_portfolio, benchmark_returns)
-        metrics = {**core, "alpha": alpha, "beta": beta}
+        metrics: dict[str, Any] = {**core, "alpha": alpha, "beta": beta}
         metrics["num_strategies"] = len(strategy_results)
         # Ultrareview merged_bug_004 on PR #73: the persisted leverage
         # metric must reflect REALIZED portfolio leverage, not just the
@@ -499,6 +535,35 @@ class PortfolioService:
         # the metric is the operator-visible audit signal.
         weight_sum = sum(abs(w) for _cid, w, _series in weighted_series)
         metrics["effective_leverage"] = portfolio_leverage * weight_sum
+
+        # ---- G5 smoke metrics enrichment (PRD v1.3) ----
+        # Iter-4 fix: enrich the persisted ``metrics`` dict (the one that
+        # lands in the SQL UPDATE below), NOT ``core`` — the latter is
+        # already superseded by the alpha/beta merge. Place AFTER all
+        # ``metrics[...] = ...`` mutations and BEFORE the UPDATE so the
+        # enriched dict is what hits the DB.
+        if run.smoke:
+            # ``smoke_config`` carries the named window ('fast' vs 'nightly')
+            # so the UI metrics-block and alerts payload render the right
+            # label without a separate DB column.
+            smoke_config_name = "fast" if (run.end_date - run.start_date).days <= 35 else "nightly"
+            trade_counts: dict[str, int] = {}
+            # ``strategy_results`` is the list of per-allocation result
+            # dicts. Each entry now carries ``trade_count`` per Step 4a of
+            # Task 5 in docs/plans/2026-05-26-ingest-backtest-smoke-test.md.
+            for strat_result in strategy_results:
+                name = str(strat_result.get("strategy_name", "unknown"))
+                trade_counts[name] = trade_counts.get(name, 0) + int(
+                    strat_result.get("trade_count", 0)
+                )
+            metrics = enrich_smoke_metrics(
+                core_metrics=metrics,
+                base_capital=float(portfolio.base_capital),
+                trade_counts_by_strategy=trade_counts,
+                benchmark_symbol="SPY",
+                smoke_config=smoke_config_name,
+            )
+
         # Equity curve stays at the strategy's native frequency for the
         # UI chart — never resampled so intraday detail is preserved.
         series_frame = build_series_from_returns(combined_returns, base_value=base_capital)
@@ -1247,6 +1312,12 @@ class PortfolioService:
             "metrics": dict(result.metrics),
             "returns": returns,
             "timestamps": timestamps,
+            # Iter-3 addition: per-allocation order count for smoke G5 metrics.
+            # ``result.orders_df`` is the Nautilus orders report — its row count
+            # is the number of orders this strategy submitted in the backtest.
+            # For ``smoke_market_order`` this is exactly 1 per instrument; for
+            # ``ema_cross`` it varies. Non-smoke runs ignore this field.
+            "trade_count": int(len(result.orders_df)) if result.orders_df is not None else 0,
         }
 
 
