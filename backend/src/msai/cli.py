@@ -56,6 +56,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import uuid
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
@@ -1042,6 +1043,57 @@ def system_health() -> None:
     _emit_json(parts)
 
 
+@system_app.command("smoke-alert")
+def smoke_alert_cmd(
+    result_file: str = typer.Argument(
+        ...,
+        help="Path to JSON file with smoke run result (output of `msai backtest smoke --json`).",
+    ),
+) -> None:
+    """Dispatch a smoke result as an alert via :class:`AlertingService`.
+
+    Used by ``.github/workflows/smoke.yml`` — reads the JSON the
+    nightly run wrote, constructs a single alert entry, and persists
+    via the existing file-backed alert log.  Picks ``level="error"``
+    when ``structural_problems`` is non-empty OR ``status`` is not
+    ``"completed"``; otherwise ``"info"``.
+
+    Note: ``status="completed"`` alone is NOT sufficient for PASS — the
+    structural assertions (G5 key presence, trade-count floor >= 2,
+    non-empty ``report_path``) must also hold.  The smoke CLI already
+    writes a ``structural_problems`` list to the JSON; we honor it.
+    """
+    from pathlib import Path
+
+    from msai.services.alerting import AlertingService
+
+    payload = json.loads(Path(result_file).read_text(encoding="utf-8"))
+    structural_problems = payload.get("structural_problems") or []
+    is_pass = payload.get("status") == "completed" and not structural_problems
+
+    level = "info" if is_pass else "error"
+    if is_pass:
+        smoke_config = (payload.get("metrics") or {}).get("smoke_config", "fast")
+        title = f"Smoke PASS — {smoke_config}"
+    elif structural_problems:
+        title = f"Smoke FAIL (structural) — {len(structural_problems)} problem(s)"
+    else:
+        title = "Smoke FAIL"
+
+    body: dict[str, Any] = {
+        "metrics": payload.get("metrics") or {},
+        "status": payload.get("status"),
+    }
+    if structural_problems:
+        body["structural_problems"] = structural_problems
+    if payload.get("error_message"):
+        body["error_message"] = payload["error_message"]
+    message = json.dumps(body, sort_keys=True)
+
+    AlertingService().send_alert(level=level, title=title, message=message)
+    typer.echo(f"alert dispatched: {title}")
+
+
 # ======================================================================
 # instruments sub-app
 # ======================================================================
@@ -1912,6 +1964,164 @@ def backtest_trades(
         typer.echo(f"Trades written to {out}", err=True)
     else:
         _emit_json(merged)
+
+
+# ======================================================================
+# T8: backtest smoke — canonical multi-strategy portfolio smoke (AAPL+SPY)
+# ======================================================================
+
+
+# Required keys on the G5 metrics block when the smoke run reports
+# ``status="completed"``.  Any missing key is a STRUCTURAL FAIL even
+# though the run's lifecycle status is terminal-success.
+_SMOKE_G5_REQUIRED: frozenset[str] = frozenset(
+    {
+        "total_return",
+        "pnl",
+        "sharpe",
+        "sortino",
+        "alpha",
+        "beta",
+        "max_drawdown",
+        "trade_count_by_strategy",
+        "trade_count_total",
+        "benchmark_symbol",
+        "smoke_config",
+    }
+)
+
+# Deterministic-trades floor: each of the two ``smoke_market_order``
+# Strategy rows (AAPL + SPY) is guaranteed to emit exactly one fill on
+# every smoke run.  Below 2 means order/fill plumbing is broken — fail
+# loudly even on a "completed" run.
+_SMOKE_TRADE_FLOOR: int = 2
+
+# Cold-nightly budget + slack — the smoke endpoint synchronously runs
+# ingest before returning, so the create-call timeout must cover the
+# upstream budget (~60 min for a cold nightly window).
+_SMOKE_HTTP_TIMEOUT_SECONDS: float = 3700.0
+
+
+@backtest_app.command("smoke")
+def smoke_cmd(
+    config: str = typer.Option(
+        "fast",
+        "--config",
+        help="Smoke config: 'fast' (1 month) or 'nightly' (2024 full year).",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit the smoke result as a single JSON document on stdout.",
+    ),
+) -> None:
+    """Run the canonical multi-strategy portfolio smoke against AAPL+SPY.
+
+    PRD: ``docs/prds/ingest-backtest-smoke-test.md`` v1.3.
+
+    On structural FAIL (status != "completed", missing G5 keys,
+    trade_count_total below the deterministic floor of 2, or empty
+    ``report_path``), exits with code 1 and prints the problems list
+    to stderr.  ``--json`` always emits a single JSON document on
+    stdout including a ``structural_problems`` array.
+    """
+    if config not in {"fast", "nightly"}:
+        typer.echo(
+            f"unknown --config {config}; expected 'fast' or 'nightly'",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    create_resp = _api_call(
+        "POST",
+        f"/api/v1/portfolios/smoke/runs?config={config}",
+        timeout=_SMOKE_HTTP_TIMEOUT_SECONDS,
+    )
+    run: dict[str, Any] = create_resp.json()
+    run_id = run["id"]
+
+    # Poll the run-detail endpoint until terminal — always do at least
+    # one GET so the CLI surfaces the run-detail shape (status,
+    # metrics, report_path) the structural assertions need rather than
+    # the create-response body shape.  Terminal states match
+    # ``PortfolioRunStatus`` (portfolio_enums.py:53) — note the
+    # single-L spelling of ``canceled``.
+    terminal = {"completed", "failed", "canceled"}
+    timeout_at = time.monotonic() + _SMOKE_HTTP_TIMEOUT_SECONDS
+    while True:
+        if time.monotonic() > timeout_at:
+            typer.echo(
+                f"FAIL @ poll: timed out waiting for run {run_id}",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        status_resp = _api_call(
+            "GET",
+            f"/api/v1/portfolios/runs/{_url_id(run_id)}",
+        )
+        run = status_resp.json()
+        if run.get("status") in terminal:
+            break
+        time.sleep(2)
+
+    metrics: dict[str, Any] = run.get("metrics") or {}
+    structural_problems: list[str] = []
+
+    if run.get("status") != "completed":
+        structural_problems.append(
+            f"status={run.get('status')!r}: {run.get('error_message') or 'unknown'}"
+        )
+    else:
+        missing_keys = _SMOKE_G5_REQUIRED - set(metrics.keys())
+        if missing_keys:
+            structural_problems.append(f"missing G5 keys: {sorted(missing_keys)}")
+        trade_total = int(metrics.get("trade_count_total") or 0)
+        if trade_total < _SMOKE_TRADE_FLOOR:
+            structural_problems.append(
+                f"trade_count_total={trade_total} < floor "
+                f"{_SMOKE_TRADE_FLOOR} — order/fill plumbing broken"
+            )
+        if not run.get("report_path"):
+            structural_problems.append("report_path empty — report generation failed")
+
+    if json_output:
+        out = {**run, "structural_problems": structural_problems}
+        typer.echo(json.dumps(out))
+        if structural_problems:
+            raise typer.Exit(code=1)
+        return
+
+    if not structural_problems:
+        _print_smoke_metrics_table(metrics, run.get("report_path") or "")
+        typer.echo(f"\nPASS — Portfolio run {run['id']}")
+        return
+
+    for problem in structural_problems:
+        typer.echo(f"FAIL: {problem}", err=True)
+    raise typer.Exit(code=1)
+
+
+def _print_smoke_metrics_table(metrics: dict[str, Any], report_path: str) -> None:
+    """Render the G5 metrics block as a compact human-readable table."""
+
+    def row(label: str, value: str) -> None:
+        typer.echo(f"  {label:<28} {value:>14}")
+
+    typer.echo("Smoke metrics:")
+    row("Total return", f"{(metrics.get('total_return') or 0):.2%}")
+    row("P&L (USD)", f"${(metrics.get('pnl') or 0):,.0f}")
+    row("Sharpe", f"{(metrics.get('sharpe') or 0):.2f}")
+    row("Sortino", f"{(metrics.get('sortino') or 0):.2f}")
+    row("Alpha vs SPY", f"{(metrics.get('alpha') or 0):.2%}")
+    row("Beta vs SPY", f"{(metrics.get('beta') or 0):.2f}")
+    row("Max drawdown", f"{(metrics.get('max_drawdown') or 0):.2%}")
+    row("Trades total", str(metrics.get("trade_count_total") or 0))
+    for strat, n in (metrics.get("trade_count_by_strategy") or {}).items():
+        row(f"  · {strat.removeprefix('__smoke__/')}", str(n))
+    row("Benchmark", str(metrics.get("benchmark_symbol") or "—"))
+    row("Smoke config", str(metrics.get("smoke_config") or "—"))
+    if report_path:
+        typer.echo(f"\nReport: {report_path}")
 
 
 # ======================================================================
