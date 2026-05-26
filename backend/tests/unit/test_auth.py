@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives.serialization import (
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
-from msai.core.auth import EntraIDValidator, get_current_user, init_validator
+from msai.core.auth import EntraIDValidator, get_current_user
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -58,7 +58,15 @@ def _make_token(
     exp_offset: int = 3600,
     extra_claims: dict[str, Any] | None = None,
 ) -> str:
-    """Encode a JWT signed with the given RSA private key."""
+    """Encode a JWT signed with the given RSA private key.
+
+    The base payload includes canonical delegated-token defaults (``scp``
+    and ``ver``) so every existing test that calls ``_make_token(pk)``
+    without overrides mints a token the extended ``validate_token``
+    accepts. ``extra_claims`` uses a remove-on-None semantic: pass
+    ``{"scp": None}`` to omit the claim entirely (tests
+    ``MissingRequiredClaimError``).
+    """
     now = int(time.time())
     payload: dict[str, Any] = {
         "sub": sub,
@@ -66,9 +74,15 @@ def _make_token(
         "iss": iss,
         "iat": now,
         "exp": now + exp_offset,
+        "scp": "access_as_user",
+        "ver": "2.0",
     }
     if extra_claims:
-        payload.update(extra_claims)
+        for key, value in extra_claims.items():
+            if value is None:
+                payload.pop(key, None)
+            else:
+                payload[key] = value
 
     private_pem = _private_key_to_pem(private_key)
     return pyjwt.encode(payload, private_pem, algorithm="RS256", headers={"kid": "test-key-1"})
@@ -247,3 +261,81 @@ class TestGetCurrentUser:
         assert body["sub"] == "user-456"
         assert body["aud"] == CLIENT_ID
         assert body["iss"] == ISSUER
+
+
+# ---------------------------------------------------------------------------
+# Extension tests — Task 2 of auth-regression-gate plan
+# ---------------------------------------------------------------------------
+
+
+class TestValidateTokenScpAndVerEnforcement:
+    """Tests for the extended validate_token: scp + ver claim enforcement."""
+
+    def test_validate_token_rejects_missing_scp_claim(
+        self,
+        rsa_keypair: tuple[rsa.RSAPrivateKey, bytes],
+    ) -> None:
+        """Defense-in-depth: a token without scp must be rejected.
+
+        Even with valid aud/iss/exp/sub, a missing scp claim is grounds for
+        rejection — defends against future Entra config drift or
+        scope-confusion attacks.
+        """
+        private_key, public_pem = rsa_keypair
+        validator = EntraIDValidator(TENANT_ID, CLIENT_ID)
+        validator._jwks_client = _mock_jwks_client(public_pem)
+
+        # extra_claims={"scp": None} REMOVES the claim per the new
+        # remove-on-None semantic in _make_token.
+        token = _make_token(private_key, extra_claims={"scp": None})
+
+        with pytest.raises(pyjwt.MissingRequiredClaimError):
+            validator.validate_token(token)
+
+    def test_validate_token_rejects_wrong_scp_value(
+        self,
+        rsa_keypair: tuple[rsa.RSAPrivateKey, bytes],
+    ) -> None:
+        """A token with scp=User.Read (right shape, wrong content) is rejected."""
+        private_key, public_pem = rsa_keypair
+        validator = EntraIDValidator(TENANT_ID, CLIENT_ID)
+        validator._jwks_client = _mock_jwks_client(public_pem)
+
+        token = _make_token(private_key, extra_claims={"scp": "User.Read"})
+
+        with pytest.raises(
+            pyjwt.InvalidTokenError,
+            match="Required scope 'access_as_user' missing",
+        ):
+            validator.validate_token(token)
+
+    def test_validate_token_rejects_wrong_token_version(
+        self,
+        rsa_keypair: tuple[rsa.RSAPrivateKey, bytes],
+    ) -> None:
+        """A token with ver=1.0 is rejected; backend expects v2.0 only."""
+        private_key, public_pem = rsa_keypair
+        validator = EntraIDValidator(TENANT_ID, CLIENT_ID)
+        validator._jwks_client = _mock_jwks_client(public_pem)
+
+        token = _make_token(private_key, extra_claims={"ver": "1.0"})
+
+        with pytest.raises(pyjwt.InvalidTokenError, match="Token version mismatch"):
+            validator.validate_token(token)
+
+    def test_validate_token_accepts_scp_with_additional_scopes(
+        self,
+        rsa_keypair: tuple[rsa.RSAPrivateKey, bytes],
+    ) -> None:
+        """scp is space-separated; access_as_user can be one of many scopes."""
+        private_key, public_pem = rsa_keypair
+        validator = EntraIDValidator(TENANT_ID, CLIENT_ID)
+        validator._jwks_client = _mock_jwks_client(public_pem)
+
+        token = _make_token(
+            private_key,
+            extra_claims={"scp": "openid profile access_as_user email"},
+        )
+
+        payload = validator.validate_token(token)
+        assert "access_as_user" in payload["scp"].split()

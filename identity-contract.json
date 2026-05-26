@@ -1,0 +1,22 @@
+{
+  "$schema": "./identity-contract.schema.json",
+  "tenant_id": "2237d332-fc65-4994-b676-61edad7be319",
+  "client_id": "24a60bec-57f4-4e19-aec0-1b90d75b4c31",
+  "app_id_uri": "api://24a60bec-57f4-4e19-aec0-1b90d75b4c31",
+  "issuer": "https://login.microsoftonline.com/2237d332-fc65-4994-b676-61edad7be319/v2.0",
+  "scope_name": "access_as_user",
+  "token_version": "2.0",
+  "frontend_env_prefix": "NEXT_PUBLIC_",
+  "env_var_names": {
+    "tenant_id": [
+      "AZURE_TENANT_ID",
+      "JWT_TENANT_ID",
+      "NEXT_PUBLIC_AZURE_TENANT_ID"
+    ],
+    "client_id": [
+      "AZURE_CLIENT_ID",
+      "JWT_CLIENT_ID",
+      "NEXT_PUBLIC_AZURE_CLIENT_ID"
+    ]
+  }
+}
