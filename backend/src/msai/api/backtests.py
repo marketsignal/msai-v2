@@ -579,7 +579,9 @@ async def list_backtests(  # noqa: PLR0912 — three independent type-branches b
                 ),
                 phase=bt.phase,  # type: ignore[arg-type]
                 progress_message=bt.progress_message,
-                smoke=bt.smoke,
+                # Legacy rows may have NULL smoke (pre-migration backfill);
+                # coerce to False so BacktestListItem's non-optional bool is satisfied.
+                smoke=bool(bt.smoke),
             )
             for bt in backtests
         )
@@ -652,7 +654,8 @@ async def list_backtests(  # noqa: PLR0912 — three independent type-branches b
                 error_public_message=(pr.error_message if pr.status == "failed" else None),
                 phase=None,
                 progress_message=None,
-                smoke=pr.smoke,
+                # Legacy rows may have NULL smoke pre-migration; coerce to False.
+                smoke=bool(pr.smoke),
             )
             for pr, portfolio_name in portfolio_rows
         )
