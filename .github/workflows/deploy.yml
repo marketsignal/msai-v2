@@ -196,30 +196,33 @@ jobs:
           # shellcheck disable=SC2029  # remote bash -s heredoc by design
           ssh "${VM_USER}@${VM_IP}" "bash -s" <<'EOF'
           set -uo pipefail  # NOTE: no -e — we want to capture nonzero exits
-          cd /opt/msai
-          CID=$(docker compose ps -q backend)
-          test -n "$CID"
+          # Prod stack uses a non-default compose file + project name; mirror
+          # deploy-on-vm.sh's invocation (scripts/deploy-on-vm.sh:40,238-240)
+          # and exec the service by name. Bare `docker compose ps -q backend`
+          # finds no config file and resolves an empty container id.
+          COMPOSE="docker compose --project-name msai -f /opt/msai/docker-compose.prod.yml"
+          $COMPOSE ps -q backend >/dev/null || { echo "::error::prod backend service not found via $COMPOSE"; exit 1; }
 
           RESULT_PATH=/tmp/smoke-preflight-result.json
 
           echo '{"status":"failed","structural_problems":["pre-CLI-launch failure (smoke CLI did not emit JSON)"],"metrics":null}' \
-            | docker exec -i "$CID" bash -c "cat > $RESULT_PATH"
+            | $COMPOSE exec -T backend bash -c "cat > $RESULT_PATH"
 
           # Redirect stderr to a SEPARATE file so a Python traceback never
           # corrupts the JSON file (silent-failure iter-1 fix #1).
           # `python -m msai.cli` — the prod image (uv sync --no-install-project)
           # has no `msai` console script, but PATH=/app/.venv/bin + PYTHONPATH=/app/src
           # make the venv python + module importable. Verified 2026-05-26.
-          docker exec -i "$CID" bash -c "python -m msai.cli backtest smoke --config fast --json > $RESULT_PATH 2>${RESULT_PATH}.stderr" || true
+          $COMPOSE exec -T backend bash -c "python -m msai.cli backtest smoke --config fast --json > $RESULT_PATH 2>${RESULT_PATH}.stderr" || true
 
           # Surface any stderr traceback to the CI log so the gate failure
           # is diagnosable without SSHing to the VM.
           echo "----- smoke preflight stderr -----"
-          docker exec -i "$CID" bash -c "test -s ${RESULT_PATH}.stderr && cat ${RESULT_PATH}.stderr || echo '(empty)'"
+          $COMPOSE exec -T backend bash -c "test -s ${RESULT_PATH}.stderr && cat ${RESULT_PATH}.stderr || echo '(empty)'"
           echo "----- end smoke preflight stderr -----"
 
-          STATUS=$(docker exec -i "$CID" python -c "import json;print(json.load(open('$RESULT_PATH')).get('status'))")
-          PROBLEMS=$(docker exec -i "$CID" python -c "import json;d=json.load(open('$RESULT_PATH'));print(len(d.get('structural_problems') or []))")
+          STATUS=$($COMPOSE exec -T backend python -c "import json;print(json.load(open('$RESULT_PATH')).get('status'))")
+          PROBLEMS=$($COMPOSE exec -T backend python -c "import json;d=json.load(open('$RESULT_PATH'));print(len(d.get('structural_problems') or []))")
           echo "preflight: status=$STATUS problems=$PROBLEMS"
           test "$STATUS" = "completed" && test "$PROBLEMS" = "0"
           EOF

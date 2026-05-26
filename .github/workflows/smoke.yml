@@ -137,12 +137,15 @@ jobs:
         #     skips the alert dispatch. Capture exit, ALWAYS dispatch alert,
         #     then exit with captured code derived from the JSON.
         #   - The JSON must live INSIDE the backend container so smoke-alert
-        #     can read it. We write via `docker exec -i bash -c 'cat > path'`
-        #     piped from a runner-side echo to avoid the YAML+heredoc
-        #     terminator-indentation hazard of a nested <<JSON inside <<'EOF'.
+        #     can read it. We write via `$COMPOSE exec -T backend bash -c
+        #     'cat > path'` piped from a runner-side echo to avoid the
+        #     YAML+heredoc terminator-indent hazard of a nested <<JSON in <<'EOF'.
+        #   - The prod stack uses `--project-name msai -f docker-compose.prod.yml`
+        #     (bare `docker compose` finds no config file on the VM), so we exec
+        #     the backend service by name rather than resolving a container id.
         #   - CONFIG is passed explicitly across the SSH boundary because SSH
         #     doesn't forward env by default. Outer heredoc `'EOF'` prevents
-        #     local expansion of $CID / $RESULT_PATH / $STATUS / $PROBLEMS.
+        #     local expansion of $COMPOSE / $RESULT_PATH / $STATUS / $PROBLEMS.
         env:
           CONFIG: ${{ steps.resolve.outputs.config }}
           VM_USER: ${{ vars.VM_SSH_USER }}
@@ -151,9 +154,12 @@ jobs:
           # shellcheck disable=SC2029  # CONFIG expansion is intentional client-side (passed across SSH boundary)
           ssh "${VM_USER}@${VM_IP}" "CONFIG='${CONFIG}' bash -s" <<'EOF'
           set -uo pipefail  # NOTE: no -e — we want to capture nonzero exits
-          cd /opt/msai
-          CID=$(docker compose ps -q backend)
-          test -n "$CID"
+          # The prod stack uses a non-default compose file + project name, so
+          # bare `docker compose` finds "no configuration file" and resolves an
+          # empty container id. Mirror deploy-on-vm.sh's invocation exactly
+          # (scripts/deploy-on-vm.sh:40,238-240) and exec the service by name.
+          COMPOSE="docker compose --project-name msai -f /opt/msai/docker-compose.prod.yml"
+          $COMPOSE ps -q backend >/dev/null || { echo "::error::prod backend service not found via $COMPOSE"; exit 1; }
 
           RESULT_PATH=/tmp/smoke-result.json
 
@@ -167,7 +173,7 @@ jobs:
           # because the inner JSON terminator ends up at column 2 instead of
           # column 0, swallowing the rest of the script.
           echo '{"status":"failed","structural_problems":["pre-CLI-launch failure (smoke CLI did not emit JSON)"],"metrics":null}' \
-            | docker exec -i "$CID" bash -c "cat > $RESULT_PATH"
+            | $COMPOSE exec -T backend bash -c "cat > $RESULT_PATH"
 
           # Run smoke inside the backend container; the CLI overwrites the
           # pre-seeded file with its real --json payload on success or on any
@@ -181,7 +187,7 @@ jobs:
           # but sets PATH=/app/.venv/bin + PYTHONPATH=/app/src, so `python`
           # resolves to the venv interpreter and the module is importable.
           # (Bare `msai` is NOT on PATH in the container — verified 2026-05-26.)
-          docker exec -i "$CID" bash -c "python -m msai.cli backtest smoke --config '$CONFIG' --json > $RESULT_PATH 2>${RESULT_PATH}.stderr" || true
+          $COMPOSE exec -T backend bash -c "python -m msai.cli backtest smoke --config '$CONFIG' --json > $RESULT_PATH 2>${RESULT_PATH}.stderr" || true
 
           # ALWAYS dispatch the alert from inside the same container, where
           # the JSON file is reachable. smoke_alert_cmd is now corrupt-JSON
@@ -194,7 +200,7 @@ jobs:
           # outage looks green and the operator never learns the smoke ran.
           # (Codex review P2: the old `|| echo ::warning` swallowed this.)
           ALERT_RC=0
-          docker exec -i "$CID" python -m msai.cli system smoke-alert "$RESULT_PATH" || ALERT_RC=$?
+          $COMPOSE exec -T backend python -m msai.cli system smoke-alert "$RESULT_PATH" || ALERT_RC=$?
           if [ "$ALERT_RC" -ne 0 ]; then
             echo "::error::smoke-alert dispatch failed (rc=$ALERT_RC) — alerting guarantee broken"
           fi
@@ -203,14 +209,14 @@ jobs:
           # so reviewers can diagnose without SSHing to the VM. Best-effort:
           # the file may not exist if the CLI never wrote stderr.
           echo "----- smoke CLI stderr -----"
-          docker exec -i "$CID" bash -c "test -s ${RESULT_PATH}.stderr && cat ${RESULT_PATH}.stderr || echo '(empty)'"
+          $COMPOSE exec -T backend bash -c "test -s ${RESULT_PATH}.stderr && cat ${RESULT_PATH}.stderr || echo '(empty)'"
           echo "----- end smoke CLI stderr -----"
 
           # Workflow exit = smoke structural PASS *and* alert dispatched.
           # Re-derive smoke status from the JSON (avoids docker-exec RC
           # swallow per moby/moby#4717) and AND it with the alert exit.
-          STATUS=$(docker exec -i "$CID" python -c "import json;print(json.load(open('$RESULT_PATH')).get('status'))")
-          PROBLEMS=$(docker exec -i "$CID" python -c "import json;d=json.load(open('$RESULT_PATH'));print(len(d.get('structural_problems') or []))")
+          STATUS=$($COMPOSE exec -T backend python -c "import json;print(json.load(open('$RESULT_PATH')).get('status'))")
+          PROBLEMS=$($COMPOSE exec -T backend python -c "import json;d=json.load(open('$RESULT_PATH'));print(len(d.get('structural_problems') or []))")
           test "$STATUS" = "completed" && test "$PROBLEMS" = "0" && test "$ALERT_RC" -eq 0
           EOF
 
