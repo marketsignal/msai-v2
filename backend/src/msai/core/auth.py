@@ -30,6 +30,13 @@ _API_KEY_CLAIMS: dict[str, Any] = {
     "name": "API Key User",
 }
 
+# Single source of truth lives in identity-contract.json at the repo root,
+# but the values are duplicated as module constants here to avoid a JSON
+# load on the auth hot path. Gate 3 enforces drift detection between this
+# pair and identity-contract.json's `scope_name` / `token_version` fields.
+_EXPECTED_SCOPE = "access_as_user"
+_EXPECTED_TOKEN_VERSION = "2.0"
+
 
 class EntraIDValidator:
     """Validates JWTs issued by Azure Entra ID using JWKS key discovery."""
@@ -44,15 +51,41 @@ class EntraIDValidator:
         )
 
     def validate_token(self, token: str) -> dict[str, Any]:
-        signing_key = self._jwks_client.get_signing_key_from_jwt(token)
+        # PyJWKClient raises PyJWKClientError on JWKS lookup misses (unknown
+        # kid, unreachable JWKS). PyJWKClientError is NOT a subclass of
+        # jwt.InvalidTokenError, so without this wrap get_current_user's
+        # `except jwt.InvalidTokenError` clause misses it and FastAPI
+        # surfaces 500 instead of 401.
+        try:
+            signing_key = self._jwks_client.get_signing_key_from_jwt(token)
+        except jwt.PyJWKClientError as exc:
+            raise jwt.InvalidTokenError(f"Signing key not found in JWKS: {exc}") from exc
+
         payload: dict[str, Any] = jwt.decode(
             token,
             signing_key.key,
             algorithms=["RS256"],
             audience=self._audience,
             issuer=self._issuer,
-            options={"require": ["exp", "iss", "aud", "sub"]},
+            options={"require": ["exp", "iss", "aud", "sub", "scp"]},
         )
+
+        # scp is a space-separated string per Entra v2.0 spec
+        # (learn.microsoft.com/en-us/entra/identity-platform/access-token-claims-reference).
+        scp_value: str = payload.get("scp", "")
+        if _EXPECTED_SCOPE not in scp_value.split():
+            raise jwt.InvalidTokenError(
+                f"Required scope '{_EXPECTED_SCOPE}' missing from scp claim "
+                f"(got: '{scp_value}')"
+            )
+
+        ver_value = payload.get("ver")
+        if ver_value != _EXPECTED_TOKEN_VERSION:
+            raise jwt.InvalidTokenError(
+                f"Token version mismatch: expected '{_EXPECTED_TOKEN_VERSION}', "
+                f"got '{ver_value}'"
+            )
+
         return payload
 
 
