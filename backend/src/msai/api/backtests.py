@@ -449,11 +449,22 @@ async def list_backtests(  # noqa: PLR0912 — three independent type-branches b
     include_smoke: bool = Query(
         default=False,
         description=(
-            "Include deploy-time data-path smoke backtests in the results. "
-            "Smoke rows are written by ``deploy-on-vm.sh`` Phase 12 to prove "
-            "the data path works on the prod VM after each deploy; they are "
+            "Include deploy-time data-path smoke backtests AND canonical "
+            "operator smoke portfolio runs in the results. Smoke rows are "
             "filtered out by default because operators don't want them in "
-            "their human history. Set ``true`` for diagnostic / audit views."
+            "their human history. Set ``true`` for diagnostic / audit "
+            "views. Mutually informative with ``smoke_only``: ``smoke_only`` "
+            "takes precedence when both are set."
+        ),
+    ),
+    smoke_only: bool = Query(
+        default=False,
+        description=(
+            "Return ONLY smoke rows (operator-driven canonical smoke "
+            "portfolio runs and deploy-time smoke single-strategy "
+            "backtests). Used by the dedicated smoke-history view to "
+            "audit recent smoke-test outcomes. Takes precedence over "
+            "``include_smoke``."
         ),
     ),
     type: Literal["single", "portfolio", "all"] = Query(  # noqa: A002 — public query name
@@ -501,7 +512,14 @@ async def list_backtests(  # noqa: PLR0912 — three independent type-branches b
             _defer(Backtest.series),
         )
         single_count_query = select(func.count()).select_from(Backtest)
-        if not include_smoke:
+        # Smoke filter — applied identically to row-fetch AND count so
+        # pagination ``total`` stays correct. ``smoke_only`` takes
+        # precedence over ``include_smoke``; default (neither set) hides
+        # smoke rows from operator-facing history.
+        if smoke_only:
+            single_query = single_query.where(Backtest.smoke.is_(True))
+            single_count_query = single_count_query.where(Backtest.smoke.is_(True))
+        elif not include_smoke:
             single_query = single_query.where(Backtest.smoke.is_(False))
             single_count_query = single_count_query.where(Backtest.smoke.is_(False))
 
@@ -561,6 +579,7 @@ async def list_backtests(  # noqa: PLR0912 — three independent type-branches b
                 ),
                 phase=bt.phase,  # type: ignore[arg-type]
                 progress_message=bt.progress_message,
+                smoke=bt.smoke,
             )
             for bt in backtests
         )
@@ -591,6 +610,15 @@ async def list_backtests(  # noqa: PLR0912 — three independent type-branches b
             .order_by(PortfolioRun.created_at.desc())
         )
         portfolio_count_query = select(func.count()).select_from(PortfolioRun)
+        # Apply the same smoke filter as on the single-strategy branch.
+        # Row-fetch AND count must agree or the response ``total`` lies for
+        # ``type="portfolio"`` pagination.
+        if smoke_only:
+            portfolio_query = portfolio_query.where(PortfolioRun.smoke.is_(True))
+            portfolio_count_query = portfolio_count_query.where(PortfolioRun.smoke.is_(True))
+        elif not include_smoke:
+            portfolio_query = portfolio_query.where(PortfolioRun.smoke.is_(False))
+            portfolio_count_query = portfolio_count_query.where(PortfolioRun.smoke.is_(False))
 
         if type == "portfolio":
             count_result = await db.execute(portfolio_count_query)
@@ -624,6 +652,7 @@ async def list_backtests(  # noqa: PLR0912 — three independent type-branches b
                 error_public_message=(pr.error_message if pr.status == "failed" else None),
                 phase=None,
                 progress_message=None,
+                smoke=pr.smoke,
             )
             for pr, portfolio_name in portfolio_rows
         )
@@ -638,12 +667,21 @@ async def list_backtests(  # noqa: PLR0912 — three independent type-branches b
         from msai.models.portfolio_run import PortfolioRun as PortfolioRunForCount
 
         single_count_query = select(func.count()).select_from(Backtest)
-        if not include_smoke:
+        portfolio_total_query = select(func.count()).select_from(PortfolioRunForCount)
+        # Apply the SAME smoke filter as on the per-branch fetches so the
+        # response ``total`` agrees with the merged item list.
+        if smoke_only:
+            single_count_query = single_count_query.where(Backtest.smoke.is_(True))
+            portfolio_total_query = portfolio_total_query.where(
+                PortfolioRunForCount.smoke.is_(True)
+            )
+        elif not include_smoke:
             single_count_query = single_count_query.where(Backtest.smoke.is_(False))
+            portfolio_total_query = portfolio_total_query.where(
+                PortfolioRunForCount.smoke.is_(False)
+            )
         single_total = (await db.execute(single_count_query)).scalar_one()
-        portfolio_total = (
-            await db.execute(select(func.count()).select_from(PortfolioRunForCount))
-        ).scalar_one()
+        portfolio_total = (await db.execute(portfolio_total_query)).scalar_one()
         total = single_total + portfolio_total
 
         offset = (page - 1) * page_size

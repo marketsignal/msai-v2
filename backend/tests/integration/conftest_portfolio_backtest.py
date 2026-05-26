@@ -360,6 +360,7 @@ async def make_completed_portfolio_run(
     async def _make(
         *,
         over_leverage: bool = False,
+        smoke: bool = False,
     ) -> PortfolioRun:
         async with portfolio_session_factory() as session:
             strategy = Strategy(
@@ -428,6 +429,7 @@ async def make_completed_portfolio_run(
                 heartbeat_at=now,
                 completed_at=now,
                 created_by=user_id,
+                smoke=smoke,
             )
             session.add(run)
             await session.commit()
@@ -452,6 +454,7 @@ async def make_backtest(
         *,
         strategy: Strategy | None = None,
         status: str = "completed",
+        smoke: bool = False,
     ) -> Backtest:
         if strategy is None:
             strategy = await make_strategy()
@@ -467,6 +470,7 @@ async def make_backtest(
                 end_date=date(2024, 6, 30),
                 status=status,
                 progress=100 if status == "completed" else 0,
+                smoke=smoke,
             )
             session.add(backtest)
             await session.commit()
