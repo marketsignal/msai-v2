@@ -5,7 +5,10 @@ name: Smoke
 #
 # Flow:
 #   1. azure/login@v2 (OIDC, no client secret; SHA-pinned action)
-#   2. Open transient NSG rule for SSH from the runner IP (priority 200;
+#   2. Open transient NSG rule for SSH from the runner IP (priority 202 —
+#      distinct from deploy.yml's 200 [main deploy] + 201 [preflight] so a
+#      concurrent nightly-smoke + on-push-deploy don't collide on the same
+#      NSG priority slot in the shared NSG;
 #      operator rule at 100 always wins). Rule name includes run_id and
 #      run_attempt for orphan diagnosis; reap-orphan-nsg-rules.yml picks
 #      up any leaks.
@@ -105,7 +108,7 @@ jobs:
             --resource-group "${{ steps.resolve.outputs.resource_group }}" \
             --nsg-name "${{ steps.resolve.outputs.nsg_name }}" \
             --name "${{ steps.resolve.outputs.rule_name }}" \
-            --priority 200 \
+            --priority 202 \
             --direction Inbound \
             --access Allow \
             --protocol Tcp \

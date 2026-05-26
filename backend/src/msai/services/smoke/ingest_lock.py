@@ -24,11 +24,12 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from msai.core.logging import get_logger
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable
     from datetime import date
 
     from redis.asyncio import Redis
@@ -113,6 +114,21 @@ async def acquire_ingest_lock(
         await asyncio.sleep(_POLL_INTERVAL_SECONDS)
 
 
+# Atomic compare-and-delete. A non-atomic GET-then-DEL has a race window:
+# between the GET and the DEL the TTL can expire, a DIFFERENT caller can
+# acquire the key, and our DEL would then delete THEIR freshly-acquired
+# lock. Running the check + delete server-side in a single Lua call closes
+# that window — returns 1 if we deleted our own lock, 0 if the holder differed
+# (or the key already expired).
+_RELEASE_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+else
+    return 0
+end
+"""
+
+
 async def release_ingest_lock(
     redis: Redis,
     *,
@@ -122,23 +138,20 @@ async def release_ingest_lock(
 ) -> None:
     """Release the lock only if ``token`` matches the current holder.
 
-    Uses a GET-then-DEL pattern (not a Lua script) because the race window
-    is bounded by TTL; a spurious release arriving after TTL expiry is
-    functionally identical to natural TTL expiry. If a different holder
-    now owns the key we log a warning and no-op — stealing a lock you
-    don't own is never the right move.
+    Uses an atomic Lua compare-and-delete (Codex review P2): a non-atomic
+    GET-then-DEL could delete another holder's lock if the TTL expired and a
+    new caller acquired the key inside the check→delete window. The compare
+    + delete therefore run server-side as one operation. A no-op (holder
+    differed or key already gone) is logged, never an error.
     """
     key = _build_lock_key(symbol=symbol, window_start=window_start)
-    current = await redis.get(key)
-    if current is None:
-        return
-    current_str = current.decode() if isinstance(current, bytes) else str(current)
-    if current_str != token:
+    # redis-py types eval() as returning Awaitable[str] | str (sync/async
+    # union), which mypy flags on await; the async client always returns the
+    # awaitable. Cast keeps --strict clean without suppressing real errors.
+    deleted = await cast("Awaitable[int]", redis.eval(_RELEASE_LUA, 1, key, token))
+    if not deleted:
         log.warning(
-            "smoke_ingest_lock_release_wrong_holder",
+            "smoke_ingest_lock_release_noop",
             key=key,
-            current=current_str,
             requested=token,
         )
-        return
-    await redis.delete(key)
