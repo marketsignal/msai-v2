@@ -73,6 +73,11 @@ on:
         type: boolean
         default: false
         description: "Explicit fresh-target / DR-rebuild flag. Allows the active-live_deployments gate to bypass on curl 6/7 (no DNS / connect-refused). MUST be false for prod re-deploys — Caddy being down doesn't mean broker (separate compose profile) is also down."
+      run_smoke:
+        required: false
+        type: boolean
+        default: false
+        description: "Opt-in pre-deploy smoke preflight. Runs `msai backtest smoke --config fast --json` on the VM BEFORE the deploy job. IMPORTANT: this validates the CURRENTLY-DEPLOYED image (env + data + Databento reachability), NOT the candidate SHA. Candidate-image staging gate is a deferred follow-up. Default false → push-to-main behavior is unchanged."
 
 permissions:
   id-token: write
@@ -85,10 +90,185 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  preflight:
+    # Opt-in pre-deploy smoke. Mirrors smoke.yml's SSH-to-VM pattern (OIDC +
+    # transient NSG SSH rule + docker exec inside the running backend
+    # container). HONEST framing: this validates the CURRENTLY-DEPLOYED image
+    # — env vars, KV secrets, Databento reachability, Parquet store, Postgres
+    # connectivity — NOT the candidate SHA. Candidate-image staging gate
+    # (build candidate, run smoke against it, then promote) is a deferred
+    # follow-up. The gate exists to catch "the env got corrupted since the
+    # last deploy" failures BEFORE we replace containers, not to validate
+    # the new code.
+    #
+    # `github.event.inputs.run_smoke` arrives as a STRING ('true' / 'false')
+    # — GitHub serializes workflow_dispatch boolean inputs to strings (Codex
+    # plan-review iter-1). Compare against the literal string 'true'.
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_smoke == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      runner_ip: ${{ steps.preflight-runner-ip.outputs.ip }}
+      rule_name: ${{ steps.preflight-resolve.outputs.rule_name }}
+      resource_group: ${{ steps.preflight-resolve.outputs.resource_group }}
+      nsg_name: ${{ steps.preflight-resolve.outputs.nsg_name }}
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Resolve preflight rule name + RG
+        id: preflight-resolve
+        run: |
+          rg="${{ inputs.resource_group }}"
+          [[ -z "$rg" ]] && rg="${{ vars.RESOURCE_GROUP }}"
+          nsg="${{ inputs.nsg_name }}"
+          [[ -z "$nsg" ]] && nsg="${{ vars.NSG_NAME }}"
+          {
+            echo "resource_group=$rg"
+            echo "nsg_name=$nsg"
+            # run_id-run_attempt-preflight suffix keeps the rule unique vs
+            # the deploy job's own rule (gha-transient-<run_id>-<attempt>).
+            echo "rule_name=gha-transient-preflight-${{ github.run_id }}-${{ github.run_attempt }}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@1384c340ab2dda50fed2bee3041d1d87018aa5e8 # v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve runner public IP
+        id: preflight-runner-ip
+        run: |
+          ip=$(curl -sf --max-time 10 https://ifconfig.me)
+          if ! [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Could not resolve runner public IP (got: $ip)" >&2
+            exit 1
+          fi
+          echo "ip=$ip" >> "$GITHUB_OUTPUT"
+
+      - name: Open transient SSH allow rule
+        run: |
+          az network nsg rule create \
+            --resource-group "${{ steps.preflight-resolve.outputs.resource_group }}" \
+            --nsg-name "${{ steps.preflight-resolve.outputs.nsg_name }}" \
+            --name "${{ steps.preflight-resolve.outputs.rule_name }}" \
+            --priority 201 \
+            --direction Inbound \
+            --access Allow \
+            --protocol Tcp \
+            --source-address-prefixes "${{ steps.preflight-runner-ip.outputs.ip }}/32" \
+            --destination-port-ranges 22 \
+            --description "Transient SSH from GHA deploy.yml preflight. run_id=${{ github.run_id }} attempt=${{ github.run_attempt }}. See docs/decisions/deploy-ssh-jit.md" \
+            --output none
+
+      - name: Wait briefly for NSG rule propagation
+        run: sleep 15
+
+      - uses: webfactory/ssh-agent@a6f90b1f127823b31d4d4a8d96047790581349bd # v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.VM_SSH_PRIVATE_KEY }}
+
+      - name: Trust VM host key
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          if [[ -n "${{ inputs.vm_ssh_known_hosts_var }}" ]]; then
+            echo "${{ inputs.vm_ssh_known_hosts_var }}" >> ~/.ssh/known_hosts
+          else
+            echo "${{ vars.VM_SSH_KNOWN_HOSTS }}" >> ~/.ssh/known_hosts
+          fi
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Run smoke preflight on VM
+        # Mirrors smoke.yml's docker-exec pattern: pre-seed a failure JSON
+        # inside the backend container so the workflow has a structured
+        # signal even if the CLI exits before emitting JSON; then run
+        # `msai backtest smoke --config fast --json`; then re-derive the
+        # workflow exit from the JSON (avoids docker-exec rc swallow per
+        # moby/moby#4717). Preflight uses --config fast (~3-10 min) — the
+        # nightly window is too long for a deploy gate.
+        env:
+          VM_USER: ${{ vars.VM_SSH_USER }}
+          VM_IP: ${{ inputs.vm_public_ip != '' && inputs.vm_public_ip || vars.VM_PUBLIC_IP }}
+        run: |
+          # shellcheck disable=SC2029  # remote bash -s heredoc by design
+          ssh "${VM_USER}@${VM_IP}" "bash -s" <<'EOF'
+          set -uo pipefail  # NOTE: no -e — we want to capture nonzero exits
+          cd /opt/msai
+          CID=$(docker compose ps -q backend)
+          test -n "$CID"
+
+          RESULT_PATH=/tmp/smoke-preflight-result.json
+
+          echo '{"status":"failed","structural_problems":["pre-CLI-launch failure (smoke CLI did not emit JSON)"],"metrics":null}' \
+            | docker exec -i "$CID" bash -c "cat > $RESULT_PATH"
+
+          docker exec -i "$CID" bash -c "msai backtest smoke --config fast --json > $RESULT_PATH 2>&1" || true
+
+          STATUS=$(docker exec -i "$CID" python -c "import json;print(json.load(open('$RESULT_PATH')).get('status'))")
+          PROBLEMS=$(docker exec -i "$CID" python -c "import json;d=json.load(open('$RESULT_PATH'));print(len(d.get('structural_problems') or []))")
+          echo "preflight: status=$STATUS problems=$PROBLEMS"
+          test "$STATUS" = "completed" && test "$PROBLEMS" = "0"
+          EOF
+
+      - name: Preflight summary
+        if: always()
+        run: |
+          {
+            echo "## Pre-deploy smoke preflight"
+            echo "- Config: \`fast\`"
+            echo "- Validates: CURRENTLY-DEPLOYED image (env + data preflight)"
+            echo "- NOT validated: candidate SHA (staging gate is a deferred follow-up)"
+            echo "- Resource group: \`${{ steps.preflight-resolve.outputs.resource_group }}\`"
+            echo "- Runner IP: \`${{ steps.preflight-runner-ip.outputs.ip }}\`"
+            echo "- Transient NSG rule: \`${{ steps.preflight-resolve.outputs.rule_name }}\`"
+            echo "- Job conclusion: \`${{ job.status }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  preflight-cleanup:
+    # Separate cleanup job for the preflight NSG rule. Mirrors the
+    # deploy/cleanup pattern (survives runner-VM kill on the preflight job).
+    needs: [preflight]
+    if: always() && needs.preflight.result != 'skipped'
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@1384c340ab2dda50fed2bee3041d1d87018aa5e8 # v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Delete transient SSH rule
+        if: needs.preflight.outputs.rule_name != ''
+        run: |
+          az network nsg rule delete \
+            --resource-group "${{ needs.preflight.outputs.resource_group }}" \
+            --nsg-name "${{ needs.preflight.outputs.nsg_name }}" \
+            --name "${{ needs.preflight.outputs.rule_name }}" \
+            --output none 2>/dev/null || true
+
   deploy:
     # workflow_run fires on ALL conclusions; gate on success explicitly. workflow_dispatch
     # always runs (no conclusion field on dispatch events).
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    #
+    # `needs: [preflight]` with `if: always() && (preflight.result == 'success'
+    # || preflight.result == 'skipped')` lets the deploy job run when the
+    # preflight job was skipped (the default, opt-in flag absent — push-to-main
+    # behavior is unchanged) AND when the preflight job ran successfully.
+    # A failed preflight blocks the deploy; a successful one (or a skipped one)
+    # proceeds.
+    needs: [preflight]
+    if: |
+      always()
+      && (needs.preflight.result == 'success' || needs.preflight.result == 'skipped')
+      && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-24.04
     outputs:
       short_sha: ${{ steps.resolve.outputs.short_sha }}
