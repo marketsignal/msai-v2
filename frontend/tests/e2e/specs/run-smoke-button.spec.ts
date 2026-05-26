@@ -70,6 +70,19 @@ test.describe("Run smoke button @smoke", () => {
     await expect(
       page.getByText(/Run id: 11111111-2222-3333-4444-555555555555/),
     ).toBeVisible({ timeout: 5_000 });
+
+    // Code-review iter-1 fix #6 — UI must navigate the operator to the
+    // run-detail page so they can watch the metrics block fill in,
+    // matching the PRD US-002 "click the row to open the details view"
+    // flow. The history list on /backtests filters smoke runs out by
+    // default, so without this navigation the operator saw no change.
+    await page.waitForURL(
+      /\/portfolio\/runs\/11111111-2222-3333-4444-555555555555$/,
+      { timeout: 5_000 },
+    );
+    expect(page.url()).toMatch(
+      /\/portfolio\/runs\/11111111-2222-3333-4444-555555555555$/,
+    );
   });
 
   test("operator sees an error toast when the smoke run fails @smoke", async ({

@@ -42,12 +42,14 @@ PRD docs/prds/ingest-backtest-smoke-test.md v1.3.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from msai.core.config import settings
+from msai.core.database import async_session_factory
 from msai.core.logging import get_logger
 from msai.core.queue import enqueue_portfolio_run, get_redis_pool
 from msai.models.portfolio import Portfolio
@@ -65,6 +67,9 @@ from msai.services.smoke.ingest_lock import (
     acquire_ingest_lock,
     release_ingest_lock,
 )
+from msai.services.symbol_onboarding.coverage import compute_coverage
+from msai.services.symbol_onboarding.partition_index import PartitionIndexService
+from msai.services.symbol_onboarding.partition_index_db import PartitionIndexGateway
 
 if TYPE_CHECKING:
     from uuid import UUID
@@ -202,38 +207,132 @@ async def _get_or_create_canonical_portfolio(
     return portfolio
 
 
+def _iter_month_starts(start_date: date, end_date: date) -> list[date]:
+    """Enumerate first-of-month ``date`` values covering ``[start_date, end_date]``.
+
+    Code-review iter-1 fix #4 (lock window covers full ingest range): the
+    Redis mutex is keyed by ``(symbol, YYYY-MM)`` (see
+    :mod:`msai.services.smoke.ingest_lock`), and ``ingest_symbols`` fetches
+    every month in the requested window. Previously the runner locked only
+    the start month, so concurrent ``smoke:nightly`` invocations colliding
+    on the December slice got no protection.
+
+    Returns one ``date`` per month — always the first of the month — so the
+    lock-key helper sees a stable representative.  Order is chronological.
+    """
+    if end_date < start_date:
+        return []
+    months: list[date] = []
+    year, month = start_date.year, start_date.month
+    end_year, end_month = end_date.year, end_date.month
+    while (year, month) <= (end_year, end_month):
+        months.append(date(year, month, 1))
+        if month == 12:
+            year += 1
+            month = 1
+        else:
+            month += 1
+    return months
+
+
+async def _symbols_with_gaps(
+    symbols: tuple[str, ...],
+    start_date: date,
+    end_date: date,
+) -> list[str]:
+    """Return the subset of ``symbols`` whose Parquet partitions are NOT yet
+    fully covering ``[start_date, end_date]``.
+
+    Code-review iter-1 fix #4 (coverage check before ingest): the previous
+    runner unconditionally called :func:`ingest_symbols`, which forces a
+    Databento fetch even when the Parquet is already on disk -- breaking the
+    warm-path runtime budget. We now consult :func:`compute_coverage` (the
+    project's authoritative day-precise coverage scan) and only return the
+    symbols whose coverage status is not ``"full"``.
+
+    Opens a fresh short-lived ``AsyncSession`` because the runner's own
+    bootstrap session is mid-transaction; querying ``parquet_partition_index``
+    on it would entangle the read with the portfolio commit. The session
+    closes via ``async with`` even if ``compute_coverage`` raises.
+    """
+    gaps: list[str] = []
+    async with async_session_factory() as session:
+        partition_index = PartitionIndexService(
+            db_gateway=PartitionIndexGateway(session=session),
+        )
+        for symbol in symbols:
+            coverage = await compute_coverage(
+                asset_class="stocks",
+                symbol=symbol,
+                start=start_date,
+                end=end_date,
+                data_root=settings.data_root,
+                partition_index=partition_index,
+            )
+            if coverage.status != "full":
+                gaps.append(symbol)
+    return gaps
+
+
 async def _ensure_ingested(symbols: tuple[str, ...], start: str, end: str) -> None:
     """Cold-ingest pre-flight via the existing in-process ``ingest_symbols``.
 
-    Wrapped per-symbol in the Redis mutex (T3) so that overlapping smoke
-    invocations from CLI + UI + nightly scheduler don't double-fetch the
-    same Databento window. ``ingest_symbols`` is idempotent -- if the
-    Parquet for the requested window is already on disk, the helper returns
-    a zero-bars result and the mutex is released cleanly.
+    Wrapped per ``(symbol, year-month)`` in the Redis mutex (T3) so that
+    overlapping smoke invocations from CLI + UI + nightly scheduler don't
+    double-fetch the same Databento window. ``ingest_symbols`` is idempotent
+    -- if the Parquet for the requested window is already on disk, the
+    helper returns a zero-bars result and every mutex is released cleanly.
+
+    Code-review iter-1 fix #4 (coverage check + full-range mutex):
+    * Skip the ``ingest_symbols`` call entirely when ALL configured symbols
+      already have ``status="full"`` coverage for the requested window
+      (warm path -- the previous code always fetched).
+    * Acquire one lock per ``(symbol, YYYY-MM)`` for every month in
+      ``[start, end]`` (not just the start month) so a concurrent fast run
+      hitting December gets the same protection as January.
     """
+    start_date = datetime.fromisoformat(start).date()
+    end_date = datetime.fromisoformat(end).date()
+
+    # Warm-path short-circuit: ask compute_coverage which symbols still have
+    # gaps; if none, the ingest is a no-op and we skip both the lock dance
+    # and the Databento round-trip.
+    gapped_symbols = await _symbols_with_gaps(symbols, start_date, end_date)
+    if not gapped_symbols:
+        log.info(
+            "smoke_ensure_ingested_coverage_full_skip",
+            symbols=list(symbols),
+            start=start,
+            end=end,
+        )
+        return
+
     redis = await get_redis_pool()
-    window_start = datetime.fromisoformat(start).date()
-    # Track ``(symbol, token)`` pairs so the ``finally`` block can release
-    # every successfully-acquired lock even when later acquisitions fail.
-    tokens: list[tuple[str, str]] = []
+    month_starts = _iter_month_starts(start_date, end_date)
+    # Track ``(symbol, month_start, token)`` triples so the ``finally`` block
+    # can release every successfully-acquired lock even when a later
+    # acquisition fails.
+    tokens: list[tuple[str, date, str]] = []
     try:
-        for symbol in symbols:
-            token = await acquire_ingest_lock(
-                redis,
-                symbol=symbol,
-                window_start=window_start,
-                # 15 minutes is comfortably longer than the worst-case
-                # Databento monthly download for a single equity.
-                ttl_seconds=900,
-                # 10 minutes -- long enough that a concurrent ingest can
-                # finish, short enough that we surface a real stall to the
-                # caller rather than hang forever.
-                wait_timeout_seconds=600,
-            )
-            tokens.append((symbol, token))
+        for symbol in gapped_symbols:
+            for month_start in month_starts:
+                token = await acquire_ingest_lock(
+                    redis,
+                    symbol=symbol,
+                    window_start=month_start,
+                    # 1 hour covers cold-nightly ingest (12 months × per-month
+                    # Databento monthly fetch). Comfortably longer than the
+                    # warm-path no-op and the worst single-month equity pull.
+                    ttl_seconds=3600,
+                    # 10 minutes -- long enough that a concurrent ingest can
+                    # finish, short enough that we surface a real stall to
+                    # the caller rather than hang forever.
+                    wait_timeout_seconds=600,
+                )
+                tokens.append((symbol, month_start, token))
         await ingest_symbols(
             "stocks",
-            list(symbols),
+            list(gapped_symbols),
             start,
             end,
             provider="databento",
@@ -244,12 +343,12 @@ async def _ensure_ingested(symbols: tuple[str, ...], start: str, end: str) -> No
         # Always release every successfully-acquired lock, even if the
         # ingest call itself raised. ``release_ingest_lock`` is holder-token
         # guarded -- a foreign token will no-op rather than steal the slot.
-        for symbol, token in tokens:
+        for symbol, month_start, token in tokens:
             try:
                 await release_ingest_lock(
                     redis,
                     symbol=symbol,
-                    window_start=window_start,
+                    window_start=month_start,
                     token=token,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -260,6 +359,7 @@ async def _ensure_ingested(symbols: tuple[str, ...], start: str, end: str) -> No
                 log.warning(
                     "smoke_ingest_lock_release_failed",
                     symbol=symbol,
+                    window_start=month_start.isoformat(),
                     error=str(exc),
                 )
 

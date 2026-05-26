@@ -2,8 +2,18 @@
 
 /**
  * `<RunSmokeButton />` — header action on `/backtests` that POSTs to
- * `/api/v1/portfolios/smoke/runs?config=fast` and surfaces the resulting
- * `PortfolioRun.id` via a sonner toast.
+ * `/api/v1/portfolios/smoke/runs?config=fast` and, on success, navigates
+ * the operator to the new run's detail page so they can watch metrics
+ * land (per PRD US-002: "I can click the row to open the existing
+ * backtest details view").
+ *
+ * Code-review iter-1 fix #6 (UI navigates to run): the previous
+ * implementation just popped a toast and stayed on `/backtests`. The
+ * history list on that page filters smoke runs OUT by default
+ * (`include_smoke=false`), so the operator saw no visual change after
+ * clicking — confusing UX. The button now pushes
+ * `/portfolio/runs/<run_id>` (the existing portfolio-run detail page
+ * mounted by T11 with the metrics block) after the toast fires.
  *
  * Auth pattern matches the project's existing authenticated-mutation
  * components (e.g., `components/live/resume-button.tsx`):
@@ -20,6 +30,7 @@
  */
 
 import * as React from "react";
+import { useRouter } from "next/navigation";
 import { Loader2, Zap } from "lucide-react";
 import { toast } from "sonner";
 
@@ -35,6 +46,7 @@ interface SmokeRunResponse {
 
 export function RunSmokeButton(): React.ReactElement {
   const { getToken } = useAuth();
+  const router = useRouter();
   const [pending, setPending] = React.useState<boolean>(false);
 
   const handleClick = async (): Promise<void> => {
@@ -50,6 +62,10 @@ export function RunSmokeButton(): React.ReactElement {
       toast.success("Smoke run started", {
         description: `Run id: ${data.id}`,
       });
+      // Navigate to the run-detail page (mounted at /portfolio/runs/[runId])
+      // so the operator can watch the metrics block fill in. Matches the
+      // PRD US-002 "click the row to open the details view" flow.
+      router.push(`/portfolio/runs/${data.id}`);
     } catch (err) {
       toast.error(describeApiError(err, "Failed to start smoke"));
       console.error("Run smoke failed:", err);

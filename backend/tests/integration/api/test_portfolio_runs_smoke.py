@@ -167,6 +167,16 @@ def _mock_smoke_redis(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _stub_enqueue(_pool: object, _run_id: str, _portfolio_id: str) -> str:
         return "stub-job-id"
 
+    # Coverage check fix (iter-1 #4): force the cold-ingest path so the
+    # lock acquire + ingest_symbols stubs still execute. The warm-path
+    # (status="full" → skip) is covered by a dedicated runner-level test.
+    async def _stub_symbols_with_gaps(
+        symbols: tuple[str, ...],
+        _start_date: object,
+        _end_date: object,
+    ) -> list[str]:
+        return list(symbols)
+
     monkeypatch.setattr("msai.services.smoke.runner.get_redis_pool", _stub_get_pool)
     monkeypatch.setattr("msai.services.smoke.runner.acquire_ingest_lock", _stub_acquire)
     monkeypatch.setattr("msai.services.smoke.runner.release_ingest_lock", _stub_release)
@@ -174,6 +184,7 @@ def _mock_smoke_redis(monkeypatch: pytest.MonkeyPatch) -> None:
     # (NOT via msai.api.portfolio's namespace), so _mock_enqueue's patch
     # doesn't cover this path. Patch the runner's local binding too.
     monkeypatch.setattr("msai.services.smoke.runner.enqueue_portfolio_run", _stub_enqueue)
+    monkeypatch.setattr("msai.services.smoke.runner._symbols_with_gaps", _stub_symbols_with_gaps)
 
 
 @pytest_asyncio.fixture
