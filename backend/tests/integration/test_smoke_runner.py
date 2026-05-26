@@ -275,3 +275,83 @@ async def test_concurrent_run_smoke_invocations_share_canonical_portfolio(
         )
         assert len(runs) == 2, f"Expected 2 runs against the canonical portfolio, got {len(runs)}"
         assert all(r.smoke is True for r in runs), "Both runs must carry smoke=True"
+
+
+# ---------------------------------------------------------------------------
+# Codex code-review P2 — the canonical smoke Portfolio must carry the config's
+# benchmark ("SPY") so orchestration calls ``load_benchmark_returns`` and
+# alpha/beta persist instead of staying null.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_runner_bootstraps_portfolio_with_benchmark_symbol(
+    portfolio_db_session: AsyncSession,
+    _seed_smoke_strategies: None,
+    _mock_runner_externals: None,
+) -> None:
+    """A freshly-bootstrapped canonical Portfolio carries benchmark="SPY".
+
+    Without this, orchestration skips alpha/beta (it only loads benchmark
+    returns when ``portfolio.benchmark_symbol`` is set), so the live UI
+    showed ``Alpha: — / Beta: —`` even though the G5 block labels SPY.
+    """
+    # Arrange
+    from msai.models.portfolio import Portfolio
+    from msai.services.smoke.config import SMOKE_CONFIGS
+    from msai.services.smoke.runner import run_smoke
+
+    # Act
+    run = await run_smoke(db=portfolio_db_session, config_name="fast")
+
+    # Assert — the persisted Portfolio carries the config benchmark.
+    portfolio = await portfolio_db_session.get(Portfolio, run.portfolio_id)
+    assert portfolio is not None
+    assert portfolio.benchmark_symbol == SMOKE_CONFIGS["fast"].benchmark_symbol
+    assert portfolio.benchmark_symbol == "SPY"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_runner_self_heals_existing_portfolio_with_null_benchmark(
+    portfolio_db_session: AsyncSession,
+    _seed_smoke_strategies: None,
+    _mock_runner_externals: None,
+) -> None:
+    """An existing canonical Portfolio with null benchmark gets self-healed.
+
+    Codex code-review P2: rows created before benchmark wiring landed have
+    ``benchmark_symbol = None``. The next ``run_smoke`` must UPDATE the
+    existing row to the config benchmark so subsequent runs compute
+    alpha/beta — no manual psql reconciliation needed.
+    """
+    # Arrange — first run creates the canonical portfolio, then we wind its
+    # benchmark back to None to simulate a pre-fix row.
+    from msai.models.portfolio import Portfolio
+    from msai.services.smoke.runner import run_smoke
+
+    first = await run_smoke(db=portfolio_db_session, config_name="fast")
+    stale = await portfolio_db_session.get(Portfolio, first.portfolio_id)
+    assert stale is not None
+    stale.benchmark_symbol = None
+    await portfolio_db_session.commit()
+
+    # Act — second run looks up the existing row and should self-heal it.
+    second = await run_smoke(db=portfolio_db_session, config_name="fast")
+
+    # Assert — same canonical portfolio, benchmark now populated. Re-SELECT
+    # with ``populate_existing`` so the assertion reads the committed value
+    # (not the identity-map's cached null) without triggering a sync lazy
+    # load.
+    assert second.portfolio_id == first.portfolio_id
+    from sqlalchemy import select as _select
+
+    healed = (
+        await portfolio_db_session.execute(
+            _select(Portfolio)
+            .where(Portfolio.id == first.portfolio_id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    assert healed.benchmark_symbol == "SPY"

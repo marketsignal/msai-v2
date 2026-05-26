@@ -2106,11 +2106,30 @@ def smoke_cmd(
     try:
         while True:
             if time.monotonic() > timeout_at:
-                typer.echo(
-                    f"FAIL @ poll: timed out waiting for run {run_id} "
-                    f"(deadline={_SMOKE_POLL_DEADLINE_SECONDS}s after create)",
-                    err=True,
-                )
+                # In --json mode emit a failure JSON document on stdout
+                # before exiting so automation parsing stdout still gets a
+                # well-formed result (Codex code-review P2 — the branch
+                # previously wrote only to stderr, breaking the JSON
+                # contract). Human mode keeps the stderr line.
+                if json_output:
+                    typer.echo(
+                        json.dumps(
+                            {
+                                "id": run_id,
+                                "status": "timeout",
+                                "structural_problems": [
+                                    "poll deadline exceeded; run still in flight"
+                                ],
+                                "metrics": None,
+                            }
+                        )
+                    )
+                else:
+                    typer.echo(
+                        f"FAIL @ poll: timed out waiting for run {run_id} "
+                        f"(deadline={_SMOKE_POLL_DEADLINE_SECONDS}s after create)",
+                        err=True,
+                    )
                 raise typer.Exit(code=1)
             status_resp = _api_call(
                 "GET",

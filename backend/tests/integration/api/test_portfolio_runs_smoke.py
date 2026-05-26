@@ -3,8 +3,10 @@
 Verifies the additive ``smoke: bool`` field on ``PortfolioRunCreate`` /
 ``PortfolioRunResponse``:
 
-- ``smoke=True`` in the POST body persists and surfaces on the response.
 - Omitting ``smoke`` defaults to ``False`` (additive, non-breaking).
+- ``smoke=True`` on the PUBLIC ``POST /{portfolio_id}/runs`` body is
+  rejected with 422 — it is an internal marker the canonical
+  ``POST /smoke/runs`` endpoint sets via the runner (Codex code-review P2).
 
 The endpoint at ``POST /api/v1/portfolios/{portfolio_id}/runs`` enqueues
 the run via arq → Redis. Redis is not guaranteed in the integration test
@@ -46,27 +48,6 @@ def _mock_enqueue(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_portfolio_run_with_smoke_true_persists_smoke_column(
-    api_client_authed,
-    sample_portfolio_id,
-    _mock_enqueue: None,
-) -> None:
-    # Arrange / Act
-    response = await api_client_authed.post(
-        f"/api/v1/portfolios/{sample_portfolio_id}/runs",
-        json={
-            "start_date": "2024-12-01",
-            "end_date": "2024-12-31",
-            "smoke": True,
-        },
-    )
-
-    # Assert
-    assert response.status_code == 201, response.text
-    assert response.json()["smoke"] is True
-
-
-@pytest.mark.asyncio
 async def test_create_portfolio_run_smoke_defaults_false(
     api_client_authed,
     sample_portfolio_id,
@@ -84,6 +65,37 @@ async def test_create_portfolio_run_smoke_defaults_false(
     # Assert
     assert response.status_code == 201, response.text
     assert response.json()["smoke"] is False
+
+
+@pytest.mark.asyncio
+async def test_create_portfolio_run_rejects_public_smoke_true_with_422(
+    api_client_authed,
+    sample_portfolio_id,
+    _mock_enqueue: None,
+) -> None:
+    """The PUBLIC run route rejects ``smoke=True`` with 422.
+
+    Codex code-review P2: ``smoke`` is an internal marker the canonical
+    ``POST /smoke/runs`` endpoint sets via the runner. Allowing it on the
+    public ``POST /{portfolio_id}/runs`` body would let any authenticated
+    client stamp an ordinary run as a smoke run (which is then filtered
+    out of ``/backtests/history`` + gets smoke-only metrics enrichment).
+    """
+    # Arrange / Act
+    response = await api_client_authed.post(
+        f"/api/v1/portfolios/{sample_portfolio_id}/runs",
+        json={
+            "start_date": "2024-12-01",
+            "end_date": "2024-12-31",
+            "smoke": True,
+        },
+    )
+
+    # Assert — 422 with an actionable message pointing at the right route.
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert "smoke is an internal flag" in detail
+    assert "/smoke/runs" in detail
 
 
 # ---------------------------------------------------------------------------

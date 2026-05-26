@@ -577,6 +577,55 @@ class TestBacktestSmokeCommand:
         assert "unknown --config" in result.output.lower()
         assert mock.call_count == 0
 
+    def test_json_mode_poll_timeout_emits_failure_json_on_stdout(self, runner: CliRunner) -> None:
+        """In --json mode, a poll-deadline timeout still emits a JSON doc.
+
+        Codex code-review P2: the poll-timeout branch used to write only to
+        stderr, breaking the JSON contract automation parses from stdout.
+        The branch must emit ``{"status": "timeout", ...}`` on stdout before
+        exiting non-zero.
+        """
+        # Arrange — create returns a pending run; the poll GET keeps
+        # returning a non-terminal status. Force the deadline to elapse on
+        # the FIRST loop check by stubbing time.monotonic: the create-time
+        # baseline is read once before the loop, then the first in-loop
+        # check sees a value past the deadline.
+        from msai.cli import _SMOKE_POLL_DEADLINE_SECONDS
+
+        pending = {
+            "id": "00000000-0000-0000-0000-000000000111",
+            "status": "pending",
+            "smoke": True,
+            "metrics": None,
+            "report_path": None,
+            "error_message": None,
+        }
+        create_resp = _ok_response(pending)
+        create_resp.status_code = 201
+        get_resp = _ok_response(pending)
+        with (
+            patch(
+                "msai.cli.httpx.request",
+                side_effect=[create_resp, get_resp, get_resp, get_resp],
+            ),
+            # First call: baseline timeout_at = 0 + deadline. Second call
+            # (the in-loop check) returns a value past that deadline.
+            patch(
+                "msai.cli.time.monotonic",
+                side_effect=[0.0, _SMOKE_POLL_DEADLINE_SECONDS + 1.0],
+            ),
+        ):
+            # Act
+            result = runner.invoke(app, ["backtest", "smoke", "--json"])
+
+        # Assert — non-zero exit AND a well-formed JSON document on stdout.
+        assert result.exit_code == 1, result.output
+        payload = json.loads(result.output)
+        assert payload["status"] == "timeout"
+        assert payload["id"] == "00000000-0000-0000-0000-000000000111"
+        assert payload["metrics"] is None
+        assert payload["structural_problems"] == ["poll deadline exceeded; run still in flight"]
+
 
 class TestSystemSmokeAlertCommand:
     """Coverage for ``msai system smoke-alert`` (Task 8)."""

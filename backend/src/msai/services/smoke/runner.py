@@ -117,7 +117,7 @@ async def _select_canonical_portfolio(db: AsyncSession) -> Portfolio | None:
 
 
 async def _get_or_create_canonical_portfolio(
-    db: AsyncSession, *, user_id: UUID | None
+    db: AsyncSession, *, user_id: UUID | None, benchmark_symbol: str
 ) -> Portfolio:
     """Idempotent bootstrap: look up by sentinel name, create if missing.
 
@@ -143,6 +143,20 @@ async def _get_or_create_canonical_portfolio(
     """
     existing = await _select_canonical_portfolio(db)
     if existing is not None:
+        # Self-heal (Codex code-review P2): canonical smoke rows created
+        # before benchmark wiring landed have ``benchmark_symbol = None``,
+        # so orchestration skips ``load_benchmark_returns`` and alpha/beta
+        # persist as null even though the G5 block labels the benchmark
+        # "SPY". When we find such a stale row, set the benchmark + flush so
+        # the next run computes alpha/beta. ``run_smoke`` owns the commit.
+        if existing.benchmark_symbol is None:
+            existing.benchmark_symbol = benchmark_symbol
+            await db.flush()
+            log.info(
+                "smoke_portfolio_benchmark_self_healed",
+                portfolio_id=str(existing.id),
+                benchmark_symbol=benchmark_symbol,
+            )
         return existing
 
     rows = (
@@ -173,6 +187,11 @@ async def _get_or_create_canonical_portfolio(
         # ``AllocatorName`` (defined as ``Literal[...]`` in
         # ``msai.schemas.portfolio``); no explicit cast is required.
         allocator_name="equal_weight",
+        # Wire the benchmark (Codex code-review P2). Orchestration only calls
+        # ``load_benchmark_returns`` when ``portfolio.benchmark_symbol`` is
+        # set; leaving it None made every smoke run skip alpha/beta even
+        # though the G5 metrics block labels the benchmark "SPY".
+        benchmark_symbol=benchmark_symbol,
         strategy_ids=strategy_ids,
     )
     try:
@@ -422,8 +441,12 @@ async def run_smoke(
     )
 
     # 2. Idempotent canonical Portfolio bootstrap (no commit; rolled back
-    # together with the run on any downstream failure).
-    portfolio = await _get_or_create_canonical_portfolio(db, user_id=user_id)
+    # together with the run on any downstream failure). Pass the config's
+    # benchmark ("SPY") so the portfolio carries it and orchestration loads
+    # benchmark returns -> alpha/beta persist (Codex code-review P2).
+    portfolio = await _get_or_create_canonical_portfolio(
+        db, user_id=user_id, benchmark_symbol=config.benchmark_symbol
+    )
 
     # 2b. FK-orphan guard (code-review clean-pass P2). If the bootstrap took
     # the race-loser path, it issued ``db.rollback()`` — which also discards a

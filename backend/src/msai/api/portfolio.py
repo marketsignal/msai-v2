@@ -346,6 +346,22 @@ async def create_portfolio_run(
     """Create a portfolio backtest run and enqueue it for execution."""
     user_id = await resolve_user_id(db, claims)
 
+    # Reject the internal ``smoke`` flag on the PUBLIC run route. ``smoke``
+    # is an operational marker the canonical ``POST /smoke/runs`` endpoint
+    # sets via the runner (NOT via this body); a smoke run is filtered out
+    # of ``/backtests/history`` by default and gets smoke-only metrics
+    # enrichment. Allowing any authenticated client to POST ``{"smoke":
+    # true}`` here would let them stamp an ordinary run with that marker.
+    # Codex code-review P2.
+    if body.smoke:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "smoke is an internal flag set only by the /smoke/runs endpoint; "
+                "do not pass it on the public run route"
+            ),
+        )
+
     # Cross-validate the per-run mode against the portfolio's allocator.
     # ``PortfolioCreate`` already rejects ``default_mode=full`` paired with
     # ``allocator_name=fixed_weight`` at compose time, but a Quick-default
