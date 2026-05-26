@@ -154,9 +154,38 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Remove the seeded smoke Strategy rows before dropping the column so
-    # downstream FK / reference checks don't fire spuriously.
-    conn = op.get_bind()
-    conn.execute(sa.text("DELETE FROM strategies WHERE name LIKE '__smoke__/%'"))
+    # Drop the column first — that is the load-bearing schema reversal and
+    # always succeeds. The seeded-strategy cleanup below is best-effort.
     op.drop_index("ix_portfolio_runs_smoke", table_name="portfolio_runs")
     op.drop_column("portfolio_runs", "smoke")
+
+    # Remove the four seeded smoke Strategy rows by EXACT name match.
+    #
+    # Codex PR review P2: a ``LIKE '__smoke__/%'`` pattern treats ``_`` as a
+    # single-character wildcard, so it would match unrelated operator
+    # strategies whose names happen to fit the shape (e.g. ``XYsmokeAB/foo``)
+    # and delete them on rollback. Bind the four seeded names explicitly.
+    #
+    # Best-effort + savepoint-guarded: once the smoke has actually run, the
+    # canonical ``__msai_smoke__`` portfolio bootstrap creates default
+    # ``graduation_candidates`` that FK-reference these strategy rows, so a
+    # plain DELETE raises ForeignKeyViolationError. That runtime data is NOT
+    # this migration's to cascade-delete, and the column drop above already
+    # reversed the schema. So we attempt the seed cleanup inside a SAVEPOINT
+    # and tolerate an FK violation (leaving the four sentinel rows in place)
+    # rather than abort the whole downgrade. A clean dev DB with no candidates
+    # deletes them; a used one keeps them harmlessly (sentinel-named, unused
+    # once the smoke feature code is gone).
+    conn = op.get_bind()
+    seeded_names = [entry["name"] for entry in SMOKE_STRATEGIES]
+    try:
+        with conn.begin_nested():
+            conn.execute(
+                sa.text("DELETE FROM strategies WHERE name IN :names").bindparams(
+                    sa.bindparam("names", expanding=True)
+                ),
+                {"names": seeded_names},
+            )
+    except sa.exc.IntegrityError:
+        # Runtime graduation_candidates reference the seed rows; leave them.
+        pass

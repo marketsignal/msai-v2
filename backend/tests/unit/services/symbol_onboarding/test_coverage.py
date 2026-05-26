@@ -377,6 +377,54 @@ async def test_gapped_emits_metric_and_alert(tmp_path: Path, monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
+async def test_gapped_with_suppress_flag_increments_metric_but_no_alert(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """suppress_gap_alert=True keeps the gap METRIC (observability) but skips
+    the operator ALERT — for callers like the smoke pre-ingest check where
+    gaps are an expected precondition, not an incident (Codex PR review P2)."""
+    base = tmp_path / "parquet" / "stocks" / "AAPL" / "2024"
+    days = [2]  # Jan 2 only — leaves the rest missing
+    p = _write_partition(base, year=2024, month=1, days=days)
+    index = _make_index_with_rows(
+        [_seed_row(p, asset_class="stocks", symbol="AAPL", year=2024, month=1, days=days)]
+    )
+
+    sent_alerts: list[tuple[str, str, str]] = []
+
+    class _StubAlerts:
+        def send_alert(self, level: str, title: str, message: str) -> None:
+            sent_alerts.append((level, title, message))
+
+    monkeypatch.setattr(
+        "msai.services.symbol_onboarding.coverage._get_alerting_service",
+        lambda: _StubAlerts(),
+    )
+
+    before = _read_counter_value(
+        "msai_coverage_gap_detected_total", asset_class="stocks", symbol="AAPL"
+    )
+    report = await compute_coverage(
+        asset_class="stocks",
+        symbol="AAPL",
+        start=date(2024, 1, 1),
+        end=date(2024, 1, 22),
+        data_root=tmp_path,
+        partition_index=index,
+        today=date(2024, 4, 1),
+        suppress_gap_alert=True,
+    )
+    after = _read_counter_value(
+        "msai_coverage_gap_detected_total", asset_class="stocks", symbol="AAPL"
+    )
+
+    # Same gapped status + metric increment, but NO alert dispatched.
+    assert report.status == "gapped"
+    assert after >= before + 1
+    assert sent_alerts == []
+
+
+@pytest.mark.asyncio
 async def test_status_none_does_NOT_emit_metric_or_alert(  # noqa: N802
     tmp_path: Path, monkeypatch
 ) -> None:

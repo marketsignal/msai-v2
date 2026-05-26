@@ -2080,9 +2080,37 @@ def smoke_cmd(
         )
         raise typer.Exit(code=2)
 
-    create_resp = _api_call(
+    def _smoke_api_call(method: str, path: str, *, stage: str, **kwargs: Any) -> Any:  # noqa: ANN401
+        """``_api_call`` that honors the --json contract on failure.
+
+        ``_api_call`` raises ``typer.Exit`` (after printing to stderr) on any
+        non-2xx / timeout — e.g. a 409 ingest-lock contention on create. In
+        ``--json`` mode the command promises a single JSON document on stdout,
+        so emit a structured failure payload before re-raising (Codex PR
+        review P2). Non-json mode keeps ``_api_call``'s stderr behavior.
+        """
+        try:
+            return _api_call(method, path, **kwargs)
+        except typer.Exit:
+            if json_output:
+                typer.echo(
+                    json.dumps(
+                        {
+                            "id": None,
+                            "status": "api_error",
+                            "structural_problems": [
+                                f"API call failed at {stage} ({method} {path})"
+                            ],
+                            "metrics": None,
+                        }
+                    )
+                )
+            raise
+
+    create_resp = _smoke_api_call(
         "POST",
         f"/api/v1/portfolios/smoke/runs?config={config}",
+        stage="create",
         timeout=_SMOKE_HTTP_TIMEOUT_SECONDS,
     )
     run: dict[str, Any] = create_resp.json()
@@ -2131,9 +2159,10 @@ def smoke_cmd(
                         err=True,
                     )
                 raise typer.Exit(code=1)
-            status_resp = _api_call(
+            status_resp = _smoke_api_call(
                 "GET",
                 f"/api/v1/portfolios/runs/{_url_id(run_id)}",
+                stage="poll",
             )
             run = status_resp.json()
             if run.get("status") in terminal:

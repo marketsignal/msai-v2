@@ -71,6 +71,7 @@ async def compute_coverage(
     data_root: Path,
     partition_index: PartitionIndexService,
     today: date | None = None,
+    suppress_gap_alert: bool = False,
 ) -> CoverageReport:
     today = today or date.today()
     expected_days = trading_days(start, end, asset_class=asset_class)
@@ -150,6 +151,18 @@ async def compute_coverage(
     #   3. missing empty (post-tolerance) → "full", no alert
     #   4. THIS PATH            → "gapped", alert
     COVERAGE_GAP_DETECTED.inc(symbol=symbol, asset_class=asset_class)
+    # ``suppress_gap_alert`` lets callers who EXPECT gaps skip the operator
+    # alert (Codex PR review P2). The smoke pre-ingest check calls this on a
+    # cold window where gaps are the normal precondition for ingest, so the
+    # alert would be a false positive that masks real coverage incidents. The
+    # metric still increments so observability of the gap is retained; only
+    # the page is suppressed. Default False preserves onboarding behavior.
+    if suppress_gap_alert:
+        return CoverageReport(
+            status="gapped",
+            covered_range=_derive_covered_range(covered_days),
+            missing_ranges=_collapse_missing(missing),
+        )
     try:
         _get_alerting_service().send_alert(
             level="warning",

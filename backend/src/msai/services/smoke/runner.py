@@ -288,6 +288,11 @@ async def _symbols_with_gaps(
                 end=end_date,
                 data_root=settings.data_root,
                 partition_index=partition_index,
+                # Smoke precheck on a cold window EXPECTS gaps before ingest —
+                # suppress the operator gap alert so this normal precondition
+                # doesn't page anyone (Codex PR review P2). The gap metric still
+                # increments inside compute_coverage; only the alert is skipped.
+                suppress_gap_alert=True,
             )
             if coverage.status != "full":
                 gaps.append(symbol)
