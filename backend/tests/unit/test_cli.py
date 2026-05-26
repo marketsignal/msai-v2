@@ -413,3 +413,355 @@ class TestIngestCommands:
         result = runner.invoke(app, ["ingest-daily", "stocks", "all"])
         assert result.exit_code != 0
         assert "no existing symbols" in result.output.lower()
+
+
+# ----------------------------------------------------------------------
+# Smoke CLI — `msai backtest smoke` + `msai system smoke-alert`
+# ----------------------------------------------------------------------
+
+
+def _smoke_completed_body(config: str = "fast") -> dict[str, Any]:
+    """Build a representative completed PortfolioRun response body."""
+    return {
+        "id": "00000000-0000-0000-0000-000000000111",
+        "status": "completed",
+        "smoke": True,
+        "metrics": {
+            "total_return": 0.05,
+            "pnl": 5000.0,
+            "sharpe": 1.3,
+            "sortino": 1.6,
+            "alpha": 0.02,
+            "beta": 0.95,
+            "max_drawdown": -0.08,
+            "trade_count_by_strategy": {
+                "__smoke__/smoke_market_order/AAPL": 1,
+                "__smoke__/smoke_market_order/SPY": 1,
+            },
+            "trade_count_total": 2,
+            "benchmark_symbol": "SPY",
+            "smoke_config": config,
+        },
+        "report_path": "/app/data/reports/portfolio_run_x.html",
+        "error_message": None,
+    }
+
+
+class TestBacktestSmokeCommand:
+    """Coverage for ``msai backtest smoke`` (Task 8)."""
+
+    def test_default_config_is_fast_and_prints_pass_table(self, runner: CliRunner) -> None:
+        # Arrange — first call: POST /portfolios/smoke/runs?config=fast (201)
+        # Subsequent call(s): GET /portfolios/runs/{id} -> terminal completed body.
+        completed = _smoke_completed_body(config="fast")
+        create_resp = _ok_response(completed)
+        create_resp.status_code = 201
+        get_resp = _ok_response(completed)
+        with patch(
+            "msai.cli.httpx.request",
+            side_effect=[create_resp, get_resp],
+        ) as mock:
+            # Act
+            result = runner.invoke(app, ["backtest", "smoke"])
+
+        # Assert
+        assert result.exit_code == 0, result.output
+        # POST URL carries config=fast (default)
+        post_args, _ = mock.call_args_list[0]
+        assert post_args[0] == "POST"
+        assert "/api/v1/portfolios/smoke/runs" in post_args[1]
+        assert "config=fast" in post_args[1]
+        # GET URL targets the run-detail route
+        get_args, _ = mock.call_args_list[1]
+        assert get_args[0] == "GET"
+        assert "/api/v1/portfolios/runs/00000000-0000-0000-0000-000000000111" in get_args[1]
+        # Human-readable table is printed and verdict is PASS
+        assert "PASS" in result.output
+        assert "Sharpe" in result.output
+        assert "Total return" in result.output
+
+    def test_nightly_config_threads_through_post_url(self, runner: CliRunner) -> None:
+        # Arrange
+        completed = _smoke_completed_body(config="nightly")
+        create_resp = _ok_response(completed)
+        create_resp.status_code = 201
+        get_resp = _ok_response(completed)
+        with patch(
+            "msai.cli.httpx.request",
+            side_effect=[create_resp, get_resp],
+        ) as mock:
+            # Act
+            result = runner.invoke(app, ["backtest", "smoke", "--config", "nightly"])
+
+        # Assert
+        assert result.exit_code == 0, result.output
+        post_args, _ = mock.call_args_list[0]
+        assert "config=nightly" in post_args[1]
+
+    def test_json_flag_emits_machine_readable_payload(self, runner: CliRunner) -> None:
+        # Arrange
+        completed = _smoke_completed_body()
+        create_resp = _ok_response(completed)
+        create_resp.status_code = 201
+        get_resp = _ok_response(completed)
+        with patch(
+            "msai.cli.httpx.request",
+            side_effect=[create_resp, get_resp],
+        ):
+            # Act
+            result = runner.invoke(app, ["backtest", "smoke", "--json"])
+
+        # Assert
+        assert result.exit_code == 0, result.output
+        # JSON-only output: parse stdout as a single JSON document.
+        payload = json.loads(result.output)
+        assert payload["status"] == "completed"
+        assert payload["metrics"]["trade_count_total"] == 2
+        # structural_problems is always present (empty on success)
+        assert payload["structural_problems"] == []
+
+    def test_structural_fail_when_trade_count_below_floor_exits_nonzero(
+        self, runner: CliRunner
+    ) -> None:
+        # Arrange — status="completed" but trade_count_total=0 (below deterministic floor of 2)
+        completed = _smoke_completed_body()
+        completed["metrics"]["trade_count_total"] = 0
+        completed["metrics"]["trade_count_by_strategy"] = {}
+        create_resp = _ok_response(completed)
+        create_resp.status_code = 201
+        get_resp = _ok_response(completed)
+        with patch(
+            "msai.cli.httpx.request",
+            side_effect=[create_resp, get_resp],
+        ):
+            # Act
+            result = runner.invoke(app, ["backtest", "smoke"])
+
+        # Assert — structural FAIL even though lifecycle status is "completed"
+        assert result.exit_code == 1, result.output
+        assert "FAIL" in result.output
+        assert "trade_count_total" in result.output
+
+    def test_structural_fail_in_json_mode_writes_problems_and_exits_nonzero(
+        self, runner: CliRunner
+    ) -> None:
+        # Arrange — missing G5 keys
+        completed = _smoke_completed_body()
+        completed["metrics"].pop("alpha")
+        completed["metrics"].pop("beta")
+        create_resp = _ok_response(completed)
+        create_resp.status_code = 201
+        get_resp = _ok_response(completed)
+        with patch(
+            "msai.cli.httpx.request",
+            side_effect=[create_resp, get_resp],
+        ):
+            # Act
+            result = runner.invoke(app, ["backtest", "smoke", "--json"])
+
+        # Assert — JSON still emitted, exit code 1, problems listed
+        assert result.exit_code == 1, result.output
+        payload = json.loads(result.output)
+        problems = payload["structural_problems"]
+        assert problems, payload
+        assert any("missing G5 keys" in p for p in problems)
+
+    def test_rejects_unknown_config(self, runner: CliRunner) -> None:
+        # Arrange — no HTTP should fire
+        with patch("msai.cli.httpx.request") as mock:
+            # Act
+            result = runner.invoke(app, ["backtest", "smoke", "--config", "weekly"])
+
+        # Assert
+        assert result.exit_code == 2
+        assert "unknown --config" in result.output.lower()
+        assert mock.call_count == 0
+
+    def test_json_mode_poll_timeout_emits_failure_json_on_stdout(self, runner: CliRunner) -> None:
+        """In --json mode, a poll-deadline timeout still emits a JSON doc.
+
+        Codex code-review P2: the poll-timeout branch used to write only to
+        stderr, breaking the JSON contract automation parses from stdout.
+        The branch must emit ``{"status": "timeout", ...}`` on stdout before
+        exiting non-zero.
+        """
+        # Arrange — create returns a pending run; the poll GET keeps
+        # returning a non-terminal status. Force the deadline to elapse on
+        # the FIRST loop check by stubbing time.monotonic: the create-time
+        # baseline is read once before the loop, then the first in-loop
+        # check sees a value past the deadline.
+        from msai.cli import _SMOKE_POLL_DEADLINE_SECONDS
+
+        pending = {
+            "id": "00000000-0000-0000-0000-000000000111",
+            "status": "pending",
+            "smoke": True,
+            "metrics": None,
+            "report_path": None,
+            "error_message": None,
+        }
+        create_resp = _ok_response(pending)
+        create_resp.status_code = 201
+        get_resp = _ok_response(pending)
+        with (
+            patch(
+                "msai.cli.httpx.request",
+                side_effect=[create_resp, get_resp, get_resp, get_resp],
+            ),
+            # First call: baseline timeout_at = 0 + deadline. Second call
+            # (the in-loop check) returns a value past that deadline.
+            patch(
+                "msai.cli.time.monotonic",
+                side_effect=[0.0, _SMOKE_POLL_DEADLINE_SECONDS + 1.0],
+            ),
+        ):
+            # Act
+            result = runner.invoke(app, ["backtest", "smoke", "--json"])
+
+        # Assert — non-zero exit AND a well-formed JSON document on stdout.
+        assert result.exit_code == 1, result.output
+        payload = json.loads(result.output)
+        assert payload["status"] == "timeout"
+        assert payload["id"] == "00000000-0000-0000-0000-000000000111"
+        assert payload["metrics"] is None
+        assert payload["structural_problems"] == ["poll deadline exceeded; run still in flight"]
+
+
+class TestSystemSmokeAlertCommand:
+    """Coverage for ``msai system smoke-alert`` (Task 8)."""
+
+    def test_pass_dispatches_info_level(self, runner: CliRunner, tmp_path) -> None:
+        # Arrange — write a clean PASS result file (no structural_problems)
+        result_file = tmp_path / "smoke-result.json"
+        body = _smoke_completed_body()
+        body["structural_problems"] = []
+        result_file.write_text(json.dumps(body))
+
+        # Act
+        with patch("msai.services.alerting.AlertingService.send_alert") as mock:
+            invocation = runner.invoke(app, ["system", "smoke-alert", str(result_file)])
+
+        # Assert
+        assert invocation.exit_code == 0, invocation.output
+        assert mock.call_count == 1
+        _, kwargs = mock.call_args
+        # Plan code uses keyword args — level/title/message.
+        assert kwargs["level"] == "info"
+        assert "PASS" in kwargs["title"]
+
+    def test_structural_fail_dispatches_error_level(self, runner: CliRunner, tmp_path) -> None:
+        # Arrange — completed status but structural_problems present
+        result_file = tmp_path / "smoke-result.json"
+        body = _smoke_completed_body()
+        body["structural_problems"] = ["trade_count_total=0 < floor 2"]
+        result_file.write_text(json.dumps(body))
+
+        # Act
+        with patch("msai.services.alerting.AlertingService.send_alert") as mock:
+            invocation = runner.invoke(app, ["system", "smoke-alert", str(result_file)])
+
+        # Assert
+        assert invocation.exit_code == 0, invocation.output
+        _, kwargs = mock.call_args
+        assert kwargs["level"] == "error"
+        assert "FAIL" in kwargs["title"]
+        # The message JSON body must include the structural problems list.
+        message_body = json.loads(kwargs["message"])
+        assert message_body["structural_problems"] == ["trade_count_total=0 < floor 2"]
+
+    def test_lifecycle_failed_status_dispatches_error_level(
+        self, runner: CliRunner, tmp_path
+    ) -> None:
+        # Arrange — lifecycle status='failed' (no structural_problems list needed)
+        result_file = tmp_path / "smoke-result.json"
+        body = {
+            "id": "x",
+            "status": "failed",
+            "smoke": True,
+            "metrics": {},
+            "report_path": "",
+            "error_message": "ingest crashed",
+            "structural_problems": [
+                "status='failed': ingest crashed",
+            ],
+        }
+        result_file.write_text(json.dumps(body))
+
+        # Act
+        with patch("msai.services.alerting.AlertingService.send_alert") as mock:
+            invocation = runner.invoke(app, ["system", "smoke-alert", str(result_file)])
+
+        # Assert
+        assert invocation.exit_code == 0, invocation.output
+        _, kwargs = mock.call_args
+        assert kwargs["level"] == "error"
+
+    # -----------------------------------------------------------------
+    # Silent-failure iter-1 fix #2 — corrupt / missing result file MUST
+    # still dispatch a level=error alert with a synthetic failure body
+    # (NOT raise JSONDecodeError that the workflow's `|| echo` would
+    # swallow into a silent warning).
+    # -----------------------------------------------------------------
+
+    def test_corrupt_json_in_result_file_synthesizes_failure_alert(
+        self, runner: CliRunner, tmp_path
+    ) -> None:
+        # Arrange — non-JSON content (e.g., a Python traceback that landed
+        # in the file before 2>${RESULT}.stderr was added).
+        result_file = tmp_path / "smoke-result.json"
+        result_file.write_text(
+            "Traceback (most recent call last):\n"
+            '  File "/app/...", line 1, in <module>\n'
+            "    raise RuntimeError('something blew up')\n"
+            "RuntimeError: something blew up\n"
+        )
+
+        # Act
+        with patch("msai.services.alerting.AlertingService.send_alert") as mock:
+            invocation = runner.invoke(app, ["system", "smoke-alert", str(result_file)])
+
+        # Assert
+        assert invocation.exit_code == 0, invocation.output
+        assert mock.call_count == 1, "alert must dispatch even when JSON is corrupt"
+        _, kwargs = mock.call_args
+        assert kwargs["level"] == "error"
+        assert "corrupt" in kwargs["title"].lower()
+        # The synthesized body must mention the failure mode so the CI/
+        # operator can diagnose without SSHing into the VM.
+        message_body = json.loads(kwargs["message"])
+        problems = message_body.get("structural_problems") or []
+        assert any("corrupt" in p.lower() for p in problems), problems
+
+    def test_missing_result_file_synthesizes_failure_alert(
+        self, runner: CliRunner, tmp_path
+    ) -> None:
+        # Arrange — path that doesn't exist (OSError on read_text).
+        result_file = tmp_path / "does-not-exist.json"
+
+        # Act
+        with patch("msai.services.alerting.AlertingService.send_alert") as mock:
+            invocation = runner.invoke(app, ["system", "smoke-alert", str(result_file)])
+
+        # Assert
+        assert invocation.exit_code == 0, invocation.output
+        assert mock.call_count == 1
+        _, kwargs = mock.call_args
+        assert kwargs["level"] == "error"
+
+    def test_alerting_backend_failure_exits_with_code_2(self, runner: CliRunner, tmp_path) -> None:
+        """If ``send_alert`` itself raises, the CLI must exit code 2 (not 0)."""
+        # Arrange — valid PASS body so the path reaches send_alert.
+        result_file = tmp_path / "smoke-result.json"
+        body = _smoke_completed_body()
+        body["structural_problems"] = []
+        result_file.write_text(json.dumps(body))
+
+        # Act
+        with patch(
+            "msai.services.alerting.AlertingService.send_alert",
+            side_effect=RuntimeError("disk full"),
+        ):
+            invocation = runner.invoke(app, ["system", "smoke-alert", str(result_file)])
+
+        # Assert — non-zero exit so the workflow sees the failure.
+        assert invocation.exit_code == 2, invocation.output

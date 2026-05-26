@@ -6,7 +6,7 @@ from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Date, DateTime, ForeignKey, Integer, Numeric, String, Text, func
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -43,6 +43,12 @@ class PortfolioRun(Base):
         ForeignKey("portfolios.id"), index=True, nullable=False
     )
     status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="pending")
+    # Smoke-test marker. Distinguishes operator-driven canonical smoke runs
+    # (per ``/api/v1/backtests/history?smoke_only=true``) from ordinary
+    # portfolio backtests. PRD ``docs/prds/ingest-backtest-smoke-test.md`` v1.3.
+    smoke: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", index=True
+    )
     metrics: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     series: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
     allocations: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)

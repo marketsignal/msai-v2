@@ -33,6 +33,7 @@ from msai.schemas.portfolio import (
     PortfolioRunResponse,
 )
 from msai.services.portfolio import PortfolioService
+from msai.services.smoke.config import SmokeConfigName
 
 log = get_logger(__name__)
 
@@ -254,6 +255,79 @@ async def list_portfolio_allocations(
 
 
 # ---------------------------------------------------------------------------
+# POST /api/v1/portfolios/smoke/runs -- canonical smoke run (no portfolio_id)
+#
+# Registered BEFORE /{portfolio_id}/runs so FastAPI doesn't try to bind
+# 'smoke' as a UUID path parameter (Codex plan-review iter-1 P1 finding;
+# FastAPI matches routes in declaration order — the dynamic UUID route
+# would swallow this static path otherwise and emit 422).
+#
+# Delegates to ``services.smoke.runner.run_smoke()`` in-process (no
+# HTTP-to-self). The runner pre-ingests AAPL+SPY for the configured
+# window, bootstraps the canonical ``__msai_smoke__`` Portfolio if
+# absent, then enqueues the existing arq portfolio-run job.
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/smoke/runs",
+    status_code=status.HTTP_201_CREATED,
+    response_model=PortfolioRunResponse,
+)
+async def start_smoke_run(
+    response: Response,
+    config: SmokeConfigName = Query(default="fast"),  # noqa: B008
+    claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+) -> PortfolioRunResponse:
+    """Authenticated shortcut for the canonical operational smoke run.
+
+    Bootstraps the ``__msai_smoke__`` Portfolio if absent, pre-ingests
+    AAPL+SPY for the configured window, then fires a ``PortfolioRun``
+    with ``smoke=True`` via the existing lifecycle. Returns 201 + the
+    persisted run row + a ``Location`` header pointing at the run-detail
+    endpoint so the caller can poll terminal status.
+
+    The ``config`` query parameter is typed as ``SmokeConfigName`` (the
+    ``Literal["fast", "nightly"]`` alias exported from
+    ``services.smoke.config``) — reusing the canonical alias keeps the
+    pydantic-driven 422 validation on bad values consistent with the
+    runner's own argument typing.
+
+    Code-review iter-1 fix #4 (Location header — api-design.md rule 4)
+    + iter-1 fix #5 (409 when an overlapping ingest is already running
+    on the same ``(symbol, YYYY-MM)`` mutex window).
+
+    PRD docs/prds/ingest-backtest-smoke-test.md v1.3 US-001 / US-002.
+    """
+    # Local import — runner pulls in the smoke service module which we
+    # don't want to load at API startup if the smoke surface is unused.
+    from msai.services.smoke.ingest_lock import IngestLockTimeoutError  # noqa: PLC0415
+    from msai.services.smoke.runner import run_smoke  # noqa: PLC0415
+
+    user_id = await resolve_user_id(db, claims)
+    try:
+        run = await run_smoke(db=db, config_name=config, user_id=user_id)
+    except IngestLockTimeoutError as exc:
+        # Another smoke invocation (CLI + UI + scheduler can all hit this
+        # path) is fetching the same Databento window. Surface a
+        # structured 409 so the client can retry shortly instead of
+        # getting a generic 500 with the stack-trace text in `detail`.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "INGEST_IN_PROGRESS",
+                "message": (
+                    "Another smoke run is fetching the same Databento window; retry shortly."
+                ),
+            },
+        ) from exc
+
+    response.headers["Location"] = f"/api/v1/portfolios/runs/{run.id}"
+    return PortfolioRunResponse.model_validate(run)
+
+
+# ---------------------------------------------------------------------------
 # POST /api/v1/portfolios/{portfolio_id}/runs -- start a portfolio run
 # ---------------------------------------------------------------------------
 
@@ -271,6 +345,22 @@ async def create_portfolio_run(
 ) -> PortfolioRunResponse:
     """Create a portfolio backtest run and enqueue it for execution."""
     user_id = await resolve_user_id(db, claims)
+
+    # Reject the internal ``smoke`` flag on the PUBLIC run route. ``smoke``
+    # is an operational marker the canonical ``POST /smoke/runs`` endpoint
+    # sets via the runner (NOT via this body); a smoke run is filtered out
+    # of ``/backtests/history`` by default and gets smoke-only metrics
+    # enrichment. Allowing any authenticated client to POST ``{"smoke":
+    # true}`` here would let them stamp an ordinary run with that marker.
+    # Codex code-review P2.
+    if body.smoke:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "smoke is an internal flag set only by the /smoke/runs endpoint; "
+                "do not pass it on the public run route"
+            ),
+        )
 
     # Cross-validate the per-run mode against the portfolio's allocator.
     # ``PortfolioCreate`` already rejects ``default_mode=full`` paired with

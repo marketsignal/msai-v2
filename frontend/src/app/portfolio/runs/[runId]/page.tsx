@@ -79,6 +79,7 @@ import {
   type PerStrategySeries,
 } from "@/components/portfolio-results/per-strategy-contribution";
 import { TrialsTable } from "@/components/portfolio-results/trials-table";
+import { MetricsBlock } from "@/components/portfolio/metrics-block";
 
 import {
   apiGet,
@@ -620,6 +621,13 @@ export default function PortfolioRunResultsPage({
           </CardContent>
         </Card>
       ) : null}
+
+      {/* G5 risk-metrics block — promoted as primary content per Task 11
+       *  of `docs/plans/2026-05-26-ingest-backtest-smoke-test.md`. Renders
+       *  above the existing equity chart / per-strategy contribution / etc.
+       *  so operators see the headline Sharpe/Sortino/Alpha/Beta/Max-DD
+       *  before the exploratory visualisations. */}
+      <MetricsBlock metrics={run.metrics} />
 
       <CombinedEquityChart series={run.series} />
 

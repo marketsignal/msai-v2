@@ -1,0 +1,259 @@
+name: Smoke
+
+# Task 12 — nightly + workflow_dispatch smoke runner.
+# Mirrors deploy.yml's OIDC + transient-NSG-SSH-rule pattern.
+#
+# Flow:
+#   1. azure/login@v2 (OIDC, no client secret; SHA-pinned action)
+#   2. Open transient NSG rule for SSH from the runner IP (priority 202 —
+#      distinct from deploy.yml's 200 [main deploy] + 201 [preflight] so a
+#      concurrent nightly-smoke + on-push-deploy don't collide on the same
+#      NSG priority slot in the shared NSG;
+#      operator rule at 100 always wins). Rule name includes run_id and
+#      run_attempt for orphan diagnosis; reap-orphan-nsg-rules.yml picks
+#      up any leaks.
+#   3. webfactory/ssh-agent loads VM key; trust VM host key from
+#      VM_SSH_KNOWN_HOSTS Variable.
+#   4. SSH to VM with CONFIG='${CONFIG}' bash -s heredoc:
+#      - pre-seed /tmp/smoke-result.json INSIDE the backend container with a
+#        failure payload so smoke-alert always has valid JSON to read
+#      - run `msai backtest smoke --config $CONFIG --json` inside the backend
+#        container, redirecting stdout+stderr to that file
+#      - ALWAYS dispatch alert via `msai system smoke-alert <path>` (captured
+#        warning on failure, never short-circuited)
+#      - re-derive workflow exit from status + structural_problems count in
+#        the JSON (avoids docker-exec rc swallow per moby/moby#4717)
+#   5. Cleanup job (separate, needs:[smoke], if:always()) deletes the
+#      transient NSG rule. Failed cleanup is reaped by reap-orphan-nsg-rules.yml.
+
+on:
+  schedule:
+    # 05:00 UTC daily. GitHub Actions schedules CANNOT interpolate vars.* —
+    # the cron expression must be a string literal. Adjust here if the
+    # nightly window shifts.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      config:
+        required: false
+        type: choice
+        default: "fast"
+        options:
+          - fast
+          - nightly
+
+permissions:
+  id-token: write
+  contents: read
+
+# Serialize smoke runs; queue rather than cancel so an in-flight smoke isn't
+# severed (cancellation mid-run = orphaned NSG rule + half-written alert).
+concurrency:
+  group: smoke-msai
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    outputs:
+      runner_ip: ${{ steps.runner-ip.outputs.ip }}
+      rule_name: ${{ steps.resolve.outputs.rule_name }}
+      resource_group: ${{ steps.resolve.outputs.resource_group }}
+      nsg_name: ${{ steps.resolve.outputs.nsg_name }}
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Resolve config + rule name
+        id: resolve
+        env:
+          # Schedule runs ignore workflow_dispatch inputs (the inputs context
+          # is empty on schedule events). For schedule, force "nightly".
+          # For workflow_dispatch, honor the input choice (default "fast").
+          CONFIG: ${{ github.event_name == 'schedule' && 'nightly' || (github.event.inputs.config || 'fast') }}
+        run: |
+          if ! [[ "${CONFIG}" =~ ^(fast|nightly)$ ]]; then
+            echo "config must be fast|nightly, got: ${CONFIG}" >&2
+            exit 1
+          fi
+          {
+            echo "config=${CONFIG}"
+            echo "resource_group=${{ vars.RESOURCE_GROUP }}"
+            echo "nsg_name=${{ vars.NSG_NAME }}"
+            # run_id-run_attempt makes the rule unique across re-runs.
+            echo "rule_name=gha-transient-smoke-${{ github.run_id }}-${{ github.run_attempt }}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@1384c340ab2dda50fed2bee3041d1d87018aa5e8 # v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Resolve runner public IP
+        id: runner-ip
+        run: |
+          ip=$(curl -sf --max-time 10 https://ifconfig.me)
+          if ! [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Could not resolve runner public IP (got: $ip)" >&2
+            exit 1
+          fi
+          echo "ip=$ip" >> "$GITHUB_OUTPUT"
+
+      - name: Open transient SSH allow rule
+        run: |
+          az network nsg rule create \
+            --resource-group "${{ steps.resolve.outputs.resource_group }}" \
+            --nsg-name "${{ steps.resolve.outputs.nsg_name }}" \
+            --name "${{ steps.resolve.outputs.rule_name }}" \
+            --priority 202 \
+            --direction Inbound \
+            --access Allow \
+            --protocol Tcp \
+            --source-address-prefixes "${{ steps.runner-ip.outputs.ip }}/32" \
+            --destination-port-ranges 22 \
+            --description "Transient SSH from GHA smoke.yml. run_id=${{ github.run_id }} attempt=${{ github.run_attempt }}. See docs/decisions/deploy-ssh-jit.md" \
+            --output none
+
+      - name: Wait briefly for NSG rule propagation
+        run: sleep 15
+
+      - uses: webfactory/ssh-agent@a6f90b1f127823b31d4d4a8d96047790581349bd # v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.VM_SSH_PRIVATE_KEY }}
+
+      - name: Trust VM host key
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ vars.VM_SSH_KNOWN_HOSTS }}" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Run smoke on VM and dispatch alert
+        # Iter-5 fix #2 + #3 + Iter-6 fix #1 + #2 (see docs/plans/2026-05-26-...md Task 12):
+        #   - set -e short-circuits when the smoke CLI exits non-zero, which
+        #     skips the alert dispatch. Capture exit, ALWAYS dispatch alert,
+        #     then exit with captured code derived from the JSON.
+        #   - The JSON must live INSIDE the backend container so smoke-alert
+        #     can read it. We write via `docker exec -i bash -c 'cat > path'`
+        #     piped from a runner-side echo to avoid the YAML+heredoc
+        #     terminator-indentation hazard of a nested <<JSON inside <<'EOF'.
+        #   - CONFIG is passed explicitly across the SSH boundary because SSH
+        #     doesn't forward env by default. Outer heredoc `'EOF'` prevents
+        #     local expansion of $CID / $RESULT_PATH / $STATUS / $PROBLEMS.
+        env:
+          CONFIG: ${{ steps.resolve.outputs.config }}
+          VM_USER: ${{ vars.VM_SSH_USER }}
+          VM_IP: ${{ vars.VM_PUBLIC_IP }}
+        run: |
+          # shellcheck disable=SC2029  # CONFIG expansion is intentional client-side (passed across SSH boundary)
+          ssh "${VM_USER}@${VM_IP}" "CONFIG='${CONFIG}' bash -s" <<'EOF'
+          set -uo pipefail  # NOTE: no -e — we want to capture nonzero exits
+          cd /opt/msai
+          CID=$(docker compose ps -q backend)
+          test -n "$CID"
+
+          RESULT_PATH=/tmp/smoke-result.json
+
+          # Pre-seed the result file with a failure payload. If the smoke CLI
+          # exits before emitting JSON (auth fail, backend down, config typo),
+          # smoke-alert still has a valid file to read and can dispatch a
+          # structured failure alert.
+          #
+          # Use echo|pipe (not a nested heredoc) — a nested <<JSON inside the
+          # outer <<'EOF' fails after YAML strips the block-scalar indent,
+          # because the inner JSON terminator ends up at column 2 instead of
+          # column 0, swallowing the rest of the script.
+          echo '{"status":"failed","structural_problems":["pre-CLI-launch failure (smoke CLI did not emit JSON)"],"metrics":null}' \
+            | docker exec -i "$CID" bash -c "cat > $RESULT_PATH"
+
+          # Run smoke inside the backend container; the CLI overwrites the
+          # pre-seeded file with its real --json payload on success or on any
+          # failure that reaches the JSON-emit stage. Redirect stderr to a
+          # SEPARATE file so a Python traceback (which goes to stderr) does
+          # NOT corrupt the JSON file (silent-failure iter-1 fix: 2>&1 made
+          # smoke_alert_cmd raise JSONDecodeError on the next exec and the
+          # workflow lost the traceback).
+          # Invoke via `python -m msai.cli` — the prod image builds with
+          # `uv sync --no-install-project` (no `msai` console script generated)
+          # but sets PATH=/app/.venv/bin + PYTHONPATH=/app/src, so `python`
+          # resolves to the venv interpreter and the module is importable.
+          # (Bare `msai` is NOT on PATH in the container — verified 2026-05-26.)
+          docker exec -i "$CID" bash -c "python -m msai.cli backtest smoke --config '$CONFIG' --json > $RESULT_PATH 2>${RESULT_PATH}.stderr" || true
+
+          # ALWAYS dispatch the alert from inside the same container, where
+          # the JSON file is reachable. smoke_alert_cmd is now corrupt-JSON
+          # tolerant (synthesizes a failure payload + dispatches level=error
+          # on JSONDecodeError) so an empty/garbled file no longer prevents
+          # the alert.
+          # Capture the alert-dispatch exit. Alerting is a GUARANTEE, not
+          # best-effort: if dispatch fails (code 2), the nightly must go RED
+          # even when the smoke itself passed — otherwise a silent alerting
+          # outage looks green and the operator never learns the smoke ran.
+          # (Codex review P2: the old `|| echo ::warning` swallowed this.)
+          ALERT_RC=0
+          docker exec -i "$CID" python -m msai.cli system smoke-alert "$RESULT_PATH" || ALERT_RC=$?
+          if [ "$ALERT_RC" -ne 0 ]; then
+            echo "::error::smoke-alert dispatch failed (rc=$ALERT_RC) — alerting guarantee broken"
+          fi
+
+          # If the CLI emitted a stderr traceback, surface it to the CI log
+          # so reviewers can diagnose without SSHing to the VM. Best-effort:
+          # the file may not exist if the CLI never wrote stderr.
+          echo "----- smoke CLI stderr -----"
+          docker exec -i "$CID" bash -c "test -s ${RESULT_PATH}.stderr && cat ${RESULT_PATH}.stderr || echo '(empty)'"
+          echo "----- end smoke CLI stderr -----"
+
+          # Workflow exit = smoke structural PASS *and* alert dispatched.
+          # Re-derive smoke status from the JSON (avoids docker-exec RC
+          # swallow per moby/moby#4717) and AND it with the alert exit.
+          STATUS=$(docker exec -i "$CID" python -c "import json;print(json.load(open('$RESULT_PATH')).get('status'))")
+          PROBLEMS=$(docker exec -i "$CID" python -c "import json;d=json.load(open('$RESULT_PATH'));print(len(d.get('structural_problems') or []))")
+          test "$STATUS" = "completed" && test "$PROBLEMS" = "0" && test "$ALERT_RC" -eq 0
+          EOF
+
+      - name: Smoke summary
+        if: always()
+        run: |
+          {
+            echo "## Smoke run"
+            echo "- Config: \`${{ steps.resolve.outputs.config }}\`"
+            echo "- Trigger: \`${{ github.event_name }}\`"
+            echo "- Resource group: \`${{ steps.resolve.outputs.resource_group }}\`"
+            echo "- Runner IP: \`${{ steps.runner-ip.outputs.ip }}\`"
+            echo "- Transient NSG rule: \`${{ steps.resolve.outputs.rule_name }}\`"
+            echo "- Job conclusion: \`${{ job.status }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  cleanup:
+    # Separate job to survive runner-VM kill on the smoke job. needs+always()
+    # ensures this runs even if smoke was cancelled or failed mid-step.
+    needs: [smoke]
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@1384c340ab2dda50fed2bee3041d1d87018aa5e8 # v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Delete transient SSH rule
+        # Tolerant to upstream failures — the rule may not exist if the smoke
+        # job died before creating it. `--output none` + `|| true` ensures
+        # cleanup never fails the workflow. If the delete legitimately fails
+        # (RBAC, network blip), reap-orphan-nsg-rules.yml cron picks it up.
+        if: needs.smoke.outputs.rule_name != ''
+        run: |
+          az network nsg rule delete \
+            --resource-group "${{ needs.smoke.outputs.resource_group }}" \
+            --nsg-name "${{ needs.smoke.outputs.nsg_name }}" \
+            --name "${{ needs.smoke.outputs.rule_name }}" \
+            --output none 2>/dev/null || true

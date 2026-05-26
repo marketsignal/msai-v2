@@ -118,6 +118,11 @@ class BacktestListItem(BaseModel):
     # See :class:`BacktestStatusResponse.phase` for semantics.
     phase: Literal["awaiting_data"] | None = None
     progress_message: str | None = None
+    # Smoke discriminator. Populated from ``Backtest.smoke`` on single rows
+    # and from ``PortfolioRun.smoke`` on portfolio rows. Lets clients route
+    # smoke runs into a dedicated view (e.g. operator-driven canonical
+    # smoke history) without re-querying with ``smoke_only=true``.
+    smoke: bool = False
 
     model_config = {"from_attributes": True}
 

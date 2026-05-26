@@ -238,6 +238,38 @@ The memory note `feedback_rehearsal_caught_real_bugs` captures why this is non-o
 
 ---
 
+## Pre-deploy smoke preflight (opt-in)
+
+`deploy.yml` supports an opt-in `run_smoke=true` workflow_dispatch input that runs a `fast`-config smoke (`msai backtest smoke --config fast --json`) on the VM BEFORE the deploy job replaces containers. Dispatch with:
+
+```bash
+# Run smoke preflight, then deploy the SHA currently on main
+gh workflow run deploy.yml -f run_smoke=true
+
+# Combine with rollback / re-deploy
+gh workflow run deploy.yml -f git_sha=<7-char-sha> -f run_smoke=true
+```
+
+**HONEST framing — what this DOES and does NOT validate.**
+
+The preflight runs `msai backtest smoke` against the **CURRENTLY-DEPLOYED** image — not the candidate SHA. It validates:
+
+- The VM is reachable and the backend container is running.
+- Postgres + Redis + Parquet store are healthy.
+- KV-rendered secrets (DATABENTO_API_KEY, MSAI_API_KEY, JWT signing, etc.) are present and valid.
+- Databento is reachable and has the expected market-data window.
+- The end-to-end ingest → portfolio-backtest → metrics → report pipeline produces a `status: completed` JSON with zero structural problems.
+
+It does **NOT** validate the candidate code in any way. The candidate image is built by `build-and-push.yml` and pulled by the deploy job AFTER preflight passes; a code regression in the candidate SHA will not be caught here. A proper candidate-image staging gate (build candidate, run smoke against it in an isolated container, then promote) is a **deferred follow-up** — track via the smoke PRD's US-004 § next-steps.
+
+**When this gate is useful.** Catches "the prod env has rotted since the last deploy" failures BEFORE we replace containers — e.g., the Databento API key was rotated and KV wasn't updated, the Parquet store got corrupted, Postgres connectivity broke. Without this gate, you'd find out via the post-deploy probes (where rollback fires) or, worse, after the new containers had already taken traffic.
+
+**Default behavior is unchanged.** `run_smoke` defaults to `false`. Push-to-main auto-deploys (via `workflow_run`) NEVER run the preflight. Only an explicit `gh workflow run deploy.yml -f run_smoke=true` dispatch triggers it. This keeps the happy-path deploy as fast as today, and reserves the preflight cost (~3-10 min) for deploys where the operator has a reason to be suspicious of env health.
+
+**Failure mode.** A failed preflight blocks the deploy job (`needs: [preflight]` + `if: always() && (preflight.result == 'success' || preflight.result == 'skipped')`). Inspect the workflow logs — the smoke JSON payload is visible in the `Run smoke preflight on VM` step. Fix the env issue, then re-dispatch with or without `run_smoke=true` as appropriate.
+
+---
+
 ## Backups + DR
 
 - **Nightly `pg_dump`** → Azure Blob `msai-backups` container (systemd timer, `scripts/backup-to-blob.timer`).
