@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://msai.local/identity-contract.schema.json",
+  "title": "MSAI Identity Contract",
+  "description": "Non-secret single source of truth for Entra ID identity wiring across MSAI v2. Consumed by Gate 1 (MSAL scope lint) and Gate 3 (cross-file consistency lint). NEVER contains secrets — only public OAuth identifiers.",
+  "type": "object",
+  "required": [
+    "tenant_id",
+    "client_id",
+    "app_id_uri",
+    "issuer",
+    "scope_name",
+    "token_version",
+    "env_var_names"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "tenant_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+      "description": "Entra tenant UUID. Public OAuth identifier (not a secret)."
+    },
+    "client_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+      "description": "Entra app registration client ID. Public OAuth identifier."
+    },
+    "app_id_uri": {
+      "type": "string",
+      "pattern": "^api://[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+      "description": "Application ID URI exposed under 'Expose an API' in Entra."
+    },
+    "issuer": {
+      "type": "string",
+      "pattern": "^https://login\\.microsoftonline\\.com/[0-9a-fA-F-]+/v2\\.0$",
+      "description": "Entra v2.0 issuer URL. Matches the iss claim PyJWT validates against."
+    },
+    "scope_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$",
+      "description": "Single scope name exposed by the app reg (NOT prefixed with api://). Canonical default is 'access_as_user'."
+    },
+    "token_version": {
+      "type": "string",
+      "enum": ["2.0"],
+      "description": "JWT 'ver' claim contract. We only accept v2.0 tokens; v1.0 is rejected (different host + claim shape)."
+    },
+    "env_var_names": {
+      "type": "object",
+      "description": "Canonical env-var names per identity field. Gate 3 uses this to discover references across config files.",
+      "required": ["tenant_id", "client_id"],
+      "additionalProperties": false,
+      "properties": {
+        "tenant_id": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        },
+        "client_id": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        }
+      }
+    },
+    "frontend_env_prefix": {
+      "type": "string",
+      "description": "Prefix used by Next.js for client-bundled env vars (so NEXT_PUBLIC_AZURE_TENANT_ID is recognised as the tenant_id variant)."
+    }
+  }
+}
