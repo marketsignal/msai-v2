@@ -39,8 +39,12 @@ export const msalConfig: Configuration = {
 // issuing the resource access-token request via acquireTokenSilent, so listing
 // them alongside the api:// scope works for both loginRedirect (claims) and
 // the silent token fetch (resource token).
+// DEMO REGRESSION — will be reverted in the next commit. The auth-regression
+// gate (msai/msal-scopes-must-be-api-or-oidc) MUST flag "User.Read" here.
+// This is the negative-control proof for PRD US-004.
 export const loginRequest = {
   scopes: [
+    "User.Read",
     "openid",
     "profile",
     "email",
