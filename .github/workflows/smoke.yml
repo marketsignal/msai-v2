@@ -173,14 +173,19 @@ jobs:
           # NOT corrupt the JSON file (silent-failure iter-1 fix: 2>&1 made
           # smoke_alert_cmd raise JSONDecodeError on the next exec and the
           # workflow lost the traceback).
-          docker exec -i "$CID" bash -c "msai backtest smoke --config '$CONFIG' --json > $RESULT_PATH 2>${RESULT_PATH}.stderr" || true
+          # Invoke via `python -m msai.cli` — the prod image builds with
+          # `uv sync --no-install-project` (no `msai` console script generated)
+          # but sets PATH=/app/.venv/bin + PYTHONPATH=/app/src, so `python`
+          # resolves to the venv interpreter and the module is importable.
+          # (Bare `msai` is NOT on PATH in the container — verified 2026-05-26.)
+          docker exec -i "$CID" bash -c "python -m msai.cli backtest smoke --config '$CONFIG' --json > $RESULT_PATH 2>${RESULT_PATH}.stderr" || true
 
           # ALWAYS dispatch the alert from inside the same container, where
           # the JSON file is reachable. smoke_alert_cmd is now corrupt-JSON
           # tolerant (synthesizes a failure payload + dispatches level=error
           # on JSONDecodeError) so an empty/garbled file no longer prevents
           # the alert.
-          docker exec -i "$CID" msai system smoke-alert "$RESULT_PATH" \
+          docker exec -i "$CID" python -m msai.cli system smoke-alert "$RESULT_PATH" \
             || echo "::warning::smoke-alert dispatch failed; check VM logs"
 
           # If the CLI emitted a stderr traceback, surface it to the CI log

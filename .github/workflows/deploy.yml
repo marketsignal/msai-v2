@@ -207,7 +207,10 @@ jobs:
 
           # Redirect stderr to a SEPARATE file so a Python traceback never
           # corrupts the JSON file (silent-failure iter-1 fix #1).
-          docker exec -i "$CID" bash -c "msai backtest smoke --config fast --json > $RESULT_PATH 2>${RESULT_PATH}.stderr" || true
+          # `python -m msai.cli` — the prod image (uv sync --no-install-project)
+          # has no `msai` console script, but PATH=/app/.venv/bin + PYTHONPATH=/app/src
+          # make the venv python + module importable. Verified 2026-05-26.
+          docker exec -i "$CID" bash -c "python -m msai.cli backtest smoke --config fast --json > $RESULT_PATH 2>${RESULT_PATH}.stderr" || true
 
           # Surface any stderr traceback to the CI log so the gate failure
           # is diagnosable without SSHing to the VM.
