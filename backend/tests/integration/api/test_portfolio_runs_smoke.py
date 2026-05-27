@@ -189,6 +189,13 @@ def _mock_smoke_redis(monkeypatch: pytest.MonkeyPatch) -> None:
     ) -> list[str]:
         return list(symbols)
 
+    # Step 1b catalog-freshness pre-flight reads/builds the real Nautilus
+    # catalog against the default DATA_ROOT (no parquet in the test env) — stub
+    # it to a no-op so the route reaches its DB/201 contract. Catalog freshness
+    # has dedicated unit tests in tests/unit/services/smoke/test_runner_coverage.py.
+    async def _stub_ensure_catalog_fresh(_symbols: tuple[str, ...], _start: str, _end: str) -> None:
+        return None
+
     monkeypatch.setattr("msai.services.smoke.runner.get_redis_pool", _stub_get_pool)
     monkeypatch.setattr("msai.services.smoke.runner.acquire_ingest_lock", _stub_acquire)
     monkeypatch.setattr("msai.services.smoke.runner.release_ingest_lock", _stub_release)
@@ -197,6 +204,9 @@ def _mock_smoke_redis(monkeypatch: pytest.MonkeyPatch) -> None:
     # doesn't cover this path. Patch the runner's local binding too.
     monkeypatch.setattr("msai.services.smoke.runner.enqueue_portfolio_run", _stub_enqueue)
     monkeypatch.setattr("msai.services.smoke.runner._symbols_with_gaps", _stub_symbols_with_gaps)
+    monkeypatch.setattr(
+        "msai.services.smoke.runner._ensure_catalog_fresh", _stub_ensure_catalog_fresh
+    )
 
 
 @pytest_asyncio.fixture

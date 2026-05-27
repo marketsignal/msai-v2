@@ -27,6 +27,7 @@ import pyarrow.parquet as pq
 
 from msai.services.nautilus.catalog_builder import (
     build_catalog_for_symbol,
+    catalog_has_bars_in_window,
     verify_catalog_coverage,
 )
 
@@ -155,4 +156,94 @@ def test_verify_catalog_coverage_end_date_ns_precision_no_off_by_one(tmp_path: P
     assert intervals == [], (
         f"expected zero gaps for full-coverage catalog, got {intervals!r} — "
         "likely an off-by-one at the end-of-day ns boundary"
+    )
+
+
+def test_catalog_has_bars_in_window_true_for_overlapping_data(tmp_path: Path) -> None:
+    """A catalog built from Dec-2024 parquet reports bars present for the
+    Dec-2024 window — the binary signal Fix #1 relies on (robust to the
+    weekend/holiday edge-gaps verify_catalog_coverage would report)."""
+    raw_root = tmp_path / "raw"
+    catalog_root = tmp_path / "catalog"
+    _write_synthetic_parquet(
+        raw_root, rows=2 * 24 * 60, start_ts=datetime(2024, 12, 2, tzinfo=UTC), symbol="AAPL"
+    )
+    iid = build_catalog_for_symbol(
+        symbol="AAPL", raw_parquet_root=raw_root, catalog_root=catalog_root
+    )
+    assert (
+        catalog_has_bars_in_window(
+            catalog_root=catalog_root, instrument_id=iid,
+            start=date(2024, 12, 1), end=date(2024, 12, 31),
+        )
+        is True
+    )
+
+
+def test_catalog_has_bars_in_window_false_when_no_overlap(tmp_path: Path) -> None:
+    """A different year's window has no overlapping bars → False (not a
+    spurious True from weekend edge handling)."""
+    raw_root = tmp_path / "raw"
+    catalog_root = tmp_path / "catalog"
+    _write_synthetic_parquet(
+        raw_root, rows=2 * 24 * 60, start_ts=datetime(2024, 12, 2, tzinfo=UTC), symbol="AAPL"
+    )
+    iid = build_catalog_for_symbol(
+        symbol="AAPL", raw_parquet_root=raw_root, catalog_root=catalog_root
+    )
+    assert (
+        catalog_has_bars_in_window(
+            catalog_root=catalog_root, instrument_id=iid,
+            start=date(2023, 1, 1), end=date(2023, 1, 31),
+        )
+        is False
+    )
+
+
+def test_catalog_has_bars_in_window_false_when_catalog_missing(tmp_path: Path) -> None:
+    """No catalog dir at all → False (the cold/empty prod case), not a crash."""
+    assert (
+        catalog_has_bars_in_window(
+            catalog_root=tmp_path / "catalog", instrument_id="AAPL.NASDAQ",
+            start=date(2024, 12, 1), end=date(2024, 12, 31),
+        )
+        is False
+    )
+
+
+def test_force_rebuild_replaces_stale_bars(tmp_path: Path) -> None:
+    """force=True must PURGE then rebuild: after building from window A then
+    force-rebuilding from parquet covering only window B, the catalog holds B
+    and NOT A. Guards the confirmed stale-catalog root cause."""
+    raw_root = tmp_path / "raw"
+    catalog_root = tmp_path / "catalog"
+    # Build from window A (Jan 2024).
+    _write_synthetic_parquet(
+        raw_root, rows=5 * 24 * 60, start_ts=datetime(2024, 1, 2, tzinfo=UTC), symbol="AAPL"
+    )
+    iid = build_catalog_for_symbol(
+        symbol="AAPL", raw_parquet_root=raw_root, catalog_root=catalog_root
+    )
+    assert catalog_has_bars_in_window(
+        catalog_root=catalog_root, instrument_id=iid,
+        start=date(2024, 1, 1), end=date(2024, 1, 31),
+    )
+    # Replace the raw parquet with only window B (Mar 2024) and force-rebuild.
+    import shutil
+
+    shutil.rmtree(raw_root / "stocks" / "AAPL")
+    _write_synthetic_parquet(
+        raw_root, rows=5 * 24 * 60, start_ts=datetime(2024, 3, 4, tzinfo=UTC), symbol="AAPL"
+    )
+    build_catalog_for_symbol(
+        symbol="AAPL", raw_parquet_root=raw_root, catalog_root=catalog_root, force=True
+    )
+    # B present, A purged.
+    assert catalog_has_bars_in_window(
+        catalog_root=catalog_root, instrument_id=iid,
+        start=date(2024, 3, 1), end=date(2024, 3, 31),
+    )
+    assert not catalog_has_bars_in_window(
+        catalog_root=catalog_root, instrument_id=iid,
+        start=date(2024, 1, 1), end=date(2024, 1, 31),
     )

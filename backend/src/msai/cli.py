@@ -58,7 +58,7 @@ import json
 import os
 import time
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote
 
 if TYPE_CHECKING:
@@ -77,6 +77,7 @@ from msai.services.data_ingestion import DataIngestionService
 from msai.services.data_sources.databento_client import DatabentoClient
 from msai.services.nautilus.security_master.service import SecurityMaster
 from msai.services.parquet_store import ParquetStore
+from msai.services.smoke.config import SMOKE_CONFIGS, SmokeConfigName
 from msai.services.symbol_onboarding.partition_index import make_refresh_callback
 
 setup_logging(settings.environment)
@@ -2029,12 +2030,6 @@ _SMOKE_G5_REQUIRED: frozenset[str] = frozenset(
     }
 )
 
-# Deterministic-trades floor: each of the two ``smoke_market_order``
-# Strategy rows (AAPL + SPY) is guaranteed to emit exactly one fill on
-# every smoke run.  Below 2 means order/fill plumbing is broken — fail
-# loudly even on a "completed" run.
-_SMOKE_TRADE_FLOOR: int = 2
-
 # Cold-nightly budget + slack — the smoke endpoint synchronously runs
 # ingest before returning, so the create-call timeout must cover the
 # upstream budget (~60 min for a cold nightly window).
@@ -2067,11 +2062,12 @@ def smoke_cmd(
 
     PRD: ``docs/prds/ingest-backtest-smoke-test.md`` v1.3.
 
-    On structural FAIL (status != "completed", missing G5 keys,
-    trade_count_total below the deterministic floor of 2, or empty
-    ``report_path``), exits with code 1 and prints the problems list
-    to stderr.  ``--json`` always emits a single JSON document on
-    stdout including a ``structural_problems`` array.
+    On structural FAIL (status != "completed", missing G5 keys, any
+    ``smoke_market_order/<symbol>`` strategy producing <1 trade — the
+    per-instrument deterministic floor — or empty ``report_path``), exits
+    with code 1 and prints the problems list to stderr.  ``--json`` always
+    emits a single JSON document on stdout including a
+    ``structural_problems`` array.
     """
     if config not in {"fast", "nightly"}:
         typer.echo(
@@ -2189,12 +2185,23 @@ def smoke_cmd(
         missing_keys = _SMOKE_G5_REQUIRED - set(metrics.keys())
         if missing_keys:
             structural_problems.append(f"missing G5 keys: {sorted(missing_keys)}")
-        trade_total = int(metrics.get("trade_count_total") or 0)
-        if trade_total < _SMOKE_TRADE_FLOOR:
-            structural_problems.append(
-                f"trade_count_total={trade_total} < floor "
-                f"{_SMOKE_TRADE_FLOOR} — order/fill plumbing broken"
-            )
+        by_strategy: dict[str, Any] = metrics.get("trade_count_by_strategy") or {}
+        # Per-instrument deterministic floor: each ``smoke_market_order/<symbol>``
+        # strategy is designed to emit ≥1 order/instrument every run. A 0 (or an
+        # ABSENT key) means that symbol's catalog had no bars at backtest time —
+        # fail loudly rather than let another symbol's volume mask it (the
+        # AAPL=0 / SPY=440 prod incident, which the old SUM floor passed).
+        # ``ema_cross`` is NOT floored — it can legitimately be 0 in a short window.
+        # ``config`` is validated to be a SmokeConfigName earlier in this command.
+        for sym in SMOKE_CONFIGS[cast("SmokeConfigName", config)].symbols:
+            name = f"__smoke__/smoke_market_order/{sym}"
+            count = int(by_strategy.get(name, -1))
+            if count < 1:
+                shown = "absent" if name not in by_strategy else str(count)
+                structural_problems.append(
+                    f"{name} produced {shown} trades; smoke_market_order must emit "
+                    "≥1 per instrument (that symbol's catalog likely had no bars)"
+                )
         if not run.get("report_path"):
             structural_problems.append("report_path empty — report generation failed")
 

@@ -28,6 +28,7 @@ from typing import Any
 import pytest
 
 from msai.services.smoke.runner import (
+    _ensure_catalog_fresh,
     _ensure_ingested,
     _iter_month_starts,
 )
@@ -198,3 +199,219 @@ async def test_ensure_ingested_acquires_lock_per_symbol_and_month(
     assert set(released) == expected
     # And ingest_symbols fired exactly once with the gapped symbols.
     assert ingest_calls == [["AAPL", "SPY"]]
+
+
+# ---------------------------------------------------------------------------
+# _ensure_catalog_fresh — CHECK-FIRST catalog freshness (the AAPL=0 fix)
+# ---------------------------------------------------------------------------
+
+
+def _patch_catalog_fresh_deps(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    bars_present: dict[str, list[bool]],
+) -> dict[str, Any]:
+    """Patch the catalog + ingest + mutex deps on the runner module for
+    ``_ensure_catalog_fresh``. ``bars_present`` scripts the per-instrument
+    binary check results popped in call order; once a list is exhausted the
+    LAST value sticks (so a "stays empty" symbol uses a single ``[False]``).
+    Returns a record of calls.
+    """
+    rec: dict[str, Any] = {"ensure_force": [], "ingest": [], "locked": []}
+    last_seen: dict[str, bool] = {}
+
+    def _stub_ensure(*, symbols: list[str], force: bool, **_kw: Any) -> list[str]:
+        # ensure_catalog_data is SYNC (invoked via asyncio.to_thread) — the stub
+        # must be sync too, else to_thread returns an unawaited coroutine.
+        rec["ensure_force"].append((tuple(symbols), force))
+        return list(symbols)
+
+    def _stub_has_bars(*, instrument_id: str, **_kw: Any) -> bool:
+        seq = bars_present.get(instrument_id, [])
+        if seq:
+            last_seen[instrument_id] = seq.pop(0)
+        return last_seen.get(instrument_id, True)
+
+    async def _stub_get_pool() -> object:
+        return object()
+
+    async def _stub_acquire(_pool: object, *, symbol: str, window_start: date, **_kw: Any) -> str:
+        rec["locked"].append((symbol, window_start))
+        return f"token-{symbol}-{window_start.isoformat()}"
+
+    async def _stub_release(_pool: object, **_kw: Any) -> None:
+        return None
+
+    async def _stub_ingest_symbols(
+        _asset: str, symbols: list[str], _start: str, _end: str, **_kw: Any
+    ) -> object:
+        rec["ingest"].append(list(symbols))
+        return object()
+
+    monkeypatch.setattr("msai.services.smoke.runner.ensure_catalog_data", _stub_ensure)
+    monkeypatch.setattr("msai.services.smoke.runner.catalog_has_bars_in_window", _stub_has_bars)
+    monkeypatch.setattr("msai.services.smoke.runner.get_redis_pool", _stub_get_pool)
+    monkeypatch.setattr("msai.services.smoke.runner.acquire_ingest_lock", _stub_acquire)
+    monkeypatch.setattr("msai.services.smoke.runner.release_ingest_lock", _stub_release)
+    monkeypatch.setattr("msai.services.smoke.runner.ingest_symbols", _stub_ingest_symbols)
+    return rec
+
+
+@pytest.mark.asyncio
+async def test_ensure_catalog_fresh_healthy_locks_but_no_force_no_ingest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Warm/healthy: the mutex is acquired (to serialize against any peer
+    mid-rebuild), the under-lock check finds bars for both instruments → NO
+    catalog build, NO re-ingest. Lock-acquire is the only cost."""
+    rec = _patch_catalog_fresh_deps(
+        monkeypatch,
+        bars_present={"AAPL.NASDAQ": [True], "SPY.NASDAQ": [True]},
+    )
+    await _ensure_catalog_fresh(("AAPL", "SPY"), "2024-12-01", "2024-12-31")
+    assert rec["ensure_force"] == []  # no mutation on the healthy path
+    # All symbols are locked up front so the check can't observe a peer's
+    # in-progress rebuild.
+    assert ("AAPL", date(2024, 12, 1)) in rec["locked"]
+    assert ("SPY", date(2024, 12, 1)) in rec["locked"]
+    assert rec["ingest"] == []
+
+
+@pytest.mark.asyncio
+async def test_ensure_catalog_fresh_stale_catalog_rebuilds_under_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stale catalog (the prod trigger): the under-lock check finds AAPL empty
+    → force-rebuild from existing parquet fills it → NO re-ingest. All work is
+    under the mutex (serializing concurrent smokes' shared bar-dir purge)."""
+    rec = _patch_catalog_fresh_deps(
+        monkeypatch,
+        # under-lock check=False (empty), post-rebuild recheck=True (filled).
+        bars_present={"AAPL.NASDAQ": [False, True], "SPY.NASDAQ": [True]},
+    )
+    await _ensure_catalog_fresh(("AAPL", "SPY"), "2024-12-01", "2024-12-31")
+    # AAPL's December slot was locked before the purge.
+    assert ("AAPL", date(2024, 12, 1)) in rec["locked"]
+    # The ONLY catalog mutation is the in-lock force-rebuild of the empty AAPL.
+    assert rec["ensure_force"] == [(("AAPL.NASDAQ",), True)]
+    assert rec["ingest"] == []
+
+
+@pytest.mark.asyncio
+async def test_ensure_catalog_fresh_missing_parquet_ingests_then_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parquet genuinely lacks the window: AAPL stays empty through rebuild →
+    ingest (under the held mutex, via ingest_symbols directly — no re-acquire)
+    + rebuild → STILL empty → loud RuntimeError."""
+    rec = _patch_catalog_fresh_deps(
+        monkeypatch,
+        bars_present={"AAPL.NASDAQ": [False], "SPY.NASDAQ": [True]},
+    )
+    with pytest.raises(RuntimeError, match="AAPL"):
+        await _ensure_catalog_fresh(("AAPL", "SPY"), "2024-12-01", "2024-12-31")
+    assert rec["ingest"] == [["AAPL"]]
+    # Both catalog mutations are force=True and in-lock (no unserialized build).
+    assert rec["ensure_force"] == [
+        (("AAPL.NASDAQ",), True),  # force-rebuild from existing parquet
+        (("AAPL.NASDAQ",), True),  # rebuild after the in-lock ingest
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ensure_catalog_fresh_missing_raw_parquet_recovers_via_ingest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Raw parquet missing entirely (e.g. a stale partition index made
+    _ensure_ingested skip): the first force-rebuild raises FileNotFoundError;
+    it must be TOLERATED so the in-lock ingest fetches the data and the second
+    rebuild fills the catalog — self-heal, NOT abort."""
+    rec: dict[str, Any] = {"ensure_force": [], "ingest": []}
+    # under-lock check=False (empty); after the FNF-tolerated rebuild + ingest +
+    # 2nd rebuild, the post-ingest recheck=True (filled).
+    bars = {"AAPL.NASDAQ": [False, True], "SPY.NASDAQ": [True]}
+    last: dict[str, bool] = {}
+    force_rebuild_attempts = {"n": 0}
+
+    def _stub_ensure(*, symbols: list[str], force: bool, **_kw: Any) -> list[str]:
+        rec["ensure_force"].append((tuple(symbols), force))
+        if force:
+            force_rebuild_attempts["n"] += 1
+            # First force-rebuild: no raw parquet on disk yet -> FileNotFoundError.
+            if force_rebuild_attempts["n"] == 1:
+                raise FileNotFoundError("No raw Parquet files found for 'AAPL'")
+        return list(symbols)
+
+    def _stub_has_bars(*, instrument_id: str, **_kw: Any) -> bool:
+        seq = bars.get(instrument_id, [])
+        if seq:
+            last[instrument_id] = seq.pop(0)
+        return last.get(instrument_id, True)
+
+    async def _stub_pool() -> object:
+        return object()
+
+    async def _stub_acquire(_p: object, *, symbol: str, window_start: date, **_k: Any) -> str:
+        return f"t-{symbol}"
+
+    async def _stub_release(_p: object, **_k: Any) -> None:
+        return None
+
+    async def _stub_ingest(_a: str, symbols: list[str], _s: str, _e: str, **_k: Any) -> object:
+        rec["ingest"].append(list(symbols))
+        return object()
+
+    monkeypatch.setattr("msai.services.smoke.runner.ensure_catalog_data", _stub_ensure)
+    monkeypatch.setattr("msai.services.smoke.runner.catalog_has_bars_in_window", _stub_has_bars)
+    monkeypatch.setattr("msai.services.smoke.runner.get_redis_pool", _stub_pool)
+    monkeypatch.setattr("msai.services.smoke.runner.acquire_ingest_lock", _stub_acquire)
+    monkeypatch.setattr("msai.services.smoke.runner.release_ingest_lock", _stub_release)
+    monkeypatch.setattr("msai.services.smoke.runner.ingest_symbols", _stub_ingest)
+
+    # Must NOT raise — the FileNotFoundError is tolerated and the ingest heals it.
+    await _ensure_catalog_fresh(("AAPL", "SPY"), "2024-12-01", "2024-12-31")
+    assert rec["ingest"] == [["AAPL"]]
+    assert force_rebuild_attempts["n"] == 2  # raised once, succeeded once
+
+
+@pytest.mark.asyncio
+async def test_ensure_catalog_fresh_no_parquet_after_ingest_raises_clear_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Databento returns nothing: BOTH force-rebuilds raise FileNotFoundError
+    (no parquet even after the in-lock ingest). The post-ingest FNF is converted
+    to a clear RuntimeError, NOT propagated as a bare FileNotFoundError."""
+    rec: dict[str, Any] = {"ingest": []}
+
+    def _stub_ensure(*, symbols: list[str], force: bool, **_kw: Any) -> list[str]:
+        if force:
+            # No raw parquet on disk, and the ingest produced none either.
+            raise FileNotFoundError("No raw Parquet files found for 'AAPL'")
+        return list(symbols)
+
+    def _stub_has_bars(*, instrument_id: str, **_kw: Any) -> bool:
+        return instrument_id != "AAPL.NASDAQ"  # AAPL always empty, SPY present
+
+    async def _stub_pool() -> object:
+        return object()
+
+    async def _stub_acquire(_p: object, *, symbol: str, window_start: date, **_k: Any) -> str:
+        return f"t-{symbol}"
+
+    async def _stub_release(_p: object, **_k: Any) -> None:
+        return None
+
+    async def _stub_ingest(_a: str, symbols: list[str], _s: str, _e: str, **_k: Any) -> object:
+        rec["ingest"].append(list(symbols))
+        return object()
+
+    monkeypatch.setattr("msai.services.smoke.runner.ensure_catalog_data", _stub_ensure)
+    monkeypatch.setattr("msai.services.smoke.runner.catalog_has_bars_in_window", _stub_has_bars)
+    monkeypatch.setattr("msai.services.smoke.runner.get_redis_pool", _stub_pool)
+    monkeypatch.setattr("msai.services.smoke.runner.acquire_ingest_lock", _stub_acquire)
+    monkeypatch.setattr("msai.services.smoke.runner.release_ingest_lock", _stub_release)
+    monkeypatch.setattr("msai.services.smoke.runner.ingest_symbols", _stub_ingest)
+
+    with pytest.raises(RuntimeError, match="Databento returned no data"):
+        await _ensure_catalog_fresh(("AAPL", "SPY"), "2024-12-01", "2024-12-31")
+    assert rec["ingest"] == [["AAPL"]]  # ingest was still attempted before giving up
