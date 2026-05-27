@@ -41,4 +41,6 @@ Two independent defects:
 
 - Unit: `tests/unit/services/nautilus/test_catalog_builder.py`, `tests/unit/services/smoke/test_runner_coverage.py`, `tests/unit/test_cli.py`.
 - E2E (live dev): `msai backtest smoke --config fast --json` → AAPL+SPY `smoke_market_order=2` each, cold + warm. Report: `tests/e2e/reports/2026-05-26-19-30-smoke-aapl-zero-trades.md`.
-- Definitive prod confirmation deferred to post-merge UC-003 (`gh workflow run smoke.yml -f config=fast`) against the real prod data state that triggered the incident.
+- **Prod confirmed 2026-05-27** (merged as #83 = `8b17ea6`, auto-deployed):
+  - **UC-003** (`gh workflow run smoke.yml -f config=fast`, run 26487751661) → **PASS** against the real prod data state that produced the incident: `trade_count_by_strategy` = `{ema_cross/AAPL: 442, ema_cross/SPY: 438, smoke_market_order/AAPL: 2, smoke_market_order/SPY: 2}`, total 884 (AAPL was 0 before). The catalog-freshness pre-flight rebuilt AAPL's stale catalog before the backtest.
+  - **UC-004** (deploy-preflight gate, `deploy.yml -f run_smoke=true`, run 26490756023) → preflight **PASS** (`status=completed problems=0`) on the deployed image. (The downstream deploy job in that same run failed only on a dispatch typo — full 40-char SHA where it wants the 7-char short SHA — which skipped all VM steps; no re-deploy, no rollback, prod stayed healthy on the fix.)
