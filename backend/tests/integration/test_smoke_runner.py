@@ -101,12 +101,23 @@ def _mock_runner_externals(monkeypatch: pytest.MonkeyPatch) -> None:
     ) -> list[str]:
         return list(symbols)
 
+    # Catalog-freshness pre-flight (step 1b) reads/builds the real Nautilus
+    # catalog against the default DATA_ROOT, which the testcontainer has no
+    # parquet for — stub it to a no-op so these tests assert the bootstrap /
+    # run-lifecycle contract. The catalog-freshness logic has dedicated unit
+    # tests in tests/unit/services/smoke/test_runner_coverage.py.
+    async def _stub_ensure_catalog_fresh(_symbols: tuple[str, ...], _start: str, _end: str) -> None:
+        return None
+
     monkeypatch.setattr("msai.services.smoke.runner.get_redis_pool", _stub_get_pool)
     monkeypatch.setattr("msai.services.smoke.runner.acquire_ingest_lock", _stub_acquire)
     monkeypatch.setattr("msai.services.smoke.runner.release_ingest_lock", _stub_release)
     monkeypatch.setattr("msai.services.smoke.runner.ingest_symbols", _stub_ingest)
     monkeypatch.setattr("msai.services.smoke.runner.enqueue_portfolio_run", _stub_enqueue)
     monkeypatch.setattr("msai.services.smoke.runner._symbols_with_gaps", _stub_symbols_with_gaps)
+    monkeypatch.setattr(
+        "msai.services.smoke.runner._ensure_catalog_fresh", _stub_ensure_catalog_fresh
+    )
 
 
 @pytest.fixture

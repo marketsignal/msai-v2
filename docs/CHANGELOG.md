@@ -4,6 +4,30 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-05-26 — Fix: smoke passed green while AAPL produced 0 trades (`fix/smoke-aapl-zero-trades`)
+
+**Symptom:** the prod operational smoke (PR #80) returned `status=completed` while `smoke_market_order/AAPL=0` (SPY=440 masked it). `smoke_market_order` is designed to fire exactly 1 order per instrument, so AAPL=0 meant AAPL received zero bars — yet the smoke went green.
+
+**Root cause (two defects):**
+
+1. **Catalog vs parquet coverage divergence.** The smoke pre-flight checked raw-parquet coverage by symbol, but the backtest reads the Nautilus **catalog** keyed by exact `instrument_id+bar_type`. The catalog build short-circuits on a matching source-hash marker, so a stale/missing catalog serves 0 bars even when parquet looks "full". AAPL's `AAPL.NASDAQ` catalog lacked Dec-2024 bars at backtest time; SPY's was fresh.
+2. **Floor was a SUM** (`trade_count_total < 2`), so SPY's 2 masked AAPL's 0.
+
+**Fix:**
+
+- `runner._ensure_catalog_fresh` (new, called from `run_smoke` after `_ensure_ingested`): under the ingest mutex, read-only `catalog_has_bars_in_window` check per strategy instrument; if empty → force purge+rebuild from parquet (tolerate `FileNotFoundError` → ingest) → in-lock `ingest_symbols` + rebuild → raise if still empty.
+- `catalog_has_bars_in_window` (new): `ParquetDataCatalog.get_intervals` overlap check (no bar materialization; robust to weekend/holiday edge-gaps `verify_catalog_coverage` reports).
+- `build_catalog_for_symbol(force=True)` now unlinks the marker + purges the bar dir BEFORE rebuilding (was nested under `if not force:`).
+- `cli.py`: per-instrument deterministic floor — each `__smoke__/smoke_market_order/<symbol>` must produce ≥1 trade (absent key also fails); removed the maskable SUM floor `_SMOKE_TRADE_FLOOR`.
+
+**Files changed:** 3 src (`services/nautilus/catalog_builder.py`, `services/smoke/runner.py`, `cli.py`) + 5 tests + UC graduation + solution doc.
+
+**Verification:** verify-app full suite (2651 passed); 6 Codex/pr-toolkit review iterations (always-lock foundation fix ended a recurring concurrency-race class); live E2E (`msai backtest smoke --config fast --json` → AAPL+SPY `smoke_market_order=2` each, cold + warm). Prod confirmation (UC-003) deferred to post-merge.
+
+**Solution doc:** `docs/solutions/backtesting/smoke-aapl-zero-trades-catalog-freshness.md`.
+
+---
+
 ### 2026-05-20 — Fix-2: MSAL scope `.default` → `access_as_user` (still PROD OUTAGE) (`fix/msal-scope-access-as-user`)
 
 **Why a second fix:** PR #74's `.default` choice failed in prod with AADSTS500011 (`invalid_resource`) — Codex `/codex` second opinion with live Microsoft docs lookup identified two problems:

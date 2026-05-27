@@ -520,13 +520,19 @@ class TestBacktestSmokeCommand:
         # structural_problems is always present (empty on success)
         assert payload["structural_problems"] == []
 
-    def test_structural_fail_when_trade_count_below_floor_exits_nonzero(
-        self, runner: CliRunner
-    ) -> None:
-        # Arrange — status="completed" but trade_count_total=0 (below deterministic floor of 2)
+    def test_structural_fail_when_a_symbol_produces_zero_trades(self, runner: CliRunner) -> None:
+        # Arrange — the exact prod incident shape: status="completed" with a
+        # healthy total (440), but smoke_market_order/AAPL produced 0 while SPY
+        # carried the volume. The per-instrument floor must catch AAPL's 0 even
+        # though the total is well above the old SUM floor of 2.
         completed = _smoke_completed_body()
-        completed["metrics"]["trade_count_total"] = 0
-        completed["metrics"]["trade_count_by_strategy"] = {}
+        completed["metrics"]["trade_count_by_strategy"] = {
+            "__smoke__/ema_cross/AAPL": 0,
+            "__smoke__/ema_cross/SPY": 438,
+            "__smoke__/smoke_market_order/AAPL": 0,
+            "__smoke__/smoke_market_order/SPY": 2,
+        }
+        completed["metrics"]["trade_count_total"] = 440
         create_resp = _ok_response(completed)
         create_resp.status_code = 201
         get_resp = _ok_response(completed)
@@ -537,10 +543,33 @@ class TestBacktestSmokeCommand:
             # Act
             result = runner.invoke(app, ["backtest", "smoke"])
 
-        # Assert — structural FAIL even though lifecycle status is "completed"
+        # Assert — structural FAIL naming the offending per-instrument strategy.
         assert result.exit_code == 1, result.output
         assert "FAIL" in result.output
-        assert "trade_count_total" in result.output
+        assert "__smoke__/smoke_market_order/AAPL" in result.output
+
+    def test_structural_fail_when_a_smoke_market_order_key_is_absent(
+        self, runner: CliRunner
+    ) -> None:
+        # Arrange — AAPL's smoke_market_order key is MISSING entirely (not just
+        # 0). The floor asserts the EXPECTED keys from the config, so an absent
+        # key must also fail (Codex plan-review P1).
+        completed = _smoke_completed_body()
+        completed["metrics"]["trade_count_by_strategy"] = {
+            "__smoke__/smoke_market_order/SPY": 2,
+        }
+        completed["metrics"]["trade_count_total"] = 2
+        create_resp = _ok_response(completed)
+        create_resp.status_code = 201
+        get_resp = _ok_response(completed)
+        with patch(
+            "msai.cli.httpx.request",
+            side_effect=[create_resp, get_resp],
+        ):
+            result = runner.invoke(app, ["backtest", "smoke"])
+
+        assert result.exit_code == 1, result.output
+        assert "__smoke__/smoke_market_order/AAPL" in result.output
 
     def test_structural_fail_in_json_mode_writes_problems_and_exits_nonzero(
         self, runner: CliRunner
@@ -653,7 +682,9 @@ class TestSystemSmokeAlertCommand:
         # Arrange — completed status but structural_problems present
         result_file = tmp_path / "smoke-result.json"
         body = _smoke_completed_body()
-        body["structural_problems"] = ["trade_count_total=0 < floor 2"]
+        body["structural_problems"] = [
+            "__smoke__/smoke_market_order/AAPL produced 0 trades; smoke_market_order must emit >=1 per instrument"
+        ]
         result_file.write_text(json.dumps(body))
 
         # Act
@@ -667,7 +698,9 @@ class TestSystemSmokeAlertCommand:
         assert "FAIL" in kwargs["title"]
         # The message JSON body must include the structural problems list.
         message_body = json.loads(kwargs["message"])
-        assert message_body["structural_problems"] == ["trade_count_total=0 < floor 2"]
+        assert message_body["structural_problems"] == [
+            "__smoke__/smoke_market_order/AAPL produced 0 trades; smoke_market_order must emit >=1 per instrument"
+        ]
 
     def test_lifecycle_failed_status_dispatches_error_level(
         self, runner: CliRunner, tmp_path

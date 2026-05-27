@@ -42,6 +42,8 @@ PRD docs/prds/ingest-backtest-smoke-test.md v1.3.
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager
 from datetime import date, datetime
 from typing import TYPE_CHECKING
 
@@ -61,6 +63,11 @@ from msai.schemas.portfolio import (
     PortfolioRunCreate,
 )
 from msai.services.data_ingestion import ingest_symbols
+from msai.services.nautilus.catalog_builder import (
+    catalog_has_bars_in_window,
+    ensure_catalog_data,
+)
+from msai.services.nautilus.instruments import DEFAULT_EQUITY_VENUE
 from msai.services.portfolio import PortfolioService
 from msai.services.portfolio.lifecycle import PortfolioLifecycle
 from msai.services.smoke.config import SMOKE_CONFIGS, SmokeConfigName
@@ -73,8 +80,10 @@ from msai.services.symbol_onboarding.partition_index import PartitionIndexServic
 from msai.services.symbol_onboarding.partition_index_db import PartitionIndexGateway
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
     from uuid import UUID
 
+    from redis.asyncio import Redis
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from msai.models.portfolio_run import PortfolioRun
@@ -334,28 +343,7 @@ async def _ensure_ingested(symbols: tuple[str, ...], start: str, end: str) -> No
 
     redis = await get_redis_pool()
     month_starts = _iter_month_starts(start_date, end_date)
-    # Track ``(symbol, month_start, token)`` triples so the ``finally`` block
-    # can release every successfully-acquired lock even when a later
-    # acquisition fails.
-    tokens: list[tuple[str, date, str]] = []
-    try:
-        for symbol in gapped_symbols:
-            for month_start in month_starts:
-                token = await acquire_ingest_lock(
-                    redis,
-                    symbol=symbol,
-                    window_start=month_start,
-                    # 1 hour covers cold-nightly ingest (12 months × per-month
-                    # Databento monthly fetch). Comfortably longer than the
-                    # warm-path no-op and the worst single-month equity pull.
-                    ttl_seconds=3600,
-                    # 10 minutes -- long enough that a concurrent ingest can
-                    # finish, short enough that we surface a real stall to
-                    # the caller rather than hang forever.
-                    wait_timeout_seconds=600,
-                )
-                tokens.append((symbol, month_start, token))
-
+    async with _ingest_locks(redis, gapped_symbols, month_starts):
         # Re-check coverage AFTER acquiring every lock. Codex review P2:
         # two cold-window runs both compute gaps before locking; the loser
         # blocks on the winner's locks, and without this re-check would then
@@ -380,10 +368,44 @@ async def _ensure_ingested(symbols: tuple[str, ...], start: str, end: str) -> No
             dataset="EQUS.MINI",
             schema="ohlcv-1m",
         )
+
+
+@asynccontextmanager
+async def _ingest_locks(
+    redis: Redis,
+    symbols: list[str] | tuple[str, ...],
+    month_starts: list[date],
+) -> AsyncIterator[None]:
+    """Acquire one ingest lock per ``(symbol, month_start)`` and release every
+    successfully-acquired lock on exit — even if a later acquisition fails or
+    the body raises. Shared by :func:`_ensure_ingested` (after its coverage
+    check) and :func:`_force_ingest` (unconditional fetch).
+    """
+    # Track ``(symbol, month_start, token)`` triples so the release loop frees
+    # every lock we actually took, even on a partial-acquire failure.
+    tokens: list[tuple[str, date, str]] = []
+    try:
+        for symbol in symbols:
+            for month_start in month_starts:
+                token = await acquire_ingest_lock(
+                    redis,
+                    symbol=symbol,
+                    window_start=month_start,
+                    # 1 hour covers cold-nightly ingest (12 months × per-month
+                    # Databento monthly fetch). Comfortably longer than the
+                    # warm-path no-op and the worst single-month equity pull.
+                    ttl_seconds=3600,
+                    # 10 minutes -- long enough that a concurrent ingest can
+                    # finish, short enough that we surface a real stall to
+                    # the caller rather than hang forever.
+                    wait_timeout_seconds=600,
+                )
+                tokens.append((symbol, month_start, token))
+        yield
     finally:
-        # Always release every successfully-acquired lock, even if the
-        # ingest call itself raised. ``release_ingest_lock`` is holder-token
-        # guarded -- a foreign token will no-op rather than steal the slot.
+        # Release is best-effort + holder-token guarded. The TTL auto-frees
+        # the lock even if a DEL never lands; swallow + log so callers still
+        # see the ingest result rather than a release-time error.
         for symbol, month_start, token in tokens:
             try:
                 await release_ingest_lock(
@@ -393,16 +415,138 @@ async def _ensure_ingested(symbols: tuple[str, ...], start: str, end: str) -> No
                     token=token,
                 )
             except Exception as exc:  # noqa: BLE001
-                # Lock release is best-effort. The TTL guarantees the lock
-                # auto-frees within ``ttl_seconds`` even if we never get
-                # the DEL through; swallow + log so the caller still sees
-                # the ingest result instead of a release-time error.
                 log.warning(
                     "smoke_ingest_lock_release_failed",
                     symbol=symbol,
                     window_start=month_start.isoformat(),
                     error=str(exc),
                 )
+
+
+async def _rebuild_catalog(instrument_ids: list[str], *, force: bool) -> list[str]:
+    """Build/rebuild the catalog off the event loop (catalog work is blocking
+    and would stall the API event loop run_smoke is awaited on)."""
+    return await asyncio.to_thread(
+        ensure_catalog_data,
+        symbols=instrument_ids,
+        raw_parquet_root=settings.parquet_root,
+        catalog_root=settings.nautilus_catalog_root,
+        asset_class="stocks",
+        force=force,
+    )
+
+
+async def _ensure_catalog_fresh(symbols: tuple[str, ...], start: str, end: str) -> None:
+    """Guarantee the Nautilus catalog the smoke backtest reads actually covers
+    the window for each strategy instrument.
+
+    The smoke pre-flight (``_ensure_ingested``) checks RAW-PARQUET coverage by
+    symbol, but the backtest reads the CATALOG keyed by the exact
+    ``instrument_id+bar_type``. A stale/partial catalog can serve 0 bars for the
+    window even when parquet is present (the AAPL=0 prod incident).
+
+    The freshness check AND every remediation run UNDER the ingest mutex. An
+    unlocked fast-path check is unsafe: a concurrent smoke (CLI + UI + scheduler
+    can all run one) mid-rebuild purges then writes monthly Parquet under their
+    final names BEFORE rewriting the source-hash marker, so an unlocked
+    ``catalog_has_bars_in_window`` can observe a PARTIALLY-rebuilt catalog and
+    wave a half-built run through. Acquiring the per-(symbol, month) mutex first
+    serializes against that peer (lock acquisition is ~ms when uncontended —
+    negligible for an infrequent multi-minute smoke; concurrent smokes correctly
+    serialize rather than race).
+
+    Under the lock:
+    a. Binary check (``catalog_has_bars_in_window`` globs bar filenames). All
+       present -> return.
+    b. Force purge+rebuild from existing parquet (tolerate missing parquet ->
+       fall through to ingest). Still empty -> ingest (in-lock, direct) +
+       rebuild.
+    c. Still empty -> raise (a loud pre-flight failure beats a silent 0-trade
+       backtest the per-instrument floor would later flag).
+    """
+    start_date = datetime.fromisoformat(start).date()
+    end_date = datetime.fromisoformat(end).date()
+    cat_root = settings.nautilus_catalog_root
+    # ``f"{sym}.{DEFAULT_EQUITY_VENUE}"`` is already the canonical id
+    # ``resolve_instrument`` echoes for a bare ticker, so it matches the bar-dir
+    # the catalog writes under and the strategy subscribes to.
+    instrument_ids_input = [f"{s}.{DEFAULT_EQUITY_VENUE}" for s in symbols]
+
+    async def _is_empty(instrument_id: str) -> bool:
+        # Off the event loop: get_intervals globs the bar dir (filesystem I/O).
+        return not await asyncio.to_thread(
+            catalog_has_bars_in_window,
+            catalog_root=cat_root,
+            instrument_id=instrument_id,
+            start=start_date,
+            end=end_date,
+        )
+
+    redis = await get_redis_pool()
+    month_starts = _iter_month_starts(start_date, end_date)
+    # Acquire the mutex for ALL symbols up front so the check can't observe a
+    # peer's in-progress rebuild and EVERY mutation is serialized.
+    async with _ingest_locks(redis, symbols, month_starts):
+        # (a) Binary check (under the lock -> no peer can be mid-rebuild).
+        pairs = list(zip(symbols, instrument_ids_input, strict=True))
+        empty = [(sym, iid) for sym, iid in pairs if await _is_empty(iid)]
+        if not empty:
+            # Catalog already covers the window for every symbol (cold runs
+            # built it in ``_ensure_ingested``; warm-fresh runs were never stale).
+            return
+
+        # (b) Force purge+rebuild from existing parquet. If a symbol's raw
+        # parquet is entirely missing (a stale partition index made
+        # ``_ensure_ingested`` skip, or files vanished after the coverage
+        # check), ``build_catalog_for_symbol`` raises ``FileNotFoundError`` —
+        # that symbol simply needs an ingest, so tolerate it here and fall
+        # through to the in-lock fetch below rather than aborting the preflight.
+        log.warning("smoke_catalog_empty_force_rebuild", symbols=[s for s, _ in empty])
+        try:
+            await _rebuild_catalog([iid for _, iid in empty], force=True)
+        except FileNotFoundError as exc:
+            log.warning(
+                "smoke_catalog_rebuild_no_raw_parquet",
+                symbols=[s for s, _ in empty],
+                error=str(exc),
+            )
+        else:
+            empty = [(sym, iid) for sym, iid in empty if await _is_empty(iid)]
+            if not empty:
+                return
+
+        # Still empty (stale catalog the rebuild couldn't fill) OR the raw
+        # parquet was missing -> fetch it. We already hold the locks, so call
+        # ingest_symbols directly (a lock-acquiring helper would deadlock on the
+        # held mutex).
+        log.warning("smoke_catalog_empty_force_ingest", symbols=[s for s, _ in empty])
+        await ingest_symbols(
+            "stocks",
+            [s for s, _ in empty],
+            start,
+            end,
+            provider="databento",
+            dataset="EQUS.MINI",
+            schema="ohlcv-1m",
+        )
+        try:
+            await _rebuild_catalog([iid for _, iid in empty], force=True)
+        except FileNotFoundError as exc:
+            # No parquet even after the ingest -> Databento returned no data for
+            # the window. Convert to the clear preflight failure (a loud failure
+            # beats a silent 0-trade backtest).
+            raise RuntimeError(
+                f"Smoke catalog has no raw parquet for {[s for s, _ in empty]} in "
+                f"{start}..{end} after forced ingest -- Databento returned no data "
+                "for the window."
+            ) from exc
+        still = [sym for sym, iid in empty if await _is_empty(iid)]
+        # (c) Loud failure beats a silent 0-trade backtest.
+        if still:
+            raise RuntimeError(
+                f"Smoke catalog still has no bars for {still} in {start}..{end} after "
+                "force-rebuild + forced ingest -- Databento may lack data for the window."
+            )
 
 
 async def run_smoke(
@@ -438,8 +582,19 @@ async def run_smoke(
     """
     config = SMOKE_CONFIGS[config_name]
 
-    # 1. Cold-ingest pre-flight (mutex-guarded; idempotent).
+    # 1. Cold-ingest pre-flight (mutex-guarded; idempotent) — ensures the raw
+    # parquet covers the window.
     await _ensure_ingested(
+        config.symbols,
+        config.start_date.isoformat(),
+        config.end_date.isoformat(),
+    )
+
+    # 1b. Catalog-freshness guarantee — the backtest reads the Nautilus catalog
+    # (keyed by instrument_id+bar_type), NOT the raw parquet, and a stale/partial
+    # catalog can serve 0 bars even when parquet is present (the AAPL=0 prod
+    # incident). Force-rebuild + verify per instrument before the run.
+    await _ensure_catalog_fresh(
         config.symbols,
         config.start_date.isoformat(),
         config.end_date.isoformat(),

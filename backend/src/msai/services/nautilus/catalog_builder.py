@@ -25,7 +25,7 @@ Design goals
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -156,7 +156,17 @@ def build_catalog_for_symbol(
     # present" and never noticed the delta.
     source_hash = _compute_raw_source_hash(raw_files, raw_root=raw_parquet_root)
     marker_path = _source_marker_path(catalog_root, instrument_id_str)
-    if not force:
+    if force:
+        # Force rebuild: unlink the marker FIRST, then purge the bar dir, so a
+        # clean rebuild always follows. The marker is re-written only AFTER all
+        # bars land (see the write at the bottom of this function), so if a
+        # force rebuild crashes after writing partial bars but before the marker
+        # rewrite, NO marker remains -> the next call treats the partial bars as
+        # legacy-unmarked and purges+rebuilds rather than skipping on a stale
+        # (marker-match + partial-bars) state.
+        marker_path.unlink(missing_ok=True)
+        _purge_catalog_for_instrument(catalog_root, instrument_id_str, bar_spec=_BAR_SPEC)
+    else:
         if marker_path.exists():
             stored_hash = marker_path.read_text().strip()
             if stored_hash == source_hash:
@@ -347,6 +357,7 @@ def ensure_catalog_data(
     *,
     asset_class: str = "stocks",
     raw_symbols: list[str] | None = None,
+    force: bool = False,
 ) -> list[str]:
     """Ensure the Nautilus catalog contains data for every requested symbol.
 
@@ -367,6 +378,11 @@ def ensure_catalog_data(
             canonical IDs whose local-part does not match the root ticker
             the ingestion pipeline writes under (e.g. ``ESM6.CME`` ingests
             under ``futures/ES/``, not ``futures/ESM6/``).
+        force: When ``True``, every symbol is purged and rebuilt from raw
+            parquet regardless of the source-hash marker (see
+            :func:`build_catalog_for_symbol`). Used by the smoke pre-flight to
+            repair a stale/partial catalog the source-hash skip would otherwise
+            serve.
 
     Returns:
         The list of canonical Nautilus instrument IDs in the same order as
@@ -395,9 +411,53 @@ def ensure_catalog_data(
                 catalog_root=catalog_root,
                 asset_class=asset_class,
                 raw_symbol_override=raw_override,
+                force=force,
             )
         )
     return instrument_ids
+
+
+def catalog_has_bars_in_window(
+    *,
+    catalog_root: Path,
+    instrument_id: str,
+    start: date,
+    end: date,
+    bar_spec: str = _BAR_SPEC,
+) -> bool:
+    """Binary: does the catalog hold ANY bar in ``[start, end]`` for this
+    instrument?
+
+    This is the signal the smoke pre-flight uses to decide whether a symbol's
+    catalog is usable. It deliberately asks "any bars?" rather than "zero
+    gaps?" — :func:`verify_catalog_coverage` reports harmless weekend/holiday
+    edge-gaps (e.g. a Sunday at the window start, or the tail after the last
+    bar) even for fully-ingested data, which cannot distinguish a healthy
+    catalog from an empty one. A total absence of bars (the AAPL=0 prod
+    incident) is exactly what this catches.
+
+    Uses ``ParquetDataCatalog.get_intervals`` — which reads the catalog's
+    ``{start_ns}_{end_ns}.parquet`` filename ranges WITHOUT materializing any
+    bars — and tests interval overlap with the requested window. This keeps the
+    "ask the catalog, not the gap-detector" intent while staying O(files): a
+    naive ``catalog.bars(...)`` would deserialize every bar in the window
+    (~100K+ for the nightly config) just to check ``len() > 0``, on the caller's
+    event loop. ``get_intervals`` returns COVERED intervals (not gaps), so the
+    weekend/holiday edge-gap noise that defeats :func:`verify_catalog_coverage`
+    does not apply here.
+    """
+    bar_type = BarType.from_str(f"{instrument_id}-{bar_spec}")
+    start_ns = pd.Timestamp(start, tz="UTC").value
+    # Inclusive end-of-day: last ns of ``end``.
+    end_ns = pd.Timestamp(end, tz="UTC").value + 86_400 * 1_000_000_000 - 1
+    catalog = ParquetDataCatalog(str(catalog_root))
+    try:
+        intervals = catalog.get_intervals(Bar, identifier=str(bar_type))
+    except (FileNotFoundError, ValueError):
+        # Missing instrument/bar directory or empty catalog → no bars.
+        return False
+    # Any covered interval overlapping [start_ns, end_ns] means bars exist.
+    return any(int(s) <= end_ns and start_ns <= int(e) for s, e in intervals)
 
 
 def describe_catalog(
