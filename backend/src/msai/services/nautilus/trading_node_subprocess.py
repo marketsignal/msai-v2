@@ -199,6 +199,64 @@ class TradingNodePayload:
     ``paper_symbols``) are still populated for back-compat and supervisor
     audit, but the multi-strategy config builder reads from here."""
 
+    # ------------------------------------------------------------------
+    # Per-account broker fleet (PR 1 Task T12)
+    # ------------------------------------------------------------------
+    # Three pre-resolved fields populated by the supervisor's ASYNC
+    # payload factory and consumed by the SYNC subprocess
+    # ``_build_real_node`` path. When all three are non-empty, the
+    # subprocess routes to :func:`build_per_account_trading_node_config`
+    # (Databento data + IB exec topology) instead of the legacy
+    # :func:`build_portfolio_trading_node_config`. The boundary lives
+    # here because the supervisor has a DB session (T10's
+    # ``resolve_databento_targets`` is async + DB-backed) and the
+    # subprocess does not.
+
+    ibg_client_id: int = 0
+    """Pre-allocated IB Gateway client_id slot for the IB exec
+    connection. Derived from ``deployment_slug`` via
+    :func:`msai.services.nautilus.ibg_client_id.derive_ibg_client_id`
+    (the single source of truth — Codex iter 1 P1-5). ``0`` falls
+    back to the legacy hashed derivation inside the SYNC builder."""
+
+    native_instrument_ids: list[str] = field(default_factory=list)
+    """Pre-resolved Databento NATIVE instrument ids (e.g.
+    ``["AAPL.XNAS"]``). Output of T10's
+    :func:`resolve_databento_targets`. Empty list means "not
+    populated — use the legacy builder"."""
+
+    venue_dataset_map: dict[str, str] = field(default_factory=dict)
+    """Authoritative ``native_venue → dataset`` map (e.g.
+    ``{"XNAS": "DBEQ.BASIC"}``). Output of T10's
+    :func:`resolve_databento_targets`."""
+
+    canonical_to_native_bar_types: dict[str, str] = field(default_factory=dict)
+    """Canonical ``<SYM>.IBKR-...`` → native ``<SYM>.{native_venue}-...``
+    bar-type strings. Built by the supervisor by zipping each
+    strategy's canonical bar_type with the native venue from the
+    shim's resolution. Threaded into the SymbologyShimActor config
+    so its ``on_start`` knows which native bar types to subscribe
+    to. Empty dict means "not populated — use the legacy builder"."""
+
+    @property
+    def use_per_account_topology(self) -> bool:
+        """Whether the subprocess should route to the per-account
+        Databento + IB-exec topology (PR 1 T11's
+        :func:`build_per_account_trading_node_config`).
+
+        True iff the supervisor populated ALL three pre-resolved
+        fields. We require the bar-type map to be non-empty because
+        without it the ``SymbologyShimActor.on_start`` has nothing to
+        subscribe to and bars never reach the strategy (Codex iter
+        7 P1 of PR 1). An empty bar-type map is a programming bug
+        upstream — fail-fast by NOT activating the new path.
+        """
+        return bool(
+            self.native_instrument_ids
+            and self.venue_dataset_map
+            and self.canonical_to_native_bar_types
+        )
+
     @property
     def all_instruments(self) -> list[str]:
         """De-duplicated, sorted union of instruments across all strategy members.
@@ -1706,6 +1764,8 @@ def _build_real_node(payload: TradingNodePayload) -> Any:
     from msai.services.nautilus.live_node_config import (
         IBSettings,
         build_live_trading_node_config,
+        build_per_account_strategy_configs,
+        build_per_account_trading_node_config,
         build_portfolio_trading_node_config,
     )
 
@@ -1727,6 +1787,85 @@ def _build_real_node(payload: TradingNodePayload) -> Any:
             spawn_today = _date.fromisoformat(payload.spawn_today_iso)
         except ValueError:
             spawn_today = None
+
+    # PR 1 T12: per-account split topology (Databento data + IB exec).
+    # When the supervisor's async payload factory pre-resolved the
+    # Databento targets + the canonical → native bar-type map,
+    # route to :func:`build_per_account_trading_node_config` and
+    # register the Databento data-client factory + IB exec factory.
+    # When any of the three pre-resolved fields is empty we keep the
+    # legacy data+exec wiring so existing tests (and any deployment
+    # the supervisor hasn't migrated yet) stay green.
+    if payload.use_per_account_topology:
+        from nautilus_trader.adapters.databento.constants import DATABENTO_CLIENT_ID
+        from nautilus_trader.adapters.databento.factories import (
+            DatabentoLiveDataClientFactory,
+        )
+
+        from msai.core.config import settings as _settings
+        from msai.services.nautilus.ibg_client_id import (
+            ROLE_EXEC,
+            derive_ibg_client_id,
+        )
+
+        # ``ibg_client_id`` is supplied by the supervisor (single source
+        # of truth via :func:`derive_ibg_client_id`). Fall back to the
+        # SYNC builder's own legacy derivation when the supervisor
+        # passed 0 — happens only in tests that bypass the supervisor
+        # payload factory.
+        ibg_client_id = payload.ibg_client_id or derive_ibg_client_id(
+            payload.deployment_slug, ROLE_EXEC
+        )
+
+        # Codex iter 1 P1-1 + P1-3 of PR 1 — build ``ImportableStrategyConfig``s
+        # from the supervisor's strategy_members BEFORE handing them to
+        # the per-account builder. Without this the spawned TradingNode
+        # contained the shim actor but ZERO strategies (P1-1); without
+        # the venue rewrite each strategy subscribed under ``.NASDAQ``
+        # while the shim republishes onto ``.IBKR`` so no bars ever
+        # reached the strategy (P1-3). ``build_per_account_strategy_configs``
+        # threads the rewrite + matches the legacy portfolio loop's
+        # ``order_id_tag`` / ``manage_stop`` / US-equity TIF wiring.
+        per_account_strategy_configs = build_per_account_strategy_configs(
+            payload.strategy_members,
+            deployment_slug=payload.deployment_slug,
+        )
+
+        # F2 fix (Codex iter 2 P1): preload the IB exec instrument
+        # provider with REAL ``IBContract`` objects keyed by their
+        # LISTING venue (NASDAQ/NYSE/etc.), NOT canonical ``.IBKR`` ids.
+        # The resolver's ``ResolvedInstrument`` rows already carry the
+        # full ``contract_spec`` (mirrors the legacy portfolio path).
+        # De-duplicate by canonical_id to avoid two strategies on the
+        # same instrument producing two IBContract entries.
+        _seen_resolved: dict[str, ResolvedInstrument] = {}
+        for _m in payload.strategy_members:
+            for _ri in _m.resolved_instruments:
+                _seen_resolved.setdefault(_ri.canonical_id, _ri)
+        per_account_resolved = list(_seen_resolved.values())
+
+        config = build_per_account_trading_node_config(
+            account_id=payload.ib_account_id,
+            ibg_client_id=ibg_client_id,
+            ib_login_key="",  # PR 1: surfaced for audit symmetry only — actor ignores it
+            native_instrument_ids=list(payload.native_instrument_ids),
+            venue_dataset_map=dict(payload.venue_dataset_map),
+            canonical_to_native_bar_types=dict(payload.canonical_to_native_bar_types),
+            databento_api_key=_settings.databento_api_key,
+            ib_host=payload.ib_host,
+            ib_port=payload.ib_port,
+            deployment_slug=payload.deployment_slug,
+            strategies=per_account_strategy_configs,
+            resolved_instruments=per_account_resolved,
+        )
+
+        node = TradingNode(config=config)
+        # Databento OWNS data; IB OWNS exec only. Register BOTH factories.
+        # ``DATABENTO_CLIENT_ID`` is the module-level ``ClientId("DATABENTO")``
+        # constant; ``add_data_client_factory`` takes the bare name string.
+        node.add_data_client_factory(str(DATABENTO_CLIENT_ID), DatabentoLiveDataClientFactory)
+        node.add_exec_client_factory(IB, InteractiveBrokersLiveExecClientFactory)
+        return node
 
     # Multi-strategy path: when strategy_members is populated, build a
     # portfolio config with N strategies sharing a single exec client.

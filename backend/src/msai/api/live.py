@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from datetime import UTC, datetime
 from time import monotonic
 from typing import TYPE_CHECKING, Any
@@ -22,6 +23,12 @@ from msai.api.live_deps import get_command_bus, get_idempotency_store
 from msai.core.audit import log_audit
 from msai.core.auth import get_current_user, resolve_user_id
 from msai.core.database import get_db
+from msai.core.halt_keys import (
+    HaltCause,
+    account_halt_key,
+    fleet_halt_key,
+    halt_cause_key,
+)
 from msai.core.logging import get_logger
 from msai.models.live_deployment import LiveDeployment
 from msai.models.live_deployment_strategy import LiveDeploymentStrategy
@@ -68,6 +75,7 @@ from msai.services.live_command_bus import (
     LIVE_COMMAND_STREAM,
     LiveCommandBus,  # noqa: TC001 — FastAPI Depends resolves at runtime
 )
+from msai.services.nautilus.ibg_client_id import derive_ibg_client_id
 from msai.services.nautilus.trading_node import TradingNodeManager
 from msai.services.risk_engine import RiskEngine
 
@@ -102,9 +110,11 @@ STOP_POLL_TIMEOUT_S: float = 60.0
 path — waits for the supervisor to flip the row to ``stopped`` or
 ``failed``."""
 
-_HALT_KEY = "msai:risk:halt"
+
+_HALT_KEY = fleet_halt_key()
 """Redis key checked by ``/start`` (layer 2 of the three-layer
-idempotency model — decision #16). Set by ``/kill-all``."""
+idempotency model — decision #16). Set by ``/kill-all``. Consolidated
+into ``msai.core.halt_keys`` via PR 1 T2."""
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +129,22 @@ async def _halt_is_active(bus: LiveCommandBus) -> bool:
     is exercised without the global ``get_command_bus`` dependency.
     """
     return bool(await bus._redis.exists(_HALT_KEY))  # noqa: SLF001 — intentional
+
+
+async def _account_halt_is_active(bus: LiveCommandBus, account_id: str) -> bool:
+    """Read the account-scoped halt latch from Redis.
+
+    PR 1 T8 / Codex iter 1 P2-1 fix: the ``/drain/{account_id}``
+    endpoint sets ``account_halt_key(account_id)`` to block the
+    drained account, but ``/start-portfolio`` previously ignored that
+    key — a queued or operator-initiated start could spawn the
+    drained account immediately after a drain. This helper closes
+    the gap. Empty ``account_id`` → False (callers that don't yet
+    set ``account_id`` keep working).
+    """
+    if not account_id:
+        return False
+    return bool(await bus._redis.exists(account_halt_key(account_id)))  # noqa: SLF001
 
 
 # Idle window for the supervisor-alive check. The supervisor's
@@ -762,6 +788,21 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
             return _apply_outcome(outcome)
 
         # -------------------------------------------------------------
+        # Layer 2b: Account-scoped halt latch (PR 1 T8 / Codex iter 1 P2-1)
+        # -------------------------------------------------------------
+        # ``/drain/{account_id}`` writes ``account_halt_key(account_id)``
+        # to block the drained sub-account. Reject the start while the
+        # latch is set — operator must explicitly clear it before this
+        # account can deploy again. Other accounts under the same TWS
+        # login are unaffected (latch is keyed by account_id, not
+        # ib_login_key — council 2026-05-29 obj #11).
+        if request.account_id and await _account_halt_is_active(bus, request.account_id):
+            outcome = EndpointOutcome.account_halt_active(request.account_id)
+            if reservation is not None:
+                await idem.release(reservation.redis_key)
+            return _apply_outcome(outcome)
+
+        # -------------------------------------------------------------
         # Supervisor liveness
         # -------------------------------------------------------------
         if not await _supervisor_is_alive(bus):
@@ -1279,6 +1320,11 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
                     "strategy_path": first_strategy.file_path,
                     "config": combined_config,
                     "instruments": all_instruments,
+                    # PR 1 T6 + council 2026-05-27 obj #2 / 2026-05-29 obj #12:
+                    # carry the gateway-session key end-to-end so the
+                    # supervisor's per-session startup serialization isn't
+                    # silently degraded to global.
+                    "gateway_session_key": deployment.ib_login_key,
                 },
                 idempotency_key=idempotency_key,
             )
@@ -1380,6 +1426,17 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
         kind = FailureKind.parse_or_unknown(row.failure_kind)
         if kind is FailureKind.HALT_ACTIVE:
             outcome = EndpointOutcome.halt_active()
+            if reservation is not None:
+                await idem.release(reservation.redis_key)
+            return _apply_outcome(outcome)
+
+        if kind is FailureKind.ACCOUNT_HALT_ACTIVE:
+            # Codex iter 4 P2-1: a START that races with /drain/{account_id}
+            # and trips the supervisor's post-payload-factory account-halt
+            # re-check lands here. Without this special case, the kind would
+            # fall through to UNKNOWN and an unrelated 503 would be cached
+            # under the caller's Idempotency-Key.
+            outcome = EndpointOutcome.account_halt_active(request.account_id)
             if reservation is not None:
                 await idem.release(reservation.redis_key)
             return _apply_outcome(outcome)
@@ -1672,17 +1729,44 @@ async def live_kill_all(
     # the platform after a restart — operators must
     # explicitly POST /resume to clear it before the TTL
     # expires.
-    await bus._redis.set(_HALT_KEY, "true", ex=86400)  # noqa: SLF001 — intentional bus reuse
-    await bus._redis.set(  # noqa: SLF001
-        f"{_HALT_KEY}:set_by",
-        str(user_id) if user_id else "unknown",
-        ex=86400,
-    )
-    await bus._redis.set(  # noqa: SLF001
-        f"{_HALT_KEY}:set_at",
-        halt_set_at.isoformat(),
-        ex=86400,
-    )
+    #
+    # PR 1 T3 + decision-doc addendum 2026-05-28 halt-cause schema:
+    # write a structured cause-attribution companion key so operators
+    # (and PR 1b's data-stale auto-halt) can distinguish a manual
+    # /kill-all from an automated halt.
+    #
+    # F9 fix (Codex iter 2 P1 / silent-failure-hunter F3): batch all
+    # halt-set writes into a single Redis transaction (MULTI/EXEC) so
+    # an emergency-stop endpoint cannot leave Redis in a partial state.
+    # The prior implementation issued 5 sequential ``await SET`` calls;
+    # a connection drop mid-sequence would set the latch but skip the
+    # cause-companion (or vice-versa), leaving operators with a
+    # half-finished kill switch. With a transactional pipeline, either
+    # ALL keys are set or NONE — and any RedisError propagates as a 5xx
+    # so the operator sees the failure instead of a green response.
+    cause_payload = {
+        "reason": HaltCause.FLEET_EMERGENCY.value,
+        "detected_at": halt_set_at.isoformat(),
+        "source": str(user_id) if user_id else "operator",
+    }
+    async with bus._redis.pipeline(transaction=True) as _halt_pipe:  # noqa: SLF001
+        _halt_pipe.set(_HALT_KEY, "true", ex=86400)
+        _halt_pipe.set(
+            f"{_HALT_KEY}:set_by",
+            str(user_id) if user_id else "unknown",
+            ex=86400,
+        )
+        _halt_pipe.set(
+            f"{_HALT_KEY}:set_at",
+            halt_set_at.isoformat(),
+            ex=86400,
+        )
+        _halt_pipe.set(
+            halt_cause_key("fleet"),
+            json.dumps(cause_payload),
+            ex=86400,
+        )
+        await _halt_pipe.execute()
 
     # Layer 3: query active live_node_processes rows and
     # publish a stop command for each. Use the explicit
@@ -1851,6 +1935,305 @@ async def live_kill_all(
     )
 
 
+def _normalize_account_id_path_param(account_id: str) -> str:
+    """Strip leading/trailing whitespace + reject internal whitespace
+    or empty values on path-param account ids.
+
+    Mirror of ``PortfolioStartRequest._normalize_account_id`` (schema
+    layer). Both produce the SAME final string so the halt-latch key
+    written here and the supervisor's per-account halt-check key are
+    byte-identical. Without this, percent-encoded path whitespace like
+    ``/api/v1/live/drain/%20DUP733214%20`` slips through and the
+    supervisor reads a different Redis key than was written. Codex
+    iter 17 P2.
+    """
+    normalized = account_id.strip()
+    if not normalized:
+        raise HTTPException(status_code=422, detail="account_id is required")
+    if any(ch.isspace() for ch in normalized):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "account_id contains whitespace — IB account ids are "
+                "alphanumeric (e.g. 'DUP733214' or 'U1234567')"
+            ),
+        )
+    return normalized
+
+
+@router.post("/drain/{account_id}", response_model=None)
+async def live_drain_account(
+    account_id: str,
+    claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+    bus: LiveCommandBus = Depends(get_command_bus),  # noqa: B008
+) -> dict[str, Any] | JSONResponse:
+    """Account-scoped drain (PR 1 T8).
+
+    Per council 2026-05-29 obj #11: keyed by ``account_id`` (NOT
+    ``ib_login_key``) so two sub-accounts under the same TWS login have
+    independent halt latches. Draining ``DUP733214`` does NOT touch
+    ``DUP733215``.
+
+    Distinct from ``/kill-all``: scoped to one account, no fleet-wide
+    halt latch, halt-cause is ``HaltCause.OPERATOR_DRAIN``. Other
+    accounts under the same login keep running.
+    """
+    account_id = _normalize_account_id_path_param(account_id)
+
+    halt_set_at = datetime.now(UTC)
+    user_id = await _resolve_user_id(db, claims)
+
+    # Account-scoped halt latch (NOT the fleet key). Idempotent: setting
+    # it again on a re-drain is harmless (TTL refreshed).
+    #
+    # Codex iter 5 P2-2: batch the latch + cause-companion writes through a
+    # Redis transactional pipeline so a mid-sequence Redis error can't leave
+    # the latch active without cause metadata (mirrors the /kill-all
+    # transactional pipeline added in iter 2 F9).
+    cause_payload = {
+        "reason": HaltCause.OPERATOR_DRAIN.value,
+        "detected_at": halt_set_at.isoformat(),
+        "source": str(user_id) if user_id else "operator",
+        "account_id": account_id,
+    }
+    async with bus._redis.pipeline(transaction=True) as _drain_pipe:  # noqa: SLF001
+        _drain_pipe.set(account_halt_key(account_id), "true", ex=86400)
+        _drain_pipe.set(
+            halt_cause_key("account", account_id=account_id),
+            json.dumps(cause_payload),
+            ex=86400,
+        )
+        await _drain_pipe.execute()
+
+    # Find active deployments matching account_id and publish STOP to each.
+    active_statuses = ("starting", "building", "ready", "running")
+    rows = (
+        (
+            await db.execute(
+                select(LiveDeployment).where(
+                    LiveDeployment.account_id == account_id,
+                    LiveDeployment.status.in_(active_statuses),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # F4 fix (silent-failure-hunter F1) + Codex iter 14 P2 (PR 1):
+    # the drain STOP-publish loop must NOT swallow failures behind a
+    # 200 response AND must NOT report drain success until the
+    # supervisor has confirmed each deployment is stopped + flat.
+    # Mirror the /kill-all flatness-polling pattern: publish STOP
+    # with a flatness nonce, then parallel-poll ``stop_report:{nonce}``.
+    # Without this, ``/drain/{account_id}`` returns 200 after merely
+    # writing STOP commands to Redis — the TradingNode may still be
+    # running and positions may still be open.
+    import redis as _redis_pkg  # narrow exception clause (Codex-safe)
+
+    stopped: list[str] = []
+    failed: list[dict[str, str]] = []
+    flatness_nonces: dict[str, str] = {}  # deployment_id -> stop_nonce
+    for dep in rows:
+        try:
+            # Gather member strategy_id_fulls so the child reports
+            # deployment-scoped flatness (Bug #2 pattern from /kill-all).
+            member_rows = (
+                await db.execute(
+                    select(LiveDeploymentStrategy.strategy_id_full).where(
+                        LiveDeploymentStrategy.deployment_id == dep.id
+                    )
+                )
+            ).all()
+            members = [r.strategy_id_full for r in member_rows]
+            nonce, _ = await coalesce_or_publish_stop_with_flatness(
+                redis=bus._redis,  # noqa: SLF001
+                bus=bus,
+                deployment_id=dep.id,
+                member_strategy_id_fulls=members,
+                reason="operator_drain",
+            )
+            flatness_nonces[str(dep.id)] = nonce
+            stopped.append(str(dep.id))
+        except (_redis_pkg.RedisError, ConnectionError, TimeoutError) as exc:
+            # Narrow exception clause: redis-py exceptions (RedisError covers
+            # ConnectionError/ResponseError/TimeoutError from redis>=4.6) +
+            # the asyncio TimeoutError surface. Anything else propagates as
+            # a 500 — that's an unexpected bug, not a "partial-stop"
+            # operator-actionable failure mode.
+            log.exception(
+                "drain_publish_stop_failed",
+                extra={"deployment_id": str(dep.id), "account_id": account_id},
+            )
+            failed.append({"deployment_id": str(dep.id), "error": str(exc)})
+
+    # Parallel-poll flatness reports for every deployment we successfully
+    # published STOP for. 35s deadline matches /kill-all (XAUTOCLAIM idle
+    # window + 5s buffer). If the supervisor doesn't write a report in
+    # that window we surface ``broker_flat=None`` so the operator sees
+    # the unknown-state truth instead of a misleading 200.
+    flatness_results: dict[str, dict[str, Any] | None] = {}
+    if flatness_nonces:
+
+        async def _poll_one(dep_id: str, nce: str) -> tuple[str, dict[str, Any] | None]:
+            return dep_id, await poll_stop_report(
+                redis=bus._redis,  # noqa: SLF001
+                stop_nonce=nce,
+                deadline_s=35.0,
+            )
+
+        results = await asyncio.gather(*(_poll_one(d, n) for d, n in flatness_nonces.items()))
+        flatness_results = dict(results)
+        for dep_id, report in flatness_results.items():
+            if report is not None:
+                with contextlib.suppress(Exception):
+                    await bus._redis.delete(f"inflight_stop:{dep_id}")  # noqa: SLF001
+
+    # Codex iter 18 P2: a flat stop_report alone is INSUFFICIENT — the
+    # child could write the report and then hang in dispose() before
+    # the terminal LiveDeployment.status / live_node_processes terminal
+    # update lands. ``/stop`` already mirrors this guard (live.py:1582).
+    # For each successfully-stopped deployment, poll the row to a
+    # terminal status BEFORE counting it toward drain success. If the
+    # poll times out, the deployment is tracked as ``any_non_flat`` so
+    # the operator sees the 207 even on a clean flatness report.
+    terminal_results: dict[str, bool] = {}
+    if flatness_nonces:
+
+        async def _poll_terminal_one(dep_uuid: UUID) -> tuple[str, bool]:
+            row = await _poll_for_terminal(
+                db,
+                dep_uuid,
+                ready_statuses=frozenset(),
+                terminal_statuses=frozenset({"stopped", "failed"}),
+                timeout_s=STOP_POLL_TIMEOUT_S,
+                interval_s=START_POLL_INTERVAL_S,
+            )
+            return str(dep_uuid), row is not None
+
+        # Per-deployment poll. Sequential (not parallel) because the
+        # helper rolls back the shared session between iterations —
+        # gathering it would race on the AsyncSession.
+        for dep_uuid_str in flatness_nonces:
+            dep_uuid_str, terminal_seen = await _poll_terminal_one(UUID(dep_uuid_str))
+            terminal_results[dep_uuid_str] = terminal_seen
+
+        # Codex iter 20 P2: ``_poll_for_terminal`` only confirms the
+        # ``live_node_processes`` row reached a terminal status. ``/stop``
+        # also updates the parent ``LiveDeployment.status='stopped'`` so
+        # ``/status`` reflects the drained state. Mirror that here for
+        # every confirmed-terminal deployment so ``/api/v1/live/status``
+        # doesn't keep showing drained accounts as ``running`` even
+        # though the subprocess has exited.
+        terminal_now = datetime.now(UTC)
+        synced_any = False
+        for dep_uuid_str, terminal_seen in terminal_results.items():
+            if not terminal_seen:
+                continue
+            dep_row = await db.get(LiveDeployment, UUID(dep_uuid_str))
+            if dep_row is not None and dep_row.status not in ("stopped", "failed"):
+                dep_row.status = "stopped"
+                dep_row.last_stopped_at = terminal_now
+                synced_any = True
+        if synced_any:
+            await db.commit()
+
+    def _drain_summary(dep_id: str) -> dict[str, Any]:
+        report = flatness_results.get(dep_id)
+        return {
+            "deployment_id": dep_id,
+            "stop_nonce": flatness_nonces[dep_id],
+            "broker_flat": report["broker_flat"] if report else None,
+            "remaining_positions": report["remaining_positions"] if report else [],
+            "terminal_confirmed": terminal_results.get(dep_id, False),
+        }
+
+    flatness_summary = [_drain_summary(dep_id) for dep_id in flatness_nonces]
+    any_non_flat = any(
+        f["broker_flat"] is False or f["broker_flat"] is None or not f["terminal_confirmed"]
+        for f in flatness_summary
+    )
+
+    log.info(
+        "live_drain_account",
+        extra={
+            "account_id": account_id,
+            "stopped_count": len(stopped),
+            "failed_count": len(failed),
+            "any_non_flat": any_non_flat,
+            "user_id": str(user_id) if user_id else None,
+        },
+    )
+
+    body: dict[str, Any] = {
+        "account_id": account_id,
+        "stopped": stopped,
+        "failed": failed,
+        "flatness_reports": flatness_summary,
+        "any_non_flat": any_non_flat,
+        "halt_cause": HaltCause.OPERATOR_DRAIN.value,
+    }
+
+    if failed and not stopped:
+        # Total publish failure — surface as 503 with a structured error
+        # envelope. The halt latch IS set (the early Redis SET is the
+        # authoritative drain marker), so /start for this account_id will
+        # still be blocked at the API layer; the 503 tells the operator
+        # the running deployments need manual attention.
+        return JSONResponse(
+            status_code=503,
+            content={
+                **body,
+                "error": {
+                    "code": "DRAIN_PARTIAL_FAILURE",
+                    "message": (
+                        f"Failed to publish STOP to {len(failed)} deployment(s) "
+                        f"for account_id={account_id}. None were stopped. Halt "
+                        "latch IS set; running deployments need manual attention."
+                    ),
+                },
+            },
+        )
+    if failed:
+        # Partial failure — 207 Multi-Status. Both arrays populated.
+        return JSONResponse(
+            status_code=207,
+            content={
+                **body,
+                "error": {
+                    "code": "DRAIN_PARTIAL_FAILURE",
+                    "message": (
+                        f"Partial drain for account_id={account_id}: "
+                        f"{len(stopped)} stopped, {len(failed)} failed. "
+                        "Halt latch IS set."
+                    ),
+                },
+            },
+        )
+    if any_non_flat:
+        # Codex iter 14 P2: STOP commands published successfully BUT the
+        # supervisor either didn't report flatness within 35s or reported
+        # remaining positions. The drain is NOT complete — surface 207
+        # so operators see the unknown-state truth instead of a green
+        # 200 that masks unflattened positions.
+        return JSONResponse(
+            status_code=207,
+            content={
+                **body,
+                "error": {
+                    "code": "DRAIN_INCOMPLETE_FLATNESS",
+                    "message": (
+                        f"STOP commands published for {len(stopped)} deployment(s) "
+                        f"on account_id={account_id}, but flatness reports show "
+                        "remaining positions or did not arrive within the deadline. "
+                        "Verify in the IB portal; halt latch IS set."
+                    ),
+                },
+            },
+        )
+    return body
+
+
 @router.post("/resume")
 async def live_resume(
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
@@ -1878,6 +2261,10 @@ async def live_resume(
     deleted = await bus._redis.delete(_HALT_KEY)  # noqa: SLF001
     await bus._redis.delete(f"{_HALT_KEY}:set_by")  # noqa: SLF001
     await bus._redis.delete(f"{_HALT_KEY}:set_at")  # noqa: SLF001
+    # Codex iter 5 P2-1: clear the halt-cause companion key written by
+    # /kill-all so post-resume readers don't see stale fleet_emergency
+    # metadata while starts are re-enabled.
+    await bus._redis.delete(halt_cause_key("fleet"))  # noqa: SLF001
 
     # PR #65 Codex P2 round-4: clear all `stop_unknown:*` markers on
     # /resume. After the operator has verified IB-portal positions
@@ -1906,6 +2293,56 @@ async def live_resume(
     log.warning("kill_switch_resumed", resumed_by=str(user_id))
 
     return LiveResumeResponse(resumed=True)
+
+
+@router.post("/resume/{account_id}", response_model=None)
+async def live_resume_account(
+    account_id: str,
+    claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+    bus: LiveCommandBus = Depends(get_command_bus),  # noqa: B008
+) -> dict[str, Any]:
+    """Clear the account-scoped halt latch (Codex iter 6 P1-2).
+
+    Mirror of ``/resume`` (which clears the fleet-wide halt) but scoped
+    to a single account. Without this endpoint, ``/drain/{account_id}``
+    sets a 24h halt latch and the operator has no API to undo it short
+    of waiting for TTL or editing Redis by hand.
+
+    Idempotent: returns ``resumed=True`` whether or not the latch was
+    actually set. Audit log captures whether the latch existed.
+    """
+    account_id = _normalize_account_id_path_param(account_id)
+
+    user_id = await _resolve_user_id(db, claims)
+
+    # Batch the latch + cause-companion deletes through a transactional
+    # pipeline so a mid-sequence Redis error can't leave one without the
+    # other (mirrors the /kill-all + /drain pipeline pattern).
+    async with bus._redis.pipeline(transaction=True) as _resume_pipe:  # noqa: SLF001
+        _resume_pipe.delete(account_halt_key(account_id))
+        _resume_pipe.delete(halt_cause_key("account", account_id=account_id))
+        results = await _resume_pipe.execute()
+    deleted_count = sum(int(r) for r in results if isinstance(r, int))
+
+    await log_audit(
+        db,
+        user_id=user_id,
+        action="live_resume_account",
+        resource_type="live_deployment",
+        details={"account_id": account_id, "keys_deleted": deleted_count},
+    )
+
+    log.warning(
+        "account_halt_resumed",
+        extra={
+            "account_id": account_id,
+            "resumed_by": str(user_id) if user_id else "operator",
+            "keys_deleted": deleted_count,
+        },
+    )
+
+    return {"resumed": True, "account_id": account_id, "keys_deleted": deleted_count}
 
 
 @router.get("/status")
@@ -1975,6 +2412,12 @@ async def live_status(
             # API contract is preserved.
             started_at=d.last_started_at,
             stopped_at=d.last_stopped_at,
+            # PR 1 T14 — account context for the fleet topology.
+            # ``ibg_client_id`` is deterministically re-derived from the
+            # deployment_slug via the shared helper (no DB column needed).
+            account_id=d.account_id,
+            ib_login_key=d.ib_login_key,
+            ibg_client_id=(derive_ibg_client_id(d.deployment_slug) if d.deployment_slug else None),
         )
         for d in deployments
     ]

@@ -49,6 +49,15 @@ class FailureKind(StrEnum):
     flipped to ``failed`` with this kind; the caller ACKs the command
     (no retry until ``/api/v1/live/resume`` clears the flag)."""
 
+    ACCOUNT_HALT_ACTIVE = "account_halt_active"
+    """The account-scoped halt latch ``msai:risk:halt:account:{account_id}``
+    was set when ``ProcessManager.spawn`` re-checked it in phase B
+    (PR 1 T8 / Codex iter 1 P2-1). Set by ``/api/v1/live/drain/{account_id}``
+    and cleared independently of the fleet latch — other accounts
+    under the same TWS login keep running. The row is flipped to
+    ``failed`` with this kind; the caller ACKs the command (no retry
+    until the drain latch is explicitly cleared)."""
+
     SPAWN_FAILED_PERMANENT = "spawn_failed_permanent"
     """The subprocess either failed to start (``mp.Process.start()`` raised),
     died before writing a more specific ``failure_kind`` in its own

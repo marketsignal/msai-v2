@@ -54,6 +54,35 @@ class TestHaltActiveFactory:
         assert "kill switch" in outcome.response["detail"].lower()
 
 
+class TestAccountHaltActiveFactory:
+    def test_account_halt_active_is_503_not_cacheable(self) -> None:
+        outcome = EndpointOutcome.account_halt_active("DUP733214")
+        assert outcome.status_code == 503
+        assert outcome.cacheable is False
+        # F1 regression: this MUST be ACCOUNT_HALT_ACTIVE, NOT the
+        # fleet-wide HALT_ACTIVE. The new enum value was added in PR 1 T8
+        # specifically for this factory; using HALT_ACTIVE here would
+        # collapse the account-scoped /drain back into the fleet halt
+        # classification (Codex iter 2 P1 / pr-toolkit convergent
+        # finding).
+        assert outcome.failure_kind == FailureKind.ACCOUNT_HALT_ACTIVE
+        # account_id must propagate into the response envelope so
+        # operators can correlate the 503 to the drain target.
+        assert outcome.response["error"]["code"] == "ACCOUNT_HALT_ACTIVE"
+        assert outcome.response["error"]["account_id"] == "DUP733214"
+
+    def test_account_halt_and_fleet_halt_have_distinct_failure_kinds(self) -> None:
+        """F1 regression: the two halt factories MUST produce distinct
+        failure_kind values so downstream classification + observability
+        can distinguish manual ``/kill-all`` from ``/drain/{account_id}``.
+        """
+        fleet = EndpointOutcome.halt_active()
+        account = EndpointOutcome.account_halt_active("DUP733214")
+        assert fleet.failure_kind != account.failure_kind
+        assert fleet.failure_kind == FailureKind.HALT_ACTIVE
+        assert account.failure_kind == FailureKind.ACCOUNT_HALT_ACTIVE
+
+
 class TestInFlightFactory:
     def test_in_flight_is_425_not_cacheable(self) -> None:
         outcome = EndpointOutcome.in_flight()

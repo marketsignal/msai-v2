@@ -133,6 +133,32 @@ class EndpointOutcome:
         )
 
     @classmethod
+    def account_halt_active(cls, account_id: str) -> EndpointOutcome:
+        """An account-scoped drain latch is set for ``account_id``.
+
+        Distinct from :meth:`halt_active` (the fleet-wide
+        ``/kill-all`` latch). Set by ``/api/v1/live/drain/{account_id}``
+        in PR 1 T8 and cleared independently — other accounts under
+        the same TWS login keep running. HTTP 503, **not cacheable**.
+        """
+        return cls(
+            status_code=503,
+            response={
+                "detail": (
+                    f"Account {account_id} is drained. "
+                    f"Clear the latch (msai:risk:halt:account:{account_id}) "
+                    "to re-enable starts."
+                ),
+                "error": {
+                    "code": "ACCOUNT_HALT_ACTIVE",
+                    "account_id": account_id,
+                },
+            },
+            cacheable=False,
+            failure_kind=FailureKind.ACCOUNT_HALT_ACTIVE,
+        )
+
+    @classmethod
     def in_flight(cls) -> EndpointOutcome:
         """Another request with the same Idempotency-Key is currently
         holding the reservation. HTTP 425 Too Early, not cacheable."""

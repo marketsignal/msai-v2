@@ -78,6 +78,20 @@ LIVE_COMMAND_DLQ_STREAM = "msai:live:commands:dlq"
 original payload plus ``original_entry_id`` / ``delivery_count`` /
 ``dlq_reason`` / ``moved_at`` diagnostic fields."""
 
+
+def command_stream_for_account(account_id: str | None) -> str:
+    """Return the per-account Redis stream name (PR 1 T7).
+
+    Used by producers/consumers that want to namespace commands by
+    ``account_id``. PR 1 only adds the helper; producer/consumer adoption
+    is deferred to PR 2 (per-account supervisor ownership). Existing
+    callers continue using the global :data:`LIVE_COMMAND_STREAM`.
+    """
+    if not account_id:
+        return LIVE_COMMAND_STREAM
+    return f"{LIVE_COMMAND_STREAM}:{account_id}"
+
+
 MAX_DELIVERY_ATTEMPTS = 5
 """Delivery-count ceiling. After the 5th XAUTOCLAIM the entry is
 considered a poison message and moved to the DLQ. Tuned conservatively

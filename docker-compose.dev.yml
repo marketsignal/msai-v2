@@ -112,6 +112,10 @@ services:
       IB_DATA_CLIENT_ID: 101
       IB_EXEC_CLIENT_ID: 102
       IB_MARKET_DATA_TYPE: ${IB_MARKET_DATA_TYPE:-REALTIME}
+      # PR 1 T15 + council 2026-05-29 obj #13: backend lifespan instantiates
+      # GatewayRouter, which fail-closes on misconfigured GATEWAY_CONFIG.
+      # Without this env, the fail-closed boot check is dead in the backend.
+      GATEWAY_CONFIG: ${GATEWAY_CONFIG:-}
     depends_on:
       <<: *worker-depends
     healthcheck:

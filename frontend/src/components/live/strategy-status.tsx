@@ -154,6 +154,9 @@ export function StrategyStatus({
             <TableHeader>
               <TableRow className="border-border/50 hover:bg-transparent">
                 <TableHead>Strategy</TableHead>
+                <TableHead>Account</TableHead>
+                <TableHead>Login</TableHead>
+                <TableHead className="text-right">Client ID</TableHead>
                 <TableHead>Instruments</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Start Time</TableHead>
@@ -170,11 +173,38 @@ export function StrategyStatus({
                     `${dep.strategy_id.slice(0, 8)}…`)
                   : "—";
                 return (
-                  <TableRow key={dep.id} className="border-border/50">
+                  <TableRow
+                    key={dep.id}
+                    data-testid={`dep-row-${dep.id}`}
+                    className="border-border/50"
+                  >
                     <TableCell className="font-medium">
                       <span title={dep.strategy_id ?? "no strategy_id"}>
                         {strategyName}
                       </span>
+                    </TableCell>
+                    {/* PR 1 T14 — account context for the fleet topology.
+                        data-testid hooks (Codex iter-23 verify-e2e
+                        recommendation) give Phase 6.2c spec generation
+                        deterministic selectors that don't drift on
+                        column reordering. */}
+                    <TableCell
+                      data-testid={`dep-account-${dep.id}`}
+                      className="font-mono text-xs"
+                    >
+                      {dep.account_id ?? "—"}
+                    </TableCell>
+                    <TableCell
+                      data-testid={`dep-login-${dep.id}`}
+                      className="font-mono text-xs"
+                    >
+                      {dep.ib_login_key ?? "—"}
+                    </TableCell>
+                    <TableCell
+                      data-testid={`dep-ibg-client-${dep.id}`}
+                      className="text-right font-mono text-xs"
+                    >
+                      {dep.ibg_client_id ?? "—"}
                     </TableCell>
                     <TableCell>
                       <div className="flex flex-wrap gap-1">

@@ -169,6 +169,10 @@ services:
       IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:?Set IB_ACCOUNT_ID in .env}
       IB_MARKET_DATA_TYPE: ${IB_MARKET_DATA_TYPE:-REALTIME}
       IB_USE_REGULAR_TRADING_HOURS: ${IB_USE_REGULAR_TRADING_HOURS:-false}
+      # PR 1 T15 + Codex iter 6 P2-3: backend lifespan instantiates
+      # GatewayRouter on boot; production needs the same fail-closed
+      # validation as dev (the dev-only update in iter 2 left this gap).
+      GATEWAY_CONFIG: ${GATEWAY_CONFIG:-}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -374,12 +378,32 @@ services:
       IB_ACCOUNT_ID: ${IB_ACCOUNT_ID:?Set IB_ACCOUNT_ID in .env}
       IB_MARKET_DATA_TYPE: ${IB_MARKET_DATA_TYPE:-REALTIME}
       IB_USE_REGULAR_TRADING_HOURS: ${IB_USE_REGULAR_TRADING_HOURS:-false}
+      # PR 1 T15 + Codex iter 6 P2-3: live-supervisor reads GATEWAY_CONFIG
+      # to route per-account TradingNode spawns to the right IB Gateway.
+      # ``:-`` permissive (NOT ``:?``) because docker-compose interpolates
+      # ALL service envs BEFORE applying profiles — making this required
+      # would break ``docker compose config / up`` for the default
+      # (non-broker) profile too. Fail-fast moves to two runtime gates:
+      #   (a) supervisor ``_async_main`` startup check emits a clear
+      #       warning if the broker profile is active without GATEWAY_CONFIG;
+      #   (b) the iter-7 fail-closed branch in ``_build_production_payload_factory``
+      #       raises ``ValueError`` per-deployment when ``ib_login_key`` is
+      #       set but no router is configured.
+      GATEWAY_CONFIG: ${GATEWAY_CONFIG:-}
       # Force-present so compose fails fast if the operator left
       # ib-gateway's credentials out of .env — otherwise the
       # gateway would crash-loop and live-supervisor would wait
       # forever on the health dependency.
       TWS_USERID: ${TWS_USERID:?Set TWS_USERID in .env}
       TWS_PASSWORD: ${TWS_PASSWORD:?Set TWS_PASSWORD in .env}
+      # PR 1 + Codex iter 7 P1: per-account TradingNode subprocesses
+      # build their Databento live data client from
+      # ``settings.databento_api_key``. ``:-`` permissive — see the
+      # GATEWAY_CONFIG comment above for why compose-level ``:?`` was
+      # reverted (it breaks default-profile interpolation). Fail-fast
+      # moved to the supervisor's startup warning + the per-account
+      # TradingNode's Databento client construction.
+      DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
     depends_on:
       migrate:
         condition: service_completed_successfully

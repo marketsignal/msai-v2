@@ -73,6 +73,11 @@ async def handle_command(command: LiveCommand, *, process_manager: ProcessManage
             deployment_slug=command.payload.get("deployment_slug", ""),
             payload=command.payload,
             idempotency_key=command.idempotency_key,
+            # PR 1 T6 + council 2026-05-27 obj #2 / 2026-05-29 obj #12: pass
+            # the gateway-session key from the START payload so per-session
+            # startup serialization in ProcessManager isn't silently degraded
+            # to global ("default") via the DB-row fallback.
+            gateway_session_key=command.payload.get("gateway_session_key"),
         )
     if command.command_type is LiveCommandType.STOP:
         return await process_manager.stop(

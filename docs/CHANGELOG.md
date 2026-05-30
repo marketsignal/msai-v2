@@ -4,6 +4,47 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-05-29..2026-05-30 — multi-account broker fleet PR 1 (`feat/multi-account-broker-fleet`)
+
+**Status:** Phase 5 quality gates COMPLETE. Phase 6 commit pending operator drill (S1-S4 spike + 7-step multi-account paper drill — see `tests/e2e/reports/2026-05-30-multi-account-broker-fleet-pr1.md`). Branch carries council-ratified Shape A architecture (ONE `ib-gateway` + TWO TradingNodes via distinct `ibg_client_id` + `account_id` on `marin1016test` sub-accounts DUP733214/DUP733215). Council provenance: 2026-05-27 verdict + 2026-05-28 Databento-data/IB-exec addendum + 2026-05-29 Shape-A addendum with Hawk minority preserved as pre-LVP/HVP graduation gate.
+
+**Quality-gate trajectory:**
+
+- **Plan-review loop:** 9 iterations → PASS at iter 9 (plan_sha `de4c2433…`).
+- **Code-review loop:** 23 iterations → PASS at iter 23 (BOTH Codex AND pr-review-toolkit clean on same head `d96314f1…`). 22 iterations produced REAL P1+P2 findings on routing / halt-latch / symbology / drain endpoints. Productive convergence per `feedback_codex_review_loop_23_iter_trajectory.md`.
+- **Simplified:** 3 high-value cleanups by code-simplifier agent; 5 candidates considered+rejected because they earned their complexity.
+- **Verified:** verify-app gate — 2802 tests pass / 11 skipped / 17 xfailed; ruff clean; mypy --strict clean on the PR-1 surface (one Actor subclass-Any nit resolved with targeted `# type: ignore[misc]`).
+- **E2E:** verify-e2e PARTIAL — Negative UC + UC4 (CLI) PASS; UC5 FAIL_STALE fixed in-place; UC1/UC2/UC3 OPERATOR_REQUIRED (broker compose profile + IB credentials + S1-S4 spike). Side-effects of UC1/UC2/UC3 (halt-cause companion-key writes, account-scoped halt isolation) WERE verified via Redis probes.
+
+**Tasks shipped (15 of 15):**
+
+- **T1-T2** — `core/halt_keys.py` with `fleet_halt_key()`, `account_halt_key(account_id)`, `halt_cause_key()` + `HaltCause` enum; single source of truth replaces three `_HALT_KEY` definitions.
+- **T3** — `/api/v1/live/kill-all` writes halt-cause companion key (`reason=fleet_emergency`).
+- **T4** — `GatewayRouter` accepts pipe-separated `accounts=A|B|...` segment + fail-closed on duplicate `ib_login_key` AND duplicate `(host, port)` AND malformed/empty segments AND empty `accounts=` lists.
+- **T5** — FastAPI lifespan + supervisor `_async_main` instantiate `GatewayRouter` on boot; misconfigured `GATEWAY_CONFIG` exits non-zero within 10s.
+- **T6** — `gateway_session_key` end-to-end from `/start-portfolio` → `handle_command` → `ProcessManager.spawn`.
+- **T7** — `command_stream_for_account(account_id)` helper.
+- **T8** — `/api/v1/live/drain/{account_id}` with account-scoped halt latch + cause-companion key + flatness poll + terminal-state poll + `LiveDeployment.status='stopped'` sync. Mirrors `/kill-all`'s pattern. Returns 207 `DRAIN_INCOMPLETE_FLATNESS` when supervisor doesn't reach terminal state. `/resume/{account_id}` clears the account-scoped halt.
+- **T9** — Bidirectional symbology shim: `resolve_for_databento` (canonical `.IBKR` → Databento native `(dataset, symbol, venue)` triple); `retag_inbound_bar` (audit-metadata sink). Asset-class pinning to EQUITY on AmbiguousRegistryError; dotted-canonical retry on RegistryMiss (aliased symbols GOOG/GOOGL); `UnsupportedListingVenueError` (subclasses ValueError → `SPAWN_FAILED_PERMANENT`) for unmapped equity venues.
+- **T10** — `databento_live_config.build_databento_data_client_config(...)` + async `resolve_databento_targets(...)` split builder.
+- **T11** — `SymbologyShimActor` (Nautilus `Actor` subclass): `on_start` subscribes native bar types; `on_bar` rebuilds canonical Bar from configured `bar_type` (handles aliased symbols correctly) + preserves `is_revision` flag for Databento corrections.
+- **T11 (cont'd)** — `build_per_account_trading_node_config` SYNC builder with `IB_VENUE.value` exec_clients key, `DATABENTO_CLIENT_ID` data_clients key, `SymbologyShimActor` registered via `ImportableActorConfig`; bar_type rewrite to `.IBKR` using `rpartition('.')` for BRK.B-style symbols.
+- **T12** — `TradingNodePayload` extended with `ibg_client_id`, `native_instrument_ids`, `venue_dataset_map`, `canonical_to_native_bar_types`; `use_per_account_topology` predicate routes subprocess between legacy and per-account builders.
+- **T12 (cont'd)** — Supervisor `_build_production_payload_factory`: `is_routed` predicate (excludes None, "", "default" migration sentinel); `accounts_for(login_key)` binding enforcement; `(NotImplementedError, LiveResolverError)` fallback to legacy builder for non-equity members; supervisor startup warnings on missing `GATEWAY_CONFIG` / `DATABENTO_API_KEY`.
+- **T13** — Synthetic multi-login test for GatewayRouter (covers binding enforcement, duplicate-rejection, malformed-segment fail-closed).
+- **T14** — `/live/status` + `msai live status` CLI + `frontend/src/components/live/strategy-status.tsx` all carry `account_id`, `ib_login_key`, `ibg_client_id`. Plus `data-testid` attributes on the new cells (Phase 6.2c spec-generation enabler).
+- **T15** — `docker-compose.dev.yml` + `docker-compose.prod.yml` backend + live-supervisor both receive `GATEWAY_CONFIG`; prod live-supervisor also receives `DATABENTO_API_KEY`. `.env.example` documents the new grammar.
+
+**Tests:** ~28 PR-1-specific tests across 13 new test modules; 2802 total tests pass (2299 unit + integration). Ruff clean on touched files; mypy --strict clean on the PR-1 surface (entire repo has pre-existing legacy debt, not introduced by this PR).
+
+**Process-manager defensiveness:** account-halt lookup wrapped in try/except → `SPAWN_FAILED_TRANSIENT` on Redis/DB blip; `_mark_failed` cleanup itself wrapped in best-effort try/except so paired failures don't leak the row (iter-10/11 P2). Pre-payload + post-payload account-halt re-check (TOCTOU window).
+
+**Process-manager error classifier confirmed:** `(ValueError, ImportError, ModuleNotFoundError, FileNotFoundError, AttributeError)` are PERMANENT; everything else is TRANSIENT (XAUTOCLAIM redelivery). `UnsupportedListingVenueError(ValueError)` lands in permanent so unmapped equity venues fail loud (iter-19 P2).
+
+**Files touched:** ~25 source files + ~13 new test modules + plan/decision/research docs + 3 compose+env files + 2 frontend files. Plan: `docs/plans/2026-05-29-multi-account-broker-fleet-pr1.md`. Council decisions: `docs/decisions/multi-account-broker-fleet.md`.
+
+**Next step (operator):** Run S1-S4 verification spike (`scripts/spike_ib_orders_without_data.py` — place one paper order on DUP733213 via IB Gateway exec-only). If PASS, run the 7-step multi-account drill from the plan's §Drill section against DUP733214+DUP733215. Then PR creation.
+
 ### 2026-05-26 — Fix: smoke passed green while AAPL produced 0 trades (`fix/smoke-aapl-zero-trades`)
 
 **Symptom:** the prod operational smoke (PR #80) returned `status=completed` while `smoke_market_order/AAPL=0` (SPY=440 masked it). `smoke_market_order` is designed to fire exactly 1 order per instrument, so AAPL=0 meant AAPL received zero bars — yet the smoke went green.

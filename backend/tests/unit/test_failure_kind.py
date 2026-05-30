@@ -12,6 +12,7 @@ class TestFailureKindValues:
         expected = {
             "none",
             "halt_active",
+            "account_halt_active",
             "spawn_failed_permanent",
             "spawn_failed_transient",
             "build_timeout",

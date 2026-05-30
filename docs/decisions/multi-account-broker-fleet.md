@@ -152,10 +152,8 @@ PR 1's deliverable is unchanged at the operator-visible level (2-account paper d
 
 **Decided: split PR 1 into PR 1 + PR 1b** (Pablo, 2026-05-28, accepting Codex P2 #6). The council's original PR 1 already had gateway topology + routing propagation + `LiveCommandBus` namespacing + halt split + drain/restart + paper drill; adding Databento wiring + symbology shim + per-node data-stale halt + multi-failure-mode test harness materially raises review risk, so split:
 
-- **PR 1 — split topology proof.** 2nd IB Gateway exec-only, `gateway_session_key` propagation, `LiveCommandBus` namespacing, halt split (account-scoped + explicit fleet emergency), drain/restart, Databento data client wired, symbology shim, paper drill green end-to-end (deploy to A + B, paper order each, drain one, emergency-halt).
+- **PR 1 — shared-login paper sub-account drill (control-plane proof).** ONE `ib-gateway` container under `marin1016test` paper login + TWO TradingNodes with distinct `ibg_client_id`s, account-scoped via `InteractiveBrokersExecClientConfig.account_id="DUP733214"|"DUP733215"`. `gateway_session_key` propagation, `LiveCommandBus` namespacing, halt split (account-scoped + explicit fleet emergency), drain/restart, Databento data client wired, symbology shim, paper drill green end-to-end (deploy to A + B, paper order each, drain one, emergency-halt). See 2026-05-29 council addendum below for the topology shape ratification + minority report.
 - **PR 1b — data-stale safety.** Per-node freshness observability + data-stale auto-halt + multi-failure-mode test harness (disconnect, stale-timestamp, partial-dataset stall, single-symbol stall, reconnect storm). Does NOT block PR 1 merge or the paper drill, but **blocks any real-money N-account graduation** (i.e., LVP/HVP) — blocking objection #9 binds at the graduation gate, not at PR 1 merge.
-
-PRs 2–6 are unchanged.
 
 PRs 2–6 are unchanged.
 
@@ -163,10 +161,63 @@ PRs 2–6 are unchanged.
 
 - ~~Second KV TWS secret pair~~ — **still required for the LVP/HVP graduation drill** (PR 1's paper drill uses `marin1016test` sub-accounts under one TWS login, so two-secret provisioning is deferred to the LVP/HVP step).
 - ~~Per-username IB market-data entitlement, CME funded-master gate~~ — **eliminated for data purposes.** IB market-data subscriptions are no longer fleet prerequisites. (Still relevant for execution-side margin & order acceptance.)
-- Second compose gateway service + volume + socat ports — **still required** for PR 1 (two IB Gateway containers, both exec-only).
+- ~~Second compose gateway service + volume + socat ports~~ — **NOT required for PR 1** (superseded by 2026-05-29 council addendum: PR 1 is a shared-login paper sub-account drill). Still required at LVP/HVP graduation — distinct TWS logins force distinct containers.
 - **NEW:** Databento live subscription covering the symbols the drill trades (equities first per the council's "stocks/FX paper-drill" framing). Confirm subscription status before PR 1.
 - **DEFERRED (Codex P2 #9):** OPRA real-time chain-load + throttle behavior is explicitly out of scope for PR 1 / 1b (equities-first). A separate OPRA capacity spike is required before options live trading.
 
 ### Provenance
 
 Pablo + agent, 2026-05-28. Verification of Nautilus adapter availability done in-session against `backend/.venv/lib/python3.12/site-packages/nautilus_trader/adapters/databento/`. Codex review pass complete (gpt-5.5, xhigh) — 0 P0, 5 P1 applied inline (per-node detection vs fleet-wide action; session-aware freshness vs raw 30s; halt-cause metadata + recovery gates; bidirectional dataset-aware symbology shim; expanded failure modes in objection 9), 4 P2 applied or resolved (audit-metadata preservation, labeled observability, PR 1 split into PR 1 + PR 1b, OPRA deferred to post-equities).
+
+---
+
+## Addendum 2026-05-29 — PR 1 topology under the one-TWS-login constraint
+
+- **Status:** Accepted (Engineering Council verdict, 2026-05-29, CONDITIONAL APPROVE).
+- **Council:** 5 advisors (Simplifier, Scalability Hawk, Pragmatist — Claude; Contrarian, Maintainer — Codex gpt-5.5 high) + Codex chairman (gpt-5.5, xhigh). Tally: 2 APPROVE, 2 CONDITIONAL, 1 OBJECT. Verdict: CONDITIONAL APPROVE Shape A with explicit scope-of-proof boundary and a hard pre-LVP/HVP graduation gate.
+- **Trigger:** `research-first` brief at [`docs/research/2026-05-28-multi-account-broker-fleet.md`](../research/2026-05-28-multi-account-broker-fleet.md) Risk #1 surfaced that the PRD's "two IB Gateway containers" topology is mechanically incompatible with the addendum-2026-05-28's "one TWS login (`marin1016test`)" prerequisite — IB allows one session per username; two containers with the same login fight via `EXISTING_SESSION_DETECTED_ACTION=primary`.
+
+### Decision
+
+**Shape A — ONE `ib-gateway` container + TWO TradingNodes.** PR 1 uses one paper IB Gateway container under `marin1016test`, with two TradingNodes connected via distinct `ibg_client_id`s (Nautilus gotcha #3). Per-account routing happens via `InteractiveBrokersExecClientConfig.account_id="DUP733214"` vs `"DUP733215"` on `placeOrder`.
+
+PR 1 is renamed in the slicing section to **"shared-login paper sub-account drill"** to make the scope-of-proof boundary explicit. PR 1 proves the control-plane: account-scoped TradingNode lifecycle, `gateway_session_key` propagation, `LiveCommandBus` namespacing, halt split, drain/restart, Databento+IB-exec wiring, bidirectional symbology shim. PR 1 does NOT prove independent IB Gateway container failure domains — that property is bound to the pre-LVP/HVP graduation gate below.
+
+### Hard pre-LVP/HVP graduation gate (institutionalized minority report)
+
+The Scalability Hawk objected: Shape A hides the highest-risk production failure mode — gateway-as-blast-radius (one IB Gateway OOM / crash / 2FA prompt / relogin issue / volume-misconfig affecting both accounts). The chairman overruled for PR 1 because Shape B is mechanically blocked, but **did not dismiss** the objection. It is preserved here as a load-bearing gate.
+
+**Before any real-money N-account deployment** (LVP/HVP graduation drill), the following MUST be proven:
+
+1. Two distinct TWS logins active concurrently (`marin1016test` + a second login — likely `mslvp000` for the live test path).
+2. Two `ib-gateway` containers running side-by-side, each with its own `TWS_USERID`/`TWS_PASSWORD`, distinct `GATEWAY_CONFIG` entries, distinct volumes (`tws_settings`), distinct host ports + socat proxies.
+3. Independent drain/restart per container — drain account A's gateway without touching account B's gateway.
+4. Crash isolation: kill one container mid-flight; confirm the other continues to receive orders and reconcile correctly.
+5. Per-container 2FA / relogin behavior verified.
+
+Until those five conditions are demonstrated in a documented drill, **no real-money fleet deployment is authorized.** This is the operationalized form of the Hawk's OBJECT.
+
+### Blocking objections from the 2026-05-29 council (must clear before PR 1 ships)
+
+10. **PRD/addendum language amendment.** The PRD and operator-prereqs list must NOT claim "two IB Gateway containers" or port `4006` under one login for PR 1. (Maintainer + Contrarian, applied at the PRD level inline with this addendum.)
+11. **PR 1 must explicitly assert in its acceptance gate** that two different `account_id`s under one `ib_login_key` use distinct `ibg_client_id`s, and that stopping TradingNode A does NOT disconnect TradingNode B from the shared gateway. (Contrarian.)
+12. **`gateway_session_key` propagation through command payload → `handle_command()` → `ProcessManager.spawn()` is non-negotiable for PR 1.** Already objection #2 from the 2026-05-27 council; reinforced here. The per-session startup guard must not silently degrade back to global serialization. (Contrarian.)
+13. **Fail-fast validation at config load time:** two configured gateway sessions (in `GATEWAY_CONFIG` or successor) cannot share the same `ib_login_key`/TWS login. The check fires at backend startup. (Maintainer.)
+14. **Synthetic tests must exercise the multi-login `GatewayRouter` path even though PR 1 runs single-login.** `_build_production_payload_factory()` only uses `ib_login_key` routing when `gateway_router.is_multi_login`; without a synthetic multi-login test, PR 1 can pass while the multi-login route table is silently undertested. (Contrarian.)
+
+### Risks accepted under Shape A (named, not dismissed)
+
+- One IB Gateway crash kills both PR 1 paper accounts. Acceptable on paper; **NOT** acceptable at LVP/HVP — gated by the pre-graduation drill above.
+- The supervisor's account-scoped drain is "proven" by draining one of two TradingNodes against a shared gateway; this is semantically different from draining one container against a separate container. Gap closed at the pre-LVP/HVP drill.
+- `gateway_session_key` propagation lands at PR 1 but is exercised against a degenerate 1-key namespace; bugs that only manifest with ≥2 distinct keys may surface later. Mitigation: the synthetic multi-login test in blocking objection #14.
+- Compose-level multi-gateway plumbing (ports, volumes, socat proxies, healthchecks for N gateways) is deferred; debugged later under PR 3 / LVP-HVP schedule pressure rather than PR 1's paper safety net.
+
+### Missing evidence (gaps the council could not assess)
+
+- Current implementation state of `gateway_session_key` propagation through `handle_command()` → `ProcessManager.spawn()`. (Phase 3 plan-writing must inspect `backend/src/msai/services/live_command_bus.py` and `live_supervisor/process_manager.py` and account for the actual current state.)
+- Whether any existing synthetic test exercises multi-login `GatewayRouter` behavior. (Phase 3 plan-writing must inspect `backend/tests/` and either reuse or author the missing coverage.)
+- Real operator timeline to procure a second paper TWS login. (Not relevant to PR 1 under Shape A, but informs LVP/HVP graduation sequencing.)
+
+### Provenance
+
+Engineering Council, 2026-05-29. Standalone `/council` invocation during `/forge-goal` autonomous run on `/new-feature multi-account-broker-fleet`. Raw advisor transcripts captured at session time. Engine diversity: 3 Claude advisors + 2 Codex advisors + Codex chairman (xhigh).

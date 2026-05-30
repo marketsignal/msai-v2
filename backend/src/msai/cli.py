@@ -564,7 +564,19 @@ def live_status() -> None:
     typer.echo(f"Deployments ({len(data['deployments'])}):")
     for d in data["deployments"]:
         mode = "PAPER" if d["paper_trading"] else "LIVE"
-        typer.echo(f"  [{mode}] {d['id']}  status={d['status']}  instruments={d['instruments']}")
+        # PR 1 T14 — account context for the fleet topology. Each line names
+        # the IB login, the specific account_id, and the deterministic
+        # ibg_client_id so operators can correlate logs across the fleet
+        # without opening the UI.
+        account = d.get("account_id") or "-"
+        login = d.get("ib_login_key") or "-"
+        client_id = d.get("ibg_client_id")
+        client_id_s = str(client_id) if client_id is not None else "-"
+        typer.echo(
+            f"  [{mode}] {d['id']}  status={d['status']}  "
+            f"account={account}  login={login}  ibg_client_id={client_id_s}  "
+            f"instruments={d['instruments']}"
+        )
     if not data["deployments"]:
         typer.echo("  (none)")
 

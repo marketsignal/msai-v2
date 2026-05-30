@@ -48,22 +48,24 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING
 
+from msai.core.halt_keys import fleet_halt_key
+
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from redis.asyncio import Redis as AsyncRedis
 
+# Module-local reference to the consolidated halt key (PR 1 T2). Same key the
+# API's /kill-all writes — setting it from inside the trading subprocess
+# triggers the same downstream behavior: supervisor blocks new starts, running
+# deployments get a stop command, and the strategy mixin's defense-in-depth
+# check refuses any new orders. See msai.core.halt_keys for the canonical
+# helpers (fleet_halt_key, account_halt_key, halt_cause_key).
+_HALT_KEY = fleet_halt_key()
+
 
 log = logging.getLogger(__name__)
 
-
-_HALT_KEY = "msai:risk:halt"
-"""Same key the API's ``/kill-all`` writes (api/live.py:96).
-Setting it from inside the trading subprocess triggers the
-exact same downstream behavior as a manual kill-all: the
-supervisor blocks new starts, running deployments get a stop
-command, and the strategy mixin's defense-in-depth check
-refuses any new orders."""
 
 _HALT_REASON_KEY = "msai:risk:halt:reason"
 _HALT_SOURCE_KEY = "msai:risk:halt:source"
@@ -170,6 +172,7 @@ class IBDisconnectHandler:
                         },
                     )
                     from msai.services.observability.trading_metrics import IB_DISCONNECTS
+
                     IB_DISCONNECTS.inc()
                     await self._fire_halt()
                     return  # one-shot
@@ -261,6 +264,7 @@ class IBDisconnectHandler:
         # Best-effort email alert — after the node is already stopping.
         try:
             from msai.services.alerting import AlertService
+
             await AlertService().alert_ib_disconnect()
         except Exception:  # noqa: BLE001
             log.debug("ib_disconnect_alert_failed")

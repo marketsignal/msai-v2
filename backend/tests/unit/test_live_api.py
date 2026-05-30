@@ -72,6 +72,31 @@ def mock_command_bus() -> MagicMock:
     )
     fake_redis.rpush = AsyncMock(return_value=1)
     fake_redis.expire = AsyncMock(return_value=True)
+
+    # F9 fix support: /kill-all now batches halt-set writes via a
+    # transactional pipeline (MULTI/EXEC). Provide an async-context-
+    # manager-friendly pipeline that records each ``set(...)`` call
+    # so tests can still assert "msai:risk:halt was written with 24h
+    # TTL" without caring whether the call went through bus._redis.set
+    # directly or through the pipeline.
+    pipeline_set_calls: list[tuple[str, str, dict[str, object]]] = []
+
+    class _FakePipeline:
+        def set(self, key: str, value: str, **kw: object) -> _FakePipeline:
+            pipeline_set_calls.append((key, value, dict(kw)))
+            return self
+
+        async def execute(self) -> list[object]:
+            return [True] * len(pipeline_set_calls)
+
+        async def __aenter__(self) -> _FakePipeline:
+            return self
+
+        async def __aexit__(self, *_exc: object) -> None:
+            return None
+
+    fake_redis.pipeline = MagicMock(return_value=_FakePipeline())
+    fake_redis._pipeline_set_calls = pipeline_set_calls
     bus._redis = fake_redis  # noqa: SLF001
     bus.publish_stop_and_report_flatness = AsyncMock(return_value="1-1")
     return bus
@@ -164,16 +189,53 @@ class TestLiveKillAll:
         mock_command_bus: MagicMock,
     ) -> None:
         """Layer 1: ``msai:risk:halt`` must be SET on every
-        kill-all so subsequent ``/start`` calls return 503."""
+        kill-all so subsequent ``/start`` calls return 503.
+
+        F9 fix (Codex iter 2 P1): kill-all now batches the 4 halt-set
+        writes (latch, set_by, set_at, cause) into a single Redis
+        transactional pipeline (MULTI/EXEC) so a connection drop
+        mid-sequence can't leave partial state. Inspect the recorded
+        pipeline SET calls.
+        """
         await client_with_mock_db.post("/api/v1/live/kill-all")
 
-        set_calls = mock_command_bus._redis.set.call_args_list  # noqa: SLF001
-        halt_keys = [call.args[0] for call in set_calls]
+        pipeline_set_calls = mock_command_bus._redis._pipeline_set_calls  # noqa: SLF001
+        halt_keys = [k for (k, _v, _kw) in pipeline_set_calls]
         assert "msai:risk:halt" in halt_keys
-        # 24h TTL applied
-        for call in set_calls:
-            if call.args[0] == "msai:risk:halt":
-                assert call.kwargs.get("ex") == 86400
+        # 24h TTL applied to every halt-set
+        for key, _value, kw in pipeline_set_calls:
+            if key == "msai:risk:halt":
+                assert kw.get("ex") == 86400
+
+    async def test_kill_all_uses_transactional_pipeline_for_halt_writes(
+        self,
+        client_with_mock_db: httpx.AsyncClient,
+        mock_command_bus: MagicMock,
+    ) -> None:
+        """F9 fix: the 4 halt-set writes (latch, set_by, set_at,
+        cause-companion) MUST go through a single Redis MULTI/EXEC
+        transaction so either all keys are set or none. The previous
+        implementation issued 5 sequential ``await SET`` calls; a
+        connection drop mid-sequence would silently leave partial
+        state (latch set, cause-companion missing).
+        """
+        await client_with_mock_db.post("/api/v1/live/kill-all")
+
+        # Pipeline was called with transaction=True.
+        pipeline_call = mock_command_bus._redis.pipeline.call_args  # noqa: SLF001
+        assert pipeline_call.kwargs.get("transaction") is True, (
+            "F9: halt-set must use a transactional pipeline so the keyset "
+            "is atomic w.r.t. operator-visible state"
+        )
+
+        # All 4 halt-set writes landed inside ONE pipeline batch.
+        pipeline_set_calls = mock_command_bus._redis._pipeline_set_calls  # noqa: SLF001
+        keys = {k for (k, _v, _kw) in pipeline_set_calls}
+        # Every halt-related key written in the same transaction.
+        assert "msai:risk:halt" in keys
+        assert "msai:risk:halt:set_by" in keys
+        assert "msai:risk:halt:set_at" in keys
+        assert "msai:risk:halt:cause" in keys
 
     async def test_kill_all_publishes_stop_for_each_active_row(
         self,

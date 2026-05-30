@@ -1,4 +1,4 @@
-"""Phase 1 live ``TradingNodeConfig`` builder.
+"""Live ``TradingNodeConfig`` builder.
 
 Constructs the Nautilus ``TradingNodeConfig`` that the live trading
 subprocess hands to ``TradingNode``. Uses Nautilus natives for every
@@ -6,15 +6,19 @@ engine and client config so we get reconciliation, risk checks, and IB
 integration "for free" (decision: don't reinvent what Nautilus already
 provides — see the natives audit).
 
-Phase 1 deliberately leaves a few things at default that later phases
-fill in:
+Current behavior (F7 comment-drift fix — the original "Phase 1 / Phase 3 /
+Phase 4 follow-ups" notes referenced work that has since landed inline):
 
-- ``cache.database`` and ``message_bus.database`` stay None — Phase 3
-  task 3.2 wires Redis as the durable backend. Phase 1 runs in-memory.
-- ``load_state`` and ``save_state`` are False — Phase 4 task 4.5
-  enables them once the persistence path has been smoke-tested.
-- ``message_bus`` does not yet pin a stream name — Phase 3 task 3.2
-  sets ``stream_per_topic=False`` and the deployment-specific stream.
+- ``cache.database`` and ``message_bus.database`` are wired to Redis via
+  :func:`build_redis_database_config`. Both writers and the
+  :class:`PositionReader` cold path share the same construction so
+  username/password/TLS survive (Codex batch 8 P1).
+- ``load_state`` and ``save_state`` are ``True`` — Nautilus's built-in
+  state persistence rehydrates strategy state across restarts.
+- ``message_bus`` runs ``stream_per_topic=False`` with the
+  trader-prefixed stream so wildcard consumption from FastAPI works.
+- ``buffer_interval_ms=None`` (write-through) on both cache and
+  message_bus per gotcha #7.
 
 Two Nautilus gotchas drive the IB client wiring:
 
@@ -31,7 +35,6 @@ Two Nautilus gotchas drive the IB client wiring:
 
 from __future__ import annotations
 
-import hashlib
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -62,13 +65,34 @@ from nautilus_trader.model.identifiers import TraderId
 from pydantic import BaseModel, Field
 
 from msai.core.config import settings
+from msai.services.nautilus.databento_live_config import (
+    build_databento_data_client_config,
+)
 from msai.services.nautilus.ib_port_validator import (
     validate_port_account_consistency,
+)
+from msai.services.nautilus.ibg_client_id import (
+    ROLE_DATA,
+    ROLE_EXEC,
+    derive_ibg_client_id,
 )
 from msai.services.nautilus.live_instrument_bootstrap import (
     build_ib_instrument_provider_config,
     build_ib_instrument_provider_config_from_resolved,
 )
+
+# Re-export the role salt constants so legacy callers that imported them
+# from this module (or grepped for them here when wiring the live status
+# surfacing in Task T14) still find them at the historical location.
+__all__ = [
+    "ROLE_DATA",
+    "ROLE_EXEC",
+    "build_live_trading_node_config",
+    "build_per_account_strategy_configs",
+    "build_per_account_trading_node_config",
+    "build_portfolio_trading_node_config",
+    "derive_ibg_client_id",
+]
 
 # US equity venues — Nautilus VENUE component of InstrumentId for stocks
 # traded on US exchanges. When `manage_stop=True` triggers Nautilus's
@@ -89,9 +113,16 @@ def _has_us_equity_venue(instrument_ids: list[str]) -> bool:
     """Return True if any of the given canonical instrument IDs targets
     a US-equity venue. Each ID is expected to be ``"SYMBOL.VENUE"``;
     inputs that don't match the shape are treated as non-US-equity
-    (caller should keep the GTC default)."""
+    (caller should keep the GTC default).
+
+    Codex iter 3 F3: use ``rpartition('.')`` so share-class symbols like
+    ``BRK.B.NYSE`` correctly resolve their venue to ``NYSE``, not ``B.NYSE``.
+    A plain ``partition('.')`` would split at the first dot and return
+    ``("BRK", ".", "B.NYSE")`` — the venue check would then fail to match
+    any US-equity venue and the TIF=DAY override would be silently dropped.
+    """
     for instrument_id in instrument_ids:
-        _, _, venue = instrument_id.partition(".")
+        _, _, venue = instrument_id.rpartition(".")
         if venue and venue.upper() in _US_EQUITY_VENUES:
             return True
     return False
@@ -129,6 +160,134 @@ def _strategy_us_equity_tif_overrides(
         # rejects string variants — see `nautilus_trader/model/enums.pyx`.
         return {"market_exit_time_in_force": int(TimeInForce.DAY)}
     return {}
+
+
+# Canonical strategy-side venue for the per-account broker fleet (PR 1).
+# Per ``nautilus.md`` architectural rule #3 ("Pin venue names per
+# environment — IBKR for live") and the council's symbology decision,
+# strategies subscribe under ``.IBKR`` and the ``SymbologyShimActor``
+# republishes inbound native Databento bars onto that canonical venue.
+# Centralized here so the supervisor's payload factory and this
+# module's strategy-config rewriter agree on the same suffix.
+_IBKR_VENUE_SUFFIX: str = "IBKR"
+
+
+def _rewrite_bar_type_to_ibkr(bar_type_str: str) -> str:
+    """Rewrite a ``bar_type`` string so its venue component becomes ``IBKR``.
+
+    Used ONLY for the strategy's ``bar_type`` field on the per-account
+    topology — the inbound data path. The strategy subscribes to
+    ``<SYM>.IBKR-1-MINUTE-LAST-EXTERNAL`` (matching what the
+    ``SymbologyShimActor`` republishes from native Databento bars onto the
+    canonical bus topic) regardless of the LISTING venue the operator
+    typed in. The ``instrument_id`` field is intentionally NOT rewritten
+    by this helper — order routing stays on the LISTING venue where the
+    IB exec adapter's contract qualification (preloaded via
+    :func:`build_ib_instrument_provider_config_from_resolved`) knows the
+    right ``primaryExchange``.
+
+    Codex iter 3 F1 SPLIT: the previous ``_rewrite_venue_to_ibkr`` helper
+    rewrote BOTH ``instrument_id`` and ``bar_type``. That caused strategy
+    orders to be minted on synthetic ``<SYM>.IBKR`` ids that the IB exec
+    provider cache (keyed by LISTING venue contracts) couldn't resolve;
+    the adapter would treat ``IBKR`` as a primary-exchange/MIC at order
+    submit time, fail qualification, and the order would never reach IB.
+
+    Codex iter 3 F3: use ``rsplit('.', 1)`` so share-class symbols like
+    ``BRK.B.NYSE`` correctly resolve to root ``BRK.B`` (not ``BRK``).
+    The supervisor's Databento bar-type map (built with ``rsplit`` in
+    ``live_supervisor/__main__.py:_strip_venue_suffix``) is keyed on
+    ``BRK.B.IBKR-...``; this helper MUST produce the same shape so the
+    strategy's bar-type subscription matches the shim's republish topic.
+
+    Args:
+        bar_type_str: A canonical Nautilus bar-type string like
+            ``"AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL"`` or
+            ``"BRK.B.NYSE-1-MINUTE-LAST-EXTERNAL"``. Inputs without a
+            ``.`` in the symbol prefix (already-bare, or already in
+            ``.IBKR`` form) pass through unchanged.
+
+    Returns:
+        The same string with the venue token replaced by ``IBKR``.
+    """
+    prefix, dash, spec_tail = bar_type_str.partition("-")
+    if "." not in prefix:
+        return bar_type_str
+    # F3: rsplit so dotted share-class roots (``BRK.B``) survive intact.
+    sym_root, _, _venue = prefix.rpartition(".")
+    if not sym_root:
+        return bar_type_str
+    rewritten_prefix = f"{sym_root}.{_IBKR_VENUE_SUFFIX}"
+    if dash:
+        return f"{rewritten_prefix}-{spec_tail}"
+    return rewritten_prefix
+
+
+def build_per_account_strategy_configs(
+    strategy_members: list[StrategyMemberPayload],
+    *,
+    deployment_slug: str,
+) -> list[ImportableStrategyConfig]:
+    """Build ``ImportableStrategyConfig``s for the per-account topology.
+
+    Codex iter 1 P1-1 + P1-3 of PR 1: the per-account router used to
+    bypass strategy wiring entirely — the spawned ``TradingNode``
+    contained the ``SymbologyShimActor`` but zero trading strategies,
+    so a deployment could start without ever subscribing or trading
+    (P1-1). And when strategies were added back, their config
+    ``bar_type`` still referenced the LISTING venue (``AAPL.NASDAQ``)
+    while the shim republishes onto ``AAPL.IBKR``, so no live bars
+    ever reached the strategy (P1-3).
+
+    **Codex iter 3 F1 (architectural decision):** the symbology shim
+    canonicalizes the DATA path (bar topics) to ``.IBKR``, NOT the EXEC
+    path. This helper rewrites ONLY the ``bar_type`` to ``.IBKR``
+    (matching what :class:`SymbologyShimActor` republishes); the
+    ``instrument_id`` field is LEFT on its LISTING venue
+    (``.NASDAQ``/``.NYSE``/``.ARCA``) so order submission resolves
+    cleanly via the IB exec adapter's preloaded contract cache.
+
+    Mirrors the legacy ``build_portfolio_trading_node_config`` strategy
+    loop for the non-venue fields (``order_id_tag`` parsing,
+    ``manage_stop=True``, US-equity TIF override) so warm-restart
+    state-reload and the audit trail behave identically across the
+    two topologies.
+    """
+    strategy_configs: list[ImportableStrategyConfig] = []
+    for member in strategy_members:
+        _parts = member.strategy_id_full.split("-", 1)
+        order_id_tag = _parts[1] if len(_parts) >= 2 else deployment_slug
+
+        # Rewrite ONLY the bar_type venue on the strategy_config copy.
+        # ``instrument_id`` stays on the LISTING venue — see F1 docstring
+        # on ``_rewrite_bar_type_to_ibkr`` for why exec lookups need the
+        # listing-venue suffix.
+        rewritten_config: dict[str, Any] = dict(member.strategy_config)
+        if "bar_type" in rewritten_config and isinstance(rewritten_config["bar_type"], str):
+            rewritten_config["bar_type"] = _rewrite_bar_type_to_ibkr(rewritten_config["bar_type"])
+
+        strategy_configs.append(
+            ImportableStrategyConfig(
+                strategy_path=member.strategy_path,
+                config_path=member.strategy_config_path,
+                config={
+                    **rewritten_config,
+                    "manage_stop": True,
+                    "order_id_tag": order_id_tag,
+                    # Per-account topology is equities-only in PR 1.
+                    # Apply the same US-equity TIF override the legacy
+                    # portfolio builder applies so the IB account
+                    # preset (DAY) matches the strategy-emitted TIF.
+                    **_strategy_us_equity_tif_overrides(
+                        rewritten_config,
+                        extra_instruments=[
+                            r.canonical_id for r in (member.resolved_instruments or ())
+                        ],
+                    ),
+                },
+            )
+        )
+    return strategy_configs
 
 
 def build_redis_database_config() -> DatabaseConfig:
@@ -176,42 +335,29 @@ class IBSettings(BaseModel):
     account_id: str = Field(default="DU0000000")
 
 
-def _derive_client_id(deployment_slug: str, role: str) -> int:
-    """Stable 31-bit positive integer derived from the deployment slug + role.
-
-    IB ``client_id`` is a signed 32-bit int; we mask to 31 bits to
-    avoid the high bit (some IB middleware doesn't like negative ids).
-
-    Determinism matters: the same ``(deployment_slug, role)`` pair must
-    always produce the same id so a restart reconnects under the SAME
-    client identity — otherwise IB Gateway sees a "new" connection and
-    the old client's open orders + subscriptions get stranded.
-
-    The ``role`` salt (``"data"`` or ``"exec"``) is mixed in via sha256
-    so two clients on the same deployment can never collide regardless
-    of slug structure (gotcha #3).
-
-    Zero is mapped to 1 because IB Gateway treats client_id=0 as a
-    privileged "master" connection — we never want to claim that slot
-    by accident.
-
-    We key on the ``deployment_slug`` (not the UUID primary key) so
-    every id the live subprocess publishes — ``trader_id``,
-    ``ibg_client_id``, ``message_bus_stream`` — resolves from the SAME
-    16-hex-char source of truth persisted on ``LiveDeployment.deployment_slug``
-    (Codex Task 1.5 iter2 P2 fix: Task 1.1b's stable-identity contract).
-    """
-    digest = hashlib.sha256(deployment_slug.encode("ascii") + role.encode("ascii")).digest()
-    raw = int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
-    return raw or 1
-
-
 def _derive_data_client_id(deployment_slug: str) -> int:
-    return _derive_client_id(deployment_slug, "data")
+    """Stable IB data-client id for the deployment.
+
+    Thin wrapper around :func:`msai.services.nautilus.ibg_client_id.derive_ibg_client_id`
+    kept here as a back-compat alias — callers in this module read more
+    naturally with the "data" / "exec" intent in the function name than
+    with a string-keyword argument.
+
+    Codex iter 1 P1-5 of PR 1 (multi-account-broker-fleet) moved the raw
+    derivation into the shared helper so the ``/api/v1/live/status``
+    serializer (Task T14) can re-derive the SAME integer without reaching
+    into the live-node config builder.
+    """
+    return derive_ibg_client_id(deployment_slug, ROLE_DATA)
 
 
 def _derive_exec_client_id(deployment_slug: str) -> int:
-    return _derive_client_id(deployment_slug, "exec")
+    """Stable IB exec-client id for the deployment.
+
+    Thin wrapper around :func:`msai.services.nautilus.ibg_client_id.derive_ibg_client_id`.
+    See :func:`_derive_data_client_id` for the migration rationale.
+    """
+    return derive_ibg_client_id(deployment_slug, ROLE_EXEC)
 
 
 def _derive_trader_id(deployment_slug: str) -> TraderId:
@@ -686,3 +832,267 @@ def build_portfolio_trading_node_config(
         exec_clients={IB_VENUE.value: exec_client},
         strategies=strategy_configs,
     )
+
+
+def build_per_account_trading_node_config(
+    *,
+    account_id: str,
+    ibg_client_id: int,
+    ib_login_key: str,
+    native_instrument_ids: list[str],
+    venue_dataset_map: dict[str, str],
+    canonical_to_native_bar_types: dict[str, str],
+    databento_api_key: str,
+    ib_host: str,
+    ib_port: int,
+    deployment_slug: str | None = None,
+    strategies: list[ImportableStrategyConfig] | None = None,
+    resolved_instruments: list[ResolvedInstrument] | None = None,
+    max_notional_per_order: dict[str, int] | None = None,
+    max_order_submit_rate: str = "100/00:00:01",
+    max_order_modify_rate: str = "100/00:00:01",
+) -> TradingNodeConfig:
+    """Per-account ``TradingNodeConfig`` — Databento data + IB exec only.
+
+    Builds the SYNC ``TradingNodeConfig`` for the multi-account broker
+    fleet (PR 1 Task T11). The shape diverges from the legacy
+    :func:`build_live_trading_node_config` / :func:`build_portfolio_trading_node_config`
+    builders in three ways:
+
+    1. **No IB data client.** ``data_clients`` contains exactly one
+       entry — the Databento client keyed under
+       ``str(DATABENTO_CLIENT_ID)`` (the Nautilus-canonical client
+       name). Asserted at build time.
+    2. **One IB exec client per account.** ``exec_clients[IB_VENUE.value]``
+       carries the per-account ``account_id`` + ``ibg_client_id``. The
+       supervisor's payload factory (Task T12) is responsible for
+       allocating distinct ``ibg_client_id`` values per concurrent
+       account so IB Gateway's gotcha #3 (silent disconnect on
+       collision) can't fire.
+    3. **A ``SymbologyShimActor`` registered via ``ImportableActorConfig``.**
+       The actor's ``on_start`` subscribes to NATIVE Databento bar types
+       (driven by ``canonical_to_native_bar_types``) so the data engine
+       routes those subscriptions to the Databento client. When native
+       bars arrive on the bus, the actor retags them to the canonical
+       ``.IBKR`` venue and republishes for the strategy's bus
+       subscription to pick up. Without BOTH halves wired (outbound
+       subscription + inbound retag) no bars ever reach the strategy
+       (Codex iter 5–7 of PR 1).
+
+    Args:
+        account_id: IB account id this node executes against (e.g.
+            ``"DUP733214"`` for a paper account, ``"U..."`` for live).
+        ibg_client_id: IB Gateway client_id slot to claim for the exec
+            connection. Caller (supervisor) MUST ensure distinct values
+            per concurrent account.
+        ib_login_key: IB username/login key that the Gateway container
+            is bound to. Currently only embedded for audit; surfaced
+            here for symmetry with the supervisor's payload factory.
+        native_instrument_ids: Pre-resolved Databento native ids
+            (e.g. ``["AAPL.XNAS"]``). Resolution happens upstream in
+            the supervisor's async payload factory; this builder is
+            sync and MUST NOT call any async DB code.
+        venue_dataset_map: Pre-resolved native_venue → dataset map
+            (e.g. ``{"XNAS": "DBEQ.BASIC"}``). Passed straight to the
+            Databento client config so Nautilus uses our authoritative
+            choice rather than publisher-default lookup.
+        canonical_to_native_bar_types: Pre-built mapping from canonical
+            ``<SYM>.IBKR-1-MINUTE-LAST-EXTERNAL`` to native
+            ``<SYM>.XNAS-1-MINUTE-LAST-EXTERNAL``. Threaded into the
+            ``SymbologyShimActor`` config so ``on_start`` knows which
+            native bar types to subscribe to. Empty dict is permitted
+            for tests that only exercise the data/exec topology.
+        databento_api_key: Databento live-API key the data client uses.
+        ib_host: IB Gateway hostname (DNS or IP).
+        ib_port: IB Gateway port (4002 = paper, 4001 = live; the
+            host-side socat proxy may use 4004 / 4003 — pass whichever
+            the supervisor was configured with).
+        deployment_slug: Optional 16-char hex slug to drive the
+            ``trader_id``. ``None`` falls back to a synthetic slug
+            derived from ``account_id`` so callers that only have the
+            account id (e.g. unit tests, PR 1 T14 status preview) can
+            still construct a config. Real supervisor calls always pass
+            the real slug.
+        strategies: Optional pre-built ``ImportableStrategyConfig`` list.
+            PR 1 doesn't define the wire-up of strategies through the
+            new builder — the supervisor (PR 2's per-account ownership
+            refactor) will assemble these — so the default is an empty
+            list. The shape is preserved so the field is forward-compatible.
+        max_notional_per_order: Per-instrument cap on order notional.
+            Same semantics as the legacy builders.
+        max_order_submit_rate: Native Nautilus order-submission throttle.
+        max_order_modify_rate: Native Nautilus order-modification throttle.
+
+    Returns:
+        A fully populated ``TradingNodeConfig`` with the per-account
+        Databento + IB exec topology. The caller (the subprocess's
+        ``node_factory``) is responsible for registering BOTH the
+        Databento data-client factory AND the IB exec-client factory
+        with the ``TradingNode`` before ``node.build()``.
+
+    Raises:
+        ValueError: ``account_id`` is empty, port/account mismatch
+            (gotcha #6), or the IB venue key would collide with the
+            Databento client key.
+    """
+    # Defer-import locally so this module's import cost stays low and
+    # so the new builder doesn't accidentally couple the legacy paths
+    # to the Databento adapter at import time.
+    from nautilus_trader.adapters.databento.constants import DATABENTO_CLIENT_ID
+    from nautilus_trader.common.config import ImportableActorConfig
+
+    if not account_id or not account_id.strip():
+        raise ValueError(
+            "build_per_account_trading_node_config requires a non-empty account_id; "
+            "the supervisor's payload factory MUST resolve the account from the "
+            "broker-account registry before reaching this builder."
+        )
+
+    normalized_account_id = account_id.strip()
+    validate_port_account_consistency(ib_port, normalized_account_id)
+
+    # The trader_id needs SOME stable identifier. Real callers pass a
+    # 16-hex-char deployment_slug; tests that only care about the
+    # client-topology shape may omit it, in which case we synthesize
+    # something from the account id (still deterministic). NEVER fall
+    # back to a random id — that would make warm-restart state reload
+    # non-deterministic across process restarts.
+    effective_slug = deployment_slug or f"acct-{normalized_account_id}"
+    trader_id = TraderId(f"MSAI-{effective_slug}")
+
+    # --- Databento data client (Codex iter 4 P2-2) ----------------------
+    # ``build_databento_data_client_config`` is the SYNC half of T10's
+    # split builder. Resolution of canonical → native already happened
+    # in the supervisor; this call is pure config assembly.
+    data_client = build_databento_data_client_config(
+        native_instrument_ids=native_instrument_ids,
+        venue_dataset_map=venue_dataset_map,
+        api_key=databento_api_key,
+    )
+
+    # --- IB exec instrument provider (Codex iter 2 P1 fix — F2) ---------
+    # The IB exec adapter resolves contracts at order-submit time via
+    # its ``instrument_provider``. Without preloaded contracts the
+    # lookup hits IB synchronously on the critical path, and a contract
+    # that isn't already in cache fails with "no instrument found" —
+    # see ``nautilus.md`` gotcha #9 (instrument not pre-loaded fails at
+    # runtime, not startup) and gotcha #11 (dynamic loading is slow).
+    #
+    # **F2 fix (Codex iter 2):** the prior implementation passed
+    # ``load_ids=frozenset(InstrumentId("AAPL.IBKR"), ...)`` via
+    # ``SymbologyMethod.IB_SIMPLIFIED``. Under IB_SIMPLIFIED the
+    # InstrumentId.venue is interpreted as the IB exchange / primary
+    # exchange during contract resolution — but ``IBKR`` is NOT a valid
+    # IB exchange/MIC, so the preload silently failed and the first
+    # order on a per-account equity strategy hit unresolved contracts.
+    #
+    # Mirror the legacy ``build_portfolio_trading_node_config`` path:
+    # preload via ``load_contracts`` populated with real ``IBContract``
+    # objects derived from the resolver's ``ResolvedInstrument``
+    # ``contract_spec`` dicts (which carry the LISTING venue —
+    # NASDAQ/NYSE/etc. — as ``primaryExchange``). This is the SAME
+    # mechanism the working portfolio builder uses today, so the per-
+    # account topology now inherits the legacy preload's correctness
+    # by construction.
+    ib_instrument_provider_config = build_ib_instrument_provider_config_from_resolved(
+        list(resolved_instruments or [])
+    )
+
+    # --- IB exec-only client --------------------------------------------
+    # PR 1 T11 explicitly drops the IB data client. Data flows via
+    # Databento; IB only executes orders + reports fills + serves as the
+    # account-state source of truth. Reconciliation against IB is still
+    # enabled via the LiveExecEngineConfig below.
+    exec_client = InteractiveBrokersExecClientConfig(
+        ibg_host=ib_host,
+        ibg_port=ib_port,
+        ibg_client_id=ibg_client_id,
+        account_id=normalized_account_id,
+        # Preload the canonical ``.IBKR`` instrument ids the strategies
+        # will subscribe to + place orders on. Without this the IB exec
+        # adapter's contract qualification path runs at submit time —
+        # the first order on AAPL.IBKR would fail before the provider
+        # ever reaches IB Gateway. Codex iter 1 P1-2 fix.
+        instrument_provider=ib_instrument_provider_config,
+    )
+
+    # --- Redis-backed cache + message bus (gotcha #7, #8) ---------------
+    redis_database = build_redis_database_config()
+    cache_config = CacheConfig(
+        database=redis_database,
+        encoding="msgpack",
+        buffer_interval_ms=None,  # write-through
+        persist_account_events=True,
+    )
+    message_bus_config = MessageBusConfig(
+        database=redis_database,
+        encoding="msgpack",
+        stream_per_topic=False,
+        use_trader_prefix=True,
+        use_trader_id=True,
+        streams_prefix="stream",
+        buffer_interval_ms=None,
+    )
+
+    # --- Symbology shim actor (Codex iter 7 P1) -------------------------
+    # The actor's two-way bridge is THE load-bearing piece of T11:
+    # outbound subscribes native bar types so Databento streams them;
+    # inbound retags + republishes onto the canonical .IBKR topic for
+    # the strategy's bus subscription. Both halves are required for
+    # bars to reach the strategy.
+    shim_actor_config = ImportableActorConfig(
+        actor_path="msai.services.symbology_shim_actor:SymbologyShimActor",
+        config_path="msai.services.symbology_shim_actor:SymbologyShimActorConfig",
+        config={
+            "canonical_to_native_bar_types": dict(canonical_to_native_bar_types),
+            "venue_dataset_map": dict(venue_dataset_map),
+            # ib_login_key surfaced into the actor config for audit
+            # symmetry; the actor itself ignores it today.
+            "ib_login_key": ib_login_key,
+        },
+    )
+
+    # --- Assemble the TradingNodeConfig --------------------------------
+    config = TradingNodeConfig(
+        trader_id=trader_id,
+        load_state=True,
+        save_state=True,
+        data_engine=LiveDataEngineConfig(),
+        exec_engine=LiveExecEngineConfig(
+            reconciliation=True,
+            reconciliation_lookback_mins=1440,
+            inflight_check_interval_ms=2000,
+            inflight_check_threshold_ms=5000,
+            position_check_interval_secs=60,
+        ),
+        risk_engine=LiveRiskEngineConfig(
+            bypass=False,
+            max_order_submit_rate=max_order_submit_rate,
+            max_order_modify_rate=max_order_modify_rate,
+            max_notional_per_order=max_notional_per_order or {},
+        ),
+        cache=cache_config,
+        message_bus=message_bus_config,
+        # Databento OWNS the data side — keyed by the Nautilus-canonical
+        # client name (the str-cast of DATABENTO_CLIENT_ID, which is
+        # itself a ClientId("DATABENTO")). The subprocess registers
+        # DatabentoLiveDataClientFactory against this same name.
+        data_clients={str(DATABENTO_CLIENT_ID): data_client},
+        # IB OWNS exec only. Keyed by IB_VENUE.value ("INTERACTIVE_BROKERS")
+        # for symmetry with the legacy builders (existing tests at
+        # tests/unit/test_live_node_config.py:278 already assert this).
+        exec_clients={IB_VENUE.value: exec_client},
+        actors=[shim_actor_config],
+        strategies=strategies or [],
+    )
+
+    # Build-time guard: assert no IB data client snuck in. PR 1 T11's
+    # architectural invariant is "Databento owns data; IB owns exec".
+    if IB_VENUE.value in config.data_clients:
+        raise ValueError(
+            "build_per_account_trading_node_config: invariant violated — "
+            "IB data client wired into data_clients. PR 1 T11 mandates "
+            "Databento as the sole data source; IB Gateway is exec-only."
+        )
+
+    return config

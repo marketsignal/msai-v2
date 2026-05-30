@@ -29,6 +29,7 @@ async def test_payload_factory_validates_with_deployment_account_not_settings() 
     mock_deployment = MagicMock()
     mock_deployment.paper_trading = False  # matches IB_PORT=4001 on port side
     mock_deployment.account_id = "DU1234567"  # paper account — MISMATCH
+    mock_deployment.ib_login_key = None  # legacy single-gateway path
 
     # Session returns the mock deployment
     mock_session = MagicMock()
@@ -135,6 +136,123 @@ async def test_payload_factory_validates_routed_port_not_settings_port() -> None
 
 
 @pytest.mark.asyncio
+async def test_payload_factory_enforces_account_binding_from_gateway_config() -> None:
+    """Codex iter 15 P2: when GATEWAY_CONFIG binds accounts to a login
+    (``marin1016test:host:port:accounts=DUP733214|DUP733215``), the
+    factory MUST reject a deployment whose ``account_id`` is not in the
+    bound list — even though the login key resolves successfully. Without
+    this check, a deployment could request a paper account assigned to a
+    different gateway entry and still be routed as long as the port/account
+    prefix matches.
+    """
+    from msai.live_supervisor.__main__ import _build_production_payload_factory
+
+    mock_deployment = MagicMock()
+    mock_deployment.paper_trading = True
+    mock_deployment.account_id = "DUP999999"  # NOT in bound accounts
+    mock_deployment.ib_login_key = "marin1016test"
+    mock_deployment.portfolio_revision_id = None
+    mock_deployment.strategy_id = 1
+
+    mock_session = MagicMock()
+    mock_session.execute = AsyncMock(
+        return_value=MagicMock(
+            scalar_one_or_none=MagicMock(return_value=mock_deployment),
+        ),
+    )
+    mock_session_ctx = MagicMock()
+    mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_ctx.__aexit__ = AsyncMock(return_value=None)
+    session_factory = MagicMock(return_value=mock_session_ctx)
+
+    mock_endpoint = MagicMock()
+    mock_endpoint.host = "ib-gateway"
+    mock_endpoint.port = 4004
+    gateway_router = MagicMock()
+    gateway_router.is_multi_login = False
+    gateway_router.resolve = MagicMock(return_value=mock_endpoint)
+    # Binding declares ONLY DUP733214 + DUP733215 — DUP999999 is rejected.
+    gateway_router.accounts_for = MagicMock(return_value=["DUP733214", "DUP733215"])
+
+    with patch("msai.live_supervisor.__main__.settings") as mock_settings:
+        mock_settings.ib_port = 4004
+        mock_settings.ib_host = "ib-gateway"
+        mock_settings.ib_account_id = "DUP733214"
+
+        factory = _build_production_payload_factory(
+            session_factory,
+            gateway_router=gateway_router,
+        )
+
+        with pytest.raises(ValueError, match="not bound to ib_login_key"):
+            await factory(
+                row_id=uuid4(),
+                deployment_id=uuid4(),
+                deployment_slug="test-slug",
+                payload_dict={},
+            )
+
+
+@pytest.mark.asyncio
+async def test_payload_factory_accepts_unbound_login_with_empty_accounts() -> None:
+    """Codex iter 15 P2: legacy GATEWAY_CONFIG entries WITHOUT an
+    ``accounts=`` segment opt out of binding enforcement — the supervisor
+    accepts any account_id under those logins. Only opt-in bindings (the
+    PR 1 fleet topology) trigger the enforcement check.
+    """
+    from msai.live_supervisor.__main__ import _build_production_payload_factory
+
+    mock_deployment = MagicMock()
+    mock_deployment.paper_trading = True
+    mock_deployment.account_id = "DU1234567"  # any account ok
+    mock_deployment.ib_login_key = "legacy-key"
+    mock_deployment.portfolio_revision_id = None
+    mock_deployment.strategy_id = 1
+
+    mock_session = MagicMock()
+    mock_session.execute = AsyncMock(
+        return_value=MagicMock(
+            scalar_one_or_none=MagicMock(return_value=mock_deployment),
+        ),
+    )
+    mock_session_ctx = MagicMock()
+    mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_ctx.__aexit__ = AsyncMock(return_value=None)
+    session_factory = MagicMock(return_value=mock_session_ctx)
+
+    mock_endpoint = MagicMock()
+    mock_endpoint.host = "ib-gateway"
+    mock_endpoint.port = 4004
+    gateway_router = MagicMock()
+    gateway_router.is_multi_login = False
+    gateway_router.resolve = MagicMock(return_value=mock_endpoint)
+    # Empty list → no binding → enforcement skipped.
+    gateway_router.accounts_for = MagicMock(return_value=[])
+
+    with patch("msai.live_supervisor.__main__.settings") as mock_settings:
+        mock_settings.ib_port = 4004
+        mock_settings.ib_host = "ib-gateway"
+        mock_settings.ib_account_id = "DU1234567"
+
+        factory = _build_production_payload_factory(
+            session_factory,
+            gateway_router=gateway_router,
+        )
+
+        # No binding violation should be raised; downstream errors (e.g.
+        # strategy lookup) are fine — we just assert the binding check
+        # didn't fire.
+        with pytest.raises(Exception) as exc_info:  # noqa: BLE001
+            await factory(
+                row_id=uuid4(),
+                deployment_id=uuid4(),
+                deployment_slug="test-slug",
+                payload_dict={},
+            )
+        assert "not bound to ib_login_key" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
 async def test_payload_factory_validates_paper_trading_vs_port() -> None:
     """Second half of gotcha #6: deployment.paper_trading must match
     port even if account_id is consistent with port."""
@@ -143,6 +261,7 @@ async def test_payload_factory_validates_paper_trading_vs_port() -> None:
     mock_deployment = MagicMock()
     mock_deployment.paper_trading = True  # operator said 'paper'
     mock_deployment.account_id = "DU1234567"  # paper account — consistent
+    mock_deployment.ib_login_key = None  # legacy single-gateway path
 
     mock_session = MagicMock()
     mock_session.execute = AsyncMock(
