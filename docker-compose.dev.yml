@@ -287,6 +287,63 @@ services:
       start_period: 180s
 
   # ---------------------------------------------------------------------------
+  # Second IB Gateway — HVP login (PR 1 drill 2026-05-30, Shape B proof)
+  # ---------------------------------------------------------------------------
+  # Mirror of the primary ``ib-gateway`` service above, but logs in under the
+  # HVP TWS credentials (``HVP_TWS_USERID`` / ``HVP_TWS_PASSWORD`` in .env).
+  # Used to prove Shape B (multi-container fleet topology) — Hawk minority
+  # report institutionalized this proof as the pre-LVP/HVP graduation gate.
+  # Container hostname: ``ib-gateway-hvp``; container-internal port 4003 is
+  # the same as LVP because each gateway is in its own network namespace.
+  # GATEWAY_CONFIG entry: ``hvp:ib-gateway-hvp:4003:accounts=<HVP_ACCOUNT_ID>``.
+  # VNC port shifted to 5901 so host-port doesn't collide with the primary.
+  # Separate tws_settings dir prevents the two gateways from sharing IB
+  # session state (which would re-trigger the "primary session" conflicts).
+  ib-gateway-hvp:
+    profiles: ["broker-hvp"]
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: msai-claude-ib-gateway-hvp
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        if [ -z "$${TWS_USERID}" ] || [ -z "$${TWS_PASSWORD}" ]; then
+          echo "ib-gateway-hvp requires HVP_TWS_USERID and HVP_TWS_PASSWORD in .env" >&2
+          exit 64
+        fi
+        exec /home/ibgateway/scripts/run.sh
+    environment:
+      TWS_USERID: ${HVP_TWS_USERID:-}
+      TWS_PASSWORD: ${HVP_TWS_PASSWORD:-}
+      TRADING_MODE: ${HVP_TRADING_MODE:-live}
+      READ_ONLY_API: ${READ_ONLY_API:-no}
+      TWS_SETTINGS_PATH: /home/ibgateway/tws_settings
+      AUTO_RESTART_TIME: ${IB_AUTO_RESTART_TIME:-11:45 PM}
+      RELOGIN_AFTER_TWOFA_TIMEOUT: ${IB_RELOGIN_AFTER_TWOFA_TIMEOUT:-yes}
+      TWOFA_TIMEOUT_ACTION: ${IB_TWOFA_TIMEOUT_ACTION:-restart}
+      EXISTING_SESSION_DETECTED_ACTION: ${IB_EXISTING_SESSION_ACTION:-primary}
+      TWS_ACCEPT_INCOMING: ${IB_TWS_ACCEPT_INCOMING:-accept}
+      BYPASS_WARNING: ${IB_BYPASS_WARNING:-yes}
+      TIME_ZONE: ${IB_TIME_ZONE:-America/Chicago}
+      JAVA_HEAP_SIZE: ${IB_JAVA_HEAP_SIZE:-1024}
+      VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-msai-dev-vnc}
+    ports:
+      - "127.0.0.1:5901:5900"
+    volumes:
+      - ./data/ib-gateway-hvp:/home/ibgateway/tws_settings
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 bash -lc ': >/dev/tcp/127.0.0.1/4002' || timeout 2 bash -lc ': >/dev/tcp/127.0.0.1/4001'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+
+  # ---------------------------------------------------------------------------
   # Frontend
   # ---------------------------------------------------------------------------
 

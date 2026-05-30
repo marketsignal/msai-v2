@@ -43,7 +43,9 @@ All notable changes to msai-v2 will be documented in this file.
 
 **Files touched:** ~25 source files + ~13 new test modules + plan/decision/research docs + 3 compose+env files + 2 frontend files. Plan: `docs/plans/2026-05-29-multi-account-broker-fleet-pr1.md`. Council decisions: `docs/decisions/multi-account-broker-fleet.md`.
 
-**Next step (operator):** Run S1-S4 verification spike (`scripts/spike_ib_orders_without_data.py` — place one paper order on DUP733213 via IB Gateway exec-only). If PASS, run the 7-step multi-account drill from the plan's §Drill section against DUP733214+DUP733215. Then PR creation.
+**2026-05-30 Shape B drill (post-commit 29820e7):** Pablo authorized using LVP + HVP (two separate TWS logins) as the two-account topology — this is Shape B (multi-container fleet), which the Hawk minority report had institutionalized as pre-LVP/HVP graduation gate. Result: **multi-container topology + halt-key isolation PROVEN** at the API/Redis level. LVP order accepted by IB through exec-only path (PreSubmitted, after-hours so no fill). HVP order container-routed but blocked by IB Account Management's Read-Only API setting (operator config, not code). Full details in `tests/e2e/reports/2026-05-30-multi-account-broker-fleet-pr1.md` §"Shape B drill". UC verdicts upgraded: Negative UC PASS, UC4 PASS, UC5 FIXED, UC1 PASS (Shape B), UC2 PASS, UC3 PASS.
+
+**Shipped with PR 1 (Shape B-enabling compose):** new `ib-gateway-hvp` service in `docker-compose.dev.yml` (opt-in via `COMPOSE_PROFILES=broker,broker-hvp`). `.env.example` documents `HVP_TWS_USERID` / `HVP_TWS_PASSWORD` / `HVP_TRADING_MODE` + the multi-login `GATEWAY_CONFIG` grammar.
 
 ### 2026-05-26 — Fix: smoke passed green while AAPL produced 0 trades (`fix/smoke-aapl-zero-trades`)
 
