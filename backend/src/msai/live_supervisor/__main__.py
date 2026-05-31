@@ -10,17 +10,20 @@ in :mod:`msai.live_supervisor.main`, :mod:`process_manager`, and
 :mod:`heartbeat_monitor` so unit/integration tests can exercise each
 piece without standing up the full Docker stack.
 
-Production wiring (Phase 4 task #154 scope-B):
+Production wiring (PR 1 multi-account-broker-fleet T11/T12 —
+per-account payload factory + per-account TradingNodeConfig):
 
 - ``spawn_target = _trading_node_subprocess`` — the real Nautilus
   subprocess entry point that constructs a ``TradingNode``, builds
   IB data + exec clients, and drives the node through its lifecycle
   with the IB disconnect handler + heartbeat thread alive alongside.
-- ``payload_factory = _production_payload_factory`` — builds a
-  per-deployment :class:`TradingNodePayload` from the
+- ``payload_factory = _build_production_payload_factory(...)`` — builds
+  a per-deployment :class:`TradingNodePayload` from the
   ``live_deployments`` row (joined with ``strategies``) + the
-  process-wide ``settings``. Each spawn gets a fresh, fully-populated
-  payload.
+  process-wide ``settings``. Resolves the Databento native ids +
+  venue_dataset_map + canonical→native bar-type map for the per-account
+  Databento data + IB-exec topology when ``account_id`` is set
+  (PR 1 T11/T12). Each spawn gets a fresh, fully-populated payload.
 """
 
 from __future__ import annotations
@@ -50,10 +53,18 @@ from msai.models import LiveDeployment, LivePortfolioRevisionStrategy, Strategy
 from msai.services.live.deployment_identity import derive_strategy_id_full
 from msai.services.live.gateway_router import GatewayRouter
 from msai.services.live_command_bus import LiveCommandBus
+from msai.services.nautilus.databento_live_config import (
+    resolve_databento_targets,
+)
+from msai.services.nautilus.ibg_client_id import (
+    ROLE_EXEC,
+    derive_ibg_client_id,
+)
 from msai.services.nautilus.live_instrument_bootstrap import (
     exchange_local_today,
 )
 from msai.services.nautilus.security_master.live_resolver import (
+    LiveResolverError,
     lookup_for_live,
 )
 from msai.services.nautilus.strategy_loader import resolve_importable_strategy_paths
@@ -64,7 +75,33 @@ from msai.services.nautilus.trading_node_subprocess import (
 )
 from msai.services.strategy_registry import compute_file_hash
 
+# Canonical strategy-side venue (per ``nautilus.md`` architectural rule #3
+# — "Pin venue names per environment"). The per-account broker fleet
+# (PR 1 T11/T12) routes Databento bars onto this canonical venue via the
+# :class:`SymbologyShimActor`. Strategies subscribe with this suffix; the
+# shim translates inbound native bars to it.
+_IBKR_VENUE_SUFFIX: str = "IBKR"
+
 log = logging.getLogger(__name__)
+
+
+def _strip_venue_suffix(instrument: str) -> str:
+    """Return the symbol root from an instrument id, stripping the
+    venue suffix once.
+
+    F8 fix (Codex iter 2 P2 / pr-toolkit code-reviewer convergent
+    finding): share-class symbols like ``BRK.B`` are supported by the
+    security_master, and their fully-qualified form is ``BRK.B.NYSE``.
+    The old ``inst.split(".")[0]`` splits at the FIRST ``.`` and returns
+    ``BRK`` — wrong root. Using ``rsplit(".", 1)`` strips one trailing
+    venue token and returns ``BRK.B``.
+
+    Inputs without a ``.`` (already-bare symbols like ``AAPL``) pass
+    through unchanged.
+    """
+    if "." not in instrument:
+        return instrument
+    return instrument.rsplit(".", 1)[0]
 
 
 def _build_production_payload_factory(
@@ -165,13 +202,76 @@ def _build_production_payload_factory(
             deployment_account = (deployment.account_id or "").strip()
 
             # ---------------------------------------------------------
-            # Resolve IB host/port: multi-login GatewayRouter or
+            # Resolve IB host/port: GatewayRouter (when configured) or
             # fall back to process-wide settings.
             # ---------------------------------------------------------
-            if deployment.ib_login_key and gateway_router and gateway_router.is_multi_login:
+            # F5 fix (silent-failure-hunter F2): the previous fallback
+            # collapsed three independent conditions into one ``else``:
+            # (1) ``ib_login_key`` empty/None, (2) ``gateway_router`` None,
+            # (3) router exists but ``is_multi_login`` is False. The
+            # missing branch — ``ib_login_key`` is non-empty but doesn't
+            # match any router entry — silently fell through to
+            # ``settings.ib_host/port``, meaning a deployment for account
+            # A on login key X could end up routed to whatever the
+            # process-wide IB env vars point at (login Y). Real-money
+            # mis-routing.
+            #
+            # New rule: when ``ib_login_key`` is set AND a router exists,
+            # ALWAYS call ``gateway_router.resolve(...)`` (regardless of
+            # ``is_multi_login``). Let ``ValueError`` propagate up to the
+            # process_manager's permanent-catch — translates to
+            # ``SPAWN_FAILED_PERMANENT`` via the existing error dispatch.
+            # Single-login routers still validate (good — they reject
+            # typos at the boundary instead of silently picking env vars).
+            # The fall-through to ``settings.ib_host/port`` is allowed
+            # ONLY when ``ib_login_key`` is None/empty (legacy row) OR
+            # equals the migration sentinel ``"default"`` (Codex iter 12
+            # P2: migration ``t8o9p0q1r2s3`` backfills NULL ib_login_key
+            # to ``"default"`` so the column can be NOT NULL — these
+            # rows pre-date routing and must continue to warm-restart
+            # via ``settings.ib_host/port``).
+            legacy_default_login_key = "default"
+            is_routed = (
+                deployment.ib_login_key is not None
+                and deployment.ib_login_key != legacy_default_login_key
+                and deployment.ib_login_key != ""
+            )
+            if is_routed and gateway_router is not None:
                 endpoint = gateway_router.resolve(deployment.ib_login_key)
                 ib_host = endpoint.host
                 ib_port = endpoint.port
+                # Codex iter 15 P2: when GATEWAY_CONFIG declares an
+                # ``accounts=`` binding for this login (e.g.
+                # ``marin1016test:host:port:accounts=DUP733214|DUP733215``),
+                # enforce that ``deployment.account_id`` is one of the
+                # bound accounts. Without this check, a deployment could
+                # request a login that routes successfully but submit
+                # orders against an unbound account_id — defeating the
+                # declarative account-to-login isolation.
+                #
+                # Bindings are opt-in: legacy ``login:host:port`` entries
+                # (no ``accounts=`` segment) get an empty list and skip
+                # the check.
+                bound_accounts = gateway_router.accounts_for(deployment.ib_login_key)
+                if bound_accounts and deployment.account_id not in bound_accounts:
+                    raise ValueError(
+                        f"account_id={deployment.account_id!r} is not bound to "
+                        f"ib_login_key={deployment.ib_login_key!r} in GATEWAY_CONFIG "
+                        f"(bound accounts: {bound_accounts!r}). Refusing to route — "
+                        "the declarative account-to-login binding would be bypassed."
+                    )
+            elif is_routed:
+                # Codex iter 7 P2-1: deployment requests a specific
+                # ``ib_login_key`` but the supervisor was started without
+                # ``GATEWAY_CONFIG`` (router is None). Falling through to
+                # ``settings.ib_host/port`` would silently route the deployment
+                # to the wrong broker. Fail-closed instead.
+                raise ValueError(
+                    f"deployment requests ib_login_key={deployment.ib_login_key!r} "
+                    f"but no GATEWAY_CONFIG is set on the supervisor — "
+                    f"refuse to route to settings.ib_host/port (would risk "
+                    f"submitting orders against the wrong broker container)"
+                )
             else:
                 ib_host = settings.ib_host
                 ib_port = settings.ib_port
@@ -294,7 +394,9 @@ def _build_production_payload_factory(
                     # (all subclass ``LiveResolverError`` → ``ValueError``), so
                     # ``ProcessManager``'s permanent-catch fires and dispatches
                     # on subtype to the specific ``FailureKind``.
-                    member_paper_symbols = [inst.split(".")[0] for inst in member.instruments]
+                    member_paper_symbols = [
+                        _strip_venue_suffix(inst) for inst in member.instruments
+                    ]
 
                     # Defensive guard — empty member.instruments is a programmer
                     # bug (portfolio revision freeze should have rejected it).
@@ -326,8 +428,8 @@ def _build_production_payload_factory(
                             for x in ("IDEALPRO", "CASH", "EUR", "GBP", "JPY", "AUD", "CHF")
                         )
                         _price_type = "MID" if _is_fx else "LAST"
-                        user_root = first_user_inst.split(".")[0]
-                        canonical_root = first_inst.split(".")[0]
+                        user_root = _strip_venue_suffix(first_user_inst)
+                        canonical_root = _strip_venue_suffix(first_inst)
                         if user_root != canonical_root:
                             member_config["instrument_id"] = first_inst
                             existing_bt = member_config.get("bar_type", "")
@@ -365,6 +467,141 @@ def _build_production_payload_factory(
                 paper_symbols = sorted(set(all_paper_symbols))
                 canonical_instrument_ids = sorted(set(all_canonical_instruments))
 
+                # ----------------------------------------------------
+                # PR 1 T12: per-account Databento + IB-exec resolution.
+                # ----------------------------------------------------
+                # When the deployment carries an ``account_id`` (always
+                # true post-Task 11), pre-resolve the three fields the
+                # subprocess needs to construct the per-account
+                # TradingNodeConfig via
+                # :func:`build_per_account_trading_node_config`:
+                #
+                #   1. ``native_instrument_ids`` + ``venue_dataset_map``
+                #      — resolved via T10's :func:`resolve_databento_targets`
+                #      which calls the symbology shim per canonical id.
+                #   2. ``canonical_to_native_bar_types`` — built here
+                #      by zipping each member's canonical bar_type
+                #      (canonical ``.IBKR`` venue suffix) with its
+                #      native equivalent (replace ``.IBKR`` with the
+                #      shim's native venue from the venue_dataset_map).
+                #   3. ``ibg_client_id`` — derived from the deployment
+                #      slug via the shared helper
+                #      :func:`derive_ibg_client_id` (single source of
+                #      truth, Codex iter 1 P1-5).
+                #
+                # PR 1 scope is EQUITIES ONLY. Any non-equity asset
+                # class trips :class:`NotImplementedError` from the
+                # shim — we catch it and skip the per-account fields
+                # so the legacy builder still spawns the deployment
+                # (futures + options bridge work is deferred to PR 2).
+                native_instrument_ids: list[str] = []
+                venue_dataset_map: dict[str, str] = {}
+                canonical_to_native_bar_types: dict[str, str] = {}
+                ibg_client_id = 0
+                if deployment_account:
+                    # Build the .IBKR-canonical id list from each
+                    # member's first canonical instrument. The shim
+                    # is keyed per-symbol so passing each canonical
+                    # root once is sufficient; ``resolve_databento_targets``
+                    # de-dups internally if needed.
+                    canonical_ibkr_ids: list[str] = []
+                    seen_canonical_roots: set[str] = set()
+                    for canonical_str in canonical_instrument_ids:
+                        if "." not in canonical_str:
+                            continue
+                        root = _strip_venue_suffix(canonical_str)
+                        if not root or root in seen_canonical_roots:
+                            continue
+                        seen_canonical_roots.add(root)
+                        canonical_ibkr_ids.append(f"{root}.{_IBKR_VENUE_SUFFIX}")
+
+                    try:
+                        resolved_targets = await resolve_databento_targets(
+                            canonical_ids=canonical_ibkr_ids,
+                            session=session,
+                            as_of_date=spawn_today,
+                        )
+                        native_instrument_ids = list(resolved_targets.native_instrument_ids)
+                        venue_dataset_map = dict(resolved_targets.venue_dataset_map)
+
+                        # Build canonical_to_native_bar_types by zipping
+                        # each member's ``bar_type`` (canonical, e.g.
+                        # ``AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL``)
+                        # with the native equivalent. The shim's
+                        # outbound subscription requires the .IBKR
+                        # canonical suffix per architectural rule #3,
+                        # so we substitute the venue portion of the
+                        # bar_type prefix:
+                        #
+                        #   AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL
+                        #     -> AAPL.IBKR-1-MINUTE-LAST-EXTERNAL   (canonical key)
+                        #     -> AAPL.XNAS-1-MINUTE-LAST-EXTERNAL   (native value)
+                        #
+                        # ``native_instrument_ids`` is order-preserved
+                        # against ``canonical_ibkr_ids`` (T10 builds the
+                        # list in that order), so we can zip them.
+                        root_to_native_iid = {
+                            _strip_venue_suffix(canonical_ibkr_id): native_iid
+                            for canonical_ibkr_id, native_iid in zip(
+                                canonical_ibkr_ids, native_instrument_ids, strict=True
+                            )
+                        }
+                        for member_payload in strategy_members:
+                            bar_type_str = str(member_payload.strategy_config.get("bar_type") or "")
+                            if not bar_type_str:
+                                continue
+                            # bar_type format: "SYM.VENUE-..."
+                            prefix, dash, spec_tail = bar_type_str.partition("-")
+                            if not dash or "." not in prefix:
+                                continue
+                            sym_root = _strip_venue_suffix(prefix)
+                            native_iid = root_to_native_iid.get(sym_root)
+                            if not native_iid:
+                                continue
+                            canonical_key = f"{sym_root}.{_IBKR_VENUE_SUFFIX}-{spec_tail}"
+                            native_value = f"{native_iid}-{spec_tail}"
+                            canonical_to_native_bar_types[canonical_key] = native_value
+
+                        ibg_client_id = derive_ibg_client_id(deployment_slug, ROLE_EXEC)
+                    except (NotImplementedError, LiveResolverError) as exc:
+                        # PR 1 equities-only: futures/options/fx fall
+                        # back to the legacy builder. Two trigger paths:
+                        #
+                        # 1. ``NotImplementedError`` — the shim's
+                        #    asset-class guard fires for a member whose
+                        #    raw_symbol matches a futures/option/fx
+                        #    registry row (the intended fallback path).
+                        #
+                        # 2. ``LiveResolverError`` (Codex iter 17 P1) —
+                        #    e.g. ``RegistryMissError`` when the
+                        #    supervisor strips the venue suffix off
+                        #    ``ESM6.CME`` and the shim's bare-symbol
+                        #    lookup of ``ESM6`` doesn't match any
+                        #    raw_symbol (the registry stores futures
+                        #    as raw_symbol=``ES`` + alias=``ESM6.CME``;
+                        #    bare ``ESM6`` skips the alias-fallback
+                        #    branch in ``lookup_for_live``). Catching
+                        #    the broader ``LiveResolverError`` base
+                        #    class lets ANY non-equity registry miss
+                        #    fall through to the legacy IB-data builder
+                        #    where contract resolution does work via
+                        #    ``find_by_alias`` upstream. A genuine
+                        #    equity miss would also fail under the
+                        #    legacy path — equivalent end result,
+                        #    correct outcome for non-equities.
+                        log.info(
+                            "per_account_topology_skipped_non_equity",
+                            extra={
+                                "deployment_id": str(deployment_id),
+                                "reason": str(exc),
+                                "exc_type": type(exc).__name__,
+                            },
+                        )
+                        native_instrument_ids = []
+                        venue_dataset_map = {}
+                        canonical_to_native_bar_types = {}
+                        ibg_client_id = 0
+
                 # Use first member's paths for backward-compat fields
                 first_member = strategy_members[0]
                 nautilus_payload = TradingNodePayload(
@@ -390,6 +627,14 @@ def _build_production_payload_factory(
                     redis_url=settings.redis_url,
                     startup_health_timeout_s=settings.startup_health_timeout_s,
                     strategy_members=strategy_members,
+                    # PR 1 T12 per-account fields. Empty when the
+                    # equities-only shim couldn't resolve (futures/
+                    # options/fx) — subprocess falls back to legacy
+                    # builder via ``use_per_account_topology = False``.
+                    ibg_client_id=ibg_client_id,
+                    native_instrument_ids=native_instrument_ids,
+                    venue_dataset_map=venue_dataset_map,
+                    canonical_to_native_bar_types=canonical_to_native_bar_types,
                 )
                 log.info(
                     "trading_node_payload_built",
@@ -404,6 +649,10 @@ def _build_production_payload_factory(
                         "account_id": deployment_account,
                         "paper_trading": deployment.paper_trading,
                         "ib_login_key": deployment.ib_login_key,
+                        "ibg_client_id": ibg_client_id,
+                        "native_instrument_ids": native_instrument_ids,
+                        "venue_dataset_map": venue_dataset_map,
+                        "canonical_to_native_bar_types_count": len(canonical_to_native_bar_types),
                     },
                 )
 
@@ -472,6 +721,26 @@ async def _async_main() -> int:
                 "login_keys": gateway_router.login_keys,
                 "config": gateway_config,
             },
+        )
+
+    # Codex iter 13 P2: docker-compose interpolation runs BEFORE profile
+    # selection, so ``:?`` guards on broker-only services would break
+    # default-profile ``docker compose config / up``. Surface missing
+    # broker-profile envs at supervisor startup instead — the supervisor
+    # only runs under the broker profile, so this is the right boundary.
+    if not gateway_config:
+        logger.warning(
+            "supervisor_started_without_gateway_config "
+            "— per-account deployments will be rejected by the "
+            "payload factory's fail-closed branch. Set GATEWAY_CONFIG "
+            "in .env if you intend to deploy with ib_login_key set."
+        )
+    if not settings.databento_api_key:
+        logger.warning(
+            "supervisor_started_without_databento_api_key "
+            "— per-account TradingNode subprocesses will fail when "
+            "constructing the Databento live data client. Set "
+            "DATABENTO_API_KEY in .env to enable per-account deployments."
         )
 
     bus = LiveCommandBus(redis=redis_client)

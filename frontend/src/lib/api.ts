@@ -298,6 +298,12 @@ export interface LiveDeploymentInfo {
   instruments: string[] | null;
   started_at: string | null;
   stopped_at: string | null;
+  // PR 1 T14 — account context for the fleet topology. Nullable while
+  // legacy deployments without IB-login bindings exist; populated for
+  // any deployment that flowed through the per-account topology path.
+  account_id: string | null;
+  ib_login_key: string | null;
+  ibg_client_id: number | null;
 }
 
 export interface LiveStatusResponse {

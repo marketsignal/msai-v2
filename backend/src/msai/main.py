@@ -224,13 +224,23 @@ async def _stop_projection_tasks() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Startup/shutdown lifecycle."""
+    import os
+
     from msai.api.account import start_ib_probe_task, stop_ib_probe_task
     from msai.core.soft_delete import register_soft_delete_listeners
     from msai.services.ib_account_snapshot import get_snapshot
+    from msai.services.live.gateway_router import GatewayRouter
 
     # Soft-delete listener — default-filters ``deleted_at IS NULL`` from
     # select(Strategy); opt-out via ``execution_options(include_deleted=True)``.
     register_soft_delete_listeners()
+
+    # PR 1 T5 + council 2026-05-29 obj #13: fail-closed on misconfigured
+    # GATEWAY_CONFIG (duplicate ib_login_key). GatewayRouter.__init__
+    # raises ValueError, which propagates and causes the ASGI process to
+    # exit non-zero — operators see the duplicate key in their logs
+    # within 10s of boot rather than at first live deployment.
+    app.state.gateway_router = GatewayRouter(os.environ.get("GATEWAY_CONFIG"))
 
     await _ensure_api_key_user()  # best-effort, retried on /ready
     await _start_projection_tasks()

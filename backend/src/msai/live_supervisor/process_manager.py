@@ -71,6 +71,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from msai.core.halt_keys import fleet_halt_key
 from msai.models import LiveDeployment, LiveNodeProcess
 from msai.services.live.failure_kind import FailureKind
 
@@ -93,8 +94,9 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-_HALT_KEY = "msai:risk:halt"
-"""Redis key set by ``/api/v1/live/kill-all``. The supervisor re-checks
+_HALT_KEY = fleet_halt_key()
+"""Redis key set by ``/api/v1/live/kill-all`` (consolidated into
+``msai.core.halt_keys`` via PR 1 T2). The supervisor re-checks
 this in phase B of ``spawn`` so a command queued before ``/kill-all``
 (or reclaimed from the PEL after) is rejected at the supervisor layer
 even if the endpoint already passed its own pre-check."""
@@ -201,28 +203,21 @@ class ProcessManager:
             deployment_slug=deployment_slug,
             gateway_session_key=gateway_session_key,
         )
-        if row_id is None:
-            # Phase A returned None → either hard failure (no
-            # deployment), busy with a 'stopping' row, or an already-
-            # active row that is NOT stopping (the idempotent-success
-            # and hard-failure cases are distinguished by the
-            # _PhaseAOutcome below). Re-implemented via helper so the
-            # three-valued return is explicit.
-            return False
+        # Phase A returns either a real UUID (newly reserved slot) or a
+        # ``_PhaseAOutcome`` sentinel. ``ALREADY_ACTIVE`` is the only
+        # idempotent-success path → ACK the command. The other three
+        # sentinels are non-spawn outcomes:
+        #   - ``BUSY_STOPPING``: stop is still draining; do NOT ACK so
+        #     the command stays in the PEL for XAUTOCLAIM redelivery.
+        #   - ``NO_DEPLOYMENT``: deployment row was deleted between the
+        #     idempotency check and the slot reservation; do NOT ACK.
+        #   - ``CONCURRENT_STARTUP`` (Bug X1): another deployment is
+        #     still initializing on the same gateway; do NOT ACK so the
+        #     consumer group picks it up via ``XAUTOCLAIM`` once the
+        #     first deployment reaches ``running``.
         if row_id is _PhaseAOutcome.ALREADY_ACTIVE:
             return True
-        if row_id is _PhaseAOutcome.BUSY_STOPPING:
-            return False
-        if row_id is _PhaseAOutcome.NO_DEPLOYMENT:
-            return False
-        if row_id is _PhaseAOutcome.CONCURRENT_STARTUP:
-            # Bug X1: another deployment is still initializing. We
-            # return False so the command reclaim path retries after
-            # the first one reaches ``running`` (or times out / fails).
-            # Ack-ing here would drop the command silently; leaving
-            # it unacked lets the supervisor consumer group pick it
-            # up on the next tick via ``XAUTOCLAIM`` once the first
-            # deployment is stable.
+        if isinstance(row_id, _PhaseAOutcome):
             return False
 
         # row_id is a real UUID from here on.
@@ -241,6 +236,71 @@ class ProcessManager:
                 failure_kind=FailureKind.HALT_ACTIVE,
             )
             return True  # ACK — no retry until /resume
+
+        # Account-scoped halt latch re-check (PR 1 T8 / Codex iter 1 P2-1).
+        # ``/api/v1/live/drain/{account_id}`` writes ``account_halt_key``
+        # to block the drained sub-account. A queued START — or any
+        # START arriving after drain — must NOT spawn the subprocess.
+        # Mirrors the fleet halt-re-check above but is keyed by the
+        # deployment's ``account_id`` so sibling accounts under the
+        # same TWS login keep running. Council 2026-05-29 obj #11:
+        # halt latch is per ``account_id``, NOT per ``ib_login_key``.
+        from msai.core.halt_keys import account_halt_key
+
+        # Codex iter 6 P1-1: bound the account-halt lookup. If
+        # ``_account_id_for`` (DB) or ``self._redis.exists`` (Redis) raise
+        # transiently, the exception would escape AFTER phase A already
+        # committed the ``starting`` row. On redelivery, ``_phase_a_reserve_slot``
+        # sees the row as active and ACKs without spawning — the deployment
+        # gets stuck until watchdog timeout. Treat lookup failures the same
+        # way as payload-factory failures (the existing transient-cleanup
+        # path below covers this class of error).
+        try:
+            deployment_account_id = await self._account_id_for(deployment_slug)
+            account_halt_set = False
+            if deployment_account_id:
+                account_halt_set = bool(
+                    await self._redis.exists(account_halt_key(deployment_account_id))
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.exception(
+                "spawn_account_halt_lookup_failed",
+                extra={"deployment_id": str(deployment_id), "exc_type": type(exc).__name__},
+            )
+            # Codex iter 10 P2: ``_mark_failed`` uses the same DB path
+            # that just blipped. If it raises here, the exception escapes
+            # AFTER Phase A committed the ``starting`` row; redelivery
+            # then sees the row as active and ACKs without spawning,
+            # leaving the deployment stuck until the watchdog recovers
+            # it. Make cleanup best-effort (matches the payload-factory
+            # transient-cleanup pattern lower in this method).
+            try:
+                await self._mark_failed(
+                    row_id=row_id,
+                    reason=f"account-halt lookup failed: {exc!r}",
+                    failure_kind=FailureKind.SPAWN_FAILED_TRANSIENT,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "spawn_account_halt_lookup_cleanup_failed",
+                    extra={"deployment_id": str(deployment_id)},
+                )
+            return True  # ACK — let the operator retry via /start after Redis/DB recovers
+
+        if deployment_account_id and account_halt_set:
+            log.warning(
+                "spawn_blocked_by_account_halt",
+                extra={
+                    "deployment_id": str(deployment_id),
+                    "account_id": deployment_account_id,
+                },
+            )
+            await self._mark_failed(
+                row_id=row_id,
+                reason=(f"blocked by account halt latch for account_id={deployment_account_id}"),
+                failure_kind=FailureKind.ACCOUNT_HALT_ACTIVE,
+            )
+            return True  # ACK — no retry until the drain latch clears
 
         # Resolve the args tuple for this spawn. Production uses the
         # payload factory to construct a per-deployment
@@ -446,6 +506,75 @@ class ProcessManager:
             )
             return True  # ACK — no retry until /resume
 
+        # F3 fix (Codex iter 2 P1 / silent-failure-hunter F4): account-halt
+        # re-check race. The account-halt check above (phase B, before the
+        # payload factory) closes one race but leaves another: the payload
+        # factory await is seconds of wall clock (DB reads, Databento
+        # resolution, module imports). ``/api/v1/live/drain/{account_id}``
+        # firing DURING that await would set ``account_halt_key(account_id)``
+        # but the earlier check already passed — the subprocess would
+        # spawn under an active drain.
+        #
+        # Mirror the fleet-halt re-check pattern above. ``account_id`` is
+        # already cached from the phase-B check via ``_account_id_for``
+        # so this is a single Redis EXISTS, no extra DB hit. Mark the row
+        # ``ACCOUNT_HALT_ACTIVE`` (NOT the fleet-wide ``HALT_ACTIVE`` —
+        # F1 + F3 are intentionally distinct kinds) and ACK.
+        if deployment_account_id:
+            # Codex iter 7 P2-3: wrap the post-payload Redis EXISTS in the
+            # same try/except as the pre-payload account-halt lookup. A
+            # transient Redis hiccup here would otherwise escape after Phase
+            # A has committed the ``starting`` row, leaving the deployment
+            # stuck on redelivery (active row → ACK without spawn).
+            try:
+                account_halt_set_again = bool(
+                    await self._redis.exists(account_halt_key(deployment_account_id))
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception(
+                    "spawn_account_halt_post_payload_lookup_failed",
+                    extra={
+                        "deployment_id": str(deployment_id),
+                        "exc_type": type(exc).__name__,
+                    },
+                )
+                # Codex iter 10 P2 (applied symmetrically): cleanup is
+                # best-effort so a paired DB blip doesn't leak the row.
+                try:
+                    await self._mark_failed(
+                        row_id=row_id,
+                        reason=f"post-payload account-halt lookup failed: {exc!r}",
+                        failure_kind=FailureKind.SPAWN_FAILED_TRANSIENT,
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception(
+                        "spawn_account_halt_post_payload_cleanup_failed",
+                        extra={"deployment_id": str(deployment_id)},
+                    )
+                return True
+            if account_halt_set_again:
+                log.warning(
+                    "spawn_blocked_by_account_halt_post_payload_factory",
+                    extra={
+                        "deployment_id": str(deployment_id),
+                        "deployment_slug": deployment_slug,
+                        "account_id": deployment_account_id,
+                        "note": (
+                            "account drain latch raised during payload factory "
+                            "await — catching at second check, no subprocess spawned"
+                        ),
+                    },
+                )
+                await self._mark_failed(
+                    row_id=row_id,
+                    reason=(
+                        f"blocked by account halt latch (post-payload-factory "
+                        f"recheck) for account_id={deployment_account_id}"
+                    ),
+                    failure_kind=FailureKind.ACCOUNT_HALT_ACTIVE,
+                )
+                return True  # ACK — no retry until the drain latch clears
+
         try:
             process = self._spawn_ctx.Process(  # type: ignore[attr-defined]  # BaseContext typed too wide; concrete ctxs (spawn/fork) expose Process
                 target=self._spawn_target,
@@ -488,6 +617,26 @@ class ProcessManager:
             )
 
         return True
+
+    async def _account_id_for(self, deployment_slug: str) -> str | None:
+        """Read the ``account_id`` for ``deployment_slug``.
+
+        Used by phase B of :meth:`spawn` to re-check the account-scoped
+        halt latch (PR 1 T8 / Codex iter 1 P2-1). Returns ``None`` when
+        the deployment row is gone (which phase A would have caught
+        with :attr:`_PhaseAOutcome.NO_DEPLOYMENT` before phase B runs;
+        the ``None`` return is purely defensive against a races where
+        the row was deleted between phases).
+        """
+        async with self._db() as session:
+            row = (
+                await session.execute(
+                    select(LiveDeployment.account_id).where(
+                        LiveDeployment.deployment_slug == deployment_slug,
+                    )
+                )
+            ).scalar_one_or_none()
+            return row
 
     async def _phase_a_reserve_slot(
         self,
@@ -658,8 +807,6 @@ class ProcessManager:
         # that never cleans up. Transition the deployment row in the
         # same transaction so /live/status reflects reality on the
         # next read.
-        from msai.models.live_deployment import LiveDeployment
-
         async with self._db() as session, session.begin():
             row = await session.get(LiveNodeProcess, row_id)
             if row is None:

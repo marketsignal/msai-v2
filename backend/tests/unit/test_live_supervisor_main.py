@@ -159,8 +159,11 @@ class _NoopProcessManager:
         deployment_slug: str,
         payload: dict,
         idempotency_key: str,
+        gateway_session_key: str | None = None,  # PR 1 T6: added kwarg
     ) -> bool:
         self.spawn_calls.append(deployment_id)
+        # PR 1 T6: capture the propagated key so tests can assert it
+        self.last_gateway_session_key: str | None = gateway_session_key
         if self.raise_on_spawn:
             raise RuntimeError("boom")
         return self.spawn_return

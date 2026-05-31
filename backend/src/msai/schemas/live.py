@@ -6,7 +6,7 @@ from datetime import datetime  # noqa: TC003 — Pydantic resolves annotations a
 from typing import Any
 from uuid import UUID  # noqa: TC003 — Pydantic resolves annotations at runtime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class LiveStartRequest(BaseModel):
@@ -31,6 +31,43 @@ class PortfolioStartRequest(BaseModel):
     paper_trading: bool = True
     ib_login_key: str = Field(min_length=1, max_length=64)
 
+    @field_validator("account_id")
+    @classmethod
+    def _normalize_account_id(cls, v: str) -> str:
+        """Codex iter 16 P2: strip whitespace and reject internal
+        whitespace so the halt-latch key written by ``/drain/{account_id}``
+        (URL-stripped) always matches the key read by the supervisor's
+        per-account halt check. A leading-space ``" DUP733214"`` slipping
+        past would let the supervisor read a different Redis key than
+        the drain endpoint wrote, bypassing the drain latch.
+        """
+        normalized = v.strip()
+        if not normalized:
+            raise ValueError("account_id cannot be empty / whitespace-only")
+        if any(ch.isspace() for ch in normalized):
+            raise ValueError(
+                f"account_id={v!r} contains whitespace — IB account ids "
+                "are alphanumeric (e.g. 'DUP733214' or 'U1234567')"
+            )
+        return normalized
+
+    # Codex iter 15 P2 REVERTED in iter 20 P2: the original validator
+    # rejected ``ib_login_key='default'`` to prevent operator typos from
+    # silently bypassing ``GatewayRouter.resolve``. But warm-restarting
+    # a deployment whose row was backfilled by migration ``t8o9p0q1r2s3``
+    # REQUIRES sending ``default`` to match the existing
+    # ``identity_signature`` — sending a real key creates a different
+    # identity and hits the ``(portfolio_revision_id, account_id)``
+    # conflict path. So the schema validator made legacy rows
+    # unrestartable through the public API. The supervisor's
+    # ``is_routed`` predicate (live_supervisor/__main__.py) and startup
+    # warning already handle the typo concern: ``default`` falls back
+    # to ``settings.ib_host/port`` and the supervisor emits a clear
+    # warning at boot when GATEWAY_CONFIG is empty. Operator-typo
+    # protection ultimately belongs at the operator's CONFIG layer
+    # (GATEWAY_CONFIG present in prod → no fall-through unless
+    # explicitly intended).
+
 
 class LiveStopRequest(BaseModel):
     """Request schema for stopping a running deployment."""
@@ -48,6 +85,15 @@ class LiveDeploymentInfo(BaseModel):
     instruments: list[str] = []
     started_at: datetime | None = None
     stopped_at: datetime | None = None
+    # PR 1 T14 — account context for the fleet topology. ``ib_login_key``
+    # + ``account_id`` are sourced from the LiveDeployment row; the
+    # ``ibg_client_id`` is the deterministic derivation from
+    # ``deployment_slug`` via ``msai.services.nautilus.ibg_client_id``
+    # (the SoT for client-id derivation). Tests / CLI / UI consume these
+    # to correlate logs across the fleet.
+    account_id: str | None = None
+    ib_login_key: str | None = None
+    ibg_client_id: int | None = None
 
     model_config = {"from_attributes": True}
 

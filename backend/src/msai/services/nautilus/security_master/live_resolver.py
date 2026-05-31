@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
     from msai.models.instrument_alias import InstrumentAlias
     from msai.models.instrument_definition import InstrumentDefinition
-    from msai.services.nautilus.security_master.types import Provider
+    from msai.services.nautilus.security_master.types import Provider, RegistryAssetClass
 
 _log = structlog.get_logger(__name__)
 # Sibling stdlib logger used only for the ``_fire_alert_bounded`` timeout /
@@ -450,6 +450,7 @@ async def lookup_for_live(
     as_of_date: date,
     session: AsyncSession,
     provider: Provider = "interactive_brokers",
+    asset_class: AssetClass | None = None,
 ) -> list[ResolvedInstrument]:
     """Pure-read registry resolver for the live-start critical path.
 
@@ -516,8 +517,20 @@ async def lookup_for_live(
         # AmbiguousRegistryError (subclass of LiveResolverError →
         # ValueError) so the supervisor's permanent-catch fires instead
         # of the transient-retry branch.
+        # Codex iter 11 P2: callers in equities-only PR 1 paths (e.g.
+        # ``symbology_shim.resolve_for_databento``) can pin ``asset_class``
+        # to disambiguate raw_symbols that exist across asset classes
+        # (e.g. ``SPY`` as both equity ARCA listing AND option rows). With
+        # ``None`` the resolver preserves its prior behavior — raise
+        # ``AmbiguousRegistryError`` on cross-class hits.
+        # ``AssetClass(StrEnum)`` values exactly match the
+        # ``RegistryAssetClass`` Literal — mypy infers the narrowing
+        # automatically, no cast needed.
+        ac_filter: RegistryAssetClass | None = (
+            asset_class.value if asset_class is not None else None
+        )
         try:
-            idef = await registry.find_by_raw_symbol(sym, provider=provider, asset_class=None)
+            idef = await registry.find_by_raw_symbol(sym, provider=provider, asset_class=ac_filter)
         except AmbiguousSymbolError as exc:
             raise AmbiguousRegistryError(
                 symbol=sym,
