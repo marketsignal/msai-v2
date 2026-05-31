@@ -221,3 +221,89 @@ Until those five conditions are demonstrated in a documented drill, **no real-mo
 ### Provenance
 
 Engineering Council, 2026-05-29. Standalone `/council` invocation during `/forge-goal` autonomous run on `/new-feature multi-account-broker-fleet`. Raw advisor transcripts captured at session time. Engine diversity: 3 Claude advisors + 2 Codex advisors + Codex chairman (xhigh).
+
+---
+
+## Addendum 2026-05-30 — Forward plan after PR 1 ship + PR 3 credentials council
+
+PR 1 shipped 2026-05-30 as **PR #84** (`feat/multi-account-broker-fleet`). Shape A control plane + Shape B compose foundation + 2026-05-30 18:55 CT operator drill: multi-container topology + halt-key isolation verified end-to-end on LVP+HVP. UC matrix: Negative UC PASS, UC4 PASS, UC5 FIXED, UC1/UC2/UC3 PASS (Shape B at API+Redis level — fill verification deferred to next market session since drill ran weekend after-hours).
+
+### Sequencing ratified (Pablo + council)
+
+1. **PR 1 — DONE** (per-account control plane, halt-key consolidation, symbology shim, GatewayRouter, account-scoped drain, Shape B compose foundation).
+2. **PR 1b — data-stale auto-halt** (deferred from PR 1 per Hawk minority report; gates LVP/HVP graduation).
+3. **PR 2 — per-account supervisor processes.** Replace `ProcessManager.handles` shared map with one supervisor process per account. The Hawk's PR 3 council vote was explicit: "letting an operator add/remove accounts at runtime is safer with isolated supervisors." PR 2 lands before PR 3.
+4. **PR 3 — BrokerAccount first-class entity.** Operator-facing CRUD: add/edit/archive an IB account via UI/CLI/API, no env-var edits. Credentials handling council below.
+5. **PR 4 — Dashboard account selector** (UI fleet view + filters).
+6. **PR 5 — Per-account hard caps + fleet-aggregate ledger** (risk overlays land here).
+
+### PR 3 credentials handling — council ruling (2026-05-30, standalone /council)
+
+- **Council:** 5 advisors (Simplifier, Scalability Hawk, Pragmatist — Claude; Contrarian, Maintainer — Codex `gpt-5.5`) + Codex chairman (`gpt-5.5`, xhigh).
+- **Tally:** 4 of 5 advisors verdict **CONDITIONAL APPROVE Option B'** (DB stores secret reference + pinned KV version; backend writes credentials to Azure Key Vault server-side from UI/CLI/API POST payload — operator never opens an Azure portal tab). 1 advisor (Pragmatist) dissented in favor of Option A (DB-encrypted-at-rest with `MASTER_ENCRYPTION_KEY`).
+
+#### Ratified decision
+
+**Option B'.** The single UI/CLI/API operator flow accepts credentials in the POST payload. Backend writes them to AKV server-side using managed identity in production, or to `.env` via `EnvSecretsProvider` in dev. The `broker_accounts` row stores **only** `credentials_secret_ref` + `credentials_secret_version` (pinned KV version GUID) + `credentials_updated_at` + `credentials_updated_by`. GET endpoints never return the cleartext. The IB Gateway container reads `TWS_USERID`/`TWS_PASSWORD` from its own process env, materialized at spawn time from a fresh KV fetch.
+
+#### Blocking objections (must land in the same PR as the storage)
+
+1. **Backend writes to KV on POST.** Operators never call `az keyvault secret set`. (Simplifier, Hawk.)
+2. **Dev fallback via `EnvSecretsProvider`** reading `TWS_USERID_<suffix>` from `.env`. **No local KV emulator** — keeps dev paths drama-free. (Hawk, Contrarian.)
+3. **Pin `credentials_secret_version`** on the row (KV version GUID, not just the name) — rotation becomes an explicit DB UPDATE; audit trail preserved across versions. (Hawk, Maintainer.)
+4. **Dedicated `BrokerCredentialsStore` interface** (or `WritableSecretsProvider`) — do NOT bolt write semantics onto the read-only `SecretsProvider`. Explicit `put(account_id) / get(account_id, version) / rotate(account_id) / delete(account_id)` semantics. (Contrarian, Maintainer.)
+5. **Audit metadata on the row:** `credentials_updated_at` + `credentials_updated_by`. (Maintainer.)
+6. **Mandatory alerts shipped same PR:**
+   - `broker_account_spawn_failed{account_id, reason}` counter — reason ∈ `kv_unauthorized | kv_not_found | kv_throttled | kv_unreachable | decrypt_failed`
+   - `kv_secret_age_seconds{account_id}` gauge — alerts when >90d (rotation enforcement)
+   - `credentials_last_accessed` timestamp on the row — feeds ghost-account detection
+   - Startup boot-time KV reachability probe — fail-closed if KV unreachable AND any active deployment exists
+   - (Hawk, Maintainer.)
+7. **Fail-LOUD mapping:** credential resolution errors must surface as `SPAWN_FAILED_PERMANENT` with actionable error messages naming the missing/invalid account + secret reference. NOT generic provisioning failures. (Hawk, Maintainer, prior council 2026-05-27.)
+8. **Account-deletion + rotation semantics specified before merge.** What happens to KV secret on `archive`? Hard delete? Soft delete with TTL? Define before shipping. (Contrarian.)
+
+#### Minority Report (Pragmatist, Option A)
+
+The Pragmatist favored Option A (DB-encrypted-at-rest with `MASTER_ENCRYPTION_KEY`) on velocity grounds (~2-3 days vs ~3-4 days) and threat-model symmetry (single-VM compromise = total compromise either way; KV's audit/rotation advantages don't apply to a solo dev today).
+
+**Overruled because:** the Pragmatist did not re-evaluate after Option B' was named during deliberation — their primary objection (Option B's out-of-band operator KV write breaking Pablo's UX) is resolved by B'. The majority preserved B' because:
+
+- KV-grade audit + rotation map to the eventual multi-user state; Option A would require re-architecting encryption later.
+- Master-key loss is unrecoverable; KV-version pinning preserves prior-version recovery.
+- Existing `SecretsProvider` abstraction in `backend/src/msai/core/secrets.py` already handles both backends — B' adds no new infrastructure surface in prod.
+
+The speed concern (2-3 days vs 3-4 days) is deferred to implementation scope control, NOT used to change the storage decision.
+
+#### Fourth option (Contrarian) — envelope encryption
+
+Stored credentials_encrypted in DB, with the encryption key itself coming from the SecretsProvider (KV in prod, env in dev). Single POST flow, avoids per-account KV write lifecycle.
+
+**Status:** Documented but not adopted. Coherent fallback if writable-KV integration spike (see Missing Evidence) finds a blocker. Re-evaluate before merge if blockers surface.
+
+#### Static-pool provisioning (Pablo's choice)
+
+The compose ships N predefined `ib-gateway-{1..N}` services. Provisioning a new account = allocate a free slot + restart that service with the new login env (read from KV via supervisor-side init). Caps N at the pool size (proposed: 10). Pool size raised by editing compose; not runtime-dynamic. **Rejected alternatives:** docker-py spawn (security surface — docker socket access), Kubernetes operator (overkill for single-VM).
+
+#### Sub-PR split for PR 3
+
+Per the Pragmatist's flattening recommendation:
+- **PR 3a** — `broker_accounts` table + migration + CRUD API + `BrokerCredentialsStore` (with `EnvSecretsProvider` + `AzureKeyVaultProvider` adapters) + API-level E2E UC. (~1.5 days target.)
+- **PR 3b** — CLI sub-app + UI wizard + 2 surface UCs (CLI, UI). (~1 day target.)
+
+### Missing evidence (PR 3 council called out for pre-merge spike)
+
+- Writable KV integration spike: prove `SecretClient.set_secret` + version pinning + read-back works cleanly with the existing managed-identity setup. Estimated effort: < 30 min.
+- Concrete failure behavior for KV outage / missing version / deleted secret / bad permissions — each maps to specific `SPAWN_FAILED_PERMANENT` reasons.
+- Final naming/schema confirmation for `credentials_secret_ref`, `credentials_secret_version`, audit columns.
+- Rotation + deletion lifecycle tests.
+
+### Pending operator tasks (post-PR-1, pre-LVP/HVP graduation)
+
+- IB Account Management → Trading API permissions on **U4715997 (HVP)** — currently Read-Only API blocks order placement (drill 2026-05-30 surfaced this via IB error 321).
+- IB Client Portal → terminate stuck `marin1016test` primary-override session — unlocks the original Shape A paper sub-account drill if desired in addition to Shape B.
+- Re-run the Shape B drill with **fills** during market hours (Monday 8:30 AM CT or later) — adds the fill-round-trip evidence that this weekend's drill couldn't capture.
+
+### Provenance
+
+PR 3 credentials council: Engineering Council, 2026-05-30 (standalone `/council`). 4-1 majority for Option B' with overlapping CONDITIONAL constraints. Pragmatist minority report preserved per protocol. Codex advisors on first dispatch misread the question and answered the Shape A/B topology question; re-dispatched with tighter prompts and produced clean credentials-focused verdicts on retry. Chairman synthesis on first attempt also drifted to topology; retry with tight prompt produced the verdict captured here. Raw transcripts at `/tmp/council_{contrarian2,maintainer2,chairman2}_response.txt` (session-local).
+
