@@ -15,6 +15,7 @@ import {
   Wallet,
   Server,
   Settings,
+  KeyRound,
   Menu,
   X,
 } from "lucide-react";
@@ -42,6 +43,11 @@ const navItems: NavItem[] = [
   { label: "Account", href: "/account", icon: Wallet },
   { label: "Alerts", href: "/alerts", icon: Bell },
   { label: "System", href: "/system", icon: Server },
+  {
+    label: "Broker Accounts",
+    href: "/settings/broker-accounts",
+    icon: KeyRound,
+  },
   { label: "Settings", href: "/settings", icon: Settings },
 ];
 
@@ -74,6 +80,14 @@ function NavLink({
 
 function SidebarContent(): React.ReactElement {
   const pathname = usePathname();
+  // Most-specific match wins: the longest navItem href that equals the pathname or is a
+  // path-segment prefix of it. Without this, /settings/broker-accounts would mark BOTH
+  // "Settings" and "Broker Accounts" active (Codex plan-review P2). Order-independent.
+  const activeHref = navItems
+    .filter((i) => pathname === i.href || pathname.startsWith(`${i.href}/`))
+    .reduce<
+      string | null
+    >((best, i) => (best === null || i.href.length > best.length ? i.href : best), null);
 
   return (
     <div className="flex h-full flex-col">
@@ -95,9 +109,7 @@ function SidebarContent(): React.ReactElement {
           <NavLink
             key={item.href}
             item={item}
-            isActive={
-              pathname === item.href || pathname.startsWith(`${item.href}/`)
-            }
+            isActive={item.href === activeHref}
           />
         ))}
       </nav>

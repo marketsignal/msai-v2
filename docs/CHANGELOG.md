@@ -4,6 +4,16 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-06-02 — Fix: deep-link / refresh of a protected route bounces to /dashboard (`fix/broker-accounts-deeplink-auth-race`)
+
+**Status:** P1 prod auth-shell race fixed. Reproduced on prod via Playwright (authenticated): every full-page load / refresh / bookmark of a non-dashboard protected route silently redirected to `/dashboard`; `/settings/broker-accounts` was effectively unreachable (no sidebar link → direct-URL-only → always raced). Pre-existing app-shell bug exposed by PR #86's no-nav-link page.
+
+- **Root cause:** `app-shell.tsx` decided auth from `useIsAuthenticated()` alone. On a full load, MSAL (`@azure/msal-react` v5) is mid-`initialize()`/`handleRedirectPromise()`, so the hook is briefly `false` → effect fires `router.replace("/login")` → MSAL rehydrates → on `/login` the guard fires `router.replace("/dashboard")`. In-app SPA nav never raced (MSAL already initialized). Dev masks it: the auth-bypass (`isAuthBypassed()`) forces `isAuthenticated=true`, so there is no init window to race.
+- **Fix (`frontend/src/components/layout/app-shell.tsx`):** gate the redirect + render on MSAL having **settled** — `useMsal().inProgress === InteractionStatus.None` (canonical MSAL v5 idiom, Context7-confirmed). Hold a "Loading..." spinner until settled AND authenticated instead of render-then-bounce. Bypass modes short-circuit the wait (behavior-preserving on dev/E2E). Reuses `isAuthBypassed()` from `lib/auth.ts` (no inline flag duplication).
+- **Fix (`frontend/src/components/layout/sidebar.tsx`):** add a "Broker Accounts" nav item (`/settings/broker-accounts`, between System and Settings) so the page is reachable in-app; add a **longest-prefix `activeHref`** so the page highlights only "Broker Accounts", not also "Settings".
+- **Tests:** graduated E2E use cases `tests/e2e/use-cases/auth/deeplink-auth-race.md` (UC-DLA-1 deep-link lands; UC-DLA-2 sidebar nav + only-active) + Playwright spec `frontend/tests/e2e/specs/deeplink-auth-race.spec.ts` (both PASS on dev). Solution doc `docs/solutions/auth/deeplink-auth-guard-race.md`.
+- **Verification caveat:** the race is intrinsically not dev-reproducible (auth-bypass); dev E2E proves sidebar reachability + active-state + no render-path regression. The race fix itself is closed by Codex + pr-toolkit review and the **post-deploy prod re-test** (authenticated full-load of `/settings/broker-accounts` must land on the page).
+
 ### 2026-06-02 — Multi-Account Broker Fleet PR 3: BrokerAccount first-class entity (`feat/broker-account-entity`)
 
 **Status:** council-ratified architecture (Option B' credentials, 2026-05-30) implemented end-to-end across API + CLI + UI. Operator-managed CRUD for IB broker accounts — add / edit / rotate-credentials / archive — with credentials written server-side to Azure Key Vault (prod) / a file-backed dev store, the DB storing only a pinned secret reference. 16-iteration Claude×Codex code-review loop (both reviewers clean on iter-16; ~33 real findings fixed — the last three after an initial iter-13 clean caught a credential-alias 422 redaction gap, an empty-DB E2E-spec precondition, and a prod deploy-break P1); verify-e2e PASS on all 4 UCs (API/CLI/UI).
