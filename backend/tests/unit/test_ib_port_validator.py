@@ -14,9 +14,57 @@ from msai.services.nautilus.ib_port_validator import (
     IB_LIVE_PORTS,
     IB_PAPER_PORTS,
     IB_PAPER_PREFIXES,
+    assert_account_mode_consistent,
     validate_port_account_consistency,
     validate_port_vs_paper_trading,
 )
+
+# ---------------------------------------------------------------------------
+# assert_account_mode_consistent (shared by broker-account create + update)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("account_id", ["DU1234567", "DF1234567", "DFP1234567"])
+def test_account_mode_paper_prefix_with_paper_passes(account_id: str) -> None:
+    """A DU/DF paper-prefix account with trading_mode='paper' is consistent."""
+    assert_account_mode_consistent(account_id, "paper")  # must not raise
+
+
+@pytest.mark.parametrize("account_id", ["U1234567", "U9876543"])
+def test_account_mode_live_prefix_with_live_passes(account_id: str) -> None:
+    """A U... live-prefix account with trading_mode='live' is consistent."""
+    assert_account_mode_consistent(account_id, "live")  # must not raise
+
+
+@pytest.mark.parametrize("account_id", ["U1234567", "U9876543"])
+def test_account_mode_live_prefix_with_paper_raises(account_id: str) -> None:
+    """A live-prefix account paired with paper mode is rejected (gotcha #6)."""
+    with pytest.raises(ValueError, match="not a paper-prefix"):
+        assert_account_mode_consistent(account_id, "paper")
+
+
+@pytest.mark.parametrize("account_id", ["DU1234567", "DF1234567"])
+def test_account_mode_paper_prefix_with_live_raises(account_id: str) -> None:
+    """A paper-prefix account paired with live mode is rejected (gotcha #6)."""
+    with pytest.raises(ValueError, match="not a live-prefix"):
+        assert_account_mode_consistent(account_id, "live")
+
+
+def test_account_mode_strips_whitespace_before_prefix_match() -> None:
+    """Leading/trailing whitespace must not sneak a mismatch past the guard."""
+    assert_account_mode_consistent("  DU1234567  ", "paper")  # must not raise
+    with pytest.raises(ValueError, match="not a paper-prefix"):
+        assert_account_mode_consistent("  U1234567  ", "paper")
+
+
+@pytest.mark.parametrize("bad_mode", ["paper ", "liv", "LIVE", "", "demo"])
+def test_account_mode_rejects_unknown_mode(bad_mode: str) -> None:
+    """Non-Pydantic callers (e.g. the backfill migration) lack the ^(paper|live)$
+    pattern; an unknown mode must be rejected up front, not silently accepted by
+    falling through both prefix branches (Codex code-review iter-6 P2)."""
+    with pytest.raises(ValueError, match="is invalid; expected 'paper' or 'live'"):
+        assert_account_mode_consistent("DU1234567", bad_mode)
+
 
 # ---------------------------------------------------------------------------
 # validate_port_account_consistency

@@ -7,12 +7,14 @@ for convenient import across the codebase.
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from os import cpu_count
 from pathlib import Path
+from typing import Annotated
 
 from pydantic import AliasChoices, Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # Local dev: .../backend/src/msai/core/config.py → parents[4] = repo root.
 # Docker:    /app/src/msai/core/config.py → parents[3] = /app/, so parents[4] = /
@@ -134,6 +136,54 @@ class Settings(BaseSettings):
     ib_instrument_client_id: int = Field(
         default=999,
         validation_alias=AliasChoices("IB_INSTRUMENT_CLIENT_ID"),
+    )
+
+    # Static pool of compose gateway service slots a broker account can occupy
+    # (multi-account broker fleet, decision doc). A bare ``list[str]`` field
+    # JSON-decodes the env var in the settings source BEFORE any validator runs,
+    # so a comma-separated ``BROKER_GATEWAY_SLOTS=ib-gateway,ib-gateway-hvp``
+    # would raise ``SettingsError`` before ``_split_slots`` could split it
+    # (verified on pydantic-settings 2.13.1). ``Annotated[list[str], NoDecode]``
+    # disables that pre-decode so the ``mode="before"`` validator handles both
+    # comma-strings and JSON-list strings. Defaults to the only universally
+    # present slot (prod compose defines just ``ib-gateway``; ``ib-gateway-hvp``
+    # is dev-only). Each env overrides via ``BROKER_GATEWAY_SLOTS``:
+    # dev Shape-B → ``"ib-gateway,ib-gateway-hvp"``; prod → ``"ib-gateway"``.
+    broker_gateway_slots: Annotated[list[str], NoDecode] = Field(
+        default=["ib-gateway"],
+        validation_alias=AliasChoices("BROKER_GATEWAY_SLOTS"),
+        description="Static pool of compose gateway service slots a broker account can occupy.",
+    )
+
+    # Azure Key Vault URI for the broker-account credentials store (multi-account
+    # fleet). In production the backend builds the KV-backed store via the VM
+    # managed identity; ``main.py`` fails LOUD if this is unset in prod with an
+    # active live deployment. Blank/None in dev → file-backed store. Declared
+    # here (not just read via ``os.environ`` in main.py) because operators are
+    # told to set it in ``.env`` (see ``.env.example``); pydantic-settings
+    # ``extra="forbid"`` would otherwise reject the dotenv key and crash
+    # ``Settings()`` at import (iter-5 P2-1).
+    azure_keyvault_uri: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AZURE_KEYVAULT_URI"),
+    )
+    # Optional user-assigned managed-identity client id for the KV store. NEVER
+    # reuse ``AZURE_CLIENT_ID`` (the JWT audience) — Codex iter-3 P1. Blank/None
+    # → system-assigned MI. Declared for the same dotenv-extra reason as above.
+    azure_kv_mi_client_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("AZURE_KV_MI_CLIENT_ID"),
+    )
+    # One-time, env-driven backfill string consumed by the broker-accounts
+    # backfill Alembic migration (``d97a64e13e4e``) to seed legacy per-env
+    # accounts. The migration reads ``BROKER_ACCOUNT_BACKFILL`` directly via
+    # ``os.environ`` (NOT via this field) — it is declared here ONLY so that an
+    # operator who lists it in ``.env`` (per ``.env.example``) does not trip the
+    # pydantic-settings ``extra="forbid"`` guard and crash ``Settings()`` at
+    # import. Empty default = no backfill (safe no-op).
+    broker_account_backfill: str = Field(
+        default="",
+        validation_alias=AliasChoices("BROKER_ACCOUNT_BACKFILL"),
     )
 
     # IB market data type: REALTIME (default, requires subscription),
@@ -309,6 +359,18 @@ class Settings(BaseSettings):
             return value
         return Path(str(value))
 
+    @field_validator("broker_gateway_slots", mode="before")
+    @classmethod
+    def _split_slots(cls, v: object) -> object:
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return []
+            if s.startswith("["):  # JSON list form
+                return json.loads(s)
+            return [part.strip() for part in s.split(",") if part.strip()]
+        return v
+
     @model_validator(mode="after")
     def _enforce_production_secrets(self) -> Settings:
         """Fail fast in production if security-sensitive secrets are weak or defaulted.
@@ -407,5 +469,12 @@ class Settings(BaseSettings):
         """
         return self.data_root / "alerts" / "alerts.json"
 
+
+# ``from __future__ import annotations`` defers every annotation to a string, so
+# the ``NoDecode`` metadata on ``broker_gateway_slots`` is not resolved when the
+# class is first built (pydantic raises "Settings is not fully defined"). Rebuild
+# once now that ``Annotated`` / ``NoDecode`` are in module globals so the marker
+# applies and the comma/JSON ``_split_slots`` validator runs.
+Settings.model_rebuild()
 
 settings: Settings = Settings()

@@ -17,9 +17,11 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID  # noqa: TC003 — FastAPI resolves the type at runtime for path params
 
 from fastapi import FastAPI, Request, Response, WebSocket
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -35,6 +37,7 @@ from msai.api.backtests import (
 from msai.api.backtests import (
     router as backtests_router,
 )
+from msai.api.broker_accounts import router as broker_accounts_router
 from msai.api.graduation import router as graduation_router
 from msai.api.instruments import router as instruments_router
 from msai.api.live import router as live_router
@@ -221,6 +224,32 @@ async def _stop_projection_tasks() -> None:
     _projection_redis_clients.clear()
 
 
+async def _has_active_live_deployments() -> bool:
+    """True if any live deployment is in an active lifecycle state.
+
+    Uses the broader ``ACTIVE_DEPLOYMENT_STATUSES`` set (running/ready/starting/
+    building/**stopping**), which intentionally differs from the projection-
+    registry bootstrap query above (that one omits ``stopping``). A ``stopping``
+    deployment is mid-teardown but still holds IB positions (nautilus gotcha
+    #13), so for the boot KV-reachability probe it MUST count as active — the
+    probe should fail-closed while any real-money node is still winding down,
+    not just while it is fully running. Shares the same set as the archive guard.
+    """
+    from msai.core.database import async_session_factory
+    from msai.models.live_deployment import LiveDeployment
+    from msai.services.live.broker_account_service import ACTIVE_DEPLOYMENT_STATUSES
+
+    async with async_session_factory() as session:
+        count = (
+            await session.execute(
+                select(func.count())
+                .select_from(LiveDeployment)
+                .where(LiveDeployment.status.in_(ACTIVE_DEPLOYMENT_STATUSES))
+            )
+        ).scalar_one()
+    return count > 0
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Startup/shutdown lifecycle."""
@@ -241,6 +270,32 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # exit non-zero — operators see the duplicate key in their logs
     # within 10s of boot rather than at first live deployment.
     app.state.gateway_router = GatewayRouter(os.environ.get("GATEWAY_CONFIG"))
+
+    # Broker-account credentials store (multi-account fleet). Azure Key Vault in
+    # prod (via the VM managed identity), file-backed in dev. The prod factory
+    # fails LOUD if AZURE_KEYVAULT_URI is absent — docker-compose.prod.yml +
+    # msai-render-env.service supply it (else the backend crashloops by design).
+    from msai.services.live.broker_credentials_store import get_broker_credentials_store
+
+    app.state.broker_credentials_store = get_broker_credentials_store(
+        environment=settings.environment,
+        data_root=settings.data_root,
+        kv_uri=settings.azure_keyvault_uri,
+        # Dedicated MI client id — NEVER the JWT AZURE_CLIENT_ID (Codex iter-3 P1).
+        mi_client_id=settings.azure_kv_mi_client_id,
+    )
+    # Boot KV reachability probe (council blocking #6): fail-closed if KV is
+    # unreachable AND any live deployment is in an active lifecycle state. The
+    # active set mirrors the projection bootstrap query above (NOT just
+    # "running" — a starting/ready deployment is in-flight and counts).
+    if settings.environment == "production" and not app.state.broker_credentials_store.ping():
+        if await _has_active_live_deployments():
+            raise RuntimeError(
+                "Broker credentials store unreachable at boot with active deployments"
+            )
+        # error (not warning) so this is alertable: the store is unreachable,
+        # we just don't hard-fail because no live deployment is in flight.
+        log.error("broker_credentials_store_unreachable_at_boot_no_active_deploys")
 
     await _ensure_api_key_user()  # best-effort, retried on /ready
     await _start_projection_tasks()
@@ -280,6 +335,110 @@ app.middleware("http")(logging_middleware)
 # Exception handlers
 # ---------------------------------------------------------------------------
 
+# Field names whose rejected value must never be echoed back in a 422 body.
+# Pydantic v2 includes the raw ``input`` in every validation error — even for
+# ``SecretStr`` fields (SecretStr masks repr/serialization, NOT the error
+# input). Two leak shapes exist and BOTH must be masked:
+#
+#   1. Field-level scalar input — e.g. a too-long ``tws_password`` produces an
+#      error with ``loc=("body", "tws_password")`` and ``input`` = the rejected
+#      cleartext scalar.
+#   2. Model-level dict input — a cross-field ``model_validator(mode="after")``
+#      (e.g. the broker-account prefix-vs-mode guard) reports
+#      ``loc=("body",)`` with ``input`` = the ENTIRE request body dict, which
+#      includes the cleartext ``tws_password`` / ``tws_userid``.
+#
+# This handler masks both: it redacts any sensitive key found inside a dict
+# ``input`` AND masks a scalar ``input`` when ``loc`` names a sensitive field.
+# Everything else is passed through unchanged, preserving FastAPI's default
+# ``{"detail": [...]}`` shape.
+_SENSITIVE_VALIDATION_FIELDS: frozenset[str] = frozenset({"tws_password", "tws_userid"})
+
+# Credential-looking key tokens. A key is treated as sensitive (its echoed value
+# redacted) if its NORMALIZED name (lowercased, non-alphanumerics stripped) CONTAINS
+# any of these — so EVERY separator/casing alias a client might send as an extra key
+# (``twsPassword``, ``password``, ``twsUserid``, ``tws_user_id``, ``twsUsername``,
+# ``pass_word``, ``tws-userid``) is masked, not just the exact field names. Normalizing
+# closes the whole alias-spelling class at once (Codex iter-10/11/12 P2). The ``user``
+# token (not the narrower ``userid``) covers every user-identifier spelling a client
+# might send for the TWS login — ``userid`` / ``user_id`` / ``username`` / ``tws_user``
+# all normalize to a name CONTAINING ``user`` (Codex final2 P2: a ``twsUsername`` alias
+# was slipping past ``userid``). Tokens chosen to match credential fields without
+# catching benign body keys: ``ib_account_id`` → ``ibaccountid``, ``ib_login_key`` →
+# ``ibloginkey``, ``trading_mode`` → ``tradingmode``, ``gateway_slot`` → ``gatewayslot``,
+# ``created_by`` → ``createdby``, ``label`` — none contain a token.
+_SENSITIVE_KEY_TOKENS: tuple[str, ...] = ("password", "passwd", "pwd", "secret", "user")
+
+# Sentinel for a redacted value in a 422 ``input`` echo.
+_REDACTED = "***"
+
+
+def _is_sensitive_key(name: object) -> bool:
+    """True if ``name`` looks like a credential key (exact field OR any alias/variant).
+
+    Normalizes the name (lowercase + drop non-alphanumerics) before the token check
+    so underscore/hyphen/camelCase variants of a credential token can't slip a value
+    past the 422 redactor.
+    """
+    if not isinstance(name, str):
+        return False
+    if name in _SENSITIVE_VALIDATION_FIELDS:
+        return True
+    normalized = "".join(ch for ch in name.lower() if ch.isalnum())
+    return any(tok in normalized for tok in _SENSITIVE_KEY_TOKENS)
+
+
+def _redact_validation_input(loc: tuple[Any, ...], value: Any) -> Any:
+    """Return a safe ``input`` echo for a single validation error item.
+
+    Handles both leak shapes (see ``_SENSITIVE_VALIDATION_FIELDS`` docstring):
+
+    * If ``value`` is a dict (model-level error), replace every sensitive key's
+      value with ``"***"`` and RECURSE into the remaining values so a sensitive
+      key nested at any depth (inside a sub-dict or a list of dicts) is masked
+      too. Returns a copy; the original error structure is left intact.
+    * If ``value`` is a list, recurse element-wise (carrying ``loc`` so a
+      sensitive scalar inside the list is still masked by the ``loc`` branch).
+    * Otherwise, if ``loc`` names a sensitive field, mask the scalar value.
+    * Otherwise, return ``value`` unchanged.
+
+    The recursion is defensive: today's request schemas are flat, but a future
+    nested/list credential schema must not leak ``tws_password`` / ``tws_userid``
+    buried below the top level (iter-5 P3-a).
+    """
+    if isinstance(value, dict):
+        return {
+            k: (_REDACTED if _is_sensitive_key(k) else _redact_validation_input(loc, v))
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_validation_input(loc, item) for item in value]
+    if any(_is_sensitive_key(part) for part in loc):
+        return _REDACTED
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def _masked_validation_handler(
+    request: Request,  # noqa: ARG001 — FastAPI handler signature
+    exc: RequestValidationError,
+) -> JSONResponse:
+    """Mask the echoed ``input`` for sensitive credential material in 422s.
+
+    Mirrors FastAPI's default ``RequestValidationError`` rendering
+    (``{"detail": jsonable_encoder(errors)}``, status 422) but redacts any
+    sensitive credential value from each error's ``input`` — covering both the
+    field-level scalar shape and the model-level body-dict shape. Non-sensitive
+    errors are passed through unchanged.
+    """
+    masked: list[dict[str, Any]] = []
+    for err in exc.errors():
+        item = dict(err)
+        if "input" in item:
+            item["input"] = _redact_validation_input(tuple(item.get("loc", ())), item["input"])
+        masked.append(item)
+    return JSONResponse(status_code=422, content=jsonable_encoder({"detail": masked}))
+
 
 @app.exception_handler(StrategyConfigValidationError)
 async def _strategy_config_validation_handler(
@@ -304,6 +463,7 @@ async def _strategy_config_validation_handler(
 app.include_router(auth_router)
 app.include_router(strategies_router)
 app.include_router(backtests_router)
+app.include_router(broker_accounts_router)
 app.include_router(market_data_router)
 app.include_router(live_router)
 app.include_router(account_router)

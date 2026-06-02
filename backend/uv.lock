@@ -1219,6 +1219,8 @@ dependencies = [
     { name = "alembic" },
     { name = "arq" },
     { name = "asyncpg" },
+    { name = "azure-identity" },
+    { name = "azure-keyvault-secrets" },
     { name = "cryptography" },
     { name = "databento" },
     { name = "duckdb" },
@@ -1246,10 +1248,6 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-azure = [
-    { name = "azure-identity" },
-    { name = "azure-keyvault-secrets" },
-]
 dev = [
     { name = "fakeredis", extra = ["lua"] },
     { name = "freezegun" },
@@ -1267,8 +1265,8 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.14.0" },
     { name = "arq", specifier = ">=0.26.0" },
     { name = "asyncpg", specifier = ">=0.30.0" },
-    { name = "azure-identity", marker = "extra == 'azure'", specifier = ">=1.19.0" },
-    { name = "azure-keyvault-secrets", marker = "extra == 'azure'", specifier = ">=4.9.0" },
+    { name = "azure-identity", specifier = ">=1.19.0" },
+    { name = "azure-keyvault-secrets", specifier = ">=4.9.0" },
     { name = "cryptography", specifier = ">=43.0.0" },
     { name = "databento", specifier = ">=0.43.0" },
     { name = "duckdb", specifier = ">=1.4.0" },
@@ -1303,7 +1301,7 @@ requires-dist = [
     { name = "typer", specifier = ">=0.15.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.0" },
 ]
-provides-extras = ["dev", "azure"]
+provides-extras = ["dev"]
 
 [[package]]
 name = "msal"

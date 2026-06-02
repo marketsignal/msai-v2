@@ -35,6 +35,53 @@ IB_LIVE_PORTS: tuple[int, ...] = (4001, 4003)
 IB_PAPER_PREFIXES: tuple[str, ...] = ("DU", "DF")
 
 
+def assert_account_mode_consistent(ib_account_id: str, trading_mode: str) -> None:
+    """Raise ``ValueError`` if ``ib_account_id``'s prefix disagrees with ``trading_mode``.
+
+    Single source of truth for the broker-account prefix-vs-mode guard, shared
+    by ``BrokerAccountCreateRequest`` (create) and ``BrokerAccountService.update``
+    so the two cannot drift. Paper accounts are :data:`IB_PAPER_PREFIXES`-prefixed
+    (``DU``/``DF``); live accounts start with ``U`` and are NOT paper-prefixed.
+    Pairing a live account with ``paper`` mode (or a paper account with ``live``
+    mode) silently misroutes orders at the gateway (nautilus gotcha #6) — caught
+    here at the broker-account control-plane boundary.
+
+    The account id is ``.strip()``-ed before prefix matching so stray whitespace
+    can't sneak a silent mismatch past the guard.
+
+    Args:
+        ib_account_id: IB account identifier (e.g. ``DU1234567``, ``U9876543``).
+        trading_mode: ``"paper"`` or ``"live"``.
+
+    Raises:
+        ValueError: If the trading mode is unknown, or the account prefix and
+            trading mode disagree.
+    """
+    # Reject unknown modes up front (Codex code-review iter-6 P2): callers outside
+    # the Pydantic schema (e.g. the backfill migration) don't get the
+    # ``^(paper|live)$`` pattern check, so a malformed mode like ``"paper "`` or
+    # ``"liv"`` would otherwise fall through BOTH prefix branches and be silently
+    # accepted, bypassing the U-vs-DU safety guard.
+    if trading_mode not in ("paper", "live"):
+        raise ValueError(f"trading_mode '{trading_mode}' is invalid; expected 'paper' or 'live'")
+    normalized = ib_account_id.strip()
+    is_paper_prefix = normalized.startswith(IB_PAPER_PREFIXES)
+    if trading_mode == "paper" and not is_paper_prefix:
+        raise ValueError(
+            f"ib_account_id '{ib_account_id}' is not a paper-prefix account "
+            f"(expected {'/'.join(IB_PAPER_PREFIXES)}*); use trading_mode='live' "
+            "for real-money accounts"
+        )
+    # A paper-prefix account (DU/DF) never starts with "U", so `not startswith("U")`
+    # already subsumes the paper-prefix case — no separate `is_paper_prefix or` term needed.
+    if trading_mode == "live" and not normalized.startswith("U"):
+        raise ValueError(
+            f"ib_account_id '{ib_account_id}' is not a live-prefix account "
+            f"(expected U*, NOT {'/'.join(IB_PAPER_PREFIXES)}); use "
+            "trading_mode='paper' for paper accounts"
+        )
+
+
 def validate_port_account_consistency(port: int, account_id: str) -> None:
     """Raise ``ValueError`` if ``port`` and ``account_id`` disagree on
     paper vs live.

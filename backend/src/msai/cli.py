@@ -54,8 +54,10 @@ or the settings-level key — matches the backend's dual-mode auth in
 from __future__ import annotations
 
 import asyncio
+import getpass
 import json
 import os
+import sys
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, cast
@@ -96,6 +98,7 @@ live_app = typer.Typer(help="Live/paper trading commands")
 graduation_app = typer.Typer(help="Graduation pipeline commands")
 portfolio_app = typer.Typer(help="Portfolio management + combined backtest commands")
 account_app = typer.Typer(help="IB account commands")
+broker_app = typer.Typer(help="Broker account management")
 system_app = typer.Typer(help="Platform health + diagnostics")
 instruments_app = typer.Typer(
     name="instruments",
@@ -113,6 +116,7 @@ app.add_typer(live_app, name="live")
 app.add_typer(graduation_app, name="graduation")
 app.add_typer(portfolio_app, name="portfolio")
 app.add_typer(account_app, name="account")
+app.add_typer(broker_app, name="broker")
 app.add_typer(system_app, name="system")
 app.add_typer(instruments_app, name="instruments")
 app.add_typer(alerts_app, name="alerts")
@@ -1045,6 +1049,155 @@ def account_health() -> None:
     """Show IB gateway connection health."""
     response = _api_call("GET", "/api/v1/account/health")
     _emit_json(response.json())
+
+
+# ======================================================================
+# broker sub-app — broker-account CRUD over /api/v1/broker-accounts
+#
+# Credential discipline (Codex iter-1 P0#2): the TWS password is NEVER a
+# CLI flag (argv leaks via shell history + `ps`).  It is read from
+# ``$MSAI_BROKER_TWS_PASSWORD`` (scriptable / E2E) or, if unset and stdin
+# is a TTY, an interactive ``getpass.getpass()`` prompt.  The password is
+# sent in the POST body to the API and is NEVER echoed to stdout.
+# ======================================================================
+
+_TWS_PASSWORD_ENV = "MSAI_BROKER_TWS_PASSWORD"
+
+
+def _read_tws_password() -> str:
+    """Resolve the TWS password without ever putting it on argv.
+
+    Order: ``$MSAI_BROKER_TWS_PASSWORD`` first (scripting / E2E), then an
+    interactive ``getpass`` prompt when stdin is a TTY.  Non-interactive
+    callers with no env var get a clear error rather than a hang.
+    """
+    password = os.environ.get(_TWS_PASSWORD_ENV)
+    if password:
+        return password
+    if sys.stdin.isatty():
+        return getpass.getpass("TWS password: ")
+    _fail(
+        f"TWS password required — set ${_TWS_PASSWORD_ENV} "
+        "or run interactively (stdin must be a TTY for a prompt)."
+    )
+    raise AssertionError("unreachable")  # _fail raises; satisfies the type checker
+
+
+@broker_app.command("add")
+def broker_add(
+    ib_account_id: str = typer.Option(..., "--ib-account-id", help="IB account id (e.g. DU123456)"),
+    ib_login_key: str = typer.Option(..., "--ib-login-key", help="Logical IB login key"),
+    tws_userid: str = typer.Option(..., "--tws-userid", help="TWS / IB Gateway username"),
+    trading_mode: str = typer.Option("paper", "--trading-mode", help="paper or live"),
+    label: str | None = typer.Option(None, "--label", help="Optional human-readable label"),
+    gateway_slot: str | None = typer.Option(
+        None, "--gateway-slot", help="Pinned gateway slot (default: auto-allocate)"
+    ),
+) -> None:
+    """Register a broker account.
+
+    The TWS password is read from ``$MSAI_BROKER_TWS_PASSWORD`` or an
+    interactive prompt — never from a CLI flag.
+    """
+    tws_password = _read_tws_password()
+    payload: dict[str, Any] = {
+        "ib_account_id": ib_account_id,
+        "ib_login_key": ib_login_key,
+        "trading_mode": trading_mode,
+        "tws_userid": tws_userid,
+        "tws_password": tws_password,
+    }
+    if label is not None:
+        payload["label"] = label
+    if gateway_slot is not None:
+        payload["gateway_slot"] = gateway_slot
+    response = _api_call("POST", "/api/v1/broker-accounts", json_body=payload)
+    data = response.json()
+    typer.echo(
+        f"Created broker account {data['ib_account_id']} "
+        f"(id: {data['id']}, status: {data['status']}, slot: {data['gateway_slot']})"
+    )
+
+
+def _broker_cell(value: object, width: int) -> str:
+    """Left-justify ``value`` to ``width``, truncating overflow with an ellipsis so
+    adjacent columns never abut (e.g. a 32-char credential version + the UUID id)."""
+    s = str(value)
+    if len(s) >= width:
+        s = s[: width - 2] + "… "  # ellipsis + guaranteed separating space
+    return f"{s:<{width}}"
+
+
+@broker_app.command("list")
+def broker_list() -> None:
+    """List broker accounts (newest first; excludes archived)."""
+    response = _api_call("GET", "/api/v1/broker-accounts")
+    rows = response.json()
+    if not rows:
+        typer.echo("No broker accounts.")
+        return
+    header = f"{'IB ACCOUNT':<14}{'STATUS':<10}{'MODE':<8}{'SLOT':<14}{'CRED VER':<14}ID"
+    typer.echo(header)
+    typer.echo("-" * len(header))
+    for row in rows:
+        typer.echo(
+            f"{_broker_cell(row['ib_account_id'], 14)}"
+            f"{_broker_cell(row['status'], 10)}"
+            f"{_broker_cell(row['trading_mode'], 8)}"
+            f"{_broker_cell(row['gateway_slot'], 14)}"
+            f"{_broker_cell(row.get('credentials_secret_version') or '-', 14)}"
+            f"{row['id']}"
+        )
+
+
+@broker_app.command("show")
+def broker_show(
+    account_id: str = typer.Argument(..., help="Broker account id (UUID)"),
+) -> None:
+    """Show one broker account (credential metadata only — never a secret)."""
+    response = _api_call("GET", f"/api/v1/broker-accounts/{_url_id(account_id)}")
+    _emit_json(response.json())
+
+
+@broker_app.command("rotate")
+def broker_rotate(
+    account_id: str = typer.Argument(..., help="Broker account id (UUID)"),
+    tws_userid: str = typer.Option(..., "--tws-userid", help="TWS / IB Gateway username"),
+) -> None:
+    """Rotate a broker account's stored credentials.
+
+    Like ``add``, the new TWS password is read from
+    ``$MSAI_BROKER_TWS_PASSWORD`` or an interactive prompt — never a flag.
+    """
+    tws_password = _read_tws_password()
+    payload: dict[str, Any] = {"tws_userid": tws_userid, "tws_password": tws_password}
+    response = _api_call(
+        "POST",
+        f"/api/v1/broker-accounts/{_url_id(account_id)}/rotate-credentials",
+        json_body=payload,
+    )
+    data = response.json()
+    typer.echo(
+        f"Rotated credentials for {data['ib_account_id']} "
+        f"(id: {data['id']}, version: {data.get('credentials_secret_version') or '-'})"
+    )
+
+
+@broker_app.command("archive")
+def broker_archive(
+    account_id: str = typer.Argument(..., help="Broker account id (UUID)"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """Archive (soft-delete) a broker account, freeing its slot + deleting its secret."""
+    if not yes:
+        typer.confirm(
+            f"Archive broker account {account_id}? "
+            "This frees its gateway slot and deletes the stored secret.",
+            abort=True,
+        )
+    response = _api_call("POST", f"/api/v1/broker-accounts/{_url_id(account_id)}/archive")
+    data = response.json()
+    typer.echo(f"Archived broker account {data['ib_account_id']} (status: {data['status']})")
 
 
 # ======================================================================

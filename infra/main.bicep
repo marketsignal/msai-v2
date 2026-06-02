@@ -641,9 +641,12 @@ resource heartbeatDcrAssociation 'Microsoft.Insights/dataCollectionRuleAssociati
 
 // ─────────────────────────────────────────────────────────────────────────────
 // T8 (continued): Role assignments
-// 5 total: VM gets KV Secrets User + AcrPull + Blob Contributor (3 runtime grants),
-// operator gets KV Secrets Officer (1 data-plane grant for seeding/rotating secrets),
-// gh-oidc MI gets AcrPush (Slice 2 — CI image push from GitHub Actions).
+// 6 total: VM gets KV Secrets User + KV Secrets Officer + AcrPull + Blob Contributor
+// (4 runtime grants — Officer added so the backend MI can SERVER-SIDE write broker-account
+// credential secrets under Option B'; Officer supersets User, the read grant is left in
+// place because role assignments are immutable by name), operator gets KV Secrets Officer
+// (1 data-plane grant for seeding/rotating secrets), gh-oidc MI gets AcrPush (Slice 2 — CI
+// image push from GitHub Actions).
 // ─────────────────────────────────────────────────────────────────────────────
 
 resource vmKvSecretsUserAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
@@ -654,6 +657,24 @@ resource vmKvSecretsUserAssignment 'Microsoft.Authorization/roleAssignments@2022
     roleDefinitionId: roleDefIdKvSecretsUser
     principalType: 'ServicePrincipal'
     description: 'VM system-assigned MI reads secrets from KV via render-env-from-kv.sh at boot'
+  }
+}
+
+// Broker-account entity (Option B'): the backend (VM system-assigned MI) WRITES
+// broker credential secrets server-side (set_secret / begin_delete_secret). KV
+// Secrets User is read-only, so a fresh/rehearsal deploy would 403 on writes.
+// Add Secrets Officer as a NEW, ADDITIONAL assignment (Officer supersets User) —
+// do NOT mutate vmKvSecretsUserAssignment in place (Azure role assignments are
+// immutable by name; changing roleDefinitionId on the same GUID seed fails on
+// reapply / disaster-recovery). New GUID seed 'kv-secrets-officer' for the VM MI.
+resource vmKvSecretsOfficerAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: keyVault
+  name: guid(vm.id, keyVault.id, 'kv-secrets-officer')
+  properties: {
+    principalId: vm.identity.principalId
+    roleDefinitionId: roleDefIdKvSecretsOfficer
+    principalType: 'ServicePrincipal'
+    description: 'VM system-assigned MI writes broker-account credential secrets server-side (Option B\' set_secret/delete). Officer supersets the read-only Secrets User grant above.'
   }
 }
 

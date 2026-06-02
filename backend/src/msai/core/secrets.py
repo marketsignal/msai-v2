@@ -1,9 +1,8 @@
 """Secrets provider abstraction for MSAI v2.
 
 Supports reading secrets from environment variables (default) or Azure Key Vault.
-Azure Key Vault requires the optional ``azure`` dependency group::
-
-    uv pip install msai[azure]
+The Azure SDK packages are base dependencies (the optional ``azure`` extra was
+removed in PR 3 / Task 3); run ``uv sync`` to install them.
 """
 
 from __future__ import annotations
@@ -88,7 +87,7 @@ class AzureKeyVaultProvider:
         except ImportError as exc:
             raise ImportError(
                 "Azure Key Vault dependencies are not installed. "
-                "Install them with: uv pip install msai[azure]"
+                "azure deps should be installed as base dependencies; run `uv sync`."
             ) from exc
 
         self._not_found_error = ResourceNotFoundError

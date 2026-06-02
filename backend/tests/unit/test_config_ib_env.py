@@ -21,6 +21,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     import pytest
 
 
@@ -113,3 +115,67 @@ def test_ib_instrument_client_id_default_and_env(monkeypatch: pytest.MonkeyPatch
     assert Settings().ib_instrument_client_id == 999
     monkeypatch.setenv("IB_INSTRUMENT_CLIENT_ID", "900")
     assert Settings().ib_instrument_client_id == 900
+
+
+def test_azure_keyvault_uri_and_mi_client_id_loaded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``AZURE_KEYVAULT_URI`` / ``AZURE_KV_MI_CLIENT_ID`` are declared Settings
+    fields and load from env without raising.
+
+    Regression for the iter-5 P2-1 startup crash: operators are told to put
+    ``AZURE_KEYVAULT_URI=`` in ``.env`` (see ``.env.example``), but the fields
+    were not declared on ``Settings``. pydantic-settings defaults to
+    ``extra="forbid"``, so an undeclared key sourced from a ``.env`` file raised
+    ``ValidationError: extra_forbidden`` at import — the backend would not boot.
+    """
+    from msai.core.config import Settings
+
+    monkeypatch.setenv("AZURE_KEYVAULT_URI", "https://kv.example.vault.azure.net/")
+    monkeypatch.setenv("AZURE_KV_MI_CLIENT_ID", "00000000-0000-0000-0000-000000000001")
+    settings = Settings()
+    assert settings.azure_keyvault_uri == "https://kv.example.vault.azure.net/"
+    assert settings.azure_kv_mi_client_id == "00000000-0000-0000-0000-000000000001"
+
+
+def test_azure_keyvault_fields_default_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both KV fields default to ``None`` when unset (dev: file-backed store)."""
+    from msai.core.config import Settings
+
+    monkeypatch.delenv("AZURE_KEYVAULT_URI", raising=False)
+    monkeypatch.delenv("AZURE_KV_MI_CLIENT_ID", raising=False)
+    settings = Settings()
+    assert settings.azure_keyvault_uri is None
+    assert settings.azure_kv_mi_client_id is None
+
+
+def test_dotenv_broker_extras_do_not_crash_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A ``.env`` file containing the broker env vars operators are told to set
+    does not crash ``Settings()`` with ``extra_forbidden``.
+
+    pydantic-settings forbids extras sourced from a ``.env`` file (env-var
+    extras pass through, but dotenv-file extras are validated against the
+    model). ``.env.example`` documents ``AZURE_KEYVAULT_URI``,
+    ``AZURE_KV_MI_CLIENT_ID``, and ``BROKER_ACCOUNT_BACKFILL`` — all three MUST
+    be declared on ``Settings`` so a populated ``.env`` boots the backend.
+    """
+    from msai.core.config import Settings
+
+    # Clear inherited env so the .env file is the only source for these keys.
+    for key in ("AZURE_KEYVAULT_URI", "AZURE_KV_MI_CLIENT_ID", "BROKER_ACCOUNT_BACKFILL"):
+        monkeypatch.delenv(key, raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "AZURE_KEYVAULT_URI=https://kv.example.vault.azure.net/\n"
+        "AZURE_KV_MI_CLIENT_ID=00000000-0000-0000-0000-000000000002\n"
+        "BROKER_ACCOUNT_BACKFILL=U4715997:hvp:ib-gateway:live:TWS_USERID|TWS_PASSWORD\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(_env_file=str(env_file))  # type: ignore[call-arg]
+
+    assert settings.azure_keyvault_uri == "https://kv.example.vault.azure.net/"
+    assert settings.azure_kv_mi_client_id == "00000000-0000-0000-0000-000000000002"
+    assert (
+        settings.broker_account_backfill == "U4715997:hvp:ib-gateway:live:TWS_USERID|TWS_PASSWORD"
+    )

@@ -8,6 +8,7 @@ from msai.models.asset_universe import AssetUniverse
 from msai.models.audit_log import AuditLog
 from msai.models.backtest import Backtest
 from msai.models.base import Base
+from msai.models.broker_account import BrokerAccount, BrokerAccountStatus, CredentialsBackend
 from msai.models.graduation_candidate import GraduationCandidate
 from msai.models.graduation_stage_transition import GraduationStageTransition
 from msai.models.instrument_alias import InstrumentAlias
@@ -36,6 +37,9 @@ __all__ = [
     "AuditLog",
     "Backtest",
     "Base",
+    "BrokerAccount",
+    "BrokerAccountStatus",
+    "CredentialsBackend",
     "GraduationCandidate",
     "GraduationStageTransition",
     "InstrumentAlias",
