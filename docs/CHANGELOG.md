@@ -16,6 +16,14 @@ All notable changes to msai-v2 will be documented in this file.
 - **Env-driven legacy backfill** migration `d97a64e13e4e` (`BROKER_ACCOUNT_BACKFILL`, empty=no-op; LVP/HVP → `legacy_env` rows referencing existing env credentials; mode-guarded, idempotent).
 - **Deferred follow-ups** (tracked, non-blocking): operator-run writable-KV spike before prod cutover (decision-doc addendum); `LegacyEnvBrokerCredentialsStore` polymorphism to fold the legacy-env branches; data-plane spawn wiring of `resolve_for_spawn`; pre-existing `playwright.config.ts` webServer-command fix.
 
+### 2026-06-01 — CLAUDE.md reconciled against forge template
+
+Reconciled `CLAUDE.md` against `claude-codex-forge/CLAUDE.template.md`, porting two genuinely-new template elements while preserving all project-specific content:
+
+- **Added the "Ground Your Claims Policy" section** (parallel to "No Bugs Left Behind Policy") — mirrors the existing `critical-rules.md` GROUND YOUR CLAIMS rule as a top-level CLAUDE.md policy, matching the template's policy-mirroring pattern.
+- **Declared `surfaces: [API, CLI, UI]`** in the E2E Configuration block. The template's new `surfaces:` field requires fullstack-plus-CLI projects to declare the CLI explicitly; the `fullstack` default omits it, which had silently suppressed the verify-e2e Step 2c CLI-coverage warning (gap empirically surfaced in the 2026-05-18 soak).
+- Stamped a `forge:reconciled 2026-06-01` marker. Template placeholder scaffolding (Design Direction / Deployment comment blocks, generic Stack/File-Structure/Commands) was intentionally not ported — the project already has richer filled-in equivalents.
+
 ### 2026-06-01 — PR 2 per-account supervisors: operator-stop / auto-restart concurrency core (`feat/pr-2-per-account-supervisors`)
 
 **Status:** council-verdict (5-advisor + Codex chairman, FINAL) implemented on the existing PR-2 working tree. Real-money operator-stop / auto-restart concurrency core — a deployment-FIRST lock-order migration done ATOMICALLY across every both-row-locking path, plus a pre-start stop-intent gate, shutdown-cancellation safety, and an ownerless-active-row backstop.
@@ -1339,7 +1347,6 @@ Commit when convenient; not on an active workflow branch.
 **Known limitation (documented scope-defer):**
 
 - The UI's Run Backtest form does not currently send `config.asset_class`; worker defaults to `"stocks"`. For a futures-backtest launched via UI against a symbol like `ES.n.0`, the remediation command will read `msai ingest stocks ES.n.0 ...` instead of `msai ingest futures`. Core feature (user sees WHY the backtest failed) is unaffected — only the positional `asset_class` arg of the suggested command is wrong. Follow-up PR: either add an `asset_class` dropdown to the UI form, or derive it server-side from the resolved canonical instrument ID shape.
-  > > > > > > > Stashed changes
 
 ### 2026-04-20 — live-path registry wiring (branch `feat/live-path-wiring-registry`)
 

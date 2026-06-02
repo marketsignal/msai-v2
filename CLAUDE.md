@@ -1,4 +1,4 @@
-<!-- forge:migrated 2026-04-28 -->
+<!-- forge:migrated 2026-04-28 --><!-- forge:reconciled 2026-06-01 -->
 
 # CLAUDE.md — MSAI v2 (MarketSignal AI)
 
@@ -262,6 +262,8 @@ No active work relies on it.
 
 **interface_type:** `fullstack` — MSAI v2 exposes an HTTP API (primary) and a Next.js UI (secondary). Per the project ordering rule ("API-first, CLI-second, UI-third"), the `verify-e2e` agent MUST test the API surface first, then the UI. An API failure means the contract/state is broken — stop immediately and diagnose; do not proceed to UI checks.
 
+**surfaces:** `[API, CLI, UI]` — MSAI v2 is API-first, CLI-second, UI-third. The `fullstack` default (UI + API) would silently omit the CLI; this explicit list makes the verify-e2e Step 2c multi-surface coverage check warn when use cases miss the `msai` CLI surface. (The CLI gap was surfaced empirically in the 2026-05-18 soak — design UCs for every surface a user can actually reach for the feature's capability area.)
+
 **Server URLs:**
 
 | Surface    | URL                     |
@@ -357,6 +359,16 @@ For bug fixes, targeted research runs after root-cause isolation (Phase 2.5 of `
 - Test coverage gaps for new code
 
 No "follow-up PRs" for known problems. No "v2" for things that should work in v1. If it's found, it's fixed — or the branch isn't ready.
+
+## Ground Your Claims Policy
+
+**State what you verified, not what you assume.** Before asserting anything about the code, read it — don't pattern-match from a name or from memory. Separate fact from inference, and say which:
+
+- Claims about code → cite the file you actually read (`file.py:42`)
+- Claims about behavior → run it, or label the claim unverified
+- Uncertain → say "I haven't checked X" instead of guessing fluently
+
+Confident guessing is a defect, the same caliber as a known bug left behind. When in doubt, check — or flag it.
 
 ## Detailed Rules
 
