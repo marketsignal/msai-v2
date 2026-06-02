@@ -163,9 +163,20 @@ main() {
         done
     fi
 
+    # AZURE_KEYVAULT_URI is structurally derivable from KV_NAME — it's the same
+    # base vault URL this script already builds for its own KV calls above
+    # (`https://${KV_NAME}.vault.azure.net/`). Emit it deterministically rather than
+    # fetching it as a KV secret: that would be circular (store the vault's own URI
+    # as a secret inside itself) AND an extra operator step whose omission would abort
+    # the deploy at the backend's `${AZURE_KEYVAULT_URI:?}` compose guard. Deriving it
+    # here guarantees the var is always present and correct-by-construction (if the
+    # script's own KV calls reach the vault, this URI is right). Backend lifespan +
+    # worker + live-supervisor consume it.
+    emit_kv_line "AZURE_KEYVAULT_URI" "https://${KV_NAME}.vault.azure.net/" >>"$TMP_FILE"
+
     # Atomic move into place.
     mv "$TMP_FILE" "$OUTPUT_FILE"
-    echo "Rendered $OUTPUT_FILE: ${#required[@]} required + ${#optional[@]} optional secrets"
+    echo "Rendered $OUTPUT_FILE: ${#required[@]} required + ${#optional[@]} optional secrets + derived AZURE_KEYVAULT_URI"
 }
 
 main "$@"

@@ -35,6 +35,11 @@ x-worker-env: &worker-env
   IB_GATEWAY_PORT_LIVE: 4003
   IB_PORT: ${IB_PORT:-4004}
   IB_ALLOW_MOCK_FALLBACK: ${IB_ALLOW_MOCK_FALLBACK:-true}
+  # Static pool of compose gateway-service slots a broker account can occupy
+  # (multi-account broker fleet). Compose .env is interpolation-only, so this
+  # must be in ``environment:`` to reach the container — empty parses to [] and
+  # breaks all creates, hence the ``ib-gateway`` default (NOT empty).
+  BROKER_GATEWAY_SLOTS: ${BROKER_GATEWAY_SLOTS:-ib-gateway}
 
 x-worker-depends: &worker-depends
   postgres:

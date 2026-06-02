@@ -194,6 +194,22 @@ mv "${IMAGES_ENV}.tmp" "$IMAGES_ENV"
 
 # ─── Phase 5: Refresh KV-rendered env (msai-render-env.service) ────────────────
 
+# Re-sync the render unit + render script from the deployed checkout so changes to
+# the secret list / render logic take effect on EXISTING VMs. cloud-init only bakes
+# these at provision time (infra/cloud-init.yaml), so without this they'd be frozen
+# at the provisioning snapshot — a new compose ${VAR:?} guard whose value the updated
+# render step is supposed to supply would abort the deploy on an old VM. Mirrors the
+# Slice-4 backup-unit copy pattern below. Idempotent — overwrite each deploy. Guarded
+# on presence so a checkout that predates these files in /opt/msai/scripts still runs.
+if [[ -f /opt/msai/scripts/msai-render-env.service ]]; then
+    install -m 0644 /opt/msai/scripts/msai-render-env.service \
+        /etc/systemd/system/msai-render-env.service
+fi
+if [[ -f /opt/msai/scripts/render-env-from-kv.sh ]]; then
+    install -m 0755 /opt/msai/scripts/render-env-from-kv.sh \
+        /usr/local/bin/render-env-from-kv.sh
+fi
+
 # KV_NAME is a placeholder in the Slice 1 systemd unit; install a drop-in override
 # so KV_NAME resolves at every render. Idempotent — overwrite each deploy.
 mkdir -p /etc/systemd/system/msai-render-env.service.d

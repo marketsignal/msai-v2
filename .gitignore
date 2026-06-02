@@ -39,6 +39,8 @@ pnpm-debug.log*
 data/parquet/
 data/reports/
 data/alerts/
+# dev broker credentials — cleartext IB logins; NEVER commit
+data/broker_credentials/
 
 # IDE
 .vscode/

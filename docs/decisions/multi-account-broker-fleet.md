@@ -355,3 +355,46 @@ Cross-reference: PR 2 implementation plan `docs/plans/2026-05-31-pr-2-per-accoun
 ### Provenance
 
 Engineering Council #2, 2026-05-31, during `/forge-goal` autonomous `/goal` run on PR 2. 3 Claude advisors (Simplifier, Scalability Hawk, Pragmatist) + 2 Codex advisors (Contrarian, Maintainer) + Codex chairman (xhigh). Escalated from the Phase 3.1c gate after the plan-review loop surfaced the container-topology P0. Verified facts cross-checked against the live codebase before the council reasoned.
+
+---
+
+## Addendum 2026-06-01 — PR 3 implementation notes + operator pre-merge writable-KV spike (REQUIRED before prod cutover)
+
+PR 3 (`broker-account-entity`) implements the Option B' verdict above. Plan: `docs/plans/2026-06-01-broker-account-entity.md` (8-iteration Claude×Codex plan-review loop, both reviewers clean on iter-8). This addendum records the operator-run steps that the dev worktree CANNOT perform and that gate the prod cutover of the credential WRITE path.
+
+### Writable-KV integration spike (council "Missing evidence" — NOT runnable in dev)
+
+Dev uses the file-backed `EnvFileBrokerCredentialsStore`; the prod `AzureKvBrokerCredentialsStore` write path (`set_secret` / version pin / `begin_delete_secret`) requires the prod VM managed identity against the real Key Vault. Run this on the prod VM (or a rehearsal RG) BEFORE relying on operator-added accounts in prod:
+
+1. **Grant the VM MI write access.** PR 3 adds `vmKvSecretsOfficerAssignment` to `infra/main.bicep` (new GUID seed `kv-secrets-officer`, additive — does NOT mutate the immutable existing Secrets User assignment). Apply the IaC so the VM MI holds **Key Vault Secrets Officer** (the read-only Secrets User grant alone 403s on `set_secret`/`begin_delete_secret`).
+2. **Round-trip spike** (≈ a few minutes): from the backend container on the VM, exercise `AzureKvBrokerCredentialsStore.put → get(pinned_version) → rotate → get(old_version) → begin_delete_secret`. Confirm: the version GUID is captured from `properties.version`; `get(name, pinned_version)` returns the exact version; rotation creates a new version with the prior retained; delete soft-deletes.
+3. **Failure-mode confirmation:** force KV-unauthorized / not-found / unreachable and confirm each maps to the right `SPAWN_FAILED_PERMANENT` reason (`kv_unauthorized | kv_not_found | kv_unreachable`) and a malformed payload → `decrypt_failed`.
+4. **If the spike surfaces a blocker** (e.g. purge-protection / RBAC propagation), fall back to the Contrarian's documented envelope-encryption "Fourth option" above. Re-evaluate before merge.
+
+### Per-environment config the operator must set (PR 3)
+
+- `AZURE_KEYVAULT_URI` (prod, required — backend/worker fail LOUD without it) + optional `AZURE_KV_MI_CLIENT_ID` (user-assigned MI only; NEVER reuse the JWT `AZURE_CLIENT_ID`).
+- `BROKER_GATEWAY_SLOTS` — dev (Shape B): `ib-gateway,ib-gateway-hvp`; prod: `ib-gateway`.
+- `BROKER_ACCOUNT_BACKFILL` (drives the legacy-account migration; empty = no-op) — dev: `U4705114:lvp:ib-gateway:live:TWS_USERID|TWS_PASSWORD`; prod: `U4715997:hvp:ib-gateway:live:TWS_USERID|TWS_PASSWORD`. Both U-prefix accounts are low-value LIVE test accounts (IB paper = DU/DF), so `trading_mode=live` for both (nautilus gotcha #6). Routed to the prod one-shot `migrate` service env.
+
+### Soft-delete naming gotcha (informs US-004 design)
+
+A soft-deleted KV secret NAME cannot be re-`set_secret`'d until recovered/purged (`ResourceExistsError`). PR 3 sidesteps this with **unique-per-row secret names** (`broker-cred-<row-uuid>`), so re-adding an archived `ib_account_id` is always a fresh row + fresh secret name — never a collision. (Research brief: `docs/research/2026-06-01-broker-account-entity.md`.)
+
+### Deploy-mechanic correction (code-review iter-15 P1 — `AZURE_KEYVAULT_URI` rendering)
+
+The plan (Step 3d) called for adding `AZURE_KEYVAULT_URI` to the `msai-render-env.service` `REQUIRED_SECRETS` list so the VM's boot-time renderer would fetch it from Key Vault. Code review surfaced two latent flaws in that mechanism that would have **broken the first prod deploy of this PR**:
+
+1. **Frozen render unit.** `/etc/systemd/system/msai-render-env.service` + `/usr/local/bin/render-env-from-kv.sh` are baked ONCE by cloud-init at VM-provision time (`infra/cloud-init.yaml`). The recurring deploy (`deploy.yml` stage step + `deploy-on-vm.sh` Phase 5) only wrote a `KV_NAME` drop-in and never re-installed the unit/script — so an existing VM's secret list was frozen, and the new `${AZURE_KEYVAULT_URI:?}` backend compose guard would abort `docker compose up` (→ auto-rollback) because the renderer never emitted the var.
+2. **Circular secret.** Fetching `AZURE_KEYVAULT_URI` as a KV secret means storing the vault's own URI as a secret inside itself — plus a missable operator step whose omission aborts the deploy.
+
+**Resolution (achieves the plan's intent — "render provides it on the VM" — more robustly):**
+
+- `render-env-from-kv.sh` now **derives** `AZURE_KEYVAULT_URI` from `KV_NAME` (`https://${KV_NAME}.vault.azure.net/`) — the same base URL the script already builds for its own KV calls, so it is correct-by-construction and can never be missing. `AZURE_KEYVAULT_URI` is therefore NOT in `REQUIRED_SECRETS`.
+- `deploy-on-vm.sh` Phase 5 now re-installs the render unit + script from `/opt/msai/scripts/` on every deploy (mirrors the Slice-4 backup-unit copy pattern), closing the frozen-at-provision-time gap generally; `deploy.yml` stages both files.
+
+Both fresh-VM (cloud-init bakes the derived logic) and existing-VM (deploy re-syncs + re-renders) paths verified by Codex + pr-toolkit.
+
+### Provenance
+
+PR 3 implementation under `/forge-goal` autonomous `/goal` run, 2026-06-01. Plan-review loop: Claude + Codex, 8 iterations to clean (architecture pre-ratified by the 2026-05-30 council above; the loop validated the file-level design + prod-deploy/IaC surface). Code-review loop: Claude × Codex + pr-review-toolkit, **16 iterations** to both-reviewers-clean (productive convergence — ~33 real findings fixed, no equal-severity regressions; the last three iterations after the initial iter-13 clean caught the credential-alias 422 redaction gap, an empty-DB E2E-spec precondition, and the deploy-mechanic P1 above).

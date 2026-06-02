@@ -107,6 +107,12 @@ services:
       # config.py:295 — without this the migration fails at import time
       # before alembic even runs.
       REPORT_SIGNING_SECRET: ${REPORT_SIGNING_SECRET}
+      # Env-driven legacy broker_accounts backfill (PR 3 Task 11). The data
+      # migration reads this here, in the migrate service, when `alembic upgrade
+      # head` runs — the migrate service has its own environment block, so
+      # without this line the backfill would silently no-op in prod. Empty
+      # default = no backfill; set the real account→slot mapping in prod .env.
+      BROKER_ACCOUNT_BACKFILL: ${BROKER_ACCOUNT_BACKFILL:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -143,6 +149,14 @@ services:
       AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:?Set AZURE_CLIENT_ID in .env}
       JWT_TENANT_ID: ${JWT_TENANT_ID:-${AZURE_TENANT_ID}}
       JWT_CLIENT_ID: ${JWT_CLIENT_ID:-${AZURE_CLIENT_ID}}
+      # Broker-account credentials store (multi-account fleet). The backend
+      # lifespan constructs the Azure Key Vault store on boot and fails LOUD
+      # if this is absent — the ``:?`` guard makes ``docker compose up`` fail
+      # fast rather than letting the backend crashloop. AZURE_KV_MI_CLIENT_ID
+      # is the dedicated user-assigned MI client id (leave blank for the VM's
+      # system-assigned MI) — NEVER alias it to AZURE_CLIENT_ID (the JWT audience).
+      AZURE_KEYVAULT_URI: ${AZURE_KEYVAULT_URI:?Set AZURE_KEYVAULT_URI in .env}
+      AZURE_KV_MI_CLIENT_ID: ${AZURE_KV_MI_CLIENT_ID:-}
       CORS_ORIGINS: ${CORS_ORIGINS:?Set CORS_ORIGINS in .env (JSON list of allowed origins)}
       MSAI_API_KEY: ${MSAI_API_KEY:-}
       POLYGON_API_KEY: ${POLYGON_API_KEY:-}
@@ -173,6 +187,11 @@ services:
       # GatewayRouter on boot; production needs the same fail-closed
       # validation as dev (the dev-only update in iter 2 left this gap).
       GATEWAY_CONFIG: ${GATEWAY_CONFIG:-}
+      # Static pool of compose gateway-service slots a broker account can
+      # occupy. Compose .env is interpolation-only — without this in
+      # ``environment:`` the var never reaches the container. Empty parses to
+      # [] and breaks all creates, hence the ``ib-gateway`` default.
+      BROKER_GATEWAY_SLOTS: ${BROKER_GATEWAY_SLOTS:-ib-gateway}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -396,6 +415,16 @@ services:
       #       raises ``ValueError`` per-deployment when ``ib_login_key`` is
       #       set but no router is configured.
       GATEWAY_CONFIG: ${GATEWAY_CONFIG:-}
+      # Broker-account credentials store (multi-account fleet). Per-account
+      # TradingNode spawns resolve their broker login from this store. ``:-``
+      # permissive (NOT ``:?``) for the same reason as GATEWAY_CONFIG above:
+      # docker-compose interpolates ALL service envs BEFORE applying profiles,
+      # so a ``:?`` here would break ``docker compose config / up`` for the
+      # default (non-broker) profile. The store factory still fails LOUD at
+      # runtime if AZURE_KEYVAULT_URI is empty in production. Never alias
+      # AZURE_KV_MI_CLIENT_ID to AZURE_CLIENT_ID (the JWT audience).
+      AZURE_KEYVAULT_URI: ${AZURE_KEYVAULT_URI:-}
+      AZURE_KV_MI_CLIENT_ID: ${AZURE_KV_MI_CLIENT_ID:-}
       # Force-present so compose fails fast if the operator left
       # ib-gateway's credentials out of .env — otherwise the
       # gateway would crash-loop and live-supervisor would wait
@@ -410,6 +439,12 @@ services:
       # moved to the supervisor's startup warning + the per-account
       # TradingNode's Databento client construction.
       DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+      # Static pool of compose gateway-service slots a broker account can
+      # occupy. The live-supervisor builds the BrokerAccountService to resolve
+      # per-account credentials; compose .env is interpolation-only so this
+      # must be in ``environment:``. Empty parses to [] (breaks creates), hence
+      # the ``ib-gateway`` default.
+      BROKER_GATEWAY_SLOTS: ${BROKER_GATEWAY_SLOTS:-ib-gateway}
     depends_on:
       migrate:
         condition: service_completed_successfully

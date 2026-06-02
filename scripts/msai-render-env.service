@@ -27,10 +27,22 @@ Environment="KV_NAME=__SLICE3_FILLS_THIS__"
 # even for paper-only / non-broker workflows. (Alternative would be relaxing
 # compose :? guards to ${TWS_USERID:-}, but that breaks PR #50's design intent
 # and is out of scope for Slice 1.)
+# AZURE_KEYVAULT_URI is NOT listed here: the backend lifespan builds the broker-account
+# credentials store on boot and fails LOUD without it (compose backend ${...:?} guard),
+# so the rendered env MUST provide it — but render-env-from-kv.sh emits it
+# deterministically from KV_NAME (`https://${KV_NAME}.vault.azure.net/`) rather than
+# fetching it as a KV secret. Fetching it would be circular (the vault's own URI stored
+# as a secret inside itself) and a missable operator step that would abort the deploy.
 Environment="REQUIRED_SECRETS=REPORT_SIGNING_SECRET,POSTGRES_PASSWORD,AZURE_TENANT_ID,AZURE_CLIENT_ID,CORS_ORIGINS,IB_ACCOUNT_ID,TWS_USERID,TWS_PASSWORD"
 # OPTIONAL secrets — boot logs warning + skips on missing. Backend has runtime
 # defaults (JWT_*) or these are nice-to-have data-source API keys.
-Environment="OPTIONAL_SECRETS=JWT_TENANT_ID,JWT_CLIENT_ID,POLYGON_API_KEY,DATABENTO_API_KEY,MSAI_API_KEY"
+# AZURE_KV_MI_CLIENT_ID is optional — blank selects the VM's system-assigned MI
+# for Key Vault access; set only when a user-assigned MI grants the vault.
+# BROKER_ACCOUNT_BACKFILL is optional — empty = no legacy broker_accounts seed
+# (the migrate service reads it during `alembic upgrade head`); set it in KV to
+# seed this VM's account→slot mapping. The render must provide it so the migrate
+# container actually receives the var.
+Environment="OPTIONAL_SECRETS=JWT_TENANT_ID,JWT_CLIENT_ID,POLYGON_API_KEY,DATABENTO_API_KEY,MSAI_API_KEY,AZURE_KV_MI_CLIENT_ID,BROKER_ACCOUNT_BACKFILL"
 # Image-version vars (MSAI_REGISTRY, MSAI_BACKEND_IMAGE, MSAI_FRONTEND_IMAGE, MSAI_GIT_SHA)
 # are NOT rendered here — they come from Slice 3's deploy step (set at unit-invocation
 # time via /run/msai-images.env or direct Environment= in docker-compose-msai.service).

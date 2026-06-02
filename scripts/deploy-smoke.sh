@@ -104,6 +104,125 @@ export DEPLOY_START_TS
 
 echo "=== deploy-smoke.sh — symbol=$SMOKE_SYMBOL window=$SMOKE_START..$SMOKE_END ==="
 
+# ─── Step 0a — Key Vault write-path smoke (prod / azure_kv backend only) ───────
+# Proves the BACKEND CONTAINER can put → get(pinned) → delete a Key Vault secret
+# through the REAL AzureKvBrokerCredentialsStore — the exact code path, credential env
+# (AZURE_KEYVAULT_URI / AZURE_KV_MI_CLIENT_ID), and IMDS/KV network that operator
+# add/rotate uses (Option B'). Running it INSIDE the container (not on the VM host) means
+# a host-only quirk can't false-pass while the container's store still fails — see
+# docs/architecture/how_IBKR_account_secrets_keyvault_works.md §7.
+#
+# Runs BEFORE the live-active gate below ON PURPOSE: it only put/get/deletes a throwaway
+# secret (never touches Parquet/DuckDB), so it is safe even during live trading — and a
+# silent KV-write regression must NOT slip through on exactly those deploys.
+# Skips automatically in dev (file-backed store → AZURE_KEYVAULT_URI is empty).
+#
+# Bounded retry absorbs Azure RBAC data-plane PROPAGATION lag on fresh / rehearsal
+# deploys (a just-created Secrets Officer assignment can 403 for a few minutes — the
+# renderer retries 403 for the same reason). Classification:
+#   round-trip ok                         → pass
+#   auth (401/403) STILL after retries    → FAIL_SMOKE_KV → deploy-on-vm.sh rolls back
+#                                           (grant genuinely missing; add/rotate would 403)
+#   not-found / malformed payload         → FAIL_SMOKE_KV (store contract broken)
+#   throttle / unreachable after retries  → WARN_SMOKE_KV, deploy proceeds (transient infra)
+if [[ -n "${AZURE_KEYVAULT_URI:-}" ]]; then
+    echo "[0a] Key Vault write path (backend container store round-trip)"
+    # Round-trip through the REAL store, printing exactly one marker:
+    #   KV_SELFCHECK_OK | KV_SELFCHECK_RETRY_AUTH | KV_SELFCHECK_RETRY_TRANSIENT
+    #   | KV_SELFCHECK_FAIL <reason>.  Throwaway name deploy-smoke-kv-<ts> never collides
+    #   with real broker-cred-<uuid>. Heredoc body is flush-left (quoted <<'PY' → no shell
+    #   expansion; the secret value "deploy-smoke" is not real credentials).
+KV_SELFCHECK_PY=$(cat <<'PY'
+import os, sys, time
+from msai.services.live.broker_credentials_store import (
+    get_broker_credentials_store, Credentials, CredentialResolutionError, KvFailureReason,
+)
+ref = "deploy-smoke-kv-%d" % int(time.time())
+store = get_broker_credentials_store(
+    environment="production",
+    data_root=os.environ.get("DATA_ROOT", "/app/data"),
+    kv_uri=os.environ.get("AZURE_KEYVAULT_URI"),
+    mi_client_id=(os.environ.get("AZURE_KV_MI_CLIENT_ID") or None),
+)
+def _cleanup():
+    try:
+        store.delete(ref)
+    except Exception:
+        pass
+try:
+    res = store.put(ref, Credentials("deploy-smoke", "deploy-smoke"), actor="deploy-smoke")
+    got = store.get(res.secret_ref, res.version)
+    store.delete(res.secret_ref)
+    if got.tws_userid != "deploy-smoke" or got.tws_password != "deploy-smoke":
+        print("KV_SELFCHECK_FAIL roundtrip_mismatch"); sys.exit(0)
+    print("KV_SELFCHECK_OK"); sys.exit(0)
+except CredentialResolutionError as e:
+    _cleanup()
+    if e.reason == KvFailureReason.UNAUTHORIZED:
+        print("KV_SELFCHECK_RETRY_AUTH"); sys.exit(0)
+    if e.reason in (KvFailureReason.THROTTLED, KvFailureReason.UNREACHABLE):
+        print("KV_SELFCHECK_RETRY_TRANSIENT"); sys.exit(0)
+    print("KV_SELFCHECK_FAIL %s" % e.reason); sys.exit(0)
+except Exception as e:  # import/config/unexpected — terminal, not retryable
+    print("KV_SELFCHECK_FAIL unexpected:%r" % (e,)); sys.exit(0)
+PY
+)
+    # Deadline-bounded retry (~5min): a just-created Secrets Officer assignment can take a
+    # few minutes of Azure RBAC data-plane PROPAGATION before writes stop returning 401/403,
+    # so a fixed handful of 15s sleeps could roll back a correctly-configured fresh/rehearsal
+    # deploy. The common steady-state case (grant long-propagated) succeeds on attempt 1 →
+    # no delay; the budget only bites on fresh/rehearsal/broken deploys. `kv_saw_auth` is
+    # STICKY: once ANY attempt observes 401/403 the run is an auth/missing-grant case even if
+    # a LATER attempt only times out or throttles — so a final transient can't mask the core
+    # missing-grant regression (which must roll back), per Codex review.
+    kv_state="exhausted"
+    kv_saw_auth=""
+    KV_OUT=""
+    kv_attempt=0
+    kv_deadline=$(( $(date +%s) + 300 ))
+    while [[ "$(date +%s)" -lt "$kv_deadline" ]]; do
+        kv_attempt=$((kv_attempt + 1))
+        # Per-attempt hard timeout: the round-trip goes through the azure SDK (its own
+        # connect/read timeouts + retries can run long), so a blackholed KV/IMDS can't hang
+        # Phase 12. Plain `timeout 30` reports its OWN deadline as 124 (SIGTERM) → transient.
+        # 137 (SIGKILL/OOM of the self-check) is a real crash → falls through to the marker
+        # `case`, finds no KV_SELFCHECK_OK, and FAILs closed (masking it would fail-open).
+        set +e
+        KV_OUT=$(timeout 30 docker compose "${COMPOSE_FLAGS[@]}" exec -T backend \
+            python -c "$KV_SELFCHECK_PY" 2>&1)
+        KV_RC=$?
+        set -e
+        if [[ "$KV_RC" -eq 124 ]]; then
+            echo "    attempt $kv_attempt: KV self-check timed out (>30s; KV/IMDS stalled) — retrying"
+            sleep 15; continue
+        fi
+        case "$KV_OUT" in
+            *KV_SELFCHECK_OK*) kv_state="ok"; break ;;
+            *KV_SELFCHECK_RETRY_AUTH*)
+                kv_saw_auth=1
+                echo "    attempt $kv_attempt: KV auth not yet propagated (401/403) — retrying within ~5min budget"
+                sleep 15 ;;
+            *KV_SELFCHECK_RETRY_TRANSIENT*)
+                echo "    attempt $kv_attempt: KV transient (throttle/unreachable) — retrying"
+                sleep 15 ;;
+            *) kv_state="fail"; break ;;  # KV_SELFCHECK_FAIL, or docker-exec/python error
+        esac
+    done
+    case "$kv_state" in
+        ok)
+            echo "    PUT+GET+DELETE ok — backend container can write, read, and delete Key Vault secrets" ;;
+        fail)
+            echo "FAIL_SMOKE_KV: backend container KV credential round-trip failed — ${KV_OUT}. AzureKvBrokerCredentialsStore (operator add/rotate) is unusable. Check the VM MI 'Key Vault Secrets Officer' grant + AZURE_KEYVAULT_URI (docs/architecture/how_IBKR_account_secrets_keyvault_works.md §4)." >&2
+            exit 1 ;;
+        *)  # budget exhausted without a clean round-trip
+            if [[ -n "$kv_saw_auth" ]]; then
+                echo "FAIL_SMOKE_KV: KV write/read still 401/403 after the ~5min propagation budget — the VM managed identity is missing 'Key Vault Secrets Officer' on ${AZURE_KEYVAULT_URI} (not mere propagation lag). Operator add/rotate will 403. Re-apply the grant (docs/architecture/how_IBKR_account_secrets_keyvault_works.md §4)." >&2
+                exit 1
+            fi
+            echo "WARN_SMOKE_KV: KV round-trip inconclusive after the retry budget (transient throttle/unreachable; no auth failure observed) — deploy proceeds; investigate if it persists." >&2 ;;
+    esac
+fi
+
 # ─── Step 0 — Gate on active live deployments ──────────────────────────────────
 # Hawk BLOCKING #3: do NOT run a backtest worker when a live deployment is
 # active. Shared Parquet/DuckDB during real-money trading is operationally
