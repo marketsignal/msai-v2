@@ -1,10 +1,12 @@
 "use client";
 
-import { useIsAuthenticated } from "@azure/msal-react";
+import { useIsAuthenticated, useMsal } from "@azure/msal-react";
+import { InteractionStatus } from "@azure/msal-browser";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect } from "react";
 import { Sidebar } from "./sidebar";
 import { Header } from "./header";
+import { isAuthBypassed } from "@/lib/auth";
 
 const PUBLIC_ROUTES = ["/login"];
 
@@ -14,44 +16,47 @@ export function AppShell({
   children: React.ReactNode;
 }): React.ReactElement {
   const _isAuthenticated = useIsAuthenticated();
-  // Bypass the MSAL UI gate for the three documented auth modes:
-  //   - ``NODE_ENV === "development"`` — local dev loop
-  //   - ``NEXT_PUBLIC_E2E_AUTH_BYPASS === "1"`` — Playwright E2E
-  //   - ``NEXT_PUBLIC_MSAI_API_KEY`` set — API-key-only sessions
-  // Codex iter-2 P2 #3: the API-key bypass was honored by ``useAuth()``
-  // but not by this guard, so the documented API-key flow redirected
-  // to ``/login`` in production. Mirrors ``isAuthBypassed()`` from
-  // ``lib/auth.ts``.
-  const isDevBypass = process.env.NODE_ENV === "development";
-  const isE2EBypass = process.env.NEXT_PUBLIC_E2E_AUTH_BYPASS === "1";
-  const isApiKeyBypass = Boolean(process.env.NEXT_PUBLIC_MSAI_API_KEY);
-  const isAuthenticated =
-    isDevBypass || isE2EBypass || isApiKeyBypass ? true : _isAuthenticated;
+  // The three documented auth-bypass modes (dev / E2E / API-key) live in isAuthBypassed()
+  // (lib/auth.ts). Reuse it here so this guard can't drift from the useQuery `enabled`
+  // flags that also honor it (Codex iter-2 P2 #3 — the guard previously mirrored the
+  // expression inline, which is exactly the drift risk this removes).
+  const isBypassed = isAuthBypassed();
+  const isAuthenticated = isBypassed ? true : _isAuthenticated;
+  // On a full page load MSAL is mid-initialize()/handleRedirectPromise(), so
+  // useIsAuthenticated() is briefly false. Gate the redirect on MSAL having SETTLED
+  // (inProgress === None) so a deep-link / refresh of a protected route doesn't bounce
+  // through /login to /dashboard. Bypass modes skip the wait. (The provider-level
+  // initialize() gate in providers.tsx is pre-existing and separate from this guard.)
+  const { inProgress } = useMsal();
+  const msalSettled = isBypassed || inProgress === InteractionStatus.None;
   const pathname = usePathname();
   const router = useRouter();
   const isPublicRoute = PUBLIC_ROUTES.includes(pathname);
 
   useEffect(() => {
+    if (!msalSettled) return; // wait for MSAL to settle; don't bounce on the init-window false
     if (!isAuthenticated && !isPublicRoute) {
       router.replace("/login");
     }
     if (isAuthenticated && isPublicRoute) {
       router.replace("/dashboard");
     }
-  }, [isAuthenticated, isPublicRoute, router]);
+  }, [msalSettled, isAuthenticated, isPublicRoute, router]);
 
   // Public routes (login) render without shell
   if (isPublicRoute) {
     return <>{children}</>;
   }
 
-  // Protected routes render with sidebar + header
-  if (!isAuthenticated) {
+  // Protected routes: hold the spinner while MSAL is still initializing (so a deep-link /
+  // refresh doesn't render-then-bounce) AND while a genuine unauthenticated redirect is in
+  // flight. Only render the shell once MSAL has settled AND the user is authenticated.
+  if (!msalSettled || !isAuthenticated) {
     return (
       <div className="flex h-screen items-center justify-center bg-background">
         <div className="flex flex-col items-center gap-3">
           <div className="size-8 animate-spin rounded-full border-2 border-muted-foreground border-t-transparent" />
-          <p className="text-sm text-muted-foreground">Redirecting...</p>
+          <p className="text-sm text-muted-foreground">Loading...</p>
         </div>
       </div>
     );
