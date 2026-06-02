@@ -418,6 +418,181 @@ async def test_clean_exit_marks_row_stopped_with_failure_kind_none(
         assert dep.status == "stopped"
 
 
+@pytest.mark.asyncio
+async def test_mark_running_forward_syncs_deployment_to_running(
+    session_factory: async_sessionmaker[AsyncSession],
+    seeded_row: LiveNodeProcess,
+) -> None:
+    """PR 2 T4 review P1: ``_mark_running`` must forward-sync the parent
+    ``live_deployments.status`` to ``running``.
+
+    A slow IB connect/reconcile can push the node's ``running`` transition
+    past the API's 60s ``/start-portfolio`` poll. The API then leaves the
+    deployment in ``starting`` (it no longer flips it to ``failed`` — that
+    would orphan a real-money node). Without this forward-sync the deployment
+    would linger at ``starting`` forever even though a live node is trading.
+    """
+    from msai.services.nautilus.trading_node_subprocess import _mark_running
+
+    # The seeded deployment + node row are both ``starting``.
+    async with session_factory() as session:
+        dep = await session.get(LiveDeployment, seeded_row.deployment_id)
+        assert dep is not None
+        assert dep.status == "starting"
+
+    await _mark_running(session_factory, seeded_row.id)
+
+    # The node row is running AND the deployment forward-synced to running.
+    node_row = await _fetch_row(session_factory, seeded_row.id)
+    assert node_row.status == "running"
+    async with session_factory() as session:
+        dep = await session.get(LiveDeployment, seeded_row.deployment_id)
+        assert dep is not None
+        assert dep.status == "running"
+        assert dep.last_stopped_at is None
+
+
+@pytest.mark.asyncio
+async def test_mark_running_does_not_resurrect_a_stopping_deployment(
+    session_factory: async_sessionmaker[AsyncSession],
+    seeded_row: LiveNodeProcess,
+) -> None:
+    """If a concurrent ``/live/stop`` already moved the deployment to
+    ``stopping`` (or a terminal status), ``_mark_running`` must NOT resurrect
+    it to ``running`` — the non-terminal guard excludes ``stopping``."""
+    from msai.services.nautilus.trading_node_subprocess import _mark_running
+
+    async with session_factory() as session, session.begin():
+        dep = await session.get(LiveDeployment, seeded_row.deployment_id)
+        assert dep is not None
+        dep.status = "stopping"
+
+    await _mark_running(session_factory, seeded_row.id)
+
+    async with session_factory() as session:
+        dep = await session.get(LiveDeployment, seeded_row.deployment_id)
+        assert dep is not None
+        # Stayed stopping — not resurrected.
+        assert dep.status == "stopping"
+
+
+@pytest.mark.asyncio
+async def test_mark_running_does_not_overwrite_a_concurrent_stop_under_lock(
+    session_factory: async_sessionmaker[AsyncSession],
+    seeded_row: LiveNodeProcess,
+) -> None:
+    """Lost-update race (prior-review P2): a concurrent ``/stop`` /
+    ``/kill-all`` that commits ``stopping`` in the TOCTOU window between
+    ``_mark_running``'s read and its write must NOT be resurrected back to
+    ``running``.
+
+    The buggy version read ``deployment.status`` on an unlocked snapshot,
+    so under READ COMMITTED its UPDATE-to-``running`` blocks on the row
+    lock held by the in-flight ``stopping`` transaction, then OVERWRITES
+    ``stopped`` once that commits — a classic lost update.
+
+    Deterministic reproduction: a concurrent transaction acquires the
+    ``LiveDeployment`` row lock (``SELECT ... FOR UPDATE``), sets
+    ``stopping``, and holds the lock while ``_mark_running`` runs. With the
+    fix, ``_mark_running``'s own ``FOR UPDATE`` fetch blocks until the stop
+    commits, then re-reads ``stopping`` and the non-terminal guard skips the
+    write. The deployment ends ``stopping``, the node row ends ``running``.
+    """
+    from sqlalchemy import select
+
+    from msai.services.nautilus.trading_node_subprocess import _mark_running
+
+    stop_committed = asyncio.Event()
+    mark_running_done = asyncio.Event()
+
+    async def concurrent_stop() -> None:
+        # Hold the deployment row lock the way /stop's UPDATE would, but
+        # keep the transaction open across the _mark_running attempt so the
+        # interleaving is deterministic rather than timing-dependent.
+        async with session_factory() as session, session.begin():
+            locked = (
+                await session.execute(
+                    select(LiveDeployment)
+                    .where(LiveDeployment.id == seeded_row.deployment_id)
+                    .with_for_update()
+                )
+            ).scalar_one()
+            locked.status = "stopping"
+            # Give _mark_running a chance to start (and, if it locks, block)
+            # before we commit the stop.
+            await asyncio.sleep(0.2)
+        # session.begin() committed here → lock released.
+        stop_committed.set()
+
+    async def run_mark_running() -> None:
+        await _mark_running(session_factory, seeded_row.id)
+        mark_running_done.set()
+
+    await asyncio.gather(concurrent_stop(), run_mark_running())
+
+    assert stop_committed.is_set()
+    assert mark_running_done.is_set()
+
+    # The node-process row still records ``running`` (the node IS running).
+    node_row = await _fetch_row(session_factory, seeded_row.id)
+    assert node_row.status == "running"
+
+    # But the deployment must NOT have been resurrected: the concurrent stop
+    # wins, so the logical view shows ``stopping`` (the being-torn-down state),
+    # never ``running``.
+    async with session_factory() as session:
+        dep = await session.get(LiveDeployment, seeded_row.deployment_id)
+        assert dep is not None
+        assert dep.status == "stopping"
+
+
+@pytest.mark.asyncio
+async def test_mark_running_skips_promotion_when_node_row_carries_stop_intent(
+    session_factory: async_sessionmaker[AsyncSession],
+    seeded_row: LiveNodeProcess,
+) -> None:
+    """Codex iter-28 P1: ``_mark_running`` is the CHILD's self-write of
+    ``running`` once it reaches ``is_running``. If an operator ``/stop`` raced
+    with startup and already stamped the NODE row with ``stop_requested_at`` /
+    flipped ``status`` to ``stopping``, promoting it back to ``running`` here
+    would ERASE the durable stop intent and (in the no-pid / supervisor-restart
+    windows) leave a STOPPED account looking active until a later terminal
+    write. The self-promotion AND the deployment forward-sync must both be
+    skipped; the row is left exactly as the stop path left it for that path /
+    the reaper to terminalize.
+
+    Distinct from ``test_mark_running_does_not_resurrect_a_stopping_deployment``:
+    that test stamps the DEPLOYMENT (covered by the deployment-level guard);
+    THIS test stamps the NODE row itself (the gap Codex iter-28 flagged — the
+    node row's ``status`` was promoted unconditionally before this fix)."""
+    from datetime import UTC, datetime
+
+    from msai.services.nautilus.trading_node_subprocess import _mark_running
+
+    # Operator /stop stamped the NODE row mid-startup: durable intent recorded
+    # AND status moved out of the startable set.
+    async with session_factory() as session, session.begin():
+        row = await session.get(LiveNodeProcess, seeded_row.id)
+        assert row is not None
+        row.stop_requested_at = datetime.now(UTC)
+        row.status = "stopping"
+
+    await _mark_running(session_factory, seeded_row.id)
+
+    # The node row was NOT resurrected to ``running`` — stop intent preserved.
+    node_row = await _fetch_row(session_factory, seeded_row.id)
+    assert node_row.status == "stopping"
+    assert node_row.stop_requested_at is not None
+
+    # The deployment was NOT forward-synced to ``running`` (the whole promotion
+    # block — deployment guard included — was skipped). It stays ``starting``,
+    # where the stop path will terminalize it.
+    async with session_factory() as session:
+        dep = await session.get(LiveDeployment, seeded_row.deployment_id)
+        assert dep is not None
+        assert dep.status == "starting"
+
+
 # ---------------------------------------------------------------------------
 # Failure paths
 # ---------------------------------------------------------------------------
@@ -511,11 +686,15 @@ async def test_run_async_exception_after_ready_marks_spawn_failed_permanent(
     session_factory: async_sessionmaker[AsyncSession],
     seeded_row: LiveNodeProcess,
 ) -> None:
-    """A post-ready exception inside ``node.run_async()`` (e.g.
-    one of the engine queue tasks crashes after the trader is
-    running) is still a permanent failure from the supervisor's POV
-    (the endpoint's cached 201 is already correct; the next
-    attempt goes through a fresh identity_signature check)."""
+    """A run_async exception caught at the STARTUP-health boundary (the
+    ``node_run_task.done()`` check after ``wait_until_ready`` returns, BEFORE
+    ``_mark_running`` persists) is a STARTUP failure, NOT the steady-state
+    runtime crash. It stays ``FailureKind.SPAWN_FAILED_PERMANENT`` — the node
+    never crossed into the persisted ``running`` trading loop, so the
+    crash-recovery paths must NOT auto-respawn it (it is adjacent to
+    RECONCILIATION_FAILED — an engine/startup problem a bare respawn won't fix).
+    The steady-state post-``_mark_running`` crash → NODE_CRASHED is the SEPARATE
+    site exercised by the live DB reaper tests (PR 2 / F2)."""
     node = _FakeNode(
         run_async_raises_after_ready=RuntimeError("strategy crashed mid-run"),
     )

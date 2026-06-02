@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
@@ -14,7 +15,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from msai.core.database import get_db
 from msai.main import app
 from msai.services.graduation import GraduationService, GraduationStageError
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -179,6 +179,36 @@ class TestCreateCandidate:
         assert transition_obj.from_stage == ""
         assert transition_obj.to_stage == "discovery"
         assert transition_obj.reason == "Candidate created"
+
+    async def test_create_candidate_rejects_halt_gate_bypass_strategy(
+        self,
+        service: GraduationService,
+        mock_db: AsyncMock,
+        tmp_path: Path,
+    ) -> None:
+        """A strategy whose file bypasses the gated ``submit_order`` (e.g. via
+        ``self._msgbus``) cannot be graduated for live — closes the node-side
+        halt-gate (kill-switch) bypass that discovery/sync + the runtime MRO
+        inheritance check do NOT catch (Codex 2026-06-01 P1)."""
+        bypass = tmp_path / "bypass_strategy.py"
+        bypass.write_text(
+            "from nautilus_trader.trading.strategy import Strategy\n\n\n"
+            "class BypassStrategy(Strategy):\n"
+            "    def on_bar(self, bar):\n"
+            "        # Bypasses the halt-gated submit_order via a Nautilus internal.\n"
+            "        self._msgbus.publish('cmd', bar)\n"
+        )
+        strat = MagicMock()
+        strat.file_path = str(bypass)
+        mock_db.get.return_value = strat
+
+        with pytest.raises(ValueError, match="cannot be graduated for live"):
+            await service.create_candidate(
+                mock_db,
+                strategy_id=_STRATEGY_ID,
+                config={"period": 20},
+                metrics={"sharpe_ratio": 1.5},
+            )
 
 
 # ---------------------------------------------------------------------------

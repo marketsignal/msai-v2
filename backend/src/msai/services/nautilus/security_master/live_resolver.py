@@ -142,8 +142,8 @@ class LiveResolverError(ValueError):
     """Base for typed errors from :func:`lookup_for_live`.
 
     Subclasses ``ValueError`` so the supervisor's payload-factory
-    catch in ``ProcessManager.spawn()`` treats resolver failures as
-    permanent (no XAUTOCLAIM retry). ``ProcessManager`` dispatches on
+    catch in ``FleetRouter.spawn()`` treats resolver failures as
+    permanent (no XAUTOCLAIM retry). ``FleetRouter`` dispatches on
     exception type before calling ``_mark_failed`` so each subclass
     maps to a distinct :class:`FailureKind`.
 

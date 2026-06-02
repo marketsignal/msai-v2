@@ -116,7 +116,7 @@ async def test_factory_embeds_per_account_databento_fields() -> None:
 
     targets = ResolvedDatabentoTargets(
         native_instrument_ids=["AAPL.XNAS"],
-        venue_dataset_map={"XNAS": "DBEQ.BASIC"},
+        venue_dataset_map={"XNAS": "EQUS.MINI"},
     )
 
     with (
@@ -165,7 +165,7 @@ async def test_factory_embeds_per_account_databento_fields() -> None:
     assert payload.native_instrument_ids == ["AAPL.XNAS"]
 
     # ---- venue_dataset_map ----
-    assert payload.venue_dataset_map == {"XNAS": "DBEQ.BASIC"}
+    assert payload.venue_dataset_map == {"XNAS": "EQUS.MINI"}
 
     # ---- canonical_to_native_bar_types ----
     # Canonical key carries .IBKR; value carries the native venue.
@@ -204,7 +204,7 @@ async def test_factory_ibg_client_id_is_deterministic_from_slug() -> None:
 
     targets = ResolvedDatabentoTargets(
         native_instrument_ids=["AAPL.XNAS"],
-        venue_dataset_map={"XNAS": "DBEQ.BASIC"},
+        venue_dataset_map={"XNAS": "EQUS.MINI"},
     )
 
     slug = "abcdef0123456789"
@@ -402,7 +402,7 @@ async def test_factory_raises_when_ib_login_key_unknown_to_router() -> None:
     deployment has a non-empty ``ib_login_key`` and a router is wired,
     the factory MUST call ``gateway_router.resolve(...)`` UNCONDITIONALLY
     (no ``is_multi_login`` gate). An unknown key MUST raise ``ValueError``
-    (which the process_manager's permanent-catch translates to
+    (which the fleet_router's permanent-catch translates to
     ``SPAWN_FAILED_PERMANENT``) — NOT silently fall through to
     ``settings.ib_host/port``.
 
@@ -448,7 +448,7 @@ async def test_factory_raises_when_ib_login_key_unknown_to_router() -> None:
 
         # F5 (Codex iter 2 P1): the factory must reach
         # ``gateway_router.resolve("unknown_key")`` and let the ValueError
-        # propagate. The process_manager's permanent-failure catch then
+        # propagate. The fleet_router's permanent-failure catch then
         # translates this into SPAWN_FAILED_PERMANENT — no silent
         # fallback to settings.ib_host/port.
         with pytest.raises(ValueError, match="No gateway configured"):
@@ -493,7 +493,7 @@ async def test_factory_resolves_single_login_router_when_ib_login_key_set() -> N
 
     targets = ResolvedDatabentoTargets(
         native_instrument_ids=["AAPL.XNAS"],
-        venue_dataset_map={"XNAS": "DBEQ.BASIC"},
+        venue_dataset_map={"XNAS": "EQUS.MINI"},
     )
 
     with (

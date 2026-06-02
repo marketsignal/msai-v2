@@ -28,7 +28,7 @@ from msai.services.nautilus.live_node_config import (
 # ---------------------------------------------------------------------------
 
 _NATIVE_IDS: list[str] = ["AAPL.XNAS"]
-_VENUE_DATASET_MAP: dict[str, str] = {"XNAS": "DBEQ.BASIC"}
+_VENUE_DATASET_MAP: dict[str, str] = {"XNAS": "EQUS.MINI"}
 _BAR_TYPE_MAP: dict[str, str] = {
     "AAPL.IBKR-1-MINUTE-LAST-EXTERNAL": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL",
 }
@@ -266,7 +266,7 @@ def test_ib_exec_provider_uses_load_contracts_with_listing_venue() -> None:
         ibg_client_id=210,
         ib_login_key="k",
         native_instrument_ids=["AAPL.XNAS", "GE.XNYS"],
-        venue_dataset_map={"XNAS": "DBEQ.BASIC", "XNYS": "DBEQ.BASIC"},
+        venue_dataset_map={"XNAS": "EQUS.MINI", "XNYS": "EQUS.MINI"},
         canonical_to_native_bar_types={
             "AAPL.IBKR-1-MINUTE-LAST-EXTERNAL": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL",
             "GE.IBKR-1-MINUTE-LAST-EXTERNAL": "GE.XNYS-1-MINUTE-LAST-EXTERNAL",
@@ -315,7 +315,7 @@ def test_ib_exec_provider_no_ibkr_strings_anywhere() -> None:
         ibg_client_id=210,
         ib_login_key="k",
         native_instrument_ids=["AAPL.XNAS"],
-        venue_dataset_map={"XNAS": "DBEQ.BASIC"},
+        venue_dataset_map={"XNAS": "EQUS.MINI"},
         canonical_to_native_bar_types={
             "AAPL.IBKR-1-MINUTE-LAST-EXTERNAL": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL",
         },
@@ -345,7 +345,7 @@ def test_ib_exec_provider_load_contracts_empty_when_no_resolved() -> None:
         ibg_client_id=210,
         ib_login_key="k",
         native_instrument_ids=["AAPL.XNAS"],
-        venue_dataset_map={"XNAS": "DBEQ.BASIC"},
+        venue_dataset_map={"XNAS": "EQUS.MINI"},
         canonical_to_native_bar_types={
             "AAPL.IBKR-1-MINUTE-LAST-EXTERNAL": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL",
         },

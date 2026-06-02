@@ -176,19 +176,16 @@ async def client(
     async def _override_current_user() -> dict[str, Any]:
         return {"sub": test_user.entra_id, "email": test_user.email}
 
-    # Register a fake ``live-supervisor`` consumer so
-    # ``_supervisor_is_alive`` (drill 2026-04-15 P0-A) sees an
-    # active consumer and doesn't short-circuit /start with 503.
-    # Real integration with a supervisor consumer loop is out of
-    # scope for these endpoint tests — we stub it at the Redis
-    # layer the same way the fake supervisor task stubs the DB
-    # side.
+    # Make ``_supervisor_is_alive`` (drill 2026-04-15 P0-A) see a live
+    # supervisor so the /start-portfolio 503 gate doesn't short-circuit.
+    # PR 2 T4: the liveness probe now reads the ``router_heartbeat`` Redis
+    # key (not the global consumer-group), so stamp a fresh heartbeat. Real
+    # integration with a supervisor consumer loop is out of scope for these
+    # endpoint tests — we stub liveness at the Redis layer the same way the
+    # fake supervisor task stubs the DB side.
     shared_bus = LiveCommandBus(redis=redis_text)
     await shared_bus.ensure_group()
-    with contextlib.suppress(Exception):
-        await redis_text.xgroup_createconsumer(
-            LIVE_COMMAND_STREAM, "live-supervisor", "fake-supervisor-1"
-        )
+    await shared_bus.publish_router_heartbeat()
 
     async def _override_command_bus() -> LiveCommandBus:
         return shared_bus
@@ -394,6 +391,129 @@ async def test_stop_returns_200_immediately_when_no_active_row(
     assert response.json()["status"] == "stopped"
 
     # No command was published (idempotent short-circuit).
+    entries = await redis_text.xrange(LIVE_COMMAND_STREAM, count=10)
+    assert len(entries) == 0
+
+
+@pytest.mark.asyncio
+async def test_stop_records_intent_on_failed_row_with_pending_restart(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    test_user: User,
+    test_strategy: Strategy,
+    redis_text: AsyncRedis,
+) -> None:
+    """FINDING 1 (P1): a plain /stop on a deployment whose latest row is
+    ``failed`` with a PENDING auto-restart (``restart_dispatched_at`` set, the
+    reaper dispatched a restart that's now backing off) MUST record the durable
+    operator-stop intent (``stop_requested_at``) on that failed row — so the
+    in-flight ``_run_restart_task`` aborts instead of resurrecting the node the
+    operator just stopped. A plain /stop sets NO halt latch, so this durable
+    intent is the only thing that suppresses the pending restart.
+
+    The handler returns 200 ``stopped`` (idempotent — there is no active row) but
+    must NOT leave the failed row's stop intent unset. It must also NOT resurrect
+    the row (status stays ``failed``) or flip the deployment status.
+    """
+    # Seed: deployment + a single FAILED node row with restart_dispatched_at set
+    # (the reaper dispatched a restart) and NO active row. Deployment is 'failed'
+    # (NOT terminally 'stopped'), so the suppression branch applies.
+    async with session_factory() as session, session.begin():
+        dep = await make_live_deployment(
+            session,
+            user=test_user,
+            strategy=test_strategy,
+            status="failed",
+            strategy_class="SmokeStrategy",
+        )
+        dep_id = dep.id
+        now = datetime.now(UTC)
+        row = LiveNodeProcess(
+            deployment_id=dep_id,
+            pid=4242,
+            host="testhost",
+            started_at=now,
+            last_heartbeat_at=now,
+            status="failed",
+            gateway_session_key="sess-1",
+            restart_dispatched_at=now,
+            stop_requested_at=None,
+        )
+        session.add(row)
+        await session.flush()
+        failed_row_id = row.id
+
+    await redis_text.xtrim(LIVE_COMMAND_STREAM, maxlen=0)
+
+    response = await client.post("/api/v1/live/stop", json={"deployment_id": str(dep_id)})
+    assert response.status_code == 200
+    assert response.json()["status"] == "stopped"
+
+    # The durable operator-stop intent was stamped on the failed-pending row —
+    # this is what the restart path re-reads to abort the respawn.
+    async with session_factory() as session:
+        refreshed = await session.get(LiveNodeProcess, failed_row_id)
+        assert refreshed is not None
+        assert refreshed.stop_requested_at is not None, (
+            "/stop must record stop_requested_at on the failed-with-pending-restart "
+            "row so the in-flight auto-restart task aborts"
+        )
+        # The row is NOT resurrected/re-activated — only the intent column changed.
+        assert refreshed.status == "failed"
+        dep_status = (
+            await session.execute(select(LiveDeployment.status).where(LiveDeployment.id == dep_id))
+        ).scalar_one()
+        assert dep_status == "failed", "/stop must NOT flip LiveDeployment.status here"
+
+    # No STOP command published (no active row to signal).
+    entries = await redis_text.xrange(LIVE_COMMAND_STREAM, count=10)
+    assert len(entries) == 0
+
+
+@pytest.mark.asyncio
+async def test_stop_queued_start_marks_deployment_stopped_no_node_row(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    test_user: User,
+    test_strategy: Strategy,
+    redis_text: AsyncRedis,
+) -> None:
+    """INVARIANT 1 (council 2026-06-01 follow-up — QUEUED-START GAP). A /stop on
+    a deployment that is still ``starting`` with NO node row (its START was
+    published but not yet consumed by the supervisor) must mark the
+    ``LiveDeployment`` row operator-terminal (``status='stopped'``). This is what
+    the supervisor's Phase-A gate reads to ABORT the queued START — there is no
+    node row to carry ``stop_requested_at``, so the deployment-level flag is the
+    only durable signal. Without this, the queued START spawns a live node after
+    the operator was told "stopped"."""
+    async with session_factory() as session, session.begin():
+        dep = await make_live_deployment(
+            session,
+            user=test_user,
+            strategy=test_strategy,
+            status="starting",  # START published, NOT yet consumed
+            strategy_class="SmokeStrategy",
+        )
+        dep_id = dep.id
+
+    await redis_text.xtrim(LIVE_COMMAND_STREAM, maxlen=0)
+
+    response = await client.post("/api/v1/live/stop", json={"deployment_id": str(dep_id)})
+    assert response.status_code == 200
+    assert response.json()["status"] == "stopped"
+
+    # The deployment is now operator-terminal so the supervisor's Phase-A gate
+    # aborts the queued START.
+    async with session_factory() as session:
+        dep_status = (
+            await session.execute(select(LiveDeployment.status).where(LiveDeployment.id == dep_id))
+        ).scalar_one()
+        assert dep_status == "stopped", (
+            "/stop of a still-starting deployment with no node row must mark the "
+            "deployment operator-terminal (stopped) so the queued START can't spawn"
+        )
+
+    # No STOP command published (no active node row to signal).
     entries = await redis_text.xrange(LIVE_COMMAND_STREAM, count=10)
     assert len(entries) == 0
 

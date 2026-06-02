@@ -20,7 +20,7 @@ from msai.services.nautilus.databento_live_config import (
 def test_resolved_targets_dataclass_is_frozen() -> None:
     targets = ResolvedDatabentoTargets(
         native_instrument_ids=["AAPL.XNAS"],
-        venue_dataset_map={"XNAS": "DBEQ.BASIC"},
+        venue_dataset_map={"XNAS": "EQUS.MINI"},
     )
     with pytest.raises((AttributeError, Exception)):
         targets.native_instrument_ids = ["bogus"]  # type: ignore[misc]
@@ -29,7 +29,7 @@ def test_resolved_targets_dataclass_is_frozen() -> None:
 def test_builder_pins_reconnect_timeout_to_10_min() -> None:
     config = build_databento_data_client_config(
         native_instrument_ids=["AAPL.XNAS", "SPY.XNAS"],
-        venue_dataset_map={"XNAS": "DBEQ.BASIC"},
+        venue_dataset_map={"XNAS": "EQUS.MINI"},
         api_key="dbn-test-key",
     )
     assert config.reconnect_timeout_mins == 10
@@ -38,7 +38,7 @@ def test_builder_pins_reconnect_timeout_to_10_min() -> None:
 def test_builder_pre_populates_native_instrument_ids() -> None:
     config = build_databento_data_client_config(
         native_instrument_ids=["AAPL.XNAS", "SPY.XNAS"],
-        venue_dataset_map={"XNAS": "DBEQ.BASIC"},
+        venue_dataset_map={"XNAS": "EQUS.MINI"},
         api_key="dbn-test-key",
     )
     native_ids = {str(iid) for iid in (config.instrument_ids or [])}
@@ -52,16 +52,16 @@ def test_builder_carries_authoritative_venue_dataset_map() -> None:
     # publisher lookup.
     config = build_databento_data_client_config(
         native_instrument_ids=["AAPL.XNAS"],
-        venue_dataset_map={"XNAS": "DBEQ.BASIC"},
+        venue_dataset_map={"XNAS": "EQUS.MINI"},
         api_key="k",
     )
-    assert config.venue_dataset_map == {"XNAS": "DBEQ.BASIC"}
+    assert config.venue_dataset_map == {"XNAS": "EQUS.MINI"}
 
 
 def test_builder_uses_exchange_as_venue_default() -> None:
     config = build_databento_data_client_config(
         native_instrument_ids=["AAPL.XNAS"],
-        venue_dataset_map={"XNAS": "DBEQ.BASIC"},
+        venue_dataset_map={"XNAS": "EQUS.MINI"},
         api_key="k",
     )
     assert config.use_exchange_as_venue is True
@@ -70,7 +70,7 @@ def test_builder_uses_exchange_as_venue_default() -> None:
 def test_builder_carries_api_key() -> None:
     config = build_databento_data_client_config(
         native_instrument_ids=["AAPL.XNAS"],
-        venue_dataset_map={"XNAS": "DBEQ.BASIC"},
+        venue_dataset_map={"XNAS": "EQUS.MINI"},
         api_key="dbn-secret-123",
     )
     assert config.api_key == "dbn-secret-123"
@@ -81,11 +81,11 @@ def test_builder_handles_multiple_native_venues() -> None:
     # supports equities (XNAS), the builder must accept arbitrary keys.
     config = build_databento_data_client_config(
         native_instrument_ids=["AAPL.XNAS", "ESM6.GLBX"],
-        venue_dataset_map={"XNAS": "DBEQ.BASIC", "GLBX": "GLBX.MDP3"},
+        venue_dataset_map={"XNAS": "EQUS.MINI", "GLBX": "GLBX.MDP3"},
         api_key="k",
     )
     assert config.venue_dataset_map == {
-        "XNAS": "DBEQ.BASIC",
+        "XNAS": "EQUS.MINI",
         "GLBX": "GLBX.MDP3",
     }
     # Both instrument_ids parse correctly as InstrumentId objects
@@ -101,7 +101,7 @@ def test_resolved_targets_is_json_serializable_via_dict() -> None:
 
     targets = ResolvedDatabentoTargets(
         native_instrument_ids=["AAPL.XNAS"],
-        venue_dataset_map={"XNAS": "DBEQ.BASIC"},
+        venue_dataset_map={"XNAS": "EQUS.MINI"},
     )
     payload = {
         "native_instrument_ids": targets.native_instrument_ids,

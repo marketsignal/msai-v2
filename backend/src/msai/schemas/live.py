@@ -95,6 +95,29 @@ class LiveDeploymentInfo(BaseModel):
     ib_login_key: str | None = None
     ibg_client_id: int | None = None
 
+    # PR 2 T8 — per-account restart-authority health (additive, read-only).
+    # Sourced from the latest ``live_node_processes`` row for this deployment
+    # (the four restart-authority columns added in T1) plus the live Redis
+    # halt latches. All nullable so a deployment that has never spawned a
+    # node process (no live_node_processes row) still serializes cleanly.
+    #
+    # ``auto_restart_paused`` True => the bounded restart policy tripped and
+    # the reaper will NOT auto-respawn this account; an operator must
+    # intervene. ``consecutive_respawn_failures`` + ``last_restart_at`` let
+    # the operator see how close an account is to (or how it crossed) the
+    # ceiling. ``last_heartbeat_age_s`` is derived server-side from
+    # ``last_heartbeat_at`` so the UI/CLI don't have to clock-compare.
+    # ``fleet_halted`` / ``account_halted`` reflect the fleet + account halt
+    # latches (read from Redis, account-scoped per ``account_halt_key``).
+    auto_restart_paused: bool | None = None
+    auto_restart_pause_reason: str | None = None
+    consecutive_respawn_failures: int | None = None
+    last_restart_at: datetime | None = None
+    last_heartbeat_at: datetime | None = None
+    last_heartbeat_age_s: float | None = None
+    fleet_halted: bool = False
+    account_halted: bool = False
+
     model_config = {"from_attributes": True}
 
 
@@ -104,6 +127,13 @@ class LiveStatusResponse(BaseModel):
     deployments: list[LiveDeploymentInfo]
     risk_halted: bool
     active_count: int
+    # PR 2 T8 — supervisor-liveness signal. Age in seconds of the
+    # ``router_heartbeat`` Redis key the supervisor stamps every loop pass
+    # (the SAME key the /start-portfolio 503 gate and the SPOF alert read —
+    # NOT a second heartbeat source). ``None`` means the key is absent /
+    # expired (supervisor down or never started — fail-closed). A small age
+    # confirms the single-supervisor SPOF is alive.
+    router_heartbeat_age_s: float | None = None
 
 
 class LiveDeploymentStatusResponse(BaseModel):
@@ -141,6 +171,20 @@ class LiveDeploymentStatusResponse(BaseModel):
     exit_code: int | None = None
     error_message: str | None = None
     failure_kind: str | None = None
+
+    # PR 2 T8 — per-account restart-authority health (additive, read-only).
+    # Mirrors the fields on ``LiveDeploymentInfo`` so the per-deployment
+    # drill-in GET surfaces the same restart-authority view as the list
+    # endpoint (UC-API-1: "the per-deployment detail GET returns the same
+    # account's restart-authority fields"). Sourced from the latest
+    # ``live_node_processes`` row + the fleet/account Redis halt latches.
+    auto_restart_paused: bool | None = None
+    auto_restart_pause_reason: str | None = None
+    consecutive_respawn_failures: int | None = None
+    last_restart_at: datetime | None = None
+    last_heartbeat_age_s: float | None = None
+    fleet_halted: bool = False
+    account_halted: bool = False
 
     model_config = {"from_attributes": True}
 

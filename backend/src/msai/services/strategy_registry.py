@@ -32,6 +32,7 @@ import hashlib
 import importlib
 import importlib.util
 import inspect
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -262,6 +263,14 @@ def validate_strategy_file(module_path: Path) -> tuple[bool, str]:
     if strategies_dir is None:
         return False, (f"Strategy file is not inside a 'strategies/' directory: {module_path}")
 
+    # Node-side halt-gate supported-API lint (PR 2 T2 / F6). The runtime
+    # ``on_post_build`` MRO gate is the real guarantee; this is defense-in-depth
+    # that rejects the OBVIOUS bypasses of the gated submit API at validation
+    # time, so an operator gets a clear error before deploying.
+    lint_ok, lint_msg = _lint_supported_submit_api(module_path)
+    if not lint_ok:
+        return False, lint_msg
+
     _ensure_strategies_importable(strategies_dir)
 
     try:
@@ -279,6 +288,37 @@ def validate_strategy_file(module_path: Path) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+# Bypasses of the node-side halt gate's supported submit API (PR 2 T2 / F6).
+# A strategy that reaches the order path via these Nautilus internals slips past
+# the gated ``submit_order`` / ``submit_order_list`` / ``modify_order`` override.
+# This is a deliberately SIMPLE source-token lint — the runtime ``on_post_build``
+# MRO gate is the real guarantee; this just rejects the obvious bypasses early.
+_FORBIDDEN_SUBMIT_BYPASS_TOKENS = ("_msgbus", "_manager", "send_risk_command")
+
+
+def _lint_supported_submit_api(module_path: Path) -> tuple[bool, str]:
+    """Reject obvious bypasses of the halt-gated submit API in a strategy file.
+
+    Returns ``(True, "")`` if clean, ``(False, <reason>)`` if the source
+    references a forbidden Nautilus internal (``self._msgbus``,
+    ``self._manager``, ``send_risk_command``). Matched on word boundaries so a
+    benign substring (e.g. ``manager_count``) doesn't false-trip.
+    """
+    try:
+        source = module_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return False, f"Cannot read strategy file for lint: {exc}"
+
+    for token in _FORBIDDEN_SUBMIT_BYPASS_TOKENS:
+        if re.search(rf"\b{re.escape(token)}\b", source):
+            return False, (
+                f"Strategy references '{token}', which bypasses the mandatory "
+                "node-side halt gate. Submit orders only via self.submit_order / "
+                "self.submit_order_list / self.modify_order."
+            )
+    return True, ""
 
 
 def _ensure_strategies_importable(strategies_dir: Path) -> None:

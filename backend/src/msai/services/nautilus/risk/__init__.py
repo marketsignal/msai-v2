@@ -9,12 +9,14 @@ checks, not instead of them.
 """
 
 from msai.services.nautilus.risk.risk_aware_strategy import (
+    DenialContext,
     RiskAwareStrategy,
     RiskCheckResult,
     RiskLimits,
 )
 
 __all__ = [
+    "DenialContext",
     "RiskAwareStrategy",
     "RiskCheckResult",
     "RiskLimits",

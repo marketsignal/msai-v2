@@ -48,7 +48,7 @@ The setup differs from the plan's sketch:
   fixture calls ``RedisContainer.get_connection_url()``, a method the
   installed ``testcontainers`` version no longer exposes — every other
   integration test that needs Redis (``test_idempotency_store``,
-  ``test_live_command_bus``, ``test_process_manager``, etc.) defines
+  ``test_live_command_bus``, ``test_fleet_router``, etc.) defines
   its own ``isolated_redis_url`` the same way. We mirror that pattern
   to keep this change narrowly focused on the PR's architectural
   question; fixing the shared fixture is out of scope.

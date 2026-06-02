@@ -66,7 +66,7 @@ def _register_actor_with_bus(actor: SymbologyShimActor, bus: MessageBus) -> None
 _BAR_TYPE_MAP: dict[str, str] = {
     "AAPL.IBKR-1-MINUTE-LAST-EXTERNAL": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL",
 }
-_VENUE_DATASET_MAP: dict[str, str] = {"XNAS": "DBEQ.BASIC"}
+_VENUE_DATASET_MAP: dict[str, str] = {"XNAS": "EQUS.MINI"}
 
 
 def _build_actor() -> SymbologyShimActor:
@@ -332,7 +332,7 @@ def test_audit_sink_receives_metadata_on_retag() -> None:
     assert md["provider"] == "databento"
     assert md["native_venue"] == "XNAS"
     assert md["native_symbol"] == "AAPL"
-    assert md["dataset"] == "DBEQ.BASIC"
+    assert md["dataset"] == "EQUS.MINI"
 
 
 # ---------------------------------------------------------------------------

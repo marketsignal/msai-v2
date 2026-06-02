@@ -34,6 +34,8 @@ from nautilus_trader.model.objects import Quantity
 from nautilus_trader.trading.config import StrategyConfig
 from nautilus_trader.trading.strategy import Strategy
 
+from msai.services.nautilus.risk import RiskAwareStrategy
+
 
 class SmokeMarketOrderConfig(StrategyConfig, frozen=True, kw_only=True):
     """Config for :class:`SmokeMarketOrderStrategy`.
@@ -68,7 +70,7 @@ class SmokeMarketOrderConfig(StrategyConfig, frozen=True, kw_only=True):
     manage_stop: bool = True
 
 
-class SmokeMarketOrderStrategy(Strategy):
+class SmokeMarketOrderStrategy(RiskAwareStrategy, Strategy):
     """Submits exactly ONE market-order buy on the first bar received.
 
     After the single order is submitted the strategy sits idle forever
@@ -76,6 +78,11 @@ class SmokeMarketOrderStrategy(Strategy):
     useful for the Phase 1 E2E harness: the harness knows exactly
     how many orders to expect (one) and can assert on the audit
     table accordingly.
+
+    ``RiskAwareStrategy`` is FIRST in the base-class tuple (PR 2 T2 / F6) so its
+    halt-gated ``submit_order`` override wins the MRO. The body still calls
+    ``self.submit_order(order)`` directly — it is now transparently node-side
+    halt-gated in LIVE (and inert in backtests, where the gate is never armed).
 
     Position cleanup at stop time is handled by ``manage_stop=True`` —
     Nautilus's base ``Strategy`` cancels open orders and flattens any

@@ -287,6 +287,7 @@ The compose ships N predefined `ib-gateway-{1..N}` services. Provisioning a new 
 #### Sub-PR split for PR 3
 
 Per the Pragmatist's flattening recommendation:
+
 - **PR 3a** — `broker_accounts` table + migration + CRUD API + `BrokerCredentialsStore` (with `EnvSecretsProvider` + `AzureKeyVaultProvider` adapters) + API-level E2E UC. (~1.5 days target.)
 - **PR 3b** — CLI sub-app + UI wizard + 2 surface UCs (CLI, UI). (~1 day target.)
 
@@ -307,3 +308,50 @@ Per the Pragmatist's flattening recommendation:
 
 PR 3 credentials council: Engineering Council, 2026-05-30 (standalone `/council`). 4-1 majority for Option B' with overlapping CONDITIONAL constraints. Pragmatist minority report preserved per protocol. Codex advisors on first dispatch misread the question and answered the Shape A/B topology question; re-dispatched with tighter prompts and produced clean credentials-focused verdicts on retry. Chairman synthesis on first attempt also drifted to topology; retry with tight prompt produced the verdict captured here. Raw transcripts at `/tmp/council_{contrarian2,maintainer2,chairman2}_response.txt` (session-local).
 
+---
+
+## Addendum 2026-05-31 — PR 2 supervisor topology + binding deploy contract (council #2)
+
+Two councils fired during PR 2 design. The first (Shape A vs B) chose "Shape B refined — one process, per-account supervisor actors, fenced authority." The **plan-review loop then surfaced a P0** that forced a second council: the chosen in-process design could not satisfy US-1's redeploy clause because of the container topology. Council #2 (2026-05-31, full 5-advisor) ruled **Opt 4 refined**, materially simplifying the design.
+
+### Verified facts that drove council #2
+
+- **F1-F3:** `live-supervisor` runs `command: python -m msai.live_supervisor` as the container's PID-1 process (`restart: unless-stopped`, no `init:true`); TradingNodes are `mp.Process` children spawned in-process (`process_manager.py:579`), in the SAME container. So supervisor/PID-1 death OR a container recreate kills ALL co-located nodes — `os.setsid`/`init:true` cannot save co-located nodes from a container recreate.
+- **F4 (decisive):** `scripts/deploy-on-vm.sh` `pull` + `up -d --wait` operate ONLY on `DEFAULT_PROFILE_SERVICES` (line 44). `live-supervisor` is behind `profiles:["broker"]` and is EXCLUDED. A routine push-to-main deploy does NOT recreate the supervisor container.
+- **F5 (decisive):** `.github/workflows/deploy.yml:399` "Refuse if active live_deployments" — the deploy workflow fails closed (before OIDC) if backend reports any active live deployment.
+- **F6 (unanimous P0):** node-side halt is a CACHED boolean (`RiskAwareStrategy._halt_flag_cached`); `_refresh_halt_flag_fn` is declared but not wired to any poll loop; the order-submit path never re-reads Redis. A halt set while the supervisor is down does NOT reach a running node's order loop.
+
+### Ruling — Opt 4 refined (1 APPROVE-equivalent + 4 CONDITIONAL, 1 OBJECT resolved)
+
+**PR 2 ships:**
+
+1. **Per-account ownership SEMANTICS in the existing single supervisor** — NOT in-process actor-fencing, NOT per-account containers. Per-account command streams (`command_stream_for_account`, pre-built PR 1) give failure containment (one account's poison command can't stall others). The reaper + a startup re-scan of `failed` rows drive halt-latch-gated auto-restart with a bounded crash-loop guard (DB-backed counter, backoff, max-concurrent-respawn=1).
+2. **Node-side live halt re-check (F6 fix)** — the running node re-reads `fleet_halt_key` + `account_halt_key` on the order-submit path, fail-closed on Redis error. Real-money P0; corrects the 4-layer-kill-all "cached Layer-4" overstatement.
+3. **Binding production deploy contract (documented + enforced):** routine deploys exclude the `broker` profile (F4); the deploy workflow refuses while any live deployment is active (F5); broker-profile image changes are deliberate, sequenceable maintenance only. Documented in PRD + this decision doc + the deploy runbook + the release checklist.
+4. **Per-account supervisor/restart-authority health** on `/live/status` + `msai live status` (US-3), honest `FleetRouter`/`NodeHandleCache` naming (was `ProcessManager`/`handles`), account-scoped logging.
+
+**PR 2 explicitly DEFERS (to the 2-VM split / per-account-container phase):**
+
+- Per-account containers (**Opt 1** — the ratified long-term container-per-account vision, see the 2026-05-27 verdict). It is a launch-model rewrite (nodes become containers launched by the orchestrator, not `mp.Process` children of the router) with material 16GB-VM OOM risk.
+- True supervisor-container redeploy isolation (only per-account containers or the 2-VM split provide it).
+
+### Shape-A / per-account-container migration trigger
+
+This deferral is NOT permanent — it is gated on the conditions below. Revisit (and migrate from the single-supervisor "Opt 4 refined" shape to per-account containers / **Opt 1**) when **ANY** of these fires:
+
+1. **The 2-VM split** — when real-money multi-account production moves off the single `Standard_D4ds_v6` to the 2-VM topology (coupled decision #3 in the 2026-05-27 verdict), per-account containers land there because that's where memory headroom + per-container rollout semantics exist.
+2. **Fleet growth beyond ~4-5 accounts on one VM** — the 16GB single-VM OOM risk that motivated the deferral becomes real; co-locating N≥~5 TradingNode `mp.Process` children in one container exhausts the budget.
+3. **A deliberate-redeploy incident the deploy contract didn't cover** — if the binding deploy contract (routine deploys exclude the `broker` profile, F4; active-live deploy refusal, F5) is ever bypassed and a broker-profile redeploy recreates the supervisor container while nodes are live, the lack of true per-container redeploy isolation has bitten us — migrate.
+
+Cross-reference: PR 2 implementation plan `docs/plans/2026-05-31-pr-2-per-account-supervisors.md` (`## Approach Comparison` → "Opt 1 — per-account containers", and US-1 / T7 / T11 honest-scope notes). PR 2 ships the single-supervisor shape; this trigger records WHEN the deferred per-account-container migration should be picked back up so the deferral isn't silently forgotten.
+
+**REJECTED for PR 2:** the in-process `AccountSupervisor + SupervisorLease + RestartBudget + generation-token` actor-fencing architecture from the first PR-2 council. It adds machinery without delivering the deploy isolation it appeared to (the container is the real boundary), and the eventual per-account-container architecture would discard it. The fencing existed to prevent two-supervisor split-brain during deploy overlap — but F5's active-live deploy refusal already prevents that overlap.
+
+### Minority Report (council #2)
+
+- **Contrarian OBJECTed** — the design relied on undocumented deploy discipline + a stale node-side halt. RESOLVED: PR 2 makes F4/F5 a binding documented contract and fixes F6. His own proposed resolution ("default deploy never touches broker + active-live gate fails closed") is exactly the verified system behavior.
+- **Scalability Hawk + Maintainer pushed Opt 1** (per-account containers — the honest Docker isolation boundary, matches the documented long-term vision). DEFERRED, not rejected: F4/F5 remove the routine-deploy blast radius that motivated it now; it lands at the 2-VM split where memory + rollout semantics support it.
+
+### Provenance
+
+Engineering Council #2, 2026-05-31, during `/forge-goal` autonomous `/goal` run on PR 2. 3 Claude advisors (Simplifier, Scalability Hawk, Pragmatist) + 2 Codex advisors (Contrarian, Maintainer) + Codex chairman (xhigh). Escalated from the Phase 3.1c gate after the plan-review loop surfaced the container-topology P0. Verified facts cross-checked against the live codebase before the council reasoned.

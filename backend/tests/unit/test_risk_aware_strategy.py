@@ -94,20 +94,37 @@ class FakePortfolio:
         return self._net_exposures.get(getattr(venue, "value", str(venue)), {})
 
 
-class DummyStrategy(RiskAwareStrategy):
-    """Concrete subclass that captures ``submit_order`` calls
-    instead of routing them to a real Nautilus runtime."""
+class _RecordingBase:
+    """Stand-in for Nautilus's ``Strategy`` base — records the submit call the
+    gated override delegates to via the unbound base call (``super()``)."""
 
-    def __init__(self, *, limits: RiskLimits, portfolio: Any, audit: Any) -> None:
+    def submit_order(self, order: Any, *args: Any, **kwargs: Any) -> None:  # noqa: ARG002
+        self.submitted.append(order)  # type: ignore[attr-defined]
+
+
+class DummyStrategy(RiskAwareStrategy, _RecordingBase):
+    """Concrete gated subclass (mixin FIRST) that captures the orders the
+    override delegates to the base impl. The PR-2 gate runs the position /
+    exposure / daily-loss suite ONLY when armed AND ``_risk_limits`` is wired —
+    both are set here so these legacy risk-suite tests still exercise it.
+
+    A fresh ``_halt_cache`` (value False) keeps the halt branch open so the
+    risk-suite checks are reached; individual tests set ``_halt_cache`` to a
+    True/None value to exercise the halt path.
+    """
+
+    def __init__(
+        self, *, limits: RiskLimits | None, portfolio: Any, audit: Any, armed: bool = True
+    ) -> None:
+        import time
+
         self._risk_limits = limits
         self.portfolio = portfolio
         self._audit = audit
-        self._halt_flag_cached = False
+        self._halt_gate_armed = armed
+        self._halt_cache = (False, time.monotonic())
         self._market_hours_check = None
         self.submitted: list[Any] = []
-
-    def submit_order(self, order: Any) -> None:
-        self.submitted.append(order)
 
 
 # ---------------------------------------------------------------------------
@@ -121,18 +138,23 @@ def _build_strategy(
     max_notional_exposure_usd: str = "1000000",
     max_position_per_instrument: str = "10000",
     portfolio: Any = None,
+    armed: bool = True,
+    wire_limits: bool = True,
 ) -> DummyStrategy:
-    limits = RiskLimits(
-        daily_loss_limit_usd=Decimal(daily_loss_limit_usd),
-        max_notional_exposure_usd=Decimal(max_notional_exposure_usd),
-        max_position_per_instrument=Decimal(max_position_per_instrument),
-    )
+    limits: RiskLimits | None = None
+    if wire_limits:
+        limits = RiskLimits(
+            daily_loss_limit_usd=Decimal(daily_loss_limit_usd),
+            max_notional_exposure_usd=Decimal(max_notional_exposure_usd),
+            max_position_per_instrument=Decimal(max_position_per_instrument),
+        )
     audit = MagicMock()
     audit.update_denied = AsyncMock()
     return DummyStrategy(
         limits=limits,
         portfolio=portfolio or FakePortfolio(),
         audit=audit,
+        armed=armed,
     )
 
 
@@ -168,14 +190,72 @@ def test_order_passes_when_within_all_limits() -> None:
 
 
 def test_halt_flag_blocks_order() -> None:
+    import time
+
     strat = _build_strategy()
-    strat._halt_flag_cached = True  # noqa: SLF001
+    strat._halt_cache = (True, time.monotonic())  # noqa: SLF001
+    order = _buy_order()
+
+    strat.submit_order(order)
+
+    # Halted -> the override never delegates to the base submit.
+    assert strat.submitted == []
+
+
+def test_submit_order_with_risk_check_reports_false_under_halt() -> None:
+    """The deprecated thin alias must report the HONEST gate decision: when the
+    armed halt latch BLOCKS an opening order, the returned result is
+    ``allowed=False`` (reason ``risk:halt``) and the order is NOT submitted."""
+    import time
+
+    strat = _build_strategy()
+    strat._halt_cache = (True, time.monotonic())  # noqa: SLF001
     order = _buy_order()
 
     result = strat.submit_order_with_risk_check(order)
 
     assert result.allowed is False
     assert result.reason == "risk:halt"
+    assert strat.submitted == []
+
+
+def test_submit_order_with_risk_check_reports_specific_risk_reason_not_halt() -> None:
+    """PR 2 F4 (review P3): when a denial is caused by a RISK-LIMIT check (not a
+    halt), the thin alias must report the ACTUAL reason (e.g.
+    ``risk:position_limit``) — NOT a misleading ``risk:halt``.
+
+    The node is NOT halted (``_halt_cache`` is False); the order is blocked by
+    the position-limit check. Pre-fix the alias returned ``risk:halt`` for ANY
+    ``_gate_allows``-False, mislabelling the denial for any PR-5 risk-limit
+    block. The order is still correctly blocked; only the reason was wrong.
+    """
+    portfolio = FakePortfolio()
+    portfolio._net_position[str(_instrument_id())] = Decimal("9950")  # noqa: SLF001
+    strat = _build_strategy(max_position_per_instrument="10000", portfolio=portfolio)
+    # 9950 + 100 = 10050 > 10000 → position-limit reject (NOT a halt).
+    order = _buy_order(qty="100")
+
+    result = strat.submit_order_with_risk_check(order)
+
+    assert result.allowed is False
+    assert result.reason == "risk:position_limit", (
+        "a position-limit denial must report risk:position_limit, not risk:halt"
+    )
+    assert strat.submitted == []
+
+
+def test_submit_order_with_risk_check_reports_daily_loss_reason() -> None:
+    """PR 2 F4 (review P3): a daily-loss denial reports ``risk:daily_loss`` from
+    the thin alias — confirming the reason tracks the actual failing check, not
+    a blanket ``risk:halt``."""
+    portfolio = FakePortfolio()
+    portfolio._total_pnls["NASDAQ"] = {"USD": FakeMoney("-12000")}  # noqa: SLF001
+    strat = _build_strategy(daily_loss_limit_usd="10000", portfolio=portfolio)
+
+    result = strat.submit_order_with_risk_check(_buy_order())
+
+    assert result.allowed is False
+    assert result.reason == "risk:daily_loss"
     assert strat.submitted == []
 
 
@@ -191,10 +271,9 @@ def test_position_limit_blocks_when_projected_exceeds() -> None:
     # 9950 + 100 = 10050 > 10000 → reject
     order = _buy_order(qty="100")
 
-    result = strat.submit_order_with_risk_check(order)
+    strat.submit_order(order)
 
-    assert result.allowed is False
-    assert result.reason == "risk:position_limit"
+    assert strat.submitted == []
 
 
 def test_position_limit_signs_sell_quantity_negatively() -> None:
@@ -209,11 +288,105 @@ def test_position_limit_signs_sell_quantity_negatively() -> None:
         price=Decimal("150"),
     )
 
-    result = strat.submit_order_with_risk_check(sell)
+    strat.submit_order(sell)
 
     # 0 + (-75) = -75 → abs(-75) = 75 > 50 → reject
-    assert result.allowed is False
+    assert strat.submitted == []
+
+
+# ---------------------------------------------------------------------------
+# FINDING 2 (P2): the risk suite must NOT be gated by ``_halt_gate_armed``.
+#
+# ``_halt_gate_armed`` gates ONLY the live Redis halt-latch branch. The general
+# position/exposure/daily-loss/market-hours suite must run whenever
+# ``_risk_limits`` is wired — REGARDLESS of arming — so a backtest / non-live /
+# legacy ``submit_order_with_risk_check`` caller with configured limits still
+# enforces them. (The suite self-skips when ``_risk_limits is None``.)
+# ---------------------------------------------------------------------------
+
+
+def test_unarmed_with_limits_blocks_position_limit_violation() -> None:
+    # FINDING 2 (P2): gate NOT armed (backtest/non-live) but ``_risk_limits`` IS
+    # wired and the order trips the per-instrument position cap. The risk suite
+    # must STILL run — the order is BLOCKED with ``risk:position_limit``. Pre-fix
+    # the unarmed short-circuit returned allowed=True and skipped the suite.
+    portfolio = FakePortfolio()
+    portfolio._net_position[str(_instrument_id())] = Decimal("9950")  # noqa: SLF001
+    strat = _build_strategy(max_position_per_instrument="10000", portfolio=portfolio, armed=False)
+    assert strat._halt_gate_armed is False  # noqa: SLF001
+    # 9950 + 100 = 10050 > 10000 → position-limit reject even though unarmed.
+    order = _buy_order(qty="100")
+
+    result = strat.submit_order_with_risk_check(order)
+
+    assert result.allowed is False, (
+        "an unarmed gate with configured limits must STILL enforce the risk "
+        "suite — the order must be blocked"
+    )
     assert result.reason == "risk:position_limit"
+    assert strat.submitted == []
+
+
+def test_unarmed_with_limits_passes_when_within_limits() -> None:
+    # FINDING 2 (P2) counter-case: unarmed + limits wired but the order is
+    # within all caps → allowed (and actually submitted via the override path).
+    strat = _build_strategy(armed=False)
+    assert strat._halt_gate_armed is False  # noqa: SLF001
+
+    strat.submit_order(_buy_order(qty="100", price="150"))
+
+    assert strat.submitted == [_buy_order(qty="100", price="150")] or len(strat.submitted) == 1, (
+        "a within-limits order on an unarmed gate must still be submitted"
+    )
+
+
+def test_unarmed_without_limits_allows_order() -> None:
+    # FINDING 2 (P2) backtest-default: unarmed AND ``_risk_limits is None`` (the
+    # PR-2 production default for backtests) → the suite self-skips and the order
+    # is allowed. This is the path the unarmed short-circuit used to (over-broadly)
+    # cover; it must still pass after decoupling the suite from arming.
+    strat = _build_strategy(armed=False, wire_limits=False)
+    assert strat._halt_gate_armed is False  # noqa: SLF001
+    assert strat._risk_limits is None  # noqa: SLF001
+
+    result = strat.submit_order_with_risk_check(_buy_order())
+
+    assert result.allowed is True
+    assert result.reason is None
+    assert strat.submitted == [_buy_order()] or len(strat.submitted) == 1
+
+
+def test_unarmed_with_limits_does_not_evaluate_halt_branch() -> None:
+    # FINDING 2 (P2): when unarmed, the HALT-LATCH branch must NOT run even
+    # though the risk suite does. A ``None`` halt cache (which would fail-closed
+    # if armed) must NOT block an unarmed order — only the risk suite governs it.
+    strat = _build_strategy(armed=False)
+    strat._halt_cache = None  # noqa: SLF001 — would fail-closed IF armed
+
+    result = strat.submit_order_with_risk_check(_buy_order(qty="100", price="150"))
+
+    assert result.allowed is True, (
+        "unarmed must skip the halt-latch branch — a None cache must not block "
+        "an unarmed order; only the risk suite (within limits here) governs it"
+    )
+
+
+def test_armed_runs_halt_branch_before_risk_suite() -> None:
+    # FINDING 2 (P2): when ARMED and the halt latch is active, the halt branch
+    # wins (reason ``risk:halt``) — even if the order would ALSO trip a risk
+    # limit. The halt branch runs BEFORE the suite (unchanged ordering).
+    import time
+
+    portfolio = FakePortfolio()
+    portfolio._net_position[str(_instrument_id())] = Decimal("9950")  # noqa: SLF001
+    strat = _build_strategy(max_position_per_instrument="10000", portfolio=portfolio, armed=True)
+    strat._halt_cache = (True, time.monotonic())  # noqa: SLF001 — halt active
+
+    result = strat.submit_order_with_risk_check(_buy_order(qty="100"))
+
+    assert result.allowed is False
+    assert result.reason == "risk:halt", "armed + halt active must report risk:halt, not the suite"
+    assert strat.submitted == []
 
 
 # ---------------------------------------------------------------------------
@@ -228,10 +401,9 @@ def test_daily_loss_limit_blocks_when_pnl_exceeds() -> None:
     }
     strat = _build_strategy(daily_loss_limit_usd="10000", portfolio=portfolio)
 
-    result = strat.submit_order_with_risk_check(_buy_order())
+    strat.submit_order(_buy_order())
 
-    assert result.allowed is False
-    assert result.reason == "risk:daily_loss"
+    assert strat.submitted == []
 
 
 def test_daily_loss_limit_uses_plural_total_pnls_with_venue() -> None:
@@ -270,11 +442,10 @@ def test_multi_currency_pnl_aggregation() -> None:
     }
     strat = _build_strategy(daily_loss_limit_usd="5000", portfolio=portfolio)
 
-    result = strat.submit_order_with_risk_check(_buy_order())
+    strat.submit_order(_buy_order())
 
     # Total = -7000, limit = 5000 → -7000 < -5000 → reject
-    assert result.allowed is False
-    assert result.reason == "risk:daily_loss"
+    assert strat.submitted == []
 
 
 def test_daily_loss_limit_passes_when_no_pnl_data() -> None:
@@ -298,10 +469,9 @@ def test_exposure_limit_blocks_when_projected_exceeds() -> None:
     # current 995_000 + (100 * 150) = 1_010_000 > 1_000_000
     order = _buy_order(qty="100", price="150")
 
-    result = strat.submit_order_with_risk_check(order)
+    strat.submit_order(order)
 
-    assert result.allowed is False
-    assert result.reason == "risk:exposure"
+    assert strat.submitted == []
 
 
 def test_exposure_limit_uses_plural_net_exposures_with_venue() -> None:
@@ -349,10 +519,9 @@ def test_market_hours_check_blocks_when_callable_returns_false() -> None:
     strat = _build_strategy()
     strat._market_hours_check = lambda _id: False  # noqa: SLF001
 
-    result = strat.submit_order_with_risk_check(_buy_order())
+    strat.submit_order(_buy_order())
 
-    assert result.allowed is False
-    assert result.reason == "risk:market_hours"
+    assert strat.submitted == []
 
 
 def test_market_hours_check_fail_closed_on_exception() -> None:
@@ -363,11 +532,10 @@ def test_market_hours_check_fail_closed_on_exception() -> None:
 
     strat._market_hours_check = boom  # noqa: SLF001
 
-    result = strat.submit_order_with_risk_check(_buy_order())
+    strat.submit_order(_buy_order())
 
-    # Fail-closed: an exception is treated as "outside hours"
-    assert result.allowed is False
-    assert result.reason == "risk:market_hours"
+    # Fail-closed: an exception is treated as "outside hours" → not submitted.
+    assert strat.submitted == []
 
 
 def test_market_hours_check_none_callable_passes() -> None:
@@ -388,11 +556,13 @@ def test_market_hours_check_none_callable_passes() -> None:
 
 
 def test_denied_order_records_audit_with_reason() -> None:
+    import time
+
     strat = _build_strategy()
-    strat._halt_flag_cached = True  # noqa: SLF001
+    strat._halt_cache = (True, time.monotonic())  # noqa: SLF001
     order = _buy_order()
 
-    strat.submit_order_with_risk_check(order)
+    strat.submit_order(order)
 
     strat._audit.update_denied.assert_called()  # noqa: SLF001
     call = strat._audit.update_denied.call_args  # noqa: SLF001
@@ -402,8 +572,119 @@ def test_denied_order_records_audit_with_reason() -> None:
 
 def test_passing_order_does_not_trigger_audit_denial() -> None:
     strat = _build_strategy()
-    strat.submit_order_with_risk_check(_buy_order())
+    strat.submit_order(_buy_order())
     strat._audit.update_denied.assert_not_called()  # noqa: SLF001
+
+
+# ---------------------------------------------------------------------------
+# Durable node-side halt denial (PR 2 T2): write_denied vs update_denied
+# ---------------------------------------------------------------------------
+
+
+def _denial_order() -> FakeOrder:
+    """A MARKET order the halt gate will block. ``order_type`` is absent on
+    ``FakeOrder`` so the facts builder falls back defensively (empty string)."""
+    return FakeOrder(
+        client_order_id="halt-ord-9",
+        instrument_id=_instrument_id(),
+        side="BUY",
+        quantity=Decimal("25"),
+        price=None,
+    )
+
+
+def _build_audit_mock() -> Any:
+    audit = MagicMock()
+    audit.update_denied = AsyncMock()
+    audit.write_denied = AsyncMock()
+    return audit
+
+
+def test_halt_block_with_denial_context_calls_write_denied_with_full_facts() -> None:
+    """When the per-run identity is wired, a node-side halt block records a
+    COMPLETE ``denied`` row via ``write_denied`` (durable even with no prior
+    ``submitted`` row), NOT the UPDATE-only ``update_denied``."""
+    import time
+    from uuid import uuid4
+
+    from msai.services.nautilus.risk import DenialContext
+
+    audit = _build_audit_mock()
+    strat = DummyStrategy(limits=None, portfolio=FakePortfolio(), audit=audit, armed=True)
+    strat._halt_cache = (True, time.monotonic())  # noqa: SLF001 — force halt
+    dep_id, sid = uuid4(), uuid4()
+    strat._denial_context = DenialContext(  # noqa: SLF001
+        deployment_id=dep_id,
+        strategy_id=sid,
+        strategy_code_hash="cafe" * 16,
+    )
+    order = _denial_order()
+
+    strat.submit_order(order)
+
+    # Blocked: never delegated to the base submit.
+    assert strat.submitted == []
+    # Durable path: write_denied, NOT the UPDATE-only fallback.
+    audit.write_denied.assert_called_once()
+    audit.update_denied.assert_not_called()
+
+    facts = audit.write_denied.call_args.args[0]
+    assert facts.client_order_id == "halt-ord-9"
+    assert facts.deployment_id == dep_id
+    assert facts.strategy_id == sid
+    assert facts.strategy_code_hash == "cafe" * 16
+    assert facts.instrument_id == "AAPL.NASDAQ"
+    assert facts.side == "BUY"
+    assert facts.quantity == Decimal("25")
+    assert facts.order_type == ""  # FakeOrder has no order_type → safe fallback
+    assert facts.reason == "risk:halt"
+    assert facts.is_live is True
+    assert facts.backtest_id is None
+
+
+def test_halt_block_without_denial_context_falls_back_to_update_denied() -> None:
+    """No per-run identity wired (``_denial_context is None``) → fall back to the
+    best-effort UPDATE-only ``update_denied`` rather than fabricating placeholder
+    identity into a real-money audit row."""
+    import time
+
+    audit = _build_audit_mock()
+    strat = DummyStrategy(limits=None, portfolio=FakePortfolio(), audit=audit, armed=True)
+    strat._halt_cache = (True, time.monotonic())  # noqa: SLF001
+    assert strat._denial_context is None  # noqa: SLF001 — class default
+
+    strat.submit_order(_denial_order())
+
+    assert strat.submitted == []
+    audit.update_denied.assert_called_once()
+    audit.write_denied.assert_not_called()
+
+
+def test_denial_audit_db_error_does_not_raise_and_order_stays_blocked() -> None:
+    """Best-effort invariant: a DB error in the denial write is logged and
+    swallowed — it MUST NOT raise and MUST NOT admit the order."""
+    import time
+    from uuid import uuid4
+
+    from msai.services.nautilus.risk import DenialContext
+
+    audit = MagicMock()
+    audit.update_denied = AsyncMock()
+    # write_denied raises synchronously when called (before a coroutine is even
+    # built) — _record_denial must swallow it.
+    audit.write_denied = MagicMock(side_effect=RuntimeError("db down"))
+
+    strat = DummyStrategy(limits=None, portfolio=FakePortfolio(), audit=audit, armed=True)
+    strat._halt_cache = (True, time.monotonic())  # noqa: SLF001
+    strat._denial_context = DenialContext(  # noqa: SLF001
+        deployment_id=uuid4(), strategy_id=uuid4(), strategy_code_hash="ab" * 32
+    )
+
+    # Must not raise.
+    strat.submit_order(_denial_order())
+
+    # Order still blocked despite the audit failure.
+    assert strat.submitted == []
 
 
 # ---------------------------------------------------------------------------

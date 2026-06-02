@@ -348,7 +348,7 @@ async def test_stopping_status_counts_as_active(
     """Codex v4 P0: 'stopping' is included in the active-states query so
     a start-during-stop race is correctly blocked at the DB layer.
 
-    (v4 documented this but the v4 ProcessManager.spawn query missed it;
+    (v4 documented this but the v4 FleetRouter.spawn query missed it;
     the partial index must cover it so the second spawn hits IntegrityError.)
     """
     stopping = LiveNodeProcess(

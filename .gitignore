@@ -63,7 +63,10 @@ scripts/ib-gateway-config/*.ini
 .ibaccounts.txt
 
 # Docker runtime state (IB Gateway logs/jars/configs, Nautilus cache, scheduler, ingestion status)
+# Glob covers the primary `ib-gateway/` AND per-account gateways (`ib-gateway-hvp/`,
+# `ib-gateway-lvp/`, …) — their generated JARs/encrypted-session state must NEVER be committed.
 data/ib-gateway/
+data/ib-gateway-*/
 data/nautilus/
 data/scheduler/
 data/ingestion_status.json

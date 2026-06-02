@@ -411,7 +411,7 @@ def build_live_trading_node_config(
             point at a real ``NautilusConfig`` subclass — Nautilus's
             ``resolve_config_path()`` rejects anything else with
             ``TypeError`` (Codex Task 1.5 review P1 fix). The caller
-            (Task 1.7 ProcessManager) is responsible for resolving the
+            (Task 1.7 FleetRouter) is responsible for resolving the
             right config class for each strategy via the strategy
             registry.
         strategy_config: Strategy parameters (already validated /
@@ -893,7 +893,7 @@ def build_per_account_trading_node_config(
             the supervisor's async payload factory; this builder is
             sync and MUST NOT call any async DB code.
         venue_dataset_map: Pre-resolved native_venue → dataset map
-            (e.g. ``{"XNAS": "DBEQ.BASIC"}``). Passed straight to the
+            (e.g. ``{"XNAS": "EQUS.MINI"}``). Passed straight to the
             Databento client config so Nautilus uses our authoritative
             choice rather than publisher-default lookup.
         canonical_to_native_bar_types: Pre-built mapping from canonical

@@ -88,6 +88,8 @@ async def _seed_row(
     deployment_id,
     status: str,
     heartbeat_age_seconds: int,
+    auto_restart_paused: bool = False,
+    stop_requested_at: datetime | None = None,
 ) -> LiveNodeProcess:
     """Helper to insert a LiveNodeProcess row with a controllable
     heartbeat age."""
@@ -101,6 +103,8 @@ async def _seed_row(
         last_heartbeat_at=now - timedelta(seconds=heartbeat_age_seconds),
         status=status,
         gateway_session_key="msai-paper-primary:localhost:4002",
+        auto_restart_paused=auto_restart_paused,
+        stop_requested_at=stop_requested_at,
     )
     session.add(row)
     await session.flush()
@@ -147,6 +151,52 @@ async def test_stale_post_startup_row_marked_failed(
         fresh_dep = await session.get(LiveDeployment, deployment.id)
         assert fresh_dep is not None
         assert fresh_dep.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_stale_paused_running_row_marked_failed_unconditionally(
+    session_factory: async_sessionmaker[AsyncSession],
+    deployment: LiveDeployment,
+) -> None:
+    """CROSS-PATH AUDIT (Rule 1): the HeartbeatMonitor's flip of a stale
+    post-startup row must be UNCONDITIONAL on ``auto_restart_paused`` AND
+    ``stop_requested_at``.
+
+    A stale ``running`` row that ALSO carries ``auto_restart_paused=True`` (a
+    ceiling-tripped restart that ran then went stale) and ``stop_requested_at``
+    (a /stop that arrived while it was already going stale) must STILL be flipped
+    to ``failed`` — cleanup of a dead row out of the active unique-index set is
+    unconditional; respawn-eligibility is a separate decision made elsewhere. The
+    monitor's WHERE filters only status + heartbeat age, so it should already do
+    this; this test PROVES it.
+    """
+    async with session_factory() as session:
+        row = await _seed_row(
+            session,
+            deployment_id=deployment.id,
+            status="running",
+            heartbeat_age_seconds=120,
+            auto_restart_paused=True,
+            stop_requested_at=datetime.now(UTC),
+        )
+        await session.commit()
+
+    monitor = HeartbeatMonitor(db=session_factory, stale_seconds=30)
+    flipped = await monitor._mark_stale_as_failed()
+
+    assert str(deployment.id) in flipped
+
+    async with session_factory() as session:
+        fresh = await session.get(LiveNodeProcess, row.id)
+        assert fresh is not None
+        assert fresh.status == "failed", (
+            "a stale paused/stop-requested running row MUST be flipped to failed "
+            "unconditionally so it leaves the active set"
+        )
+        assert fresh.failure_kind == FailureKind.HEARTBEAT_TIMEOUT.value
+        # Cleanup preserves the latch + intent — it is a flip, not a reset.
+        assert fresh.auto_restart_paused is True
+        assert fresh.stop_requested_at is not None
 
 
 # ---------------------------------------------------------------------------

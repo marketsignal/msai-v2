@@ -124,6 +124,53 @@ class OrderSubmittedFacts:
     strategy_git_sha: str | None = None
 
 
+@dataclass(frozen=True)
+class OrderDeniedFacts:
+    """Everything the writer needs to durably record a node-side
+    halt/risk DENIAL — the complete order context for an order that
+    was BLOCKED before submission.
+
+    PR 2 T2 audit-completeness fix
+    ------------------------------
+    The node-side live halt gate (``RiskAwareStrategy``) blocks an
+    opening order BEFORE it reaches Nautilus, so NO ``OrderSubmitted``
+    event ever fires on the engine msgbus — the engine-level audit
+    hook never inserts a ``submitted`` row. A bare
+    :meth:`OrderAuditWriter.update_denied` (UPDATE-only on
+    ``client_order_id``) therefore matches nothing and the denial is
+    lost beyond a structured log line. ``nautilus.md`` #10 requires
+    every order attempt on the real-money path to be durably
+    auditable, so a halt-block must leave a ``denied`` row.
+
+    :meth:`OrderAuditWriter.write_denied` UPSERTs on
+    ``client_order_id`` so it records the denial whether or not a
+    ``submitted`` row already exists (a denial AFTER a real
+    submission still flips that row to ``denied`` rather than
+    duplicating it). The frozen-dataclass shape mirrors
+    :class:`OrderSubmittedFacts` so the caller (the strategy mixin)
+    builds it from the per-run context + the blocked ``Order``.
+    """
+
+    client_order_id: str
+    strategy_id: UUID
+    strategy_code_hash: str
+    instrument_id: str
+    side: str
+    quantity: Decimal
+    price: Decimal | None
+    order_type: str
+    ts_attempted: datetime
+    reason: str
+    # Exactly one of these must be populated — the CHECK constraint
+    # on the table enforces it at the DB layer. Node-side halt
+    # denials are always live, so ``deployment_id`` is populated and
+    # ``backtest_id`` stays ``None``.
+    deployment_id: UUID | None = None
+    backtest_id: UUID | None = None
+    is_live: bool = True
+    strategy_git_sha: str | None = None
+
+
 class OrderAuditWriter:
     """Persists order lifecycle events to ``order_attempt_audits``.
 
@@ -373,8 +420,105 @@ class OrderAuditWriter:
         """Risk engine denied the order before submission. The row
         still carries ``deployment_id`` but ``broker_order_id`` stays
         NULL forever because the order never reached the broker.
+
+        UPDATE-only: this transitions an EXISTING row (one a prior
+        ``write_submitted`` inserted). For a PRE-SUBMIT halt block —
+        where no ``submitted`` row was ever inserted — use
+        :meth:`write_denied`, which UPSERTs the complete row.
         """
         await self._update_status(client_order_id, status=_ORDER_STATUS_DENIED, reason=reason)
+
+    async def write_denied(self, facts: OrderDeniedFacts) -> UUID:
+        """Durably record a node-side DENIAL, INSERTing a complete
+        ``denied`` row when none exists yet, or flipping the existing
+        row to ``denied`` when a ``submitted`` row already does.
+
+        PR 2 T2 audit-completeness fix. A node-side halt block returns
+        BEFORE the order reaches Nautilus, so the engine-level audit
+        hook never inserts a ``submitted`` row — a bare
+        :meth:`update_denied` would UPDATE nothing and the real-money
+        denial would go unrecorded (``nautilus.md`` #10 violation).
+        This method does an idempotent ``INSERT ... ON CONFLICT
+        (client_order_id) DO UPDATE`` so the denial is recorded
+        atomically whether or not a row preexists:
+
+        - No prior row (the halt-block case) → INSERT the full
+          ``denied`` row from ``facts``.
+        - A ``submitted`` row preexists (a denial AFTER a real
+          submission) → flip THAT row to ``status='denied'`` + set the
+          reason, WITHOUT touching the immutable submit-time columns
+          (instrument/side/quantity/…) and WITHOUT duplicating the
+          row (the ``client_order_id`` UNIQUE index drives the
+          conflict target).
+        - A duplicate denial for the same ``client_order_id`` → no
+          error, the row simply re-asserts ``denied`` + reason.
+
+        Returns the affected row's primary key. ``broker_order_id``
+        is never set on this path (the order never reached the
+        broker), and the ON CONFLICT clause does not touch it, so a
+        post-acceptance denial preserves any broker id already there.
+
+        Raises:
+            ValueError: If neither ``deployment_id`` nor
+                ``backtest_id`` is populated (the XOR CHECK constraint
+                would reject it anyway — surfaced early with the
+                ``client_order_id`` context, mirroring
+                :meth:`write_submitted`).
+        """
+        if (facts.deployment_id is None) == (facts.backtest_id is None):
+            raise ValueError(
+                "OrderDeniedFacts must set exactly one of "
+                "deployment_id / backtest_id (the XOR CHECK constraint "
+                "on order_attempt_audits rejects any other shape). "
+                f"client_order_id={facts.client_order_id}"
+            )
+
+        row_id = uuid4()
+        stmt = (
+            pg_insert(OrderAttemptAudit)
+            .values(
+                id=row_id,
+                client_order_id=facts.client_order_id,
+                deployment_id=facts.deployment_id,
+                backtest_id=facts.backtest_id,
+                strategy_id=facts.strategy_id,
+                strategy_code_hash=facts.strategy_code_hash,
+                strategy_git_sha=facts.strategy_git_sha,
+                instrument_id=facts.instrument_id,
+                side=facts.side,
+                quantity=facts.quantity,
+                price=facts.price,
+                order_type=facts.order_type,
+                ts_attempted=facts.ts_attempted,
+                status=_ORDER_STATUS_DENIED,
+                reason=facts.reason,
+                is_live=facts.is_live,
+            )
+            # On conflict (a ``submitted`` row already exists for this
+            # client_order_id), only transition status + reason. The
+            # submit-time identity columns and any broker_order_id are
+            # left untouched.
+            .on_conflict_do_update(
+                index_elements=["client_order_id"],
+                set_={"status": _ORDER_STATUS_DENIED, "reason": facts.reason},
+            )
+            .returning(OrderAttemptAudit.id)
+        )
+        async with self._db() as session, session.begin():
+            result = await session.execute(stmt)
+            affected_id = result.scalar_one()
+
+        log.info(
+            "order_audit_denied_recorded",
+            extra={
+                "client_order_id": facts.client_order_id,
+                "deployment_id": str(facts.deployment_id) if facts.deployment_id else None,
+                "instrument_id": facts.instrument_id,
+                "reason": facts.reason,
+                "inserted_new_row": affected_id == row_id,
+            },
+        )
+        return affected_id
 
     # ------------------------------------------------------------------
     # Internal

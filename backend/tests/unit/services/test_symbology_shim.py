@@ -84,7 +84,7 @@ def test_retag_inbound_bar_invokes_audit_sink_with_provenance_dict() -> None:
     assert len(captured) == 1
     meta = captured[0]
     assert meta["provider"] == "databento"
-    assert meta["dataset"] == "DBEQ.BASIC"
+    assert meta["dataset"] == "EQUS.MINI"
     assert meta["native_venue"] == "XNAS"
     assert meta["native_symbol"] == "AAPL"
     assert meta["original_instrument_id"] == "AAPL.XNAS"
@@ -324,7 +324,7 @@ def test_databento_subscription_target_is_frozen_dataclass() -> None:
     import dataclasses
 
     target = DatabentoSubscriptionTarget(
-        dataset="DBEQ.BASIC",
+        dataset="EQUS.MINI",
         native_symbol="AAPL",
         native_venue="XNAS",
     )

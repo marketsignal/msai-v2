@@ -199,6 +199,69 @@ If `broker_flat=false` (or `any_non_flat=true`, which may also mean _unknown_-fl
 
 ---
 
+## The binding deploy contract (broker isolation)
+
+This is the **load-bearing safety property** that bounds routine-deploy blast radius on the single 16 GB prod VM. It is a binding contract, not a convention — code review and operator discipline both enforce it. Established by the multi-account broker-fleet council (council #2, [`docs/decisions/multi-account-broker-fleet.md`](decisions/multi-account-broker-fleet.md) §Addendum 2026-05-31, ruling item 3).
+
+**Why it matters.** `live-supervisor` runs as its container's PID-1, and TradingNodes are `mp.Process` children spawned **in the same container**. So a supervisor-container recreate (or PID-1 death) kills every co-located live node. On a single VM, the only thing standing between a routine code deploy and an all-account trading interruption is this contract. (True supervisor-redeploy isolation — a separate container or process per account that survives a sibling recreate — is deferred to the 2-VM split / per-account-container phase; F4 + F5 are what make that deferral safe.)
+
+**The three clauses:**
+
+1. **F4 — routine deploys exclude the `broker` profile.** `scripts/deploy-on-vm.sh` performs `docker compose pull` + `up -d --wait` (and rollback) ONLY against the explicit `DEFAULT_PROFILE_SERVICES` array (`scripts/deploy-on-vm.sh:44` — `postgres redis migrate backend backtest-worker research-worker portfolio-worker ingest-worker frontend caddy`). `live-supervisor`, `ib-gateway`, and the rest of the `broker` compose profile are **not** in that array, so a routine push-to-main deploy never recreates the supervisor container or interrupts any running live node. Broker-profile containers stay up across routine deploys.
+
+2. **F5 — the deploy workflow refuses while any live deployment is active.** `.github/workflows/deploy.yml:399` ("Refuse if active live_deployments") queries `GET /api/v1/live/status?active_only=true` **before** Azure login and fails closed (exit 1, `FAIL_ACTIVE_DEPLOYMENTS_REFUSAL`) if any deployment is in `{starting, building, ready, running}`. See [§The active-deployments gate](#the-active-deployments-gate-slice-4) above for how to clear it. This guarantees a deploy can only land while the broker profile is idle — so even though F4 leaves broker containers untouched, a deploy can't race against a node that's mid-trade.
+
+3. **Broker-profile supervisor-image changes are DELIBERATE, sequenceable maintenance — never part of a routine deploy.** Because F4 deliberately excludes the broker profile, a change to the supervisor image does NOT ship on push-to-main. Rolling out a new supervisor image is an explicit maintenance operation: you must intentionally recreate the broker-profile containers, which restarts **all** co-located accounts at once (there is no per-account isolation on the single VM yet). Sequence it as maintenance — drain every account first (`msai live stop <id>` per deployment, confirming `broker_flat`), or accept and announce an all-account restart — then recreate the broker profile out-of-band:
+
+   ```bash
+   # On the VM, after draining: recreate ONLY the broker profile with the new image
+   COMPOSE_PROFILES=broker sudo docker compose \
+     --project-name msai -f /opt/msai/docker-compose.prod.yml \
+     --env-file /run/msai.env --env-file /run/msai-images.env \
+     up -d ib-gateway live-supervisor
+   ```
+
+   Reaching the VM requires the same transient-NSG-SSH access pattern the deploy pipeline uses (council-mandated, [`docs/decisions/deploy-ssh-jit.md`](decisions/deploy-ssh-jit.md)); the broker profile is default-off in the deploy pipeline and stays up across routine deploys once started.
+
+**The contract is binding.** Do not "temporarily" widen `DEFAULT_PROFILE_SERVICES` to include broker services, and do not bypass F5 with `bootstrap=true` for a routine deploy. Either change silently removes the blast-radius bound the single-VM architecture depends on. If a deploy genuinely needs to touch the broker profile, it is supervisor-image maintenance (clause 3), not a routine deploy.
+
+### Coordinated release: supervisor↔API command-routing/heartbeat contract changes (PR 2 and beyond)
+
+**When a release changes the supervisor↔API contract** — the per-account Redis command streams (`msai:live:commands:<account>`) and/or the `router_heartbeat` Redis key that `/start-portfolio` gates on — it is a **COORDINATED release**, not a plain push-to-main. PR 2 (per-account supervisors) is the first such release. The routine deploy (F4 / `DEFAULT_PROFILE_SERVICES`) updates the backend image but deliberately **does NOT** recreate the broker-profile `live-supervisor`. So immediately after a routine PR-2 deploy you are running **new API + old supervisor**.
+
+**Operator action — after the routine backend deploy and BEFORE resuming live trading, recreate the broker profile with the new image:**
+
+```bash
+# On the VM (same transient-NSG-SSH access the deploy pipeline uses)
+COMPOSE_PROFILES=broker sudo docker compose \
+  --project-name msai -f /opt/msai/docker-compose.prod.yml \
+  --env-file /run/msai.env --env-file /run/msai-images.env \
+  up -d live-supervisor ib-gateway
+```
+
+Until you do this, `/start-portfolio` returns **503 ("live-supervisor is not running…")** — because the new API gates on a fresh `router_heartbeat` key that only the NEW supervisor publishes (`backend/src/msai/api/live.py:937`, which already names the recreate command in its message). **This 503 is the intended FAIL-LOUD guard, not a bug** — it refuses to START live trading against a mismatched old supervisor.
+
+**Why no in-flight command can be stranded across this window:**
+
+- **F5** (the active-`live_deployments` gate, [§The binding deploy contract](#the-binding-deploy-contract-broker-isolation) clause 2) refuses to deploy while any live deployment is active, so there are **zero running nodes / zero in-flight commands** at deploy time — nothing to strand.
+- The **fail-loud 503** guarantees no NEW trading starts under the (new-API + old-supervisor) pairing, so no STOP / kill-all / drain command is ever issued against a mismatched supervisor.
+
+Recreating the broker profile is the same all-account maintenance operation as clause 3 above (it restarts all co-located accounts at once on the single VM); sequence it the same way (drain or accept-and-announce). The coordinated-release requirement is purely additive to clause 3 — it documents that the broker-profile recreate is **mandatory** (not merely "deliberate maintenance") whenever the routing/heartbeat contract changed, and must complete before live trading resumes.
+
+---
+
+## Pre-deploy checklist
+
+Run through these before any prod deploy. Most routine push-to-main deploys clear them trivially; the broker-related lines matter when a change touches live-trading code or the supervisor image.
+
+- [ ] **Active-live gate clear.** No live deployment in `{starting, building, ready, running}` (`msai live status`). The F5 gate ([§The active-deployments gate](#the-active-deployments-gate-slice-4)) enforces this — clear it via `msai live stop <id>` per deployment (or `msai live kill-all --yes`) and confirm `broker_flat` before deploying.
+- [ ] **Routine deploy does not touch the broker profile.** Confirm the change is shipping via the normal push-to-main path (which excludes broker per F4). If the change is to a broker-profile image, it is NOT a routine deploy — see the next line.
+- [ ] **Broker-profile supervisor-image change → sequence as maintenance** (drain or accept all-account restart); routine deploys never touch broker. Recreate the broker profile out-of-band per [§The binding deploy contract](#the-binding-deploy-contract-broker-isolation) clause 3 — do NOT fold it into a push-to-main deploy.
+- [ ] **(PR 2 — per-account supervisors) Live strategy MRO pre-flight.** Before deploying PR 2, every live/queued strategy file MUST declare `class X(RiskAwareStrategy, Strategy)` — the mixin FIRST — so the halt-gated submit override wins the MRO. The PR-2 node startup gate fails-closed (`SPAWN_FAILED_PERMANENT`) any live strategy that is bare-`Strategy` OR mixes the order wrong. Test-only fixtures (e.g. `strategies/intentionally_failing_strategy.py`) are intentionally not migrated.
+- [ ] **(PR 2 and any supervisor↔API contract change) Coordinated release — recreate the broker profile with the new image AFTER the backend deploy, BEFORE resuming live trading.** PR 2 version-couples the API and supervisor (per-account command streams + `router_heartbeat` gate). F4 does NOT recreate `live-supervisor` on a routine deploy, so until you run the broker-profile recreate (`COMPOSE_PROFILES=broker docker compose -f docker-compose.prod.yml up -d live-supervisor ib-gateway`) `/start-portfolio` returns 503 ("live-supervisor is not running…") — the intended fail-loud guard. See [§Coordinated release: supervisor↔API command-routing/heartbeat contract changes](#coordinated-release-supervisorapi-command-routingheartbeat-contract-changes-pr-2-and-beyond). F5 guarantees no in-flight command is stranded during the deploy window.
+
+---
+
 ## Pre-deploy rehearsal (for risky changes)
 
 Council-mandated for first deploys to new infra and any change touching `docker-compose.prod.yml`, `Caddyfile`, `scripts/deploy-on-vm.sh`, or `infra/main.bicep`. Deploy to a throwaway resource group first.

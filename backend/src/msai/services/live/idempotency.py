@@ -368,6 +368,13 @@ class EndpointOutcome:
 PERMANENT_FAILURE_KINDS: frozenset[FailureKind] = frozenset(
     {
         FailureKind.SPAWN_FAILED_PERMANENT,
+        # NODE_CRASHED is a RUNTIME crash (the node ran then crashed). For the
+        # ORIGINATING /start request it is a permanent outcome — that start
+        # attempt ended in a crash — so the endpoint surfaces the same cacheable
+        # 503 it gave for a generic SPAWN_FAILED_PERMANENT before the F2 split
+        # (behavior-preserving at the HTTP layer). The crash-RECOVERY (reaper /
+        # rescan) is a SEPARATE concern from the endpoint classification.
+        FailureKind.NODE_CRASHED,
         FailureKind.RECONCILIATION_FAILED,
         FailureKind.BUILD_TIMEOUT,
         FailureKind.HEARTBEAT_TIMEOUT,

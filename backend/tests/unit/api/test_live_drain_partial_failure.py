@@ -90,7 +90,7 @@ def client(
 def _patch_flatness(monkeypatch: pytest.MonkeyPatch) -> dict[str, AsyncMock]:
     """Patch the flatness + terminal-poll helpers at the ``live``
     module's namespace so the drain endpoint runs without Redis or the
-    supervisor's process_manager. Returns the mock handles so tests
+    supervisor's fleet_router. Returns the mock handles so tests
     can configure per-call side effects.
 
     By default ``_poll_for_terminal`` returns a synthetic row whose

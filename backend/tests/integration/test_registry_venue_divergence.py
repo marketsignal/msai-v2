@@ -6,15 +6,53 @@ import pytest
 
 from msai.services.nautilus.security_master.service import SecurityMaster
 from msai.services.observability import get_registry
+from msai.services.observability.trading_metrics import REGISTRY_VENUE_DIVERGENCE_TOTAL
 
 pytest_plugins = ["tests.integration.conftest_databento"]
+
+
+def _counter_value(databento_venue: str, ib_venue: str) -> float:
+    """Read the live divergence counter for a label pair DIRECTLY off the
+    bound :data:`REGISTRY_VENUE_DIVERGENCE_TOTAL` object the production code
+    increments — NOT via ``get_registry().render()``.
+
+    Test-isolation fix (full-suite ordering): ``REGISTRY_VENUE_DIVERGENCE_TOTAL``
+    is bound at ``trading_metrics`` import time and registered in the global
+    ``MetricsRegistry`` ``_metrics`` dict. The autouse ``_reset_registry``
+    fixture in ``tests/unit/test_metrics_endpoint.py`` calls
+    ``get_registry().reset()``, which CLEARS that dict — orphaning the bound
+    counter object from the registry's ``render()`` view while the object
+    itself (which ``service.py`` increments) lives on. So once that fixture has
+    run earlier in the same session, ``get_registry().render()`` no longer
+    contains the divergence series and the old ``_extract_counter(render())``
+    read saw ``0.0`` even though the increment fired. Reading the counter's own
+    ``_values`` dict observes the SAME object the production code mutates, so it
+    is correct regardless of registry-dict resets. DELTA-based (capture
+    before/after for this label pair) so a residual cross-test increment on the
+    venue-pair-only series is tolerated."""
+    key = REGISTRY_VENUE_DIVERGENCE_TOTAL._key(
+        {"databento_venue": databento_venue, "ib_venue": ib_venue}
+    )
+    with REGISTRY_VENUE_DIVERGENCE_TOTAL._lock:
+        return REGISTRY_VENUE_DIVERGENCE_TOTAL._values.get(key, 0.0)
 
 
 @pytest.mark.asyncio
 async def test_divergence_counter_fires_on_mismatch(session_factory):
     """Seed Databento SPY.XARC → normalized to SPY.ARCA. Later IB refresh
-    claims SPY.BATS. Counter increments with labels
-    (databento_venue=ARCA, ib_venue=BATS)."""
+    claims SPY.BATS. The divergence counter for labels
+    (databento_venue=ARCA, ib_venue=BATS) increments by exactly one.
+
+    DELTA-based (not an absolute ``... 1.0`` string match): the
+    ``msai_registry_venue_divergence_total`` counter lives on a PROCESS-GLOBAL
+    Prometheus registry that is NOT reset between tests, and its labels are
+    venue-pair-only (NOT symbol-scoped). ``test_divergence_counter_does_not_re_
+    fire_on_idempotent_ib_refresh`` also increments the SAME ``(ARCA, BATS)``
+    series, so under a full-suite random order the absolute ``1.0`` assertion
+    saw ``2.0`` and failed (both tests pass in isolation). Capture the series
+    value BEFORE this test's IB refresh and assert it grew by exactly one,
+    mirroring the existing delta style of
+    ``test_divergence_counter_silent_on_match``."""
     # Seed
     async with session_factory() as session:
         sm = SecurityMaster(db=session, databento_client=None)
@@ -28,6 +66,8 @@ async def test_divergence_counter_fires_on_mismatch(session_factory):
             venue_format="mic_code",
         )
         await session.commit()
+
+    before = _counter_value("ARCA", "BATS")
 
     # IB refresh with a different venue (hypothetical migration)
     async with session_factory() as session:
@@ -43,11 +83,10 @@ async def test_divergence_counter_fires_on_mismatch(session_factory):
         )
         await session.commit()
 
-    rendered = get_registry().render()
-    # Labels alphabetical per metrics.py:61 _format_labels(); value is float.
-    assert (
-        'msai_registry_venue_divergence_total{databento_venue="ARCA",ib_venue="BATS"} 1.0'
-        in rendered
+    after = _counter_value("ARCA", "BATS")
+    assert after == before + 1.0, (
+        f"the venue-divergence counter (databento=ARCA, ib=BATS) must increment "
+        f"by exactly one on this mismatch (before={before}, after={after})"
     )
 
 
@@ -133,8 +172,7 @@ async def test_divergence_counter_does_not_re_fire_on_idempotent_ib_refresh(sess
         )
         await session.commit()
 
-    rendered_after_first = get_registry().render()
-    first_count = _extract_counter(rendered_after_first, "ARCA", "BATS")
+    first_count = _counter_value("ARCA", "BATS")
     assert first_count >= 1.0, "first real migration must fire the counter"
 
     # Second IB refresh — same BATS venue, IB alias didn't transition.
@@ -152,23 +190,7 @@ async def test_divergence_counter_does_not_re_fire_on_idempotent_ib_refresh(sess
         )
         await session.commit()
 
-    rendered_after_second = get_registry().render()
-    second_count = _extract_counter(rendered_after_second, "ARCA", "BATS")
+    second_count = _counter_value("ARCA", "BATS")
     assert second_count == first_count, (
         f"idempotent refresh re-fired the counter ({first_count} → {second_count})"
     )
-
-
-def _extract_counter(rendered: str, databento_venue: str, ib_venue: str) -> float:
-    """Pull the current value of the divergence counter for a given label pair.
-
-    Returns 0.0 if no matching counter line exists yet.
-    """
-    target = (
-        f'msai_registry_venue_divergence_total{{databento_venue="{databento_venue}",'
-        f'ib_venue="{ib_venue}"}}'
-    )
-    for line in rendered.splitlines():
-        if line.startswith(target):
-            return float(line.rsplit(" ", 1)[1])
-    return 0.0

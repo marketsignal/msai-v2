@@ -304,12 +304,30 @@ export interface LiveDeploymentInfo {
   account_id: string | null;
   ib_login_key: string | null;
   ibg_client_id: number | null;
+  // PR 2 T8 — per-account restart-authority health (additive, read-only).
+  // ``auto_restart_paused`` true means the bounded restart policy tripped
+  // and the supervisor will NOT auto-respawn this account — an operator must
+  // intervene. The rest let the dashboard surface how close an account is to
+  // (or how it crossed) the ceiling + its live halt-latch state. All nullable
+  // because a deployment that has never spawned a node has no process row.
+  auto_restart_paused: boolean | null;
+  auto_restart_pause_reason: string | null;
+  consecutive_respawn_failures: number | null;
+  last_restart_at: string | null;
+  last_heartbeat_at: string | null;
+  last_heartbeat_age_s: number | null;
+  fleet_halted: boolean;
+  account_halted: boolean;
 }
 
 export interface LiveStatusResponse {
   deployments: LiveDeploymentInfo[];
   risk_halted: boolean;
   active_count: number;
+  // PR 2 T8 — supervisor-liveness signal. Age (seconds) of the supervisor's
+  // ``router_heartbeat``; null means the supervisor is down / never started
+  // (fail-closed). A small value confirms the single-supervisor SPOF is alive.
+  router_heartbeat_age_s: number | null;
 }
 
 /** Fetch the current list of live deployments + global state. */

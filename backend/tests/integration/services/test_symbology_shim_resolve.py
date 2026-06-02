@@ -105,10 +105,10 @@ async def _seed_es_future(session: AsyncSession) -> None:
     await session.commit()
 
 
-async def test_outbound_resolves_aapl_to_dbeq_basic_xnas(
+async def test_outbound_resolves_aapl_to_equs_mini_xnas(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """AAPL.IBKR canonical → Databento ``DBEQ.BASIC`` / XNAS / ``AAPL``."""
+    """AAPL.IBKR canonical → Databento ``EQUS.MINI`` / XNAS / ``AAPL``."""
     async with session_factory() as session:
         await _seed_aapl_equity(session)
 
@@ -119,7 +119,7 @@ async def test_outbound_resolves_aapl_to_dbeq_basic_xnas(
         )
 
         assert isinstance(target, DatabentoSubscriptionTarget)
-        assert target.dataset == "DBEQ.BASIC"
+        assert target.dataset == "EQUS.MINI"
         assert target.native_symbol == "AAPL"
         assert target.native_venue == "XNAS"
 
@@ -228,7 +228,7 @@ async def test_outbound_resolves_listing_venue_to_databento_native(
         # All four listing venues currently map to the same Databento
         # BASIC bundle; only the native_venue varies. native_symbol is
         # the operator-typed raw symbol.
-        assert target.dataset == "DBEQ.BASIC"
+        assert target.dataset == "EQUS.MINI"
         assert target.native_symbol == raw_symbol
         assert target.native_venue == expected_native_venue
 

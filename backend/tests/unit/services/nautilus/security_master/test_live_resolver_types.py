@@ -50,7 +50,7 @@ def test_unsupported_asset_class_error_names_class():
 
 
 def test_live_resolver_error_is_value_error_subclass():
-    """Critical: supervisor's ProcessManager.spawn() permanent-catch only
+    """Critical: supervisor's FleetRouter.spawn() permanent-catch only
     fires for ValueError/ImportError/etc. Resolver errors MUST inherit
     ValueError via LiveResolverError, or they land in the transient-
     retry branch."""
@@ -58,6 +58,7 @@ def test_live_resolver_error_is_value_error_subclass():
         AmbiguousRegistryError,
         LiveResolverError,
     )
+
     assert issubclass(LiveResolverError, ValueError)
     assert issubclass(RegistryMissError, LiveResolverError)
     assert issubclass(RegistryIncompleteError, LiveResolverError)
@@ -115,6 +116,7 @@ def test_ambiguous_registry_error_sorts_conflicts_deterministically():
     from msai.services.nautilus.security_master.live_resolver import (
         AmbiguousRegistryError,
     )
+
     # Inputs in non-sorted order — err.conflicts must be sorted
     err = AmbiguousRegistryError(
         symbol="ES",
