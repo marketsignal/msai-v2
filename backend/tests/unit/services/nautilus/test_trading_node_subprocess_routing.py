@@ -85,7 +85,7 @@ def test_payload_with_per_account_fields_uses_databento_builder() -> None:
     out so we can inspect the config that was passed in."""
     payload = _make_payload(
         native_instrument_ids=["AAPL.XNAS"],
-        venue_dataset_map={"XNAS": "DBEQ.BASIC"},
+        venue_dataset_map={"XNAS": "EQUS.MINI"},
         canonical_to_native_bar_types={
             "AAPL.IBKR-1-MINUTE-LAST-EXTERNAL": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL",
         },
@@ -137,7 +137,7 @@ def test_payload_with_per_account_fields_propagates_ibg_client_id() -> None:
     collide on IB Gateway's client_id slot (gotcha #3)."""
     payload = _make_payload(
         native_instrument_ids=["AAPL.XNAS"],
-        venue_dataset_map={"XNAS": "DBEQ.BASIC"},
+        venue_dataset_map={"XNAS": "EQUS.MINI"},
         canonical_to_native_bar_types={
             "AAPL.IBKR-1-MINUTE-LAST-EXTERNAL": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL",
         },
@@ -239,7 +239,7 @@ def test_payload_missing_bar_type_map_falls_back_to_legacy() -> None:
     (no bars)."""
     payload = _make_payload(
         native_instrument_ids=["AAPL.XNAS"],
-        venue_dataset_map={"XNAS": "DBEQ.BASIC"},
+        venue_dataset_map={"XNAS": "EQUS.MINI"},
         canonical_to_native_bar_types={},  # EMPTY — must NOT route per-account
     )
     assert payload.use_per_account_topology is False
@@ -250,12 +250,12 @@ def test_payload_missing_bar_type_map_falls_back_to_legacy() -> None:
     [
         ([], {}, {}, False),
         (["AAPL.XNAS"], {}, {}, False),
-        ([], {"XNAS": "DBEQ.BASIC"}, {}, False),
+        ([], {"XNAS": "EQUS.MINI"}, {}, False),
         ([], {}, {"k": "v"}, False),
-        (["AAPL.XNAS"], {"XNAS": "DBEQ.BASIC"}, {}, False),
+        (["AAPL.XNAS"], {"XNAS": "EQUS.MINI"}, {}, False),
         (["AAPL.XNAS"], {}, {"k": "v"}, False),
-        ([], {"XNAS": "DBEQ.BASIC"}, {"k": "v"}, False),
-        (["AAPL.XNAS"], {"XNAS": "DBEQ.BASIC"}, {"k": "v"}, True),
+        ([], {"XNAS": "EQUS.MINI"}, {"k": "v"}, False),
+        (["AAPL.XNAS"], {"XNAS": "EQUS.MINI"}, {"k": "v"}, True),
     ],
 )
 def test_use_per_account_topology_requires_all_three_fields(
@@ -316,7 +316,7 @@ def test_per_account_routing_threads_strategies_through_builder() -> None:
         strategy_members=[member],
         ibg_client_id=12345,
         native_instrument_ids=["AAPL.XNAS"],
-        venue_dataset_map={"XNAS": "DBEQ.BASIC"},
+        venue_dataset_map={"XNAS": "EQUS.MINI"},
         canonical_to_native_bar_types={
             "AAPL.IBKR-1-MINUTE-LAST-EXTERNAL": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL",
         },

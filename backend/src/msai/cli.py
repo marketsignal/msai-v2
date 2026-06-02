@@ -554,13 +554,49 @@ def live_stop(
     typer.echo(f"Deployment {data['id']} stopped.")
 
 
+def _fmt_age_s(age: float | None) -> str:
+    """Render a heartbeat / router age in seconds as a compact ``N.Ns``
+    string, or ``stale`` when the age is unknown (``None`` — key absent /
+    expired / no heartbeat). PR 2 T8."""
+    if age is None:
+        return "stale"
+    return f"{age:.1f}s"
+
+
 @live_app.command("status")
 def live_status() -> None:
-    """Show all active deployments + risk-halt state."""
+    """Show all active deployments + risk-halt state + per-account
+    restart-authority health (PR 2 T8)."""
     response = _api_call("GET", "/api/v1/live/status", timeout=10.0)
     data = response.json()
     typer.echo(f"Risk halted: {data['risk_halted']}")
     typer.echo(f"Active nodes: {data['active_count']}")
+    # PR 2 T8 — supervisor (router) liveness. The single live-supervisor is a
+    # SPOF; a stale/absent router heartbeat means nothing is reaping or
+    # auto-restarting crashed nodes — the fleet is unmonitored.
+    #
+    # PR 2 F4 — the router heartbeat key has a 90s TTL, so ``router_age`` stays
+    # numeric for up to 90s after the supervisor dies. But the backend treats
+    # the supervisor as DEAD far earlier: the SPOF alert fires at
+    # ``ROUTER_HEARTBEAT_SPOF_THRESHOLD_S`` (30s) and the /start-portfolio gate
+    # at 15s. A null-only check would render "alive (45.0s ago)" in the 30-90s
+    # window, hiding an unmonitored fleet. Mirror the SPOF threshold (the exact
+    # age at which the fleet alert pages) so the CLI and dashboard agree on
+    # "dead" with the backend liveness semantics.
+    from msai.services.fleet_alerts import ROUTER_HEARTBEAT_SPOF_THRESHOLD_S
+
+    router_age = data.get("router_heartbeat_age_s")
+    if router_age is None:
+        router_health = "DOWN (no heartbeat)"
+    elif router_age > ROUTER_HEARTBEAT_SPOF_THRESHOLD_S:
+        router_health = (
+            f"STALE ({_fmt_age_s(router_age)} ago — "
+            f"exceeds {int(ROUTER_HEARTBEAT_SPOF_THRESHOLD_S)}s SPOF threshold; "
+            "fleet unmonitored)"
+        )
+    else:
+        router_health = f"alive ({_fmt_age_s(router_age)} ago)"
+    typer.echo(f"Supervisor (router): {router_health}")
     typer.echo(f"Deployments ({len(data['deployments'])}):")
     for d in data["deployments"]:
         mode = "PAPER" if d["paper_trading"] else "LIVE"
@@ -576,6 +612,30 @@ def live_status() -> None:
             f"  [{mode}] {d['id']}  status={d['status']}  "
             f"account={account}  login={login}  ibg_client_id={client_id_s}  "
             f"instruments={d['instruments']}"
+        )
+        # PR 2 T8 — per-account restart-authority health line. Flags a tripped
+        # restart ceiling (auto_restart_paused) + the consecutive-failure
+        # count + heartbeat age + halt-latch state so the operator can spot an
+        # account that needs intervention from the shell.
+        paused = d.get("auto_restart_paused")
+        if paused:
+            reason = d.get("auto_restart_pause_reason") or "unspecified"
+            restart_state = f"PAUSED ({reason})"
+        else:
+            restart_state = "auto-restart on"
+        halts = []
+        if d.get("fleet_halted"):
+            halts.append("FLEET")
+        if d.get("account_halted"):
+            halts.append("ACCOUNT")
+        halt_state = "+".join(halts) if halts else "none"
+        failures = d.get("consecutive_respawn_failures")
+        failures_s = "-" if failures is None else str(failures)
+        typer.echo(
+            f"        restart={restart_state}  "
+            f"consecutive_failures={failures_s}  "
+            f"heartbeat={_fmt_age_s(d.get('last_heartbeat_age_s'))} ago  "
+            f"halt={halt_state}"
         )
     if not data["deployments"]:
         typer.echo("  (none)")

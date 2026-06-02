@@ -145,3 +145,21 @@ class GatewayRouter:
     def login_keys(self) -> list[str]:
         """Return all configured IB login keys."""
         return list(self._routes.keys())
+
+    def all_accounts(self) -> list[str]:
+        """Return every account_id bound across all logins, de-duplicated.
+
+        The static configured account pool the supervisor uses to start
+        one per-account command consumer per account at boot (PR 2 T4).
+        Logins with no ``accounts=`` segment contribute nothing — their
+        account_ids only become known once a deployment for them is
+        active (covered by the active-deployment scan).
+        """
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for login_key in self._routes:
+            for account in self._accounts.get(login_key, []):
+                if account and account not in seen:
+                    seen.add(account)
+                    ordered.append(account)
+        return ordered

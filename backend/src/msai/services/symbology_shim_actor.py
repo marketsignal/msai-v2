@@ -85,7 +85,7 @@ class SymbologyShimActorConfig(ActorConfig, frozen=True):
             behalf so Databento actually streams the data.
         venue_dataset_map: The authoritative ``native_venue → dataset``
             map produced by the upstream symbology resolver (e.g.
-            ``{"XNAS": "DBEQ.BASIC"}``). Used by the inbound handler to
+            ``{"XNAS": "EQUS.MINI"}``). Used by the inbound handler to
             attach the dataset string to the audit metadata.
         ib_login_key: IB Gateway login key the deployment is bound to.
             Embedded for audit symmetry with the supervisor payload —

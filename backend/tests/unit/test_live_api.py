@@ -19,6 +19,35 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _kill_all_execute_side_effect(rows: list[tuple[object, str]]):
+    """Build a ``db.execute`` side_effect for the PR 2 T4 /kill-all path.
+
+    The active-process query is joined to ``live_deployments`` and returns
+    ``(LiveNodeProcess, account_id)`` 2-tuples via ``result.all()``. Other
+    ``execute`` calls (the user lookup, the per-row member-strategy lookup)
+    are matched by statement text and served defaults so they don't consume
+    the tuple-result slot. Matching on the rendered SQL is order-independent.
+    """
+
+    async def _execute(statement: object = "", *_a: object, **_k: object) -> MagicMock:
+        sql = str(statement).lower()
+        result = MagicMock()
+        result.scalar_one.return_value = 0
+        result.scalar_one_or_none.return_value = None
+        if "live_node_processes" in sql and "join" in sql:
+            result.all.return_value = rows
+        else:
+            result.all.return_value = []
+        return result
+
+    return _execute
+
+
+# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
@@ -249,16 +278,17 @@ class TestLiveKillAll:
 
         from msai.models.live_node_process import LiveNodeProcess
 
+        # PR 2 T4: /kill-all now selects (LiveNodeProcess, account_id) via a
+        # join to live_deployments, so the result rows are 2-tuples consumed
+        # via ``result.all()`` (not ``.scalars().all()``). The per-row member
+        # lookup ALSO uses ``.all()``, so route the main query result via a
+        # side_effect (first call) and return an empty member result after.
         rows = [
-            LiveNodeProcess(deployment_id=uuid4(), status="running"),
-            LiveNodeProcess(deployment_id=uuid4(), status="ready"),
-            LiveNodeProcess(deployment_id=uuid4(), status="building"),
+            (LiveNodeProcess(deployment_id=uuid4(), status="running"), "DUP-A"),
+            (LiveNodeProcess(deployment_id=uuid4(), status="ready"), "DUP-B"),
+            (LiveNodeProcess(deployment_id=uuid4(), status="building"), "DUP-C"),
         ]
-        mock_result = MagicMock()
-        mock_scalars = MagicMock()
-        mock_scalars.all.return_value = rows
-        mock_result.scalars.return_value = mock_scalars
-        mock_db.execute.return_value = mock_result
+        mock_db.execute.side_effect = _kill_all_execute_side_effect(rows)
 
         response = await client_with_mock_db.post("/api/v1/live/kill-all")
 
@@ -268,8 +298,13 @@ class TestLiveKillAll:
         # Bug #2 (live-deploy-safety-trio): /kill-all publishes
         # STOP_AND_REPORT_FLATNESS, not plain STOP.
         assert mock_command_bus.publish_stop_and_report_flatness.await_count == 3
+        expected_accounts = {"DUP-A", "DUP-B", "DUP-C"}
+        seen_accounts: set[str] = set()
         for call in mock_command_bus.publish_stop_and_report_flatness.await_args_list:
             assert call.kwargs.get("reason") == "kill_switch"
+            # PR 2 T4: each STOP routes onto the process's per-account stream.
+            seen_accounts.add(call.kwargs.get("account_id"))
+        assert seen_accounts == expected_accounts
 
     async def test_kill_all_continues_when_one_publish_fails(
         self,
@@ -289,15 +324,12 @@ class TestLiveKillAll:
 
         from msai.models.live_node_process import LiveNodeProcess
 
+        # PR 2 T4: (LiveNodeProcess, account_id) 2-tuples via result.all().
         rows = [
-            LiveNodeProcess(deployment_id=uuid4(), status="running"),
-            LiveNodeProcess(deployment_id=uuid4(), status="running"),
+            (LiveNodeProcess(deployment_id=uuid4(), status="running"), "DUP-A"),
+            (LiveNodeProcess(deployment_id=uuid4(), status="running"), "DUP-B"),
         ]
-        mock_result = MagicMock()
-        mock_scalars = MagicMock()
-        mock_scalars.all.return_value = rows
-        mock_result.scalars.return_value = mock_scalars
-        mock_db.execute.return_value = mock_result
+        mock_db.execute.side_effect = _kill_all_execute_side_effect(rows)
 
         # First call raises, second succeeds. /kill-all now uses
         # publish_stop_and_report_flatness (Bug #2).

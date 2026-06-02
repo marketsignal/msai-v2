@@ -8,6 +8,7 @@ covered.
 
 from __future__ import annotations
 
+import contextlib
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -17,11 +18,13 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from msai.api.live_deps import get_command_bus
 from msai.core.auth import get_current_user
 from msai.core.database import get_db
 from msai.main import app
 from msai.models import Base, LiveDeployment, LiveNodeProcess, Strategy, User
 from msai.services.live.failure_kind import FailureKind
+from msai.services.live_command_bus import LiveCommandBus
 from tests.integration._deployment_factory import make_live_deployment
 
 if TYPE_CHECKING:
@@ -43,6 +46,16 @@ def isolated_postgres_url() -> Iterator[str]:
         yield pg.get_connection_url().replace("psycopg2", "asyncpg")
 
 
+@pytest.fixture(scope="module")
+def isolated_redis_url() -> Iterator[str]:
+    from testcontainers.redis import RedisContainer
+
+    with RedisContainer("redis:7-alpine") as container:
+        host = container.get_container_host_ip()
+        port = container.get_exposed_port(6379)
+        yield f"redis://{host}:{port}/0"
+
+
 @pytest_asyncio.fixture
 async def session_factory(
     isolated_postgres_url: str,
@@ -57,10 +70,30 @@ async def session_factory(
 
 
 @pytest_asyncio.fixture
+async def bus(isolated_redis_url: str) -> AsyncIterator[LiveCommandBus]:
+    """Real LiveCommandBus over a testcontainer Redis. PR 2 T8 added a
+    ``bus`` dependency to ``GET /live/status/{id}`` (halt-latch state), so
+    this fixture supplies a working bus instead of the lazy real-Redis
+    client the un-overridden provider would build."""
+    import redis.asyncio as aioredis
+
+    client = aioredis.from_url(isolated_redis_url, decode_responses=True)
+    with contextlib.suppress(Exception):
+        await client.flushdb()
+    try:
+        yield LiveCommandBus(redis=client, min_idle_ms=0, recovery_interval_s=60)
+    finally:
+        with contextlib.suppress(Exception):
+            await client.flushdb()
+        await client.aclose()
+
+
+@pytest_asyncio.fixture
 async def client(
     session_factory: async_sessionmaker[AsyncSession],
+    bus: LiveCommandBus,
 ) -> AsyncIterator[httpx.AsyncClient]:
-    """Test client with DB + auth dependencies overridden."""
+    """Test client with DB + auth + command-bus dependencies overridden."""
 
     async def _override_get_db() -> AsyncIterator[AsyncSession]:
         async with session_factory() as session:
@@ -69,8 +102,12 @@ async def client(
     async def _override_get_current_user() -> dict[str, Any]:
         return {"sub": "test-sub", "email": "test@example.com", "preferred_username": "test"}
 
+    async def _override_get_bus() -> LiveCommandBus:
+        return bus
+
     app.dependency_overrides[get_db] = _override_get_db
     app.dependency_overrides[get_current_user] = _override_get_current_user
+    app.dependency_overrides[get_command_bus] = _override_get_bus
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as ac:
@@ -78,6 +115,7 @@ async def client(
 
     app.dependency_overrides.pop(get_db, None)
     app.dependency_overrides.pop(get_current_user, None)
+    app.dependency_overrides.pop(get_command_bus, None)
 
 
 async def _seed_deployment_with_process(

@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from msai.models import Backtest, Base, Strategy, User
 from msai.services.nautilus.audit_hook import (
     OrderAuditWriter,
+    OrderDeniedFacts,
     OrderSubmittedFacts,
     TradeFillFacts,
     lookup_by_client_order_id,
@@ -386,6 +387,197 @@ class TestStateMachine:
         assert row.status == "denied"
         assert row.reason == "Daily loss limit reached"
         assert row.broker_order_id is None
+
+
+# ---------------------------------------------------------------------------
+# write_denied — PR 2 T2 durable node-side halt denial (UPSERT)
+# ---------------------------------------------------------------------------
+
+
+def _denied_facts(
+    *,
+    client_order_id: str,
+    strategy_id,
+    deployment_id=None,
+    backtest_id=None,
+    reason: str = "risk:halt",
+    is_live: bool = True,
+) -> OrderDeniedFacts:
+    return OrderDeniedFacts(
+        client_order_id=client_order_id,
+        deployment_id=deployment_id,
+        backtest_id=backtest_id,
+        strategy_id=strategy_id,
+        strategy_code_hash="deadbeef" * 8,
+        instrument_id="AAPL.NASDAQ",
+        side="BUY",
+        quantity=Decimal("25"),
+        price=None,
+        order_type="MARKET",
+        ts_attempted=datetime.now(UTC),
+        reason=reason,
+        is_live=is_live,
+    )
+
+
+class TestWriteDenied:
+    @pytest.mark.asyncio
+    async def test_inserts_denied_row_when_no_submitted_row_exists(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        fixtures: dict[str, object],
+    ) -> None:
+        """The node-side halt-block case: the order never submitted, so
+        NO ``submitted`` row exists. ``write_denied`` must INSERT a
+        complete ``denied`` row so the real-money denial is durable
+        (nautilus.md #10)."""
+        writer = OrderAuditWriter(db=session_factory)
+        strategy = fixtures["strategy"]
+        deployment = fixtures["deployment"]
+
+        assert await lookup_by_client_order_id(session_factory, "halt-001") is None
+
+        row_id = await writer.write_denied(
+            _denied_facts(
+                client_order_id="halt-001",
+                strategy_id=strategy.id,  # type: ignore[union-attr]
+                deployment_id=deployment.id,  # type: ignore[union-attr]
+            )
+        )
+        assert row_id is not None
+
+        row = await lookup_by_client_order_id(session_factory, "halt-001")
+        assert row is not None
+        assert row.status == "denied"
+        assert row.reason == "risk:halt"
+        assert row.deployment_id == deployment.id  # type: ignore[union-attr]
+        assert row.backtest_id is None
+        assert row.strategy_id == strategy.id  # type: ignore[union-attr]
+        assert row.strategy_code_hash == "deadbeef" * 8
+        assert row.instrument_id == "AAPL.NASDAQ"
+        assert row.side == "BUY"
+        assert row.quantity == Decimal("25")
+        assert row.order_type == "MARKET"
+        assert row.is_live is True
+        # Order never reached the broker on the halt path.
+        assert row.broker_order_id is None
+
+    @pytest.mark.asyncio
+    async def test_denial_after_submitted_row_transitions_in_place(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        fixtures: dict[str, object],
+    ) -> None:
+        """A denial AFTER a real submission must flip the SAME row to
+        ``denied`` (no duplicate) and preserve submit-time identity +
+        any broker_order_id (post-acceptance denial)."""
+        from sqlalchemy import func, select
+
+        from msai.models import OrderAttemptAudit
+
+        writer = OrderAuditWriter(db=session_factory)
+        strategy = fixtures["strategy"]
+        deployment = fixtures["deployment"]
+
+        # A prior submission inserted the row (with the real submit-time
+        # fields) and the broker acknowledged it.
+        await writer.write_submitted(
+            _facts(
+                client_order_id="post-submit-deny",
+                strategy_id=strategy.id,  # type: ignore[union-attr]
+                deployment_id=deployment.id,  # type: ignore[union-attr]
+                quantity=Decimal("10"),
+                price=Decimal("100.00"),
+            )
+        )
+        await writer.update_accepted("post-submit-deny", broker_order_id="ib-555")
+
+        # Now a denial arrives for the SAME client_order_id.
+        await writer.write_denied(
+            _denied_facts(
+                client_order_id="post-submit-deny",
+                strategy_id=strategy.id,  # type: ignore[union-attr]
+                deployment_id=deployment.id,  # type: ignore[union-attr]
+                reason="risk:halt",
+            )
+        )
+
+        row = await lookup_by_client_order_id(session_factory, "post-submit-deny")
+        assert row is not None
+        assert row.status == "denied"
+        assert row.reason == "risk:halt"
+        # Submit-time identity columns are NOT clobbered by the upsert.
+        assert row.quantity == Decimal("10")
+        assert row.price == Decimal("100.00")
+        # broker_order_id from the accepted step is preserved.
+        assert row.broker_order_id == "ib-555"
+
+        # Exactly ONE row — the client_order_id UNIQUE index drove the
+        # conflict to an UPDATE, not a duplicate INSERT.
+        async with session_factory() as session:
+            count = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(OrderAttemptAudit)
+                    .where(OrderAttemptAudit.client_order_id == "post-submit-deny")
+                )
+            ).scalar_one()
+            assert count == 1
+
+    @pytest.mark.asyncio
+    async def test_duplicate_denial_is_idempotent(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        fixtures: dict[str, object],
+    ) -> None:
+        """Two denials for the same client_order_id → one row, no error
+        (the ON CONFLICT DO UPDATE re-asserts the same denied state)."""
+        from sqlalchemy import func, select
+
+        from msai.models import OrderAttemptAudit
+
+        writer = OrderAuditWriter(db=session_factory)
+        strategy = fixtures["strategy"]
+        deployment = fixtures["deployment"]
+
+        facts = _denied_facts(
+            client_order_id="dup-deny",
+            strategy_id=strategy.id,  # type: ignore[union-attr]
+            deployment_id=deployment.id,  # type: ignore[union-attr]
+        )
+        first = await writer.write_denied(facts)
+        second = await writer.write_denied(facts)
+
+        # Both calls return a row id; they refer to the same row.
+        assert first is not None
+        assert second is not None
+
+        async with session_factory() as session:
+            count = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(OrderAttemptAudit)
+                    .where(OrderAttemptAudit.client_order_id == "dup-deny")
+                )
+            ).scalar_one()
+            assert count == 1
+
+    @pytest.mark.asyncio
+    async def test_xor_violation_both_null_raises(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        fixtures: dict[str, object],
+    ) -> None:
+        writer = OrderAuditWriter(db=session_factory)
+        strategy = fixtures["strategy"]
+
+        with pytest.raises(ValueError, match="exactly one"):
+            await writer.write_denied(
+                _denied_facts(
+                    client_order_id="den-orphan",
+                    strategy_id=strategy.id,  # type: ignore[union-attr]
+                )
+            )
 
 
 # ---------------------------------------------------------------------------

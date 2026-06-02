@@ -66,7 +66,14 @@ _IBKR_VENUE: Venue = Venue("IBKR")
 # option / fx entries are intentionally NOT enumerated here; the explicit
 # ``NotImplementedError`` below points implementers at the deferred work.
 _ASSET_CLASS_TO_DATASET: dict[AssetClass, str] = {
-    AssetClass.EQUITY: "DBEQ.BASIC",
+    # ``DBEQ.BASIC`` was DEPRECATED by Databento on 2025-01-13 and split into
+    # the individually-licensed ``EQUS.*`` datasets — a live subscription to it
+    # connects but yields ZERO instrument definitions and ZERO bars (confirmed
+    # in the 2026-06-01 real-money drill: "Timeout waiting for instruments" +
+    # no data). ``EQUS.MINI`` (Databento US Equities Mini) is the live-active,
+    # zero-license-fee consolidated top-of-book + last-sale feed covering all
+    # US listing venues, and is what historical ingestion already uses.
+    AssetClass.EQUITY: "EQUS.MINI",
     # AssetClass.FUTURES: "GLBX.MDP3",   # deferred — root vs contract symbol ambiguity
     # AssetClass.OPTION:  "OPRA.PILLAR", # deferred
     # AssetClass.FX:      TBD            # not in PR 1 scope
@@ -79,8 +86,9 @@ _ASSET_CLASS_TO_DATASET: dict[AssetClass, str] = {
 # subscriptions tagged with the correct native venue, otherwise the
 # Databento client builds ``GE.XNAS`` (wrong) and the shim's
 # ``venue_dataset_map`` keys on ``XNAS`` for non-NASDAQ instruments
-# (also wrong). All four entries point at ``DBEQ.BASIC`` per the
-# Databento BASIC bundle, but the venue suffix differs.
+# (also wrong). All four entries resolve to the ``EQUS.MINI`` dataset (the
+# live-active US Equities Mini bundle; ``DBEQ.BASIC`` was deprecated
+# 2025-01-13), but the venue suffix differs.
 #
 # Keep in sync with ``live_resolver._build_contract_spec`` equity branch
 # (``primaryExchange = definition.listing_venue``) — any listing venue
@@ -99,7 +107,7 @@ class UnsupportedListingVenueError(ValueError):
 
     Subclasses :class:`ValueError` (Codex iter 19 P2) so the
     supervisor's payload-factory error classifier in
-    ``ProcessManager.spawn()`` treats it as PERMANENT
+    ``FleetRouter.spawn()`` treats it as PERMANENT
     (``SPAWN_FAILED_PERMANENT`` — no PEL retry). ``Exception`` would
     land in the transient branch and let the supervisor retry forever.
 
@@ -145,7 +153,7 @@ async def resolve_for_databento(
 
     Returns:
         :class:`DatabentoSubscriptionTarget` with the dataset string
-        (e.g. ``"DBEQ.BASIC"``), the native symbol the data feed uses
+        (e.g. ``"EQUS.MINI"``), the native symbol the data feed uses
         (e.g. ``"AAPL"``), and the native venue (e.g. ``"XNAS"``).
 
     Raises:
@@ -364,7 +372,7 @@ def retag_inbound_bar(
         native_venue = str(original_id.venue)
         # Look up the dataset by reverse-mapping native_venue. PR 1 maps
         # all US equity listing venues (XNAS / XNYS / ARCX / XASE) to the
-        # ``DBEQ.BASIC`` dataset — same Databento BASIC bundle. Anything
+        # ``EQUS.MINI`` dataset. Anything
         # outside that set yields ``dataset=None`` in the audit metadata
         # so the gap is observable (matches the legacy behavior).
         # Codex iter 3 F2: keep this reverse lookup keyed on the SAME
@@ -373,7 +381,7 @@ def retag_inbound_bar(
         # path picks up its dataset automatically via this reverse walk.
         dataset: str | None = None
         if native_venue in _LISTING_VENUE_TO_DATABENTO_NATIVE.values():
-            # All currently-mapped US equity native venues use DBEQ.BASIC.
+            # All currently-mapped US equity native venues use EQUS.MINI.
             dataset = _ASSET_CLASS_TO_DATASET[AssetClass.EQUITY]
         audit_metadata_sink(
             {

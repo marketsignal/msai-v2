@@ -12,7 +12,7 @@ through :class:`StrategyMemberPayload`. Asserts:
 3. :class:`StrategyMemberPayload` defaults ``resolved_instruments`` to
    an empty tuple — existing construction sites are backward-compatible.
 4. An un-seeded symbol raises :class:`RegistryMissError` (which
-   ``ProcessManager`` would catch and classify — this test only
+   ``FleetRouter`` would catch and classify — this test only
    verifies the raise).
 """
 
@@ -171,7 +171,7 @@ async def test_lookup_for_live_raises_miss_for_unseeded_symbol(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """An un-seeded symbol must raise :class:`RegistryMissError` — the
-    supervisor's ``ProcessManager`` would then catch and classify to
+    supervisor's ``FleetRouter`` would then catch and classify to
     :attr:`FailureKind.REGISTRY_MISS`. This test verifies only the
     raise, not the supervisor dispatch (see unit-test for that).
     """

@@ -6,7 +6,7 @@ translated into a clean ``stop_event`` set so the loop drains
 gracefully.
 
 This module is intentionally thin — every piece of real logic lives
-in :mod:`msai.live_supervisor.main`, :mod:`process_manager`, and
+in :mod:`msai.live_supervisor.main`, :mod:`fleet_router`, and
 :mod:`heartbeat_monitor` so unit/integration tests can exercise each
 piece without standing up the full Docker stack.
 
@@ -33,7 +33,9 @@ import logging
 import os
 import signal
 import sys
-from typing import Any
+from collections.abc import Awaitable, Callable  # noqa: TC003 — runtime annotations
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 from uuid import UUID  # noqa: TC003 — used at runtime in _factory signature
 
 import redis.asyncio as aioredis
@@ -46,10 +48,17 @@ from sqlalchemy.ext.asyncio import (
 
 from msai.core.config import settings
 from msai.core.logging import setup_logging
+from msai.live_supervisor.fleet_router import FleetRouter
 from msai.live_supervisor.heartbeat_monitor import HeartbeatMonitor
-from msai.live_supervisor.main import run_forever
-from msai.live_supervisor.process_manager import ProcessManager
-from msai.models import LiveDeployment, LivePortfolioRevisionStrategy, Strategy
+from msai.live_supervisor.main import enumerate_known_accounts, run_forever
+from msai.live_supervisor.restart_policy import RestartPolicy
+from msai.models import (
+    LiveDeployment,
+    LiveNodeProcess,
+    LivePortfolioRevisionStrategy,
+    Strategy,
+)
+from msai.services.alerting import AlertService
 from msai.services.live.deployment_identity import derive_strategy_id_full
 from msai.services.live.gateway_router import GatewayRouter
 from msai.services.live_command_bus import LiveCommandBus
@@ -74,6 +83,9 @@ from msai.services.nautilus.trading_node_subprocess import (
     _trading_node_subprocess,
 )
 from msai.services.strategy_registry import compute_file_hash
+
+if TYPE_CHECKING:
+    from msai.services.fleet_alerts import FleetHealthSnapshot
 
 # Canonical strategy-side venue (per ``nautilus.md`` architectural rule #3
 # — "Pin venue names per environment"). The per-account broker fleet
@@ -110,7 +122,7 @@ def _build_production_payload_factory(
 ) -> Any:
     """Closure factory so the returned callable captures the
     session factory without needing a class wrapper. The returned
-    callable matches :data:`ProcessManager.PayloadFactory`.
+    callable matches :data:`FleetRouter.PayloadFactory`.
 
     The factory reads the ``live_deployments`` row (joined with its
     ``strategies`` row) to recover the operator-chosen strategy file,
@@ -135,7 +147,7 @@ def _build_production_payload_factory(
     enables multi-login topologies where each IB login connects to a
     dedicated gateway container.
 
-    Raises are propagated so :meth:`ProcessManager.spawn` can mark
+    Raises are propagated so :meth:`FleetRouter.spawn` can mark
     the row as ``SPAWN_FAILED_PERMANENT``.
     """
 
@@ -219,7 +231,7 @@ def _build_production_payload_factory(
             # New rule: when ``ib_login_key`` is set AND a router exists,
             # ALWAYS call ``gateway_router.resolve(...)`` (regardless of
             # ``is_multi_login``). Let ``ValueError`` propagate up to the
-            # process_manager's permanent-catch — translates to
+            # fleet_router's permanent-catch — translates to
             # ``SPAWN_FAILED_PERMANENT`` via the existing error dispatch.
             # Single-login routers still validate (good — they reject
             # typos at the boundary instead of silently picking env vars).
@@ -392,7 +404,7 @@ def _build_production_payload_factory(
                     # ``RegistryMissError`` / ``RegistryIncompleteError`` /
                     # ``UnsupportedAssetClassError`` / ``AmbiguousRegistryError``
                     # (all subclass ``LiveResolverError`` → ``ValueError``), so
-                    # ``ProcessManager``'s permanent-catch fires and dispatches
+                    # ``FleetRouter``'s permanent-catch fires and dispatches
                     # on subtype to the specific ``FailureKind``.
                     member_paper_symbols = [
                         _strip_venue_suffix(inst) for inst in member.instruments
@@ -669,6 +681,172 @@ def _build_production_payload_factory(
     return _factory
 
 
+def _build_account_refresher(
+    *,
+    gateway_router: GatewayRouter | None,
+    scan: Callable[[], Awaitable[list[str]]],
+) -> Callable[[], Awaitable[list[str]]]:
+    """Return the async refresher ``run_forever`` calls on each refresh pass
+    to re-derive the known-account set (PR 2 T4 review P1 strand fix).
+
+    Each call re-reads the static configured pool (``GatewayRouter``
+    ``accounts=`` bindings — cheap, in-memory) AND re-runs the
+    active-deployment ``scan`` (a fresh DB query) and returns their union.
+    So an account that became known AFTER boot — a deploy landed, or the
+    boot-time scan that blipped now succeeds — is picked up within one
+    refresh interval and a per-account consumer is lazily started for it.
+    The DB scan is best-effort (``scan`` swallows its own errors), so a
+    transient DB blip degrades to "static pool only" for that pass instead
+    of dropping coverage entirely.
+    """
+
+    async def _refresh() -> list[str]:
+        static_accounts = gateway_router.all_accounts() if gateway_router else []
+        active_account_ids = await scan()
+        return enumerate_known_accounts(
+            static_accounts=static_accounts,
+            active_deployment_account_ids=active_account_ids,
+        )
+
+    return _refresh
+
+
+async def _scan_active_deployment_account_ids(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> list[str]:
+    """Return the DISTINCT account_ids of active/recent live deployments.
+
+    Used at supervisor startup (PR 2 T4) to ensure a per-account command
+    consumer exists for every account that has live work, even if that
+    account isn't in the static GatewayRouter pool (e.g. a legacy
+    deployment, or a paper account created before PR 3's dynamic CRUD).
+    Best-effort: a DB error here must not block supervisor startup — the
+    static pool still covers the configured accounts.
+    """
+    try:
+        async with session_factory() as session:
+            active_statuses = ("starting", "building", "ready", "running", "stopping")
+            rows = (
+                await session.execute(
+                    select(LiveDeployment.account_id)
+                    .where(LiveDeployment.status.in_(active_statuses))
+                    .distinct()
+                )
+            ).all()
+        return [row.account_id for row in rows if row.account_id]
+    except Exception:  # noqa: BLE001 — startup discovery is best-effort
+        log.warning(
+            "active_deployment_account_scan_failed "
+            "— per-account consumers will cover only the static pool until "
+            "the next supervisor restart"
+        )
+        return []
+
+
+def _build_fleet_health_provider(
+    *,
+    bus: LiveCommandBus,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> Callable[[list[str]], Awaitable[FleetHealthSnapshot]]:
+    """Return the async snapshot builder ``run_forever``'s fleet-alert loop
+    calls each pass (PR 2 T4 review P1/P3 — wire the mandatory T9 alerts into
+    a live loop instead of leaving them dead).
+
+    The returned callable receives the supervisor's AUTHORITATIVE in-memory
+    ``consumed_accounts`` list (passed by the loop) and reads:
+
+    * ``router_heartbeat_age_s`` from the bus — drives the SPOF alert. (The
+      supervisor is alive when this builds, so the age is fresh; the SPOF
+      alert's true value is when the supervisor is DOWN and a separate watcher
+      / the next incarnation sees the stale key — see ``_fleet_alert_loop``.)
+    * the set of accounts with an ACTIVE deployment — drives the
+      account-consumer-missing alert (an active account not in
+      ``consumed_accounts`` is un-stoppable).
+    * each ``failed`` deployment whose latest node-process heartbeat is stale —
+      drives the flat-and-unmonitored alert. ``respawned_successfully`` is
+      reported ``False`` conservatively (fail-LOUD): the authoritative
+      "a live node is watching again" signal is supplied by the auto-restart
+      reaper (T6, pending). Until T6 lands, a ``failed`` + stale deployment
+      ALWAYS pages — the safe direction for a real-money flat-and-unmonitored
+      detector. T6 will refine this to clear the alert once a restart reconciles.
+
+    Best-effort: a DB error returns a minimal snapshot (heartbeat + active
+    accounts may be empty) so the loop still evaluates the SPOF/coverage
+    conditions it can; it never raises into the loop.
+    """
+    from msai.services.fleet_alerts import DeploymentHealth, FleetHealthSnapshot
+
+    active_statuses = ("starting", "building", "ready", "running", "stopping")
+
+    async def _provider(consumed_accounts: list[str]) -> FleetHealthSnapshot:
+        router_age = await bus.read_router_heartbeat_age_s()
+        accounts_with_active: list[str] = []
+        deployments: list[DeploymentHealth] = []
+        try:
+            async with session_factory() as session:
+                active_rows = (
+                    await session.execute(
+                        select(LiveDeployment.account_id)
+                        .where(LiveDeployment.status.in_(active_statuses))
+                        .distinct()
+                    )
+                ).all()
+                accounts_with_active = [r.account_id for r in active_rows if r.account_id]
+
+                # Flat-and-unmonitored candidates: deployments in ``failed``
+                # whose LATEST node-process row is stale. We read the most
+                # recent node row per failed deployment for its heartbeat age.
+                failed_deps = (
+                    await session.execute(
+                        select(LiveDeployment.id, LiveDeployment.account_id).where(
+                            LiveDeployment.status == "failed"
+                        )
+                    )
+                ).all()
+                now = datetime.now(UTC)
+                for dep_id, account_id in failed_deps:
+                    latest = (
+                        await session.execute(
+                            select(LiveNodeProcess.last_heartbeat_at)
+                            .where(LiveNodeProcess.deployment_id == dep_id)
+                            .order_by(LiveNodeProcess.started_at.desc())
+                            .limit(1)
+                        )
+                    ).scalar_one_or_none()
+                    # No node row at all → the node never reported a single
+                    # heartbeat. Represent that as ``None`` (NOT ``float('inf')``
+                    # — Codex bug: the alert formatter's ``int(inf)`` raised
+                    # OverflowError, which the fleet-alert loop caught BEFORE
+                    # sending, SILENTLY SUPPRESSING the flat-and-unmonitored
+                    # alert for exactly this never-reported case). ``None`` is
+                    # maximally stale by definition, so the detector still pages
+                    # and renders the age as "never reported".
+                    age_s: float | None = (
+                        None if latest is None else max(0.0, (now - latest).total_seconds())
+                    )
+                    deployments.append(
+                        DeploymentHealth(
+                            deployment_id=str(dep_id),
+                            account_id=account_id or "",
+                            status="failed",
+                            last_heartbeat_age_s=age_s,
+                            # Conservative until T6 supplies the real signal.
+                            respawned_successfully=False,
+                        )
+                    )
+        except Exception:  # noqa: BLE001 — alert evaluation must never crash the loop
+            log.warning("fleet_health_snapshot_build_degraded")
+
+        return FleetHealthSnapshot(
+            router_heartbeat_age_s=router_age,
+            deployments=deployments,
+            accounts_with_active_deployments=accounts_with_active,
+            consumed_accounts=consumed_accounts,
+        )
+
+    return _provider
+
+
 def _install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asyncio.Event) -> None:
     """Translate SIGTERM + SIGINT into ``stop_event.set()``.
 
@@ -690,7 +868,7 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asynci
 
 async def _async_main() -> int:
     # ``setup_logging`` configures structlog. The supervisor modules
-    # (__main__.py, main.py, process_manager.py, heartbeat_monitor.py)
+    # (__main__.py, main.py, fleet_router.py, heartbeat_monitor.py)
     # and ``live_command_bus`` all use stdlib ``logging.getLogger`` —
     # without an explicit basicConfig those INFO records are dropped
     # by stdlib's lastResort (WARNING+ only), which is exactly why
@@ -744,15 +922,63 @@ async def _async_main() -> int:
         )
 
     bus = LiveCommandBus(redis=redis_client)
-    process_manager = ProcessManager(
+    # PR 2 T6: inject the bounded auto-restart policy so the reaper +
+    # startup re-scan can halt-gated-restart crashed nodes. The policy is a
+    # pure function of the durable T1 restart-authority columns on the
+    # ``live_node_processes`` row, so the crash-loop ceiling survives a
+    # supervisor / container recreate.
+    process_manager = FleetRouter(
         db=session_factory,
         redis=redis_client,
         spawn_target=_trading_node_subprocess,
         payload_factory=_build_production_payload_factory(
             session_factory, gateway_router=gateway_router
         ),
+        restart_policy=RestartPolicy(),
     )
     heartbeat_monitor = HeartbeatMonitor(db=session_factory)
+
+    # PR 2 T4: enumerate the known accounts so the supervisor starts one
+    # per-account command consumer per account at boot. Union of (a) the
+    # static configured pool (GatewayRouter ``accounts=`` bindings) and
+    # (b) the account_ids of active/recent deployments.
+    static_accounts = gateway_router.all_accounts() if gateway_router else []
+    active_account_ids = await _scan_active_deployment_account_ids(session_factory)
+    known_accounts = enumerate_known_accounts(
+        static_accounts=static_accounts,
+        active_deployment_account_ids=active_account_ids,
+    )
+    logger.info(
+        "supervisor_known_accounts_enumerated",
+        extra={
+            "static_accounts": static_accounts,
+            "active_account_ids": active_account_ids,
+            "known_accounts": known_accounts,
+        },
+    )
+
+    # PR 2 T4 review P1 strand fix: a runtime refresher so a per-account
+    # consumer is lazily started for an account that became known AFTER boot
+    # (a deploy landed, or the boot-time DB scan that blipped now succeeds)
+    # WITHOUT a supervisor restart. Re-derives the static pool ∪ a fresh
+    # active-deployment scan on each refresh pass.
+    account_refresher = _build_account_refresher(
+        gateway_router=gateway_router,
+        scan=lambda: _scan_active_deployment_account_ids(session_factory),
+    )
+
+    # PR 2 T4 review P1/P3: wire the mandatory T9 fleet alerts into a running
+    # loop. ``AlertService`` degrades gracefully when SMTP is unconfigured
+    # (logs + records to the GET /api/v1/alerts/ history) so a bare
+    # construction is safe — same pattern as the FleetRouter / disconnect
+    # handler call sites. The provider scans the DB each pass for
+    # active-account coverage + flat-and-unmonitored candidates; the loop
+    # passes the supervisor's authoritative in-memory consumed-account set.
+    alert_service = AlertService()
+    fleet_health_provider = _build_fleet_health_provider(
+        bus=bus,
+        session_factory=session_factory,
+    )
 
     stop_event = asyncio.Event()
     _install_signal_handlers(asyncio.get_running_loop(), stop_event)
@@ -763,6 +989,10 @@ async def _async_main() -> int:
             process_manager=process_manager,
             heartbeat_monitor=heartbeat_monitor,
             stop_event=stop_event,
+            known_accounts=known_accounts,
+            account_refresher=account_refresher,
+            alert_service=alert_service,
+            fleet_health_provider=fleet_health_provider,
         )
     finally:
         await redis_client.aclose()

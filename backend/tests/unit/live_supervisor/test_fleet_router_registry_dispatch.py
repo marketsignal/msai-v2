@@ -1,12 +1,12 @@
-"""Unit test: ProcessManager.spawn() permanent-catch dispatches on
+"""Unit test: FleetRouter.spawn() permanent-catch dispatches on
 LiveResolverError subtype to the specific FailureKind.
 
-The real ``ProcessManager`` is expensive to construct in isolation
+The real ``FleetRouter`` is expensive to construct in isolation
 (it needs a session factory, Redis, spawn_target, payload_factory,
 etc). We test the dispatch logic in-place by exercising the except
 branch via a pure helper that mirrors the permanent-catch control
 flow. A final consistency check uses ``inspect.getsource`` to verify
-the real ``process_manager.py`` contains the same dispatch branches —
+the real ``fleet_router.py`` contains the same dispatch branches —
 if the helper's dispatch matches AND the real source has the
 expected branches, the real impl is also correct.
 """
@@ -29,9 +29,9 @@ from msai.services.nautilus.security_master.live_resolver import (
 
 
 def _dispatch_on_subtype(exc: BaseException) -> tuple[FailureKind, str]:
-    """Pure-function extraction of ProcessManager's permanent-catch
+    """Pure-function extraction of FleetRouter's permanent-catch
     dispatch. Ships as a test-local helper that mirrors the real logic
-    at process_manager.py's permanent-catch block."""
+    at fleet_router.py's permanent-catch block."""
     if isinstance(exc, RegistryMissError):
         kind = FailureKind.REGISTRY_MISS
     elif isinstance(exc, RegistryIncompleteError):
@@ -156,15 +156,15 @@ def test_value_error_subclass_not_resolver_maps_to_spawn_failed_permanent() -> N
     assert "something else" in reason
 
 
-def test_process_manager_real_dispatch_matches_helper() -> None:
-    """Consistency check — the real process_manager.py dispatch must
+def test_fleet_router_real_dispatch_matches_helper() -> None:
+    """Consistency check — the real fleet_router.py dispatch must
     contain the same subtype branches and use ``exc.to_error_message()``
     for resolver-class errors.
     """
     # Arrange / Act
-    from msai.live_supervisor import process_manager as pm_module
+    from msai.live_supervisor import fleet_router as fr_module
 
-    source = inspect.getsource(pm_module)
+    source = inspect.getsource(fr_module)
 
     # Assert
     assert "FailureKind.REGISTRY_MISS" in source

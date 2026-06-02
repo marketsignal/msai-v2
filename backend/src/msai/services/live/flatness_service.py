@@ -49,6 +49,7 @@ async def coalesce_or_publish_stop_with_flatness(
     member_strategy_id_fulls: list[str],
     reason: str = "user",
     idempotency_key: str | None = None,
+    account_id: str | None = None,
 ) -> tuple[str, bool]:
     """Atomic 'one publish per deployment in flight' primitive.
 
@@ -62,6 +63,13 @@ async def coalesce_or_publish_stop_with_flatness(
         2. ``SET inflight_stop:{deployment_id} <nonce> NX EX 60``.
         3. NX succeeds → publish + return (nonce, True).
         4. NX fails → GET the in-flight nonce, return (existing, False).
+
+    ``account_id`` (PR 2 T4) routes the published
+    STOP_AND_REPORT_FLATNESS command onto the deployment's per-account
+    command stream so the per-account supervisor consumer picks it up.
+    The inflight-coalescing key stays ``inflight_stop:{deployment_id}``
+    (deployment-scoped, unchanged) — only the published command's stream
+    is namespaced by account.
     """
     # Local import: keeps the observability layer out of test paths that
     # stub the bus + redis without needing the metric registry.
@@ -82,6 +90,7 @@ async def coalesce_or_publish_stop_with_flatness(
                 member_strategy_id_fulls=member_strategy_id_fulls,
                 reason=reason,
                 idempotency_key=idempotency_key,
+                account_id=account_id,
             )
         except Exception:
             # PR #65 Codex P1: SET-NX succeeded but publish failed.
@@ -111,6 +120,7 @@ async def coalesce_or_publish_stop_with_flatness(
             member_strategy_id_fulls=member_strategy_id_fulls,
             reason=reason,
             idempotency_key=idempotency_key,
+            account_id=account_id,
         )
     return existing, False
 

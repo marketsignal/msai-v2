@@ -134,6 +134,90 @@ class TestValidateStrategyFile:
 
 
 # ---------------------------------------------------------------------------
+# Tests: node-side halt-gate supported-API lint (PR 2 T2 / F6)
+# ---------------------------------------------------------------------------
+
+
+class TestSupportedSubmitApiLint:
+    """Tests for the ``_lint_supported_submit_api`` defense-in-depth check.
+
+    The runtime ``on_post_build`` MRO gate is the real guarantee; this lint
+    rejects the OBVIOUS bypasses of the gated submit API at validation time so
+    an operator gets a clear error before deploying a strategy that reaches the
+    order path via Nautilus internals.
+    """
+
+    def _make_strategies_file(self, tmp_path: Path, body: str) -> Path:
+        strategies_dir = tmp_path / "strategies"
+        strategies_dir.mkdir()
+        f = strategies_dir / "candidate.py"
+        f.write_text(body, encoding="utf-8")
+        return f
+
+    def test_clean_strategy_passes_the_lint(self, tmp_path: Path) -> None:
+        """A strategy that only uses the supported submit API is not rejected by
+        the lint (it then proceeds to import + class discovery)."""
+        from msai.services.strategy_registry import _lint_supported_submit_api
+
+        f = self._make_strategies_file(
+            tmp_path,
+            "def on_bar(self, bar):\n"
+            "    order = self.order_factory.market(...)\n"
+            "    self.submit_order(order)\n",
+        )
+        ok, msg = _lint_supported_submit_api(f)
+
+        assert ok is True
+        assert msg == ""
+
+    @pytest.mark.parametrize(
+        "forbidden",
+        ["self._msgbus", "self._manager.something", "self.send_risk_command(cmd)"],
+    )
+    def test_msgbus_manager_or_send_risk_command_is_rejected(
+        self, tmp_path: Path, forbidden: str
+    ) -> None:
+        """Each forbidden Nautilus internal that would bypass the gate is rejected
+        with a message naming the offending token."""
+        from msai.services.strategy_registry import _lint_supported_submit_api
+
+        f = self._make_strategies_file(
+            tmp_path,
+            f"def on_bar(self, bar):\n    {forbidden}\n",
+        )
+        ok, msg = _lint_supported_submit_api(f)
+
+        assert ok is False
+        assert "bypass" in msg.lower()
+
+    def test_benign_substring_does_not_false_trip(self, tmp_path: Path) -> None:
+        """A benign identifier that merely CONTAINS a forbidden token as a
+        substring (e.g. ``manager_count``) must not trip the word-boundary lint."""
+        from msai.services.strategy_registry import _lint_supported_submit_api
+
+        f = self._make_strategies_file(
+            tmp_path,
+            "manager_count = 3\nmsgbus_label = 'ok'\n",
+        )
+        ok, msg = _lint_supported_submit_api(f)
+
+        assert ok is True
+        assert msg == ""
+
+    def test_validate_strategy_file_rejects_bypass_before_import(self, tmp_path: Path) -> None:
+        """End-to-end: ``validate_strategy_file`` surfaces the lint rejection
+        (the operator sees the error before the strategy is ever imported)."""
+        f = self._make_strategies_file(
+            tmp_path,
+            "class S:\n    def on_bar(self, bar):\n        self._msgbus.publish('x', 1)\n",
+        )
+        ok, message = validate_strategy_file(f)
+
+        assert ok is False
+        assert "_msgbus" in message
+
+
+# ---------------------------------------------------------------------------
 # Tests: load_strategy_class (legacy helper retained for tests)
 # ---------------------------------------------------------------------------
 

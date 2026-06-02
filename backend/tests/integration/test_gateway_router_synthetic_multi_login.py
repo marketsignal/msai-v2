@@ -108,7 +108,7 @@ async def test_factory_multi_login_uses_router_resolved_host_port_for_marin() ->
 
     resolved = ResolvedDatabentoTargets(
         native_instrument_ids=["AAPL.XNAS"],
-        venue_dataset_map={"XNAS": "DBEQ.BASIC"},
+        venue_dataset_map={"XNAS": "EQUS.MINI"},
     )
 
     resolved_instrument = MagicMock()
@@ -174,7 +174,7 @@ async def test_factory_multi_login_uses_router_resolved_host_port_for_mslvp() ->
 
     resolved = ResolvedDatabentoTargets(
         native_instrument_ids=["AAPL.XNAS"],
-        venue_dataset_map={"XNAS": "DBEQ.BASIC"},
+        venue_dataset_map={"XNAS": "EQUS.MINI"},
     )
 
     resolved_instrument = MagicMock()

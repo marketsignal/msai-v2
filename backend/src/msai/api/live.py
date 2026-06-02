@@ -71,8 +71,7 @@ from msai.services.live.idempotency import (
     Reserved,
 )
 from msai.services.live_command_bus import (
-    LIVE_COMMAND_GROUP,
-    LIVE_COMMAND_STREAM,
+    ROUTER_HEARTBEAT_KEY,
     LiveCommandBus,  # noqa: TC001 — FastAPI Depends resolves at runtime
 )
 from msai.services.nautilus.ibg_client_id import derive_ibg_client_id
@@ -147,18 +146,17 @@ async def _account_halt_is_active(bus: LiveCommandBus, account_id: str) -> bool:
     return bool(await bus._redis.exists(account_halt_key(account_id)))  # noqa: SLF001
 
 
-# Idle window for the supervisor-alive check. The supervisor's
-# ``XREADGROUP`` uses ``BLOCK 5000ms`` (see
-# ``live_command_bus.consume``) so a live consumer's ``idle`` never
-# exceeds a few seconds. 15 s is 3× that — a consumer idle for
-# longer than this is almost certainly a crashed/stopped supervisor
-# whose group entry hasn't been cleaned up yet.
-_SUPERVISOR_MAX_IDLE_MS = 15_000
+# Max age of the supervisor's ``router_heartbeat`` before the
+# ``/start-portfolio`` 503 gate treats the supervisor as dead. The
+# supervisor stamps the heartbeat every ~5 s (``run_forever``'s
+# ``ROUTER_HEARTBEAT_PUBLISH_INTERVAL_S``); 15 s is 3× that, so a
+# brief event-loop stall doesn't false-trip the gate while a genuinely
+# crashed/stopped supervisor is detected within one poll window.
+_SUPERVISOR_MAX_HEARTBEAT_AGE_S = 15.0
 
 
 async def _supervisor_is_alive(bus: LiveCommandBus) -> bool:
-    """Return True when at least one ``live-supervisor`` consumer has
-    been active within ``_SUPERVISOR_MAX_IDLE_MS``.
+    """Return True when the supervisor's ``router_heartbeat`` is fresh.
 
     Drill 2026-04-15 P0-A: the ``live-supervisor`` service is gated
     behind the ``broker`` compose profile and therefore absent from
@@ -166,29 +164,107 @@ async def _supervisor_is_alive(bus: LiveCommandBus) -> bool:
     down, ``/api/v1/live/start`` used to publish a command, poll the
     (never-created) ``live_node_processes`` row until its 60 s
     deadline, and return 504 — a silent hang with no actionable
-    error. Checking the consumer group's liveness here lets the
-    endpoint return 503 with a clear remediation message the moment
-    an operator forgets to activate the profile or the supervisor
-    has crashed.
+    error. Gating on supervisor liveness here lets the endpoint return
+    503 with a clear remediation message the moment an operator forgets
+    to activate the profile or the supervisor has crashed.
+
+    PR 2 T4: this probe MUST read the ``router_heartbeat`` Redis key,
+    NOT the global command stream's consumer-group activity. T4 retires
+    the single global ``bus.consume()`` and fans the supervisor out into
+    per-account consumers; ``xinfo_consumers(GLOBAL_STREAM)`` would then
+    show no active consumer and this gate would 503 EVERY
+    ``/start-portfolio`` even with the supervisor up. Reading the
+    heartbeat key (which ``run_forever`` stamps every loop pass) is
+    stream-topology-independent. ``None`` age (key absent/expired) ⇒
+    fail-closed (dead).
     """
     try:
-        consumers = await bus._redis.xinfo_consumers(  # noqa: SLF001
-            LIVE_COMMAND_STREAM, LIVE_COMMAND_GROUP
-        )
+        age = await bus.read_router_heartbeat_age_s()
     except Exception as exc:  # noqa: BLE001 — any Redis error means "can't tell, assume dead"
-        # iter-4 SF P3: log with type so a programming bug (wrong
-        # stream/group name, redis-py API change) doesn't manifest as
-        # "supervisor permanently dead" with no forensic trail.
+        # iter-4 SF P3: log with type so a programming bug (wrong key
+        # name, redis-py API change) doesn't manifest as "supervisor
+        # permanently dead" with no forensic trail.
         log.warning(
             "supervisor_liveness_check_failed",
             error=str(exc),
             error_type=type(exc).__name__,
         )
         return False
-    if not consumers:
+    if age is None:
         return False
-    max_idle = _SUPERVISOR_MAX_IDLE_MS
-    return any(int(c.get("idle", max_idle + 1)) < max_idle for c in consumers)
+    return age < _SUPERVISOR_MAX_HEARTBEAT_AGE_S
+
+
+def _heartbeat_age_s(last_heartbeat_at: datetime | None) -> float | None:
+    """Return the age in seconds of *last_heartbeat_at*, or ``None`` when
+    absent. Server-side so the UI/CLI don't have to clock-compare.
+
+    A naive (tz-unaware) timestamp is treated as UTC — the column is
+    ``DateTime(timezone=True)`` so this only matters for defensive safety.
+    Clamped at 0 so a tiny clock skew never yields a negative age.
+    """
+    if last_heartbeat_at is None:
+        return None
+    ts = last_heartbeat_at
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    return max(0.0, (datetime.now(UTC) - ts).total_seconds())
+
+
+def _restart_authority_fields(
+    process: LiveNodeProcess | None,
+    *,
+    fleet_halted: bool,
+    account_halted: bool,
+) -> dict[str, Any]:
+    """Build the additive PR 2 T8 restart-authority field dict for a
+    deployment's status row, from its latest ``live_node_processes`` row
+    (may be ``None`` when the deployment never spawned a node) + the live
+    fleet/account halt-latch booleans (read from Redis by the caller).
+
+    Shared by the list (``/live/status``) and detail
+    (``/live/status/{deployment_id}``) endpoints so the two never drift —
+    UC-API-1 requires the detail GET to carry the SAME fields.
+    """
+    return {
+        "auto_restart_paused": (process.auto_restart_paused if process else None),
+        "auto_restart_pause_reason": (process.auto_restart_pause_reason if process else None),
+        "consecutive_respawn_failures": (process.consecutive_respawn_failures if process else None),
+        "last_restart_at": (process.last_restart_at if process else None),
+        "last_heartbeat_age_s": (_heartbeat_age_s(process.last_heartbeat_at) if process else None),
+        "fleet_halted": fleet_halted,
+        "account_halted": account_halted,
+    }
+
+
+async def _latest_process_by_deployment(
+    db: AsyncSession, deployment_ids: list[UUID]
+) -> dict[UUID, LiveNodeProcess]:
+    """Return the most-recent ``live_node_processes`` row per deployment.
+
+    Single query (``DISTINCT ON (deployment_id) ... ORDER BY deployment_id,
+    started_at DESC``) so the list endpoint stays O(1) queries — no N+1
+    per-deployment fetch. Deployments with no process row are simply absent
+    from the returned map (the caller maps them to ``None``).
+    """
+    if not deployment_ids:
+        return {}
+    rows = (
+        (
+            await db.execute(
+                select(LiveNodeProcess)
+                .where(LiveNodeProcess.deployment_id.in_(deployment_ids))
+                .order_by(
+                    LiveNodeProcess.deployment_id,
+                    LiveNodeProcess.started_at.desc(),
+                )
+                .distinct(LiveNodeProcess.deployment_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {p.deployment_id: p for p in rows}
 
 
 async def _poll_for_terminal(
@@ -239,6 +315,52 @@ async def _poll_for_terminal(
             return row
         await asyncio.sleep(interval_s)
     return None
+
+
+# The live_node_processes statuses that mean "a trading subprocess is alive
+# (or building toward alive) RIGHT NOW for this deployment". Matches the
+# partial unique index ``uq_live_node_processes_active_deployment`` on the
+# model so the API and the DB agree on what "active" means.
+_ACTIVE_NODE_PROCESS_STATUSES: frozenset[str] = frozenset(
+    {"starting", "building", "ready", "running", "stopping"}
+)
+
+
+async def _active_node_process_exists(db: AsyncSession, deployment_id: UUID) -> bool:
+    """Return True if an ACTIVE ``live_node_processes`` row exists for
+    ``deployment_id`` (PR 2 T4 review P1 — stranded-START flip guard).
+
+    The ``/start-portfolio`` poll-timeout flip must NOT mark a deployment
+    ``failed`` when a trading subprocess is in fact alive but slow to build /
+    reconcile (IB connect + reconciliation legitimately take time — nautilus
+    gotchas #10 / #19, and the supervisor watchdog tolerates a wedged build
+    for ``startup_hard_timeout_s`` = 1800s, far beyond the 60s API poll).
+
+    Flipping the deployment to ``failed`` while its node row is still
+    ``building`` would make that real-money node INVISIBLE to
+    ``GET /live/status?active_only=true`` AND to the production deploy gate
+    (which selects ``status IN ('starting','building','ready','running')``),
+    so a routine push-to-main deploy could recreate the supervisor/containers
+    while a real-money node is live and unaccounted-for — the exact failure
+    PR 2's binding deploy contract exists to prevent.
+
+    So the flip is allowed ONLY when this returns False (no active row → the
+    START genuinely stranded: no per-account consumer attached, nothing
+    spawned). A fresh DB read is used (the caller already rolled back inside
+    the poll loop) so we observe rows the supervisor committed from another
+    session.
+    """
+    row = (
+        await db.execute(
+            select(LiveNodeProcess.id)
+            .where(
+                LiveNodeProcess.deployment_id == deployment_id,
+                LiveNodeProcess.status.in_(_ACTIVE_NODE_PROCESS_STATUSES),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return row is not None
 
 
 def _apply_outcome(outcome: EndpointOutcome) -> JSONResponse:
@@ -808,19 +930,19 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
         if not await _supervisor_is_alive(bus):
             log.error(
                 "portfolio_start_rejected_no_supervisor",
-                extra={
-                    "stream": LIVE_COMMAND_STREAM,
-                    "group": LIVE_COMMAND_GROUP,
-                },
+                extra={"heartbeat_key": ROUTER_HEARTBEAT_KEY},
             )
             if reservation is not None:
                 await idem.release(reservation.redis_key)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=(
-                    "live-supervisor is not running. Start it with "
-                    "`docker compose -f docker-compose.dev.yml --profile broker "
-                    "up -d live-supervisor ib-gateway` and retry."
+                    "live-supervisor is not running (no fresh router heartbeat). "
+                    "Recreate the broker-profile supervisor with the current image: "
+                    "`COMPOSE_PROFILES=broker docker compose up -d live-supervisor "
+                    "ib-gateway` (use your environment's compose file, e.g. "
+                    "docker-compose.prod.yml in prod, docker-compose.dev.yml in dev), "
+                    "then retry."
                 ),
             )
 
@@ -1327,6 +1449,9 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
                     "gateway_session_key": deployment.ib_login_key,
                 },
                 idempotency_key=idempotency_key,
+                # PR 2 T4: route the START onto the per-account command
+                # stream so the per-account supervisor consumer picks it up.
+                account_id=deployment.account_id,
             )
         except Exception:
             log.exception(
@@ -1385,6 +1510,61 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
         )
 
         if row is None:
+            # Capture the PK as a plain value NOW, while ``deployment`` is still a
+            # live persistent instance. The ``db.rollback()`` below expires every
+            # attribute on the session's objects, so any later ``deployment.id``
+            # access triggers a lazy refresh — illegal in this sync context (no
+            # greenlet) and the source of a ``MissingGreenlet`` 500 that masked the
+            # honest 504 on the poll-timeout path (E2E 2026-06-01).
+            deployment_id = deployment.id
+            # PR 2 T4 review P1 — stranded-START flip guard (API side).
+            #
+            # The poll timed out (60s). TWO very different states look the
+            # same from here:
+            #
+            #   (a) The START genuinely STRANDED — no per-account consumer
+            #       attached, nothing was spawned, no live_node_processes row
+            #       exists. Safe to flip the deployment to ``failed`` so a
+            #       later XAUTOCLAIM re-delivery of this same START is
+            #       recognised as STALE by the supervisor and dropped — it
+            #       must NOT silently resurrect a node the operator (who just
+            #       got a 504) walked away from.
+            #
+            #   (b) The node is SLOW to build/reconcile — a per-account
+            #       consumer DID spawn it and its live_node_processes row is
+            #       in ``starting`` / ``building`` (IB connect + reconciliation
+            #       can run well past the 60s poll; the supervisor watchdog
+            #       tolerates ``startup_hard_timeout_s``=1800s). This is a LIVE
+            #       real-money node. Flipping the deployment to ``failed`` here
+            #       would orphan it: invisible to ``/live/status?active_only``
+            #       AND to the deploy gate, so a routine deploy could recreate
+            #       the supervisor while a real-money node is unaccounted-for.
+            #
+            # So flip ONLY in case (a). In case (b) we leave the deployment in
+            # its non-terminal status (``starting``/``building``) — fail-CLOSED:
+            # it stays gated and visible; the supervisor's startup watchdog is
+            # the authority that eventually flips a genuinely-wedged build.
+            # The operator's 504 is honest ("still building"), not a lie that
+            # hides a live node. Best-effort: a failure to read/mark here
+            # leaves the row in ``starting``; the watchdog is the backstop.
+            try:
+                await db.rollback()
+                if await _active_node_process_exists(db, deployment_id):
+                    log.warning(
+                        "start_portfolio_poll_timeout_node_still_building",
+                        deployment_id=str(deployment_id),
+                    )
+                else:
+                    fresh = await db.get(LiveDeployment, deployment_id)
+                    if fresh is not None and fresh.status in ("starting", "building", "ready"):
+                        fresh.status = "failed"
+                        fresh.last_stopped_at = datetime.now(UTC)
+                        await db.commit()
+            except Exception:  # noqa: BLE001
+                log.warning(
+                    "start_portfolio_poll_timeout_mark_failed_failed",
+                    deployment_id=str(deployment_id),
+                )
             outcome = EndpointOutcome.api_poll_timeout()
             if reservation is not None:
                 await idem.release(reservation.redis_key)
@@ -1487,8 +1667,21 @@ async def live_stop(
     row exists, returns 200 with ``status=stopped`` immediately
     (already stopped).
     """
+    # Council 2026-06-01 (LOCK-ORDER MIGRATION — deployment-FIRST): take the
+    # ``live_deployments`` row lock ``FOR UPDATE`` FIRST — BEFORE any
+    # ``live_node_processes`` ``FOR UPDATE`` below — matching the global
+    # supervisor invariant ``advisory(gateway) → live_deployments FOR UPDATE →
+    # live_node_processes FOR UPDATE``. This serialises the operator /stop
+    # intent-stamp against the supervisor's Phase-A slot reservation (which also
+    # locks this deployment row first): if /stop wins the lock, Phase-A then sees
+    # the durable ``stop_requested_at`` (OPERATOR_STOPPED suppress); if Phase-A
+    # wins, /stop blocks then sees the reserved active row and stamps it. The
+    # lock is held until the first ``db.commit()`` below (which covers BOTH the
+    # no-active-row failed-pending stamp AND the active-row stamp branch), so the
+    # node-row ``FOR UPDATE``s in those branches are always taken AFTER the
+    # deployment lock — no node→deployment edge.
     result = await db.execute(
-        select(LiveDeployment).where(LiveDeployment.id == request.deployment_id)
+        select(LiveDeployment).where(LiveDeployment.id == request.deployment_id).with_for_update()
     )
     deployment: LiveDeployment | None = result.scalar_one_or_none()
 
@@ -1513,6 +1706,104 @@ async def live_stop(
         )
     ).scalar_one_or_none()
     if active_process is None:
+        # FINDING 1 (P1) — suppress a PENDING / FUTURE auto-restart on a FAILED
+        # latest row. A plain /stop sets NO halt latch, so when the deployment's
+        # latest row has already been classified ``failed`` and is restart-
+        # ELIGIBLE, the active-row stamping below never runs (there is no active
+        # row) — and without a durable stop intent on that failed row a restart
+        # would respawn the very node the operator just stopped. Stamp
+        # ``stop_requested_at`` on that latest failed row HERE (under ``FOR
+        # UPDATE``) so BOTH restart paths honor it: the reaper-driven
+        # ``_attempt_auto_restart`` (pre/post-backoff ``_operator_stop_requested``
+        # re-check + the atomic Phase-A re-check) AND the periodic
+        # ``rescan_for_restart`` (whose candidate query gates
+        # ``stop_requested_at IS NULL``).
+        #
+        # FIX 1 (Codex P1 #1) — the prior code required ``restart_dispatched_at
+        # IS NOT NULL`` (a reaper-dispatched sentinel). That MISSED two restart-
+        # eligible shapes:
+        #   (a) a supervisor-outage-window crash the PERIODIC RESCAN will pick up
+        #       — the rescan restarts ``failed`` deployments and does NOT require
+        #       ``restart_dispatched_at``; and
+        #   (b) a restart task that GAVE UP and cleared the sentinel
+        #       (``restart_dispatched_at`` back to NULL) but whose deployment is
+        #       still ``failed`` and rescan-eligible.
+        # In both, the prior filter SKIPPED stamping → /stop returned "stopped" →
+        # the rescan later saw ``stop_requested_at IS NULL`` → auto-restarted the
+        # stopped deployment. Broaden to: stamp the LATEST row whenever it is
+        # ``failed`` AND ``stop_requested_at IS NULL`` (drop the
+        # ``restart_dispatched_at`` requirement). Stamping intent on a failed
+        # latest row that turns out NOT to be restart-eligible (e.g. a permanent
+        # SPAWN_FAILED kind the rescan excludes) is HARMLESS — the intent column
+        # is advisory and the row is never resurrected. We read the LATEST row by
+        # ``started_at`` (the SAME row the rescan + reaper classify on) so we
+        # stamp exactly the row those paths gate on.
+        #
+        # We touch ONLY the durable intent column — never the row ``status`` or
+        # ``LiveDeployment.status`` — so the failed row is NOT resurrected /
+        # re-activated; the intent just becomes visible to the restart paths (and
+        # survives a supervisor restart). Skipped when the deployment is already
+        # terminally ``stopped`` (nothing pending to suppress).
+        if deployment.status != "stopped":
+            latest_row = (
+                await db.execute(
+                    select(LiveNodeProcess)
+                    .where(LiveNodeProcess.deployment_id == deployment.id)
+                    .order_by(LiveNodeProcess.started_at.desc())
+                    .limit(1)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            failed_pending = (
+                latest_row
+                if latest_row is not None
+                and latest_row.status == "failed"
+                and latest_row.stop_requested_at is None
+                else None
+            )
+            if failed_pending is not None:
+                failed_pending.stop_requested_at = datetime.now(UTC)
+                await db.commit()
+                log.info(
+                    "live_stop_suppressed_pending_restart",
+                    deployment_id=str(deployment.id),
+                    failed_row_id=str(failed_pending.id),
+                )
+                # The durable ``stop_requested_at`` stamped above is the
+                # AUTHORITATIVE suppressor: the in-flight ``_run_restart_task``
+                # re-reads it (``_operator_stop_requested``) under ``FOR UPDATE``
+                # before every respawn — and after the backoff — and aborts
+                # (SUPPRESSED) when set. The intent survives a supervisor restart
+                # (it is on the DB row, not in supervisor memory), so the
+                # startup re-scan honors it too. There is no active row to signal
+                # here, so we do NOT publish a STOP command (the SIGTERM path is
+                # for live nodes). Immediate task cancellation happens on the
+                # regular /stop path (``FleetRouter.stop`` → ``cancel_restart_
+                # task``) where a STOP command IS consumed; in this dead-node
+                # branch the durable intent is sufficient and the task aborts at
+                # its next respawn re-check.
+            elif deployment.status in ("starting", "building", "ready", "running"):
+                # INVARIANT 1 (council 2026-06-01 follow-up — QUEUED-START GAP).
+                # No active node row AND no pending-failed row to stamp, but the
+                # deployment is still in a NON-TERMINAL PRE-ACTIVE state — a START
+                # was PUBLISHED but NOT yet consumed (Phase A never reserved a node
+                # row), OR the latest node row is a prior ``stopped``/non-failed row
+                # from an earlier lifecycle. There is no node row to carry
+                # ``stop_requested_at``, so we mark the ``LiveDeployment`` row
+                # itself operator-terminal (``status='stopped'``) under THIS ``FOR
+                # UPDATE`` lock. The supervisor's Phase-A OPERATOR-TERMINAL
+                # DEPLOYMENT GATE then aborts the queued START (initial + any
+                # redelivery + any restart_carry respawn) — never spawning a live
+                # node for an account the operator already stopped. Mirrors
+                # ``FleetRouter.stop``'s pre-active no-active-row branch.
+                deployment.status = "stopped"
+                deployment.last_stopped_at = datetime.now(UTC)
+                await db.commit()
+                log.info(
+                    "live_stop_marked_queued_start_deployment_stopped",
+                    deployment_id=str(deployment.id),
+                )
+
         # PR #65 Codex P2 round-4: if a prior /stop returned
         # FLATNESS_UNKNOWN, persist that state so a retry doesn't
         # silently 200 here. The marker key `stop_unknown:{deployment_id}`
@@ -1548,6 +1839,54 @@ async def live_stop(
     ).all()
     member_strategy_id_fulls = [row.strategy_id_full for row in member_rows]
 
+    # Durable operator-stop intent (PR 2 T6 / council #3 F5) — set
+    # SYNCHRONOUSLY at the API layer, committed under a row lock, BEFORE the
+    # STOP command is published.
+    #
+    # REAL-MONEY P1 (adversarial-safety-review): unlike /kill-all and /drain
+    # (which set their halt LATCH synchronously here so the reaper's
+    # fail-closed halt gate backstops the publish→consume gap), a plain /stop
+    # sets NO halt latch. So without this synchronous stamp there is a window:
+    # the API publishes STOP, the supervisor has not yet CONSUMED it (only
+    # ``FleetRouter.stop()`` — which runs on consume — used to set
+    # ``stop_requested_at``), and the node self-crashes (non-zero exit) in
+    # that gap. The reaper's ``_on_child_exit`` would then see
+    # ``stop_requested_at IS NULL`` → classify it as a non-operator-stop
+    # failure → AUTO-RESTART the very node the operator just stopped, letting
+    # a resurrected node submit fresh orders for a stopped account until the
+    # pending STOP is finally consumed. Stamping the durable intent here
+    # closes that gap: the reaper (which classifies under its own ``FOR
+    # UPDATE``) either reads this committed value or blocks until this commits.
+    #
+    # Mirrors the kill-all/drain in-handler synchronous-marker placement. The
+    # supervisor-side ``FleetRouter.stop()`` re-stamps ``stop_requested_at``
+    # idempotently on consume; that is harmless (it only re-writes the same
+    # intent). Scoped to the CURRENTLY-ACTIVE node rows for this deployment so
+    # a terminal/historical row is left untouched. We do NOT touch
+    # ``LiveDeployment.status`` here — only the durable per-row stop intent —
+    # so /resume / re-deploy semantics are unaffected (unlike /drain, which
+    # owns the account halt latch).
+    stop_intent_at = datetime.now(UTC)
+    active_rows_for_intent = (
+        (
+            await db.execute(
+                select(LiveNodeProcess)
+                .where(
+                    LiveNodeProcess.deployment_id == deployment.id,
+                    LiveNodeProcess.status.in_(
+                        ("starting", "building", "ready", "running", "stopping")
+                    ),
+                )
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for active_row in active_rows_for_intent:
+        active_row.stop_requested_at = stop_intent_at
+    await db.commit()
+
     # Publish STOP_AND_REPORT_FLATNESS via SET-NX coalescing — concurrent
     # /stop callers converge on the originator's nonce (Codex iter-6 P2 #1).
     stop_nonce, _is_originator = await coalesce_or_publish_stop_with_flatness(
@@ -1557,6 +1896,8 @@ async def live_stop(
         member_strategy_id_fulls=member_strategy_id_fulls,
         reason="user",
         idempotency_key=idempotency_key,
+        # PR 2 T4: STOP routes onto the deployment's per-account stream.
+        account_id=deployment.account_id,
     )
 
     # Poll for the child's STOP_REPORT (30 s deadline). Does NOT DEL —
@@ -1692,7 +2033,7 @@ async def live_kill_all(
     any NEW deployments from being launched at the API.
 
     Layer 2 — **Supervisor-side halt re-check** (Task 1.7
-    ProcessManager.spawn). The supervisor re-checks the halt
+    FleetRouter.spawn). The supervisor re-checks the halt
     flag AFTER reserving the DB slot but BEFORE
     ``process.start()``. Catches commands queued in
     ``msai:live:commands`` before the kill-all and commands
@@ -1772,21 +2113,24 @@ async def live_kill_all(
     # publish a stop command for each. Use the explicit
     # status set so a row in a terminal state ('stopped',
     # 'failed') doesn't get a useless stop command.
+    #
+    # PR 2 T4: join to ``live_deployments`` to recover each process's
+    # ``account_id`` so the STOP is published onto that account's
+    # per-account command stream (``live_node_processes`` itself carries
+    # no account_id; the deployment row does).
     active_statuses = ("starting", "building", "ready", "running")
     rows = (
-        (
-            await db.execute(
-                select(LiveNodeProcess).where(LiveNodeProcess.status.in_(active_statuses))
-            )
+        await db.execute(
+            select(LiveNodeProcess, LiveDeployment.account_id)
+            .join(LiveDeployment, LiveDeployment.id == LiveNodeProcess.deployment_id)
+            .where(LiveNodeProcess.status.in_(active_statuses))
         )
-        .scalars()
-        .all()
-    )
+    ).all()
 
     stopped = 0
     failed: list[str] = []
     flatness_nonces: dict[str, str] = {}  # deployment_id -> stop_nonce
-    for row in rows:
+    for row, row_account_id in rows:
         try:
             # Gather member strategy_id_fulls so the child reports
             # deployment-scoped flatness (Bug #2).
@@ -1805,6 +2149,8 @@ async def live_kill_all(
                 deployment_id=row.deployment_id,
                 member_strategy_id_fulls=members,
                 reason="kill_switch",
+                # PR 2 T4: route STOP onto this process's account stream.
+                account_id=row_account_id,
             )
             flatness_nonces[str(row.deployment_id)] = nonce
             stopped += 1
@@ -2052,6 +2398,8 @@ async def live_drain_account(
                 deployment_id=dep.id,
                 member_strategy_id_fulls=members,
                 reason="operator_drain",
+                # PR 2 T4: route STOP onto this account's per-account stream.
+                account_id=dep.account_id,
             )
             flatness_nonces[str(dep.id)] = nonce
             stopped.append(str(dep.id))
@@ -2127,10 +2475,20 @@ async def live_drain_account(
         # though the subprocess has exited.
         terminal_now = datetime.now(UTC)
         synced_any = False
-        for dep_uuid_str, terminal_seen in terminal_results.items():
-            if not terminal_seen:
-                continue
-            dep_row = await db.get(LiveDeployment, UUID(dep_uuid_str))
+        # INVARIANT 2 (council 2026-06-01 follow-up — DETERMINISTIC TOTAL ORDER):
+        # iterate the to-sync deployments in ascending-id order so the per-row
+        # dirty-flush UPDATE (which acquires a deployment row write lock held
+        # until commit) acquires its locks in the SAME global id order the
+        # supervisor sweeps use. A drain on account A and a stale sweep can have
+        # OVERLAPPING deployment sets (a drained account's deployment is also
+        # stale); locking in id order means they serialise rather than AB-BA
+        # deadlock. (Two drains target different account_ids → disjoint sets, but
+        # the cross-locker overlap with the sweeps makes the ordering load-bearing.)
+        terminal_dep_uuids = sorted(
+            (UUID(s) for s, seen in terminal_results.items() if seen),
+        )
+        for dep_uuid in terminal_dep_uuids:
+            dep_row = await db.get(LiveDeployment, dep_uuid)
             if dep_row is not None and dep_row.status not in ("stopped", "failed"):
                 dep_row.status = "stopped"
                 dep_row.last_stopped_at = terminal_now
@@ -2396,31 +2754,10 @@ async def live_status(
     result = await db.execute(query)
     deployments = result.scalars().all()
 
-    items = [
-        LiveDeploymentInfo(
-            id=d.id,
-            strategy_id=d.strategy_id,
-            status=d.status,
-            paper_trading=d.paper_trading,
-            # ``instruments`` column was dropped in Task 11 — data now
-            # lives on ``live_portfolio_revision_strategies``. Default
-            # to empty list for backward-compatible API response.
-            instruments=[],
-            # Map the new most-recent-run timestamps onto the existing
-            # response field names for backward compatibility. The
-            # underlying columns were renamed in v9 task 1.1b but the
-            # API contract is preserved.
-            started_at=d.last_started_at,
-            stopped_at=d.last_stopped_at,
-            # PR 1 T14 — account context for the fleet topology.
-            # ``ibg_client_id`` is deterministically re-derived from the
-            # deployment_slug via the shared helper (no DB column needed).
-            account_id=d.account_id,
-            ib_login_key=d.ib_login_key,
-            ibg_client_id=(derive_ibg_client_id(d.deployment_slug) if d.deployment_slug else None),
-        )
-        for d in deployments
-    ]
+    # PR 2 T8: fetch the latest live_node_processes row per deployment in a
+    # single query (no N+1), so each row can surface its restart-authority
+    # health (auto_restart_paused, consecutive_respawn_failures, …).
+    latest_process = await _latest_process_by_deployment(db, [d.id for d in deployments])
 
     # Read the *persistent* halt flag from Redis (the key written by
     # ``/kill-all`` and cleared by ``/resume``) rather than the
@@ -2438,11 +2775,66 @@ async def live_status(
     # crash on ``bus._redis``. Type-check before reading. False is the
     # documented test fallback (the direct-call test doesn't assert
     # ``risk_halted``; over-the-wire calls always pass a real bus).
-    risk_halted = await _halt_is_active(bus) if isinstance(bus, LiveCommandBus) else False
+    bus_resolved = isinstance(bus, LiveCommandBus)
+    risk_halted = await _halt_is_active(bus) if bus_resolved else False
+    # PR 2 T8: fleet-halt latch + router heartbeat age are fleet-wide reads
+    # done ONCE. ``risk_halted`` already reflects the fleet halt key, so
+    # reuse it for ``fleet_halted`` (same latch) without a second round-trip.
+    fleet_halted = risk_halted
+    router_heartbeat_age_s = await bus.read_router_heartbeat_age_s() if bus_resolved else None
+    # Per-account halt latch: read once per distinct account_id (a fleet may
+    # have many deployments under the same account) and reuse across rows.
+    account_halt_cache: dict[str, bool] = {}
+
+    items: list[LiveDeploymentInfo] = []
+    for d in deployments:
+        account_halted = False
+        if bus_resolved and d.account_id:
+            if d.account_id not in account_halt_cache:
+                account_halt_cache[d.account_id] = await _account_halt_is_active(bus, d.account_id)
+            account_halted = account_halt_cache[d.account_id]
+        restart_authority = _restart_authority_fields(
+            latest_process.get(d.id),
+            fleet_halted=fleet_halted,
+            account_halted=account_halted,
+        )
+        items.append(
+            LiveDeploymentInfo(
+                id=d.id,
+                strategy_id=d.strategy_id,
+                status=d.status,
+                paper_trading=d.paper_trading,
+                # ``instruments`` column was dropped in Task 11 — data now
+                # lives on ``live_portfolio_revision_strategies``. Default
+                # to empty list for backward-compatible API response.
+                instruments=[],
+                # Map the new most-recent-run timestamps onto the existing
+                # response field names for backward compatibility. The
+                # underlying columns were renamed in v9 task 1.1b but the
+                # API contract is preserved.
+                started_at=d.last_started_at,
+                stopped_at=d.last_stopped_at,
+                # PR 1 T14 — account context for the fleet topology.
+                # ``ibg_client_id`` is deterministically re-derived from the
+                # deployment_slug via the shared helper (no DB column needed).
+                account_id=d.account_id,
+                ib_login_key=d.ib_login_key,
+                ibg_client_id=(
+                    derive_ibg_client_id(d.deployment_slug) if d.deployment_slug else None
+                ),
+                # PR 2 T8 — per-account restart-authority health.
+                last_heartbeat_at=(
+                    p.last_heartbeat_at if (p := latest_process.get(d.id)) else None
+                ),
+                **restart_authority,
+            )
+        )
+
     return LiveStatusResponse(
         deployments=items,
         risk_halted=risk_halted,
         active_count=_node_manager.active_count,
+        router_heartbeat_age_s=router_heartbeat_age_s,
     )
 
 
@@ -2451,6 +2843,7 @@ async def get_live_deployment_status(
     deployment_id: UUID,
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008, ARG001
     db: AsyncSession = Depends(get_db),  # noqa: B008
+    bus: LiveCommandBus = Depends(get_command_bus),  # noqa: B008
 ) -> LiveDeploymentStatusResponse:
     """Return the current status of a single live deployment (Task 1.13).
 
@@ -2459,6 +2852,11 @@ async def get_live_deployment_status(
     the most recent ``LiveNodeProcess`` row so the caller sees both
     the stable identity (slug, trader_id, config hash) AND the live
     per-run state (pid, host, heartbeat, terminal outcome).
+
+    PR 2 T8: also surfaces the latest process row's restart-authority
+    health + the fleet/account halt-latch state (read from Redis via the
+    command bus) so the per-deployment drill-in carries the SAME
+    restart-authority view as the ``/live/status`` list (UC-API-1).
 
     Returns 404 when ``deployment_id`` is unknown. Returns 200 with
     all process fields populated when a deployment has an active or
@@ -2486,6 +2884,22 @@ async def get_live_deployment_status(
         )
     ).scalar_one_or_none()
 
+    # PR 2 T8 — halt-latch state, read live from Redis. Same DI-sentinel
+    # guard as the list endpoint: a direct-call path (no FastAPI DI) leaves
+    # ``bus`` as the ``Depends`` sentinel, in which case halts default False.
+    bus_resolved = isinstance(bus, LiveCommandBus)
+    fleet_halted = await _halt_is_active(bus) if bus_resolved else False
+    account_halted = (
+        await _account_halt_is_active(bus, deployment.account_id)
+        if (bus_resolved and deployment.account_id)
+        else False
+    )
+    restart_authority = _restart_authority_fields(
+        process,
+        fleet_halted=fleet_halted,
+        account_halted=account_halted,
+    )
+
     return LiveDeploymentStatusResponse(
         id=deployment.id,
         strategy_id=deployment.strategy_id,
@@ -2504,6 +2918,7 @@ async def get_live_deployment_status(
         exit_code=process.exit_code if process else None,
         error_message=process.error_message if process else None,
         failure_kind=process.failure_kind if process else None,
+        **restart_authority,
     )
 
 

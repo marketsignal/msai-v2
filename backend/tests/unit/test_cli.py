@@ -393,6 +393,62 @@ class TestHttpCommands:
 
 
 # ----------------------------------------------------------------------
+# live status — supervisor (router) liveness rendering (PR 2 F4)
+#
+# The router heartbeat key has a 90s TTL, but the backend treats the
+# supervisor as DEAD far earlier (the SPOF alert fires at 30s; the
+# /start-portfolio gate at 15s). The CLI must NOT print "alive (45.0s ago)"
+# for the 30-90s window — that hides an unmonitored fleet. It must warn
+# "STALE/DOWN" once the age exceeds the shared SPOF threshold.
+# ----------------------------------------------------------------------
+
+
+class TestLiveStatusRouterHealth:
+    @staticmethod
+    def _status_body(router_age: float | None) -> dict[str, Any]:
+        return {
+            "risk_halted": False,
+            "active_count": 0,
+            "router_heartbeat_age_s": router_age,
+            "deployments": [],
+        }
+
+    def test_fresh_router_age_renders_alive(self, runner: CliRunner) -> None:
+        body = self._status_body(2.0)
+        with patch("msai.cli.httpx.request", return_value=_ok_response(body)):
+            result = runner.invoke(app, ["live", "status"])
+        assert result.exit_code == 0
+        assert "alive" in result.output
+        assert "2.0s ago" in result.output
+        assert "STALE" not in result.output
+
+    def test_stale_router_age_past_threshold_renders_stale_warning(self, runner: CliRunner) -> None:
+        """A router age of 45s (> the 30s SPOF threshold but < the 90s TTL) is
+        a DEAD supervisor that the old null-only check rendered as
+        ``alive (45.0s ago)`` — hiding an unmonitored fleet. The CLI must warn
+        STALE so the operator sees the fleet is unmonitored from the shell."""
+        from msai.services.fleet_alerts import ROUTER_HEARTBEAT_SPOF_THRESHOLD_S
+
+        stale_age = ROUTER_HEARTBEAT_SPOF_THRESHOLD_S + 15.0  # 45.0s by default
+        body = self._status_body(stale_age)
+        with patch("msai.cli.httpx.request", return_value=_ok_response(body)):
+            result = runner.invoke(app, ["live", "status"])
+        assert result.exit_code == 0
+        # The headline regression: must NOT claim the supervisor is alive.
+        assert "alive" not in result.output
+        assert "STALE" in result.output
+        assert f"{stale_age:.1f}s ago" in result.output
+
+    def test_missing_router_heartbeat_renders_down(self, runner: CliRunner) -> None:
+        body = self._status_body(None)
+        with patch("msai.cli.httpx.request", return_value=_ok_response(body)):
+            result = runner.invoke(app, ["live", "status"])
+        assert result.exit_code == 0
+        assert "DOWN" in result.output
+        assert "alive" not in result.output
+
+
+# ----------------------------------------------------------------------
 # Ingest commands — direct service invocation, no HTTP
 # ----------------------------------------------------------------------
 

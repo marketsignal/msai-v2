@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
@@ -79,17 +80,55 @@ original payload plus ``original_entry_id`` / ``delivery_count`` /
 ``dlq_reason`` / ``moved_at`` diagnostic fields."""
 
 
-def command_stream_for_account(account_id: str | None) -> str:
+ROUTER_HEARTBEAT_KEY = "msai:live:router:heartbeat"
+"""Redis key holding the supervisor's most recent liveness timestamp
+(epoch seconds as a string). Published by ``run_forever`` on every loop
+pass (PR 2 T4) and read by ``_supervisor_is_alive`` (the ``/start-portfolio``
+503 gate) and by T8's ``/live/status`` ``router_heartbeat_age_s`` field.
+
+Replaces the prior global-stream consumer-group liveness probe: once T4
+retires the single global ``bus.consume()`` and fans out into per-account
+consumers, ``xinfo_consumers(GLOBAL_STREAM)`` no longer reflects supervisor
+health, so the probe migrates to this dedicated heartbeat key."""
+
+ROUTER_HEARTBEAT_TTL_S = 90
+"""TTL on the heartbeat key. Comfortably larger than the supervisor's
+publish cadence + the 30 s SPOF threshold (``fleet_alerts``) so a brief
+event-loop stall doesn't expire it, but small enough that a genuinely
+dead supervisor's key disappears rather than lingering forever."""
+
+
+CONSUMED_ACCOUNTS_KEY = "msai:live:router:consumed_accounts"
+"""Redis key holding the JSON-encoded list of account_ids the supervisor
+currently has a running per-account command consumer for (PR 2 T4).
+Published by ``run_forever`` alongside :data:`ROUTER_HEARTBEAT_KEY` so the
+liveness signal reflects CONSUMPTION coverage, not just router-loop
+aliveness. The fleet coverage alert (``fleet_alerts``) and T8's
+``/live/status`` read this to detect an active-deployment account with no
+running consumer (the silent-strand class). Shares the heartbeat TTL so a
+genuinely dead supervisor's coverage claim expires too."""
+
+
+def command_stream_for_account(account_id: str | None, *, base: str = LIVE_COMMAND_STREAM) -> str:
     """Return the per-account Redis stream name (PR 1 T7).
 
     Used by producers/consumers that want to namespace commands by
     ``account_id``. PR 1 only adds the helper; producer/consumer adoption
     is deferred to PR 2 (per-account supervisor ownership). Existing
     callers continue using the global :data:`LIVE_COMMAND_STREAM`.
+
+    ``base`` is the stream prefix to namespace under; it defaults to the
+    global :data:`LIVE_COMMAND_STREAM` but callers that operate a bus with
+    a non-default ``stream`` (e.g. :class:`LiveCommandBus(stream=...)`) MUST
+    pass ``base=self._stream`` so a published command lands on the SAME
+    stream family the bus's :meth:`consume`/:meth:`ack` read from. Codex
+    iter-19: without this, an account-less publish from a custom-stream bus
+    went to the global stream while the consumer blocked on the configured
+    one, stranding the command.
     """
     if not account_id:
-        return LIVE_COMMAND_STREAM
-    return f"{LIVE_COMMAND_STREAM}:{account_id}"
+        return base
+    return f"{base}:{account_id}"
 
 
 MAX_DELIVERY_ATTEMPTS = 5
@@ -245,18 +284,25 @@ class LiveCommandBus:
         payload: dict[str, Any],
         *,
         idempotency_key: str | None = None,
+        account_id: str | None = None,
     ) -> str:
         """Publish a start command. Returns the Redis stream entry id.
 
         ``idempotency_key`` is the HTTP ``Idempotency-Key`` header when
         the caller supplies one (so retries from the same client
         collide); otherwise a stable per-deployment default is used.
+
+        ``account_id`` (PR 2 T4) routes the command onto the per-account
+        stream :func:`command_stream_for_account`. When ``None``/empty
+        the command goes to the global :data:`LIVE_COMMAND_STREAM`
+        (legacy / single-account behaviour).
         """
         return await self._publish(
             command_type=LiveCommandType.START,
             deployment_id=deployment_id,
             payload=payload,
             idempotency_key=idempotency_key,
+            account_id=account_id,
         )
 
     async def publish_stop(
@@ -265,13 +311,19 @@ class LiveCommandBus:
         reason: str = "user",
         *,
         idempotency_key: str | None = None,
+        account_id: str | None = None,
     ) -> str:
-        """Publish a stop command. Returns the Redis stream entry id."""
+        """Publish a stop command. Returns the Redis stream entry id.
+
+        ``account_id`` (PR 2 T4) routes onto the per-account stream;
+        see :meth:`publish_start`.
+        """
         return await self._publish(
             command_type=LiveCommandType.STOP,
             deployment_id=deployment_id,
             payload={"reason": reason},
             idempotency_key=idempotency_key,
+            account_id=account_id,
         )
 
     async def publish_stop_and_report_flatness(
@@ -282,6 +334,7 @@ class LiveCommandBus:
         member_strategy_id_fulls: list[str],
         reason: str = "user",
         idempotency_key: str | None = None,
+        account_id: str | None = None,
     ) -> str:
         """Publish a STOP_AND_REPORT_FLATNESS command.
 
@@ -293,6 +346,9 @@ class LiveCommandBus:
         ``member_strategy_id_fulls`` tells the child which Nautilus
         ``StrategyId`` values to filter ``positions_open()`` by — all
         members of a portfolio, not just one.
+
+        ``account_id`` (PR 2 T4) routes onto the per-account stream;
+        see :meth:`publish_start`.
         """
         return await self._publish(
             command_type=LiveCommandType.STOP_AND_REPORT_FLATNESS,
@@ -303,7 +359,20 @@ class LiveCommandBus:
                 "member_strategy_id_fulls": member_strategy_id_fulls,
             },
             idempotency_key=idempotency_key,
+            account_id=account_id,
         )
+
+    def account_stream(self, account_id: str | None) -> str:
+        """The per-account command stream for THIS bus, namespaced under its
+        configured base (``self._stream``).
+
+        Producers (:meth:`_publish`) AND the supervisor's per-account consumer
+        MUST both derive the stream this way so publish and consume/ack agree on
+        a bus configured with a non-default ``stream`` (Codex iter-19 fixed the
+        publish side; iter-20 the consume side). For the default bus this equals
+        ``command_stream_for_account(account_id)`` — no behavior change.
+        """
+        return command_stream_for_account(account_id, base=self._stream)
 
     async def _publish(
         self,
@@ -312,7 +381,18 @@ class LiveCommandBus:
         deployment_id: UUID,
         payload: dict[str, Any],
         idempotency_key: str | None,
+        account_id: str | None = None,
     ) -> str:
+        # Resolve the target stream off THIS bus's configured base
+        # (``self._stream``), so publish stays consistent with the
+        # ``consume``/``ack`` paths (which default to ``self._stream``).
+        # When ``account_id`` is set we route onto the per-account stream
+        # (PR 2 T4); otherwise the bus's base stream (legacy single-account
+        # / tests). Codex iter-19: a custom-stream bus previously published
+        # account-less commands to the GLOBAL stream while its consumer was
+        # blocked on the configured one — stranding the command.
+        stream = self.account_stream(account_id)
+
         # Ensure the consumer group exists BEFORE xadd. Without this,
         # a command published to a fresh Redis (or a Redis where the
         # supervisor has never started) is lost: the first supervisor
@@ -321,7 +401,14 @@ class LiveCommandBus:
         # waiting command — so XREADGROUP > never sees it. Idempotent
         # (BUSYGROUP swallowed) so the per-publish cost is one Redis
         # round-trip on steady-state. Drill 2026-04-15 root cause.
-        await self.ensure_group()
+        #
+        # PR 2 T4 attach-late guarantee: this idempotent create on the
+        # PRODUCER side means a START published BEFORE the per-account
+        # consumer attaches still lands in a group whose
+        # last-delivered-id precedes the entry — Redis retains the entry,
+        # and the consumer reads it (via XREADGROUP > or the XAUTOCLAIM
+        # PEL sweep) when it attaches a beat later.
+        await self.ensure_group(stream=stream)
 
         fields: dict[str, str] = {
             "command_type": command_type.value,
@@ -334,13 +421,14 @@ class LiveCommandBus:
         for key, value in payload.items():
             fields[f"payload_{key}"] = json.dumps(value)
 
-        entry_id: str = await self._redis.xadd(self._stream, fields)  # type: ignore[arg-type]  # redis-py stubs mistype mapping values; str is accepted at runtime
+        entry_id: str = await self._redis.xadd(stream, fields)  # type: ignore[arg-type]  # redis-py stubs mistype mapping values; str is accepted at runtime
         log.info(
             "live_command_published",
             extra={
                 "entry_id": entry_id,
                 "command_type": command_type.value,
                 "deployment_id": str(deployment_id),
+                "stream": stream,
             },
         )
         return entry_id
@@ -349,17 +437,22 @@ class LiveCommandBus:
     # Group lifecycle
     # ------------------------------------------------------------------
 
-    async def ensure_group(self) -> None:
+    async def ensure_group(self, *, stream: str | None = None) -> None:
         """Idempotently create the consumer group via XGROUP CREATE MKSTREAM.
 
         ``MKSTREAM`` auto-creates the underlying stream if it doesn't
         exist yet (so the first publish doesn't race with the first
         ensure_group). ``BUSYGROUP`` is swallowed because repeated
         ``ensure_group`` calls across restarts are expected.
+
+        ``stream`` (PR 2 T4) overrides the bus's default stream so a
+        per-account stream's group can be created idempotently. Defaults
+        to the bus's configured stream when omitted.
         """
+        target = stream if stream is not None else self._stream
         try:
             await self._redis.xgroup_create(
-                name=self._stream,
+                name=target,
                 groupname=self._group,
                 id="$",
                 mkstream=True,
@@ -369,11 +462,86 @@ class LiveCommandBus:
                 raise
 
     # ------------------------------------------------------------------
+    # Router heartbeat (PR 2 T4)
+    # ------------------------------------------------------------------
+
+    async def publish_router_heartbeat(self) -> None:
+        """Stamp :data:`ROUTER_HEARTBEAT_KEY` with the current epoch
+        seconds and a bounded TTL.
+
+        Called by ``run_forever`` on every supervisor loop pass. The
+        value is the wall-clock time the supervisor was last alive;
+        :meth:`read_router_heartbeat_age_s` derives an age from it, and
+        ``_supervisor_is_alive`` / T8's ``router_heartbeat_age_s`` read
+        the same key. The TTL is the fail-closed backstop: a dead
+        supervisor's key simply expires.
+        """
+        await self._redis.set(
+            ROUTER_HEARTBEAT_KEY,
+            str(time.time()),
+            ex=ROUTER_HEARTBEAT_TTL_S,
+        )
+
+    async def read_router_heartbeat_age_s(self) -> float | None:
+        """Return the age in seconds of the last router heartbeat, or
+        ``None`` if no heartbeat is present (key absent/expired) or the
+        stored value is unparsable.
+
+        ``None`` is the fail-closed signal: callers treat a missing
+        heartbeat as "supervisor dead / unmonitored"."""
+        raw = await self._redis.get(ROUTER_HEARTBEAT_KEY)
+        if raw is None:
+            return None
+        try:
+            stamped = float(raw)
+        except (TypeError, ValueError):
+            return None
+        age = time.time() - stamped
+        # Guard against a clock skew producing a tiny negative age.
+        return max(0.0, age)
+
+    async def publish_consumed_accounts(self, account_ids: list[str]) -> None:
+        """Stamp :data:`CONSUMED_ACCOUNTS_KEY` with the JSON-encoded set of
+        account_ids the supervisor currently has a running consumer for.
+
+        Published by ``run_forever`` alongside the heartbeat so the liveness
+        signal reflects CONSUMPTION coverage, not just router-loop aliveness
+        (review P2: liveness must not be decoupled from consumption). The TTL
+        matches the heartbeat so a dead supervisor's coverage claim expires.
+        """
+        await self._redis.set(
+            CONSUMED_ACCOUNTS_KEY,
+            json.dumps(sorted(set(account_ids))),
+            ex=ROUTER_HEARTBEAT_TTL_S,
+        )
+
+    async def read_consumed_accounts(self) -> list[str] | None:
+        """Return the account_ids the supervisor has a running consumer for,
+        or ``None`` if the key is absent/expired/unparsable.
+
+        ``None`` is fail-closed: callers treat absence as "coverage unknown"
+        (a dead/just-started supervisor) rather than "everything covered"."""
+        raw = await self._redis.get(CONSUMED_ACCOUNTS_KEY)
+        if raw is None:
+            return None
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(value, list):
+            return None
+        return [str(a) for a in value]
+
+    # ------------------------------------------------------------------
     # Consume
     # ------------------------------------------------------------------
 
     async def consume(
-        self, consumer_id: str, stop_event: asyncio.Event
+        self,
+        consumer_id: str,
+        stop_event: asyncio.Event,
+        *,
+        stream: str | None = None,
     ) -> AsyncIterator[LiveCommand]:
         """Consume commands until ``stop_event`` is set.
 
@@ -390,14 +558,19 @@ class LiveCommandBus:
         Each yielded ``LiveCommand`` has an ``entry_id`` the caller
         MUST pass back to ``ack()`` after successfully handling the
         work (decision #13 — no ACK-in-finally).
+
+        ``stream`` (PR 2 T4) selects a per-account stream; the caller
+        MUST pass the SAME ``stream`` to :meth:`ack` for entries from
+        that consumer. Defaults to the bus's configured stream.
         """
-        await self.ensure_group()
+        target = stream if stream is not None else self._stream
+        await self.ensure_group(stream=target)
 
         # Phase 2: recover any entries stranded in the PEL by a previous
         # run or a peer crash. Yields them through the same interface
         # as fresh reads so the caller doesn't have to care whether an
         # entry is new or recovered.
-        async for command in self._recover_pending(consumer_id):
+        async for command in self._recover_pending(consumer_id, stream=target):
             yield command
             if stop_event.is_set():
                 return
@@ -411,7 +584,7 @@ class LiveCommandBus:
         while not stop_event.is_set():
             now = asyncio.get_event_loop().time()
             if now - last_recovery_s >= self._recovery_interval_s:
-                async for command in self._recover_pending(consumer_id):
+                async for command in self._recover_pending(consumer_id, stream=target):
                     yield command
                     if stop_event.is_set():
                         return
@@ -420,7 +593,7 @@ class LiveCommandBus:
             entries = await self._redis.xreadgroup(
                 groupname=self._group,
                 consumername=consumer_id,
-                streams={self._stream: ">"},
+                streams={target: ">"},
                 count=16,
                 block=block_ms,
             )
@@ -433,7 +606,9 @@ class LiveCommandBus:
                     if stop_event.is_set():
                         return
 
-    async def _recover_pending(self, consumer_id: str) -> AsyncIterator[LiveCommand]:
+    async def _recover_pending(
+        self, consumer_id: str, *, stream: str | None = None
+    ) -> AsyncIterator[LiveCommand]:
         """Reclaim stale entries via XAUTOCLAIM.
 
         Walks the cursor until ``XAUTOCLAIM`` returns ``"0-0"`` (the
@@ -444,11 +619,15 @@ class LiveCommandBus:
           (with diagnostic metadata) and XACK on the primary so it
           stops bouncing
         - otherwise → yield to the caller for another handler attempt
+
+        ``stream`` (PR 2 T4) targets a per-account stream; defaults to
+        the bus's configured stream.
         """
+        target = stream if stream is not None else self._stream
         cursor: str = "0-0"
         while True:
             result = await self._redis.xautoclaim(
-                name=self._stream,
+                name=target,
                 groupname=self._group,
                 consumername=consumer_id,
                 min_idle_time=self._min_idle_ms,
@@ -460,7 +639,7 @@ class LiveCommandBus:
             next_cursor, claimed, _deleted = result
             for entry_id, fields in claimed:
                 pending = await self._redis.xpending_range(
-                    name=self._stream,
+                    name=target,
                     groupname=self._group,
                     min=entry_id,
                     max=entry_id,
@@ -477,6 +656,7 @@ class LiveCommandBus:
                         fields=fields,
                         delivery_count=delivery_count,
                         reason="max_attempts",
+                        stream=target,
                     )
                     continue
                 yield LiveCommand.from_redis(entry_id, fields)
@@ -489,15 +669,20 @@ class LiveCommandBus:
     # ACK + DLQ
     # ------------------------------------------------------------------
 
-    async def ack(self, entry_id: str) -> None:
+    async def ack(self, entry_id: str, *, stream: str | None = None) -> None:
         """XACK the entry on the primary stream.
 
         Safe to call with a stale or already-ACKed entry id — Redis's
         XACK returns 0 in that case, which we don't surface. This lets
         a retry of the ACK path (e.g. after a transient network blip)
         be a no-op instead of crashing the consumer loop.
+
+        ``stream`` (PR 2 T4) MUST match the stream the entry was
+        consumed from (the per-account stream for a per-account
+        consumer). Defaults to the bus's configured stream.
         """
-        await self._redis.xack(self._stream, self._group, entry_id)
+        target = stream if stream is not None else self._stream
+        await self._redis.xack(target, self._group, entry_id)
 
     async def _move_to_dlq(
         self,
@@ -506,22 +691,29 @@ class LiveCommandBus:
         fields: dict[str, str],
         delivery_count: int,
         reason: str,
+        stream: str | None = None,
     ) -> None:
         """Copy the entry to the DLQ stream and XACK it on the primary.
 
         The DLQ entry preserves every field from the primary entry and
         tacks on diagnostic metadata so an operator can replay or
         triage without reaching into the PEL.
+
+        ``stream`` (PR 2 T4) is the source stream to XACK on (the
+        per-account stream for a per-account consumer); the DLQ stream
+        itself stays the single shared sibling stream.
         """
+        target = stream if stream is not None else self._stream
         dlq_fields: dict[str, str] = {
             **fields,
             "original_entry_id": entry_id,
             "delivery_count": str(delivery_count),
             "dlq_reason": reason,
             "moved_at": _utcnow_iso(),
+            "source_stream": target,
         }
         await self._redis.xadd(self._dlq_stream, dlq_fields)  # type: ignore[arg-type]  # redis-py stubs mistype mapping values
-        await self._redis.xack(self._stream, self._group, entry_id)
+        await self._redis.xack(target, self._group, entry_id)
         log.error(
             "live_command_moved_to_dlq",
             extra={

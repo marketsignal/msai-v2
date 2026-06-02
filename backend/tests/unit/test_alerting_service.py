@@ -628,7 +628,7 @@ class TestAlertServiceWritesHistory:
         expected_level: str,
         expected_title_fragment: str,
     ) -> None:
-        # Regression guard for existing callers (process_manager.py uses
+        # Regression guard for existing callers (fleet_router.py uses
         # alert_strategy_error; disconnect_handler.py uses alert_ib_disconnect).
         # The new kw-only level= parameter must not break these sites and
         # must carry severity through to the history record.

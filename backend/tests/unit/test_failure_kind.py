@@ -14,6 +14,7 @@ class TestFailureKindValues:
             "halt_active",
             "account_halt_active",
             "spawn_failed_permanent",
+            "node_crashed",
             "spawn_failed_transient",
             "build_timeout",
             "reconciliation_failed",
@@ -52,3 +53,54 @@ class TestParseOrUnknown:
     def test_recognized_values_round_trip(self) -> None:
         for kind in FailureKind:
             assert FailureKind.parse_or_unknown(kind.value) is kind
+
+
+class TestIsRecoverableCrash:
+    """The ONE recovery-eligibility predicate shared by the reaper +
+    rescan (PR 2 / F2). Pins the GOVERNING PRINCIPLE: re-drive ONLY a node
+    that RAN-then-crashed or an orphaned in-flight start — never a pre-spawn
+    START failure that never ran."""
+
+    def test_pre_spawn_never_ran_kinds_are_not_recoverable(self) -> None:
+        # Permanent pre-spawn config / never-ran kinds + halt-blocked starts.
+        not_recoverable = {
+            FailureKind.SPAWN_FAILED_PERMANENT,
+            FailureKind.REGISTRY_MISS,
+            FailureKind.REGISTRY_INCOMPLETE,
+            FailureKind.UNSUPPORTED_ASSET_CLASS,
+            FailureKind.AMBIGUOUS_REGISTRY,
+            FailureKind.HALT_ACTIVE,
+            FailureKind.ACCOUNT_HALT_ACTIVE,
+            FailureKind.NONE,
+            FailureKind.IN_FLIGHT,
+            FailureKind.API_POLL_TIMEOUT,
+            FailureKind.BODY_MISMATCH,
+        }
+        for kind in not_recoverable:
+            assert kind.is_recoverable_crash() is False, kind
+
+    def test_runtime_crash_kinds_are_recoverable(self) -> None:
+        recoverable = {
+            FailureKind.NODE_CRASHED,
+            FailureKind.RECONCILIATION_FAILED,
+            FailureKind.HEARTBEAT_TIMEOUT,
+            FailureKind.BUILD_TIMEOUT,
+            FailureKind.SPAWN_FAILED_TRANSIENT,
+            # NULL / unrecognised → UNKNOWN: the genuine outage-window crash
+            # presents this way; fail TOWARD recovery (ceiling brakes a loop).
+            FailureKind.UNKNOWN,
+        }
+        for kind in recoverable:
+            assert kind.is_recoverable_crash() is True, kind
+
+    def test_null_failure_kind_is_recoverable(self) -> None:
+        """A terminal ``failed`` row with a NULL ``failure_kind`` (the genuine
+        outage-window crash) parses to UNKNOWN and MUST be recoverable —
+        otherwise US-2 self-heal would silently strand a real-money account."""
+        assert FailureKind.parse_or_unknown(None).is_recoverable_crash() is True
+
+    def test_every_kind_is_partitioned(self) -> None:
+        """Every enum value is decisively recoverable XOR not — no kind is
+        left ambiguous by the predicate."""
+        for kind in FailureKind:
+            assert isinstance(kind.is_recoverable_crash(), bool)

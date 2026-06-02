@@ -349,6 +349,12 @@ services:
   live-supervisor:
     image: ${MSAI_REGISTRY}/${MSAI_BACKEND_IMAGE}:${MSAI_GIT_SHA}
     profiles: ["broker"]
+    # PR 2 T7: run a real container init (tini) as PID 1 so exited trading-node
+    # children are reaped — no zombie accumulation. Pairs with os.setsid() in the
+    # node child entrypoint (session detachment so a supervisor-group SIGTERM
+    # doesn't cascade into nodes). Honest scope: hardens node-crash reaping, NOT
+    # supervisor-process-crash survivability (the supervisor IS PID 1).
+    init: true
     command: ["python", "-m", "msai.live_supervisor"]
     volumes:
       - app_data:/app/data

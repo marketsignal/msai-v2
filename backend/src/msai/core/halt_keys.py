@@ -1,7 +1,7 @@
 """Redis halt-key namespacing for the live-trading fleet.
 
 Single source of truth — replaces three duplicate ``_HALT_KEY = "msai:risk:halt"``
-definitions across api/live.py, live_supervisor/process_manager.py, and
+definitions across api/live.py, live_supervisor/fleet_router.py, and
 services/nautilus/disconnect_handler.py.
 
 Halt-cause metadata is written as a companion key alongside the latch key so

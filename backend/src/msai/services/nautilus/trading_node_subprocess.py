@@ -1,7 +1,7 @@
 """Live trading subprocess entry point (Phase 1 task 1.8).
 
 Runs in a fresh Python interpreter under the ``mp.get_context('spawn')``
-context that :meth:`msai.live_supervisor.ProcessManager.spawn` creates.
+context that :meth:`msai.live_supervisor.FleetRouter.spawn` creates.
 Owns one Nautilus ``TradingNode`` from construction through clean
 (or unclean) shutdown.
 
@@ -66,7 +66,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, NoReturn
 from uuid import UUID  # noqa: TC003 — used at runtime for dataclass field type
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from msai.models.live_node_process import LiveNodeProcess
@@ -87,6 +87,240 @@ if TYPE_CHECKING:
 
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Node-crash child reaping (PR 2 T7) — os.setsid session detachment
+# ---------------------------------------------------------------------------
+#
+# ``multiprocessing.Process`` has NO ``preexec_fn`` (that is a
+# ``subprocess.Popen`` feature), so the session detachment must run INSIDE the
+# spawned target — as the very first executable statement of
+# :func:`_trading_node_subprocess`, before any ``nautilus_trader`` import opens
+# sockets or a signal can arrive.
+#
+# ``os.setsid()`` puts the trading-node child in its own session / process group.
+# Two payoffs:
+#   1. A SIGTERM delivered to the SUPERVISOR's process group does not cascade
+#      into the nodes (the supervisor controls each node's lifecycle explicitly
+#      via the command bus + targeted SIGTERM, never a group signal).
+#   2. When the supervisor exits, the child reparents cleanly to the container
+#      init (PID 1) instead of being orphaned to whatever inherits the group.
+#
+# This pairs with ``init: true`` on the ``live-supervisor`` compose service: tini
+# (the container PID 1) reaps the exited node children so no zombies accumulate.
+# ``os.setsid`` only detaches the session; tini does the actual reaping.
+#
+# **Honest scope:** this hardens the NODE-crash + child-reaping case. It does NOT
+# make a supervisor-PROCESS crash survivable — the supervisor IS PID 1, so its
+# crash recreates the container. That survivability is the deferred per-account-
+# container capability (see ``docs/decisions/multi-account-broker-fleet.md``).
+
+
+def _detach_session() -> None:
+    """Detach the spawned trading-node child into its own session/process group.
+
+    Called as the FIRST executable statement of :func:`_trading_node_subprocess`
+    (the ``mp.Process`` target). Idempotent + best-effort: if the child is
+    already a session leader (``os.setsid`` raises ``PermissionError`` /
+    ``OSError`` in that case) we log and continue — detachment is a hardening
+    measure, never a reason to refuse to start a live node.
+    """
+    try:
+        os.setsid()
+    except OSError as exc:
+        # Already a session/group leader (or setsid otherwise refused). The
+        # process keeps its current session; this is a no-op hardening miss,
+        # not a startup blocker.
+        log.warning("node_child_setsid_skipped", extra={"error": repr(exc)})
+
+
+# ---------------------------------------------------------------------------
+# Node-side live-halt gate enforcement + wiring (F6 — PR 2 T2, REAL-MONEY P0)
+# ---------------------------------------------------------------------------
+#
+# These two functions are module-level (not nested in the production wrapper) so
+# the mandatory-base-class enforcement and the halt-refresh wiring are directly
+# unit-testable without standing up a subprocess. They are invoked from the
+# live ``on_post_build`` hook (``_wire_market_hours``), AFTER ``node.build()``
+# (strategy CLASSES don't exist before build) but BEFORE ``node.run_async()``.
+
+_GATED_SUBMIT_METHODS = ("submit_order", "submit_order_list", "modify_order")
+"""The public submit API the halt gate covers. ``RiskAwareStrategy`` must be the
+FIRST MRO owner of each so its gated override is the effective implementation."""
+
+HALT_REFRESH_INTERVAL_S: float = 1.0
+"""Background halt-cache refresh cadence (``≤1s`` — comfortably under the mixin's
+``HALT_CACHE_MAX_AGE_S=2.0`` staleness ceiling)."""
+
+
+def enforce_halt_gate_mro(strategies: list[Any]) -> None:
+    """Reject any live strategy that is not halt-gated (F6 — fail-closed).
+
+    For EACH strategy, require:
+
+    1. ``isinstance(strategy, RiskAwareStrategy)`` — the mixin is present; AND
+    2. for EACH gated submit method, the FIRST class in ``type(strategy).__mro__``
+       whose ``__dict__`` contains that name is ``RiskAwareStrategy`` — i.e. the
+       gated override actually WINS the MRO.
+
+    ``isinstance`` ALONE is insufficient: ``class S(Strategy, RiskAwareStrategy)``
+    (mixin LAST) passes ``isinstance`` but resolves ``self.submit_order`` to
+    Nautilus's un-gated ``Strategy.submit_order``. And the weaker
+    ``is not Strategy.submit_order`` identity check would accept a subclass that
+    RE-OVERRIDES ``submit_order`` with its own un-gated impl. "First MRO owner is
+    ``RiskAwareStrategy``" rejects BOTH.
+
+    Raises a plain ``RuntimeError`` on any violation — the subprocess run loop's
+    catch-all maps it to ``FailureKind.SPAWN_FAILED_PERMANENT`` and the node never
+    reaches ``run_async()`` (a non-halt-aware live strategy never trades). We use
+    an explicit ``raise`` (NOT ``assert`` — ``python -O`` strips asserts).
+    """
+    from msai.services.nautilus.risk import RiskAwareStrategy
+
+    for strategy in strategies:
+        cls = type(strategy)
+        if not isinstance(strategy, RiskAwareStrategy):
+            raise RuntimeError(
+                f"live strategy {cls.__module__}.{cls.__qualname__} is not a "
+                "RiskAwareStrategy — the node-side halt gate is mandatory for live "
+                "trading. Declare it as `class X(RiskAwareStrategy, Strategy)` "
+                "(mixin FIRST). SPAWN_FAILED_PERMANENT."
+            )
+        for method_name in _GATED_SUBMIT_METHODS:
+            first_owner = next(
+                (c for c in cls.__mro__ if method_name in c.__dict__),
+                None,
+            )
+            if first_owner is not RiskAwareStrategy:
+                raise RuntimeError(
+                    f"live strategy {cls.__module__}.{cls.__qualname__} does not let "
+                    f"RiskAwareStrategy own '{method_name}' (first MRO owner is "
+                    f"{first_owner.__qualname__ if first_owner else None}). The halt "
+                    "gate must be the EFFECTIVE implementation: put RiskAwareStrategy "
+                    "FIRST in the base-class tuple and do NOT re-override the submit "
+                    "methods. SPAWN_FAILED_PERMANENT."
+                )
+
+
+async def _read_halt_value(redis_client: Any, account_id: str) -> bool:
+    """Return True iff the fleet OR the account halt latch is set.
+
+    Reads ``fleet_halt_key()`` and ``account_halt_key(account_id)`` directly so
+    the node-side gate is router-independent (it survives a supervisor outage).
+    A non-empty value at EITHER key means halted.
+    """
+    from msai.core.halt_keys import account_halt_key, fleet_halt_key
+
+    fleet = await redis_client.get(fleet_halt_key())
+    if fleet:
+        return True
+    if account_id:
+        account = await redis_client.get(account_halt_key(account_id))
+        if account:
+            return True
+    return False
+
+
+async def wire_halt_refresh(
+    *,
+    strategies: list[Any],
+    redis_client: Any,
+    account_id: str,
+    interval_s: float = HALT_REFRESH_INTERVAL_S,
+    audit_writer: Any | None = None,
+    denial_contexts: dict[str, Any] | None = None,
+) -> asyncio.Task[None]:
+    """Arm the live halt gate on every ``RiskAwareStrategy`` + start the
+    background halt-cache refresh task. Returns the task handle so the caller
+    cancels it on shutdown.
+
+    **FAIL-CLOSED arming order (P1 — the precise F6 hole).** The gate is armed
+    and the background recovery task is created BEFORE the immediate refresh is
+    attempted. The immediate refresh — which opens a fresh Redis client on the
+    critical build window — can raise (connection-refused / timeout / DNS blip).
+    If we armed AFTER the refresh, that error would leave the gate disarmed for
+    the node's ENTIRE lifetime → ``_gate_allows`` takes the inert branch →
+    admits ALL opening orders with ZERO node-side halt enforcement — exactly the
+    supervisor-independent hole F6 exists to defend. So we arm FIRST: an armed
+    gate with a ``None`` cache fails CLOSED (blocks opening orders, allows
+    flatten), and the background task recovers the cache when Redis returns. The
+    immediate refresh is then best-effort (it only closes the cold-start window
+    where a healthy node would briefly false-block its first opening order).
+
+    The ``audit_writer`` (an :class:`OrderAuditWriter`) is injected onto each
+    gated strategy's ``_audit`` slot here so node-side halt-denial audit is
+    functional in prod: a BLOCKED order returns BEFORE ``super().submit_order``,
+    so NO order event ever fires on the engine msgbus — the strategy's own audit
+    write is the ONLY path to record a node-side denial. ``denial_contexts`` maps
+    ``str(strategy.id)`` → :class:`DenialContext` (per-run identity) so that write
+    is a COMPLETE ``denied`` row via ``OrderAuditWriter.write_denied`` (idempotent
+    UPSERT — durable even when no ``submitted`` row exists; PR 2 T2). The audit
+    remains best-effort (a missing/raising ``_audit`` still BLOCKS — see
+    :meth:`RiskAwareStrategy._record_denial`).
+
+    The background task re-reads the fleet+account latches every ``interval_s``
+    and stamps ``monotonic()`` so the synchronous gate can detect staleness.
+
+    Arming the gate is LIVE-ONLY — backtests never reach this hook, so they stay
+    inert (their ``_halt_gate_armed`` keeps the ``False`` class default).
+    """
+    from msai.services.nautilus.risk import RiskAwareStrategy
+
+    gated = [s for s in strategies if isinstance(s, RiskAwareStrategy)]
+
+    async def _read() -> bool:
+        return await _read_halt_value(redis_client, account_id)
+
+    # --- Arm the gate + inject the audit writer FIRST (fail-closed). An armed
+    # gate with a None cache blocks opening orders, so a Redis blip during the
+    # immediate refresh below CANNOT silently disarm the node.
+    #
+    # ``denial_contexts`` maps ``str(strategy.id)`` (== the member's
+    # ``strategy_id_full``) → :class:`DenialContext` so a node-side halt block
+    # can write a COMPLETE ``denied`` audit row (PR 2 T2). A strategy with no
+    # matching context keeps ``_denial_context = None`` and falls back to the
+    # UPDATE-only ``update_denied`` (best-effort; never fabricates identity).
+    _contexts = denial_contexts or {}
+    for strategy in gated:
+        if audit_writer is not None:
+            strategy._audit = audit_writer  # noqa: SLF001
+        ctx = _contexts.get(str(getattr(strategy, "id", "")))
+        if ctx is not None:
+            strategy._denial_context = ctx  # noqa: SLF001
+        strategy._halt_gate_armed = True  # noqa: SLF001
+
+    async def _refresh_loop() -> None:
+        while True:
+            await asyncio.sleep(interval_s)
+            try:
+                for strategy in gated:
+                    await strategy.refresh_halt_cache(_read)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — a Redis blip must not kill the loop
+                # Leave the cache untouched → it ages out → the gate fails closed.
+                log.warning("halt_cache_refresh_failed")
+
+    # --- Create the background recovery task UNCONDITIONALLY (before the
+    # immediate refresh) so a refresh error can't skip it.
+    task = asyncio.create_task(_refresh_loop(), name=f"halt_refresh-{account_id}")
+
+    # --- Best-effort immediate refresh: closes the cold-start window on a
+    # healthy node. On error the gate stays armed with a None/stale cache (fails
+    # CLOSED) and the background task above recovers when Redis returns.
+    for strategy in gated:
+        try:
+            await strategy.refresh_halt_cache(_read)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "halt_cache_immediate_refresh_failed_gate_armed_fail_closed",
+                extra={"account_id": account_id},
+            )
+
+    return task
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +461,7 @@ class TradingNodePayload:
 
     venue_dataset_map: dict[str, str] = field(default_factory=dict)
     """Authoritative ``native_venue → dataset`` map (e.g.
-    ``{"XNAS": "DBEQ.BASIC"}``). Output of T10's
+    ``{"XNAS": "EQUS.MINI"}``). Output of T10's
     :func:`resolve_databento_targets`."""
 
     canonical_to_native_bar_types: dict[str, str] = field(default_factory=dict)
@@ -333,12 +567,145 @@ async def _mark_ready(session_factory: async_sessionmaker[AsyncSession], row_id:
 
 
 async def _mark_running(session_factory: async_sessionmaker[AsyncSession], row_id: UUID) -> None:
-    await _update_row(
-        session_factory,
-        row_id,
-        status="running",
-        last_heartbeat_at=datetime.now(UTC),
-    )
+    """Write the node's ``running`` row state AND forward-sync the parent
+    ``live_deployments.status`` to ``running``.
+
+    PR 2 T4 review P1: the ``/start-portfolio`` API poll only waits 60s, but a
+    slow IB connect/reconcile can push the node's ``running`` transition past
+    that window. When that happens the API leaves the deployment in its
+    non-terminal ``starting`` / ``building`` status (it no longer flips it to
+    ``failed`` — that would orphan a real-money node). But absent this
+    forward-sync the node ONLY ever wrote terminal statuses to the deployment
+    row, so the deployment would linger at ``starting`` forever even though a
+    live node is trading. Forward-syncing here means the logical deployment
+    view eventually reflects ``running`` with no operator retry required.
+
+    The non-terminal guard (``starting`` / ``building`` / ``ready``) makes this
+    a no-op once a concurrent ``/live/stop`` / kill-all has already moved the
+    deployment to ``stopping`` / ``stopped`` / ``failed`` — we never resurrect
+    a deployment the operator is tearing down.
+
+    **Lost-update lock (prior-review P2).** The guard is only sound if the
+    read-check-write of ``deployment.status`` is serialized against a
+    concurrent ``/stop`` / ``/kill-all`` transaction. Without a row lock,
+    under READ COMMITTED this transaction could read ``building`` on an
+    unlocked snapshot, then have its UPDATE block on the row lock the
+    concurrent stop's UPDATE holds, and finally OVERWRITE ``stopped`` /
+    ``stopping`` back to ``running`` after the stop commits. We therefore
+    fetch the ``LiveDeployment`` row ``FOR UPDATE`` (``with_for_update``) so
+    the conditional is evaluated against the value seen UNDER the lock: if a
+    concurrent stop committed first, our ``FOR UPDATE`` fetch blocks until it
+    releases, then re-reads the terminal/``stopping`` status and the guard
+    skips the write. The node-process row is locked the same way so the two
+    writes stay in one consistent critical section.
+
+    **Council 2026-06-01 (LOCK-ORDER MIGRATION — deployment-FIRST).** This is
+    the SOLE subprocess writer that locks BOTH rows. The lock order is
+    ``LiveDeployment FOR UPDATE`` FIRST, THEN ``LiveNodeProcess FOR UPDATE`` —
+    matching the global supervisor invariant ``advisory(gateway) →
+    live_deployments FOR UPDATE → live_node_processes FOR UPDATE``. The prior
+    order locked the node row FIRST then the deployment (a node→deployment edge),
+    which could cycle with the operator-/stop + give-up + Phase-A paths (all
+    deployment-first) and deadlock the real-money stop path. Re-ordering does NOT
+    weaken the lost-update guard: the deployment row is still evaluated UNDER its
+    lock; we simply acquire it before the node row.
+    """
+    from msai.models.live_deployment import LiveDeployment
+
+    now = datetime.now(UTC)
+    async with session_factory() as session, session.begin():
+        # Deployment FOR UPDATE FIRST (council 2026-06-01 lock-order invariant),
+        # then the owned node row. We need the deployment_id to lock the parent,
+        # which lives on the node row — so resolve it with a plain (unlocked)
+        # read of just that column, then take the deployment lock, then the node
+        # lock. The plain id read acquires NO row lock, so it adds no edge.
+        deployment_id = (
+            await session.execute(
+                select(LiveNodeProcess.deployment_id).where(LiveNodeProcess.id == row_id)
+            )
+        ).scalar_one_or_none()
+        if deployment_id is None:
+            return
+        # FOR UPDATE so the status guard below races correctly with a concurrent
+        # /stop or /kill-all UPDATE on the same deployment row — acquired FIRST.
+        deployment = await session.get(LiveDeployment, deployment_id, with_for_update=True)
+
+        process_row = await session.get(LiveNodeProcess, row_id, with_for_update=True)
+        if process_row is None:
+            return
+
+        # PR 2 / Codex iter-28 P1 — preserve operator-stop intent across the
+        # startup→running self-promotion. ``_mark_running`` is the CHILD's
+        # self-write of "running" once it reaches ``is_running`` (legitimately
+        # called while the row is in any pre-running active state:
+        # ``starting`` → ``building`` → ``ready`` → ``running``). If an operator
+        # ``/stop`` (or ``/kill-all``) raced with startup and already moved this
+        # row into a stop/terminal state — stamping ``stop_requested_at`` and/or
+        # flipping ``status`` to ``stopping``/``stopped``/``failed`` — promoting
+        # it back to "running" here would ERASE that durable stop intent and, in
+        # the no-pid / supervisor-restart windows, leave a STOPPED account
+        # looking active until a later terminal write. The ``FOR UPDATE``
+        # acquired above serializes against the ``/stop`` writer's own row lock,
+        # so a stop that committed first is visible here. Leave the row exactly
+        # as the stop path left it (that path + the reaper terminalize it and
+        # suppress auto-restart) and SKIP the deployment promotion below too, so
+        # ``/live/status`` keeps showing the operator's stop rather than a
+        # resurrection. ``record_success`` is also skipped — a node being torn
+        # down did not "restart healthily". We enumerate the stop/terminal
+        # statuses (NOT a promotable allow-list) so a new pre-running state can
+        # never be silently excluded from a healthy promotion.
+        if process_row.stop_requested_at is not None or process_row.status in (
+            "stopping",
+            "stopped",
+            "failed",
+        ):
+            log.info(
+                "mark_running_skipped_stop_intent_present",
+                extra={
+                    "row_id": str(row_id),
+                    "deployment_id": str(deployment_id),
+                    "status": process_row.status,
+                    "stop_requested": process_row.stop_requested_at is not None,
+                },
+            )
+            return
+
+        process_row.status = "running"
+        process_row.last_heartbeat_at = now
+
+        # PR 2 T6 — healthy-reconcile RESET of the auto-restart authority.
+        #
+        # ``wait_until_ready`` (gotcha #10: reconciliation verified via
+        # ``kernel.trader.is_running``) has just succeeded, so this node
+        # reached ``is_running`` AND reconciled. That is exactly the
+        # "successful restart" signal :meth:`RestartPolicy.record_success`
+        # is defined for: clear the consecutive-failure streak + the pause
+        # latch so a node that crashes, restarts, runs healthily, then later
+        # suffers an INDEPENDENT transient crash starts a FRESH rolling
+        # window rather than accumulating across every successful restart
+        # toward the ceiling (prior-review P1: ``record_success`` was dead
+        # code — the only reset path was the 30-min window in
+        # ``record_failure``; this is the production call site that wires
+        # the documented "healthy reconcile resets the streak" contract).
+        #
+        # Call the policy's mutator (single source of the reset semantics)
+        # rather than duplicating its field writes inline. The counters live
+        # on the per-spawn row but are CARRIED FORWARD across respawn
+        # generations by Phase A (see ``FleetRouter._phase_a_reserve_slot``
+        # ``restart_carry``), so resetting them here on the live row is the
+        # authoritative "streak ended healthily" mutation.
+        from msai.live_supervisor.restart_policy import RestartPolicy
+
+        RestartPolicy().record_success(process_row)
+
+        # The deployment row was already locked FOR UPDATE at the TOP of this
+        # transaction (council 2026-06-01 deployment-first invariant). Evaluate
+        # the lost-update guard against that locked value: a concurrent /stop /
+        # /kill-all that committed first is already visible here, so we never
+        # resurrect a deployment the operator is tearing down.
+        if deployment is not None and deployment.status in ("starting", "building", "ready"):
+            deployment.status = "running"
+            deployment.last_stopped_at = None
 
 
 async def _mark_terminal(
@@ -361,17 +728,66 @@ async def _mark_terminal(
     (which only covered the spawn-failure path in ``_mark_failed``)
     to also cover the normal-stop path that terminates through this
     function.
-    """
-    # LiveNodeProcess terminal write (always runs first so the process
-    # row state is authoritative even if the deployment sync below
-    # fails for some reason).
 
+    **Council 2026-06-01 — Finding 1 (P0 DEADLOCK FIX): deployment-FIRST.**
+    The prior implementation used a plain ``session.get`` on the node row
+    THEN the deployment row, with NO row locks. That was WRONGLY exempted
+    from the lock-order invariant: a dirty-flush ORM UPDATE still acquires a
+    row-level WRITE lock held until commit, and SQLAlchemy's unit-of-work
+    flushes UPDATEs in the order objects became dirty (it does NOT reorder by
+    FK for UPDATEs) — so writing the node row before the deployment row was a
+    ``live_node_processes → live_deployments`` lock-acquisition edge. Run
+    concurrently with the operator-``/stop`` deployment-first path that edge
+    closes a D→N→D cycle and DEADLOCKS the real-money stop path (a reviewer
+    reproduced it 15/15 rounds on Postgres). We now acquire the
+    ``LiveDeployment`` row lock ``FOR UPDATE`` FIRST, then the ``LiveNodeProcess``
+    row ``FOR UPDATE`` — matching the global invariant ``advisory(gateway) →
+    live_deployments FOR UPDATE → live_node_processes FOR UPDATE`` and mirroring
+    the already-correct :func:`_mark_running`. The deployment_id lives on the
+    node row, so we resolve it with a PLAIN (unlocked) column read first (that
+    read acquires no row lock, so it adds no edge), then take the two locks
+    deployment-first.
+
+    **"Terminal write LAST" is preserved.** That contract (see the caller's
+    shutdown sequence: dispose → heartbeat-stop → terminal DB write) is about
+    WRITE ORDERING — which row's status commits last, and at which point in the
+    subprocess teardown the row leaves the active set — NOT about
+    lock-acquisition order WITHIN this transaction. We still write the node
+    status (the active-set-releasing write) here at the end of the subprocess's
+    teardown, and the whole transaction commits atomically; acquiring the
+    deployment lock first inside this single transaction does not change WHEN the
+    node status becomes visible. The slot-release ordering therefore holds.
+    """
     from msai.models.live_deployment import LiveDeployment
 
     async with session_factory() as session, session.begin():
-        process_row = await session.get(LiveNodeProcess, row_id)
+        # Deployment FOR UPDATE FIRST (council 2026-06-01 deployment-first
+        # invariant), then the owned node row. The deployment_id lives on the
+        # node row, so resolve it with a PLAIN (unlocked) column read — that read
+        # acquires NO row lock, so it adds no edge — then take the deployment lock
+        # before the node lock.
+        deployment_id = (
+            await session.execute(
+                select(LiveNodeProcess.deployment_id).where(LiveNodeProcess.id == row_id)
+            )
+        ).scalar_one_or_none()
+        # FOR UPDATE FIRST so the non-terminal status guard below races correctly
+        # with a concurrent ``/live/stop`` / ``/kill-all`` UPDATE on the same
+        # deployment row, and so the global lock order stays deployment→node.
+        deployment = (
+            await session.get(LiveDeployment, deployment_id, with_for_update=True)
+            if deployment_id is not None
+            else None
+        )
+
+        process_row = await session.get(LiveNodeProcess, row_id, with_for_update=True)
         if process_row is None:
             return
+
+        # LiveNodeProcess terminal write. This is the active-set-releasing write
+        # ("Terminal write LAST" — see docstring); the node lock is held under the
+        # deployment lock taken above, so the lock-acquisition order is
+        # deployment→node even though we WRITE the node row here.
         process_row.status = status
         process_row.failure_kind = failure_kind.value
         process_row.error_message = error_message
@@ -384,8 +800,9 @@ async def _mark_terminal(
         # The non-terminal guard lets a concurrent ``/live/stop`` that
         # already set ``stopped`` take precedence over a subsequent
         # ``failed``-path terminal write (e.g., if SIGTERM arrived but
-        # the subprocess then crashed during teardown).
-        deployment = await session.get(LiveDeployment, process_row.deployment_id)
+        # the subprocess then crashed during teardown). Evaluated UNDER the
+        # deployment lock taken at the top, so a concurrent stop that committed
+        # first is already visible here.
         if deployment is not None and deployment.status in (
             "starting",
             "building",
@@ -959,7 +1376,14 @@ async def run_subprocess_async(
                 },
             )
             terminal_status = "failed"
-            terminal_failure_kind = FailureKind.SPAWN_FAILED_PERMANENT
+            # PR 2 / F2: this except fires only AFTER ``_mark_running`` above —
+            # the node REACHED ``running`` and then ``node.run_async()`` raised.
+            # That is a genuine RUNTIME crash the crash-recovery reaper / rescan
+            # SHOULD re-drive (bounded by the RestartPolicy ceiling), so write
+            # the recoverable NODE_CRASHED kind — NOT SPAWN_FAILED_PERMANENT,
+            # which is reserved for pre-spawn / never-ran permanent failures
+            # the recovery paths must leave for an operator START.
+            terminal_failure_kind = FailureKind.NODE_CRASHED
             terminal_error = tb
             terminal_exit_code = 1
             return terminal_exit_code
@@ -1296,10 +1720,23 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
     mp ignores the return value and the child exits 0 regardless.
     Without this, a handled failure whose terminal DB write missed
     (e.g. a transient DB blip inside the finally block) would reach
-    ``ProcessManager.reap_once()`` with ``exitcode == 0`` and get
+    ``FleetRouter.reap_once()`` with ``exitcode == 0`` and get
     misclassified as a clean ``stopped`` instead of the actual
     failure_kind we intended to write.
+
+    **Node-crash child reaping (PR 2 T7).** The FIRST executable statement is
+    :func:`_detach_session` — ``os.setsid()`` puts this child in its own session
+    so a SIGTERM to the supervisor's process group never cascades into the node,
+    and the child reparents cleanly to the container init (tini, via
+    ``init: true``) on supervisor exit. ``mp.Process`` has no ``preexec_fn``, so
+    this lives inside the target rather than as a spawn kwarg; it MUST stay first
+    so it runs before any ``nautilus_trader`` import opens sockets or a signal
+    arrives.
     """
+    # PR 2 T7: detach into own session BEFORE anything else (no preexec_fn on
+    # mp.Process — must be the first statement of the child entrypoint).
+    _detach_session()
+
     # Gotcha #1 + #18
     asyncio.set_event_loop_policy(None)
 
@@ -1403,11 +1840,104 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
     def _capture_node(n: Any) -> None:
         node_box.append(n)
 
+    # Halt-gate cleanup box (F6 — PR 2 T2): the live ``on_post_build`` hook
+    # below starts a background halt-refresh task + opens a Redis client. They
+    # are cancelled/closed by ``_async_cleanup`` (which runs INSIDE the
+    # asyncio.run loop, so the Redis pool tears down on its own loop).
+    halt_refresh_box: dict[str, Any] = {"task": None, "redis": None}
+
     async def _wire_market_hours(
         node: Any, p: TradingNodePayload, sf: async_sessionmaker[AsyncSession]
     ) -> None:
-        """Post-build hook: construct MarketHoursService inside the
-        subprocess and inject it into any RiskAwareStrategy."""
+        """Post-build hook (LIVE only — backtests have no such hook):
+
+        1. ENFORCE the mandatory node-side halt gate (F6, REAL-MONEY P0): every
+           live strategy MUST be a properly-ordered ``RiskAwareStrategy``, else
+           raise → ``SPAWN_FAILED_PERMANENT`` BEFORE ``node.run_async()``.
+        2. CONSTRUCT the OrderAuditWriter (used both for the node-side
+           halt-denial audit injected onto each strategy AND for the
+           engine-level msgbus hook).
+        3. ARM the gate + inject the audit writer + start the background
+           halt-refresh task (the one mandatory new collaborator), with an
+           immediate awaited refresh so the cache is populated before the first
+           bar. Arm-failure is LOUD + fail-closed (raise → SPAWN_FAILED_PERMANENT).
+        4. Inject the MarketHoursService + engine-level audit hook.
+        """
+        # --- (1) Fail-closed enforcement FIRST. A non-halt-aware live strategy
+        # never trades — raise BEFORE any further wiring or run_async(). The run
+        # loop's catch-all maps this to FailureKind.SPAWN_FAILED_PERMANENT.
+        enforce_halt_gate_mro(list(node.trader.strategies()))
+
+        # --- (2) Construct the OrderAuditWriter OUTSIDE the swallowed best-effort
+        # block below so an injection failure is visible, not silent. It is
+        # injected onto each gated strategy's ``_audit`` (the ONLY path to record
+        # a node-side halt denial — a BLOCKED order returns before
+        # ``super().submit_order`` so no engine order event ever fires) AND reused
+        # by the engine-level msgbus hook in step (4).
+        from msai.services.nautilus.audit_hook import OrderAuditWriter
+
+        writer = OrderAuditWriter(db=sf)  # keyword-only init (Codex fix)
+
+        # --- (3) Arm the halt gate + inject the audit writer + start the refresh
+        # task. Pass the ib_account_id (the DU…/U… latch id, per halt_keys) — NOT
+        # ib_login_key. wire_halt_refresh arms FIRST + creates the recovery task
+        # UNCONDITIONALLY, so a Redis blip during the immediate refresh fails
+        # CLOSED (None cache → blocks opening orders) rather than disarming the
+        # node. The ONLY way the gate ends up unarmed is a hard failure BEFORE
+        # arming (e.g. Redis client construction throws). For a REAL-MONEY P0
+        # surface that must be LOUD + fail-closed: re-raise so the run loop maps
+        # it to SPAWN_FAILED_PERMANENT — a live node must NEVER trade with the
+        # halt gate silently inert.
+        # Per-strategy denial context (PR 2 T2): keyed on the Nautilus
+        # ``StrategyId`` value (== the member's ``strategy_id_full``) so a
+        # node-side halt block can write a COMPLETE ``denied`` row. Built from
+        # the SAME member identity the engine-level msgbus hook uses
+        # (``strategy_id`` / ``strategy_code_hash`` per member; ``deployment_id``
+        # from the node payload). A member with a missing identity is simply
+        # omitted → that strategy falls back to the best-effort UPDATE-only path
+        # rather than getting fabricated identity.
+        from msai.services.nautilus.risk import DenialContext
+
+        _denial_contexts: dict[str, Any] = {}
+        for _m in p.strategy_members:
+            if _m.strategy_id_full and _m.strategy_id is not None:
+                _denial_contexts[_m.strategy_id_full] = DenialContext(
+                    deployment_id=p.deployment_id,
+                    strategy_id=_m.strategy_id,
+                    strategy_code_hash=_m.strategy_code_hash
+                    or p.strategy_code_hash
+                    or "engine-audit",
+                    strategy_git_sha=None,
+                )
+
+        if p.redis_url:
+            import redis.asyncio as _aioredis
+
+            redis_client = _aioredis.from_url(  # type: ignore[no-untyped-call]
+                p.redis_url,
+                decode_responses=False,
+                socket_connect_timeout=2.0,
+                socket_timeout=2.0,
+            )
+            halt_refresh_box["redis"] = redis_client
+            halt_refresh_box["task"] = await wire_halt_refresh(
+                strategies=list(node.trader.strategies()),
+                redis_client=redis_client,
+                account_id=p.ib_account_id,
+                audit_writer=writer,
+                denial_contexts=_denial_contexts,
+            )
+        else:
+            # No Redis URL → the halt gate cannot be armed. For a live node this
+            # is a misconfiguration that must fail LOUD + fail-closed (never trade
+            # without node-side halt enforcement), NOT a silent degrade.
+            raise RuntimeError(
+                "live trading node has no redis_url — the node-side halt gate "
+                "(F6, REAL-MONEY P0) cannot be armed; refusing to start. "
+                "SPAWN_FAILED_PERMANENT."
+            )
+
+        # --- (4) MarketHoursService + audit hook (best-effort).
         try:
             from msai.services.nautilus.market_hours import (
                 MarketHoursService,
@@ -1443,12 +1973,13 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
             from decimal import Decimal
 
             from msai.services.nautilus.audit_hook import (
-                OrderAuditWriter,
                 OrderSubmittedFacts,
                 TradeFillFacts,
             )
 
-            writer = OrderAuditWriter(db=sf)  # keyword-only init (Codex fix)
+            # ``writer`` was constructed in step (2) and is reused here for the
+            # engine-level msgbus audit hook (the node-side halt-denial audit was
+            # already injected onto each strategy's ``_audit`` via step (3)).
             _cache = node.kernel.cache  # for fetching full order details
             _loop = _aio.get_running_loop()
 
@@ -1661,6 +2192,21 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
         except Exception as _audit_exc:  # noqa: BLE001
             print(f"[MSAI] Engine audit hook wiring FAILED: {_audit_exc!r}", flush=True)  # noqa: T201
 
+    async def _async_cleanup() -> None:
+        """Tear down the halt-refresh task + its Redis client (F6 — PR 2 T2)
+        FIRST, then dispose the AsyncEngine. Runs INSIDE the asyncio.run loop so
+        both the Redis pool and the engine pool tear down on their own loop."""
+        task = halt_refresh_box.get("task")
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        redis_client = halt_refresh_box.get("redis")
+        if redis_client is not None:
+            with contextlib.suppress(Exception):
+                await redis_client.aclose()
+        await engine.dispose()
+
     # Bug X2 fix: dispose the AsyncEngine INSIDE the same event loop
     # that created its connection pool. Previously the dispose ran
     # via a second ``asyncio.run(engine.dispose())`` call after the
@@ -1681,7 +2227,7 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
             skip_dispose=True,
             on_node_constructed=_capture_node,
             on_post_build=_wire_market_hours,
-            async_cleanup=engine.dispose,
+            async_cleanup=_async_cleanup,
         )
     )
 

@@ -25,17 +25,21 @@ Design notes
 
 from __future__ import annotations
 
+# Nautilus msgspec configs resolve field annotations at runtime via inspect, so
+# the model types must be importable at module load, not only under
+# TYPE_CHECKING (same rationale as smoke_market_order.py).
 from nautilus_trader.indicators import ExponentialMovingAverage
-from nautilus_trader.model.data import Bar, BarType
+from nautilus_trader.model.data import Bar, BarType  # noqa: TC002
 from nautilus_trader.model.enums import OrderSide
-from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.identifiers import InstrumentId  # noqa: TC002
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.trading.strategy import Strategy
 
-from strategies.example.config import EMACrossConfig
+from msai.services.nautilus.risk import RiskAwareStrategy
+from strategies.example.config import EMACrossConfig  # noqa: TC001
 
 
-class EMACrossStrategy(Strategy):
+class EMACrossStrategy(RiskAwareStrategy, Strategy):
     """Buy-on-golden-cross / sell-on-death-cross EMA strategy.
 
     The strategy subscribes to a single bar type and keeps two EMAs
@@ -50,6 +54,13 @@ class EMACrossStrategy(Strategy):
     The intentionally coarse logic makes it trivial to reason about how
     many trades a given historical window should produce, which is
     important for smoke-testing the full Nautilus backtest pipeline.
+
+    ``RiskAwareStrategy`` is FIRST in the base-class tuple (PR 2 T2 / F6) so its
+    halt-gated ``submit_order`` override wins the MRO. Opening orders submitted
+    from ``on_bar`` are transparently node-side halt-gated in LIVE; the
+    ``on_stop`` flatten path uses reduce-only / ``MARKET_EXIT`` orders which are
+    always allowed (so a halt never strands an open position). In backtests the
+    gate is never armed, so this strategy trades unchanged.
     """
 
     def __init__(self, config: EMACrossConfig) -> None:

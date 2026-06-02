@@ -47,6 +47,21 @@ export default function LiveTradingPage(): React.ReactElement {
   // Fetch real deployments + global state from /api/v1/live/status.
   const [deployments, setDeployments] = useState<LiveDeploymentInfo[]>([]);
   const [riskHalted, setRiskHalted] = useState<boolean>(false);
+  // PR 2 T8 — supervisor (router) liveness age, surfaced on the deployments
+  // card so the operator can see the single-supervisor SPOF is alive.
+  //
+  // PR 2 F5 (review P3): the THREE states are distinct and the child component
+  // (StrategyStatus / SupervisorHealthCell) relies on them:
+  //   - undefined → NOT yet fetched → render nothing (no premature verdict)
+  //   - null      → fetched, heartbeat ABSENT → "Supervisor: DOWN"
+  //   - number    → fetched, age in seconds → alive / stale-by-threshold
+  // Initialise as `undefined` (not `null`), so the page does NOT flash
+  // "Supervisor: DOWN (no heartbeat)" on every load before the first
+  // /live/status returns — and a slow/erroring first request doesn't show a
+  // FALSE critical supervisor-down signal.
+  const [routerHeartbeatAgeS, setRouterHeartbeatAgeS] = useState<
+    number | null | undefined
+  >(undefined);
   // iter-3 SF P1: positionsUnavailable distinguishes "no positions" (real
   // empty state) from "live/positions fetch failed". Passed to PositionsTable
   // + factored into KillSwitch's positionCount so the operator isn't told
@@ -90,6 +105,7 @@ export default function LiveTradingPage(): React.ReactElement {
       const status = await getLiveStatus(token);
       setDeployments(status.deployments);
       setRiskHalted(status.risk_halted);
+      setRouterHeartbeatAgeS(status.router_heartbeat_age_s);
       setApiError(null);
     } catch (err) {
       // iter-3 SF P1: bare catch swallowed the real cause. The
@@ -337,6 +353,7 @@ export default function LiveTradingPage(): React.ReactElement {
       <StrategyStatus
         deployments={deployments}
         strategiesById={strategiesById}
+        routerHeartbeatAgeS={routerHeartbeatAgeS}
         onDeploymentMutated={() => void refreshStatus()}
       />
       <PositionsTable livePositions={positionsForTable} />

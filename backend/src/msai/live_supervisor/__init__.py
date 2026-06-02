@@ -24,6 +24,6 @@ when the container exits. The next supervisor start re-discovers
 surviving children via heartbeat-fresh rows.
 """
 
-from msai.live_supervisor.process_manager import ProcessManager
+from msai.live_supervisor.fleet_router import FleetRouter
 
-__all__ = ["ProcessManager"]
+__all__ = ["FleetRouter"]

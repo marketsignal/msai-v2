@@ -48,7 +48,7 @@ class ResolvedDatabentoTargets:
     """
 
     native_instrument_ids: list[str]  # e.g. ["AAPL.XNAS", "SPY.XNAS"]
-    venue_dataset_map: dict[str, str]  # e.g. {"XNAS": "DBEQ.BASIC"}
+    venue_dataset_map: dict[str, str]  # e.g. {"XNAS": "EQUS.MINI"}
 
 
 async def resolve_databento_targets(

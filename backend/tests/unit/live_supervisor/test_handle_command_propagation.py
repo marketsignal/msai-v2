@@ -2,9 +2,9 @@
 
 Council 2026-05-27 blocking objection #2 + 2026-05-29 blocking objection #12:
 the START path MUST pull ``gateway_session_key`` from the command payload and
-pass it to ``ProcessManager.spawn(...)``. Without this, per-session startup
+pass it to ``FleetRouter.spawn(...)``. Without this, per-session startup
 serialization silently degrades to global via the DB-row ``ib_login_key`` or
-``"default"`` fallback inside ``ProcessManager``.
+``"default"`` fallback inside ``FleetRouter``.
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ async def test_handle_command_start_passes_gateway_session_key_when_in_payload()
 
 @pytest.mark.asyncio
 async def test_handle_command_start_omits_gateway_session_key_when_absent() -> None:
-    # Backwards-compat: payload without the key still works (ProcessManager
+    # Backwards-compat: payload without the key still works (FleetRouter
     # falls back to the deployment row's ib_login_key).
     pm = MagicMock()
     pm.spawn = AsyncMock(return_value=True)

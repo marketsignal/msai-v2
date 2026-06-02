@@ -23,7 +23,8 @@ This project was originally built in parallel by two AI implementations from the
 - **Database:** PostgreSQL 16 + Parquet files + DuckDB + Redis 7
 - **Auth:** Azure Entra ID (MSAL frontend, PyJWT backend)
 - **Deploy:** Docker Compose on Azure VM (dev: single-host; prod: single-VM Standard_D4ds_v6, Phase 2 splits to 2-VM for real money)
-- **Data Sources:** Databento (equities + futures + options historical), IB Gateway (execution only)
+- **Data Sources:** Databento — equities **live real-time via `EQUS.MINI`** (the `DBEQ.BASIC` dataset was deprecated by Databento 2025-01-13; do NOT use it) + equities/futures/options historical; IB Gateway (execution only)
+- **Live test accounts:** local dev uses the **LVP** account (`U4705114` / test-lvp); the prod VM uses the **HVP** account (`U4715997` / test-hvp). IB allows only ONE live session per login (gotcha #3), so the same login cannot run on local and prod at the same time — bring one down before the other comes up. The real **fund** account is NOT touched until everything is proven, after PR-3.
 
 ### Ports (dev)
 
@@ -207,7 +208,7 @@ All endpoints except `/health` and `/ready` require Azure Entra ID JWT authentic
 - arq (not multiprocessing) for job queue — handles retry, timeout, dead-letter
 - PyJWT for backend JWT validation (NOT MSAL — MSAL is frontend only)
 - Backend accepts `X-API-Key` header as alternative to Bearer JWT (dev/CLI/testing via `MSAI_API_KEY` env)
-- Risk engine validates before every live deployment start; 4-layer kill-all (Redis halt flag + supervisor re-check + push-stop + SIGTERM+flatten)
+- Risk engine validates before every live deployment start; 4-layer kill-all (Redis halt latch [fleet + per-account] + supervisor re-check + push-stop + SIGTERM+flatten). On top of these supervisor-driven layers, every live strategy carries a **node-side live-halt order gate** (PR 2 / F6): `RiskAwareStrategy` overrides `submit_order`/`submit_order_list`/`modify_order` and blocks any new opening order while the fleet OR account halt latch is set — read directly from Redis by the node (bounded-staleness ≤2s; `None`/stale → fail-closed), so it is router-independent and survives a supervisor outage. Reduce-only / `MARKET_EXIT` flatten orders are ALWAYS allowed so kill-all/drain flatten still works under a halt. The gate is armed only in live (inert in backtests, where it is never wired).
 - Trade dedup via partial unique index on `(deployment_id, broker_trade_id) WHERE broker_trade_id IS NOT NULL` — idempotent reconciliation replay
 - WebSocket auth: first message must be JWT token within 5 seconds; reconnect hydrates orders/trades/status/risk_halt from DB
 
