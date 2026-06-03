@@ -173,7 +173,17 @@ async def test_backfill_seeds_from_env_idempotently(
         # SAME ib_account_id by hand so the second upgrade exercises the
         # idempotent guard branch (skip when already present) — mirrors
         # test_instrument_cache_migration's seeded-registry idempotency test.
-        _run_alembic(isolated_postgres_url_broker_accounts, "downgrade", "-1", extra_env=extra_env)
+        # Use the EXPLICIT CREATE-TABLE revision (d87c2aa5f751), NOT a relative
+        # "-1": once later revisions stack on top of the backfill (e.g.
+        # 81e7efe6d772, the live_deployments broker_account FK), "-1" from head
+        # no longer lands on the bare table — it stops at the backfill revision,
+        # leaving the legacy_env row in place and breaking the re-seed below.
+        _run_alembic(
+            isolated_postgres_url_broker_accounts,
+            "downgrade",
+            "d87c2aa5f751",
+            extra_env=extra_env,
+        )
         async with engine.begin() as conn:
             await conn.execute(
                 sa.text(

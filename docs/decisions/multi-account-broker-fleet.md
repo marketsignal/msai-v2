@@ -398,3 +398,37 @@ Both fresh-VM (cloud-init bakes the derived logic) and existing-VM (deploy re-sy
 ### Provenance
 
 PR 3 implementation under `/forge-goal` autonomous `/goal` run, 2026-06-01. Plan-review loop: Claude + Codex, 8 iterations to clean (architecture pre-ratified by the 2026-05-30 council above; the loop validated the file-level design + prod-deploy/IaC surface). Code-review loop: Claude × Codex + pr-review-toolkit, **16 iterations** to both-reviewers-clean (productive convergence — ~33 real findings fixed, no equal-severity regressions; the last three iterations after the initial iter-13 clean caught the credential-alias 422 redaction gap, an empty-DB E2E-spec precondition, and the deploy-mechanic P1 above).
+
+---
+
+## Addendum 2026-06-02 — operator writable-KV step DONE + spawn-wiring slice council
+
+### Operator writable-KV IaC apply + spike — DONE
+
+The PR 3 pre-cutover operator step (2026-06-01 addendum: grant the VM MI **Key Vault Secrets Officer**, set per-env config, run the writable-KV spike) is **operator-confirmed complete** (Pablo, 2026-06-02). The prod credential WRITE path (add/edit/rotate/archive → Azure KV) is live. This unblocks operator-managed account CRUD against prod KV; it is independent of the spawn-wiring slice below (which only READs).
+
+### Deep-link auth-race fix (#87) shipped
+
+A pre-existing app-shell MSAL-init auth-guard race — exposed by PR 3's no-nav-link `/settings/broker-accounts` page — was fixed in #87 (merged → prod `b8910e1`, prod re-test PASS). See `docs/solutions/auth/deeplink-auth-guard-race.md`.
+
+### Spawn-wiring slice — Engineering Council verdict (2026-06-02, standalone /council, 5 advisors + Codex chairman xhigh)
+
+**Question:** what is the correct slice for the next PR that makes PR 3's `BrokerAccount` operationally real (the deferred "data-plane spawn wiring of `resolve_for_spawn`")?
+
+**Verified finding that reshaped the fork:** the spawned TradingNode does NOT consume TWS credentials — `InteractiveBrokersExecClientConfig`/`DataClientConfig` (live_node_config.py:475) take only ibg_host/ibg_port/ibg_client_id/account_id; the IB Gateway container authenticates with its own env `TWS_USERID`/`TWS_PASSWORD` (one gateway per `ib_login_key`). So `resolve_for_spawn`'s credentials are consumed at the gateway-provisioning layer, NOT node-spawn. And `LiveDeployment.account_id`/`ib_login_key` are bare strings with NO FK to `broker_accounts` (live_deployment.py:109-119; api/live.py:456 feeds free-form strings), so a PR-3-CRUD-created account is not deployable by identity.
+
+**Verdict — NARROWED OPTION A.** Ship in this PR:
+
+1. A **nullable, additive** `LiveDeployment.broker_account_id` FK → `broker_accounts.id`. No NOT-NULL, no rename of the legacy `account_id`/`ib_login_key` strings, legacy/default rows untouched + backfill-forward where an unambiguous active account matches.
+2. New deploy/start flows **resolve exactly one ACTIVE `BrokerAccount`** and derive `account_id` / `ib_login_key` / gateway routing **from the row** (single source of truth). Any new free-form `account_id`+`ib_login_key` path must resolve to one active account or **fail closed**. Legacy string fallback only for existing deployments.
+3. `resolve_for_spawn` used **ONLY as a control-plane deploy/start validation gate** — confirms active + mode-consistent + router-resolvable (`accounts_for` binding) + credentials resolvable/version-pinned + identity match (`tws_userid` ↔ `ib_login_key`). Persist a validation stamp/status before enqueueing the supervisor spawn. **NOT** node credential wiring; **NOT** on the supervisor per-spawn/warm-restart path; must **NOT** claim to prove the gateway authenticated with those KV creds. On failure → distinct deployment status + `SPAWN_FAILED`-equivalent alert.
+
+**Deferred (NOT this PR):** Option B (wire `resolve_for_spawn` into the gateway-env render path — touches the frozen cloud-init render unit) and Option C (per-account gateway containers — bound to the 2-VM split per the PR 2 addendum).
+
+**Minority report:** the Simplifier called the gate "theater" (gateway auth comes from env; node never uses TWS creds). Partially sustained — theater IF marketed as credential wiring or placed on the spawn path; overruled for control-plane validation, where refusing archived/unpinned/misconfigured rows pre-deploy is real, limited value. Contrarian + Maintainer: validating KV creds does not prove the live gateway uses them — SUSTAINED; the PR must state exactly what the gate proves and must not imply gateway-env verification.
+
+**Missing evidence (later spike):** whether the rendered gateway env can be tied to `BrokerAccount` credential material + verified without destabilizing existing deployments (that is the Option B spike, deferred). Concrete backfill map for legacy/default `LiveDeployment` rows to be settled in the plan.
+
+**Acceptance:** demonstrable off-hours on the paper LVP account (create active account → deploy → linked + derived identity; create→archive→deploy→fail-closed refusal). The real-login LVP/HVP graduation drill remains market-hours-parked.
+
+This council serves as Phase 3.1/3.1b/3.1c (brainstorm + approach comparison + contrarian gate) for the `broker-account-spawn-wiring` PR per the skip-Phase-3-when-council-predone convention; Phases 3.2 (plan) + 3.3 (plan-review loop) run fresh.

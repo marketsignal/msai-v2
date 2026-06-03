@@ -145,6 +145,13 @@ def client_with_mock_db(
     async def _override_get_bus() -> LiveCommandBus:
         return mock_command_bus
 
+    # Task 5: /start-portfolio reads app.state.gateway_router (set during the
+    # app lifespan in production). The unit fixture doesn't run the lifespan, so
+    # set an empty router here so the handler's eager read doesn't AttributeError.
+    from msai.services.live.gateway_router import GatewayRouter
+
+    app.state.gateway_router = GatewayRouter(None)
+
     app.dependency_overrides[get_db] = _override_get_db
     app.dependency_overrides[get_command_bus] = _override_get_bus
 
@@ -496,15 +503,18 @@ class TestStartPortfolioPreReserveBinding:
     """
 
     @pytest.mark.asyncio
-    async def test_missing_revision_returns_404_before_idempotency(
+    async def test_new_freeform_deploy_with_unresolvable_account_422_before_binding(
         self,
         client_with_mock_db: httpx.AsyncClient,
     ) -> None:
-        """The mock DB returns scalar_one_or_none=None for the revision
-        lookup, so the pre-reserve loader bails with 404. This used to
-        be a 503 LIVE_DEPLOY_BLOCKED on paper_trading=false; with the
-        guard gone, the binding flow itself surfaces the missing-revision
-        error first."""
+        """Task 5 reordered account resolution to the TOP of the handler:
+        a NEW free-form (legacy-strings) deploy whose ``account_id`` does not
+        resolve to an ACTIVE broker account now fails closed with 422
+        BROKER_ACCOUNT_NOT_RESOLVABLE BEFORE the revision lookup / idempotency
+        reservation (council mandate — new free-form deploys must resolve or
+        fail closed). The mock DB returns ``scalar_one_or_none=None`` for every
+        query, so the warm-restart identity lookup misses (→ NEW deploy) and the
+        registry lookup also misses (→ unresolvable)."""
         response = await client_with_mock_db.post(
             "/api/v1/live/start-portfolio",
             json={
@@ -514,5 +524,5 @@ class TestStartPortfolioPreReserveBinding:
                 "ib_login_key": "test-user",
             },
         )
-        assert response.status_code == 404, response.text
-        assert "not found" in response.text.lower()
+        assert response.status_code == 422, response.text
+        assert "BROKER_ACCOUNT_NOT_RESOLVABLE" in response.text

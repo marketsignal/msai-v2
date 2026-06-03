@@ -51,6 +51,7 @@ from msai.services.live.broker_credentials_store import (
     CredentialResolutionError,
     Credentials,
     KvFailureReason,
+    ResolvedSpawnCredentials,
 )
 from msai.services.nautilus.ib_port_validator import assert_account_mode_consistent
 from msai.services.observability.broker_account_metrics import KV_SECRET_AGE, SPAWN_FAILED
@@ -471,10 +472,28 @@ class BrokerAccountService:
         the store, no longer the env path.
         """
         acct = await self.get(account_id)
-        if acct.status == BrokerAccountStatus.ARCHIVED:
-            raise AccountArchivedError(
-                f"account {acct.ib_account_id} is archived and cannot be rotated"
+        # Lock the row + refresh UNDER the lock so the archived-check AND the
+        # ``credentials_backend`` promotion branch below read state reflecting any
+        # concurrent archive()/rotate() commit — not a stale identity-map cache.
+        # Without the lock, a rotate could promote (write a managed secret to) an
+        # account another session just archived, orphaning the secret and
+        # violating the archived invariant. Same FOR UPDATE + populate_existing
+        # discipline as archive() and the deploy gate's lock_and_assert_account_active.
+        acct = (
+            await self._db.execute(
+                select(BrokerAccount)
+                .where(BrokerAccount.id == acct.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
+        ).scalar_one()
+        if acct.status == BrokerAccountStatus.ARCHIVED:
+            # Capture before rollback (rollback expires ORM attributes), then
+            # release the row lock so a caller catching AccountArchivedError with
+            # an open session does not block subsequent start/archive/rotate.
+            ib_account_id = acct.ib_account_id
+            await self._db.rollback()
+            raise AccountArchivedError(f"account {ib_account_id} is archived and cannot be rotated")
         # Track a freshly-PROMOTED secret ref so a commit failure on the
         # legacy→managed branch does not leave an orphan secret with no row
         # pointing at it (the row stays legacy_env on rollback). The
@@ -482,23 +501,36 @@ class BrokerAccountService:
         # extra secret version under the SAME ref the row still references —
         # acceptable, and not safely deletable without dropping the live version.
         promoted_ref: str | None = None
-        if acct.credentials_backend == CredentialsBackend.LEGACY_ENV:
-            # UNIQUE-per-attempt secret name (Codex final-review P2): a deterministic
-            # `broker-cred-{acct.id}` would, on a commit-failure rollback, be soft-deleted
-            # in Azure KV — and KV RESERVES soft-deleted names, so the operator's retry
-            # (reusing the same name) would fail with ResourceExistsError until purge/recover.
-            # A fresh uuid suffix per attempt is never reused, mirroring create()'s
-            # unique-name invariant (research finding #1).
-            new_ref = f"broker-cred-{acct.id}-{uuid4().hex}"
-            write = self._store.put(new_ref, creds, actor=actor)  # STORE FIRST
-            promoted_ref = write.secret_ref
-            acct.credentials_backend = self._backend
-            acct.credentials_secret_ref = write.secret_ref
-        else:
-            write = self._store.rotate(acct.credentials_secret_ref, creds, actor=actor)
-        acct.credentials_secret_version = write.version
-        acct.credentials_updated_at = datetime.now(UTC)
-        acct.credentials_updated_by = actor
+        # The store write happens AFTER the FOR UPDATE lock above, so a store
+        # failure must release that lock — otherwise a caller that catches the
+        # error and keeps the session open blocks every subsequent
+        # start/archive/rotate for this account. (Before rotate() took the lock
+        # this path held none, so a store failure was harmless; the lock made the
+        # rollback mandatory.) A store.put() that RAISED returns no ref we own and
+        # the in-memory backend/ref mutation is discarded by the rollback, so no
+        # secret cleanup is needed here — promoted-secret cleanup belongs only to
+        # the post-write COMMIT-failure path below (where put() succeeded).
+        try:
+            if acct.credentials_backend == CredentialsBackend.LEGACY_ENV:
+                # UNIQUE-per-attempt secret name (Codex final-review P2): a deterministic
+                # `broker-cred-{acct.id}` would, on a commit-failure rollback, be soft-deleted
+                # in Azure KV — and KV RESERVES soft-deleted names, so the operator's retry
+                # (reusing the same name) would fail with ResourceExistsError until purge/recover.
+                # A fresh uuid suffix per attempt is never reused, mirroring create()'s
+                # unique-name invariant (research finding #1).
+                new_ref = f"broker-cred-{acct.id}-{uuid4().hex}"
+                write = self._store.put(new_ref, creds, actor=actor)  # STORE FIRST
+                promoted_ref = write.secret_ref
+                acct.credentials_backend = self._backend
+                acct.credentials_secret_ref = write.secret_ref
+            else:
+                write = self._store.rotate(acct.credentials_secret_ref, creds, actor=actor)
+            acct.credentials_secret_version = write.version
+            acct.credentials_updated_at = datetime.now(UTC)
+            acct.credentials_updated_by = actor
+        except Exception:
+            await self._db.rollback()
+            raise
         try:
             await self._db.commit()
         except Exception:
@@ -522,6 +554,34 @@ class BrokerAccountService:
         """
         acct = await self.get(account_id)
 
+        # Serialize against a concurrent ``/live/start-portfolio`` on the SAME
+        # broker_accounts row (deploy/archive TOCTOU). The start handler takes a
+        # ``SELECT ... FOR UPDATE`` on this row immediately before its deployment
+        # upsert and holds it until that upsert commits; we take the matching lock
+        # here BEFORE the active-deployment check below, so whoever commits first
+        # wins. If start commits first, the row lock blocks us until its active
+        # deployment exists → the guard below fires (AccountInUseError). If we
+        # commit the ARCHIVED status first, start blocks on this lock, then
+        # re-reads ARCHIVED and fails closed before inserting/publishing. The lock
+        # is released by this method's ``commit()`` (or rollback on error).
+        #
+        # Re-read the row UNDER the lock with ``populate_existing=True`` and use
+        # THAT instance: the ``credentials_backend`` / ``credentials_secret_ref``
+        # reads below must reflect any rotation/promotion another session committed
+        # while we waited on the lock. A stale identity-map cache (from ``get()``
+        # above, taken before the lock) could still read ``LEGACY_ENV`` after a
+        # concurrent legacy→managed promotion, skip deleting the just-promoted
+        # managed secret, and orphan it. Same discipline as the deploy gate's
+        # ``lock_and_assert_account_active``.
+        acct = (
+            await self._db.execute(
+                select(BrokerAccount)
+                .where(BrokerAccount.id == acct.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+
         # Block on ANY active deployment for this IB account, matched by
         # ``account_id`` ALONE (Codex iter-4 P2 / archive-too-narrow): a
         # deployment under a DIFFERENT ib_login_key (e.g. legacy "default" vs
@@ -535,8 +595,18 @@ class BrokerAccountService:
             )
         )
         if active.first() is not None:
+            # Capture the id BEFORE the rollback below — rollback expires ORM
+            # attributes, so reading ``acct.ib_account_id`` afterward would
+            # trigger a lazy reload on the just-rolled-back session.
+            ib_account_id = acct.ib_account_id
+            # Release the FOR UPDATE row lock acquired above before raising. The
+            # success path commits (which releases it); this post-lock domain
+            # error must roll back so a caller that catches AccountInUseError and
+            # keeps the session open does not hold the broker_accounts row lock,
+            # blocking every subsequent start/archive for this account (Codex P3).
+            await self._db.rollback()
             raise AccountInUseError(
-                f"account {acct.ib_account_id} has an active deployment; stop it before archiving"
+                f"account {ib_account_id} has an active deployment; stop it before archiving"
             )
 
         secret_ref = acct.credentials_secret_ref
@@ -553,7 +623,9 @@ class BrokerAccountService:
         await self._db.refresh(acct)
         return acct
 
-    async def resolve_for_spawn(self, account_id: UUID) -> Credentials:
+    async def resolve_for_spawn(
+        self, account_id: UUID, *, stamp_access: bool = True
+    ) -> ResolvedSpawnCredentials:
         """Resolve live credentials for the supervisor to spawn a TradingNode.
 
         Branches on ``credentials_backend``:
@@ -569,11 +641,53 @@ class BrokerAccountService:
 
         On any :class:`CredentialResolutionError` the spawn-failure counter is
         incremented (labeled by ``account_id`` + ``reason``) before re-raising.
-        On success ``credentials_last_accessed`` is stamped (tz-aware UTC) and the
-        secret-age gauge is set from ``now - credentials_updated_at`` (skipped for
-        ``legacy_env`` rows, which have no ``credentials_updated_at``).
+
+        ``stamp_access`` controls the success-path side effects (council
+        2026-06-01, bounded Option B):
+
+        * ``True`` (default — preserves behavior for the data-plane / existing /
+          test callers): stamp ``credentials_last_accessed`` (tz-aware UTC),
+          ``commit()`` the request session, and set the secret-age gauge from
+          ``now - credentials_updated_at`` (skipped for ``legacy_env`` rows, which
+          have no ``credentials_updated_at``).
+        * ``False`` (the **deploy-gate** path in ``api/live.py``): do the
+          non-locking ``refresh`` + archived check + ``store.get`` and RETURN —
+          with **NO ``commit()``** and **NO** write to ``credentials_last_accessed``.
+          The mid-handler commit on the request's SHARED session was releasing any
+          ``FOR UPDATE`` row lock held before it (the lock-invariant defect this
+          fork fixes), so the deploy gate must validate credentials with no lock
+          held and no commit. The CALLER then persists
+          ``credentials_last_accessed`` (and sets the secret-age gauge) in its
+          FINAL successful transaction, atomic with the deployment upsert.
+          ``credentials_last_accessed`` is pure observability metadata — nothing
+          branches on it, and a fail-closed deploy need not stamp it.
+
+        The early ``db.refresh(acct)`` (a NON-locking ``SELECT``) is kept in both
+        modes: it is the archived-race guard and runs BEFORE any lock in the
+        deploy-gate's new lock ordering.
+
+        Returns a :class:`ResolvedSpawnCredentials` carrying the resolved
+        ``creds`` AND the EXACT ``version_used`` — the version passed to
+        ``store.get(ref, version)`` for the read that produced ``creds`` (``None``
+        for ``legacy_env``). ``version_used`` is captured AT the store-read call
+        site, BEFORE the post-commit ``refresh``, so a concurrent credential
+        rotation committing a NEWER version onto the row mid-resolve cannot make
+        the caller believe it validated the new version. Callers MUST use
+        ``version_used`` (never re-read ``credentials_secret_version`` afterwards)
+        as the validated version — that is what the STAGE-3 rotation guard in
+        ``api/live.py`` compares against the locked row's current version.
         """
         acct = await self.get(account_id)
+        # The instance may be a CACHED ACTIVE copy from this session's identity
+        # map (STAGE-1 _resolve_effective_account loaded it; a concurrent request
+        # may have archived + committed it since). Re-SELECT committed state so the
+        # ARCHIVED check below — and the subsequent credentials_secret_version /
+        # backend reads — never trust stale ACTIVE data. This is a NON-locking
+        # SELECT; in the deploy-gate (stamp_access=False) path it runs BEFORE any
+        # FOR UPDATE lock is taken. broker accounts are soft-archived (never
+        # hard-deleted), so the row always exists; if it were somehow gone,
+        # refresh() raises and we fail closed.
+        await self._db.refresh(acct)
         # An archived account must never yield usable credentials — even a
         # legacy_env row whose env secret still exists. Fail BEFORE resolving any
         # material and BEFORE stamping last_accessed.
@@ -583,6 +697,10 @@ class BrokerAccountService:
             )
         ref = acct.credentials_secret_ref
         is_legacy = acct.credentials_backend == CredentialsBackend.LEGACY_ENV
+        # The version we ACTUALLY read against. Captured here (BEFORE the store
+        # read for non-legacy, and BEFORE the post-commit refresh) so it reflects
+        # the version this request resolved — never a newer rotated version.
+        version_used: str | None = None
         try:
             if is_legacy:
                 creds = self._resolve_legacy_env(ref)
@@ -593,10 +711,20 @@ class BrokerAccountService:
                         ref,
                         "non-legacy account is missing a pinned secret version",
                     )
-                creds = self._store.get(ref, acct.credentials_secret_version)
+                version_used = acct.credentials_secret_version
+                creds = self._store.get(ref, version_used)
         except CredentialResolutionError as exc:
             SPAWN_FAILED.inc(account_id=acct.ib_account_id, reason=exc.reason)
             raise
+
+        if not stamp_access:
+            # Deploy-gate path: NO commit on the shared request session and NO
+            # last-accessed stamp. The caller persists credentials_last_accessed
+            # + the secret-age gauge in its final transaction (atomic with the
+            # deployment upsert). Returning here leaves no row lock held and no
+            # pending write that would autoflush a lock between here and the
+            # caller's critical section.
+            return ResolvedSpawnCredentials(creds=creds, version_used=version_used)
 
         now = datetime.now(UTC)
         acct.credentials_last_accessed = now
@@ -605,7 +733,7 @@ class BrokerAccountService:
         if not is_legacy and acct.credentials_updated_at is not None:
             age_seconds = (now - acct.credentials_updated_at).total_seconds()
             KV_SECRET_AGE.set(age_seconds, account_id=acct.ib_account_id)
-        return creds
+        return ResolvedSpawnCredentials(creds=creds, version_used=version_used)
 
     @staticmethod
     def _resolve_legacy_env(ref: str) -> Credentials:

@@ -9,16 +9,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import monotonic
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 from uuid import UUID  # noqa: TC003 — FastAPI resolves the type at runtime for path params
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import case, delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from msai.api._broker_account_deps import build_broker_account_service
 from msai.api.live_deps import get_command_bus, get_idempotency_store
 from msai.core.audit import log_audit
 from msai.core.auth import get_current_user, resolve_user_id
@@ -30,6 +32,7 @@ from msai.core.halt_keys import (
     halt_cause_key,
 )
 from msai.core.logging import get_logger
+from msai.models.broker_account import BrokerAccount
 from msai.models.live_deployment import LiveDeployment
 from msai.models.live_deployment_strategy import LiveDeploymentStrategy
 from msai.models.live_node_process import LiveNodeProcess
@@ -47,6 +50,13 @@ from msai.schemas.live import (
     LiveStopRequest,
     LiveTradesResponse,
     PortfolioStartRequest,
+)
+from msai.services.live.deployment_account_resolver import (
+    AccountNotResolvable,
+    lock_and_assert_account_active,
+    resolve_active_broker_account,
+    validate_account_credentials,
+    validate_account_row_state,
 )
 from msai.services.live.deployment_identity import (
     derive_message_bus_stream,
@@ -76,12 +86,17 @@ from msai.services.live_command_bus import (
 )
 from msai.services.nautilus.ibg_client_id import derive_ibg_client_id
 from msai.services.nautilus.trading_node import TradingNodeManager
+from msai.services.observability.broker_account_metrics import (
+    DEPLOY_VALIDATION_FAILED,
+    KV_SECRET_AGE,
+)
 from msai.services.risk_engine import RiskEngine
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from msai.models.graduation_candidate import GraduationCandidate
+    from msai.services.live.gateway_router import GatewayRouter
 
 log = get_logger(__name__)
 
@@ -405,10 +420,277 @@ async def live_start(
     )
 
 
+@dataclass(frozen=True)
+class _EffectiveAccount:
+    """The account identity ALL downstream safety/identity checks must use.
+
+    ``account_id`` / ``ib_login_key`` are the EFFECTIVE strings — DERIVED from
+    the resolved :class:`BrokerAccount` row when one was resolved, or the legacy
+    request strings on the warm-restart back-compat path. ``broker_account`` is
+    the resolved registry row (``None`` on the legacy warm-restart path, where
+    no resolution is forced and the account may be unregistered).
+
+    Once an ``_EffectiveAccount`` is established at the TOP of the handler, the
+    raw ``request.account_id`` must NEVER drive a safety check (identity,
+    body-hash, collision, per-account halt, publish) — that would re-open the
+    halt-bypass an attacker could ride by sending a halted derived account
+    alongside a non-halted raw ``account_id``.
+    """
+
+    account_id: str
+    ib_login_key: str
+    broker_account: BrokerAccount | None
+
+
+def _deploy_error(status_code: int, code: str, message: str, details: dict[str, Any]) -> NoReturn:
+    """Raise an :class:`HTTPException` carrying the canonical ``{"error": {...}}``
+    envelope used across the deploy path. Single builder so the status code /
+    error code / message / details contract (asserted by the integration tests)
+    is constructed in exactly one place. Does NOT touch the alert metric — callers
+    that need to count a rejection do so before calling this (see
+    :func:`_not_resolvable_fail` / :func:`_deploy_validation_fail`)."""
+    raise HTTPException(
+        status_code=status_code,
+        detail={"error": {"code": code, "message": message, "details": details}},
+    )
+
+
+def _not_resolvable_fail(account_id: str, message: str, details: dict[str, Any]) -> NoReturn:
+    """Increment the alert metric + raise a 422 ``BROKER_ACCOUNT_NOT_RESOLVABLE``.
+
+    Wraps :func:`_deploy_error` for the three credential-resolvability sites in
+    ``_resolve_effective_account`` / ``_resolve_new_legacy_deploy_account``, all
+    of which count the rejection with ``reason="not_resolvable"`` and surface the
+    same error code."""
+    DEPLOY_VALIDATION_FAILED.inc(account_id=account_id, reason="not_resolvable")
+    _deploy_error(
+        status.HTTP_422_UNPROCESSABLE_ENTITY,
+        "BROKER_ACCOUNT_NOT_RESOLVABLE",
+        message,
+        details,
+    )
+
+
+def _deploy_validation_fail(account_id: str, reason: str | None) -> NoReturn:
+    """Increment the alert metric + raise a fail-closed 422 for a row-state
+    deploy-validation rejection (archived / mode_inconsistent / route_not_found
+    / not_router_bound). Credential-resolvability failures are NOT routed here —
+    those are counted inside ``resolve_for_spawn`` and surfaced separately."""
+    DEPLOY_VALIDATION_FAILED.inc(account_id=account_id, reason=reason or "unknown")
+    _deploy_error(
+        status.HTTP_422_UNPROCESSABLE_ENTITY,
+        "DEPLOY_VALIDATION_FAILED",
+        (
+            f"Broker account {account_id} failed deploy validation: {reason}. "
+            "Resolve the account state (un-archive / fix mode / bind the gateway "
+            "route) before deploying."
+        ),
+        {"account_id": account_id, "reason": reason},
+    )
+
+
+async def _resolve_effective_account(
+    *,
+    db: AsyncSession,
+    request: PortfolioStartRequest,
+    user_id: UUID | None,
+    claims: dict[str, Any],
+    gateway_router: GatewayRouter,
+) -> _EffectiveAccount:
+    """Establish the EFFECTIVE account at the TOP of ``/start-portfolio``.
+
+    Resolution rules (council mandate — new free-form deploys must resolve or
+    fail closed; warm restarts of pre-registry deployments stay back-compatible):
+
+    * ``broker_account_id`` set → resolve the registry row by id (422 on
+      :class:`AccountNotResolvable`). Effective strings are DERIVED from the row.
+    * legacy strings only → compute the warm-restart identity from the REQUEST
+      strings. If an EXISTING deployment matches that identity_signature:
+        - its row's ``broker_account_id IS NULL`` (never linked to the registry,
+          predates it) → keep the legacy strings, no forced resolution; OR
+        - its row's ``broker_account_id IS NOT NULL`` (LINKED to a registry
+          account) → the legacy bypass is NOT allowed: resolve that linked
+          account by its row id and run validation, so a since-archived /
+          invalidated broker-linked deployment fails closed (422) instead of
+          being grandfathered back to life.
+      Otherwise this is a NEW deploy: resolve by ``ib_account_id``
+      (422 on :class:`AccountNotResolvable`) and DERIVE the effective strings.
+
+    When an account is resolved, the CHEAP row-state validation
+    (:func:`validate_account_row_state`) runs here (no KV, no commit); an invalid
+    row fails closed with 422 + an alert-metric increment. The KV credential
+    validation runs LATER (after the idempotency reservation) in the handler.
+    """
+    requested_mode = "paper" if request.paper_trading else "live"
+
+    account: BrokerAccount | None = None
+    if request.broker_account_id is not None:
+        try:
+            account = await resolve_active_broker_account(
+                db, broker_account_id=request.broker_account_id, ib_account_id=None
+            )
+        except AccountNotResolvable as exc:
+            # An unresolvable id (unknown OR only an ARCHIVED row exists for it)
+            # is an alertable deploy rejection — count it (label by the id) so
+            # an operator deploying against a stale/archived account is visible.
+            try:
+                _not_resolvable_fail(
+                    str(request.broker_account_id),
+                    str(exc),
+                    {"broker_account_id": str(request.broker_account_id)},
+                )
+            except HTTPException as http_exc:
+                raise http_exc from exc
+    else:
+        # Legacy strings path. The either/or schema validator guarantees both
+        # account_id + ib_login_key are present here.
+        assert request.account_id is not None  # noqa: S101 — schema-guaranteed
+        assert request.ib_login_key is not None  # noqa: S101 — schema-guaranteed
+        identity = derive_portfolio_deployment_identity(
+            user_id=user_id,
+            portfolio_revision_id=request.portfolio_revision_id,
+            account_id=request.account_id,
+            paper_trading=request.paper_trading,
+            ib_login_key=request.ib_login_key,
+            user_sub=claims.get("sub"),
+        )
+        existing = (
+            await db.execute(
+                select(
+                    LiveDeployment.id,
+                    LiveDeployment.broker_account_id,
+                ).where(LiveDeployment.identity_signature == identity.signature())
+            )
+        ).one_or_none()
+        if existing is not None:
+            existing_broker_account_id = existing.broker_account_id
+            if existing_broker_account_id is None:
+                # Warm-restart of a row that was NEVER linked to a registry account
+                # (predates the registry FK). Back-compat — keep the legacy strings
+                # with no forced resolution — is preserved ONLY while NO
+                # BrokerAccount exists for this IB account. If an operator has SINCE
+                # registered one for this account_id, the registry is authoritative
+                # and the NULL-FK restart must NOT bypass it (Codex iter-20 P2):
+                # resolve it so an ACTIVE row links + validates and an
+                # archived/inactive row fails closed (422) — closing the
+                # "spawn against a since-archived account via a legacy restart" hole.
+                registry_row_exists = (
+                    await db.execute(
+                        select(BrokerAccount.id)
+                        .where(BrokerAccount.ib_account_id == request.account_id)
+                        .limit(1)
+                    )
+                ).first() is not None
+                if not registry_row_exists:
+                    # Genuinely pre-registry account_id → keep the legacy strings.
+                    return _EffectiveAccount(
+                        account_id=request.account_id,
+                        ib_login_key=request.ib_login_key,
+                        broker_account=None,
+                    )
+                # A BrokerAccount exists for this IB account → resolve it (ACTIVE
+                # links + validates; archived/inactive → 422 fail closed).
+                try:
+                    account = await resolve_active_broker_account(
+                        db, broker_account_id=None, ib_account_id=request.account_id
+                    )
+                except AccountNotResolvable as exc:
+                    try:
+                        _not_resolvable_fail(
+                            str(request.account_id),
+                            (
+                                f"{exc} A broker account is registered for this IB "
+                                "account but is no longer active (archived or "
+                                "invalidated). Restore/replace it before restarting."
+                            ),
+                            {"account_id": request.account_id},
+                        )
+                    except HTTPException as http_exc:
+                        raise http_exc from exc
+            else:
+                # The matched row IS linked to a BrokerAccount. A legacy-strings
+                # restart must NOT bypass validation: resolve that linked account
+                # by its row id and fall through to row-state validation below so a
+                # since-archived / invalidated account fails closed (no
+                # grandfathering a broker-linked deployment back to life).
+                try:
+                    account = await resolve_active_broker_account(
+                        db,
+                        broker_account_id=existing_broker_account_id,
+                        ib_account_id=None,
+                    )
+                except AccountNotResolvable as exc:
+                    try:
+                        _not_resolvable_fail(
+                            str(existing_broker_account_id),
+                            (
+                                f"{exc} This deployment is linked to a broker account "
+                                "that is no longer active (archived or invalidated). "
+                                "Restore/replace the account before restarting."
+                            ),
+                            {"broker_account_id": str(existing_broker_account_id)},
+                        )
+                    except HTTPException as http_exc:
+                        raise http_exc from exc
+            # account is set (broker-linked restart OR NULL-FK restart whose IB
+            # account now has a registry row) → fall through to the shared
+            # row-state validation + effective-account derivation below.
+        else:
+            # NEW free-form deploy: must resolve to an ACTIVE registry row or fail.
+            account = await _resolve_new_legacy_deploy_account(db, request)
+
+    # An account was resolved (by id, by ib_account_id on a new deploy, or via
+    # an existing broker-linked row on a legacy-strings restart). Run the CHEAP
+    # row-state validation now — fail closed on an invalid row.
+    row_state = validate_account_row_state(
+        account, requested_mode=requested_mode, gateway_router=gateway_router
+    )
+    if not row_state.valid:
+        _deploy_validation_fail(account.ib_account_id, row_state.reason)
+
+    return _EffectiveAccount(
+        account_id=account.ib_account_id,
+        ib_login_key=account.ib_login_key,
+        broker_account=account,
+    )
+
+
+async def _resolve_new_legacy_deploy_account(
+    db: AsyncSession, request: PortfolioStartRequest
+) -> BrokerAccount:
+    """Resolve a NEW free-form (legacy-strings) deploy to an ACTIVE registry row.
+
+    Council mandate: new free-form deploys must resolve or fail closed — they
+    are NOT silently legacy-passed-through. Raises 422
+    ``BROKER_ACCOUNT_NOT_RESOLVABLE`` (and increments the alert metric) when the
+    request ``account_id`` does not match an ACTIVE registry row.
+    """
+    assert request.account_id is not None  # noqa: S101 — schema-guaranteed
+    try:
+        return await resolve_active_broker_account(
+            db, broker_account_id=None, ib_account_id=request.account_id
+        )
+    except AccountNotResolvable as exc:
+        try:
+            _not_resolvable_fail(
+                str(request.account_id),
+                (
+                    f"{exc} New deployments must reference an ACTIVE broker "
+                    "account (register it via POST /api/v1/broker-accounts "
+                    "first)."
+                ),
+                {"account_id": request.account_id},
+            )
+        except HTTPException as http_exc:
+            raise http_exc from exc
+
+
 async def _resolve_binding_for_start_portfolio(
     *,
     db: AsyncSession,
     request: PortfolioStartRequest,
+    effective_account_id: str,
+    effective_ib_login_key: str,
     user_id: UUID | None,
     claims: dict[str, Any],
 ) -> tuple[
@@ -450,12 +732,16 @@ async def _resolve_binding_for_start_portfolio(
     )
 
     # ----- 1. Identity signature (for warm-restart lookup) -----
+    # Task 5: identity is built from the EFFECTIVE account (derived from the
+    # resolved BrokerAccount row, or the legacy strings on warm restart) — NOT
+    # the raw request strings, so the binding warm-restart lookup + the
+    # collision check below agree with the handler's identity recompute.
     identity = derive_portfolio_deployment_identity(
         user_id=user_id,
         portfolio_revision_id=request.portfolio_revision_id,
-        account_id=request.account_id,
+        account_id=effective_account_id,
         paper_trading=request.paper_trading,
-        ib_login_key=request.ib_login_key,
+        ib_login_key=effective_ib_login_key,
         user_sub=claims.get("sub"),
     )
     identity_signature = identity.signature()
@@ -481,7 +767,7 @@ async def _resolve_binding_for_start_portfolio(
             await db.execute(
                 select(LiveDeployment).where(
                     LiveDeployment.portfolio_revision_id == request.portfolio_revision_id,
-                    LiveDeployment.account_id == request.account_id,
+                    LiveDeployment.account_id == effective_account_id,
                     LiveDeployment.identity_signature != identity_signature,
                 )
             )
@@ -503,7 +789,11 @@ async def _resolve_binding_for_start_portfolio(
                             "existing_status": collision_row.status,
                             "existing_ib_login_key": collision_row.ib_login_key,
                             "existing_paper_trading": collision_row.paper_trading,
-                            "requested_ib_login_key": request.ib_login_key,
+                            # Use the EFFECTIVE login (derived from the resolved
+                            # BrokerAccount on a selector-only deploy) — the raw
+                            # ``request.ib_login_key`` is None when the caller
+                            # selected by ``broker_account_id``.
+                            "requested_ib_login_key": effective_ib_login_key,
                             "requested_paper_trading": request.paper_trading,
                             "hint": (
                                 "stop the existing deployment via POST /api/v1/live/stop, "
@@ -828,6 +1118,7 @@ async def _resolve_binding_for_start_portfolio(
 @router.post("/start-portfolio")
 async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispatch by design
     request: PortfolioStartRequest,
+    http_request: Request,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
@@ -863,6 +1154,25 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
     # ------------------------------------------------------------------
     user_id = await _resolve_user_id(db, claims)
 
+    # ------------------------------------------------------------------
+    # Task 5: establish the EFFECTIVE account BEFORE identity / body-hash /
+    # binding. resolve → derive → (cheap row-state validate). From here on the
+    # raw ``request.account_id`` must NOT drive any safety / identity check —
+    # ``effective_account_id`` / ``effective_ib_login_key`` are authoritative
+    # (closes the halt-bypass P1). The KV credential validation runs LATER,
+    # after the idempotency reservation, so a replay doesn't re-poke Key Vault.
+    # ------------------------------------------------------------------
+    gateway_router: GatewayRouter = http_request.app.state.gateway_router
+    effective = await _resolve_effective_account(
+        db=db,
+        request=request,
+        user_id=user_id,
+        claims=claims,
+        gateway_router=gateway_router,
+    )
+    effective_account_id = effective.account_id
+    effective_ib_login_key = effective.ib_login_key
+
     (
         binding_fingerprint,
         resolved_bindings,
@@ -870,16 +1180,30 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
     ) = await _resolve_binding_for_start_portfolio(
         db=db,
         request=request,
+        effective_account_id=effective_account_id,
+        effective_ib_login_key=effective_ib_login_key,
         user_id=user_id,
         claims=claims,
     )
 
     body_for_hash: dict[str, Any] = {
         "portfolio_revision_id": str(request.portfolio_revision_id),
-        "account_id": request.account_id,
+        "account_id": effective_account_id,
         "paper_trading": request.paper_trading,
-        "ib_login_key": request.ib_login_key,
+        "ib_login_key": effective_ib_login_key,
         "binding_fingerprint": binding_fingerprint,
+        # P2-B: fold in the RAW account selector (the distinguishing input), not
+        # the derived effective account. Two requests that resolve to the same
+        # effective account/login but differ in HOW they selected it — one via
+        # the legacy ``account_id``/``ib_login_key`` pair (broker_account_id
+        # absent → None), the other via the registry ``broker_account_id`` — must
+        # NOT collide on the same Idempotency-Key. Without this, a cached legacy
+        # warm-restart (no link) could be served to a later selector-bearing
+        # retry BEFORE its credential validation + broker-link upsert run, so the
+        # link + validation stamps would never persist.
+        "broker_account_id": (
+            str(request.broker_account_id) if request.broker_account_id is not None else None
+        ),
     }
     body_hash = IdempotencyStore.body_hash(body_for_hash)
 
@@ -918,8 +1242,13 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
         # account can deploy again. Other accounts under the same TWS
         # login are unaffected (latch is keyed by account_id, not
         # ib_login_key — council 2026-05-29 obj #11).
-        if request.account_id and await _account_halt_is_active(bus, request.account_id):
-            outcome = EndpointOutcome.account_halt_active(request.account_id)
+        # Task 5: use the EFFECTIVE account (derived from the resolved row, or
+        # the legacy strings on warm restart) — NOT the raw request.account_id.
+        # Driving this gate off the raw request would let a halted derived
+        # account be bypassed by sending a non-halted raw account_id alongside
+        # ``broker_account_id`` (the halt-bypass P1).
+        if await _account_halt_is_active(bus, effective_account_id):
+            outcome = EndpointOutcome.account_halt_active(effective_account_id)
             if reservation is not None:
                 await idem.release(reservation.redis_key)
             return _apply_outcome(outcome)
@@ -947,13 +1276,26 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
             )
 
         # -------------------------------------------------------------
-        # Load frozen revision + members (SELECT FOR UPDATE)
+        # Cheap deploy-eligibility checks on a NON-LOCKING revision read
         # -------------------------------------------------------------
+        # Council 2026-06-01 (bounded Option B): these checks (frozen-revision /
+        # strategy-found / non-empty-members / not-archived-strategy) run BEFORE
+        # STAGE-2's Key Vault read so a request that cannot deploy (e.g. a DRAFT
+        # revision) returns its 400/404/422 without ever poking the credential
+        # store. They read the revision WITHOUT ``FOR UPDATE``: a frozen revision
+        # is immutable (the partial unique index allows at most one unfrozen row
+        # per portfolio and freezing is one-way), so its values are stable without
+        # a row lock — and acquiring a row lock HERE, then committing inside the
+        # old STAGE-2 ``resolve_for_spawn``, was exactly the lock-release defect
+        # this fork fixes. The upsert-critical revision ``FOR UPDATE`` (serializing
+        # concurrent same-revision starts for the collision re-check) is acquired
+        # LATER, in the final critical section AFTER credential validation, and
+        # held through the upsert with no intervening commit.
         revision: LivePortfolioRevision | None = (
             await db.execute(
-                select(LivePortfolioRevision)
-                .where(LivePortfolioRevision.id == request.portfolio_revision_id)
-                .with_for_update()
+                select(LivePortfolioRevision).where(
+                    LivePortfolioRevision.id == request.portfolio_revision_id
+                )
             )
         ).scalar_one_or_none()
         if revision is None:
@@ -1041,6 +1383,73 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
                 ),
             )
 
+        # -------------------------------------------------------------
+        # Task 5: KV credential validation (STAGE 2 — credential read).
+        # -------------------------------------------------------------
+        # Council 2026-06-01 (bounded Option B): STAGE 2 reads the credential
+        # store to PROVE resolvability but performs NO commit and holds NO DB row
+        # lock — the KV read happens with no ``FOR UPDATE`` held, and the request
+        # session's transaction is never released by a mid-handler commit (the
+        # lock-invariant defect this fork fixes). It does NOT stamp
+        # ``credentials_last_accessed`` — that is deferred to the final upsert
+        # transaction below (atomic with the deployment row).
+        #
+        # Runs AFTER the idempotency reservation decided this request executes
+        # (not a cached/in-flight replay) AND after the cheap deploy-eligibility
+        # checks (frozen-revision / strategy-found / non-empty-members /
+        # not-archived) above — so a request that cannot deploy (e.g. a DRAFT
+        # revision) returns its 400/404/422 BEFORE any Key Vault read. The KV read
+        # runs at most once per executed request (a replay is short-circuited by
+        # the idempotency reservation). Only when an account was resolved (the
+        # legacy warm-restart path has ``broker_account is None``). On failure,
+        # fail closed; the cred reason was already counted inside
+        # ``resolve_for_spawn`` (SPAWN_FAILED) so we don't double-count here. The
+        # captured ``credentials_validated_version`` flows into STAGE 3's
+        # rotation-version comparison and the upsert stamp below.
+        credentials_validated_version: str | None = None
+        if effective.broker_account is not None:
+            broker_account_service = build_broker_account_service(http_request, db)
+            cred_validation = await validate_account_credentials(
+                effective.broker_account, broker_account_service
+            )
+            if not cred_validation.valid:
+                # Always release the reservation before raising, in BOTH the
+                # transient and permanent branches, so a retry is not stuck
+                # in-flight (P2-A).
+                if reservation is not None:
+                    await idem.release(reservation.redis_key)
+                if cred_validation.transient:
+                    # TRANSIENT infra failure (Key Vault throttled/unreachable at
+                    # deploy time) — retryable. Return 503 with a DISTINCT code so
+                    # operators retry rather than reading a deploy-time KV outage
+                    # as permanent invalid input (P2-A).
+                    _deploy_error(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "BROKER_ACCOUNT_CREDENTIALS_UNAVAILABLE",
+                        (
+                            f"Broker account {effective_account_id} credential "
+                            "store is temporarily unavailable "
+                            f"({cred_validation.reason}); retry shortly."
+                        ),
+                        {
+                            "account_id": effective_account_id,
+                            "reason": cred_validation.reason,
+                        },
+                    )
+                _deploy_error(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "BROKER_ACCOUNT_CREDENTIALS_INVALID",
+                    (
+                        f"Broker account {effective_account_id} credentials failed "
+                        f"validation: {cred_validation.reason}."
+                    ),
+                    {
+                        "account_id": effective_account_id,
+                        "reason": cred_validation.reason,
+                    },
+                )
+            credentials_validated_version = cred_validation.version
+
         # Pick the first member's strategy for the deployment row's strategy_id.
         first_strategy = strategies_by_id[members[0].strategy_id]
 
@@ -1056,35 +1465,153 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
         # -------------------------------------------------------------
         # Layer 3: Identity-based warm-restart upsert
         # -------------------------------------------------------------
+        # Task 5: identity recompute uses the EFFECTIVE account so the upsert's
+        # ``identity_signature`` matches the warm-restart lookup done at the top
+        # of the handler (and the binding resolver).
         identity = derive_portfolio_deployment_identity(
             user_id=user_id,
             portfolio_revision_id=request.portfolio_revision_id,
-            account_id=request.account_id,
+            account_id=effective_account_id,
             paper_trading=request.paper_trading,
-            ib_login_key=request.ib_login_key,
+            ib_login_key=effective_ib_login_key,
             user_sub=claims.get("sub"),
         )
         identity_signature = identity.signature()
 
+        slug = generate_deployment_slug()
+        now = datetime.now(UTC)
+        deployment_table = LiveDeployment.__table__
+
+        # =============================================================
+        # FINAL CRITICAL SECTION — one transaction, NO commit until the
+        # very end (council 2026-06-01, bounded Option B).
+        # =============================================================
+        # Lock ordering, established here AFTER STAGE-2 credential validation
+        # (which read Key Vault with NO lock held and NO commit):
+        #
+        #   1. revision ``FOR UPDATE`` — serializes concurrent starts for the
+        #      SAME portfolio revision (a superset of same-``(revision_id,
+        #      account_id)`` starts), so the ``(revision_id, account_id)``
+        #      collision re-check below runs UNDER a held lock and the loser
+        #      returns 422 ``LIVE_DEPLOY_CONFLICT`` deterministically — never a
+        #      raw ``IntegrityError`` 500. A frozen revision is immutable, so the
+        #      lock is purely a serialization point, not a value-staleness guard.
+        #   2. broker_accounts ``FOR UPDATE`` (STAGE 3, when an account was
+        #      resolved) — serializes START vs ARCHIVE / credential ROTATION on
+        #      THIS account's row.
+        #
+        # NO commit lies anywhere between these locks and the single ``db.commit()``
+        # after the upsert below — the lock-release defect this fork fixes was
+        # STAGE-2's ``resolve_for_spawn`` committing the shared request session
+        # mid-handler, which silently dropped any ``FOR UPDATE`` lock held before
+        # it. STAGE 2 no longer commits (``stamp_access=False``), so every lock
+        # taken here survives to the upsert.
+        await db.execute(
+            select(LivePortfolioRevision.id)
+            .where(LivePortfolioRevision.id == request.portfolio_revision_id)
+            .with_for_update()
+        )
+
+        # -------------------------------------------------------------
+        # STAGE 3: serialize START vs ARCHIVE / ROTATION on broker_accounts.
+        # -------------------------------------------------------------
+        # An operator could archive this account OR rotate its credentials AFTER
+        # STAGE-2 validation (which holds no lock) but BEFORE the deployment row
+        # below is inserted. Take a row-level ``FOR UPDATE`` lock on the
+        # broker_accounts row and RE-ASSERT ACTIVE here, inside this SAME
+        # transaction. Held until the upsert commits, this lock serializes us
+        # against ``BrokerAccountService.archive``'s matching ``FOR UPDATE`` on the
+        # same row: whoever commits first wins. If START commits first, archive
+        # then sees our active deployment and is blocked (409); if archive commits
+        # first, we re-read ARCHIVED here and fail closed BEFORE any insert/publish.
+        # The locked re-read (``populate_existing``) also surfaces the FRESH
+        # ``credentials_secret_version`` for the rotation guard. Only when an
+        # account was resolved (legacy warm-restart has ``broker_account is None``
+        # and is unaffected; its same-revision serialization is the revision lock
+        # above).
+        locked_broker_account: BrokerAccount | None = None
+        if effective.broker_account is not None:
+            active_recheck = await lock_and_assert_account_active(db, effective.broker_account.id)
+            if not active_recheck.valid:
+                if reservation is not None:
+                    await idem.release(reservation.redis_key)
+                DEPLOY_VALIDATION_FAILED.inc(
+                    account_id=effective_account_id, reason=active_recheck.reason or "archived"
+                )
+                _deploy_error(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "DEPLOY_VALIDATION_FAILED",
+                    (
+                        f"Broker account {effective_account_id} was archived "
+                        "before the deployment could be persisted. Re-activate "
+                        "or select a different account, then retry."
+                    ),
+                    {
+                        "account_id": effective_account_id,
+                        "reason": active_recheck.reason or "archived",
+                    },
+                )
+
+            # Credential-rotation race guard: STAGE 2 validated against
+            # ``credentials_validated_version``; the STAGE-3 locked re-read just
+            # surfaced the FRESH ``credentials_secret_version`` under the row lock.
+            # If a rotation committed in the STAGE-2→STAGE-3 window the two DIFFER
+            # — the deployment would otherwise be stamped/published as validated
+            # against a now-stale secret version. Fail closed RETRYABLE (409): the
+            # retry re-runs STAGE 2 against the new version. For ``legacy_env``
+            # rows both are NULL (NULL == NULL → no false trip). Comparison only
+            # when an account was resolved (legacy warm-restart has no version).
+            if active_recheck.current_version != credentials_validated_version:
+                if reservation is not None:
+                    await idem.release(reservation.redis_key)
+                DEPLOY_VALIDATION_FAILED.inc(
+                    account_id=effective_account_id, reason="credentials_rotated"
+                )
+                _deploy_error(
+                    status.HTTP_409_CONFLICT,
+                    "BROKER_ACCOUNT_CREDENTIALS_ROTATED",
+                    (
+                        f"Broker account {effective_account_id} credentials were "
+                        "rotated after validation but before the deployment could "
+                        "be persisted. Retry — the retry re-validates against the "
+                        "new credential version."
+                    ),
+                    {
+                        "account_id": effective_account_id,
+                        "reason": "credentials_rotated",
+                    },
+                )
+            # The locked, freshly-populated ORM instance (same identity-map object
+            # ``lock_and_assert_account_active`` re-read under the lock) — used
+            # below to stamp ``credentials_last_accessed`` atomically with the
+            # upsert (the deferred observability metadata STAGE 2 no longer stamps).
+            locked_broker_account = await db.get(BrokerAccount, effective.broker_account.id)
+
         # --------------------------------------------------------------
-        # UNIQUE(revision_id, account_id) pre-insert gate (Bug #1 fix).
-        # Changing ib_login_key produces a new identity_signature, but
-        # the row would still collide with the existing one on the
-        # (revision_id, account_id) UNIQUE constraint. Reject explicitly
-        # with 422 rather than surfacing IntegrityError to the caller —
-        # operator must archive/stop the existing row first.
-        # See docs/plans/2026-05-13-live-deploy-safety-trio.md §Bug #1.
+        # UNIQUE(revision_id, account_id) collision re-check — UNDER LOCK.
         # --------------------------------------------------------------
+        # Council 2026-06-01: this re-SELECT runs UNDER the held revision (and,
+        # when resolved, broker_accounts) ``FOR UPDATE`` lock, immediately before
+        # the upsert. Two concurrent same-``(revision_id, account_id)`` starts are
+        # serialized by the revision lock above; the loser observes the winner's
+        # committed row HERE and returns 422 ``LIVE_DEPLOY_CONFLICT`` rather than
+        # surfacing a raw ``IntegrityError`` 500 from the
+        # ``(revision_id, account_id)`` UNIQUE constraint. (Changing ib_login_key
+        # produces a new identity_signature, but the row would still collide on
+        # ``(revision_id, account_id)`` — operator must archive/stop the existing
+        # row first.) See docs/plans/2026-05-13-live-deploy-safety-trio.md §Bug #1.
         existing_collision = (
             await db.execute(
                 select(LiveDeployment).where(
                     LiveDeployment.portfolio_revision_id == request.portfolio_revision_id,
-                    LiveDeployment.account_id == request.account_id,
+                    LiveDeployment.account_id == effective_account_id,
                     LiveDeployment.identity_signature != identity_signature,
                 )
             )
         ).scalar_one_or_none()
         if existing_collision is not None:
+            if reservation is not None:
+                await idem.release(reservation.redis_key)
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail={
@@ -1101,7 +1628,7 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
                             "existing_status": existing_collision.status,
                             "existing_ib_login_key": existing_collision.ib_login_key,
                             "existing_paper_trading": existing_collision.paper_trading,
-                            "requested_ib_login_key": request.ib_login_key,
+                            "requested_ib_login_key": effective_ib_login_key,
                             "requested_paper_trading": request.paper_trading,
                             "hint": (
                                 "stop the existing deployment via POST /api/v1/live/stop, "
@@ -1112,10 +1639,13 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
                 },
             )
 
-        slug = generate_deployment_slug()
-        now = datetime.now(UTC)
-        deployment_table = LiveDeployment.__table__
-
+        # Task 5: persist the EFFECTIVE account on the row + (when an account
+        # was resolved) the broker-account linkage and credential-validation
+        # stamps. ``broker_account_id`` / ``credentials_validated_*`` are NULL
+        # on the legacy warm-restart path (no account resolved).
+        broker_account_id = (
+            effective.broker_account.id if effective.broker_account is not None else None
+        )
         stmt = pg_insert(LiveDeployment).values(
             strategy_id=first_strategy.id,
             status="starting",
@@ -1127,29 +1657,69 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
             identity_signature=identity_signature,
             trader_id=derive_trader_id(slug),
             strategy_id_full=derive_strategy_id_full(first_strategy.strategy_class, slug),
-            account_id=request.account_id,
-            ib_login_key=request.ib_login_key,
+            account_id=effective_account_id,
+            ib_login_key=effective_ib_login_key,
             message_bus_stream=derive_message_bus_stream(slug),
             portfolio_revision_id=request.portfolio_revision_id,
+            broker_account_id=broker_account_id,
+            credentials_validated_at=(now if effective.broker_account is not None else None),
+            credentials_validated_version=credentials_validated_version,
         )
         _active_statuses = ("starting", "building", "ready", "running")
+        # On a warm restart the DO UPDATE SET must persist the freshly-resolved
+        # broker linkage + credential-validation stamps — otherwise Postgres
+        # keeps the insert's values out of the row and the link/stamps would be
+        # silently discarded. Only overwrite them when an account was resolved
+        # for THIS request (``broker_account is not None``); on the legacy
+        # warm-restart path (no account resolved) leave the existing values
+        # untouched so an established link is never nulled out.
+        do_update_set: dict[str, Any] = {
+            "status": case(
+                (
+                    deployment_table.c.status.in_(_active_statuses),
+                    deployment_table.c.status,
+                ),
+                else_="starting",
+            ),
+            "last_started_at": now,
+        }
+        if effective.broker_account is not None:
+            do_update_set["broker_account_id"] = stmt.excluded.broker_account_id
+            do_update_set["credentials_validated_at"] = stmt.excluded.credentials_validated_at
+            do_update_set["credentials_validated_version"] = (
+                stmt.excluded.credentials_validated_version
+            )
         upsert_stmt = stmt.on_conflict_do_update(
             index_elements=[deployment_table.c.identity_signature],
-            set_={
-                "status": case(
-                    (
-                        deployment_table.c.status.in_(_active_statuses),
-                        deployment_table.c.status,
-                    ),
-                    else_="starting",
-                ),
-                "last_started_at": now,
-            },
+            set_=do_update_set,
         ).returning(deployment_table.c.id, deployment_table.c.deployment_slug)
         upsert_row = (await db.execute(upsert_stmt)).one()
         deployment_id = upsert_row.id
         is_warm_restart = upsert_row.deployment_slug != slug
+
+        # Deferred credential-access stamp (council 2026-06-01, bounded Option B):
+        # STAGE 2 no longer stamps ``credentials_last_accessed`` (it commits
+        # nothing). Stamp it HERE — on the still-locked broker_accounts row, atomic
+        # with the deployment upsert in this SAME transaction — so a SUCCESSFUL
+        # deploy records the access while a deploy that FAILED CLOSED after STAGE 2
+        # (archived 422 / rotation 409 / collision 422) leaves it UNCHANGED (those
+        # branches raise before reaching here). It is pure observability metadata;
+        # nothing branches on it, so deferring it costs nothing functionally.
+        if locked_broker_account is not None:
+            locked_broker_account.credentials_last_accessed = now
+
         await db.commit()
+
+        # Set the secret-age gauge AFTER the successful commit (metrics are not
+        # transactional). Skipped for ``legacy_env`` rows, which have no
+        # ``credentials_updated_at``. Mirrors the gauge ``resolve_for_spawn`` used
+        # to set on the data-plane (``stamp_access=True``) path.
+        if (
+            locked_broker_account is not None
+            and locked_broker_account.credentials_updated_at is not None
+        ):
+            age_seconds = (now - locked_broker_account.credentials_updated_at).total_seconds()
+            KV_SECRET_AGE.set(age_seconds, account_id=locked_broker_account.ib_account_id)
 
         deployment = await db.get(LiveDeployment, deployment_id)
         if deployment is None:
@@ -1582,7 +2152,7 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
                 resource_id=deployment.id,
                 details={
                     "portfolio_revision_id": str(request.portfolio_revision_id),
-                    "account_id": request.account_id,
+                    "account_id": effective_account_id,
                     "member_count": len(members),
                     "instruments": all_instruments,
                     "paper": request.paper_trading,
@@ -1615,8 +2185,9 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
             # and trips the supervisor's post-payload-factory account-halt
             # re-check lands here. Without this special case, the kind would
             # fall through to UNKNOWN and an unrelated 503 would be cached
-            # under the caller's Idempotency-Key.
-            outcome = EndpointOutcome.account_halt_active(request.account_id)
+            # under the caller's Idempotency-Key. Task 5: use the EFFECTIVE
+            # account (the one actually published), not the raw request.
+            outcome = EndpointOutcome.account_halt_active(effective_account_id)
             if reservation is not None:
                 await idem.release(reservation.redis_key)
             return _apply_outcome(outcome)
@@ -2819,6 +3390,9 @@ async def live_status(
                 # deployment_slug via the shared helper (no DB column needed).
                 account_id=d.account_id,
                 ib_login_key=d.ib_login_key,
+                # Task 5 — control-plane broker-account linkage (NULL for
+                # pre-registry / legacy deployments).
+                broker_account_id=d.broker_account_id,
                 ibg_client_id=(
                     derive_ibg_client_id(d.deployment_slug) if d.deployment_slug else None
                 ),
@@ -2910,6 +3484,7 @@ async def get_live_deployment_status(
         instruments=[],
         last_started_at=deployment.last_started_at,
         last_stopped_at=deployment.last_stopped_at,
+        broker_account_id=deployment.broker_account_id,
         process_id=process.id if process else None,
         pid=process.pid if process else None,
         host=process.host if process else None,
