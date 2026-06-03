@@ -37,3 +37,23 @@ KV_SECRET_AGE = _r.gauge(
     "msai_kv_secret_age_seconds",
     "Age in seconds of a broker account's stored credential secret (rotation enforcement)",
 )
+
+# Deploy-validation rejections at ``/live/start-portfolio`` (Task 5). The
+# cheap row-state stage (``validate_account_row_state``) is fail-closed: a
+# resolved broker account that is archived / mode-inconsistent / not routable /
+# not bound to its login blocks the deploy BEFORE any node spawns. Labeled by
+# account + reason at increment time via ``.inc(account_id=..., reason=...)``.
+#
+# STAGE-2 credential-validation rejections are split by reason:
+#   * ``archived`` (the defensive archived-between-stages branch in
+#     ``validate_account_credentials``) IS counted here — it is not counted
+#     anywhere else, so this is the only alert signal for it.
+#   * ``CredentialResolutionError`` (KV unreachable / unauthorized / missing) is
+#     NOT counted here — it is already counted inside ``resolve_for_spawn``
+#     (``SPAWN_FAILED``), so a single failure is never double-counted.
+# (There is intentionally no ``login_mismatch`` reason: ``ib_login_key`` is a
+# routing alias, not the TWS username, so a userid↔login check was removed.)
+DEPLOY_VALIDATION_FAILED = _r.counter(
+    "msai_broker_account_deploy_validation_failed_total",
+    "Broker account deploy-validation rejections by account and row-state reason",
+)

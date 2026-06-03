@@ -15,7 +15,7 @@ retry loop and duplicate detection depend on those partial indexes.
 from __future__ import annotations
 
 import pytest
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from msai.services.live.broker_account_service import (
     _GATEWAY_SLOT_CONSTRAINT,
@@ -369,15 +369,94 @@ async def test_archive_blocked_while_deployment_active(broker_db_session, tmp_pa
         )
     )
     await broker_db_session.commit()
+    # Capture the secret ref/version BEFORE the failed archive — the in-use
+    # guard now rolls back (P3 lock-release fix), which expires ORM attributes
+    # on ``acct``; reading them afterward would trigger a lazy reload.
+    acct_id = acct.id
+    secret_ref = acct.credentials_secret_ref
+    secret_version = acct.credentials_secret_version
     with pytest.raises(AccountInUseError):
-        await svc.archive(acct.id, actor="op@x")
+        await svc.archive(acct_id, actor="op@x")
     # secret NOT deleted — archive aborted before the store.delete
-    assert store.get(acct.credentials_secret_ref, acct.credentials_secret_version) == Credentials(
-        "u", "p"
-    )
+    assert store.get(secret_ref, secret_version) == Credentials("u", "p")
     # and the account is still active
-    refreshed = await svc.get(acct.id)
+    refreshed = await svc.get(acct_id)
     assert refreshed.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_archive_in_use_error_releases_row_lock(
+    broker_db_session, _broker_migrated_url, tmp_path
+):
+    # P3 (Codex review): archive() takes a SELECT ... FOR UPDATE on the
+    # broker_accounts row BEFORE the active-deployment guard. When that guard
+    # raises AccountInUseError it must roll back FIRST — otherwise a caller that
+    # catches the error and keeps the session open holds the row lock, blocking
+    # every subsequent start/archive for that account until session close.
+    # Prove the lock is released: after the failed archive (session left OPEN,
+    # mimicking a caller that catches and continues), an INDEPENDENT session can
+    # immediately acquire SELECT ... FOR UPDATE NOWAIT on the same row.
+    import secrets
+
+    from sqlalchemy import select as _select
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from msai.models.broker_account import BrokerAccount
+    from msai.models.live_deployment import LiveDeployment
+
+    store = EnvFileBrokerCredentialsStore(path=tmp_path / "c.json")
+    svc = BrokerAccountService(db=broker_db_session, store=store, slots=["slot-a"])
+    acct = await svc.create(
+        ib_account_id="DU1",
+        ib_login_key="L1",
+        trading_mode="paper",
+        gateway_slot=None,
+        creds=Credentials("u", "p"),
+        actor="op@x",
+    )
+    revision = await _seed_portfolio_revision(broker_db_session)
+    slug = secrets.token_hex(8)
+    broker_db_session.add(
+        LiveDeployment(
+            account_id="DU1",
+            ib_login_key="L1",
+            status="running",
+            deployment_slug=slug,
+            identity_signature=secrets.token_hex(32),
+            trader_id=f"MSAI-{slug}",
+            strategy_id_full=f"EMACrossStrategy-{slug}",
+            portfolio_revision_id=revision.id,
+            message_bus_stream=f"trader-MSAI-{slug}-stream",
+        )
+    )
+    await broker_db_session.commit()
+    acct_id = acct.id
+
+    # ACT: archive raises (active deployment present). The session is deliberately
+    # left OPEN afterward — a caller that catches AccountInUseError and continues.
+    with pytest.raises(AccountInUseError):
+        await svc.archive(acct_id, actor="op@x")
+
+    # ASSERT: the row lock was released. An independent connection acquires
+    # FOR UPDATE NOWAIT without blocking/raising — impossible if archive() leaked
+    # the lock by raising before rollback.
+    probe_engine = create_async_engine(_broker_migrated_url)
+    probe_factory = async_sessionmaker(probe_engine, expire_on_commit=False)
+    try:
+        async with probe_factory() as probe:
+            locked = (
+                await probe.execute(
+                    _select(BrokerAccount.id)
+                    .where(BrokerAccount.id == acct_id)
+                    .with_for_update(nowait=True)
+                )
+            ).scalar_one_or_none()
+            assert locked == acct_id
+            await probe.rollback()
+    except DBAPIError as exc:  # pragma: no cover - failure path
+        pytest.fail(f"archive() leaked the FOR UPDATE row lock after AccountInUseError: {exc}")
+    finally:
+        await probe_engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -415,10 +494,365 @@ async def test_archive_blocked_by_deployment_under_different_login_key(broker_db
         )
     )
     await broker_db_session.commit()
+    # Capture the id BEFORE the failed archive — the in-use guard now rolls back
+    # (P3 lock-release fix), expiring ORM attributes on ``acct``.
+    acct_id = acct.id
     with pytest.raises(AccountInUseError):
-        await svc.archive(acct.id, actor="op@x")
-    refreshed = await svc.get(acct.id)
+        await svc.archive(acct_id, actor="op@x")
+    refreshed = await svc.get(acct_id)
     assert refreshed.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_lock_and_assert_active_archived_row_fails_closed(broker_db_session, tmp_path):
+    # STAGE-3 deploy re-check helper: an ARCHIVED row read under FOR UPDATE must
+    # fail closed (reason="archived") so the start handler never inserts a row /
+    # publishes START for an account archived in the deploy/archive race window.
+    from msai.services.live.deployment_account_resolver import lock_and_assert_account_active
+
+    store = EnvFileBrokerCredentialsStore(path=tmp_path / "c.json")
+    svc = BrokerAccountService(db=broker_db_session, store=store, slots=["slot-a"])
+    acct = await svc.create(
+        ib_account_id="DU1",
+        ib_login_key="L1",
+        trading_mode="paper",
+        gateway_slot=None,
+        creds=Credentials("u", "p"),
+        actor="op@x",
+    )
+    # ACTIVE row → valid under the lock.
+    ok = await lock_and_assert_account_active(broker_db_session, acct.id)
+    assert ok.valid is True
+    await broker_db_session.commit()
+
+    # Archive it, then the locked re-check must fail closed.
+    await svc.archive(acct.id, actor="op@x")
+    rejected = await lock_and_assert_account_active(broker_db_session, acct.id)
+    assert rejected.valid is False
+    assert rejected.reason == "archived"
+    await broker_db_session.commit()
+
+    # An unknown id is likewise fail-closed (no row → archived).
+    import uuid
+
+    gone = await lock_and_assert_account_active(broker_db_session, uuid.uuid4())
+    assert gone.valid is False
+    assert gone.reason == "archived"
+
+
+@pytest.mark.asyncio
+async def test_lock_and_assert_active_reads_fresh_version_after_committed_rotation(
+    broker_db_session, _broker_migrated_url, tmp_path
+):
+    # FRESHNESS: lock_and_assert_account_active must reflect column values
+    # COMMITTED by another session (a credential rotation), NOT a stale value
+    # cached in this session's identity map. Session A reads the row once
+    # (populating its identity map with version v1), session B rotates to a new
+    # version + commits, then session A's locked re-read must surface the NEW
+    # version via populate_existing — proving the STAGE-3 read is not stale.
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from msai.models.broker_account import BrokerAccount
+    from msai.services.live.deployment_account_resolver import lock_and_assert_account_active
+
+    store = EnvFileBrokerCredentialsStore(path=tmp_path / "c.json")
+    svc = BrokerAccountService(db=broker_db_session, store=store, slots=["slot-a"])
+    acct = await svc.create(
+        ib_account_id="DU1",
+        ib_login_key="L1",
+        trading_mode="paper",
+        gateway_slot=None,
+        creds=Credentials("u", "p"),
+        actor="op@x",
+    )
+    await broker_db_session.commit()
+    acct_id = acct.id
+    v1 = acct.credentials_secret_version
+    assert v1 is not None
+
+    # Session A: prime the identity map with the v1 row (a stale-cache trap).
+    primed = await broker_db_session.get(BrokerAccount, acct_id)
+    assert primed is not None
+    assert primed.credentials_secret_version == v1
+
+    # Session B (independent engine/connection): rotate → new committed version.
+    other_engine = create_async_engine(_broker_migrated_url)
+    other_factory = async_sessionmaker(other_engine, expire_on_commit=False)
+    try:
+        async with other_factory() as other:
+            other_svc = BrokerAccountService(db=other, store=store, slots=["slot-a"])
+            rotated = await other_svc.rotate(acct_id, creds=Credentials("u2", "p2"), actor="op@x")
+            v2 = rotated.credentials_secret_version
+        assert v2 is not None
+        assert v2 != v1
+    finally:
+        await other_engine.dispose()
+
+    # Session A's locked re-check must surface the FRESH v2, not the primed v1.
+    res = await lock_and_assert_account_active(broker_db_session, acct_id)
+    assert res.valid is True
+    assert res.current_version == v2
+    await broker_db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_archive_serializes_against_concurrent_start_via_for_update(
+    broker_db_session, _broker_migrated_url, tmp_path
+):
+    # Deterministic deploy/archive serialization: a START transaction holds the
+    # broker_accounts FOR UPDATE lock AND inserts an active deployment (uncommitted);
+    # a concurrent archive() blocks on that row lock. When START commits, archive
+    # unblocks, sees the now-committed active deployment, and is REJECTED
+    # (AccountInUseError). This proves the two operations serialize on the row lock
+    # and that "start commits first" → archive is blocked.
+    import asyncio
+    import secrets
+
+    from sqlalchemy import select as _select
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from msai.models.broker_account import BrokerAccount
+    from msai.models.live_deployment import LiveDeployment
+
+    store = EnvFileBrokerCredentialsStore(path=tmp_path / "c.json")
+    svc = BrokerAccountService(db=broker_db_session, store=store, slots=["slot-a"])
+    acct = await svc.create(
+        ib_account_id="DU1",
+        ib_login_key="L1",
+        trading_mode="paper",
+        gateway_slot=None,
+        creds=Credentials("u", "p"),
+        actor="op@x",
+    )
+    revision = await _seed_portfolio_revision(broker_db_session)
+    await broker_db_session.commit()
+    acct_id = acct.id
+    revision_id = revision.id
+
+    # Second engine → independent connection/transaction for the concurrent archive.
+    archive_engine = create_async_engine(_broker_migrated_url)
+    archive_factory = async_sessionmaker(archive_engine, expire_on_commit=False)
+    start_engine = create_async_engine(_broker_migrated_url)
+    start_factory = async_sessionmaker(start_engine, expire_on_commit=False)
+
+    archive_blocked = asyncio.Event()
+    start_committed = asyncio.Event()
+    archive_raised: list[BaseException] = []
+
+    try:
+        async with start_factory() as start_session:
+            # START tx: take the FOR UPDATE lock on the broker row, then INSERT an
+            # active deployment — exactly the handler's STAGE-3 lock + upsert order.
+            await start_session.execute(
+                _select(BrokerAccount.id).where(BrokerAccount.id == acct_id).with_for_update()
+            )
+            slug = secrets.token_hex(8)
+            start_session.add(
+                LiveDeployment(
+                    account_id="DU1",
+                    ib_login_key="L1",
+                    status="starting",
+                    deployment_slug=slug,
+                    identity_signature=secrets.token_hex(32),
+                    trader_id=f"MSAI-{slug}",
+                    strategy_id_full=f"EMACrossStrategy-{slug}",
+                    portfolio_revision_id=revision_id,
+                    message_bus_stream=f"trader-MSAI-{slug}-stream",
+                )
+            )
+            await start_session.flush()  # rows present in START's tx, NOT yet committed
+
+            async def _concurrent_archive() -> None:
+                async with archive_factory() as archive_session:
+                    archive_svc = BrokerAccountService(
+                        db=archive_session, store=store, slots=["slot-a"]
+                    )
+                    archive_blocked.set()  # about to attempt the lock → will block
+                    try:
+                        await archive_svc.archive(acct_id, actor="op@x")
+                    except BaseException as exc:  # noqa: BLE001 — capture for assertion
+                        archive_raised.append(exc)
+
+            archive_task = asyncio.create_task(_concurrent_archive())
+
+            # Give the archive task time to reach + block on the FOR UPDATE lock.
+            await archive_blocked.wait()
+            await asyncio.sleep(0.5)
+            assert not archive_task.done(), "archive should be BLOCKED on the row lock"
+
+            # START commits first → it wins; its active deployment is now visible.
+            await start_session.commit()
+            start_committed.set()
+
+        # archive now unblocks; it must see the active deployment and be REJECTED.
+        await asyncio.wait_for(archive_task, timeout=10)
+        assert len(archive_raised) == 1
+        assert isinstance(archive_raised[0], AccountInUseError)
+
+        # The account is still ACTIVE (archive was blocked from committing).
+        async with archive_factory() as verify:
+            row = await verify.get(BrokerAccount, acct_id)
+            assert row is not None
+            assert row.status == "active"
+    finally:
+        await archive_engine.dispose()
+        await start_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_archive_reads_fresh_backend_under_lock_deletes_promoted_secret(
+    broker_db_session, _broker_migrated_url, tmp_path
+):
+    # Codex iter-16 P1 (stale-ORM-after-FOR-UPDATE): archive() must read
+    # credentials_backend/secret_ref from the row RE-READ under the FOR UPDATE
+    # lock (populate_existing), NOT a stale identity-map cache. A concurrent
+    # legacy->managed promotion that commits while archive holds a pre-lock cache
+    # would otherwise leave archive seeing LEGACY_ENV, skip deleting the
+    # just-promoted managed secret, and orphan it. This test pins the row into
+    # archive's session cache as legacy_env, promotes it via a SECOND session,
+    # then asserts archive deletes the managed secret (proving it read fresh).
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from msai.models.broker_account import CredentialsBackend
+
+    store = EnvFileBrokerCredentialsStore(path=tmp_path / "c.json")
+    account_id = await _insert_legacy_row(broker_db_session, ref="env:TWS_USERID|TWS_PASSWORD")
+    svc = BrokerAccountService(db=broker_db_session, store=store, slots=["ib-gateway"])
+    # Pin the legacy_env row into THIS session's identity map (un-expired). The
+    # archive() below calls self.get() which hits this cache → stale legacy_env
+    # unless the FOR UPDATE re-read refreshes it.
+    cached = await svc.get(account_id)
+    assert cached.credentials_backend == CredentialsBackend.LEGACY_ENV
+
+    promote_engine = create_async_engine(_broker_migrated_url)
+    promote_factory = async_sessionmaker(promote_engine, expire_on_commit=False)
+    try:
+        async with promote_factory() as promote_session:
+            promote_svc = BrokerAccountService(
+                db=promote_session, store=store, slots=["ib-gateway"]
+            )
+            promoted = await promote_svc.rotate(
+                account_id, creds=Credentials("newu", "newp"), actor="rot@x"
+            )
+            managed_ref = promoted.credentials_secret_ref
+            managed_version = promoted.credentials_secret_version
+        # The promoted managed secret is readable BEFORE archive.
+        assert store.get(managed_ref, managed_version) == Credentials("newu", "newp")
+
+        # archive() on the first session: its get() returns the cached legacy_env,
+        # but the FOR UPDATE re-read (populate_existing) must surface the fresh
+        # managed backend → archive DELETES the managed secret.
+        archived = await svc.archive(account_id, actor="op@x")
+        assert archived.status == "archived"
+
+        # Distinguishing assertion: the managed secret is GONE (archive read the
+        # fresh managed backend, not the stale legacy_env that would skip delete).
+        with pytest.raises(CredentialResolutionError) as exc:
+            store.get(managed_ref, managed_version)
+        assert exc.value.reason == KvFailureReason.NOT_FOUND
+    finally:
+        await promote_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_rotate_rejects_account_archived_by_concurrent_session_under_lock(
+    broker_db_session, _broker_migrated_url, tmp_path
+):
+    # Codex iter-16 P1 sibling: rotate() must re-check ARCHIVED status under the
+    # FOR UPDATE lock (populate_existing), NOT a stale identity-map cache. With a
+    # stale ACTIVE cache, rotate would promote/write a managed secret onto a row
+    # another session just archived — orphaning the secret and violating the
+    # archived invariant. Pin the ACTIVE row into rotate's session cache, archive
+    # it via a SECOND session, then assert rotate fails closed.
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    store = EnvFileBrokerCredentialsStore(path=tmp_path / "c.json")
+    svc = BrokerAccountService(db=broker_db_session, store=store, slots=["slot-a"])
+    # create() leaves the ACTIVE row un-expired in THIS session's identity map.
+    acct = await svc.create(
+        ib_account_id="DU1",
+        ib_login_key="L1",
+        trading_mode="paper",
+        gateway_slot=None,
+        creds=Credentials("u", "p"),
+        actor="op@x",
+    )
+    account_id = acct.id
+
+    archive_engine = create_async_engine(_broker_migrated_url)
+    archive_factory = async_sessionmaker(archive_engine, expire_on_commit=False)
+    try:
+        async with archive_factory() as archive_session:
+            archive_svc = BrokerAccountService(db=archive_session, store=store, slots=["slot-a"])
+            archived = await archive_svc.archive(account_id, actor="op@x")
+            assert archived.status == "archived"
+
+        # rotate() on the first session: its get() returns the cached ACTIVE row,
+        # but the FOR UPDATE re-read must surface ARCHIVED → fail closed.
+        with pytest.raises(AccountArchivedError):
+            await svc.rotate(account_id, creds=Credentials("newu", "newp"), actor="rot@x")
+    finally:
+        await archive_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_rotate_store_failure_releases_row_lock(
+    broker_db_session, _broker_migrated_url, tmp_path
+):
+    # Codex iter-17 P2: rotate() now takes a FOR UPDATE lock BEFORE the store
+    # write. A store failure must roll back to release that lock — otherwise a
+    # caller that catches the error and keeps the session open blocks every
+    # subsequent start/archive/rotate for the account. (Before rotate() took the
+    # lock this path held none, so a store failure leaked nothing.) Prove release:
+    # after a store-failed rotate (session left OPEN), an INDEPENDENT session can
+    # immediately acquire SELECT ... FOR UPDATE NOWAIT on the same row.
+    from sqlalchemy import select as _select
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from msai.models.broker_account import BrokerAccount
+
+    store = EnvFileBrokerCredentialsStore(path=tmp_path / "c.json")
+    svc = BrokerAccountService(db=broker_db_session, store=store, slots=["slot-a"])
+    acct = await svc.create(
+        ib_account_id="DU1",
+        ib_login_key="L1",
+        trading_mode="paper",
+        gateway_slot=None,
+        creds=Credentials("u", "p"),
+        actor="op@x",
+    )
+    acct_id = acct.id
+
+    # Make the store write fail (managed account → rotate() hits store.rotate()).
+    def _boom(*_a: object, **_k: object) -> object:
+        raise CredentialResolutionError(KvFailureReason.UNREACHABLE, "broker-cred", "kv down")
+
+    store.rotate = _boom  # type: ignore[method-assign]
+
+    with pytest.raises(CredentialResolutionError):
+        await svc.rotate(acct_id, creds=Credentials("newu", "newp"), actor="rot@x")
+
+    # ASSERT: the FOR UPDATE row lock acquired by rotate() was released on the
+    # store failure. An independent connection acquires FOR UPDATE NOWAIT without
+    # blocking/raising — impossible if rotate() leaked the lock by raising before
+    # rollback.
+    probe_engine = create_async_engine(_broker_migrated_url)
+    probe_factory = async_sessionmaker(probe_engine, expire_on_commit=False)
+    try:
+        async with probe_factory() as probe:
+            locked = (
+                await probe.execute(
+                    _select(BrokerAccount.id)
+                    .where(BrokerAccount.id == acct_id)
+                    .with_for_update(nowait=True)
+                )
+            ).scalar_one_or_none()
+            assert locked == acct_id
+            await probe.rollback()
+    except DBAPIError as exc:  # pragma: no cover - failure path
+        pytest.fail(f"rotate() leaked the FOR UPDATE row lock after a store failure: {exc}")
+    finally:
+        await probe_engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -446,7 +880,9 @@ async def test_rotate_legacy_env_promotes_to_managed_backend(broker_db_session, 
     ) == Credentials("newu", "newp")
     # ... and resolve_for_spawn now reads via the store (no longer the env path).
     resolved = await svc.resolve_for_spawn(account_id)
-    assert resolved == Credentials("newu", "newp")
+    assert resolved.creds == Credentials("newu", "newp")
+    # version_used reflects the pinned version actually read against the store.
+    assert resolved.version_used == rotated.credentials_secret_version
 
 
 @pytest.mark.asyncio
@@ -463,10 +899,156 @@ async def test_resolve_for_spawn_stamps_last_accessed_and_returns_creds(
         creds=Credentials("u", "p"),
         actor="op@x",
     )
-    creds = await svc.resolve_for_spawn(acct.id)
-    assert creds == Credentials("u", "p")
+    resolved = await svc.resolve_for_spawn(acct.id)
+    assert resolved.creds == Credentials("u", "p")
+    # version_used is the pinned version the store read used (a managed-backend row).
+    assert resolved.version_used == acct.credentials_secret_version
     refreshed = await svc.get(acct.id)
     assert refreshed.credentials_last_accessed is not None
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_spawn_stamp_access_false_does_not_commit_or_stamp(
+    broker_db_session, _broker_migrated_url, tmp_path
+):
+    # Council 2026-06-01 (bounded Option B): the DEPLOY-GATE path calls
+    # resolve_for_spawn(stamp_access=False). It must read the store (return creds
+    # + version) but NEITHER commit the request session NOR stamp
+    # credentials_last_accessed — so the caller can hold a FOR UPDATE lock across
+    # the validation (no mid-handler commit releases it) and persist the
+    # last-accessed stamp itself in its final transaction.
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from msai.models.broker_account import BrokerAccount
+
+    store = EnvFileBrokerCredentialsStore(path=tmp_path / "c.json")
+    svc = BrokerAccountService(db=broker_db_session, store=store, slots=["slot-a"])
+    acct = await svc.create(
+        ib_account_id="DU1",
+        ib_login_key="L1",
+        trading_mode="paper",
+        gateway_slot=None,
+        creds=Credentials("u", "p"),
+        actor="op@x",
+    )
+    await broker_db_session.commit()
+    acct_id = acct.id
+    assert acct.credentials_last_accessed is None
+
+    # Spy on the SESSION's commit so we can prove the no-stamp path never commits.
+    commit_calls: list[int] = []
+    real_commit = broker_db_session.commit
+
+    async def _spy_commit() -> None:
+        commit_calls.append(1)
+        await real_commit()
+
+    broker_db_session.commit = _spy_commit  # type: ignore[method-assign]
+    try:
+        resolved = await svc.resolve_for_spawn(acct_id, stamp_access=False)
+    finally:
+        broker_db_session.commit = real_commit  # type: ignore[method-assign]
+
+    # Creds + version were resolved exactly as on the stamping path ...
+    assert resolved.creds == Credentials("u", "p")
+    assert resolved.version_used == acct.credentials_secret_version
+    # ... but NO commit happened on the request session ...
+    assert commit_calls == [], "stamp_access=False must NOT commit the request session"
+    # ... and credentials_last_accessed was NOT written in-memory ...
+    assert acct.credentials_last_accessed is None
+    # ... nor durably (a fresh independent connection sees the unstamped row).
+    verify_engine = create_async_engine(_broker_migrated_url)
+    verify_factory = async_sessionmaker(verify_engine, expire_on_commit=False)
+    try:
+        async with verify_factory() as verify:
+            durable = await verify.get(BrokerAccount, acct_id)
+            assert durable is not None
+            assert durable.credentials_last_accessed is None
+    finally:
+        await verify_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_spawn_stamp_access_false_archived_fails_closed_no_stamp(
+    broker_db_session, tmp_path
+):
+    # The deploy-gate (stamp_access=False) path still fails closed on an ARCHIVED
+    # account (archived-race guard) and never stamps last_accessed.
+
+    store = EnvFileBrokerCredentialsStore(path=tmp_path / "c.json")
+    svc = BrokerAccountService(db=broker_db_session, store=store, slots=["slot-a"])
+    acct = await svc.create(
+        ib_account_id="DU1",
+        ib_login_key="L1",
+        trading_mode="paper",
+        gateway_slot=None,
+        creds=Credentials("u", "p"),
+        actor="op@x",
+    )
+    await svc.archive(acct.id, actor="op@x")
+    acct_id = acct.id
+    with pytest.raises(AccountArchivedError):
+        await svc.resolve_for_spawn(acct_id, stamp_access=False)
+    refreshed = await svc.get(acct_id)
+    assert refreshed.credentials_last_accessed is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_spawn_version_used_is_store_read_version_not_post_call_orm(
+    broker_db_session, tmp_path
+):
+    # Regression (P2 credential-version-reporting race): resolve_for_spawn must
+    # return the version it ACTUALLY READ AGAINST (the value passed to
+    # store.get(ref, version)), NOT the credentials_secret_version ORM attribute
+    # read AFTER the store call / post-commit refresh. If a credential ROTATION
+    # commits a NEWER version onto the row while resolve_for_spawn is executing,
+    # the post-call ORM attribute reflects the new version (v2) but only v1's
+    # creds were resolved. version_used must be v1, so the STAGE-3 rotation guard
+    # (current_version v2 != reported v1) fires instead of being defeated.
+    #
+    # Deterministic simulation: a spy store CAPTURES the version arg it was called
+    # with (the v1 read), then — mid-resolve, right after the read — MUTATES the
+    # in-session acct.credentials_secret_version to "v2" (the rotation landing).
+    # version_used must still be the captured store-read version (v1), proving it
+    # was NOT re-read from the now-rotated ORM attribute.
+    captured_versions: list[str | None] = []
+
+    class _RotatingSpyStore(EnvFileBrokerCredentialsStore):
+        def __init__(self, *args, target_account=None, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            super().__init__(*args, **kwargs)
+            self._target_account = target_account
+
+        def get(self, secret_ref, version):  # noqa: ANN001 — match base signature
+            captured_versions.append(version)
+            creds = super().get(secret_ref, version)
+            # Simulate a concurrent rotation committing a NEWER version onto the
+            # row AFTER this read but BEFORE resolve_for_spawn reports a version.
+            if self._target_account is not None:
+                self._target_account.credentials_secret_version = "v2-rotated"
+            return creds
+
+    store = _RotatingSpyStore(path=tmp_path / "c.json")
+    svc = BrokerAccountService(db=broker_db_session, store=store, slots=["slot-a"])
+    acct = await svc.create(
+        ib_account_id="DU1",
+        ib_login_key="L1",
+        trading_mode="paper",
+        gateway_slot=None,
+        creds=Credentials("u", "p"),
+        actor="op@x",
+    )
+    v1 = acct.credentials_secret_version
+    assert v1 is not None
+    store._target_account = acct  # arm the mid-read rotation against THIS row
+
+    resolved = await svc.resolve_for_spawn(acct.id)
+
+    # The store was read against v1 (the pre-rotation pinned version) ...
+    assert captured_versions == [v1]
+    # ... and version_used is THAT v1, NOT the rotated ORM attribute ("v2-rotated").
+    assert resolved.version_used == v1
+    assert resolved.version_used != "v2-rotated"
+    assert resolved.creds == Credentials("u", "p")
 
 
 @pytest.mark.asyncio
@@ -541,6 +1123,68 @@ async def test_resolve_for_spawn_on_archived_legacy_env_raises_no_creds_no_stamp
         await svc.resolve_for_spawn(account_id)
     refreshed = await svc.get(account_id)
     assert refreshed.credentials_last_accessed is None  # not stamped
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_spawn_with_stale_active_identity_map_refreshes_and_fails_closed(
+    broker_db_session, _broker_migrated_url, tmp_path
+):
+    # STAGE-2 stale-ORM race: the account is loaded ACTIVE into session A's
+    # identity map (mirroring _resolve_effective_account in STAGE-1), then a
+    # CONCURRENT request archives + commits it via an independent session B.
+    # resolve_for_spawn on session A must NOT trust the cached ACTIVE instance —
+    # it must re-read committed state, see ARCHIVED, raise AccountArchivedError,
+    # and (the invariant this guards) NOT read credentials nor stamp
+    # credentials_last_accessed. The store .get must never be called.
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    class _GetSpyStore(EnvFileBrokerCredentialsStore):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.get_calls: list[tuple] = []
+
+        def get(self, ref, version):  # noqa: ANN001 — match base signature
+            self.get_calls.append((ref, version))
+            return super().get(ref, version)
+
+    store = _GetSpyStore(path=tmp_path / "c.json")
+    svc = BrokerAccountService(db=broker_db_session, store=store, slots=["slot-a"])
+    acct = await svc.create(
+        ib_account_id="DU1",
+        ib_login_key="L1",
+        trading_mode="paper",
+        gateway_slot=None,
+        creds=Credentials("u", "p"),
+        actor="op@x",
+    )
+    await broker_db_session.commit()
+    acct_id = acct.id
+
+    # Load the row ACTIVE into session A's identity map (STAGE-1 effect). After
+    # this, plain self._db.get() would return THIS cached ACTIVE instance.
+    cached = await svc.get(acct_id)
+    assert cached.status == "active"  # StrEnum stored as String(32)
+    last_accessed_before = cached.credentials_last_accessed
+
+    # Concurrent request archives + COMMITS via an independent engine/session.
+    archive_engine = create_async_engine(_broker_migrated_url)
+    archive_factory = async_sessionmaker(archive_engine, expire_on_commit=False)
+    try:
+        async with archive_factory() as archive_session:
+            archive_svc = BrokerAccountService(db=archive_session, store=store, slots=["slot-a"])
+            await archive_svc.archive(acct_id, actor="op@x")
+
+        # Session A still holds the stale ACTIVE instance in its identity map.
+        # resolve_for_spawn must re-read committed state and fail closed.
+        with pytest.raises(AccountArchivedError):
+            await svc.resolve_for_spawn(acct_id)
+
+        # Invariant: no credential read, no last_accessed stamp on the archived row.
+        assert store.get_calls == [], "archived account must not touch the credential store"
+        refreshed = await svc.get(acct_id)
+        assert refreshed.credentials_last_accessed == last_accessed_before
+    finally:
+        await archive_engine.dispose()
 
 
 class _CommitFailsSession:
@@ -926,8 +1570,10 @@ async def test_resolve_for_spawn_legacy_env_reads_paired_keys(
     store = EnvFileBrokerCredentialsStore(path=tmp_path / "c.json")
     svc = BrokerAccountService(db=broker_db_session, store=store, slots=["ib-gateway"])
     account_id = await _insert_legacy_row(broker_db_session, ref="env:TWS_USERID|TWS_PASSWORD")
-    creds = await svc.resolve_for_spawn(account_id)
-    assert creds == Credentials("legacyuser", "legacypass")
+    resolved = await svc.resolve_for_spawn(account_id)
+    assert resolved.creds == Credentials("legacyuser", "legacypass")
+    # legacy_env rows have no pinned version — version_used is None.
+    assert resolved.version_used is None
 
 
 @pytest.mark.asyncio

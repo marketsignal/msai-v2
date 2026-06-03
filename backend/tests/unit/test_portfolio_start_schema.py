@@ -56,11 +56,17 @@ def test_portfolio_start_request_paper_trading_override() -> None:
     assert req.paper_trading is False
 
 
-def test_portfolio_start_request_ib_login_key_required() -> None:
-    """Bug #1 (live-deploy-safety-trio): ib_login_key must be required by the
-    API schema (the DB column has been NOT NULL since PR #3). Sending the
-    request without it should produce a 422 (Pydantic validation error),
-    not the previous 500 / IntegrityError surface."""
+def test_portfolio_start_request_account_id_without_login_key_rejected() -> None:
+    """Bug #1 (live-deploy-safety-trio) preserved under the broker-account-spawn-wiring
+    either/or contract: an account_id without its ib_login_key (and without a
+    broker_account_id selector) must still be rejected at the schema with a 422
+    (Pydantic ValidationError), not a 500 / IntegrityError downstream.
+
+    Since broker-account-spawn-wiring made the legacy strings optional and moved the
+    invariant into the ``_require_account_selector`` model_validator, the failure is
+    now a model-level value_error ("provide broker_account_id, or both account_id and
+    ib_login_key") rather than a field-level ``ib_login_key`` missing error — but the
+    user-facing outcome (422, not 500) is unchanged."""
     import pytest
     from pydantic import ValidationError
 
@@ -70,7 +76,10 @@ def test_portfolio_start_request_ib_login_key_required() -> None:
             account_id="DU123",
         )
     errors = exc_info.value.errors()
-    assert any(e["loc"] == ("ib_login_key",) and e["type"] == "missing" for e in errors)
+    # Either/or invariant fired (model-level), and no usable identity was accepted.
+    assert any(
+        e["type"] == "value_error" and "broker_account_id" in str(e.get("msg", "")) for e in errors
+    )
 
 
 def test_portfolio_start_request_ib_login_key_accepts_value() -> None:

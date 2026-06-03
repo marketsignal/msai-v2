@@ -28,6 +28,41 @@ class KvFailureReason(StrEnum):
     DECRYPT_FAILED = "decrypt_failed"
 
 
+# TRANSIENT (retryable) credential-resolution failures: a deploy-time Key Vault
+# outage — throttling (HTTP 429) or unreachability (network/timeout/unknown HTTP
+# error; ``classify_kv_exception`` fail-safes both ServiceRequestError and
+# unknown HttpResponseError to UNREACHABLE) — is an infrastructure blip, NOT
+# invalid input. Callers map these to HTTP 503 so operators retry.
+#
+# Everything else is PERMANENT (genuinely misconfigured / invalid input → 422):
+#   * UNAUTHORIZED   — RBAC / identity misconfiguration; retrying as-is won't help
+#   * NOT_FOUND      — the secret or pinned version does not exist
+#   * DECRYPT_FAILED — malformed payload / missing pinned version
+#
+# Kept as an explicit frozenset next to the enum (not inferred per call) so the
+# transient/permanent split is auditable in one place.
+TRANSIENT_KV_REASONS: frozenset[KvFailureReason] = frozenset(
+    {KvFailureReason.THROTTLED, KvFailureReason.UNREACHABLE}
+)
+
+
+def is_transient_kv_reason(reason: KvFailureReason | str | None) -> bool:
+    """Return True if ``reason`` is a TRANSIENT (retryable) KV failure.
+
+    Accepts a :class:`KvFailureReason`, its ``.value`` string, or any other
+    coarse reason code (row-state reasons like ``"archived"`` /
+    ``"route_not_found"``). Non-KV / unknown reasons are NEVER transient — they
+    are permanent by construction, so a malformed reason fails closed to 422.
+    """
+    if reason is None:
+        return False
+    try:
+        return KvFailureReason(reason) in TRANSIENT_KV_REASONS
+    except ValueError:
+        # Not a KvFailureReason value (e.g. a row-state reason) — never transient.
+        return False
+
+
 class CredentialResolutionError(RuntimeError):
     """Raised when reading/writing credentials fails. `reason` maps to SPAWN_FAILED_PERMANENT."""
 
@@ -41,6 +76,28 @@ class CredentialResolutionError(RuntimeError):
 class Credentials:
     tws_userid: str
     tws_password: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedSpawnCredentials:
+    """Outcome of :meth:`BrokerAccountService.resolve_for_spawn`.
+
+    ``creds`` is the resolved credential material. ``version_used`` is the EXACT
+    secret version that was passed to ``store.get(ref, version)`` for the read
+    that produced ``creds`` (``None`` for ``legacy_env`` rows, whose version is
+    legitimately NULL).
+
+    ``version_used`` is captured AT the store-read call site — BEFORE the
+    post-commit ``refresh`` — so it reflects the version this request actually
+    resolved, NOT a NEWER version that a concurrent credential rotation may have
+    committed onto the row while ``resolve_for_spawn`` was executing. Reporting
+    the post-call ORM attribute instead would let a rotation race defeat the
+    STAGE-3 ``current_version`` equality check in ``api/live.py`` (it would
+    compare v2-against-v2 even though only v1's creds were resolved).
+    """
+
+    creds: Credentials
+    version_used: str | None
 
 
 @dataclass(frozen=True, slots=True)

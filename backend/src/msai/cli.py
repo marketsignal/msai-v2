@@ -150,6 +150,86 @@ def _fail(message: str, *, code: int = 1) -> None:
     raise typer.Exit(code=code)
 
 
+def _resolve_cli_account_payload(
+    *,
+    broker_account_id: str,
+    account: str,
+    ib_login_key: str,
+    paper: bool,
+    selector_pair_hint: str,
+    account_flag_label: str,
+    account_value_label: str,
+) -> dict[str, str]:
+    """Validate the either/or account selection (Task 5/6 contract) and return
+    the account-bearing payload fields for ``POST /api/v1/live/start-portfolio``.
+
+    Shared by ``live start`` and ``live start-portfolio`` so the either/or check,
+    the DU/DF-vs-U prefix guard, and the real-money confirm prompt can never drift
+    between the two commands. The label parameters preserve each command's
+    surface vocabulary in error/prompt text:
+
+    * ``selector_pair_hint`` — the legacy form shown in the "provide either" error
+      (e.g. ``"ACCOUNT_ID --ib-login-key <key>"`` vs
+      ``"--account <ib-account> --ib-login-key <key>"``).
+    * ``account_flag_label`` — how the account argument is named in the
+      ``--ib-login-key is required ...`` message (``"ACCOUNT_ID"`` vs
+      ``"--account"``).
+    * ``account_value_label`` — the prefix used when echoing the bad account value
+      (``"account_id"`` vs ``"--account"``).
+
+    When the broker-account selector is supplied the raw account string may be
+    omitted and the server is the authority on the contract, so the prefix guard
+    is skipped. Identity-bearing fields are trimmed before submission (the backend
+    hashes account_id + ib_login_key into the deployment identity_signature and
+    routes by the exact ib_login_key string; whitespace creates a distinct
+    identity row and misses gateway routes)."""
+    trimmed_broker_account_id = broker_account_id.strip()
+    trimmed_account = account.strip()
+    if not trimmed_broker_account_id and not trimmed_account:
+        _fail(f"Provide either --broker-account-id <uuid> OR {selector_pair_hint}.")
+    if not trimmed_broker_account_id:
+        # Legacy pair form — --ib-login-key is required alongside the account.
+        if not ib_login_key.strip():
+            _fail(f"--ib-login-key is required when deploying with {account_flag_label}.")
+        # Mirror the UI's account-prefix guard so a CLI caller can't paste an
+        # account_id that contradicts --paper / --no-paper. Without this,
+        # <account U...> --paper would post paper_trading=true and the supervisor
+        # would create+reject the deployment row, leaving a collision-prone
+        # (revision_id, account_id) entry that needs manual archive. Backend
+        # `ib_port_validator.IB_PAPER_PREFIXES = ("DU", "DF")`.
+        is_paper_prefix = trimmed_account.startswith(("DU", "DF"))
+        if paper and not is_paper_prefix:
+            _fail(
+                f"{account_value_label} '{trimmed_account}' is not a paper-prefix account "
+                "(expected DU* or DF*). Pass --no-paper for real-money accounts."
+            )
+        if not paper and (is_paper_prefix or not trimmed_account.startswith("U")):
+            _fail(
+                f"{account_value_label} '{trimmed_account}' is not a live-prefix account "
+                "(expected U*, NOT DU/DF). Remove --no-paper for paper accounts."
+            )
+    if not paper:
+        # The real-money confirmation MUST name what will actually be deployed.
+        # The payload below prefers broker_account_id (the legacy strings are
+        # dropped when it is set), so the prompt must prefer it too — otherwise a
+        # caller passing BOTH --broker-account-id and a legacy --account would
+        # confirm real-money against the legacy account label while the API deploys
+        # the account resolved from the UUID (Codex review: misleading real-money
+        # confirmation). broker_account_id wins in both the prompt and the payload.
+        confirm_target = (
+            f"broker account {trimmed_broker_account_id}"
+            if trimmed_broker_account_id
+            else trimmed_account
+        )
+        typer.confirm(
+            f"This will start REAL-MONEY trading on {confirm_target}. Continue?",
+            abort=True,
+        )
+    if trimmed_broker_account_id:
+        return {"broker_account_id": trimmed_broker_account_id}
+    return {"account_id": trimmed_account, "ib_login_key": ib_login_key.strip()}
+
+
 def _api_call(
     method: str,
     path: str,
@@ -467,11 +547,23 @@ def research_cancel(
 @live_app.command("start")
 def live_start(
     portfolio_revision_id: str = typer.Argument(..., help="Portfolio revision UUID"),
-    account_id: str = typer.Argument(..., help="IB account id (e.g. DU1234567)"),
+    account_id: str = typer.Argument(
+        "",
+        help="IB account id (e.g. DU1234567). Legacy form; omit when --broker-account-id is set.",
+    ),
+    broker_account_id: str = typer.Option(
+        "",
+        "--broker-account-id",
+        help=(
+            "Managed broker-account UUID (Task 5/6 selector). When given, the "
+            "server resolves the IB account + login; the positional ACCOUNT_ID "
+            "and --ib-login-key may be omitted."
+        ),
+    ),
     ib_login_key: str = typer.Option(
-        ...,
+        "",
         "--ib-login-key",
-        help="IB login username — REQUIRED by /api/v1/live/start-portfolio (Bug #1 trio).",
+        help="IB login username — required for the legacy ACCOUNT_ID form (Bug #1 trio).",
     ),
     paper: bool = typer.Option(True, help="Paper trading mode (default: True)"),
     idempotency_key: str = typer.Option(
@@ -493,39 +585,33 @@ def live_start(
     required `--ib-login-key`, `--no-paper` confirmation prompt, and a
     startup-safe timeout (90s > backend's 60s START_POLL_TIMEOUT_S).
     """
-    # PR #67 Codex bot P2: mirror start-portfolio's account/paper prefix
-    # guard. Without this, `live start <rev> U... --paper` posts paper_trading=
-    # true with a live account_id; the supervisor rejects after creating the
-    # deployment row, leaving a collision-prone (revision_id, account_id)
-    # entry that poisons later deploy attempts. Backend
-    # `ib_port_validator.IB_PAPER_PREFIXES = ("DU", "DF")`.
-    trimmed_account = account_id.strip()
-    is_paper_prefix = trimmed_account.startswith(("DU", "DF"))
-    if paper and not is_paper_prefix:
-        _fail(
-            f"account_id '{trimmed_account}' is not a paper-prefix account "
-            "(expected DU* or DF*). Pass --no-paper for real-money accounts."
-        )
-    if not paper and (is_paper_prefix or not trimmed_account.startswith("U")):
-        _fail(
-            f"account_id '{trimmed_account}' is not a live-prefix account "
-            "(expected U*, NOT DU/DF). Remove --no-paper for paper accounts."
-        )
-    if not paper:
-        typer.confirm(
-            f"This will start REAL-MONEY trading on {trimmed_account}. Continue?",
-            abort=True,
-        )
-    # Codex iter-9 P2: submit trimmed identity-bearing fields. The backend
-    # hashes account_id + ib_login_key into the deployment identity_signature
-    # and routes by the exact ib_login_key string; whitespace creates a
-    # distinct identity row and misses gateway routes.
+    # Task 5/6 either/or contract (mirrors start-portfolio). Pass
+    # --broker-account-id <uuid> (server resolves account + login) OR the
+    # legacy positional ACCOUNT_ID + --ib-login-key pair. When the selector
+    # is supplied, the prefix guard below MUST NOT run — the operator may
+    # legitimately omit the raw account string and the server is the authority
+    # on the either/or contract.
+    # Task 5/6 either/or contract (mirrors start-portfolio): pass
+    # --broker-account-id <uuid> (server resolves account + login) OR the legacy
+    # positional ACCOUNT_ID + --ib-login-key pair. The shared helper does the
+    # either/or check, the DU/DF-vs-U prefix guard (skipped under the selector),
+    # the --no-paper real-money confirm, and returns the trimmed account-bearing
+    # payload fields.
     payload: dict[str, object] = {
         "portfolio_revision_id": portfolio_revision_id,
-        "account_id": trimmed_account,
         "paper_trading": paper,
-        "ib_login_key": ib_login_key.strip(),
     }
+    payload.update(
+        _resolve_cli_account_payload(
+            broker_account_id=broker_account_id,
+            account=account_id,
+            ib_login_key=ib_login_key,
+            paper=paper,
+            selector_pair_hint="ACCOUNT_ID --ib-login-key <key>",
+            account_flag_label="ACCOUNT_ID",
+            account_value_label="account_id",
+        )
+    )
     # Codex iter-7 P2 + PR #67 review: send Idempotency-Key so timeout /
     # network retries within the same operator action hit the Redis
     # reservation (operator passes the same --idempotency-key on retry).
@@ -762,11 +848,24 @@ def live_portfolio_members(
 @live_app.command("start-portfolio")
 def live_start_portfolio(
     revision: str = typer.Option(..., "--revision", help="Portfolio revision UUID"),
-    account: str = typer.Option(..., "--account", help="IB account id (e.g. DUP733213)"),
+    broker_account_id: str = typer.Option(
+        "",
+        "--broker-account-id",
+        help=(
+            "Managed broker-account UUID (Task 5/6 selector). When given, the "
+            "server resolves the IB account + login from the stored record, so "
+            "--account / --ib-login-key may be omitted."
+        ),
+    ),
+    account: str = typer.Option(
+        "",
+        "--account",
+        help="IB account id (e.g. DUP733213). Legacy form; omit when --broker-account-id is set.",
+    ),
     ib_login_key: str = typer.Option(
-        ...,
+        "",
         "--ib-login-key",
-        help="IB login username key (e.g. marin1016test). REQUIRED.",
+        help="IB login username key (e.g. marin1016test). Legacy form; pair with --account.",
     ),
     paper: bool = typer.Option(
         True,
@@ -786,46 +885,38 @@ def live_start_portfolio(
     ``MSAI_API_URL=http://localhost:8800`` + ``MSAI_API_KEY=msai-dev-key``
     when running outside the backend container (dev compose exposes the
     backend at host port 8800, not the CLI default 8000).
+
+    Two mutually-exclusive identity forms (Task 5/6 either/or contract):
+    pass ``--broker-account-id <uuid>`` (server resolves account + login from
+    the managed record), OR the legacy ``--account ... --ib-login-key ...``
+    pair. The server is the authority on the either/or contract — the CLI
+    relaxes its client-side prefix guard when the selector is supplied so a
+    selector-only deploy is not rejected before the API sees it.
     """
-    # Codex iter-8 P2: mirror the UI's account-prefix guard so a CLI
-    # caller can't paste an account_id that contradicts --paper / --no-paper.
-    # Without this, --account U... --paper would post paper_trading=true and
-    # the supervisor would create+reject the deployment row, leaving a
-    # collision-prone (revision_id, account_id) entry that needs manual
-    # archive. Backend `ib_port_validator.IB_PAPER_PREFIXES = ("DU", "DF")`.
-    trimmed_account = account.strip()
-    is_paper_prefix = trimmed_account.startswith(("DU", "DF"))
-    if paper and not is_paper_prefix:
-        _fail(
-            f"--account '{trimmed_account}' is not a paper-prefix account "
-            "(expected DU* or DF*). Pass --no-paper for real-money accounts."
+    # Either/or contract (Task 5/6), client-side. The shared helper does the
+    # either/or check, the DU/DF-vs-U prefix guard (skipped under the selector,
+    # where the server is the authority), the --no-paper real-money confirm, and
+    # returns the trimmed account-bearing payload fields.
+    payload: dict[str, Any] = {
+        "portfolio_revision_id": revision,
+        "paper_trading": paper,
+    }
+    payload.update(
+        _resolve_cli_account_payload(
+            broker_account_id=broker_account_id,
+            account=account,
+            ib_login_key=ib_login_key,
+            paper=paper,
+            selector_pair_hint="--account <ib-account> --ib-login-key <key>",
+            account_flag_label="--account",
+            account_value_label="--account",
         )
-    if not paper and (is_paper_prefix or not trimmed_account.startswith("U")):
-        _fail(
-            f"--account '{trimmed_account}' is not a live-prefix account "
-            "(expected U*, NOT DU/DF). Remove --no-paper for paper accounts."
-        )
-    if not paper:
-        typer.confirm(
-            f"This will start REAL-MONEY trading on {trimmed_account}. Continue?",
-            abort=True,
-        )
+    )
     ikey = idempotency_key or uuid.uuid4().hex
     # Codex code-review P1: send Idempotency-Key as HTTP header (backend reads
     # it via `Header(default=None, alias="Idempotency-Key")` in /start-portfolio).
     # Embedding it in the JSON body silently bypasses the Redis reservation layer
     # because PortfolioStartRequest doesn't define an `idempotency_key` field.
-    # Codex iter-9 P2: submit trimmed identity-bearing fields. The backend
-    # hashes account_id + ib_login_key into the deployment identity_signature
-    # and routes by the exact ib_login_key string. Leading/trailing whitespace
-    # would create a distinct identity row (collision-prone) and miss gateway
-    # routes. The prefix guard above already worked from `trimmed_account`.
-    payload: dict[str, Any] = {
-        "portfolio_revision_id": revision,
-        "account_id": trimmed_account,
-        "ib_login_key": ib_login_key.strip(),
-        "paper_trading": paper,
-    }
     # Codex iter-3 P2: timeout must exceed backend's START_POLL_TIMEOUT_S
     # (60s) — cold supervisor spawns can legitimately run that long while
     # the supervisor reaches ready/failed. 30s default would surface as

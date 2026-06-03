@@ -23,13 +23,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    from msai.services.live.broker_credentials_store import BrokerCredentialsStore
 
+from msai.api._broker_account_deps import (
+    build_broker_account_service as _build_service,
+)
 from msai.core.auth import get_current_user, resolve_user_id
-from msai.core.config import settings
 from msai.core.database import get_db
 from msai.core.logging import get_logger
-from msai.models.broker_account import CredentialsBackend
 from msai.schemas.broker_account import (
     BrokerAccountCreateRequest,
     BrokerAccountResponse,
@@ -41,7 +41,6 @@ from msai.services.live.broker_account_service import (
     AccountInUseError,
     AccountNotFoundError,
     BrokerAccountError,
-    BrokerAccountService,
     DuplicateAccountError,
     NoFreeSlotError,
 )
@@ -53,27 +52,6 @@ from msai.services.live.broker_credentials_store import (
 log = get_logger(__name__)
 
 router = APIRouter(prefix="/api/v1/broker-accounts", tags=["broker-accounts"])
-
-
-def _build_service(request: Request, db: AsyncSession) -> BrokerAccountService:
-    """Construct a :class:`BrokerAccountService` from app state + settings.
-
-    The credentials store is wired onto ``app.state`` during the application
-    lifespan; the gateway-slot pool and the credentials backend come from
-    configuration (``env`` in dev, ``azure_kv`` in prod).
-    """
-    store: BrokerCredentialsStore = request.app.state.broker_credentials_store
-    backend = (
-        CredentialsBackend.AZURE_KV
-        if settings.environment == "production"
-        else CredentialsBackend.ENV
-    )
-    return BrokerAccountService(
-        db,
-        store=store,
-        slots=settings.broker_gateway_slots,
-        backend=backend,
-    )
 
 
 def _actor(claims: dict[str, Any]) -> str:

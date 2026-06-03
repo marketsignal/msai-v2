@@ -6,7 +6,7 @@ from datetime import datetime  # noqa: TC003 — Pydantic resolves annotations a
 from typing import Any
 from uuid import UUID  # noqa: TC003 — Pydantic resolves annotations at runtime
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class LiveStartRequest(BaseModel):
@@ -27,20 +27,32 @@ class PortfolioStartRequest(BaseModel):
     """
 
     portfolio_revision_id: UUID
-    account_id: str
+    # Task 4: a deployment may select its broker account EITHER by the
+    # control-plane ``broker_account_id`` (the registry row id) OR by the
+    # legacy ``account_id`` + ``ib_login_key`` pair. All three fields are
+    # now optional at the field level; the either/or invariant is enforced
+    # by ``_require_account_selector`` below.
+    broker_account_id: UUID | None = None
+    account_id: str | None = None
     paper_trading: bool = True
-    ib_login_key: str = Field(min_length=1, max_length=64)
+    ib_login_key: str | None = Field(default=None, min_length=1, max_length=64)
 
     @field_validator("account_id")
     @classmethod
-    def _normalize_account_id(cls, v: str) -> str:
+    def _normalize_account_id(cls, v: str | None) -> str | None:
         """Codex iter 16 P2: strip whitespace and reject internal
         whitespace so the halt-latch key written by ``/drain/{account_id}``
         (URL-stripped) always matches the key read by the supervisor's
         per-account halt check. A leading-space ``" DUP733214"`` slipping
         past would let the supervisor read a different Redis key than
         the drain endpoint wrote, bypassing the drain latch.
+
+        Task 4: ``account_id`` is now optional (selector-only deploys omit
+        it), so ``None`` passes through untouched and the either/or check in
+        ``_require_account_selector`` decides whether that is acceptable.
         """
+        if v is None:
+            return None
         normalized = v.strip()
         if not normalized:
             raise ValueError("account_id cannot be empty / whitespace-only")
@@ -50,6 +62,22 @@ class PortfolioStartRequest(BaseModel):
                 "are alphanumeric (e.g. 'DUP733214' or 'U1234567')"
             )
         return normalized
+
+    @model_validator(mode="after")
+    def _require_account_selector(self) -> PortfolioStartRequest:
+        """Task 4: enforce the either/or account-selection contract.
+
+        A valid request provides EITHER ``broker_account_id`` (registry
+        selector) OR BOTH ``account_id`` and ``ib_login_key`` (legacy
+        explicit pair). This is either/or, NOT exclusive-or: sending all
+        three is accepted for back-compat with callers that always populate
+        the legacy pair alongside the new selector.
+        """
+        has_selector = self.broker_account_id is not None
+        has_legacy_pair = self.account_id is not None and self.ib_login_key is not None
+        if not has_selector and not has_legacy_pair:
+            raise ValueError("provide broker_account_id, or both account_id and ib_login_key")
+        return self
 
     # Codex iter 15 P2 REVERTED in iter 20 P2: the original validator
     # rejected ``ib_login_key='default'`` to prevent operator typos from
@@ -94,6 +122,13 @@ class LiveDeploymentInfo(BaseModel):
     account_id: str | None = None
     ib_login_key: str | None = None
     ibg_client_id: int | None = None
+    # Task 4 — control-plane broker-account linkage. The id of the
+    # broker-account registry row this deployment is bound to, so an API
+    # caller can observe the deployment↔account relationship without a DB
+    # peek. Population in the status builder (api/live.py) is Task 5; this
+    # field only establishes the response contract. ``None`` for deployments
+    # not (yet) linked to a registry account.
+    broker_account_id: UUID | None = None
 
     # PR 2 T8 — per-account restart-authority health (additive, read-only).
     # Sourced from the latest ``live_node_processes`` row for this deployment
@@ -160,6 +195,11 @@ class LiveDeploymentStatusResponse(BaseModel):
     instruments: list[str] = []
     last_started_at: datetime | None = None
     last_stopped_at: datetime | None = None
+    # Control-plane broker-account linkage (parity with LiveDeploymentInfo on
+    # the list endpoint) so the per-deployment detail GET also surfaces the
+    # deployment↔account relationship. ``None`` for deployments not linked to a
+    # registry account.
+    broker_account_id: UUID | None = None
 
     # Latest per-run process fields — nullable when no live_node_processes
     # row exists for this deployment.

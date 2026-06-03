@@ -33,6 +33,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from msai.models.base import Base
 
 if TYPE_CHECKING:
+    from msai.models.broker_account import BrokerAccount
     from msai.models.live_portfolio_revision import LivePortfolioRevision
     from msai.models.strategy import Strategy
     from msai.models.user import User
@@ -150,11 +151,41 @@ class LiveDeployment(Base):
     only the secondary "degenerate loop" backstop."""
 
     # ------------------------------------------------------------------
+    # Broker-account binding columns (broker-account-spawn-wiring Task 1/2).
+    # Migration 81e7efe6d772 added all three nullable; ADDITIVE over the
+    # legacy ``account_id`` / ``ib_login_key`` columns above.
+    # ------------------------------------------------------------------
+    broker_account_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("broker_accounts.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    """FK to the operator-managed ``broker_accounts`` row that owns this
+    deployment's IB credentials. Nullable for legacy rows that predate the
+    broker-account registry (those still resolve via ``account_id`` /
+    ``ib_login_key``). ``ondelete=RESTRICT`` blocks deleting a broker account
+    that still has deployments bound to it."""
+
+    credentials_validated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    """tz-aware UTC timestamp of the last successful credential validation for
+    the bound broker account at spawn time. NULL for legacy rows."""
+
+    credentials_validated_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    """The ``credentials_secret_version`` that was validated at spawn time.
+    NULL is legacy-valid (LEGACY_ENV accounts carry no version)."""
+
+    # ------------------------------------------------------------------
     # Relationships
     # ------------------------------------------------------------------
     strategy: Mapped[Strategy | None] = relationship(lazy="selectin")  # noqa: F821
     starter: Mapped[User] = relationship(lazy="selectin")  # noqa: F821
     portfolio_revision: Mapped[LivePortfolioRevision] = relationship(lazy="selectin")
+    # lazy="raise": the broker_account scalar FK column (broker_account_id) is what
+    # the status/detail builders read; this ORM relationship is intentionally never
+    # accessed. Avoids an unconditional batched SELECT broker_accounts on every
+    # LiveDeployment materialization (incl. GET /live/status), and turns any future
+    # accidental `.broker_account` access into a loud error rather than a silent query.
+    broker_account: Mapped[BrokerAccount | None] = relationship(lazy="raise")  # noqa: F821
 
     # UNIQUE(identity_signature) remains for upsert target.
     # UNIQUE(portfolio_revision_id, account_id) added by Task 11.
