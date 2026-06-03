@@ -199,6 +199,26 @@ All endpoints except `/health` and `/ready` require Azure Entra ID JWT authentic
 - **Live trading**: FastAPI → risk engine validation → `live_supervisor` spawns TradingNode subprocess → NautilusTrader → IB Gateway. Supervisor owns heartbeat monitor + command bus (Redis Streams + consumer groups + PEL recovery + DLQ).
 - **Dashboard queries**: Frontend → FastAPI → DuckDB (in-memory, reads Parquet) → JSON response
 
+### Databento Data Availability (SETTLED 2026-06-03 — do NOT re-investigate)
+
+Verified empirically on our **Standard** account via `metadata.list_datasets` + `get_dataset_range` + live fetches, cross-checked against Databento docs. This is the definitive history coverage — do not re-open it.
+
+| Asset class                             | Dataset(s)                                                                                                                   | History from   | Notes                                                                       |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | -------------- | --------------------------------------------------------------------------- |
+| **Futures** (ES, NQ, YM, EMD)           | `GLBX.MDP3`                                                                                                                  | **2010-06-06** | ~16 yr; consolidated by nature. RTY (Russell 2000) only 2017.               |
+| **Equities — per-VENUE feeds**          | `ARCX.PILLAR` (NYSE Arca), `XNAS.ITCH` (Nasdaq), `XNYS.PILLAR`, `XASE.PILLAR`, `BATS/BATY/EDGA/EDGX.PITCH`, `XBOS/XPSX.ITCH` | **2018-05-01** | ~8 yr; 1-min + daily. SINGLE-VENUE only (Nasdaq ≈13% ADV, Arca a fraction). |
+| **Equities — CONSOLIDATED**             | `EQUS.MINI`, `DBEQ.BASIC` (deprecated 2025-01)                                                                               | **2023-03-28** | ~3 yr.                                                                      |
+| **Equities — consolidated EOD/summary** | `EQUS.SUMMARY`, `XNAS.BASIC`                                                                                                 | **2024-07-01** | ~2 yr.                                                                      |
+
+**The rules that follow from this (memorize — they keep biting):**
+
+- **Consolidated equities exist ONLY from 2023** (`EQUS.MINI`). There is **NO single consolidated all-venue equities dataset before 2023** — for true total-market volume/OHLCV in 2018–2023 you must pull every venue feed and aggregate yourself. A volume-based equity signal pre-2023 therefore needs either venue-aggregation or must accept single-venue data.
+- **The "2023 wall" is a dataset-choice artifact, not a hard floor.** Querying `EQUS.MINI` (the consolidated feed, what the app wires for equities) returns only 2023+. The **per-venue feeds (`ARCX.PILLAR` for SPY/IWM/DIA/EEM/EFA/LQD, `XNAS.ITCH` for QQQ/AAPL/MSFT) go back to 2018** for both 1-min and daily bars.
+- **15 years of equities is NOT available from Databento — ever.** The entire equity archive begins 2018-05-01 (~8 yr max). For deeper history use **futures** (ES via `GLBX.MDP3`, 2010) or another provider.
+- **For deep S&P signal research, default to ES futures** (2010, consolidated, no venue-aggregation problem) rather than SPY cash.
+- **Plus is NOT needed for more history.** Depth is fixed by each dataset's inception date, not by subscription tier (Standard pulls 2018 venue data fine). Plus only deepens L1 tick history + licensing — see `MEMORY` note `reference_databento_plan_standard_sufficient`.
+- Always confirm a symbol/dataset's real range with `metadata.get_dataset_range(dataset=...)` + a tiny fetch before designing a backtest window — never assume.
+
 ### Key Design Decisions
 
 - `DATA_ROOT` env var controls all Parquet/report paths (Docker: `/app/data`, local: `./data`)
