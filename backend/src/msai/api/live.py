@@ -565,40 +565,76 @@ async def _resolve_effective_account(
         if existing is not None:
             existing_broker_account_id = existing.broker_account_id
             if existing_broker_account_id is None:
-                # Warm-restart back-compat: the matched row was NEVER linked to a
-                # registry account (predates the registry). Keep the legacy
-                # request strings, no forced resolution.
-                return _EffectiveAccount(
-                    account_id=request.account_id,
-                    ib_login_key=request.ib_login_key,
-                    broker_account=None,
-                )
-            # The matched row IS linked to a BrokerAccount. A legacy-strings
-            # restart must NOT bypass validation: resolve that linked account
-            # by its row id and fall through to row-state validation below so a
-            # since-archived / invalidated account fails closed (no
-            # grandfathering a broker-linked deployment back to life).
-            try:
-                account = await resolve_active_broker_account(
-                    db,
-                    broker_account_id=existing_broker_account_id,
-                    ib_account_id=None,
-                )
-            except AccountNotResolvable as exc:
-                try:
-                    _not_resolvable_fail(
-                        str(existing_broker_account_id),
-                        (
-                            f"{exc} This deployment is linked to a broker account "
-                            "that is no longer active (archived or invalidated). "
-                            "Restore/replace the account before restarting."
-                        ),
-                        {"broker_account_id": str(existing_broker_account_id)},
+                # Warm-restart of a row that was NEVER linked to a registry account
+                # (predates the registry FK). Back-compat — keep the legacy strings
+                # with no forced resolution — is preserved ONLY while NO
+                # BrokerAccount exists for this IB account. If an operator has SINCE
+                # registered one for this account_id, the registry is authoritative
+                # and the NULL-FK restart must NOT bypass it (Codex iter-20 P2):
+                # resolve it so an ACTIVE row links + validates and an
+                # archived/inactive row fails closed (422) — closing the
+                # "spawn against a since-archived account via a legacy restart" hole.
+                registry_row_exists = (
+                    await db.execute(
+                        select(BrokerAccount.id)
+                        .where(BrokerAccount.ib_account_id == request.account_id)
+                        .limit(1)
                     )
-                except HTTPException as http_exc:
-                    raise http_exc from exc
-            # account is set → fall through to the shared row-state validation
-            # + effective-account derivation below.
+                ).first() is not None
+                if not registry_row_exists:
+                    # Genuinely pre-registry account_id → keep the legacy strings.
+                    return _EffectiveAccount(
+                        account_id=request.account_id,
+                        ib_login_key=request.ib_login_key,
+                        broker_account=None,
+                    )
+                # A BrokerAccount exists for this IB account → resolve it (ACTIVE
+                # links + validates; archived/inactive → 422 fail closed).
+                try:
+                    account = await resolve_active_broker_account(
+                        db, broker_account_id=None, ib_account_id=request.account_id
+                    )
+                except AccountNotResolvable as exc:
+                    try:
+                        _not_resolvable_fail(
+                            str(request.account_id),
+                            (
+                                f"{exc} A broker account is registered for this IB "
+                                "account but is no longer active (archived or "
+                                "invalidated). Restore/replace it before restarting."
+                            ),
+                            {"account_id": request.account_id},
+                        )
+                    except HTTPException as http_exc:
+                        raise http_exc from exc
+            else:
+                # The matched row IS linked to a BrokerAccount. A legacy-strings
+                # restart must NOT bypass validation: resolve that linked account
+                # by its row id and fall through to row-state validation below so a
+                # since-archived / invalidated account fails closed (no
+                # grandfathering a broker-linked deployment back to life).
+                try:
+                    account = await resolve_active_broker_account(
+                        db,
+                        broker_account_id=existing_broker_account_id,
+                        ib_account_id=None,
+                    )
+                except AccountNotResolvable as exc:
+                    try:
+                        _not_resolvable_fail(
+                            str(existing_broker_account_id),
+                            (
+                                f"{exc} This deployment is linked to a broker account "
+                                "that is no longer active (archived or invalidated). "
+                                "Restore/replace the account before restarting."
+                            ),
+                            {"broker_account_id": str(existing_broker_account_id)},
+                        )
+                    except HTTPException as http_exc:
+                        raise http_exc from exc
+            # account is set (broker-linked restart OR NULL-FK restart whose IB
+            # account now has a registry row) → fall through to the shared
+            # row-state validation + effective-account derivation below.
         else:
             # NEW free-form deploy: must resolve to an ACTIVE registry row or fail.
             account = await _resolve_new_legacy_deploy_account(db, request)

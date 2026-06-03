@@ -1211,7 +1211,10 @@ async def test_idempotency_hash_includes_selector_no_cross_collision(
     key = f"sw-collide-{uuid4().hex}"
     headers = {"Idempotency-Key": key}
 
-    # First request: legacy strings, NO selector → warm-restart, no KV call.
+    # First request: legacy strings, NO selector. Because an ACTIVE registry row
+    # exists for this IB account, the NULL-FK warm-restart now RESOLVES + links +
+    # validates it (iter-20 fix — the legacy bypass is reserved for IB accounts
+    # with NO registry row), so it DOES run one credential validation.
     legacy_body = {
         "portfolio_revision_id": str(rev_id),
         "account_id": account,
@@ -1219,7 +1222,7 @@ async def test_idempotency_hash_includes_selector_no_cross_collision(
     }
     r1 = await ac.post("/api/v1/live/start-portfolio", json=legacy_body, headers=headers)
     assert r1.status_code in (200, 201), r1.text
-    assert len(store.get_calls) == 0  # no credential validation on the legacy path
+    assert len(store.get_calls) == 1  # active registry row resolved on the restart → validated
 
     # Second request: SAME key, but WITH the broker_account_id selector resolving
     # to the SAME effective account. If the hash omitted the selector this would
@@ -1264,11 +1267,15 @@ async def test_idempotency_hash_includes_selector_no_cross_collision(
     )
     assert legacy_hash != selector_hash
 
-    # The original legacy deployment row was never linked by the colliding call.
+    # r2 (the colliding selector call) was rejected 422 → it performed NO upsert.
+    # The row's linkage is whatever r1 left: r1 resolved the now-existing ACTIVE
+    # registry row and linked the deployment to it (iter-20 fix). The point of
+    # this assertion is that r2 did not collapse onto r1's outcome and silently
+    # re-link/serve a cached success — the link state is r1's, untouched by r2.
     async with session_factory() as session:
         dep = await session.get(LiveDeployment, dep_id)
         assert dep is not None
-        assert dep.broker_account_id is None
+        assert dep.broker_account_id == acct_id
 
 
 # ---------------------------------------------------------------------------
@@ -1533,6 +1540,103 @@ async def test_warm_restart_broker_linked_archived_account_fails_closed_422(
         assert dep.status == "stopped"
 
     # The deploy-validation alert metric grew (a row-state rejection counted).
+    after = DEPLOY_VALIDATION_FAILED.render()
+    assert _metric_total(after) > _metric_total(before)
+
+
+@pytest.mark.asyncio
+async def test_warm_restart_null_fk_legacy_with_archived_registry_row_fails_closed_422(
+    client: tuple[httpx.AsyncClient, _StubStore, _ResolveSpy],
+    redis_text: AsyncRedis,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Codex iter-20 P2: a NULL-FK legacy deployment (``broker_account_id IS
+    NULL``, predates the registry) must NOT warm-restart through the legacy
+    bypass once a BrokerAccount has been registered for its IB account and
+    ARCHIVED. The legacy back-compat fallback is reserved for IB accounts with
+    NO registry row at all; if a (now-archived) row exists, the restart resolves
+    by ib_account_id and fails closed (422) — closing the "spawn against a
+    since-archived account via a legacy NULL-FK restart" hole.
+
+    Contrast with ``test_warm_restart_legacy_deployment_no_registry_row`` (no
+    registry row → legacy fallback still allowed)."""
+    ac, store, _spy = client
+    legacy_account = _BOUND_ACCOUNTS[0]
+    before = DEPLOY_VALIDATION_FAILED.render()
+
+    async with session_factory() as session:
+        user, strategy, revision, member = await _seed_deployable_revision(
+            session, entra_id="test-operator"
+        )
+        # An ARCHIVED BrokerAccount now exists for this IB account — registered
+        # AFTER the legacy deployment was first started (which left broker_account_id NULL).
+        await _seed_broker_account(
+            session,
+            ib_account_id=legacy_account,
+            status=BrokerAccountStatus.ARCHIVED,
+        )
+        identity = derive_portfolio_deployment_identity(
+            user_id=user.id,
+            portfolio_revision_id=revision.id,
+            account_id=legacy_account,
+            paper_trading=True,
+            ib_login_key=_LOGIN,
+            user_sub="test-operator",
+        )
+        slug = generate_deployment_slug()
+        dep = LiveDeployment(
+            id=uuid4(),
+            strategy_id=strategy.id,
+            status="stopped",
+            paper_trading=True,
+            started_by=user.id,
+            deployment_slug=slug,
+            identity_signature=identity.signature(),
+            trader_id=derive_trader_id(slug),
+            strategy_id_full=derive_strategy_id_full(strategy.strategy_class, slug),
+            account_id=legacy_account,
+            ib_login_key=_LOGIN,
+            portfolio_revision_id=revision.id,
+            message_bus_stream=derive_message_bus_stream(slug),
+            broker_account_id=None,  # NULL-FK — the legacy bypass MUST NOT apply now
+        )
+        session.add(dep)
+        cand = (
+            await session.execute(
+                select(GraduationCandidate).where(GraduationCandidate.strategy_id == strategy.id)
+            )
+        ).scalar_one()
+        cand.stage = "live_running"
+        cand.deployment_id = dep.id
+        await session.commit()
+        rev_id = revision.id
+        dep_id = dep.id
+
+    resp = await ac.post(
+        "/api/v1/live/start-portfolio",
+        json={
+            "portfolio_revision_id": str(rev_id),
+            "account_id": legacy_account,
+            "ib_login_key": _LOGIN,
+        },
+    )
+    # A registry row exists for this IB account and is archived → fail closed.
+    assert resp.status_code == 422, resp.text
+
+    # No credential validation ran (resolution failed before the KV stage) and no
+    # START was enqueued on the per-account or global stream.
+    assert len(store.get_calls) == 0
+    assert await redis_text.xlen(command_stream_for_account(legacy_account)) == 0
+    assert await redis_text.xlen(LIVE_COMMAND_STREAM) == 0
+
+    # The deployment did NOT transition out of stopped, and stayed NULL-FK.
+    async with session_factory() as session:
+        dep = await session.get(LiveDeployment, dep_id)
+        assert dep is not None
+        assert dep.status == "stopped"
+        assert dep.broker_account_id is None
+
+    # The deploy-rejection alert metric grew.
     after = DEPLOY_VALIDATION_FAILED.render()
     assert _metric_total(after) > _metric_total(before)
 
