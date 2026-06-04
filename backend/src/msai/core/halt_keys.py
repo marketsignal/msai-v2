@@ -324,8 +324,16 @@ local n_reconciled = tonumber(ARGV[3])
 local idx = 0
 for i = 1, n_manifest do
   idx = idx + 1
-  if redis.call('exists', KEYS[idx]) == 0 then
+  local current = redis.call('get', KEYS[idx])
+  if current == false then
     return 'MANIFEST_MISSING:' .. KEYS[idx]
+  end
+  -- Content-pin (TOCTOU): the Python probe validated a SPECIFIC manifest value
+  -- and derived the verdict-key list FROM it. If the monitor overwrote the
+  -- manifest with a CHANGED feed universe between the probe and this clear, the
+  -- pre-derived verdict list is stale — abort rather than clear on it.
+  if current ~= ARGV[3 + i] then
+    return 'MANIFEST_CHANGED:' .. KEYS[idx]
   end
 end
 for i = 1, n_verdict do
@@ -362,8 +370,13 @@ the Python probe and the clear.
 
 1. ``manifest`` keys (``ARGV[1]`` of them) — :func:`data_freshness_manifest_key`
    for every active deployment. Each MUST still EXIST (a monitor that died after
-   the Python probe lets its manifest TTL lapse → abort). EMPTY manifests count:
-   their key still exists while the monitor is alive.
+   the Python probe lets its manifest TTL lapse → abort) AND its CURRENT value
+   MUST equal the raw value the Python probe validated (passed in the
+   ``expected-manifest`` ARGV tail) — a content-pin closing the changed-universe
+   TOCTOU (the monitor overwriting a manifest with a DIFFERENT feed set between
+   probe and clear, which would otherwise let the clear proceed on a now-stale
+   pre-derived verdict-key list). EMPTY manifests count: their key still exists
+   while the monitor is alive, and an empty-list value pins like any other.
 2. ``verdict`` keys (``ARGV[2]`` of them) — the per-feed ``:verdict`` companion
    (:data:`VERDICT_KEY_SUFFIX`) for every manifest feed across all deployments.
    Each MUST EXIST and equal the bare string ``warm`` (no JSON parsing in Lua —
@@ -381,12 +394,19 @@ the Python probe and the clear.
 1. ``n_manifest``   — count of manifest keys at the head of ``KEYS``
 2. ``n_verdict``    — count of verdict keys following the manifest keys
 3. ``n_reconciled`` — count of reconciled keys following the verdict keys
+4. ``expected_manifest[1..n_manifest]`` — the raw manifest VALUE the Python
+   probe validated, one per manifest key in ``KEYS`` order (``ARGV[3 + i]`` for
+   the ``i``-th manifest key). Manifests are small JSON arrays so the ARGV size
+   is a non-issue. This is the content-pin for the changed-universe TOCTOU.
 
 Returns the bare string ``OK`` on a successful clear (nothing deleted on
 failure), or a ``<REASON>:<offending-key>`` string when a check fails — the
 route maps any non-``OK`` return to a 409. Reason prefixes: ``MANIFEST_MISSING``
-(a monitor died mid-resume), ``VERDICT_MISSING`` / ``VERDICT_NOT_WARM`` (a feed
-re-staled or its row expired between probe and clear), ``RECONCILED_MISSING``
-(a node lost its reconciliation marker). A feed re-staling AFTER a successful
-clear is a NEW stale event the monitor re-halts within a tick.
+(a monitor died mid-resume), ``MANIFEST_CHANGED`` (the monitor overwrote a
+manifest with a DIFFERENT feed universe between the probe and the clear — the
+pre-derived verdict-key list no longer describes the required feeds, so clearing
+on it is unsafe), ``VERDICT_MISSING`` / ``VERDICT_NOT_WARM`` (a feed re-staled or
+its row expired between probe and clear), ``RECONCILED_MISSING`` (a node lost its
+reconciliation marker). A feed re-staling AFTER a successful clear is a NEW stale
+event the monitor re-halts within a tick.
 """

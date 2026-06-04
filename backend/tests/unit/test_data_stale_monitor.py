@@ -90,6 +90,7 @@ def _make_monitor(
     deployment_id: str = "dep-1",
     account_id: str = "DUP733214",
     node_id: str = "node-abc",
+    on_halt: Any = None,
 ) -> DataStaleMonitor:
     return DataStaleMonitor(
         registry=None,  # tests inject snapshots directly; see _set_snapshot
@@ -101,6 +102,7 @@ def _make_monitor(
         account_id=account_id,
         node_id=node_id,
         clock=clock,
+        on_halt=on_halt,
     )
 
 
@@ -597,6 +599,61 @@ async def test_fast_restart_overwrites_stale_warm_verdicts_at_start(
 
 
 @pytest.mark.asyncio
+async def test_start_fires_halt_synchronously_when_feed_stale_at_start(
+    redis: Any, clock: _StubClock
+) -> None:
+    """Codex iter-20 P2 — a feed that is ALREADY stale at monitor start (the
+    registry/snapshot holds a stale observation, e.g. a node restart DURING an
+    ongoing outage where the feed had been observed then went silent) must fire
+    the fleet halt SYNCHRONOUSLY inside ``start()`` — BEFORE ``start()`` returns
+    and therefore before the subprocess run loop reaches ``_mark_running``.
+
+    Previously ``start()`` only PUBLISHED the initial 'stale' verdict and
+    deferred the halt to the first background tick, leaving a window where the
+    deployment could flip to ``running`` with KNOWN-stale data and no awaited
+    halt. ``run_loop=False`` so NO background tick can run — the halt must come
+    from ``start()`` itself."""
+    on_halt_calls: list[str] = []
+
+    async def _on_halt() -> None:
+        on_halt_calls.append("fired")
+
+    monitor = _make_monitor(
+        required_feeds={EQ_AAPL, EQ_MSFT}, redis=redis, clock=clock, on_halt=_on_halt
+    )
+    # Stale-at-start: both 1-minute feeds were observed but have been silent for
+    # 10 minutes — well past the 60s+90s budget. Injected BEFORE start().
+    _set_snapshot(monitor, {EQ_AAPL: _obs(clock, 600), EQ_MSFT: _obs(clock, 600)})
+
+    await monitor.start(run_loop=False)
+
+    # The fleet halt latch is set the instant start() returns — no _tick() ran.
+    assert await _read_str(redis, fleet_halt_key()) == "true"
+    cause = json.loads((await _read(redis, halt_cause_key("fleet"))).decode())
+    assert cause["reason"] == "data_stale"
+    # The local-shutdown on_halt fallback also fired once during start().
+    assert on_halt_calls == ["fired"]
+    await monitor.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_does_not_fire_halt_when_feed_warm_at_start(
+    redis: Any, clock: _StubClock
+) -> None:
+    """Counter-case: a feed that is WARM (freshly observed) at start must NOT
+    fire the halt during ``start()`` — only a stale-at-start finding latches.
+    Guards against the synchronous start-evaluation being over-eager."""
+    monitor = _make_monitor(required_feeds={EQ_AAPL}, redis=redis, clock=clock)
+    # Fresh observation (1s ago) — well within budget.
+    _set_snapshot(monitor, {EQ_AAPL: _obs(clock, 1)})
+
+    await monitor.start(run_loop=False)
+
+    assert await _read_str(redis, fleet_halt_key()) != "true"
+    await monitor.stop()
+
+
+@pytest.mark.asyncio
 async def test_initial_publish_failure_raises_out_of_start(redis: Any, clock: _StubClock) -> None:
     """Codex iter-12 P1 — the initial feed-state publish at start() must be
     FAIL-CLOSED. If the synchronous start-time per-feed publish fails (e.g. the
@@ -628,6 +685,43 @@ async def test_initial_publish_failure_raises_out_of_start(redis: Any, clock: _S
 
     # No background loop was ever spawned (start raised before that).
     assert monitor._task is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_halt_fires_even_when_telemetry_publish_fails(redis: Any, clock: _StubClock) -> None:
+    """Review iter-16 P1 — the halt is the safety action and is INDEPENDENT of
+    telemetry publishing. On a stale tick whose per-feed/manifest publish
+    pipeline FAILS, the fleet halt latch must STILL be written (the Lua halt
+    write goes through ``redis.eval``, not the publish pipeline), the publish
+    failure is logged + swallowed, and the loop continues. Earlier the publish
+    ran FIRST inside the same try, so a pipeline failure raised into the outer
+    catch and SKIPPED the halt entirely."""
+    monitor = _make_monitor(required_feeds={EQ_AAPL}, redis=redis, clock=clock)
+    await monitor.start(run_loop=False)
+    _set_snapshot(monitor, {EQ_AAPL: _obs(clock, 600)})  # stale
+
+    class _FailingPipeline:
+        def __getattr__(self, _name: str) -> Any:
+            return lambda *a, **k: None
+
+        async def execute(self) -> Any:
+            raise RuntimeError("telemetry pipeline boom")
+
+    # Patch ONLY the publish pipeline; redis.eval (the halt write) is untouched.
+    with patch.object(redis, "pipeline", lambda *a, **k: _FailingPipeline()):
+        # Must NOT raise out of the tick.
+        await monitor._tick()
+
+    # The halt latch IS written despite the telemetry publish failing.
+    assert await _read_str(redis, fleet_halt_key()) == "true"
+    cause = json.loads((await _read(redis, halt_cause_key("fleet"))).decode())
+    assert cause["reason"] == "data_stale"
+
+    # A subsequent warm tick (publish working again) re-arms and keeps running.
+    clock.advance_s(5)
+    _set_snapshot(monitor, {EQ_AAPL: _obs(clock, 2)})
+    await monitor._tick()
+    await monitor.stop()
 
 
 @pytest.mark.asyncio
@@ -803,6 +897,122 @@ async def test_halt_fire_incrs_redis_data_stale_halts_counter(
     await monitor._tick()
     counter2 = await _read_str(redis, data_stale_halts_key("DUP733214"))
     assert counter2 == "1"
+    await monitor.stop()
+
+
+@pytest.mark.asyncio
+async def test_on_halt_callback_fires_on_successful_halt(redis: Any, clock: _StubClock) -> None:
+    """Review iter-16 P1 — when a stale tick latches the halt successfully, the
+    optional ``on_halt`` local-shutdown callback fires exactly ONCE per episode
+    (mirroring the IB disconnect handler's on_halt semantics)."""
+    fired = {"n": 0}
+
+    async def on_halt() -> None:
+        fired["n"] += 1
+
+    monitor = _make_monitor(required_feeds={EQ_AAPL}, redis=redis, clock=clock, on_halt=on_halt)
+    await monitor.start(run_loop=False)
+    _set_snapshot(monitor, {EQ_AAPL: _obs(clock, 600)})
+
+    await monitor._tick()
+    assert await _read_str(redis, fleet_halt_key()) == "true"
+    assert fired["n"] == 1
+
+    # Idempotent while stale: a second stale tick does NOT re-fire on_halt
+    # (the latch guard short-circuits _fire_halt entirely).
+    clock.advance_s(5)
+    _set_snapshot(monitor, {EQ_AAPL: _obs(clock, 605)})
+    await monitor._tick()
+    assert fired["n"] == 1
+    await monitor.stop()
+
+
+@pytest.mark.asyncio
+async def test_on_halt_callback_fires_even_when_halt_write_exhausts(
+    redis: Any, clock: _StubClock
+) -> None:
+    """Review iter-16 P1 — the no-local-fallback gap: when the halt-latch write
+    EXHAUSTS all retries (every eval raises), the latch is never written but the
+    ``on_halt`` callback STILL fires so the node tears down locally (the F6 read
+    gate can't be trusted to block on an asymmetric write failure). Mirrors the
+    disconnect handler's exhaustion semantics."""
+    fired = {"n": 0}
+
+    async def on_halt() -> None:
+        fired["n"] += 1
+
+    monitor = _make_monitor(required_feeds={EQ_AAPL}, redis=redis, clock=clock, on_halt=on_halt)
+    await monitor.start(run_loop=False)
+    _set_snapshot(monitor, {EQ_AAPL: _obs(clock, 600)})
+
+    async def always_fails(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("redis dead")
+
+    import msai.services.nautilus.data_stale_monitor as mod
+
+    real_backoff = mod.HALT_SET_BACKOFF_S
+    mod.HALT_SET_BACKOFF_S = 0.001  # type: ignore[assignment]
+    try:
+        with patch.object(redis, "eval", always_fails):
+            await monitor._tick()
+    finally:
+        mod.HALT_SET_BACKOFF_S = real_backoff  # type: ignore[assignment]
+
+    # Latch never landed (all writes failed) ...
+    assert await _read_str(redis, fleet_halt_key()) is None
+    # ... but the local-shutdown callback STILL fired.
+    assert fired["n"] == 1
+    await monitor.stop()
+
+
+@pytest.mark.asyncio
+async def test_on_halt_callback_failure_does_not_crash_tick(redis: Any, clock: _StubClock) -> None:
+    """Review iter-16 P1 — if the on_halt callback raises, the tick logs and
+    swallows it (the halt attempt already ran; the callback failure is just
+    metadata — mirrors the disconnect handler)."""
+
+    async def boom() -> None:
+        raise RuntimeError("flatten failed")
+
+    monitor = _make_monitor(required_feeds={EQ_AAPL}, redis=redis, clock=clock, on_halt=boom)
+    await monitor.start(run_loop=False)
+    _set_snapshot(monitor, {EQ_AAPL: _obs(clock, 600)})
+
+    # Must NOT raise out of the tick despite the callback raising.
+    await monitor._tick()
+    assert await _read_str(redis, fleet_halt_key()) == "true"
+    await monitor.stop()
+
+
+@pytest.mark.asyncio
+async def test_on_halt_callback_re_fires_on_new_episode(redis: Any, clock: _StubClock) -> None:
+    """Review iter-16 P1 — on_halt is re-armed on a fully-warm tick alongside the
+    latch guard, so a LATER stale episode in the same node lifetime fires it
+    again (once per episode, not once per node lifetime)."""
+    fired = {"n": 0}
+
+    async def on_halt() -> None:
+        fired["n"] += 1
+
+    monitor = _make_monitor(required_feeds={EQ_AAPL}, redis=redis, clock=clock, on_halt=on_halt)
+    await monitor.start(run_loop=False)
+
+    # Episode 1 — stale → on_halt fires.
+    _set_snapshot(monitor, {EQ_AAPL: _obs(clock, 600)})
+    await monitor._tick()
+    assert fired["n"] == 1
+
+    # Recover (fully-warm tick re-arms) + operator clears the latch.
+    clock.advance_s(5)
+    _set_snapshot(monitor, {EQ_AAPL: _obs(clock, 2)})
+    await monitor._tick()
+    await redis.delete(fleet_halt_key())
+
+    # Episode 2 — re-stale → on_halt fires AGAIN.
+    clock.advance_s(5)
+    _set_snapshot(monitor, {EQ_AAPL: _obs(clock, 600)})
+    await monitor._tick()
+    assert fired["n"] == 2
     await monitor.stop()
 
 

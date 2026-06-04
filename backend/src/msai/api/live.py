@@ -3259,6 +3259,7 @@ async def live_resume(
     # reconciliation marker. Build the Lua key lists as we go so the atomic
     # clear re-verifies EXACTLY what passed here.
     manifest_keys: list[str] = []
+    expected_manifests: list[str] = []
     verdict_keys: list[str] = []
     reconciled_keys: list[str] = []
     feeds_verified: list[str] = []
@@ -3298,6 +3299,15 @@ async def live_resume(
             )
 
         manifest_keys.append(manifest_key)
+        # Pin the EXACT raw value Python validated (content-pin closing the
+        # changed-universe TOCTOU). ``bus._redis`` decodes responses, so
+        # ``raw_manifest`` is the str the monitor wrote; coerce bytes defensively
+        # in case a future bus uses a byte client. The Lua compares this to the
+        # CURRENT manifest value before clearing on the verdict-key list we
+        # derived FROM it.
+        expected_manifests.append(
+            raw_manifest.decode() if isinstance(raw_manifest, bytes) else raw_manifest
+        )
         reconciled_marker = reconciled_key(dep_id)
         reconciled_keys.append(reconciled_marker)
 
@@ -3359,17 +3369,31 @@ async def live_resume(
         f"{_HALT_KEY}:source",
     ]
     lua_keys = [*manifest_keys, *verdict_keys, *reconciled_keys, *delete_keys]
-    lua_argv = [str(len(manifest_keys)), str(len(verdict_keys)), str(len(reconciled_keys))]
+    # ARGV: 3 counts, then the expected raw manifest VALUE per manifest key (in
+    # KEYS order) — the content-pin closing the changed-universe TOCTOU.
+    lua_argv = [
+        str(len(manifest_keys)),
+        str(len(verdict_keys)),
+        str(len(reconciled_keys)),
+        *expected_manifests,
+    ]
     result = await bus._redis.eval(  # type: ignore[misc]  # noqa: SLF001
         RESUME_CLEAR_LUA, len(lua_keys), *lua_keys, *lua_argv
     )
     result_str = result.decode() if isinstance(result, bytes) else str(result)
     if result_str != "OK":
         # A precondition re-staled between the Python probe and the clear
-        # (monitor-death race / feed flipped to stale). Nothing was deleted.
+        # (monitor-death race / feed flipped to stale / manifest feed universe
+        # changed). Nothing was deleted.
         reason, _, offending = result_str.partition(":")
         if reason == "RECONCILED_MISSING":
             return _resume_blocked_reconciliation(offending or "(unknown)")
+        if reason == "MANIFEST_CHANGED":
+            return _resume_blocked_data_stale(
+                "refusing to resume — manifest changed during resume "
+                f"(feed universe differs from the probed value) on key {offending}; "
+                "the monitor re-published a different required-feed set — retry resume"
+            )
         return _resume_blocked_data_stale(
             f"refusing to resume — precondition re-check failed ({reason}) on key {offending}"
         )

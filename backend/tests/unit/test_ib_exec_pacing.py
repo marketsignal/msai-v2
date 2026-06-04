@@ -29,6 +29,12 @@ from msai.services.nautilus.trading_node_subprocess import (
         "The max rate of messages per second has been exceeded",
         "request was throttled by the gateway",
         "Throttle limit reached",
+        # A codeless throttle phrase still matches — exec-side throttles may
+        # carry no IB error code.
+        "pacing violation",
+        # A coded reason whose code is NOT a market-data pacing code (100/162/420)
+        # still matches on the phrase.
+        "Error 999: pacing violation",
     ],
 )
 def test_exec_pacing_phrases_match(reason: str) -> None:
@@ -46,6 +52,12 @@ def test_exec_pacing_phrases_match(reason: str) -> None:
         "Error 162: historical market data service error",
         "Error 420: invalid real-time query pacing",
         "order quantity exceeds limit",
+        # IB's *canonical* market-data pacing message texts embed the matched
+        # phrases verbatim — these MUST be suppressed by the leading code, not
+        # mis-counted as exec pacing (the bug this regression guards).
+        "Error 100: max rate of messages per second exceeded",
+        "Error 162: Historical Market Data Service error message: pacing violation",
+        "Error 420: Invalid real-time query: pacing violation",
     ],
 )
 def test_non_exec_pacing_reasons_do_not_match(reason: str | None) -> None:

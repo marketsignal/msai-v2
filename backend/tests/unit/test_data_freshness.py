@@ -1526,14 +1526,35 @@ class _FakeWiringNode:
 class _FakeResult:
     """Minimal SQLAlchemy result stand-in for the subprocess DB helpers."""
 
+    def __init__(self, scalar: Any = None) -> None:
+        self._scalar = scalar
+
     def scalar_one_or_none(self) -> Any:
-        return None
+        return self._scalar
 
     def scalar_one(self) -> Any:
-        return None
+        return self._scalar
+
+
+class _FakeRow:
+    """Permissive stand-in for a ``LiveNodeProcess`` / ``LiveDeployment`` row —
+    starts in a PROMOTABLE state (``starting``, no stop intent) so the real
+    ``_mark_running`` promotes it and returns ``True``. Tolerates arbitrary
+    attribute writes (the mark helpers set ``status`` / ``last_heartbeat_at`` /
+    etc.). Tests that need a STOP-RACED row flip ``status`` / ``stop_requested_at``
+    via ``_FakeSessionFactory(stop_intent=True)``."""
+
+    def __init__(self, *, stop_intent: bool = False) -> None:
+        self.status = "stopping" if stop_intent else "starting"
+        self.stop_requested_at = datetime.now(UTC) if stop_intent else None
+        self.last_stopped_at: Any = None
 
 
 class _FakeSession:
+    def __init__(self, *, deployment_id: Any, stop_intent: bool = False) -> None:
+        self._deployment_id = deployment_id
+        self._stop_intent = stop_intent
+
     async def __aenter__(self) -> _FakeSession:
         return self
 
@@ -1544,10 +1565,18 @@ class _FakeSession:
         return self
 
     async def execute(self, *args: Any, **kwargs: Any) -> _FakeResult:
-        return _FakeResult()
+        # ``_mark_running`` / ``_mark_terminal`` first resolve the parent
+        # deployment_id via ``select(LiveNodeProcess.deployment_id)``. Return a
+        # non-None id so the promotion path runs (a None id would make
+        # ``_mark_running`` early-return False — not the healthy run these
+        # wiring tests simulate). UPDATE statements (``_update_row``) ignore the
+        # result, so a populated scalar is harmless for them.
+        return _FakeResult(scalar=self._deployment_id)
 
     async def get(self, *args: Any, **kwargs: Any) -> Any:
-        return None
+        # ``_mark_running`` gets the deployment row then the node row; return a
+        # promotable (or stop-raced) fake row for both.
+        return _FakeRow(stop_intent=self._stop_intent)
 
     async def commit(self) -> None:
         return None
@@ -1557,11 +1586,20 @@ class _FakeSession:
 
 
 class _FakeSessionFactory:
-    """No-op async session factory — the freshness wiring tests don't care
-    about the DB writes (those have their own integration tests)."""
+    """Async session factory for the freshness wiring tests. By default it
+    yields a PROMOTABLE node/deployment so the real ``_mark_running`` promotes
+    and returns ``True`` (the healthy run the run-loop tests simulate). Pass
+    ``stop_intent=True`` to simulate a concurrent ``/stop`` that raced startup —
+    ``_mark_running`` then SKIPS promotion (returns ``False``) and the run loop
+    must NOT set the reconciled marker. The DB writes themselves are no-ops
+    (those have their own integration tests)."""
+
+    def __init__(self, *, stop_intent: bool = False) -> None:
+        self._stop_intent = stop_intent
+        self._deployment_id = uuid4()
 
     def __call__(self) -> _FakeSession:
-        return _FakeSession()
+        return _FakeSession(deployment_id=self._deployment_id, stop_intent=self._stop_intent)
 
 
 class _FakeRedis:
@@ -1613,6 +1651,7 @@ async def _drive_run_loop(
     payload: TradingNodePayload,
     monitor_factory: Any,
     marker_factory: Any,
+    session_factory: Any = None,
 ) -> None:
     """Run ``run_subprocess_async`` to its ``running`` state, then trigger a
     clean stop so the finally block runs. Returns once the loop exits.
@@ -1639,7 +1678,7 @@ async def _drive_run_loop(
     stopper = asyncio.create_task(_stopper())
     await run_subprocess_async(
         payload,
-        session_factory=_FakeSessionFactory(),  # type: ignore[arg-type]
+        session_factory=session_factory or _FakeSessionFactory(),  # type: ignore[arg-type]
         node_factory=lambda _p: node,
         shutdown_event=shutdown,
         data_freshness_monitor_factory=monitor_factory,
@@ -1747,6 +1786,70 @@ async def test_run_loop_starts_and_stops_monitor() -> None:
     )
 
     assert calls == ["start", "stop"]
+
+
+@pytest.mark.asyncio
+async def test_run_loop_injects_local_shutdown_on_halt_into_monitor() -> None:
+    """Review iter-16 P1 — the run loop injects a fail-closed local-shutdown
+    ``_on_halt`` callback onto the monitor (BEFORE start), mirroring the IB
+    disconnect handler. Firing the injected callback sets the local shutdown
+    event + stops the node — so a data-stale halt tears the node down even if
+    the Redis latch write exhausts."""
+    actor = DataFreshnessActor(DataFreshnessActorConfig())
+    node = _FakeWiringNode(actors=[actor])
+    payload = _wiring_payload()
+
+    captured: dict[str, Any] = {}
+
+    class _StubMonitor:
+        def __init__(self) -> None:
+            self._on_halt: Any = None
+            self._on_halt_at_start: Any = "UNSET"
+
+        async def start(self, **kwargs: Any) -> None:
+            # Record the callback that was injected before start.
+            self._on_halt_at_start = self._on_halt
+            captured["on_halt_at_start"] = self._on_halt
+
+        async def stop(self) -> None:
+            return None
+
+    async def _monitor_factory(p: TradingNodePayload, n: Any) -> Any:
+        m = _StubMonitor()
+        captured["monitor"] = m
+        return m
+
+    async def _marker_factory(p: TradingNodePayload) -> Any:
+        class _M:
+            async def clear(self) -> None: ...
+            async def mark_reconciled(self) -> None: ...
+
+        return _M()
+
+    await _drive_run_loop(
+        node=node,
+        payload=payload,
+        monitor_factory=_monitor_factory,
+        marker_factory=_marker_factory,
+    )
+
+    # A callable on_halt was injected BEFORE start() ran (armed before the
+    # first tick could fire a halt).
+    injected = captured["on_halt_at_start"]
+    assert callable(injected)
+
+    # Firing it sets the local shutdown event + stops the node (in-process,
+    # no Redis) — the fail-closed local-shutdown path.
+    node_stop_calls: dict[str, int] = {"n": 0}
+    real_stop = node.stop_async
+
+    async def _counting_stop() -> None:
+        node_stop_calls["n"] += 1
+        await real_stop()
+
+    node.stop_async = _counting_stop  # type: ignore[method-assign]
+    await injected()
+    assert node_stop_calls["n"] == 1
 
 
 @pytest.mark.asyncio
@@ -2103,6 +2206,152 @@ async def test_run_loop_clears_marker_before_start_and_sets_after_running() -> N
     )
 
     assert order == ["clear", "mark"]
+
+
+@pytest.mark.asyncio
+async def test_run_loop_marker_not_set_when_mark_running_skips_on_stop_intent() -> None:
+    """Codex iter-20 P1 — a concurrent ``/stop`` / ``/kill-all`` that races
+    startup and stamps stop intent on the node row makes ``_mark_running`` SKIP
+    promotion (it leaves the row exactly as the stop path left it). The run loop
+    must then NOT set the reconciled marker: ``/resume`` trusts the reconciled
+    marker for ACTIVE deployments (including ``stopping``), so a marker set on a
+    stop-raced, deliberately-unpromoted node would let ``/resume`` clear a halt
+    against a node that is going down.
+
+    The marker is still CLEARed at start (fail-closed re-arm) but NEVER set —
+    distinct from the healthy run where ``_mark_running`` promotes and the order
+    is ``clear`` → ``mark``. Here the order is ``clear`` only."""
+    actor = DataFreshnessActor(DataFreshnessActorConfig())
+    node = _FakeWiringNode(actors=[actor])
+    payload = _wiring_payload()
+
+    order: list[str] = []
+
+    async def _monitor_factory(p: TradingNodePayload, n: Any) -> Any:
+        class _M:
+            async def start(self, **kwargs: Any) -> None: ...
+            async def stop(self) -> None: ...
+
+        return _M()
+
+    async def _marker_factory(p: TradingNodePayload) -> Any:
+        class _M:
+            async def clear(self) -> None:
+                order.append("clear")
+
+            async def mark_reconciled(self) -> None:
+                order.append("mark")
+
+        return _M()
+
+    # Stop-raced startup: the node row carries stop intent, so the real
+    # ``_mark_running`` skips promotion and returns False.
+    await _drive_run_loop(
+        node=node,
+        payload=payload,
+        monitor_factory=_monitor_factory,
+        marker_factory=_marker_factory,
+        session_factory=_FakeSessionFactory(stop_intent=True),
+    )
+
+    assert "clear" in order
+    assert "mark" not in order
+
+
+@pytest.mark.asyncio
+async def test_run_loop_stale_at_start_halt_skips_promotion_and_marker() -> None:
+    """Codex iter-22 P1 — a stale-at-start data-health halt must NOT leave the
+    node recorded as a successfully running + reconciled deployment.
+
+    The iter-20 fix made ``monitor.start()`` capable of firing the injected
+    local-shutdown ``_on_halt`` SYNCHRONOUSLY (stale-at-start → halt + local
+    shutdown, which sets ``shutdown_requested`` + stops the node). But the run
+    loop proceeded to ``_mark_running`` (promote the row) + ``mark_reconciled``
+    (set the reconciled marker) regardless — the only ``shutdown_requested``
+    checkpoint was LATER (before ``await node_run_task``). Net: a halted node
+    was promoted to ``running`` and stamped ``reconciled`` (which ``/resume``
+    would trust during the teardown window) before the process exited.
+
+    ``_mark_running``'s stop-intent guard reads the DB row
+    (``stop_requested_at`` / ``status``); a LOCAL ``shutdown_requested`` event
+    does NOT stamp the DB row, so the existing guard does NOT cover this — the
+    fake session yields a PROMOTABLE row here (``stop_intent=False``), proving
+    the local-halt path is what must short-circuit promotion.
+
+    With the fix: a ``shutdown_requested.is_set()`` checkpoint immediately after
+    ``monitor.start()`` returns and BEFORE ``_mark_running`` skips promotion +
+    marker entirely and falls through to teardown. ``_mark_running`` is never
+    called; the marker is cleared at start but never set; the node exits clean."""
+    actor = DataFreshnessActor(DataFreshnessActorConfig())
+    node = _FakeWiringNode(actors=[actor])
+    payload = _wiring_payload()
+
+    order: list[str] = []
+
+    class _StaleAtStartMonitor:
+        """Mirrors the production monitor: exposes ``_on_halt`` (so the run
+        loop injects its fail-closed local-shutdown callback before start),
+        and on ``start()`` fires that callback SYNCHRONOUSLY — exactly what a
+        stale-at-start finding does on the very first assert tick."""
+
+        def __init__(self) -> None:
+            self._on_halt: Any = None
+
+        async def start(self, **kwargs: Any) -> None:
+            order.append("monitor_start")
+            # Stale-at-start: fire the injected local-shutdown on_halt NOW.
+            if self._on_halt is not None:
+                await self._on_halt()
+
+        async def stop(self) -> None:
+            order.append("monitor_stop")
+
+    async def _monitor_factory(p: TradingNodePayload, n: Any) -> Any:
+        return _StaleAtStartMonitor()
+
+    async def _marker_factory(p: TradingNodePayload) -> Any:
+        class _M:
+            async def clear(self) -> None:
+                order.append("clear")
+
+            async def mark_reconciled(self) -> None:
+                order.append("mark")
+
+        return _M()
+
+    from msai.services.nautilus import trading_node_subprocess as _tns
+
+    mark_running_calls: dict[str, int] = {"n": 0}
+    real_mark_running = _tns._mark_running
+
+    async def _spy_mark_running(session_factory: Any, row_id: Any) -> bool:
+        mark_running_calls["n"] += 1
+        return await real_mark_running(session_factory, row_id)
+
+    # The monitor fires on_halt during start() → node.stop_async() unblocks the
+    # fake run_async, so the loop reaches teardown WITHOUT the external stopper.
+    shutdown = asyncio.Event()
+    with patch.object(_tns, "_mark_running", _spy_mark_running):
+        exit_code = await run_subprocess_async(
+            payload,
+            session_factory=_FakeSessionFactory(),  # type: ignore[arg-type]
+            node_factory=lambda _p: node,
+            shutdown_event=shutdown,
+            data_freshness_monitor_factory=_monitor_factory,
+            reconciled_marker_factory=_marker_factory,
+        )
+
+    # The marker was cleared at start (fail-closed re-arm) but NEVER set.
+    assert "clear" in order
+    assert "mark" not in order
+    # The monitor started (and the stale-at-start halt fired during start).
+    assert "monitor_start" in order
+    # Promotion was SKIPPED — _mark_running must not run after a stale-at-start
+    # halt set the local shutdown event.
+    assert mark_running_calls["n"] == 0
+    # The subprocess proceeded to teardown via the shutdown checkpoint — clean
+    # exit (not a failure / crash classification).
+    assert exit_code == 0
 
 
 @pytest.mark.asyncio

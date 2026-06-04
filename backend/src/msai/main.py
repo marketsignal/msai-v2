@@ -519,7 +519,13 @@ async def metrics(
     bus come through the same overridable dependencies the live
     routes use. Hydration degrades gracefully — if Redis or the DB
     is down it renders whatever is already registered and NEVER 500s
-    the scrape."""
+    the scrape. FIX 3: when the active-deployment enumeration FAILS
+    (transient DB/Redis error) the snapshot is flagged
+    ``collection_ok=False`` and hydration SKIPS the gauge prune, so the
+    previously-hydrated feed/stale/halt children stay standing through
+    the blip rather than momentarily vanishing (which would clear a
+    firing Prometheus alert). A successful-but-empty fleet still prunes
+    to empty."""
     from msai.services.observability import get_registry
 
     with suppress(Exception):

@@ -56,6 +56,7 @@ import contextlib
 import inspect
 import logging
 import os
+import re
 import signal
 import sys
 import threading
@@ -63,7 +64,7 @@ import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, Final, NoReturn
 from uuid import UUID  # noqa: TC003 — used at runtime for dataclass field type
 
 from sqlalchemy import select, update
@@ -106,11 +107,53 @@ _IB_EXEC_PACING_PHRASES: tuple[str, ...] = (
     "throttle",
 )
 
+# IB market-DATA pacing/rate codes. These are EXCLUDED — IB is exec-only in this
+# system (Databento owns market data), so a data-pacing rejection must NOT touch
+# the exec-pacing counter. The exclusion matters because IB's canonical message
+# texts for these codes *embed the matched phrases verbatim* — e.g.
+#   "Error 100: max rate of messages per second exceeded"
+#   "Error 162: Historical Market Data Service error message: pacing violation"
+#   "Error 420: ...pacing violation"
+# so pure phrase matching would mis-count them. We extract a leading/embedded IB
+# error code and suppress these BEFORE phrase matching.
+_IB_MARKET_DATA_PACING_CODES: frozenset[int] = frozenset({100, 162, 420})
+
+# Matches the IB error code in the reason text, anchored at the start (after
+# optional leading whitespace) in any of the forms IB / Nautilus surface:
+#   "Error 162: ..."  |  "error code 162: ..."  |  "162: ..."
+# Anchoring at the start prevents an incidental number deeper in free text from
+# being mistaken for the rejection's code.
+_IB_REASON_CODE_RE: Final = re.compile(
+    r"^\s*(?:error(?:\s+code)?\s+)?(\d+)\s*:",
+    re.IGNORECASE,
+)
+
+
+def _extract_ib_error_code(reason: str) -> int | None:
+    """Extract the leading IB error code from an OrderRejected *reason*, if present.
+
+    Returns the integer code for the IB reason formats ``Error 162: ...`` /
+    ``error code 162: ...`` / ``162: ...``; ``None`` when the reason carries no
+    leading code (codeless exec-side throttles take this path)."""
+    match = _IB_REASON_CODE_RE.match(reason)
+    if match is None:
+        return None
+    return int(match.group(1))
+
 
 def is_ib_exec_pacing_reason(reason: str | None) -> bool:
     """Return True if an OrderRejected *reason* indicates IB EXEC-side
-    pacing/throttle (NOT the legacy market-data pacing codes 100/162/420)."""
+    pacing/throttle (NOT the legacy market-data pacing codes 100/162/420).
+
+    Discrimination: when the reason carries a leading IB error code that is a
+    market-data pacing code (100/162/420), it is suppressed regardless of the
+    phrases it contains — IB's canonical texts for those codes embed the
+    exec-throttle phrases verbatim. Codeless reasons (and reasons with a
+    non-market-data code) fall through to pure phrase matching, so exec-side
+    throttles that carry no code still count."""
     if not reason:
+        return False
+    if _extract_ib_error_code(reason) in _IB_MARKET_DATA_PACING_CODES:
         return False
     lowered = reason.lower()
     return any(phrase in lowered for phrase in _IB_EXEC_PACING_PHRASES)
@@ -640,9 +683,20 @@ async def _mark_ready(session_factory: async_sessionmaker[AsyncSession], row_id:
     )
 
 
-async def _mark_running(session_factory: async_sessionmaker[AsyncSession], row_id: UUID) -> None:
+async def _mark_running(session_factory: async_sessionmaker[AsyncSession], row_id: UUID) -> bool:
     """Write the node's ``running`` row state AND forward-sync the parent
     ``live_deployments.status`` to ``running``.
+
+    Returns ``True`` iff the node row was actually PROMOTED to ``running``
+    (a real self-promotion happened). Returns ``False`` when promotion was
+    SKIPPED — the node/deployment row could not be resolved, OR a concurrent
+    ``/stop`` / ``/kill-all`` already stamped stop intent on the node row. The
+    caller uses this to decide whether to SET the reconciled marker (Codex
+    iter-20 P1): the marker must be SET only on a real promotion, never on a
+    stop-raced startup where the row was deliberately left unpromoted — else
+    ``/resume`` (which trusts the reconciled marker for ACTIVE deployments,
+    including ``stopping``) could clear a halt against a node that is going
+    down.
 
     PR 2 T4 review P1: the ``/start-portfolio`` API poll only waits 60s, but a
     slow IB connect/reconcile can push the node's ``running`` transition past
@@ -699,14 +753,14 @@ async def _mark_running(session_factory: async_sessionmaker[AsyncSession], row_i
             )
         ).scalar_one_or_none()
         if deployment_id is None:
-            return
+            return False
         # FOR UPDATE so the status guard below races correctly with a concurrent
         # /stop or /kill-all UPDATE on the same deployment row — acquired FIRST.
         deployment = await session.get(LiveDeployment, deployment_id, with_for_update=True)
 
         process_row = await session.get(LiveNodeProcess, row_id, with_for_update=True)
         if process_row is None:
-            return
+            return False
 
         # PR 2 / Codex iter-28 P1 — preserve operator-stop intent across the
         # startup→running self-promotion. ``_mark_running`` is the CHILD's
@@ -742,7 +796,7 @@ async def _mark_running(session_factory: async_sessionmaker[AsyncSession], row_i
                     "stop_requested": process_row.stop_requested_at is not None,
                 },
             )
-            return
+            return False
 
         process_row.status = "running"
         process_row.last_heartbeat_at = now
@@ -780,6 +834,12 @@ async def _mark_running(session_factory: async_sessionmaker[AsyncSession], row_i
         if deployment is not None and deployment.status in ("starting", "building", "ready"):
             deployment.status = "running"
             deployment.last_stopped_at = None
+
+    # A real self-promotion happened (the node row was set ``running``). The
+    # deployment forward-sync above is best-effort under its own guard, but the
+    # node-row promotion is the authoritative "this node reached running + was
+    # not racing a stop" signal that gates the reconciled-marker SET.
+    return True
 
 
 async def _mark_terminal(
@@ -1428,12 +1488,81 @@ async def run_subprocess_async(
         if freshness_enabled and data_freshness_monitor_factory is not None:
             data_stale_monitor = await _maybe_await(data_freshness_monitor_factory(payload, node))
             if data_stale_monitor is not None:
+                # Review iter-16 P1: inject the SAME fail-closed local-shutdown
+                # callback the IB disconnect handler gets (below). The monitor's
+                # ``_fire_halt`` fires ``on_halt`` after a halt attempt REGARDLESS
+                # of whether the Redis latch write succeeded — so an asymmetric
+                # latch-WRITE exhaustion (the F6 read gate can't be trusted to
+                # block in that case) still tears the node down locally. The
+                # callback sets the local ``shutdown_requested`` event + stops the
+                # node — purely in-process, no Redis. Injected BEFORE ``start()``
+                # so it is armed before the first tick can fire a halt. Composes
+                # with any pre-existing callback the factory configured; test
+                # fakes that don't expose ``_on_halt`` are unaffected.
+                if hasattr(data_stale_monitor, "_on_halt"):
+                    _ds_preexisting_on_halt = data_stale_monitor._on_halt
+
+                    async def _data_stale_local_shutdown_on_halt() -> None:
+                        """Fail-closed fallback: set the local shutdown event +
+                        stop the node. Runs AFTER any pre-existing on_halt the
+                        factory configured."""
+                        log.critical(
+                            "data_stale_monitor_local_halt_triggered",
+                            extra={
+                                "deployment_id": str(payload.deployment_id),
+                                "deployment_slug": payload.deployment_slug,
+                                "reason": (
+                                    "data feed stale past budget — triggering "
+                                    "local shutdown regardless of Redis "
+                                    "halt-latch write status"
+                                ),
+                            },
+                        )
+                        if _ds_preexisting_on_halt is not None:
+                            with contextlib.suppress(Exception):
+                                await _ds_preexisting_on_halt()
+                        shutdown_requested.set()
+                        with contextlib.suppress(Exception):
+                            await node.stop_async()
+
+                    data_stale_monitor._on_halt = _data_stale_local_shutdown_on_halt  # noqa: SLF001
+
                 await data_stale_monitor.start()
+
+        # Codex iter-22 P1 — STALE-AT-START checkpoint. ``data_stale_monitor.start()``
+        # can fire the injected local-shutdown ``_on_halt`` SYNCHRONOUSLY: a
+        # stale-at-start finding (a required feed already past budget on the very
+        # first assert tick) halts + locally shuts down, which sets
+        # ``shutdown_requested`` and schedules ``node.stop_async()``. Without this
+        # checkpoint the run loop fell through to ``_mark_running`` (promote the
+        # row to ``running``) + the reconciled-marker SET regardless — the only
+        # ``shutdown_requested`` check was LATER (~before ``await node_run_task``).
+        # Net: a halted, going-down node was recorded as a successfully running +
+        # reconciled deployment, and ``/resume`` (which trusts the reconciled
+        # marker for ACTIVE deployments) could clear the halt during the teardown
+        # window. ``_mark_running``'s own stop-intent guard does NOT cover this —
+        # that guard reads the DB row's ``stop_requested_at`` / ``status``, but a
+        # LOCAL ``shutdown_requested`` event does not stamp the DB row. So we
+        # short-circuit here: skip promotion + the marker SET entirely and fall
+        # through to the existing teardown path (mirrors the later shutdown
+        # check), leaving the marker absent → ``/resume`` fails closed.
+        if shutdown_requested.is_set():
+            log.warning(
+                "data_stale_halt_at_start_skipping_promotion",
+                extra={
+                    "row_id": str(payload.row_id),
+                    "deployment_id": str(payload.deployment_id),
+                    "deployment_slug": payload.deployment_slug,
+                },
+            )
+            node_run_task.cancel()
+            _record_clean_exit("data_stale_halt_at_start")
+            return terminal_exit_code
 
         # NOW flip the deployment row to ``running`` — AFTER the monitor has
         # published its manifest, so the ``running`` state implies the manifest
         # exists (no transient ``monitor_missing`` gap for healthy startups).
-        await _mark_running(session_factory, payload.row_id)
+        promoted = await _mark_running(session_factory, payload.row_id)
 
         # PR 1b T4: SET the reconciled marker NOW — immediately AFTER
         # ``_mark_running`` succeeds (its contract is unchanged: readiness
@@ -1448,7 +1577,19 @@ async def run_subprocess_async(
         # lives at the run-loop level, NOT inside ``_mark_running`` (a DB-only
         # helper with no Redis/node handle). If readiness failed above we
         # already returned, so the marker stays absent (fail-closed).
-        if reconciled_marker is not None:
+        #
+        # Codex iter-20 P1: gate the SET on ``_mark_running`` having ACTUALLY
+        # PROMOTED the node row (``promoted is True``). ``_mark_running``
+        # early-returns WITHOUT promoting when a concurrent ``/stop`` /
+        # ``/kill-all`` raced startup and stamped stop intent on the node row
+        # (or the row/deployment could not be resolved). Setting the marker in
+        # that window would present a stop-raced, deliberately-unpromoted node
+        # as ``reconciled`` — and ``/resume`` trusts the reconciled marker for
+        # ACTIVE deployments (which include ``stopping``), so it could clear a
+        # halt against a node that is going down. Skipping the SET keeps the
+        # marker absent → ``/resume`` fails closed (no marker = refuse) for a
+        # node being torn down, exactly as for a readiness failure.
+        if reconciled_marker is not None and promoted:
             await reconciled_marker.mark_reconciled()
 
         # Phase 4 task 4.2 iter-2 wiring: spawn the IB disconnect

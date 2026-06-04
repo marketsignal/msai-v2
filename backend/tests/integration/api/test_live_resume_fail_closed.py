@@ -598,14 +598,19 @@ async def test_resume_clear_lua_clears_on_all_preconditions_met(
     rec_key = reconciled_key(dep_id)
     delete_keys = [_HALT, f"{_HALT}:set_by", halt_cause_key("fleet")]
 
-    await redis_text.set(manifest_key, "[]")
+    expected_manifest = "[]"
+    await redis_text.set(manifest_key, expected_manifest)
     await redis_text.set(verdict_key, "warm")
     await redis_text.set(rec_key, "ts")
     for k in delete_keys:
         await redis_text.set(k, "x")
 
     lua_keys = [manifest_key, verdict_key, rec_key, *delete_keys]
-    result = await redis_text.eval(RESUME_CLEAR_LUA, len(lua_keys), *lua_keys, "1", "1", "1")
+    # ARGV: n_manifest, n_verdict, n_reconciled, then the expected raw manifest
+    # value(s) — one per manifest key, in order (TOCTOU content-pin).
+    result = await redis_text.eval(
+        RESUME_CLEAR_LUA, len(lua_keys), *lua_keys, "1", "1", "1", expected_manifest
+    )
     result_str = result.decode() if isinstance(result, bytes) else str(result)
     assert result_str == "OK"
     for k in delete_keys:
@@ -613,6 +618,119 @@ async def test_resume_clear_lua_clears_on_all_preconditions_met(
     # Check keys survive (only delete-keys are removed).
     assert await redis_text.exists(manifest_key) == 1
     assert await redis_text.exists(verdict_key) == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_clear_lua_aborts_on_manifest_value_changed_mid_clear(
+    redis_text: AsyncRedis,
+) -> None:
+    """Codex iter-21 P1 — changed-universe TOCTOU: if the monitor OVERWRITES a
+    manifest with a CHANGED feed universe between the Python probe and the
+    atomic clear, the Lua must abort (``MANIFEST_CHANGED:<key>``) and delete
+    NOTHING — the latch survives. The pre-derived verdict-key list reflects the
+    OLD feeds, so clearing on it would clear the halt without proving the
+    CURRENT required feeds are warm.
+
+    Seeds state that would pass the probe (expected_manifest pinned in ARGV),
+    then overwrites the manifest with a DIFFERENT value before invoking the Lua
+    directly (simulating the race window)."""
+    dep_id = str(uuid4())
+    manifest_key = data_freshness_manifest_key(dep_id)
+    verdict_key = data_freshness_key(dep_id, _DATASET, _BAR_TYPE) + VERDICT_KEY_SUFFIX
+    rec_key = reconciled_key(dep_id)
+    delete_keys = [_HALT, f"{_HALT}:set_by", halt_cause_key("fleet")]
+
+    expected_manifest = json.dumps([{"dataset": _DATASET, "feed": _BAR_TYPE, "symbol": "AAPL"}])
+    # The monitor restarted the node with a DIFFERENT (larger) feed universe.
+    changed_manifest = json.dumps(
+        [
+            {"dataset": _DATASET, "feed": _BAR_TYPE, "symbol": "AAPL"},
+            {"dataset": _DATASET, "feed": "MSFT.XNAS-1-MINUTE-LAST-EXTERNAL", "symbol": "MSFT"},
+        ]
+    )
+    await redis_text.set(manifest_key, changed_manifest)  # CURRENT value differs
+    await redis_text.set(verdict_key, "warm")
+    await redis_text.set(rec_key, "ts")
+    for k in delete_keys:
+        await redis_text.set(k, "x")
+
+    lua_keys = [manifest_key, verdict_key, rec_key, *delete_keys]
+    result = await redis_text.eval(
+        RESUME_CLEAR_LUA, len(lua_keys), *lua_keys, "1", "1", "1", expected_manifest
+    )
+    result_str = result.decode() if isinstance(result, bytes) else str(result)
+    assert result_str.startswith("MANIFEST_CHANGED:")
+    assert manifest_key in result_str
+    # NOTHING deleted — the latch survives the aborted clear.
+    assert await redis_text.exists(_HALT) == 1
+    assert await redis_text.exists(halt_cause_key("fleet")) == 1
+
+
+# ---------------------------------------------------------------------------
+# Endpoint-level changed-universe TOCTOU (manifest swapped between probe + clear)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resume_manifest_swapped_between_probe_and_clear_409(
+    client: httpx.AsyncClient,
+    bus: LiveCommandBus,
+    redis_text: AsyncRedis,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Codex iter-21 P1 — changed-universe TOCTOU at the ENDPOINT level: the
+    monitor overwrites a deployment's manifest with a CHANGED feed universe in
+    the window between the Python probe (``GET manifest``) and the atomic clear
+    (``EVAL``). The route must refuse (409 ``RESUME_BLOCKED_DATA_STALE`` naming a
+    'manifest changed during resume') and clear NOTHING — the latch survives.
+
+    Injection point: wrap ``bus._redis`` so the SUCCESS-path ``eval`` is
+    preceded by an in-band manifest overwrite, reproducing the race precisely
+    where the route hands the pre-derived (now-stale) verdict-key list to Lua.
+    """
+    async with session_factory() as session:
+        dep = await _seed_active_deployment(session)
+        dep_id = str(dep.id)
+
+    await _seed_halt_latch(redis_text)
+    await _seed_manifest(redis_text, dep_id)  # one AAPL feed
+    await _seed_feed_verdict(redis_text, dep_id, verdict="warm")
+    await _seed_reconciled(redis_text, dep_id)
+
+    manifest_key = data_freshness_manifest_key(dep_id)
+    changed_manifest = json.dumps(
+        [
+            {"dataset": _DATASET, "feed": _BAR_TYPE, "symbol": "AAPL"},
+            {"dataset": _DATASET, "feed": "MSFT.XNAS-1-MINUTE-LAST-EXTERNAL", "symbol": "MSFT"},
+        ]
+    )
+
+    real_redis = bus._redis  # noqa: SLF001
+
+    class _RaceRedis:
+        """Delegates everything to the real client, but overwrites the manifest
+        in the instant BEFORE the resume ``eval`` fires — the race window."""
+
+        def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+            return getattr(real_redis, name)
+
+        async def eval(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            await real_redis.set(manifest_key, changed_manifest, ex=120)
+            return await real_redis.eval(*args, **kwargs)
+
+    bus._redis = _RaceRedis()  # type: ignore[assignment]  # noqa: SLF001
+    try:
+        resp = await client.post("/api/v1/live/resume")
+    finally:
+        bus._redis = real_redis  # noqa: SLF001
+
+    assert resp.status_code == 409, resp.text
+    err = resp.json()["detail"]["error"]
+    assert err["code"] == "RESUME_BLOCKED_DATA_STALE"
+    assert "manifest changed during resume" in err["message"]
+    # Latch UNTOUCHED — nothing cleared.
+    assert await redis_text.exists(_HALT) == 1
+    assert await redis_text.exists(halt_cause_key("fleet")) == 1
 
 
 # ---------------------------------------------------------------------------

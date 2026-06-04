@@ -431,6 +431,91 @@ async def test_data_health_manifest_feed_without_row_is_missing(
 
 
 @pytest.mark.asyncio
+async def test_data_health_verdict_comes_from_companion_not_json_row(
+    client: httpx.AsyncClient,
+    redis_text: AsyncRedis,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """FIX 4 (review iter-16 P2) — the verdict shown on data-health must come
+    from the SAME ``:verdict`` companion key ``/resume`` trusts, NOT from the
+    JSON row's embedded ``verdict`` field. The monitor writes the two as
+    separate SETs in a non-transactional pipeline, so they can drift. Seed a
+    JSON row that SAYS warm but a companion that says stale → data-health must
+    show STALE (the companion wins), matching what /resume would block on."""
+    async with session_factory() as session:
+        dep = await _seed_active_deployment(session)
+        dep_id = str(dep.id)
+
+    await _seed_manifest(redis_text, dep_id)
+    # Drift: JSON row embeds verdict='warm' but the companion is 'stale'.
+    key = data_freshness_key(dep_id, _DATASET, _BAR_TYPE)
+    payload = {
+        "last_event_ts": 1_700_000_000_000_000_000,
+        "last_arrival_ts": 1_700_000_000_000_000_000,
+        "verdict": "warm",  # stale companion below must WIN
+        "phase": "regular",
+        "grace_s": 90,
+        "account_id": _ACCOUNT,
+        "node_id": _NODE_ID,
+        "symbol": "AAPL",
+        "published_at": "2026-06-03T00:00:00+00:00",
+    }
+    await redis_text.set(key, json.dumps(payload), ex=120)
+    await redis_text.set(key + ":verdict", "stale", ex=120)
+
+    resp = await client.get("/api/v1/live/data-health")
+    assert resp.status_code == 200, resp.text
+    row = resp.json()["feeds"][0]
+    # The companion (stale) wins over the JSON row's (warm).
+    assert row["verdict"] == "stale"
+    # Persistence: re-poll → still stale (the companion is authoritative).
+    resp2 = await client.get("/api/v1/live/data-health")
+    assert resp2.json()["feeds"][0]["verdict"] == "stale"
+
+
+@pytest.mark.asyncio
+async def test_data_health_row_present_but_companion_absent_is_missing(
+    client: httpx.AsyncClient,
+    redis_text: AsyncRedis,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """FIX 4 (review iter-16 P2) — partial-write drift: the JSON row exists but
+    its ``:verdict`` companion is absent. The feed's verdict must be 'missing'
+    (fail-visible) — matching what /resume does (a missing companion blocks the
+    resume). Without this, a present JSON row with a stale embedded verdict
+    would have rendered as that embedded value while /resume blocked."""
+    async with session_factory() as session:
+        dep = await _seed_active_deployment(session)
+        dep_id = str(dep.id)
+
+    await _seed_manifest(redis_text, dep_id)
+    key = data_freshness_key(dep_id, _DATASET, _BAR_TYPE)
+    payload = {
+        "last_event_ts": 1_700_000_000_000_000_000,
+        "verdict": "warm",
+        "phase": "regular",
+        "grace_s": 90,
+        "account_id": _ACCOUNT,
+        "node_id": _NODE_ID,
+        "symbol": "AAPL",
+        "published_at": "2026-06-03T00:00:00+00:00",
+    }
+    # JSON row present, companion DELIBERATELY absent.
+    await redis_text.set(key, json.dumps(payload), ex=120)
+
+    resp = await client.get("/api/v1/live/data-health")
+    assert resp.status_code == 200, resp.text
+    row = resp.json()["feeds"][0]
+    assert row["verdict"] == "missing"
+    # But the JSON metadata still rendered (the row exists, so we have fields).
+    assert row["symbol"] == "AAPL"
+    assert row["last_event_ts"] == 1_700_000_000_000_000_000
+    # Persistence.
+    resp2 = await client.get("/api/v1/live/data-health")
+    assert resp2.json()["feeds"][0]["verdict"] == "missing"
+
+
+@pytest.mark.asyncio
 async def test_data_health_malformed_manifest_does_not_crash(
     client: httpx.AsyncClient,
     redis_text: AsyncRedis,
@@ -637,6 +722,58 @@ async def test_data_health_null_field_entry_consistent_with_resume(
     assert await redis_text.exists(fleet_halt_key()) == 1
 
 
+@pytest.mark.asyncio
+async def test_data_health_non_dict_list_entry_does_not_crash(
+    client: httpx.AsyncClient,
+    redis_text: AsyncRedis,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Review iter-19 (pr-toolkit P0) — a LIST manifest containing a NON-DICT
+    entry (``[42]``, ``["AAPL"]``, ``[null]``) must be handled by the SAME
+    'manifest malformed' path as the dict-missing-field entries — not crash.
+
+    The non-dict branch of ``_read_deployment_feeds`` previously returned the OLD
+    2-tuple ``([], 'manifest malformed')`` after the iter-18 conversion to
+    3-tuples. The sole call site unpacks 3 values → ``ValueError: not enough
+    values to unpack (expected 3, got 2)``. That raise escapes ``collect_data_health``
+    (the deployment loop isn't wrapped) AND ``hydrate_data_health_metrics`` (collect
+    is called outside its try) → 500 on BOTH ``GET /api/v1/live/data-health`` and
+    ``/metrics``, contradicting the "Never raises" contract.
+
+    After the fix BOTH surfaces stay up: data-health lists the deployment under
+    ``monitor_missing`` with reason ``'manifest malformed'`` (consistent with the
+    other malformed-entry tests) and ``/metrics`` renders 200."""
+    async with session_factory() as session:
+        dep = await _seed_active_deployment(session)
+        dep_id = str(dep.id)
+
+    # A LIST manifest whose single entry is a NON-DICT scalar.
+    await redis_text.set(
+        data_freshness_manifest_key(dep_id),
+        json.dumps([42]),
+        ex=120,
+    )
+
+    # (a) data-health does NOT 500 and classifies the deployment monitor_missing
+    # 'manifest malformed' (same semantics as the dict-missing-field tests).
+    resp = await client.get("/api/v1/live/data-health")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["feeds"] == []
+    entry = next(e for e in body["monitor_missing"] if e["deployment_id"] == dep_id)
+    assert entry["reason"] == "manifest malformed"
+
+    # (b) /metrics scrape renders 200 on the SAME state (collect runs in the
+    # hydration path too — it must not raise there either).
+    resp_metrics = await client.get("/metrics")
+    assert resp_metrics.status_code == 200, resp_metrics.text
+
+    # Persistence: re-poll → still flagged monitor_missing, still no 500.
+    resp2 = await client.get("/api/v1/live/data-health")
+    assert resp2.status_code == 200
+    assert any(e["deployment_id"] == dep_id for e in resp2.json()["monitor_missing"])
+
+
 # ---------------------------------------------------------------------------
 # Route — Redis manifest READ-FAILURE must NOT page as monitor_missing (FIX 1)
 # ---------------------------------------------------------------------------
@@ -839,6 +976,136 @@ async def test_data_health_call_hydrates_labeled_metric_series(
 
 
 # ---------------------------------------------------------------------------
+# Metrics node-attribution — missing rows inherit the deployment's node (P2)
+# ---------------------------------------------------------------------------
+
+# Two feeds on the SAME dataset within one deployment: one warm (carries
+# node_id from its published JSON row), one manifest-declared but with NO row
+# (derived 'missing'). The two feeds are different bar-types so they coexist.
+_DATASET_2 = "EQUS.MINI"  # SAME dataset → both feeds share one dataset_alive key
+_BAR_TYPE_2 = "MSFT.XNAS-1-MINUTE-LAST-EXTERNAL"
+
+
+@pytest.mark.asyncio
+async def test_missing_feed_inherits_deployment_node_for_dataset_alive(
+    client: httpx.AsyncClient,
+    redis_text: AsyncRedis,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A deployment with one WARM feed (node-1) and one manifest-declared MISSING
+    feed (no Redis row) on the SAME dataset must attribute the missing feed to
+    the warm feed's node — NOT to a phantom node="unknown" series.
+
+    Regression for the false-green-node bug (Codex iter-24 P2): a missing row
+    carries no node_id of its own (the node never published it). Grouping it
+    under node="unknown" split ONE dataset across TWO node buckets — node-1
+    alive=1 (only the warm feed) AND unknown alive=0 — so a node-scoped
+    dashboard filtered to node-1 showed FALSE GREEN while a feed of that exact
+    deployment+node was dead. All feeds of a deployment live on ONE node by
+    construction (the manifest is per-deployment-node), so the missing feed
+    inherits the deployment's observed node and lands in the SAME dataset_alive
+    bucket → that bucket is alive=0 (one feed stale) and no 'unknown' series
+    appears."""
+    async with session_factory() as session:
+        dep = await _seed_active_deployment(session)
+        dep_id = str(dep.id)
+
+    # Manifest declares TWO feeds on the same dataset; only the first is warm.
+    await _seed_manifest(
+        redis_text,
+        dep_id,
+        feeds=[
+            {"dataset": _DATASET, "feed": _BAR_TYPE, "symbol": "AAPL"},
+            {"dataset": _DATASET_2, "feed": _BAR_TYPE_2, "symbol": "MSFT"},
+        ],
+    )
+    # Warm row for the FIRST feed only → carries node_id=_NODE_ID.
+    await _seed_feed_row(redis_text, dep_id, verdict="warm")
+    # No row for the SECOND feed → derived 'missing', node_id inherited.
+
+    resp = await client.get("/api/v1/live/data-health")
+    assert resp.status_code == 200, resp.text
+    feeds = resp.json()["feeds"]
+    # Route consistency: BOTH feed entries carry the deployment's node_id
+    # (same FeedHealth objects feed the route + metrics).
+    assert {f["feed"] for f in feeds} == {_BAR_TYPE, _BAR_TYPE_2}
+    for f in feeds:
+        assert f["node_id"] == _NODE_ID, f
+
+    rendered = get_registry().render()
+    alive_lines = [
+        ln for ln in rendered.splitlines() if ln.startswith("msai_databento_dataset_alive{")
+    ]
+    assert alive_lines, rendered
+    # NO 'unknown' node series — the missing feed inherited node-1.
+    assert not any('node="unknown"' in ln for ln in alive_lines), alive_lines
+    # Exactly ONE dataset_alive series for this dataset, attributed to node-1,
+    # and it is DEAD (0) because one of its feeds is missing.
+    node1_lines = [ln for ln in alive_lines if f'node="{_NODE_ID}"' in ln]
+    assert len(node1_lines) == 1, alive_lines
+    assert f'dataset="{_DATASET}"' in node1_lines[0]
+    assert node1_lines[0].endswith(" 0.0") or node1_lines[0].endswith(" 0"), node1_lines[0]
+
+    # Persistence: re-poll → still attributed to node-1, still dead, no 'unknown'.
+    resp2 = await client.get("/api/v1/live/data-health")
+    assert resp2.status_code == 200
+    for f in resp2.json()["feeds"]:
+        assert f["node_id"] == _NODE_ID
+    rendered2 = get_registry().render()
+    alive2 = [ln for ln in rendered2.splitlines() if ln.startswith("msai_databento_dataset_alive{")]
+    assert not any('node="unknown"' in ln for ln in alive2), alive2
+
+
+@pytest.mark.asyncio
+async def test_fully_missing_deployment_attributes_dataset_alive_to_unknown(
+    client: httpx.AsyncClient,
+    redis_text: AsyncRedis,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A deployment whose manifest is present + parseable but for which NO feed
+    has published a row (every feed derived 'missing') is genuinely
+    unattributable to a node — NO present row carries a node_id. The dataset is
+    correctly attributed to node="unknown" (we cannot invent a node), and the
+    dead state is STILL visible: dataset_alive=0 for that (account,unknown,
+    dataset) bucket.
+
+    Note: a present + parseable manifest does NOT trigger monitor_missing (that
+    fires only on an ABSENT or MALFORMED manifest); the dead-feed signal for a
+    fully-quiet-but-declared deployment is dataset_alive=0, which this asserts."""
+    async with session_factory() as session:
+        dep = await _seed_active_deployment(session)
+        dep_id = str(dep.id)
+
+    # Manifest present + parseable, but NO feed rows seeded → all derived missing.
+    await _seed_manifest(redis_text, dep_id)
+
+    resp = await client.get("/api/v1/live/data-health")
+    assert resp.status_code == 200, resp.text
+    feeds = resp.json()["feeds"]
+    assert len(feeds) == 1
+    # Genuinely unattributable: no published row carried a node_id.
+    assert feeds[0]["node_id"] is None
+    assert feeds[0]["verdict"] == "missing"
+    # Present + parseable manifest → NOT a monitor_missing case.
+    assert resp.json()["monitor_missing"] == []
+
+    rendered = get_registry().render()
+    alive_lines = [
+        ln for ln in rendered.splitlines() if ln.startswith("msai_databento_dataset_alive{")
+    ]
+    assert len(alive_lines) == 1, rendered
+    # Unknown node (unattributable), and DEAD (0) — the dead signal is visible.
+    assert 'node="unknown"' in alive_lines[0], alive_lines[0]
+    assert f'dataset="{_DATASET}"' in alive_lines[0]
+    assert alive_lines[0].endswith(" 0.0") or alive_lines[0].endswith(" 0"), alive_lines[0]
+
+    # Persistence: re-poll → still unknown + dead.
+    resp2 = await client.get("/api/v1/live/data-health")
+    assert resp2.status_code == 200
+    assert resp2.json()["feeds"][0]["node_id"] is None
+
+
+# ---------------------------------------------------------------------------
 # Bare /metrics scrape hydrates the series with no prior data-health call
 # ---------------------------------------------------------------------------
 
@@ -898,6 +1165,303 @@ async def test_data_feed_series_pruned_when_feed_leaves_manifest(
 
     resp2 = await client.get("/metrics")
     assert f'feed="{_BAR_TYPE}"' not in resp2.text
+
+
+# ---------------------------------------------------------------------------
+# FIX 3 — transient collection failure must NOT erase the hydrated gauges
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_data_feed_gauges_survive_transient_db_collection_failure(
+    client: httpx.AsyncClient,
+    redis_text: AsyncRedis,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """FIX 3 (review iter-16 P2) — a transient DB error during the
+    active-deployment enumeration must NOT wipe the previously-hydrated feed
+    gauges. Otherwise a Prometheus stale/halt alert would momentarily clear (the
+    gauge child vanishes) on every DB blip. After a clean hydrate, a scrape whose
+    DB query RAISES must leave the prior children standing."""
+    async with session_factory() as session:
+        dep = await _seed_active_deployment(session)
+        dep_id = str(dep.id)
+
+    await _seed_manifest(redis_text, dep_id)
+    await _seed_feed_row(redis_text, dep_id, verdict="stale")
+
+    # First scrape hydrates the gauges (the feed is stale → alert-worthy).
+    resp1 = await client.get("/metrics")
+    assert f'feed="{_BAR_TYPE}"' in resp1.text
+    assert "msai_data_feed_stale{" in resp1.text
+
+    # Now make the DB enumeration RAISE for the next scrape (transient blip).
+    class _BoomSession:
+        async def __aenter__(self) -> _BoomSession:
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+        async def execute(self, *_a: object, **_k: object) -> object:
+            raise ConnectionError("db blip")
+
+    async def _override_boom_db() -> AsyncIterator[object]:
+        yield _BoomSession()
+
+    app.dependency_overrides[get_db] = _override_boom_db
+    try:
+        resp2 = await client.get("/metrics")
+    finally:
+        # Restore the working override the client fixture installed.
+        async def _override_get_db() -> AsyncIterator[AsyncSession]:
+            async with session_factory() as s:
+                yield s
+
+        app.dependency_overrides[get_db] = _override_get_db
+
+    assert resp2.status_code == 200, resp2.text
+    # FIX 3: the prior children SURVIVE the failed collection (not pruned).
+    assert f'feed="{_BAR_TYPE}"' in resp2.text
+    assert "msai_data_feed_stale{" in resp2.text
+
+    # And once the DB recovers AND the feed legitimately leaves the manifest,
+    # the normal prune still works (collection_ok=True path).
+    await _seed_manifest(redis_text, dep_id, feeds=[])
+    await redis_text.delete(data_freshness_key(dep_id, _DATASET, _BAR_TYPE))
+    await redis_text.delete(data_freshness_key(dep_id, _DATASET, _BAR_TYPE) + ":verdict")
+    resp3 = await client.get("/metrics")
+    assert f'feed="{_BAR_TYPE}"' not in resp3.text
+
+
+# ---------------------------------------------------------------------------
+# FIX (iter-17) — a Redis read failure during collection must NOT erase gauges
+# ---------------------------------------------------------------------------
+
+
+class _RaisingOnManifestRedis:
+    """Delegate every Redis op to a real client EXCEPT a ``get`` of the given
+    manifest key, which RAISES (simulates a transient Redis blip on that one
+    deployment's manifest read)."""
+
+    def __init__(self, inner: AsyncRedis, manifest_key: str) -> None:
+        self._inner = inner
+        self._manifest_key = manifest_key
+
+    async def get(self, key: str, *a: object, **k: object) -> object:
+        if key == self._manifest_key:
+            raise ConnectionError("manifest read blip")
+        return await self._inner.get(key, *a, **k)
+
+    def __getattr__(self, name: str) -> object:
+        # exists / scan_iter / mget / set / delete / ... → real client.
+        return getattr(self._inner, name)
+
+
+class _RaisingOnScanRedis:
+    """Delegate every Redis op to a real client EXCEPT ``scan_iter`` (the
+    account-counter scan behind the pacing / stale-halt gauges), which RAISES
+    (simulates a transient Redis blip on a pre-DB counter read)."""
+
+    def __init__(self, inner: AsyncRedis) -> None:
+        self._inner = inner
+
+    def scan_iter(self, *a: object, **k: object) -> object:
+        raise ConnectionError("counter scan blip")
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
+class _RaisingOnMgetRedis:
+    """Delegate every Redis op to a real client EXCEPT ``mget`` (the per-feed
+    JSON-row + ``:verdict`` companion batch read inside ``_read_deployment_feeds``),
+    which RAISES (simulates a transient Redis blip between the manifest GET and
+    the feed MGET — a pool-checkout failure / cluster timeout on the larger
+    MGET). The manifest ``get`` still SUCCEEDS, so the per-feed read is the only
+    thing that fails for this deployment."""
+
+    def __init__(self, inner: AsyncRedis) -> None:
+        self._inner = inner
+
+    async def mget(self, *a: object, **k: object) -> object:
+        raise ConnectionError("feed mget blip")
+
+    def __getattr__(self, name: str) -> object:
+        # get / exists / scan_iter / set / delete / ... → real client.
+        return getattr(self._inner, name)
+
+
+@pytest.mark.asyncio
+async def test_data_feed_gauges_survive_transient_feed_mget_failure(
+    client: httpx.AsyncClient,
+    redis_text: AsyncRedis,
+    bus: LiveCommandBus,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """FIX (review iter-18, pr-toolkit P1 / Codex P2) — a per-deployment
+    per-feed MGET failure (the manifest GET succeeds but the feed-row / verdict
+    MGET RAISES — a Redis blip between the two calls) must flip
+    ``collection_ok=False`` so the previously-hydrated feed gauges SURVIVE the
+    next scrape. Previously ``_read_deployment_feeds`` read the rows + verdicts
+    via the UNCHECKED ``_redis_mget`` (swallowing the ok flag), so a raised MGET
+    degraded every feed to all-None → ``missing`` rows while ``collection_ok``
+    stayed True; hydration then pruned/rewrote the firing DATA_FEED_AGE_SECONDS
+    children and flipped DATA_FEED_STALE→1 / DATABENTO_DATASET_ALIVE→0 on the
+    blip — exactly the blip-wipe the ``collection_ok`` contract promises to
+    prevent."""
+    async with session_factory() as session:
+        dep = await _seed_active_deployment(session)
+        dep_id = str(dep.id)
+
+    await _seed_manifest(redis_text, dep_id)
+    # A WARM feed → DATA_FEED_AGE_SECONDS present, DATA_FEED_STALE=0,
+    # DATABENTO_DATASET_ALIVE=1. The blip would (pre-fix) flip all of these.
+    await _seed_feed_row(redis_text, dep_id, verdict="warm")
+
+    # First scrape hydrates the gauges (warm feed → alive=1, stale=0, age present).
+    resp1 = await client.get("/metrics")
+    assert f'feed="{_BAR_TYPE}"' in resp1.text
+    assert "msai_data_feed_age_seconds{" in resp1.text
+    age_line1 = next(
+        ln for ln in resp1.text.splitlines() if ln.startswith("msai_data_feed_age_seconds{")
+    )
+    stale_line1 = next(
+        ln for ln in resp1.text.splitlines() if ln.startswith("msai_data_feed_stale{")
+    )
+    alive_line1 = next(
+        ln for ln in resp1.text.splitlines() if ln.startswith("msai_databento_dataset_alive{")
+    )
+    assert stale_line1.endswith(" 0.0") or stale_line1.endswith(" 0")
+    assert alive_line1.endswith(" 1.0") or alive_line1.endswith(" 1")
+
+    # Next scrape: the per-feed MGET RAISES (manifest GET still succeeds).
+    real_redis = bus._redis  # noqa: SLF001
+    bus._redis = _RaisingOnMgetRedis(real_redis)  # type: ignore[assignment]  # noqa: SLF001
+    try:
+        resp2 = await client.get("/metrics")
+    finally:
+        bus._redis = real_redis  # noqa: SLF001
+
+    assert resp2.status_code == 200, resp2.text
+    # The prior children SURVIVE the failed MGET (not pruned / not rewritten):
+    # the warm age child is still present and the stale/alive values are
+    # UNCHANGED (pre-fix they would have flipped stale→1, alive→0, age pruned).
+    assert f'feed="{_BAR_TYPE}"' in resp2.text
+    assert "msai_data_feed_age_seconds{" in resp2.text
+    age_line2 = next(
+        ln for ln in resp2.text.splitlines() if ln.startswith("msai_data_feed_age_seconds{")
+    )
+    stale_line2 = next(
+        ln for ln in resp2.text.splitlines() if ln.startswith("msai_data_feed_stale{")
+    )
+    alive_line2 = next(
+        ln for ln in resp2.text.splitlines() if ln.startswith("msai_databento_dataset_alive{")
+    )
+    assert age_line2 == age_line1
+    assert stale_line2 == stale_line1
+    assert alive_line2 == alive_line1
+
+    # Recovery: a clean scrape updates the gauges again.
+    resp3 = await client.get("/metrics")
+    assert f'feed="{_BAR_TYPE}"' in resp3.text
+    stale_line3 = next(
+        ln for ln in resp3.text.splitlines() if ln.startswith("msai_data_feed_stale{")
+    )
+    assert stale_line3.endswith(" 0.0") or stale_line3.endswith(" 0")
+
+    # And a clean EMPTY collection still prunes (collection_ok=True path).
+    await _seed_manifest(redis_text, dep_id, feeds=[])
+    await redis_text.delete(data_freshness_key(dep_id, _DATASET, _BAR_TYPE))
+    await redis_text.delete(data_freshness_key(dep_id, _DATASET, _BAR_TYPE) + ":verdict")
+    resp4 = await client.get("/metrics")
+    assert f'feed="{_BAR_TYPE}"' not in resp4.text
+
+
+@pytest.mark.asyncio
+async def test_data_feed_gauges_survive_transient_manifest_read_failure(
+    client: httpx.AsyncClient,
+    redis_text: AsyncRedis,
+    bus: LiveCommandBus,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """FIX (review iter-17, Codex P1 / pr-toolkit P2) — a per-deployment manifest
+    READ FAILURE (transient Redis blip) must flip ``collection_ok=False`` so the
+    previously-hydrated feed gauges SURVIVE the next scrape. Previously the
+    read-failed deployment was skipped (no rows) while ``collection_ok`` stayed
+    True, so hydration pruned that deployment's firing children with a partial
+    snapshot — clearing a stale/halt alert on a Redis blip."""
+    async with session_factory() as session:
+        dep = await _seed_active_deployment(session)
+        dep_id = str(dep.id)
+
+    await _seed_manifest(redis_text, dep_id)
+    await _seed_feed_row(redis_text, dep_id, verdict="stale")
+
+    # First scrape hydrates the gauges (the feed is stale → alert-worthy).
+    resp1 = await client.get("/metrics")
+    assert f'feed="{_BAR_TYPE}"' in resp1.text
+    assert "msai_data_feed_stale{" in resp1.text
+
+    # Next scrape: the manifest GET for this deployment RAISES (transient blip).
+    real_redis = bus._redis  # noqa: SLF001
+    bus._redis = _RaisingOnManifestRedis(  # type: ignore[assignment]  # noqa: SLF001
+        real_redis, data_freshness_manifest_key(dep_id)
+    )
+    try:
+        resp2 = await client.get("/metrics")
+    finally:
+        bus._redis = real_redis  # noqa: SLF001
+
+    assert resp2.status_code == 200, resp2.text
+    # The prior children SURVIVE the failed manifest read (not pruned).
+    assert f'feed="{_BAR_TYPE}"' in resp2.text
+    assert "msai_data_feed_stale{" in resp2.text
+
+    # Recovery: a clean scrape with the feed legitimately gone still prunes.
+    await _seed_manifest(redis_text, dep_id, feeds=[])
+    await redis_text.delete(data_freshness_key(dep_id, _DATASET, _BAR_TYPE))
+    await redis_text.delete(data_freshness_key(dep_id, _DATASET, _BAR_TYPE) + ":verdict")
+    resp3 = await client.get("/metrics")
+    assert f'feed="{_BAR_TYPE}"' not in resp3.text
+
+
+@pytest.mark.asyncio
+async def test_pacing_gauge_survives_transient_counter_scan_failure(
+    client: httpx.AsyncClient,
+    redis_text: AsyncRedis,
+    bus: LiveCommandBus,
+) -> None:
+    """FIX (review iter-17) — a pre-DB Redis read failure (here the account-counter
+    SCAN behind the pacing gauge) must flip ``collection_ok=False`` so the
+    previously-hydrated pacing gauge SURVIVES the next scrape. Previously the
+    pacing/stale-halt scans degraded silently to an empty map while
+    ``collection_ok`` stayed True, so hydration pruned the firing pacing child to
+    absent — clearing a real pacing-error series on a Redis blip."""
+    await redis_text.set(ib_exec_pacing_key(_ACCOUNT), "5")
+
+    # First scrape hydrates the pacing gauge.
+    resp1 = await client.get("/metrics")
+    assert "msai_ib_exec_pacing_errors{" in resp1.text
+    assert f'account="{_ACCOUNT}"' in resp1.text
+
+    # Next scrape: the counter SCAN RAISES (transient blip).
+    real_redis = bus._redis  # noqa: SLF001
+    bus._redis = _RaisingOnScanRedis(real_redis)  # type: ignore[assignment]  # noqa: SLF001
+    try:
+        resp2 = await client.get("/metrics")
+    finally:
+        bus._redis = real_redis  # noqa: SLF001
+
+    assert resp2.status_code == 200, resp2.text
+    # The prior pacing child SURVIVES the failed scan (not pruned to absent).
+    assert "msai_ib_exec_pacing_errors{" in resp2.text
+    assert f'account="{_ACCOUNT}"' in resp2.text
+
+    # Recovery: a clean scrape with the counter legitimately gone still prunes.
+    await redis_text.delete(ib_exec_pacing_key(_ACCOUNT))
+    resp3 = await client.get("/metrics")
+    assert f'account="{_ACCOUNT}"' not in resp3.text
 
 
 # ---------------------------------------------------------------------------

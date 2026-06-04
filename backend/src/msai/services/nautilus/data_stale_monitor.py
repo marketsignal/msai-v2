@@ -81,7 +81,7 @@ from msai.services.live.data_freshness import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable
 
     from msai.services.live.data_freshness import FeedKey, FreshnessRegistry
 
@@ -123,6 +123,7 @@ class DataStaleMonitor:
         account_id: str,
         node_id: str,
         clock: Any,
+        on_halt: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self._registry = registry
         self._required_feeds = set(required_feeds)
@@ -133,6 +134,15 @@ class DataStaleMonitor:
         self._account_id = account_id
         self._node_id = node_id
         self._clock = clock
+        # Optional fail-closed local-shutdown callback (review iter-16 P1).
+        # Mirrors :class:`IBDisconnectHandler.on_halt`: fired after a halt
+        # ATTEMPT regardless of whether the Redis write succeeded, so a flatten /
+        # local-shutdown hook runs even when the halt-latch write exhausts its
+        # retries (the F6 order gate fails closed only on its own Redis READ
+        # failure, so an asymmetric WRITE failure would otherwise leave the node
+        # trading until a later tick's write succeeds). Fires once per stale
+        # episode.
+        self._on_halt = on_halt
 
         self._redis: Any = None
         self._task: asyncio.Task[None] | None = None
@@ -141,6 +151,12 @@ class DataStaleMonitor:
 
         # Idempotency: once we fire the halt we don't re-fire while still stale.
         self._halt_fired: bool = False
+        # Separate episode-scoped guard for the local-shutdown ``on_halt``
+        # callback. The latch-write path can EXHAUST (leaving ``_halt_fired``
+        # False so a later tick retries the write), but ``on_halt`` must still
+        # fire exactly once per episode — so it tracks its own state and is
+        # re-armed on the same fully-warm tick that re-arms ``_halt_fired``.
+        self._on_halt_fired: bool = False
         # Test seam: when set, the tick evaluates this instead of the registry.
         self._snapshot_override: dict[FeedKey, FeedObservation] | None = None
 
@@ -276,48 +292,97 @@ class DataStaleMonitor:
     # -- TICK ------------------------------------------------------------
 
     async def _tick(self) -> None:
-        """One monitor cycle: re-set the manifest, evaluate, publish, and fire
-        the halt on the first stale finding. Catches and logs everything — the
-        loop must never crash the live node over a freshness-observation bug."""
+        """One monitor cycle: evaluate, FIRE THE HALT FIRST (the safety action),
+        then publish telemetry. Catches and logs everything — the loop must
+        never crash the live node over a freshness-observation bug.
+
+        SAFETY-FIRST ORDERING (review iter-16 P1): the halt is the real-money
+        safety action and MUST be independent of telemetry publishing. Earlier
+        this method publatched the manifest/per-feed/verdict pipeline FIRST and
+        fired the halt AFTER ``pipe.execute()`` — so a telemetry-pipeline failure
+        raised into the outer catch and SKIPPED the halt even though
+        ``evaluate()`` had already returned stale findings (a feed could be stale
+        AND the fleet stay un-halted because a cosmetic per-feed write blipped).
+        Now the order is: evaluate → (if findings and not fired) ``_fire_halt``
+        → then publish telemetry inside its OWN try/except so a publish failure
+        is logged and swallowed but can NEVER prevent or undo the halt. The halt
+        write itself already has its own retry/backoff + exhaustion handling in
+        :meth:`_fire_halt`."""
         try:
             now_ns = self._now_ns()
             snapshot = self._current_snapshot()
-            findings = evaluate(
-                self._required_feeds,
-                snapshot,
-                now_ns,
-                self._monitor_started_ns,
-                self._cfg,
-                self._phase_resolver,
-            )
+            findings = await self._evaluate_and_apply_halt(snapshot, now_ns)
 
-            # Pipeline ALL per-tick state writes (manifest SET + per-feed JSON
-            # SET + per-feed :verdict SET) into ONE round-trip. Same keys /
-            # values / TTLs as the prior sequential awaits. transaction=False:
-            # these are independent SETs with no read-modify-write, so MULTI's
-            # atomicity buys nothing and a plain command batch is cheaper.
-            stale_feeds = {f.feed_key for f in findings if f.feed_key is not None}
-            pipe = self._redis.pipeline(transaction=False)
-            self._queue_manifest(pipe)
-            self._queue_per_feed(pipe, snapshot, stale_feeds, now_ns)
-            await pipe.execute()
-
-            if findings:
-                if not self._halt_fired:
-                    await self._fire_halt(self._select_finding(findings))
-            else:
-                # Fully-warm tick: the CURRENT stale episode (if any) is over.
-                # Re-arm so a LATER stale episode in the same node lifetime
-                # re-latches the fleet — the flag tracks the CURRENT episode,
-                # not "ever fired". This keeps the within-episode idempotency
-                # (no re-LPUSH spam while a feed stays stale) intact while
-                # closing the fail-OPEN gap after an operator /resume.
-                self._halt_fired = False
+            # TELEMETRY SECOND — in its OWN try/except so a publish failure can
+            # NEVER affect the halt above. Pipeline ALL per-tick state writes
+            # (manifest SET + per-feed JSON SET + per-feed :verdict SET) into
+            # ONE round-trip. transaction=False: these are independent SETs with
+            # no read-modify-write, so MULTI's atomicity buys nothing and a
+            # plain command batch is cheaper.
+            try:
+                stale_feeds = {f.feed_key for f in findings if f.feed_key is not None}
+                pipe = self._redis.pipeline(transaction=False)
+                self._queue_manifest(pipe)
+                self._queue_per_feed(pipe, snapshot, stale_feeds, now_ns)
+                await pipe.execute()
+            except Exception:  # noqa: BLE001 — telemetry publish must not affect the halt
+                log.exception(
+                    "data_stale_monitor_publish_failed",
+                    extra={"deployment_id": self._deployment_id, "node_id": self._node_id},
+                )
         except Exception:  # noqa: BLE001 — a freshness bug must not crash the node
             log.exception(
                 "data_stale_monitor_tick_failed",
                 extra={"deployment_id": self._deployment_id, "node_id": self._node_id},
             )
+
+    async def _evaluate_and_apply_halt(
+        self, snapshot: dict[FeedKey, FeedObservation], now_ns: int
+    ) -> list[StaleFinding]:
+        """Evaluate the snapshot and apply the SAFETY ACTION (latch the fleet
+        halt on stale findings, or re-arm the episode guards on a fully-warm
+        result). Returns the findings so the caller can publish telemetry.
+
+        Extracted from :meth:`_tick` so the SAME safety-first evaluate→fire
+        logic runs BOTH on every background tick AND synchronously from
+        :meth:`start` (Codex iter-20 P2 — a feed already stale at monitor start
+        must halt before ``start()`` returns, not wait for the first background
+        tick which races the run loop's ``_mark_running``). The episode
+        idempotency (``_halt_fired`` / ``_on_halt_fired``) is shared, so a
+        synchronous start-time halt does NOT re-fire on the first tick while the
+        feed stays stale.
+
+        Telemetry publishing stays the caller's responsibility — this method is
+        purely the halt decision so it can be reused by the start path (which
+        publishes its own initial per-feed state) without double-writing."""
+        findings = evaluate(
+            self._required_feeds,
+            snapshot,
+            now_ns,
+            self._monitor_started_ns,
+            self._cfg,
+            self._phase_resolver,
+        )
+
+        # SAFETY ACTION FIRST — before any telemetry write. A stale finding
+        # latches the fleet halt regardless of whether the subsequent
+        # telemetry publish succeeds.
+        if findings:
+            if not self._halt_fired:
+                await self._fire_halt(self._select_finding(findings))
+        else:
+            # Fully-warm: the CURRENT stale episode (if any) is over. Re-arm so
+            # a LATER stale episode in the same node lifetime re-latches the
+            # fleet — the flag tracks the CURRENT episode, not "ever fired".
+            # This keeps the within-episode idempotency (no re-LPUSH spam while
+            # a feed stays stale) intact while closing the fail-OPEN gap after
+            # an operator /resume.
+            self._halt_fired = False
+            # Re-arm the local-shutdown callback guard alongside the latch guard
+            # so a LATER stale episode fires ``on_halt`` again.
+            self._on_halt_fired = False
+
+        return findings
 
     def _current_snapshot(self) -> dict[FeedKey, FeedObservation]:
         if self._snapshot_override is not None:
@@ -358,8 +423,17 @@ class DataStaleMonitor:
         (empty for an unobserved feed → ``pending``) using the SAME
         evaluate→publish path the loop tick uses, so the fresh verdicts
         OVERWRITE any stale ``warm`` leftovers from a prior run on this stable
-        deployment id. It does NOT fire the halt — that is the loop tick's job;
-        ``start()`` only re-establishes the per-feed state authoritatively.
+        deployment id.
+
+        It ALSO fires the halt synchronously when the start-time snapshot is
+        already stale (Codex iter-20 P2): the run loop calls ``start()`` BEFORE
+        ``_mark_running``, so a feed that is stale the instant the monitor comes
+        up (e.g. a node restart DURING an ongoing outage where the feed had been
+        observed then went silent) must latch the fleet halt here — before the
+        deployment can flip to ``running`` — rather than waiting for the first
+        background tick (which runs CONCURRENTLY with ``_mark_running``). The
+        halt decision reuses :meth:`_evaluate_and_apply_halt`, sharing the
+        episode-idempotency guards with the loop tick so it does not double-fire.
 
         FAIL-CLOSED (Codex iter-12 P1): unlike the per-tick loop (which swallows
         its own errors for steady-state resilience), a failure HERE PROPAGATES
@@ -376,14 +450,19 @@ class DataStaleMonitor:
         """
         now_ns = self._now_ns()
         snapshot = self._current_snapshot()
-        findings = evaluate(
-            self._required_feeds,
-            snapshot,
-            now_ns,
-            self._monitor_started_ns,
-            self._cfg,
-            self._phase_resolver,
-        )
+        # SAFETY ACTION FIRST (Codex iter-20 P2): apply the halt decision over
+        # the start-time snapshot SYNCHRONOUSLY, before publishing telemetry and
+        # before :meth:`start` returns. A feed already stale at monitor start
+        # (e.g. a node restart DURING an ongoing outage where the feed had been
+        # observed then went silent) must latch the fleet halt BEFORE the
+        # subprocess run loop reaches ``_mark_running`` — otherwise the
+        # deployment could flip to ``running`` with KNOWN-stale data and no
+        # awaited halt, trading un-halted until the first background tick. The
+        # shared episode guards (``_halt_fired`` / ``_on_halt_fired``) mean this
+        # start-time fire does NOT re-fire on the first tick while the feed stays
+        # stale. Reuses the exact evaluate→fire path the loop tick uses, so there
+        # is no duplicated halt logic.
+        findings = await self._evaluate_and_apply_halt(snapshot, now_ns)
         stale_feeds = {f.feed_key for f in findings if f.feed_key is not None}
         pipe = self._redis.pipeline(transaction=False)
         self._queue_per_feed(pipe, snapshot, stale_feeds, now_ns)
@@ -475,7 +554,19 @@ class DataStaleMonitor:
         manual ``/kill-all`` cause), and LPUSH/LTRIMs the cause onto the capped
         history list. Fires the metric + a single critical log once per
         warm→stale transition, then sets ``_halt_fired`` so subsequent ticks
-        don't re-fire while the feed stays stale."""
+        don't re-fire while the feed stays stale.
+
+        LOCAL-SHUTDOWN FALLBACK (review iter-16 P1): the optional ``on_halt``
+        callback is fired after the halt ATTEMPT REGARDLESS of whether the Redis
+        latch write succeeded — mirroring :meth:`IBDisconnectHandler._fire_halt`.
+        Rationale: the F6 node-side order gate fails closed only when its OWN
+        Redis READS fail; an asymmetric latch-WRITE exhaustion (writes fail but
+        reads still work / return None→fail-closed only transiently) would
+        otherwise leave the node trading until a later tick's write succeeds. The
+        injected ``on_halt`` (in the subprocess factory) sets the local shutdown
+        event + stops the node — purely in-process, no Redis — so the node tears
+        down even if the latch never lands. Fired at most once per stale episode
+        (guarded by ``_on_halt_fired``, re-armed on a fully-warm tick)."""
         cause_json = json.dumps(self._build_cause(finding))
         set_at = datetime.now(UTC).isoformat()
         set_by = f"data_stale_monitor:{self._node_id}"
@@ -518,7 +609,12 @@ class DataStaleMonitor:
                     "last_error": str(last_exc),
                 },
             )
-            return  # leave _halt_fired False so the next tick retries the write
+            # Leave _halt_fired False so the next tick retries the WRITE, but
+            # STILL fire the local-shutdown callback so the node tears down even
+            # though the latch never landed (the F6 read gate can't be trusted to
+            # block on an asymmetric write failure). Once per episode.
+            await self._maybe_fire_on_halt()
+            return
 
         # One transition log + metric (idempotent while stale thereafter).
         self._halt_fired = True
@@ -546,6 +642,27 @@ class DataStaleMonitor:
         from msai.services.observability.trading_metrics import DATA_STALE_HALTS
 
         DATA_STALE_HALTS.inc(account=self._account_id)
+
+        # Local-shutdown callback — fired on the successful-write path too, once
+        # per episode, so the on_halt semantics match the disconnect handler
+        # (callback fires whenever a halt is triggered, write success or not).
+        await self._maybe_fire_on_halt()
+
+    async def _maybe_fire_on_halt(self) -> None:
+        """Fire the optional ``on_halt`` local-shutdown callback at most once per
+        stale episode. A callback failure is logged and swallowed — the halt
+        attempt already ran, and the callback failure is just metadata (mirrors
+        :class:`IBDisconnectHandler`)."""
+        if self._on_halt is None or self._on_halt_fired:
+            return
+        self._on_halt_fired = True
+        try:
+            await self._on_halt()
+        except Exception:  # noqa: BLE001 — a callback failure must not crash the loop
+            log.exception(
+                "data_stale_on_halt_callback_failed",
+                extra={"deployment_id": self._deployment_id, "node_id": self._node_id},
+            )
 
     def _build_cause(self, finding: StaleFinding) -> dict[str, Any]:
         """Canonical cause JSON (see :data:`HALT_WRITE_LUA` docstring)."""
