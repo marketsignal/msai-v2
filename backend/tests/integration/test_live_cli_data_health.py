@@ -145,6 +145,27 @@ def _manual_halt_response(method: str, url: str) -> httpx.Response:
     )
 
 
+def _monitor_missing_response(method: str, url: str) -> httpx.Response:
+    """An active deployment whose in-node data-stale monitor is missing/dead
+    (absent manifest) — FIX 4. No feeds, but the deployment is surfaced."""
+    return httpx.Response(
+        200,
+        json={
+            "feeds": [],
+            "monitor_missing": [
+                {
+                    "deployment_id": "dep-dead",
+                    "account_id": "DU1234567",
+                    "reason": "manifest absent",
+                }
+            ],
+            "fleet_halted": False,
+            "halt_cause": None,
+        },
+        request=httpx.Request(method, url),
+    )
+
+
 def _service_unavailable_response(method: str, url: str) -> httpx.Response:
     """A 503 the API returns when the command bus / Redis is unreachable."""
     return httpx.Response(
@@ -239,6 +260,19 @@ def test_data_health_manual_halt_banner_distinguishes_cause(capture_request) -> 
     # A manual kill-all is distinguished from a data-stale halt.
     assert "fleet_emergency" in out
     assert "data_stale" not in out
+
+
+def test_data_health_monitor_missing_renders_line(capture_request) -> None:  # type: ignore[no-untyped-def]
+    capture_request["_install"](_monitor_missing_response)
+
+    result = CliRunner().invoke(app, ["live", "data-health"])
+
+    assert result.exit_code == 0, result.output
+    out = _clean(result.stdout)
+    # The operator must see a MONITOR MISSING line naming the dead deployment.
+    assert "MONITOR MISSING" in out.upper()
+    assert "dep-dead" in out
+    assert "manifest absent" in out
 
 
 def test_data_health_api_503_surfaces_error_to_stderr_exit_1(capture_request) -> None:  # type: ignore[no-untyped-def]

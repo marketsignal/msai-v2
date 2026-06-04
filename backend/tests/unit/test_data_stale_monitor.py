@@ -537,6 +537,125 @@ async def test_pending_flips_to_stale_past_startup_grace(redis: Any, clock: _Stu
 
 
 # ===========================================================================
+# Synchronous start() publish + fast-restart verdict-reuse safety (iter-11)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_start_publishes_pending_verdict_synchronously_before_any_tick(
+    redis: Any, clock: _StubClock
+) -> None:
+    """Codex iter-11 High — start() SYNCHRONOUSLY publishes per-feed rows +
+    verdict companions for every required feed BEFORE any tick. An unobserved
+    feed at start (empty registry) publishes 'pending', not absent — so the
+    state is authoritative the instant start() returns."""
+    monitor = _make_monitor(required_feeds={EQ_AAPL}, redis=redis, clock=clock)
+    # Unobserved at start (no snapshot injected → empty).
+    _set_snapshot(monitor, {})
+
+    await monitor.start(run_loop=False)
+
+    # No _tick() called yet — the verdict must already be present + 'pending'.
+    fkey = data_freshness_key("dep-1", "EQUS.MINI", EQ_AAPL.native_bar_type_str)
+    assert await _read_str(redis, fkey + VERDICT_KEY_SUFFIX) == "pending"
+    payload = json.loads((await _read(redis, fkey)).decode())
+    assert payload["verdict"] == "pending"
+    assert payload["last_event_ts"] is None
+    await monitor.stop()
+
+
+@pytest.mark.asyncio
+async def test_fast_restart_overwrites_stale_warm_verdicts_at_start(
+    redis: Any, clock: _StubClock
+) -> None:
+    """Codex iter-11 High — fast-restart simulation. Seed the OLD run's 'warm'
+    verdict keys + manifest for the (stable) deployment id, then construct a
+    NEW monitor and start() it. The synchronous start-publish OVERWRITES the
+    stale 'warm' verdicts with 'pending' (unobserved at restart) BEFORE the new
+    monitor ever ticks — so a /resume reaching the row in the restart window
+    can no longer clear a halt off the previous run's warm verdicts."""
+    fkey = data_freshness_key("dep-1", "EQUS.MINI", EQ_AAPL.native_bar_type_str)
+    vkey = fkey + VERDICT_KEY_SUFFIX
+    mkey = data_freshness_manifest_key("dep-1")
+
+    # OLD run left 'warm' verdict keys + manifest alive (e.g. a crash, or just
+    # before TTL expiry on a fast restart).
+    await redis.set(vkey, "warm")
+    await redis.set(fkey, json.dumps({"verdict": "warm"}))
+    await redis.set(mkey, json.dumps([{"dataset": "EQUS.MINI", "feed": "x", "symbol": "AAPL"}]))
+
+    # NEW monitor for the SAME deployment id, unobserved at restart.
+    monitor = _make_monitor(required_feeds={EQ_AAPL}, redis=redis, clock=clock)
+    _set_snapshot(monitor, {})
+    await monitor.start(run_loop=False)
+
+    # The stale 'warm' verdict has been OVERWRITTEN to 'pending' at start time.
+    assert await _read_str(redis, vkey) == "pending"
+    payload = json.loads((await _read(redis, fkey)).decode())
+    assert payload["verdict"] == "pending"
+    await monitor.stop()
+
+
+@pytest.mark.asyncio
+async def test_initial_publish_failure_raises_out_of_start(redis: Any, clock: _StubClock) -> None:
+    """Codex iter-12 P1 — the initial feed-state publish at start() must be
+    FAIL-CLOSED. If the synchronous start-time per-feed publish fails (e.g. the
+    pipeline execute raises) AFTER the manifest write, start() must RAISE rather
+    than swallow it. Swallowing it would let the run-loop reach ``_mark_running``
+    + the reconciled marker while the OLD run's TTL-alive ``warm`` verdicts
+    survive — breaking the overwrite-before-running invariant, so ``/resume``
+    could clear a halt off a prior run's verdicts. The wiring then fails the
+    subprocess BEFORE ``_mark_running`` (the monitor-wiring-failure path)."""
+    monitor = _make_monitor(required_feeds={EQ_AAPL}, redis=redis, clock=clock)
+    _set_snapshot(monitor, {})
+
+    boom = RuntimeError("redis pipeline execute failed")
+
+    class _FailingPipeline:
+        def __getattr__(self, _name: str) -> Any:
+            # Queueing commands (set/...) is a no-op; execute is what fails.
+            return lambda *a, **k: None
+
+        async def execute(self) -> Any:
+            raise boom
+
+    # Manifest write (plain set) succeeds; the per-feed pipeline execute fails.
+    with (
+        patch.object(redis, "pipeline", lambda *a, **k: _FailingPipeline()),
+        pytest.raises(RuntimeError, match="redis pipeline execute failed"),
+    ):
+        await monitor.start(run_loop=False)
+
+    # No background loop was ever spawned (start raised before that).
+    assert monitor._task is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_tick_publish_failure_is_swallowed_by_loop(redis: Any, clock: _StubClock) -> None:
+    """Steady-state resilience is UNCHANGED: a per-tick publish failure must NOT
+    crash the live node. The loop's own try/except keeps swallowing tick errors
+    (only start()'s INITIAL publish is fail-closed). This is the counterpart to
+    test_initial_publish_failure_raises_out_of_start — same failure shape, but
+    raised from inside _tick() must be swallowed."""
+    monitor = _make_monitor(required_feeds={EQ_AAPL}, redis=redis, clock=clock)
+    await monitor.start(run_loop=False)
+    _set_snapshot(monitor, {EQ_AAPL: _obs(clock, 5)})
+
+    class _FailingPipeline:
+        def __getattr__(self, _name: str) -> Any:
+            return lambda *a, **k: None
+
+        async def execute(self) -> Any:
+            raise RuntimeError("tick pipeline boom")
+
+    with patch.object(redis, "pipeline", lambda *a, **k: _FailingPipeline()):
+        # Must NOT raise out of the tick.
+        await monitor._tick()
+
+    await monitor.stop()
+
+
+# ===========================================================================
 # Halt-write mechanics (atomic Lua + retry + SETNX preservation)
 # ===========================================================================
 
@@ -798,22 +917,74 @@ async def test_re_stale_with_latch_not_cleared_still_appends_history(
 
 
 @pytest.mark.asyncio
-async def test_clean_stop_deletes_manifest_and_feed_keys(redis: Any, clock: _StubClock) -> None:
-    """On clean stop() the monitor DELETEs the manifest + the per-feed keys it
-    owns (so a graceful shutdown leaves no stale freshness state)."""
-    monitor = _make_monitor(required_feeds={EQ_AAPL}, redis=redis, clock=clock)
+async def test_clean_stop_deletes_per_feed_keys_but_leaves_manifest_ttl_alive(
+    redis: Any, clock: _StubClock
+) -> None:
+    """On clean stop() (Codex iter-11 High) the monitor DELETES the per-feed
+    JSON + ``:verdict`` keys but LEAVES the manifest to TTL-expire.
+
+    WHY delete per-feed keys: deployment ids are stable across restarts, so a
+    leftover ``warm`` verdict could let ``/resume`` clear a halt off a previous
+    run's state before the new monitor observes anything. Deleting them on
+    clean stop removes that fuel.
+
+    WHY leave the manifest: deleting it on a still-``running`` row was iter-10's
+    false-page bug — the subprocess stops the monitor in its ``finally`` BEFORE
+    the terminal write flips the row out of ``running``, so an absent manifest
+    would falsely page ``monitor_missing``. Deleting ONLY the per-feed keys does
+    NOT page (monitor-missing keys off the MANIFEST). The manifest stays
+    TTL-alive (TTL > 0, ≤ 3× the tick interval) and self-expires shortly
+    after."""
+    cfg = GraceConfig(interval_s=5)
+    monitor = _make_monitor(required_feeds={EQ_AAPL}, redis=redis, clock=clock, cfg=cfg)
     await monitor.start(run_loop=False)
     _set_snapshot(monitor, {EQ_AAPL: _obs(clock, 5)})
     await monitor._tick()
 
     fkey = data_freshness_key("dep-1", "EQUS.MINI", EQ_AAPL.native_bar_type_str)
+    vkey = fkey + VERDICT_KEY_SUFFIX
+    mkey = data_freshness_manifest_key("dep-1")
     assert await _read(redis, fkey) is not None
 
     await monitor.stop()
 
-    assert await _read(redis, data_freshness_manifest_key("dep-1")) is None
+    # Per-feed JSON + verdict are DELETED (no fuel for a fast-restart /resume).
     assert await _read(redis, fkey) is None
-    assert await _read(redis, fkey + VERDICT_KEY_SUFFIX) is None
+    assert await _read(redis, vkey) is None
+    # The manifest STILL EXISTS (no eager delete) and carries a positive TTL
+    # bounded by 3× the tick interval, so it self-expires shortly after the
+    # terminal write flips the row.
+    assert await _read(redis, mkey) is not None
+    ttl = await redis.ttl(mkey)
+    max_ttl = 3 * cfg.interval_s
+    assert 0 < ttl <= max_ttl, f"{mkey} TTL {ttl} not in (0, {max_ttl}]"
+
+
+@pytest.mark.asyncio
+async def test_running_row_with_freshly_stopped_monitor_is_not_monitor_missing(
+    redis: Any, clock: _StubClock
+) -> None:
+    """Data-health invariant: a 'running' row whose monitor has just been
+    stop()ped is NOT reported ``monitor_missing``, because the manifest is
+    still TTL-alive in the shutdown window.
+
+    This is the data-health-shaped assertion for the iter-10 fix: the
+    data-health collector keys monitor-missing off an ABSENT manifest for a
+    running deployment. Since clean stop() no longer eagerly deletes the
+    manifest, the collector still sees it present during the shutdown window
+    and does NOT page."""
+    monitor = _make_monitor(required_feeds={EQ_AAPL}, redis=redis, clock=clock)
+    await monitor.start(run_loop=False)
+    _set_snapshot(monitor, {EQ_AAPL: _obs(clock, 5)})
+    await monitor._tick()
+    await monitor.stop()
+
+    # The collector's monitor-missing predicate for a 'running' row: manifest
+    # absent (None) → page. After a clean stop the manifest is still present,
+    # so the predicate is False (no page).
+    raw_manifest = await redis.get(data_freshness_manifest_key("dep-1"))
+    monitor_missing_for_running_row = raw_manifest is None
+    assert monitor_missing_for_running_row is False
 
 
 @pytest.mark.asyncio
@@ -849,11 +1020,16 @@ async def test_run_loop_ticks_until_stopped(redis: Any, clock: _StubClock) -> No
     await asyncio.sleep(0.05)
 
     # While the loop is RUNNING, it has published the manifest + at least one
-    # per-feed key (clean-stop deletes them — verified separately).
+    # per-feed key.
     fkey = data_freshness_key("dep-1", "EQUS.MINI", EQ_AAPL.native_bar_type_str)
     assert await _read(redis, data_freshness_manifest_key("dep-1")) is not None
     assert await _read(redis, fkey) is not None
 
     await monitor.stop()
-    # The loop exited cleanly (task is gone) and cleaned up after itself.
+    # The loop exited cleanly (the task is gone). On clean stop the per-feed
+    # keys ARE deleted (iter-11 — no stale verdict fuel for a fast restart),
+    # while the manifest stays TTL-alive through the shutdown window (see
+    # test_clean_stop_deletes_per_feed_keys_but_leaves_manifest_ttl_alive).
+    assert monitor._task is None  # type: ignore[attr-defined]
     assert await _read(redis, fkey) is None
+    assert await _read(redis, data_freshness_manifest_key("dep-1")) is not None

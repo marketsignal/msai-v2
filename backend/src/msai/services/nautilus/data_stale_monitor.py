@@ -18,15 +18,31 @@ keeps publishing warm verdicts after a feed recovers but never clears the latch.
 Lifecycle (mirrors :class:`~msai.services.nautilus.disconnect_handler.IBDisconnectHandler`):
 
 * :meth:`start` — open the monitor's OWN aioredis client via the injected
-  factory, publish the required-feed MANIFEST (with TTL), and spawn the loop
-  task. A freshness-INELIGIBLE node (empty ``required_feeds``) still runs and
-  publishes an EMPTY manifest (distinct from absent).
+  factory, publish the required-feed MANIFEST (with TTL), SYNCHRONOUSLY publish
+  the CURRENT per-feed rows + ``:verdict`` companions (an inline first
+  evaluation — ``pending`` for an unobserved feed at start), and spawn the loop
+  task. Publishing the per-feed state BEFORE the loop (and BEFORE
+  ``_mark_running`` in the run-loop ordering) OVERWRITES any stale ``warm``
+  verdict leftovers from a prior run on the same stable deployment id, closing
+  the fast-restart resume-on-stale-verdict window (Codex iter-11 High). A
+  freshness-INELIGIBLE node (empty ``required_feeds``) still runs and publishes
+  an EMPTY manifest (distinct from absent).
 * the loop calls :meth:`_tick` every ``interval`` seconds: re-set the manifest,
   evaluate, publish per-feed JSON + verdict, and fire the halt on the FIRST
   stale finding. The loop NEVER raises out (an evaluation error is logged and
   swallowed — a freshness bug must not crash the live node).
-* :meth:`stop` — cancel the loop, DELETE the manifest + per-feed keys the
-  monitor owns, and close the Redis client.
+* :meth:`stop` — cancel the loop, DELETE the per-feed JSON + ``:verdict`` keys
+  (rebuilt from ``required_feeds``), LEAVE the manifest to TTL-expire, and
+  close the Redis client. Deleting the per-feed keys removes stale ``warm``
+  verdicts so a fast restart can't ``/resume`` off them; deleting ONLY the
+  per-feed keys does NOT page ``monitor_missing`` (that keys off the MANIFEST).
+  The manifest is left because deleting it on a still-``running`` row was
+  iter-10's false-page bug (the subprocess stops the monitor in its ``finally``
+  BEFORE the terminal write flips the row out of ``running``); the manifest's
+  3×-tick TTL keeps it alive through the shutdown window, then it self-expires.
+  Residual (CRASH only): a SIGKILL skips clean stop, leaving old ``warm``
+  verdicts ≤3×tick — bounded by the same TTL that bounds all verdict freshness;
+  the manifest TTL then fails ``/resume`` closed. Accepted.
 
 Redis client discipline: the monitor opens its own ``decode_responses=False``
 client (mirroring ``_real_disconnect_handler_factory`` in
@@ -125,8 +141,6 @@ class DataStaleMonitor:
 
         # Idempotency: once we fire the halt we don't re-fire while still stale.
         self._halt_fired: bool = False
-        # Keys the monitor has published this lifetime (deleted on clean stop).
-        self._owned_feed_keys: set[str] = set()
         # Test seam: when set, the tick evaluates this instead of the registry.
         self._snapshot_override: dict[FeedKey, FeedObservation] | None = None
 
@@ -141,12 +155,37 @@ class DataStaleMonitor:
         does NOT spawn the loop, so a test (or caller) can step the monitor a
         cycle at a time via :meth:`_tick` without the background loop ticking
         concurrently.
+
+        Fast-restart safety (Codex iter-11 High): besides the manifest, we
+        SYNCHRONOUSLY publish the CURRENT per-feed rows + ``:verdict``
+        companions for EVERY required feed BEFORE returning — an inline first
+        evaluation (the same evaluate→publish path the loop uses, just once,
+        before any background tick). Deployment ids are stable across
+        restarts, so a FAST restart can reach ``_mark_running`` + the
+        reconciled marker while the OLD run's ``warm`` verdict keys are still
+        TTL-alive (clean stop deletes the per-feed keys, but a CRASH leaves
+        them ≤3×tick). Because the run-loop ordering starts this monitor
+        BEFORE ``_mark_running``, these fresh verdicts (``pending`` for an
+        unobserved feed at start) OVERWRITE any stale ``warm`` leftovers
+        before the deployment row is ever ``running`` — closing the
+        clean/crash-restart window structurally so ``/resume`` can never clear
+        a halt off a previous run's verdicts.
+
+        RAISES (Codex iter-12 P1 — fail-closed): if opening Redis, publishing
+        the manifest, or publishing the initial per-feed state fails, this
+        method RAISES. The run-loop factory path
+        (``trading_node_subprocess.run_subprocess_async``) calls ``start()``
+        BEFORE ``_mark_running``; a raised error is caught by the run-loop's
+        monitor-wiring fail-closed catch-all → the subprocess exits 1 (failed)
+        and the deployment is NEVER marked ``running``. The safety envelope
+        must be fully established or the node must not run.
         """
         self._redis = self._redis_factory()
         self._monitor_started_ns = self._now_ns()
         self._stop_event.clear()
 
         await self._publish_manifest()
+        await self._publish_initial_feed_state()
 
         if run_loop:
             interval = (
@@ -155,7 +194,46 @@ class DataStaleMonitor:
             self._task = asyncio.create_task(self._run(interval))
 
     async def stop(self) -> None:
-        """Cancel the loop, delete owned keys, and close the Redis client."""
+        """Cancel the loop, DELETE the per-feed keys, and close the Redis client.
+
+        Clean-stop semantics (Codex iter-10 P2 + iter-11 High):
+
+        * **Per-feed JSON + ``:verdict`` keys — EAGERLY DELETED.** We rebuild
+          the key list from ``required_feeds`` (the monitor knows its own
+          universe) and delete every per-feed freshness key + its ``:verdict``
+          companion. WHY (iter-11): deployment ids are stable across restarts,
+          so a FAST restart can reach ``_mark_running`` while a prior run's
+          ``warm`` verdict keys are still alive — ``/resume`` could then clear
+          a halt off STALE warm verdicts before the new monitor observes
+          anything. Deleting them on clean stop removes that fuel. (The new
+          run's :meth:`start` ALSO overwrites them with fresh ``pending``
+          verdicts before ``_mark_running``, so deletion + overwrite are
+          belt-and-suspenders.) Deleting ONLY the per-feed keys does NOT
+          trigger ``monitor_missing`` — that pages off an ABSENT MANIFEST, not
+          off missing per-feed rows. During the shutdown window the affected
+          feeds render as ``missing`` (accurate — the monitor is gone), and
+          ``/resume`` fired during shutdown FAILS CLOSED (absent verdict =
+          blocking), which is correct for a stopping node.
+
+        * **Manifest — LEFT to TTL-expire, NOT deleted.** Deleting the
+          manifest was iter-10's false-page bug: the subprocess finally-block
+          stops this monitor BEFORE the terminal write flips the
+          ``LiveDeployment`` row out of ``running``, so an absent manifest on a
+          still-``running`` row would falsely page ``monitor_missing``. The
+          manifest is TTL'd at 3× the tick interval (``_key_ttl_s``, ~15s at
+          the default cadence); it stays alive through the shutdown window (no
+          false page) and self-expires shortly after, by which time the
+          terminal write has long flipped the row out of ``running``.
+
+        Residual (CRASH path only — accepted): a SIGKILL / crash skips this
+        clean ``stop()``, so the old run's ``warm`` verdict keys survive ≤3×tick
+        and the reconciled marker (no TTL) lingers. A ``/resume`` fired in that
+        ≤15s post-crash window could accept verdicts up to ≤15s stale — bounded
+        by the same TTL that bounds ALL verdict freshness, after which the
+        manifest TTL lapses and ``/resume`` fails closed. Accepted: a crash is
+        not a clean stop, and the staleness bound is identical to every other
+        verdict the system trusts.
+        """
         self._stop_event.set()
         if self._task is not None:
             self._task.cancel()
@@ -163,12 +241,25 @@ class DataStaleMonitor:
                 await self._task
             self._task = None
 
-        await self._cleanup_owned_keys()
-
         if self._redis is not None:
+            with contextlib.suppress(Exception):
+                await self._delete_per_feed_keys()
             with contextlib.suppress(Exception):
                 await self._redis.aclose()
             self._redis = None
+
+    async def _delete_per_feed_keys(self) -> None:
+        """DELETE the per-feed JSON + ``:verdict`` companion keys for every
+        required feed (clean-stop cleanup — Codex iter-11). Rebuilt from
+        ``required_feeds`` so it stays in lockstep with what :meth:`_queue_per_feed`
+        publishes. The manifest is deliberately NOT in this list."""
+        keys: list[str] = []
+        for fk in self._required_feeds:
+            base = data_freshness_key(self._deployment_id, fk.dataset, fk.native_bar_type_str)
+            keys.append(base)
+            keys.append(base + VERDICT_KEY_SUFFIX)
+        if keys:
+            await self._redis.delete(*keys)
 
     async def _run(self, interval_s: float) -> None:
         """Main loop. Ticks every ``interval_s`` until :meth:`stop` is called.
@@ -258,6 +349,46 @@ class DataStaleMonitor:
             ex=self._key_ttl_s(),
         )
 
+    async def _publish_initial_feed_state(self) -> None:
+        """Synchronously publish the CURRENT per-feed JSON + ``:verdict``
+        companions for every required feed at :meth:`start`, BEFORE the first
+        background tick (Codex iter-11 High — fast-restart verdict reuse).
+
+        This runs one inline evaluation/publish over the start-time snapshot
+        (empty for an unobserved feed → ``pending``) using the SAME
+        evaluate→publish path the loop tick uses, so the fresh verdicts
+        OVERWRITE any stale ``warm`` leftovers from a prior run on this stable
+        deployment id. It does NOT fire the halt — that is the loop tick's job;
+        ``start()`` only re-establishes the per-feed state authoritatively.
+
+        FAIL-CLOSED (Codex iter-12 P1): unlike the per-tick loop (which swallows
+        its own errors for steady-state resilience), a failure HERE PROPAGATES
+        out of :meth:`start`. The initial state is the safety envelope: if it
+        is only HALF-established (manifest written, per-feed verdicts NOT), a
+        leftover TTL-alive ``warm`` verdict from a prior run on this stable
+        deployment id survives, and the run-loop would otherwise reach
+        ``_mark_running`` + the reconciled marker — letting ``/resume`` clear a
+        halt off that stale verdict (breaking the overwrite-before-running
+        invariant). By raising, the run-loop's monitor-wiring fail-closed path
+        fails the subprocess BEFORE ``_mark_running``, so the node never trades
+        with a half-published envelope. (The loop's per-tick publish error
+        swallowing is unchanged — see :meth:`_tick`.)
+        """
+        now_ns = self._now_ns()
+        snapshot = self._current_snapshot()
+        findings = evaluate(
+            self._required_feeds,
+            snapshot,
+            now_ns,
+            self._monitor_started_ns,
+            self._cfg,
+            self._phase_resolver,
+        )
+        stale_feeds = {f.feed_key for f in findings if f.feed_key is not None}
+        pipe = self._redis.pipeline(transaction=False)
+        self._queue_per_feed(pipe, snapshot, stale_feeds, now_ns)
+        await pipe.execute()
+
     def _manifest_payload(self) -> list[dict[str, str]]:
         """The manifest JSON body: a list of ``{dataset, feed, symbol}``. An
         empty ``required_feeds`` yields ``[]`` (distinct from an absent
@@ -330,8 +461,6 @@ class DataStaleMonitor:
             key = data_freshness_key(self._deployment_id, fk.dataset, fk.native_bar_type_str)
             pipe.set(key, json.dumps(payload), ex=ttl)
             pipe.set(key + VERDICT_KEY_SUFFIX, verdict, ex=ttl)
-            self._owned_feed_keys.add(key)
-            self._owned_feed_keys.add(key + VERDICT_KEY_SUFFIX)
 
     def _phase_for(self, fk: FeedKey, now_ns: int) -> SessionPhase:
         return self._phase_resolver(asset_class_for_dataset(fk.dataset), _ns_to_utc(now_ns))
@@ -431,17 +560,6 @@ class DataStaleMonitor:
             "detected_at": _ns_to_utc(finding.detected_at).isoformat(),
             "last_event_ts": finding.last_event_ts,
         }
-
-    # -- CLEANUP ---------------------------------------------------------
-
-    async def _cleanup_owned_keys(self) -> None:
-        """Delete the manifest + every per-feed key the monitor published."""
-        if self._redis is None:
-            return
-        keys = [data_freshness_manifest_key(self._deployment_id), *self._owned_feed_keys]
-        with contextlib.suppress(Exception):
-            await self._redis.delete(*keys)
-        self._owned_feed_keys.clear()
 
     # -- HELPERS ---------------------------------------------------------
 

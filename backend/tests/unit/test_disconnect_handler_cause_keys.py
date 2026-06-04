@@ -121,6 +121,37 @@ async def test_fire_halt_preserves_existing_cause_and_appends_history(redis: Any
 
 
 @pytest.mark.asyncio
+async def test_fire_halt_refreshes_preserved_cause_ttl(redis: Any) -> None:
+    """FIX 3 — a pre-existing cause whose TTL is SHORTER than the latch must have
+    its TTL refreshed to the full 24h window on a later halt-write, even though
+    its VALUE is preserved (SET NX). Otherwise the latch lives on for 24h while
+    the attribution cause expires early, leaving an active halt with no cause."""
+    from msai.core.halt_keys import HALT_TTL_SECONDS
+
+    # Seed an existing data-stale cause with a SHORT TTL (10s) — simulating a
+    # cause written a long time before this second halt fires.
+    await redis.set(
+        halt_cause_key("fleet"),
+        json.dumps({"reason": HaltCause.DATA_STALE.value, "dataset": "EQUS.MINI"}),
+        ex=10,
+    )
+    assert await redis.ttl(halt_cause_key("fleet")) <= 10
+
+    handler = _make_handler(redis)
+    await handler._fire_halt()  # noqa: SLF001
+
+    # VALUE is unchanged (SET NX preserved the original data-stale cause).
+    cause = json.loads((await redis.get(halt_cause_key("fleet"))).decode())
+    assert cause["reason"] == HaltCause.DATA_STALE.value
+    assert cause["dataset"] == "EQUS.MINI"
+
+    # TTL was refreshed to ~24h (the new halt-write's EXPIRE), not the old 10s.
+    ttl = await redis.ttl(halt_cause_key("fleet"))
+    assert ttl > 86000
+    assert ttl <= HALT_TTL_SECONDS
+
+
+@pytest.mark.asyncio
 async def test_fire_halt_retries_lua_on_first_failure(redis: Any) -> None:
     """A transient error on the FIRST Lua call is retried with backoff; the
     second attempt succeeds and the canonical cause lands."""

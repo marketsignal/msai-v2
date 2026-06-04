@@ -209,6 +209,7 @@ redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[5])
 redis.call('set', KEYS[2], ARGV[2], 'EX', ARGV[5])
 redis.call('set', KEYS[3], ARGV[3], 'EX', ARGV[5])
 redis.call('set', KEYS[4], ARGV[4], 'NX', 'EX', ARGV[5])
+redis.call('expire', KEYS[4], ARGV[5])
 redis.call('lpush', KEYS[5], ARGV[4])
 redis.call('ltrim', KEYS[5], 0, 49)
 return 1
@@ -236,8 +237,17 @@ F9 all-or-nothing guarantee).
 
 The script: SET latch+EX, SET set_by+EX, SET set_at+EX, SET cause NX EX
 (preserve existing cause — a plain SETNX inside MULTI/EXEC can't read-then-decide,
-which is why this is a script), LPUSH history cause_json, LTRIM history 0 49,
-return 1.
+which is why this is a script), then UNCONDITIONALLY EXPIRE the cause key to the
+same TTL, LPUSH history cause_json, LTRIM history 0 49, return 1.
+
+The unconditional ``EXPIRE`` after the ``SET ... NX`` is the fix for a stale-
+attribution bug: ``SET NX`` preserves a PRE-EXISTING cause's value but leaves its
+OLD (possibly shorter) TTL untouched, while the latch/companions are refreshed to
+the full 24h window. Without the explicit ``EXPIRE``, a long-running halt could
+keep its latch alive while the preserved cause key expired early — leaving an
+active halt with NO attribution. The ``EXPIRE`` refreshes the preserved cause's
+TTL without overwriting its value, and is a no-op-safe refresh when the ``SET NX``
+just created the key (the EX already set it; EXPIRE re-sets to the same window).
 
 **Canonical cause JSON shape** (the value of ARGV[4]) is a REASON-TAGGED UNION:
 every caller stamps a ``reason`` (= :class:`HaltCause` value) plus a common

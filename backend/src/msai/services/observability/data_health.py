@@ -97,11 +97,46 @@ class FeedHealth:
         }
 
 
+@dataclass(frozen=True)
+class MonitorMissing:
+    """A RUNNING deployment whose data-stale monitor is missing/dead (FIX 4).
+    (The alert keys off ``status == "running"`` only — see the running-only
+    rationale at the collection site; the ENUMERATION below scans the broader
+    active set for feed rendering.)
+
+    ``reason`` is ``'manifest absent'`` (no manifest key at all — monitor never
+    started or its node died + TTL lapsed) or ``'manifest malformed'`` (the key
+    exists but isn't a parseable JSON list).
+
+    A production deployment ALWAYS runs the monitor, so ``monitor_missing`` for
+    a ``running`` row signals a genuine fault (crashed monitor / TTL lapse). The
+    ``TradingNodePayload.data_freshness_enabled=False`` switch is a TEST-ONLY
+    escape hatch with no production override path — a legacy / no-feed node
+    still runs the monitor and publishes the EMPTY manifest (rendered as
+    vacuous-warm, never paged). A False-flag deployment would publish NO
+    manifest and so WOULD page here (and fail ``/resume`` closed); that is the
+    intended fail-closed posture for an unsupported configuration, not a false
+    page. See ``TradingNodePayload.data_freshness_enabled`` for the full
+    rationale."""
+
+    deployment_id: str
+    account_id: str | None
+    reason: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "deployment_id": self.deployment_id,
+            "account_id": self.account_id,
+            "reason": self.reason,
+        }
+
+
 @dataclass
 class DataHealthSnapshot:
     """Full manifest-first data-feed health for the active fleet."""
 
     feeds: list[FeedHealth] = field(default_factory=list)
+    monitor_missing: list[MonitorMissing] = field(default_factory=list)
     fleet_halted: bool = False
     halt_cause: dict[str, Any] | None = None
     pacing_by_account: dict[str, int] = field(default_factory=dict)
@@ -110,6 +145,7 @@ class DataHealthSnapshot:
     def as_dict(self) -> dict[str, Any]:
         return {
             "feeds": [f.as_dict() for f in self.feeds],
+            "monitor_missing": [m.as_dict() for m in self.monitor_missing],
             "fleet_halted": self.fleet_halted,
             "halt_cause": self.halt_cause,
         }
@@ -146,22 +182,52 @@ async def _redis_mget(redis: Any, keys: list[str]) -> list[str | None]:
     return [_decode(raw) for raw in raws]
 
 
-async def _read_manifest(redis: Any, deployment_id: str) -> list[dict[str, Any]] | None:
+# Sentinel reason emitted when the manifest GET itself raised (transient Redis
+# outage) — DISTINCT from a genuine absence. FIX 1: a read-failure must NOT be
+# reported as monitor_missing (it is "unknown", not "dead") so a Redis blip
+# never makes every active monitor look dead and page on-call. The caller skips
+# a read-failed deployment entirely (no rows, no monitor_missing, no gauge).
+_MANIFEST_READ_FAILED = "manifest read failed"
+
+
+async def _read_manifest(
+    redis: Any, deployment_id: str
+) -> tuple[list[dict[str, Any]] | None, str | None]:
     """Read + parse a deployment's required-feed manifest.
 
-    Returns the (possibly empty) feed list, or ``None`` when the manifest is
-    absent (monitor never started / node gone + TTL lapsed) or malformed."""
-    raw = await _redis_get(redis, data_freshness_manifest_key(deployment_id))
+    Returns ``(manifest_list, None)`` on success — the (possibly empty) feed
+    list. On failure returns ``(None, reason)`` where ``reason`` is one of:
+
+    * ``'manifest absent'`` — the key genuinely does not exist (monitor never
+      started / node gone + TTL lapsed). The caller surfaces this as
+      monitor_missing.
+    * ``'manifest malformed'`` — key exists but isn't a parseable JSON list.
+      Also monitor_missing.
+    * ``_MANIFEST_READ_FAILED`` — the Redis GET itself raised (transient
+      outage). FIX 1: this is NOT a genuine absence — "unknown", not "dead". The
+      caller SKIPS the deployment (no rows, no monitor_missing, no gauge) so a
+      Redis blip never pages every active monitor as dead.
+
+    FIX 4: the absent/malformed distinction is preserved so the monitor-missing
+    surface can name WHY a deployment's monitor is dark."""
+    # Read the manifest key DIRECTLY (not via ``_redis_get``) so a raised
+    # exception is distinguishable from a genuine ``None`` (absent key).
+    try:
+        raw_any = await redis.get(data_freshness_manifest_key(deployment_id))
+    except Exception:  # noqa: BLE001 — a metrics/health read must never crash the caller
+        log.warning("data_health_manifest_read_failed", extra={"deployment_id": deployment_id})
+        return None, _MANIFEST_READ_FAILED
+    raw = _decode(raw_any)
     if raw is None:
-        return None
+        return None, "manifest absent"
     try:
         parsed = json.loads(raw)
     except (ValueError, TypeError):
         log.warning("data_health_manifest_malformed", extra={"deployment_id": deployment_id})
-        return None
+        return None, "manifest malformed"
     if not isinstance(parsed, list):
-        return None
-    return parsed
+        return None, "manifest malformed"
+    return parsed, None
 
 
 async def _read_fleet_halt(redis: Any) -> tuple[bool, dict[str, Any] | None]:
@@ -241,27 +307,54 @@ async def _read_deployment_feeds(
     *,
     deployment_id: str,
     fallback_account_id: str | None,
-) -> list[FeedHealth]:
+) -> tuple[list[FeedHealth], str | None]:
     """Manifest-first per-feed health for one deployment.
 
     For each manifest feed, look up its published per-feed JSON. Present → use
-    its verdict + fields; absent/expired → derive a ``missing`` verdict. A
-    deployment with an absent/malformed manifest contributes no rows."""
-    manifest = await _read_manifest(redis, deployment_id)
-    if manifest is None:
-        return []
+    its verdict + fields; absent/expired → derive a ``missing`` verdict.
 
-    # Collect the valid manifest entries + their per-feed keys, then MGET every
+    Returns ``(rows, monitor_missing_reason)``. FIX 4: a deployment with an
+    absent/malformed manifest contributes NO feed rows AND a non-``None``
+    reason (``'manifest absent'`` / ``'manifest malformed'``) so the caller can
+    surface it under ``monitor_missing`` rather than silently dropping it.
+    Codex iter-12 P2: ``'manifest malformed'`` now also covers a LIST manifest
+    with malformed ENTRIES (non-dict, or missing dataset/feed) — matching
+    ``/resume``'s fail-closed read so the two surfaces never contradict.
+    FIX 1: a manifest READ-FAILURE returns the ``_MANIFEST_READ_FAILED`` reason
+    so the caller can SKIP the deployment entirely (a transient Redis error is
+    "unknown", not "dead")."""
+    manifest, missing_reason = await _read_manifest(redis, deployment_id)
+    if manifest is None:
+        return [], missing_reason
+
+    # Collect the manifest entries + their per-feed keys, then MGET every
     # per-feed JSON row in ONE round-trip (instead of a GET per feed).
+    #
+    # Codex iter-12 P2 — entry-level malformed detection aligned with /resume.
+    # A LIST manifest whose ENTRIES are malformed (a non-dict entry, or a dict
+    # missing 'dataset'/'feed') is treated as a malformed DEPLOYMENT-level
+    # manifest — exactly as ``/resume`` (api/live.py) reads it: any malformed
+    # entry blocks the resume as 'manifest malformed'. Previously this loop
+    # SKIPPED such entries, so a running deployment with manifest ``[{}]``
+    # rendered ``feeds:[]`` with NO monitor_missing + no gauge while /resume
+    # 409'd the SAME manifest — contradictory operator surfaces. Now both fail
+    # closed at the deployment level: return the 'manifest malformed' reason so
+    # the caller surfaces it under ``monitor_missing`` (+ gauge).
     entries: list[tuple[str, str, Any]] = []  # (dataset, feed, manifest_symbol)
     feed_keys: list[str] = []
     for entry in manifest:
         if not isinstance(entry, dict):
-            continue
-        dataset = str(entry.get("dataset", ""))
-        feed = str(entry.get("feed", ""))
-        if not dataset or not feed:
-            continue
+            log.warning("data_health_manifest_malformed", extra={"deployment_id": deployment_id})
+            return [], "manifest malformed"
+        # Validate RAW values BEFORE coercion: ``str(None)`` would yield the
+        # truthy string "None" and let a ``{"dataset": null, ...}`` entry pass
+        # here while /resume rejects the same manifest as malformed (Codex
+        # iter-13 P2 — the two surfaces must fail closed identically).
+        dataset = entry.get("dataset")
+        feed = entry.get("feed")
+        if not isinstance(dataset, str) or not isinstance(feed, str) or not dataset or not feed:
+            log.warning("data_health_manifest_malformed", extra={"deployment_id": deployment_id})
+            return [], "manifest malformed"
         entries.append((dataset, feed, entry.get("symbol")))
         feed_keys.append(data_freshness_key(deployment_id, dataset, feed))
 
@@ -307,7 +400,7 @@ async def _read_deployment_feeds(
                 published_at=payload.get("published_at"),
             )
         )
-    return rows
+    return rows, None
 
 
 async def collect_data_health(db: AsyncSession, redis: Any) -> DataHealthSnapshot:
@@ -336,12 +429,57 @@ async def collect_data_health(db: AsyncSession, redis: Any) -> DataHealthSnapsho
         return snapshot
 
     for dep in deployments:
-        rows = await _read_deployment_feeds(
+        deployment_id = str(dep.id)
+        rows, missing_reason = await _read_deployment_feeds(
             redis,
-            deployment_id=str(dep.id),
+            deployment_id=deployment_id,
             fallback_account_id=dep.account_id,
         )
         snapshot.feeds.extend(rows)
+        if missing_reason is None:
+            continue
+        # FIX 1: a manifest READ-FAILURE (transient Redis error) is "unknown",
+        # NOT "dead" — skip the deployment entirely (no rows already; no
+        # monitor_missing, no gauge). A Redis blip must never page every active
+        # monitor as dead.
+        if missing_reason == _MANIFEST_READ_FAILED:
+            continue
+        # FIX 2: the monitor_missing ALERT is restricted to status == 'running'.
+        # The in-node monitor publishes its manifest BEFORE the node marks
+        # itself running (the monitor's ``start()`` runs ahead of
+        # ``_mark_running`` in ``trading_node_subprocess.py``), and on a clean
+        # stop it does NOT eagerly delete the manifest — it lets the key
+        # self-expire on its 3×-tick TTL (Codex iter-10 P2). INVARIANT: the
+        # manifest's lifetime ⊇ [pre-``running``, ~3×tick past ``stop()``], so a
+        # ``running`` row ALWAYS implies the manifest is present — both during
+        # healthy startup (monitor starts first) AND through the shutdown window
+        # (the monitor stops before the terminal write flips the row out of
+        # ``running``, but the manifest stays TTL-alive). A running deployment
+        # with NO manifest is therefore a dead monitor, not a startup OR
+        # shutdown race. A deployment in a normal lifecycle status
+        # (building / starting / ready / stopping) with no manifest is EXPECTED.
+        # The ``status == 'running'`` guard is a clean, race-free signal at both
+        # lifecycle edges. Alerting on the non-running statuses would page
+        # on-call during every normal startup and shutdown.
+        #
+        # ASYMMETRY (intentional): /resume's fail-closed gate (api/live.py)
+        # covers the FULL active set (ACTIVE_DEPLOYMENT_STATUSES) — it refuses
+        # to resume any active deployment it cannot prove warm, which is correct
+        # because resume is an operator-driven safety action. The monitor_missing
+        # ALERT here is narrower (running only) because its job is to page on a
+        # dead monitor, not to gate a state transition.
+        if dep.status != "running":
+            continue
+        # FIX 4: a RUNNING deployment with an absent/malformed manifest is a
+        # monitor-missing/dead case — surface it explicitly so it is
+        # distinguishable from a quiet (empty) fleet.
+        snapshot.monitor_missing.append(
+            MonitorMissing(
+                deployment_id=deployment_id,
+                account_id=dep.account_id,
+                reason=missing_reason,
+            )
+        )
     return snapshot
 
 
@@ -361,6 +499,7 @@ def hydrate_metrics_from_snapshot(snapshot: DataHealthSnapshot) -> None:
     from msai.services.observability.trading_metrics import (
         DATA_FEED_AGE_SECONDS,
         DATA_FEED_STALE,
+        DATA_MONITOR_MISSING,
         DATA_STALE_HALTS,
         DATABENTO_DATASET_ALIVE,
         IB_EXEC_PACING_ERRORS,
@@ -408,11 +547,19 @@ def hydrate_metrics_from_snapshot(snapshot: DataHealthSnapshot) -> None:
         for account, count in snapshot.stale_halts_by_account.items()
     ]
 
+    # FIX 4: 1 per monitor-missing deployment, labeled by deployment. Pruned
+    # via replace_children like the others, so a deployment whose monitor came
+    # back (manifest present again) disappears from the next scrape.
+    monitor_missing_samples: list[tuple[dict[str, str], float]] = [
+        ({"deployment": m.deployment_id}, 1.0) for m in snapshot.monitor_missing
+    ]
+
     DATA_FEED_AGE_SECONDS.replace_children(age_samples)
     DATA_FEED_STALE.replace_children(stale_samples)
     DATABENTO_DATASET_ALIVE.replace_children(alive_samples)
     IB_EXEC_PACING_ERRORS.replace_children(pacing_samples)
     DATA_STALE_HALTS.replace_children(stale_halt_samples)
+    DATA_MONITOR_MISSING.replace_children(monitor_missing_samples)
 
 
 async def hydrate_data_health_metrics(db: AsyncSession, redis: Any) -> DataHealthSnapshot:

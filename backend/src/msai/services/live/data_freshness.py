@@ -210,8 +210,11 @@ class GraceConfig(BaseModel):
     *tick* cadence scalar (default 5); ``startup_grace_s`` is the absent-
     feed grace at monitor start (default 180).
 
-    Two load-time asserts (grace-only): ``startup_grace_s > 0`` and
-    ``interval_s * 4 <= min(open-phase grace)``.
+    Load-time asserts (grace-only): ``interval_s >= 1`` (it is the monitor loop
+    sleep — 0 would busy-spin, negative is nonsensical), ``startup_grace_s >= 1``,
+    and ``interval_s * 4 <= min(open-phase grace)``. All raise ``ValueError`` at
+    config load (fail-loud), which the live subprocess turns into a fail-closed
+    spawn failure (iteration-2 wiring).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -222,8 +225,11 @@ class GraceConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_asserts(self) -> GraceConfig:
-        if self.startup_grace_s <= 0:
-            msg = f"startup_grace_s must be > 0 (got {self.startup_grace_s})"
+        if self.interval_s < 1:
+            msg = f"interval_s must be >= 1 (got {self.interval_s})"
+            raise ValueError(msg)
+        if self.startup_grace_s < 1:
+            msg = f"startup_grace_s must be >= 1 (got {self.startup_grace_s})"
             raise ValueError(msg)
 
         open_graces = [
@@ -571,8 +577,16 @@ def evaluate(
     carried across phases here; latching lives in the monitor layer).
 
     An ABSENT required feed (in ``required_feeds`` but missing from
-    ``snapshot``) is stale once ``now - monitor_started_ns > startup_grace``
-    during an open phase (manifest-minus-snapshot can auto-halt).
+    ``snapshot``) is stale once ``now - max(monitor_started_ns, phase_open_ts)``
+    exceeds its CADENCE-AWARE absent budget
+    ``max(startup_grace, expected_interval + grace)`` during an open phase
+    (manifest-minus-snapshot can auto-halt). The ``max(..., phase_open_ts)`` is
+    the SAME phase-open clamp the observed path uses: a node started before the
+    session opens does not burn its absent budget while the phase is closed, so
+    it gets the full startup/cadence window once the phase opens. The cadence
+    term prevents a slow feed (e.g. a 5-MINUTE bar) from false-halting before its
+    first bar could legitimately arrive; a 1-MINUTE feed keeps the prior 180s
+    floor (``max(180, 60 + 90) = 180``).
 
     A dataset is stale iff the max over its feeds' CLAMPED event ts exceeds
     the dataset budget (``min parsed interval among the dataset's feeds +
@@ -612,8 +626,34 @@ def evaluate(
             interval_s = fk.expected_interval_s
 
             if obs is None:
-                # Absent required feed: startup-grace gate.
-                if now_ns - monitor_started_ns > cfg.startup_grace_s * _NS_PER_S:
+                # Absent required feed: cadence-aware startup-grace gate.
+                #
+                # FIX 1(b): the budget is NOT a flat ``startup_grace_s``. A
+                # slow-cadence feed (e.g. a 5-MINUTE bar) can legitimately
+                # deliver its FIRST bar up to ``expected_interval_s`` (+ the
+                # phase grace) after the monitor starts — flat 180s would
+                # false-halt the fleet before the first 5-min bar could even
+                # arrive. So the per-feed absent budget is
+                # ``max(startup_grace_s, expected_interval_s + grace)``, still
+                # clamped to OPEN phases only (handled above). A 1-MINUTE feed
+                # keeps the prior 180s floor: max(180, 60 + 90) = 180.
+                #
+                # FIX 1(c): the budget is measured from ``max(monitor_started,
+                # phase_open)`` — the SAME phase-open clamp the observed-feed
+                # path uses (``clamp`` above). A node started BEFORE the session
+                # opens (normal pre-RTH startup) accumulates hours of wall-clock
+                # while the phase is CLOSED (closed phases skip evaluation); the
+                # moment RTH opens, ``now - monitor_started_ns`` is already
+                # enormous and an absent feed would false-halt on the FIRST open
+                # tick. Clamping to phase open restarts the budget at the open so
+                # the absent feed gets its full startup/cadence window in the
+                # open phase. ``max(...)`` keeps monitor_started authoritative
+                # for a mid-session start (monitor_started > phase_open), so the
+                # clamp never LOOSENS detection — it only removes the closed-phase
+                # head-start.
+                absent_budget_s = max(cfg.startup_grace_s, interval_s + grace)
+                absent_start_ns = max(monitor_started_ns, clamp)
+                if now_ns - absent_start_ns > absent_budget_s * _NS_PER_S:
                     findings.append(
                         StaleFinding(
                             dataset=dataset,

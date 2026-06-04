@@ -793,6 +793,18 @@ def live_data_health() -> None:
                 f"phase={phase}  grace={grace_s}  age={age}"
             )
 
+    # Monitor-missing deployments (FIX 4) — an ACTIVE deployment whose in-node
+    # data-stale monitor never started / died (absent or malformed manifest).
+    # Render explicitly so a dead monitor is distinguishable from a quiet fleet.
+    monitor_missing = data.get("monitor_missing") or []
+    if monitor_missing:
+        typer.echo(f"Monitor missing ({len(monitor_missing)}):")
+        for entry in monitor_missing:
+            dep = entry.get("deployment_id") or "-"
+            account = entry.get("account_id") or "-"
+            reason = entry.get("reason") or "-"
+            typer.echo(f"  MONITOR MISSING — deployment={dep}  account={account}  reason={reason}")
+
     # Fleet halt banner — parse the cause so the operator sees WHICH cause.
     # ``halt_cause.reason`` is a HaltCause value (data_stale / fleet_emergency /
     # operator_drain / ib_disconnect). A data-stale trip also names the source

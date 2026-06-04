@@ -130,6 +130,7 @@ def _clear_data_health_children() -> Iterator[None]:
     from msai.services.observability.trading_metrics import (
         DATA_FEED_AGE_SECONDS,
         DATA_FEED_STALE,
+        DATA_MONITOR_MISSING,
         DATA_STALE_HALTS,
         DATABENTO_DATASET_ALIVE,
         IB_EXEC_PACING_ERRORS,
@@ -141,6 +142,7 @@ def _clear_data_health_children() -> Iterator[None]:
         DATABENTO_DATASET_ALIVE,
         IB_EXEC_PACING_ERRORS,
         DATA_STALE_HALTS,
+        DATA_MONITOR_MISSING,
     )
     for g in gauges:
         g.replace_children([])
@@ -455,6 +457,309 @@ async def test_data_health_malformed_manifest_does_not_crash(
     # Malformed manifest → no rows for that deployment, no 500.
     assert body["feeds"] == []
     assert body["fleet_halted"] is False
+
+
+# ---------------------------------------------------------------------------
+# Route — active deployment with NO manifest → monitor_missing (FIX 4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_data_health_active_deployment_without_manifest_is_monitor_missing(
+    client: httpx.AsyncClient,
+    redis_text: AsyncRedis,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """FIX 4 — an ACTIVE deployment whose freshness manifest is ABSENT (monitor
+    never started, or its node died and the manifest TTL lapsed) must be
+    surfaced explicitly under ``monitor_missing`` — distinct from an empty fleet
+    — so an operator can tell a dead monitor apart from a quiet one."""
+    async with session_factory() as session:
+        dep = await _seed_active_deployment(session)
+        dep_id = str(dep.id)
+
+    # NO manifest seeded → monitor is missing/dead for this active deployment.
+
+    resp = await client.get("/api/v1/live/data-health")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # No feed rows (no manifest), but the deployment is NOT silently dropped.
+    assert body["feeds"] == []
+    assert len(body["monitor_missing"]) == 1
+    entry = body["monitor_missing"][0]
+    assert entry["deployment_id"] == dep_id
+    assert entry["account_id"] == _ACCOUNT
+    assert entry["reason"] == "manifest absent"
+
+    # Persistence: re-poll → the deployment is still flagged monitor_missing.
+    resp2 = await client.get("/api/v1/live/data-health")
+    assert resp2.status_code == 200
+    assert any(e["deployment_id"] == dep_id for e in resp2.json()["monitor_missing"])
+
+
+@pytest.mark.asyncio
+async def test_data_health_monitor_missing_hydrates_gauge(
+    client: httpx.AsyncClient,
+    redis_text: AsyncRedis,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """FIX 4 — a monitor-missing deployment hydrates the labeled
+    ``msai_data_monitor_missing`` gauge so Prometheus can alert on a dead
+    in-node monitor."""
+    async with session_factory() as session:
+        dep = await _seed_active_deployment(session)
+        dep_id = str(dep.id)
+
+    # NO manifest seeded.
+    resp = await client.get("/api/v1/live/data-health")
+    assert resp.status_code == 200, resp.text
+
+    rendered = get_registry().render()
+    assert "msai_data_monitor_missing{" in rendered
+    missing_line = next(
+        ln for ln in rendered.splitlines() if ln.startswith("msai_data_monitor_missing{")
+    )
+    assert f'deployment="{dep_id}"' in missing_line
+    assert missing_line.endswith(" 1.0") or missing_line.endswith(" 1")
+
+
+@pytest.mark.asyncio
+async def test_data_health_malformed_manifest_is_monitor_missing(
+    client: httpx.AsyncClient,
+    redis_text: AsyncRedis,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """FIX 4 — a MALFORMED manifest (non-list JSON) is also surfaced under
+    monitor_missing with reason 'manifest malformed', distinct from 'absent'."""
+    async with session_factory() as session:
+        dep = await _seed_active_deployment(session)
+        dep_id = str(dep.id)
+
+    await redis_text.set(
+        data_freshness_manifest_key(dep_id),
+        json.dumps({"dataset": _DATASET, "feed": _BAR_TYPE}),  # object, not list
+        ex=120,
+    )
+
+    resp = await client.get("/api/v1/live/data-health")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["feeds"] == []
+    entry = next(e for e in body["monitor_missing"] if e["deployment_id"] == dep_id)
+    assert entry["reason"] == "manifest malformed"
+
+
+@pytest.mark.asyncio
+async def test_data_health_malformed_list_entry_consistent_with_resume(
+    client: httpx.AsyncClient,
+    redis_text: AsyncRedis,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Codex iter-12 P2 — data-health and /resume must agree on a manifest that
+    is a LIST but whose ENTRIES are malformed (here ``[{}]`` — an entry that is
+    a dict but lacks 'dataset'/'feed'). Previously data-health silently SKIPPED
+    such entries → a ``running`` deployment rendered ``feeds:[]`` with NO
+    monitor_missing and no gauge, while /resume 409'd the SAME manifest as
+    malformed — contradictory operator surfaces.
+
+    After the fix BOTH surfaces treat any malformed ENTRY as a malformed
+    deployment-level manifest: data-health lists it under ``monitor_missing``
+    with reason ``'manifest malformed'`` + hydrates the gauge, AND /resume
+    fails closed (409 ``RESUME_BLOCKED_DATA_STALE``)."""
+    async with session_factory() as session:
+        dep = await _seed_active_deployment(session)
+        dep_id = str(dep.id)
+
+    # A LIST manifest whose single entry is malformed (no dataset/feed).
+    await redis_text.set(
+        data_freshness_manifest_key(dep_id),
+        json.dumps([{}]),
+        ex=120,
+    )
+
+    # (a) data-health classifies the deployment monitor_missing 'manifest
+    # malformed' (NOT silently skipped) and exposes the gauge.
+    resp = await client.get("/api/v1/live/data-health")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["feeds"] == []
+    entry = next(e for e in body["monitor_missing"] if e["deployment_id"] == dep_id)
+    assert entry["reason"] == "manifest malformed"
+
+    rendered = get_registry().render()
+    missing_line = next(
+        ln for ln in rendered.splitlines() if ln.startswith("msai_data_monitor_missing{")
+    )
+    assert f'deployment="{dep_id}"' in missing_line
+
+    # (b) /resume fail-closes (409) on the SAME manifest → the two surfaces agree.
+    await _seed_halt(redis_text)
+    resp_resume = await client.post("/api/v1/live/resume")
+    assert resp_resume.status_code == 409, resp_resume.text
+    assert resp_resume.json()["detail"]["error"]["code"] == "RESUME_BLOCKED_DATA_STALE"
+    # Latch retained (resume refused).
+    assert await redis_text.exists(fleet_halt_key()) == 1
+
+
+@pytest.mark.asyncio
+async def test_data_health_null_field_entry_consistent_with_resume(
+    client: httpx.AsyncClient,
+    redis_text: AsyncRedis,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Codex iter-13 P2 — a manifest entry carrying ``null`` for 'dataset' (or
+    'feed') must be malformed on BOTH surfaces. Previously data-health coerced
+    via ``str(None)`` → the truthy string "None" → the entry passed as a
+    'valid' feed rendered ``missing``, with NO monitor_missing/gauge — while
+    /resume rejected the same manifest as malformed. Raw values are now
+    validated as non-empty STRINGS before coercion on both surfaces."""
+    async with session_factory() as session:
+        dep = await _seed_active_deployment(session)
+        dep_id = str(dep.id)
+
+    await redis_text.set(
+        data_freshness_manifest_key(dep_id),
+        json.dumps([{"dataset": None, "feed": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL"}]),
+        ex=120,
+    )
+
+    resp = await client.get("/api/v1/live/data-health")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["feeds"] == []  # NOT rendered as a bogus 'None' feed
+    entry = next(e for e in body["monitor_missing"] if e["deployment_id"] == dep_id)
+    assert entry["reason"] == "manifest malformed"
+
+    await _seed_halt(redis_text)
+    resp_resume = await client.post("/api/v1/live/resume")
+    assert resp_resume.status_code == 409, resp_resume.text
+    assert resp_resume.json()["detail"]["error"]["code"] == "RESUME_BLOCKED_DATA_STALE"
+    assert await redis_text.exists(fleet_halt_key()) == 1
+
+
+# ---------------------------------------------------------------------------
+# Route — Redis manifest READ-FAILURE must NOT page as monitor_missing (FIX 1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_data_health_manifest_read_failure_is_not_monitor_missing(
+    session_factory: async_sessionmaker[AsyncSession],
+    redis_text: AsyncRedis,
+    bus: LiveCommandBus,
+) -> None:
+    """FIX 1 — when the manifest GET itself FAILS (transient Redis error, not a
+    genuine absence), the deployment must be SKIPPED: no ``monitor_missing``
+    entry and no gauge=1. A Redis blip must never make every active monitor look
+    dead and page on-call. We wrap the real Redis so ONLY manifest GETs raise;
+    every other call (halt exists, counter scans) still works."""
+    async with session_factory() as session:
+        dep = await _seed_active_deployment(session)
+        dep_id = str(dep.id)
+
+    class _ManifestGetFailsRedis:
+        """Delegates everything to the real client EXCEPT a GET of the
+        deployment's manifest key, which raises (a transient read failure)."""
+
+        def __init__(self, inner: AsyncRedis, manifest_key: str) -> None:
+            self._inner = inner
+            self._manifest_key = manifest_key
+
+        async def get(self, key: str, *a: object, **k: object) -> object:
+            if key == self._manifest_key:
+                raise ConnectionError("transient redis read failure")
+            return await self._inner.get(key, *a, **k)
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._inner, name)
+
+    bus._redis = _ManifestGetFailsRedis(  # type: ignore[assignment]  # noqa: SLF001
+        redis_text, data_freshness_manifest_key(dep_id)
+    )
+
+    async def _override_get_db() -> AsyncIterator[AsyncSession]:
+        async with session_factory() as s:
+            yield s
+
+    async def _override_get_bus() -> LiveCommandBus:
+        return bus
+
+    async def _override_user() -> dict:
+        return {"sub": "test-operator", "oid": str(uuid4())}
+
+    app.dependency_overrides[get_db] = _override_get_db
+    app.dependency_overrides[get_command_bus] = _override_get_bus
+    app.dependency_overrides[get_current_user] = _override_user
+    transport = httpx.ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+            resp = await c.get("/api/v1/live/data-health")
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_command_bus, None)
+        app.dependency_overrides.pop(get_current_user, None)
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # The deployment is SKIPPED on read-failure: no feed rows, and crucially NO
+    # monitor_missing entry (read-failed != absent).
+    assert body["feeds"] == []
+    assert all(e["deployment_id"] != dep_id for e in body["monitor_missing"])
+
+    # And the monitor-missing gauge must NOT carry a 1.0 for this deployment.
+    rendered = get_registry().render()
+    missing_lines = [
+        ln for ln in rendered.splitlines() if ln.startswith("msai_data_monitor_missing{")
+    ]
+    assert all(f'deployment="{dep_id}"' not in ln for ln in missing_lines)
+
+
+# ---------------------------------------------------------------------------
+# Route — monitor_missing ALERT fires only for 'running' deployments (FIX 2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_data_health_starting_deployment_without_manifest_is_not_monitor_missing(
+    client: httpx.AsyncClient,
+    redis_text: AsyncRedis,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """FIX 2 — a deployment still in a normal lifecycle status ('starting') with
+    no manifest must NOT appear under ``monitor_missing``. The in-node monitor
+    only publishes its manifest after the node marks itself running, so flagging
+    building/starting/ready/stopping deployments as dead monitors would page
+    on-call during every normal startup and shutdown."""
+    async with session_factory() as session:
+        dep = await _seed_active_deployment(session, status="starting")
+        dep_id = str(dep.id)
+
+    # NO manifest seeded — normal for a starting node whose monitor isn't up yet.
+    resp = await client.get("/api/v1/live/data-health")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert all(e["deployment_id"] != dep_id for e in body["monitor_missing"])
+
+
+@pytest.mark.asyncio
+async def test_data_health_running_deployment_without_manifest_is_monitor_missing(
+    client: httpx.AsyncClient,
+    redis_text: AsyncRedis,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """FIX 2 — a 'running' deployment whose manifest is absent IS monitor_missing
+    (its monitor should have published by now). Pairs with the 'starting' case to
+    pin the running-only alert restriction."""
+    async with session_factory() as session:
+        dep = await _seed_active_deployment(session, status="running")
+        dep_id = str(dep.id)
+
+    # NO manifest seeded.
+    resp = await client.get("/api/v1/live/data-health")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    entry = next(e for e in body["monitor_missing"] if e["deployment_id"] == dep_id)
+    assert entry["reason"] == "manifest absent"
 
 
 # ---------------------------------------------------------------------------

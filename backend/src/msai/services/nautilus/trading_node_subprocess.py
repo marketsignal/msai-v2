@@ -526,7 +526,20 @@ class TradingNodePayload:
     (even on a legacy node with no Databento feeds — it then publishes an
     EMPTY manifest) and DELETEs/SETs the reconciled marker. When False the
     whole freshness/marker path is a no-op (existing flows unaffected).
-    Primitive bool so the payload stays picklable under the spawn context."""
+    Primitive bool so the payload stays picklable under the spawn context.
+
+    TEST-ONLY escape hatch — NOT a supported runtime opt-out (Codex iter-11
+    open question). There is no production override path that ever sets this
+    False: the default is True and nothing in the deploy/start flow flips it.
+    The field exists so unit tests can construct a payload that skips the
+    monitor wiring. A PRODUCTION deployment ALWAYS runs the monitor — a
+    legacy / no-feed node is covered by the EMPTY-manifest case (which
+    data-health renders as vacuous-warm and never pages ``monitor_missing``),
+    so there is no legitimate "running but no monitor" configuration. If a
+    deployment WERE somehow started with this False, it would publish NO
+    manifest → data-health WILL page ``monitor_missing`` and ``/resume`` WILL
+    fail closed (absent verdict = blocking). That is the intended fail-closed
+    posture for an unsupported configuration, not a bug."""
 
     data_freshness_grace_json: str | None = None
     """Optional JSON override for :class:`GraceConfig`, flowing into
@@ -1373,27 +1386,20 @@ async def run_subprocess_async(
             return terminal_exit_code
 
         await _mark_ready(session_factory, payload.row_id)
-        await _mark_running(session_factory, payload.row_id)
 
-        # PR 1b T4: SET the reconciled marker NOW — immediately AFTER
-        # ``_mark_running`` succeeds. ``_mark_running`` is gated by
-        # ``wait_until_ready`` proving ``trader.is_running``, which in
-        # nautilus 1.223.0 cannot flip True without a healthy reconciliation
-        # (``kernel.py:1025-1037`` returns early from ``start_async`` on a
-        # failed/timed-out reconcile so ``trader.start()`` is never reached).
-        # We deliberately do NOT read ``ExecutionEngine.reconciliation`` —
-        # that property is the config FLAG, not a completion signal
-        # (``execution_engine.py:260``). The SET lives at the run-loop level,
-        # NOT inside ``_mark_running`` (a DB-only helper with no Redis/node
-        # handle). If readiness failed above we already returned, so the
-        # marker stays absent (fail-closed).
-        if reconciled_marker is not None:
-            await reconciled_marker.mark_reconciled()
-
-        # PR 1b T4: build + START the in-node data-stale monitor, AFTER the
-        # node is running (same point as the IB disconnect handler) so the
-        # DataFreshnessActor exists and the registry has a live actor feeding
-        # it. The production factory retrieves the actor via
+        # PR 1b T4 (FIX 2 — reordered before ``_mark_running``): build + START
+        # the in-node data-stale monitor BEFORE the deployment row flips to
+        # ``running``, so a ``running`` row STRUCTURALLY implies the freshness
+        # manifest already exists. Previously the monitor started AFTER
+        # ``_mark_running``, leaving a sub-second window where a data-health
+        # scrape could observe a ``running`` row with no manifest yet and
+        # report a spurious ``monitor_missing`` for a perfectly healthy
+        # startup. Starting the monitor first closes that gap by construction.
+        #
+        # We start the monitor at the same logical point as before — AFTER the
+        # node is running (``wait_until_ready`` proved ``trader.is_running``),
+        # so the DataFreshnessActor exists and the registry has a live actor
+        # feeding it. The production factory retrieves the actor via
         # ``node.trader.actors()``, injects the shared registry, derives the
         # required-feed universe, and returns the monitor. A legacy node (no
         # Databento feeds) STILL runs the monitor with an empty universe — it
@@ -1411,16 +1417,39 @@ async def run_subprocess_async(
         # ``terminal_status="failed"`` + ``SPAWN_FAILED_PERMANENT`` + exit
         # code 1 and returns, so the node tears down through the SAME
         # finally/terminal path as any other startup failure and the
-        # deployment row is marked ``failed``. We do NOT latch the fleet halt
-        # here: a single node's config typo must not halt OTHER healthy
-        # accounts. ``data_freshness_enabled=False`` is the explicit opt-out
-        # (no factory call, no failure). NOTE: the monitor is LIVE-ONLY — this
-        # entry point is never used in backtests, so it can never be wired
-        # there.
+        # deployment row is marked ``failed``. Because this now runs BEFORE
+        # ``_mark_running``, a monitor-wiring failure means the deployment is
+        # NEVER marked ``running`` — strictly more fail-closed than before. We
+        # do NOT latch the fleet halt here: a single node's config typo must
+        # not halt OTHER healthy accounts. ``data_freshness_enabled=False`` is
+        # the explicit opt-out (no factory call, no failure). NOTE: the monitor
+        # is LIVE-ONLY — this entry point is never used in backtests, so it can
+        # never be wired there.
         if freshness_enabled and data_freshness_monitor_factory is not None:
             data_stale_monitor = await _maybe_await(data_freshness_monitor_factory(payload, node))
             if data_stale_monitor is not None:
                 await data_stale_monitor.start()
+
+        # NOW flip the deployment row to ``running`` — AFTER the monitor has
+        # published its manifest, so the ``running`` state implies the manifest
+        # exists (no transient ``monitor_missing`` gap for healthy startups).
+        await _mark_running(session_factory, payload.row_id)
+
+        # PR 1b T4: SET the reconciled marker NOW — immediately AFTER
+        # ``_mark_running`` succeeds (its contract is unchanged: readiness
+        # implies a healthy reconcile, so the marker is SET only once the row
+        # is ``running``). ``_mark_running`` is gated by ``wait_until_ready``
+        # proving ``trader.is_running``, which in nautilus 1.223.0 cannot flip
+        # True without a healthy reconciliation (``kernel.py:1025-1037``
+        # returns early from ``start_async`` on a failed/timed-out reconcile so
+        # ``trader.start()`` is never reached). We deliberately do NOT read
+        # ``ExecutionEngine.reconciliation`` — that property is the config
+        # FLAG, not a completion signal (``execution_engine.py:260``). The SET
+        # lives at the run-loop level, NOT inside ``_mark_running`` (a DB-only
+        # helper with no Redis/node handle). If readiness failed above we
+        # already returned, so the marker stays absent (fail-closed).
+        if reconciled_marker is not None:
+            await reconciled_marker.mark_reconciled()
 
         # Phase 4 task 4.2 iter-2 wiring: spawn the IB disconnect
         # monitor as a sibling task. We start it AFTER the node is
@@ -1598,8 +1627,17 @@ async def run_subprocess_async(
         # ``dispose()`` is a no-op and the test loop is unaffected.
         # PR 1b T4: STOP the data-stale monitor first — it owns its own
         # background loop + Redis client (mirrors the IBDisconnectHandler
-        # discipline). ``stop`` cancels the loop, deletes the per-feed /
-        # manifest keys it published, and closes its Redis client. It never
+        # discipline). ``stop`` cancels the loop, DELETEs the per-feed JSON +
+        # ``:verdict`` keys (iter-11 — so a fast restart on the stable
+        # deployment id can't ``/resume`` off a prior run's stale ``warm``
+        # verdicts), and closes its Redis client. The MANIFEST is deliberately
+        # LEFT to TTL-expire (3x-tick), so a data-health scrape during this
+        # still-'running' shutdown window never false-pages monitor_missing
+        # (that pages off an ABSENT manifest, not off missing per-feed rows).
+        # Deleting the per-feed keys runs BEFORE the terminal write below, so it
+        # is impossible for this stop() to delete a NEWER same-deployment run's
+        # keys — the new spawn cannot reserve the slot until the terminal write
+        # drops this row out of the active-status set. It never
         # raises out (errors are swallowed), but we guard anyway so a monitor
         # teardown bug can never block node/heartbeat cleanup. NOTE: we do NOT
         # clear the reconciled marker here — an operator-resumable halt and a

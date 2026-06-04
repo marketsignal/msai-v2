@@ -152,6 +152,39 @@ def test_grace_config_assert_startup_grace_positive() -> None:
         GraceConfig.from_env_json(bad)
 
 
+@pytest.mark.parametrize("bad_interval", [0, -5])
+def test_grace_config_interval_s_must_be_at_least_one(bad_interval: int) -> None:
+    # Arrange — interval_s drives the monitor's loop sleep; a value <= 0 would
+    # busy-spin (0) or be nonsensical (negative). Fail loud at config load.
+    bad = f'{{"interval_s": {bad_interval}}}'
+
+    # Act / Assert
+    with pytest.raises(ValueError):
+        GraceConfig.from_env_json(bad)
+
+
+def test_grace_config_startup_grace_s_zero_rejected_direct_construction() -> None:
+    # Arrange / Act / Assert — the bound holds on direct construction too, not
+    # only via the JSON path.
+    with pytest.raises(ValueError):
+        GraceConfig(startup_grace_s=0)
+
+
+def test_grace_config_interval_s_zero_rejected_direct_construction() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ValueError):
+        GraceConfig(interval_s=0)
+
+
+def test_grace_config_defaults_pass_interval_and_startup_bounds() -> None:
+    # Arrange / Act — the shipped defaults must satisfy the >=1 bounds.
+    cfg = GraceConfig()
+
+    # Assert
+    assert cfg.interval_s >= 1
+    assert cfg.startup_grace_s >= 1
+
+
 # ===========================================================================
 # Bar-type interval parsing
 # ===========================================================================
@@ -725,6 +758,171 @@ def test_evaluate_absent_feed_past_startup_grace_finding() -> None:
     assert any(f.feed_key == fk and f.last_event_ts is None for f in findings)
 
 
+def test_evaluate_absent_5min_feed_within_cadence_budget_no_finding() -> None:
+    # FIX 1(b) — a 5-MINUTE absent feed must NOT false-halt at the fixed 180s
+    # startup grace: its first bar can legitimately arrive ~300s+ after monitor
+    # start. The absent-feed budget per feed is now
+    # max(startup_grace_s, expected_interval_s + phase_grace) =
+    # max(180, 300 + 90) = 390s. Monitor started 200s ago < 390 → NO finding.
+    cfg = GraceConfig()
+    fk = _feed(bar_type="AAPL.XNAS-5-MINUTE-LAST-EXTERNAL")
+    assert fk.expected_interval_s == 300
+    phase_open = _utc(2026, 11, 25, 14, 30)
+    now = _utc(2026, 11, 25, 18, 0)
+    now_ns = _ns(now)
+
+    # Act
+    findings = evaluate(
+        required_feeds=[fk],
+        snapshot={},
+        now_ns=now_ns,
+        monitor_started_ns=now_ns - 200 * _NS,  # 200s < 390 budget
+        cfg=cfg,
+        phase_resolver=_open_resolver(phase_open),
+    )
+
+    # Assert — no false halt during the legitimate 5-min first-bar window.
+    assert findings == []
+
+
+def test_evaluate_absent_5min_feed_past_cadence_budget_finding() -> None:
+    # FIX 1(b) — once the 5-min cadence budget (max(180, 300+90)=390s) is
+    # exceeded, the absent feed IS a finding (the feed genuinely never arrived).
+    cfg = GraceConfig()
+    fk = _feed(bar_type="AAPL.XNAS-5-MINUTE-LAST-EXTERNAL")
+    phase_open = _utc(2026, 11, 25, 14, 30)
+    now = _utc(2026, 11, 25, 18, 0)
+    now_ns = _ns(now)
+
+    # Act — 400s > 390 budget.
+    findings = evaluate(
+        required_feeds=[fk],
+        snapshot={},
+        now_ns=now_ns,
+        monitor_started_ns=now_ns - 400 * _NS,
+        cfg=cfg,
+        phase_resolver=_open_resolver(phase_open),
+    )
+
+    # Assert
+    assert any(f.feed_key == fk and f.last_event_ts is None for f in findings)
+
+
+def test_evaluate_absent_1min_feed_keeps_180s_budget() -> None:
+    # FIX 1(b) — a 1-MINUTE feed keeps the prior 180s behavior:
+    # max(180, 60 + 90) = 180. Monitor started 200s ago > 180 → finding;
+    # this pins that the cadence change does NOT relax the fast-feed budget.
+    cfg = GraceConfig()
+    fk = _feed()  # 1-MINUTE
+    assert fk.expected_interval_s == 60
+    phase_open = _utc(2026, 11, 25, 14, 30)
+    now = _utc(2026, 11, 25, 18, 0)
+    now_ns = _ns(now)
+
+    # 200s > max(180, 60+90)=180 → finding.
+    findings = evaluate(
+        required_feeds=[fk],
+        snapshot={},
+        now_ns=now_ns,
+        monitor_started_ns=now_ns - 200 * _NS,
+        cfg=cfg,
+        phase_resolver=_open_resolver(phase_open),
+    )
+    assert any(f.feed_key == fk and f.last_event_ts is None for f in findings)
+
+    # And 100s < 180 budget → NO finding (the 180s floor still holds).
+    findings_within = evaluate(
+        required_feeds=[fk],
+        snapshot={},
+        now_ns=now_ns,
+        monitor_started_ns=now_ns - 100 * _NS,
+        cfg=cfg,
+        phase_resolver=_open_resolver(phase_open),
+    )
+    assert findings_within == []
+
+
+def test_evaluate_absent_feed_pre_open_startup_no_false_halt_at_open() -> None:
+    # FIX 1(c) — the absent-feed budget must be measured from the PHASE OPEN, not
+    # from monitor_started alone. A node started 3h BEFORE RTH open (normal
+    # pre-RTH startup) accumulates hours of wall-clock while the phase is closed
+    # (closed phases skip evaluation), so on the FIRST open tick
+    # ``now - monitor_started_ns`` is already enormous. Without the phase-open
+    # clamp an absent feed false-halts on that first open tick. With the clamp
+    # elapsed = ``now - max(monitor_started, phase_open)`` = 30s < 180 budget →
+    # NO finding.
+    cfg = GraceConfig()
+    fk = _feed()  # 1-MINUTE → budget max(180, 60+90) = 180
+    phase_open = _utc(2026, 11, 25, 14, 30)
+    now = _utc(2026, 11, 25, 14, 30, 30)  # open + 30s
+    now_ns = _ns(now)
+
+    # Act — monitor started 3h before the phase opened.
+    findings = evaluate(
+        required_feeds=[fk],
+        snapshot={},
+        now_ns=now_ns,
+        monitor_started_ns=_ns(phase_open) - 3 * 3600 * _NS,
+        cfg=cfg,
+        phase_resolver=_open_resolver(phase_open),
+    )
+
+    # Assert — the pre-open startup time is clamped away; no false halt.
+    assert findings == []
+
+
+def test_evaluate_absent_feed_pre_open_startup_finding_after_clamped_budget() -> None:
+    # FIX 1(c) — detection still fires: at phase_open + budget + ε the clamped
+    # elapsed exceeds the absent budget even though monitor_started is far
+    # earlier. Budget for the 1-MINUTE feed = max(180, 60+90) = 180s.
+    cfg = GraceConfig()
+    fk = _feed()  # 1-MINUTE
+    phase_open = _utc(2026, 11, 25, 14, 30)
+    now = _utc(2026, 11, 25, 14, 33, 1)  # open + 180s + 1s
+    now_ns = _ns(now)
+
+    # Act — monitor started 3h before the phase opened.
+    findings = evaluate(
+        required_feeds=[fk],
+        snapshot={},
+        now_ns=now_ns,
+        monitor_started_ns=_ns(phase_open) - 3 * 3600 * _NS,
+        cfg=cfg,
+        phase_resolver=_open_resolver(phase_open),
+    )
+
+    # Assert — past the clamped budget, the absent feed is a finding.
+    assert any(f.feed_key == fk and f.last_event_ts is None for f in findings)
+
+
+def test_evaluate_absent_feed_mid_session_start_clamp_keeps_monitor_started() -> None:
+    # FIX 1(c) — the max() clamp must NOT loosen the mid-session case. When the
+    # monitor started AFTER phase open (a node spun up mid-RTH),
+    # max(monitor_started, phase_open) = monitor_started, so the budget is still
+    # measured from monitor_started — detection fires at the same wall-clock time
+    # it did before the clamp existed. Monitor started 200s ago > 180 budget.
+    cfg = GraceConfig()
+    fk = _feed()  # 1-MINUTE → budget max(180, 60+90) = 180
+    phase_open = _utc(2026, 11, 25, 14, 30)
+    now = _utc(2026, 11, 25, 18, 0)  # well into RTH, hours after open
+    now_ns = _ns(now)
+    monitor_started_ns = now_ns - 200 * _NS  # mid-session, after phase_open
+    assert monitor_started_ns > _ns(phase_open)
+
+    # Act
+    findings = evaluate(
+        required_feeds=[fk],
+        snapshot={},
+        now_ns=now_ns,
+        monitor_started_ns=monitor_started_ns,
+        cfg=cfg,
+        phase_resolver=_open_resolver(phase_open),
+    )
+
+    # Assert — clamp keeps monitor_started authoritative; finding still fires.
+    assert any(f.feed_key == fk and f.last_event_ts is None for f in findings)
+
+
 def test_evaluate_session_reopen_no_halt_until_phase_open_plus_budget() -> None:
     # Arrange — yesterday's last event is ancient, but the phase just opened
     # 30s ago. With the phase-open clamp the budget restarts at phase_open,
@@ -906,32 +1104,215 @@ def test_on_bar_records_event_and_arrival_with_correct_feed_key() -> None:
     assert ts_arrival_ns > 0
 
 
-# --- Registry-injection: no registry → safe no-op + single warning --------
+# --- Registry-injection: actor records internally before/without injection --
 
 
-def test_on_bar_without_registry_no_ops_safely_and_warns_once() -> None:
-    """Without an injected registry the actor must record nothing, never
-    raise, and warn at most once even across many bars.
-
-    The Nautilus ``Logger.warning`` is a read-only Cython method, so we
-    assert the contract via the actor's internal warn-once latch (flipped
-    exactly once) plus the fact that no exception is raised across many
-    bars."""
+def test_on_bar_records_internally_before_set_registry() -> None:
+    """FIX 1(a) — the actor ALWAYS records into its OWN internal registry from
+    the first bar, even before ``set_registry`` is ever called. Bars delivered
+    between node start and the post-build registry injection must NOT be lost."""
     actor = _build_fresh_actor()
     bus = MessageBus(trader_id=TraderId("TESTER-000"), clock=LiveClock())
     _register_actor_with_bus(actor, bus)
-    # NB: set_registry deliberately NOT called.
+    # NB: set_registry deliberately NOT called yet.
 
-    assert actor._warned_no_registry is False
+    actor.on_start()
+    bar = _build_native_bar(ts_event=1_700_000_000_000_000_000)
+    actor.on_bar(bar)  # must not raise; recorded internally
+
+    # The actor's own registry holds the observation keyed by the right FeedKey.
+    fk = FeedKey(dataset="EQUS.MINI", native_bar_type_str="AAPL.XNAS-1-MINUTE-LAST-EXTERNAL")
+    snap = actor._registry.snapshot()  # noqa: SLF001
+    assert fk in snap
+    assert snap[fk].ts_event_ns == 1_700_000_000_000_000_000
+
+
+def test_set_registry_replays_internal_snapshot_into_shared() -> None:
+    """FIX 1(a) — pre-injection bars recorded into the internal registry are
+    REPLAYED into the shared registry on ``set_registry`` (no observation lost),
+    and subsequent bars record into the shared registry too."""
+    actor = _build_fresh_actor()
+    bus = MessageBus(trader_id=TraderId("TESTER-000"), clock=LiveClock())
+    _register_actor_with_bus(actor, bus)
+    actor.on_start()
+
+    fk = FeedKey(dataset="EQUS.MINI", native_bar_type_str="AAPL.XNAS-1-MINUTE-LAST-EXTERNAL")
+
+    # Pre-injection bar.
+    early = _build_native_bar(ts_event=1_700_000_000_000_000_000)
+    actor.on_bar(early)
+
+    # Inject the shared registry AFTER the early bar (the real ordering).
+    shared = FreshnessRegistry()
+    actor.set_registry(shared)
+
+    # Replay landed the early observation in the SHARED registry.
+    shared_snap = shared.snapshot()
+    assert fk in shared_snap
+    assert shared_snap[fk].ts_event_ns == 1_700_000_000_000_000_000
+
+    # A later bar also records into the shared registry (newest event wins).
+    late = _build_native_bar(ts_event=1_700_000_000_000_000_000 + 60 * _NS)
+    actor.on_bar(late)
+    assert shared.snapshot()[fk].ts_event_ns == 1_700_000_000_000_000_000 + 60 * _NS
+
+
+def test_set_registry_swaps_before_replaying() -> None:
+    """FIX 3 — ``set_registry`` must SWAP ``self._registry`` to the shared
+    registry FIRST, then replay the old internal snapshot into it. If the swap
+    happened AFTER the replay, a bar recorded during the handoff (e.g. a bar
+    delivered while ``record`` is mid-replay) would land in the soon-discarded
+    internal registry and be lost. We assert the swap-first ordering by spying
+    on the shared registry's ``record``: at the moment replay calls it, the
+    actor must ALREADY point at the shared registry."""
+    actor = _build_fresh_actor()
+    bus = MessageBus(trader_id=TraderId("TESTER-000"), clock=LiveClock())
+    _register_actor_with_bus(actor, bus)
+    actor.on_start()
+
+    fk = FeedKey(dataset="EQUS.MINI", native_bar_type_str="AAPL.XNAS-1-MINUTE-LAST-EXTERNAL")
+
+    # One pre-injection observation so replay calls ``shared.record`` at least
+    # once (the moment we inspect the actor's pointer).
+    early = _build_native_bar(ts_event=1_700_000_000_000_000_000)
+    actor.on_bar(early)
+
+    observed_pointer_is_shared: list[bool] = []
+
+    class _SwapSpyRegistry(FreshnessRegistry):
+        def record(self, feed_key: FeedKey, ts_event_ns: int, ts_arrival_ns: int) -> None:
+            # When replay drives this during set_registry, the actor must
+            # already have swapped its pointer to THIS registry (swap-first).
+            observed_pointer_is_shared.append(actor._registry is self)  # noqa: SLF001
+            super().record(feed_key, ts_event_ns, ts_arrival_ns)
+
+    shared = _SwapSpyRegistry()
+    actor.set_registry(shared)
+
+    # Replay invoked shared.record, and at that point the pointer was already
+    # the shared registry (swap-first ordering).
+    assert observed_pointer_is_shared == [True]
+    # And the replayed observation actually landed in the shared registry.
+    assert shared.snapshot()[fk].ts_event_ns == 1_700_000_000_000_000_000
+    # Post-condition: the actor now points at the shared registry.
+    assert actor._registry is shared  # noqa: SLF001
+
+
+def test_set_registry_and_on_bar_are_mutually_exclusive_no_observation_lost() -> None:
+    """FIX 1 (iter 8) — the ENTIRE ``set_registry`` handoff (swap → snapshot →
+    replay) is mutually exclusive with ``on_bar``'s record via the actor-level
+    ``_handoff_lock``. This DETERMINISTICALLY proves the race is closed
+    completely (not merely narrowed): a bar that begins recording during the
+    handoff is fully serialized AFTER the handoff and lands in the shared
+    registry — it can never be stranded in the snapshotted-then-discarded
+    internal registry.
+
+    Construction:
+      * The actor's OLD internal registry is a stub whose ``snapshot()`` blocks
+        on an event, so ``set_registry`` parks INSIDE its critical section
+        while holding ``_handoff_lock``.
+      * Thread A enters ``set_registry`` → acquires the lock → swaps → calls
+        ``old.snapshot()`` which signals it entered and blocks.
+      * Thread B then calls ``on_bar``; it MUST block on ``_handoff_lock``
+        (held by A) and therefore record nothing yet.
+      * We assert B is blocked (shared registry still empty), then release the
+        snapshot; A completes + drops the lock; B records into the shared
+        registry. The in-flight observation is present post-handoff.
+    """
+    actor = _build_fresh_actor()
+    bus = MessageBus(trader_id=TraderId("TESTER-000"), clock=LiveClock())
+    _register_actor_with_bus(actor, bus)
+    actor.on_start()
+
+    fk = FeedKey(dataset="EQUS.MINI", native_bar_type_str="AAPL.XNAS-1-MINUTE-LAST-EXTERNAL")
+
+    snapshot_entered = threading.Event()
+    replay_may_proceed = threading.Event()
+
+    class _BlockingSnapshotRegistry(FreshnessRegistry):
+        """Internal (OLD) registry whose snapshot() parks set_registry inside
+        its critical section so we can interleave a concurrent on_bar."""
+
+        def snapshot(self) -> dict[FeedKey, FeedObservation]:
+            snapshot_entered.set()
+            # Block until the test lets the handoff finish — set_registry holds
+            # ``_handoff_lock`` for the duration of this call.
+            assert replay_may_proceed.wait(timeout=5.0)
+            return super().snapshot()
+
+    # Install the blocking internal registry as the actor's current registry.
+    actor._registry = _BlockingSnapshotRegistry()  # noqa: SLF001
+
+    shared = FreshnessRegistry()
+
+    set_registry_error: list[BaseException] = []
+    on_bar_error: list[BaseException] = []
+
+    def _do_set_registry() -> None:
+        try:
+            actor.set_registry(shared)
+        except BaseException as exc:  # noqa: BLE001 — surface to the test thread
+            set_registry_error.append(exc)
+
+    # The in-flight bar that begins recording during the handoff.
+    in_flight_event_ts = 1_700_000_000_000_000_000 + 120 * _NS
+    in_flight_bar = _build_native_bar(ts_event=in_flight_event_ts)
+
+    def _do_on_bar() -> None:
+        try:
+            actor.on_bar(in_flight_bar)
+        except BaseException as exc:  # noqa: BLE001 — surface to the test thread
+            on_bar_error.append(exc)
+
+    thread_a = threading.Thread(target=_do_set_registry, name="set_registry")
+    thread_a.start()
+
+    # Wait until set_registry is parked inside snapshot() holding the lock.
+    assert snapshot_entered.wait(timeout=5.0)
+
+    thread_b = threading.Thread(target=_do_on_bar, name="on_bar")
+    thread_b.start()
+
+    # on_bar must be BLOCKED on _handoff_lock — give it a moment to try, then
+    # assert it has recorded nothing in the shared registry yet.
+    thread_b.join(timeout=0.2)
+    assert thread_b.is_alive(), "on_bar should be blocked on the handoff lock"
+    assert fk not in shared.snapshot(), "on_bar recorded during the locked handoff"
+
+    # Let the handoff finish; set_registry drops the lock, on_bar proceeds.
+    replay_may_proceed.set()
+    thread_a.join(timeout=5.0)
+    thread_b.join(timeout=5.0)
+
+    assert not thread_a.is_alive()
+    assert not thread_b.is_alive()
+    assert not set_registry_error, f"set_registry raised: {set_registry_error}"
+    assert not on_bar_error, f"on_bar raised: {on_bar_error}"
+
+    # The in-flight observation landed in the SHARED registry (never lost), and
+    # the actor now points at the shared registry.
+    final = shared.snapshot()
+    assert fk in final
+    assert final[fk].ts_event_ns == in_flight_event_ts
+    assert actor._registry is shared  # noqa: SLF001
+
+
+def test_on_bar_never_crashes_when_set_registry_never_called() -> None:
+    """FIX 1(a) — the actor must still never crash if ``set_registry`` is never
+    called; it just records internally across many bars."""
+    actor = _build_fresh_actor()
+    bus = MessageBus(trader_id=TraderId("TESTER-000"), clock=LiveClock())
+    _register_actor_with_bus(actor, bus)
+    actor.on_start()
 
     bar = _build_native_bar()
-    # Multiple bars — must not raise; the warn-once latch flips once.
-    actor.on_bar(bar)
-    assert actor._warned_no_registry is True
-    actor.on_bar(bar)
-    actor.on_bar(bar)
-    # Still latched (no second arming) and no exception raised.
-    assert actor._warned_no_registry is True
+    # Many bars, no shared registry ever injected — no exception.
+    for _ in range(5):
+        actor.on_bar(bar)
+
+    # The internal registry holds exactly one (deduped) observation.
+    fk = FeedKey(dataset="EQUS.MINI", native_bar_type_str="AAPL.XNAS-1-MINUTE-LAST-EXTERNAL")
+    assert fk in actor._registry.snapshot()  # noqa: SLF001
 
 
 # --- live_node_config: freshness actor appended with derived datasets -----
@@ -1077,7 +1458,8 @@ def test_build_per_account_config_no_freshness_actor_when_canonical_empty() -> N
 
 import asyncio  # noqa: E402 — co-located with the Task-4 wiring tests
 from typing import Any  # noqa: E402
-from uuid import uuid4  # noqa: E402
+from unittest.mock import patch  # noqa: E402
+from uuid import UUID, uuid4  # noqa: E402
 
 from msai.core.halt_keys import reconciled_key  # noqa: E402
 from msai.services.nautilus.data_stale_monitor import DataStaleMonitor  # noqa: E402
@@ -1429,15 +1811,21 @@ async def test_run_loop_monitor_factory_raising_fails_subprocess() -> None:
     the subprocess must FAIL rather than keep trading with no freshness
     manifest + no data-stale protection. The exception propagates to the
     run-loop catch-all, which returns exit code 1 (failed) — same discipline
-    as any other startup failure. The marker is cleared (start-of-loop) but
-    NEVER set, because the failure happens AFTER ``_mark_running`` but the
-    deployment is recorded as failed; the node tears down via the finally
+    as any other startup failure.
+
+    FIX 2 (iter 8 — reordered): the monitor is built/started BEFORE
+    ``_mark_running`` + the reconciled-marker SET. So a monitor-wiring failure
+    now happens BEFORE the deployment is ever marked ``running`` — strictly
+    more fail-closed than before. The marker is cleared (start-of-loop) but
+    NEVER set (``mark_reconciled`` runs only AFTER a successful monitor start),
+    and ``_mark_running`` is never reached. The node tears down via the finally
     block (``stop_async`` called)."""
     actor = DataFreshnessActor(DataFreshnessActorConfig())
     node = _FakeWiringNode(actors=[actor])
     payload = _wiring_payload()
 
     marker_order: list[str] = []
+    mark_running_calls: list[UUID] = []
 
     async def _monitor_factory(p: TradingNodePayload, n: Any) -> Any:
         msg = "boom — monitor wiring bug"
@@ -1453,23 +1841,143 @@ async def test_run_loop_monitor_factory_raising_fails_subprocess() -> None:
 
         return _M()
 
+    # Spy on _mark_running to prove the deployment is NEVER marked running when
+    # the monitor wiring fails first (cheap, direct assertion of fail-closed).
+    import msai.services.nautilus.trading_node_subprocess as tns_mod
+
+    real_mark_running = tns_mod._mark_running
+
+    async def _spy_mark_running(session_factory: Any, row_id: UUID) -> None:
+        mark_running_calls.append(row_id)
+        await real_mark_running(session_factory, row_id)
+
     shutdown = asyncio.Event()
-    exit_code = await run_subprocess_async(
-        payload,
-        session_factory=_FakeSessionFactory(),  # type: ignore[arg-type]
-        node_factory=lambda _p: node,
-        shutdown_event=shutdown,
-        data_freshness_monitor_factory=_monitor_factory,
-        reconciled_marker_factory=_marker_factory,
-    )
+    with patch.object(tns_mod, "_mark_running", _spy_mark_running):
+        exit_code = await run_subprocess_async(
+            payload,
+            session_factory=_FakeSessionFactory(),  # type: ignore[arg-type]
+            node_factory=lambda _p: node,
+            shutdown_event=shutdown,
+            data_freshness_monitor_factory=_monitor_factory,
+            reconciled_marker_factory=_marker_factory,
+        )
 
     # FAIL-CLOSED: the run must report a failure exit code, NOT a clean exit.
     assert exit_code == 1
     # The node must have been torn down (finally block ran stop_async).
     assert node._stop.is_set()
-    # Marker cleared at start but never set (the run never reached steady state).
+    # Marker cleared at start but NEVER set — the monitor start (which precedes
+    # _mark_running + the marker SET) raised first.
     assert "clear" in marker_order
-    assert "mark" in marker_order  # mark_reconciled runs right before the monitor wiring
+    assert "mark" not in marker_order
+    # The deployment was NEVER marked running (monitor wiring failed first).
+    assert mark_running_calls == []
+
+
+@pytest.mark.asyncio
+async def test_run_loop_monitor_start_initial_publish_failure_fails_subprocess() -> None:
+    """Codex iter-12 P1 — FAIL-CLOSED on monitor START failure (not just factory).
+
+    The factory SUCCEEDS and returns a real ``DataStaleMonitor``, but the
+    monitor's ``start()`` raises during its synchronous initial feed-state
+    publish (the per-feed pipeline execute fails after the manifest write). That
+    failure must propagate exactly like a factory-raise: the subprocess FAILS
+    (exit code 1), ``_mark_running`` is NEVER reached, and the reconciled marker
+    is cleared-but-never-set. This is the start()-can-raise half of the iter-2
+    fail-closed wiring — established by iter-12 so a half-published safety
+    envelope never lets the node trade with stale leftover verdicts."""
+    actor = DataFreshnessActor(
+        DataFreshnessActorConfig(
+            native_bar_types=["AAPL.XNAS-1-MINUTE-LAST-EXTERNAL"],
+            bar_type_datasets={"AAPL.XNAS-1-MINUTE-LAST-EXTERNAL": "EQUS.MINI"},
+        )
+    )
+    node = _FakeWiringNode(actors=[actor])
+    payload = _wiring_payload()
+
+    marker_order: list[str] = []
+    mark_running_calls: list[UUID] = []
+
+    class _FailingPipeline:
+        def __getattr__(self, _name: str) -> Any:
+            return lambda *a, **k: None
+
+        async def execute(self) -> Any:
+            msg = "initial publish pipeline execute failed"
+            raise RuntimeError(msg)
+
+    class _StartFailRedis:
+        async def set(self, *a: Any, **k: Any) -> None:
+            # Manifest write succeeds; only the per-feed pipeline execute fails.
+            return None
+
+        def pipeline(self, *a: Any, **k: Any) -> Any:
+            return _FailingPipeline()
+
+        async def delete(self, *a: Any, **k: Any) -> None:
+            return None
+
+        async def aclose(self) -> None:
+            return None
+
+    async def _monitor_factory(p: TradingNodePayload, n: Any) -> DataStaleMonitor:
+        registry = FreshnessRegistry()
+        for candidate in n.trader.actors():
+            if isinstance(candidate, DataFreshnessActor):
+                candidate.set_registry(registry)
+        required = {
+            FeedKey(dataset=ds, native_bar_type_str=bt)
+            for bt, ds in {"AAPL.XNAS-1-MINUTE-LAST-EXTERNAL": "EQUS.MINI"}.items()
+        }
+        return DataStaleMonitor(
+            registry=registry,
+            required_feeds=required,
+            redis_factory=lambda: _StartFailRedis(),
+            cfg=GraceConfig(),
+            phase_resolver=resolve_session_phase,
+            deployment_id=str(p.deployment_id),
+            account_id=p.ib_account_id,
+            node_id=p.deployment_slug,
+            clock=n.kernel.clock,
+        )
+
+    async def _marker_factory(p: TradingNodePayload) -> Any:
+        class _M:
+            async def clear(self) -> None:
+                marker_order.append("clear")
+
+            async def mark_reconciled(self) -> None:
+                marker_order.append("mark")
+
+        return _M()
+
+    import msai.services.nautilus.trading_node_subprocess as tns_mod
+
+    real_mark_running = tns_mod._mark_running
+
+    async def _spy_mark_running(session_factory: Any, row_id: UUID) -> None:
+        mark_running_calls.append(row_id)
+        await real_mark_running(session_factory, row_id)
+
+    shutdown = asyncio.Event()
+    with patch.object(tns_mod, "_mark_running", _spy_mark_running):
+        exit_code = await run_subprocess_async(
+            payload,
+            session_factory=_FakeSessionFactory(),  # type: ignore[arg-type]
+            node_factory=lambda _p: node,
+            shutdown_event=shutdown,
+            data_freshness_monitor_factory=_monitor_factory,
+            reconciled_marker_factory=_marker_factory,
+        )
+
+    # FAIL-CLOSED: start()'s initial-publish failure must fail the subprocess.
+    assert exit_code == 1
+    assert node._stop.is_set()
+    # Marker cleared at start, NEVER set (monitor start raised before the SET).
+    assert "clear" in marker_order
+    assert "mark" not in marker_order
+    # The deployment was NEVER marked running (monitor start failed first).
+    assert mark_running_calls == []
 
 
 @pytest.mark.asyncio

@@ -3286,7 +3286,11 @@ async def live_resume(
         # malformed manifest and BLOCKS the resume (409) — never a 500. We
         # cannot prove the listed feeds are warm if we can't read their shape.
         if not isinstance(manifest, list) or not all(
-            isinstance(entry, dict) and entry.get("dataset") and entry.get("feed")
+            isinstance(entry, dict)
+            and isinstance(entry.get("dataset"), str)
+            and entry.get("dataset")
+            and isinstance(entry.get("feed"), str)
+            and entry.get("feed")
             for entry in manifest
         ):
             return _resume_blocked_data_stale(

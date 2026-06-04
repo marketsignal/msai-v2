@@ -321,14 +321,34 @@ class DataFeedHealth(BaseModel):
     published_at: str | None = None
 
 
+class MonitorMissingDeployment(BaseModel):
+    """A RUNNING deployment whose in-node data-stale monitor is missing/dead
+    (FIX 4).
+
+    Surfaced when an active deployment's freshness manifest is ABSENT (monitor
+    never started, or its node died and the manifest TTL lapsed) or MALFORMED.
+    This is distinct from an empty fleet: the deployment IS running but its
+    data-stale protection is dark, so an operator must see it explicitly rather
+    than have it silently drop out of the feeds list."""
+
+    deployment_id: str
+    account_id: str | None = None
+    reason: str  # 'manifest absent' | 'manifest malformed'
+
+
 class DataHealthResponse(BaseModel):
     """Response schema for ``GET /api/v1/live/data-health`` (PR 1b T7).
 
     The operator's read-only window onto the in-node data-stale monitor: every
     required feed across the active fleet, plus the fleet halt latch + parsed
-    halt-cause for context. An empty fleet yields ``feeds: []`` with a 200."""
+    halt-cause for context. An empty fleet yields ``feeds: []`` with a 200.
+
+    FIX 4: ``monitor_missing`` lists RUNNING deployments whose monitor is
+    missing/dead (absent/malformed manifest) so a dead monitor is distinguishable
+    from a quiet fleet."""
 
     feeds: list[DataFeedHealth] = Field(default_factory=list)
+    monitor_missing: list[MonitorMissingDeployment] = Field(default_factory=list)
     fleet_halted: bool
     halt_cause: dict[str, Any] | None = None
 

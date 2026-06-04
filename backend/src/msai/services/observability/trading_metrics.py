@@ -113,6 +113,19 @@ IB_EXEC_PACING_ERRORS = _r.gauge(
     "Redis-hydrated from the msai:metrics:ib_exec_pacing:{account_id} counter "
     "INCRed by the live node's OrderRejected audit branch.",
 )
+# FIX 4 — an ACTIVE deployment whose freshness manifest is ABSENT or MALFORMED
+# means its in-node data-stale monitor never started / died (and the manifest
+# TTL lapsed). That is distinct from an empty fleet: the deployment IS running
+# but its data-stale protection is dark. Hydrated (and pruned via
+# replace_children) on the same manifest-first reader path so Prometheus can
+# alert on a dead monitor — 1 per monitor-missing deployment, labeled by
+# deployment.
+DATA_MONITOR_MISSING = _r.gauge(
+    "msai_data_monitor_missing",
+    "1 if an active deployment's in-node data-stale monitor is missing/dead "
+    "(freshness manifest absent or malformed), labeled by deployment. "
+    "Redis-hydrated alongside the data-feed health series.",
+)
 
 # Active deployments gauge
 ACTIVE_DEPLOYMENTS = _r.gauge("msai_active_deployments", "Currently active deployments")
