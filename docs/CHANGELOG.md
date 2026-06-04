@@ -16,6 +16,13 @@ All notable changes to msai-v2 will be documented in this file.
 - **Multi-failure-mode harness (objection #9):** 25-test simulated harness (no sockets; real Lua via fakeredis) — disconnect, stale-timestamp, partial-dataset stall, single-symbol stall, reconnect-storm each halt with correct attribution; closing-bar gaps / closed sessions / maintenance / session-reopen / thin 5-min feeds produce NO false halt.
 - **Scope honesty:** the live runtime topology is equities-only today — futures (GLBX) freshness ships as config + CMES sessions + simulated-harness coverage, activating when futures nodes ship; no futures data bridge in this PR. OPRA/options deferred (capacity spike). UI surface deferred to PR 4.
 
+### 2026-06-03 — Docs: settle Databento data-availability in CLAUDE.md (`main`)
+
+**Status:** reference-only, no code. Added a "Databento Data Availability (SETTLED 2026-06-03 — do NOT re-investigate)" subsection to `CLAUDE.md`, verified empirically on the Standard account (`metadata.get_dataset_range` + live fetches) and cross-checked against Databento docs.
+
+- **Futures** (`GLBX.MDP3`): 2010-06 (~16 yr, consolidated). **Equities per-venue feeds** (`ARCX.PILLAR`, `XNAS.ITCH`, `XNYS/XASE.PILLAR`, `BATS/BATY/EDGA/EDGX.PITCH`, …): 2018-05-01 (~8 yr, single-venue). **Equities consolidated** (`EQUS.MINI`): 2023-03-28; `EQUS.SUMMARY`/`XNAS.BASIC`: 2024-07-01.
+- Key facts memorialized: no single consolidated equities dataset before 2023; the "2023 wall" is a dataset-choice artifact (`EQUS.MINI`) — per-venue feeds reach 2018; **15 yr equities is impossible on Databento** (use ES futures, 2010, for deep history); **Plus does NOT add history depth** (depth = dataset inception, not tier). Resolved a BD-rep "back to 2018" claim vs the empirical 3-yr `EQUS.MINI` wall.
+
 ### 2026-06-02 — Multi-Account Broker Fleet: BrokerAccount spawn-wiring (`feat/broker-account-spawn-wiring`)
 
 **Status:** council-ratified **narrowed Option A** (2026-06-02 `/council`, 5 advisors + Codex chairman). Makes a PR-3 `BrokerAccount` deployable by identity: a live deployment can now be linked to a broker-account record, derives its IB identity from that record, and is refused fail-closed before any node spawns if the chosen account is archived / mode-inconsistent / not-router-resolvable / credential-unresolvable. Control-plane only — does NOT change where the IB Gateway gets its working credentials (still env/render; that's the deferred Option B) and does NOT introduce per-account containers (deferred Option C). Plan-review loop: Claude + Codex, **4 iterations** to clean.
