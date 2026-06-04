@@ -224,6 +224,10 @@ if [ -f "$ROOT/.claude/local/state.md" ]; then
     echo "STATE_EXISTS"
 elif [ -f "$TEMPLATE" ]; then
     echo "STATE_NEEDS_INIT_FROM:$TEMPLATE"
+    # Seed narrative from main into a fresh worktree state.md (state-continuity-roundtrip).
+    if [ "$PARENT_ROOT" != "$ROOT" ] && [ -f "$PARENT_ROOT/.claude/local/state.md" ]; then
+        echo "SEED_FROM_MAIN:$PARENT_ROOT/.claude/local/state.md"
+    fi
 elif [ -f "$PARENT_ROOT/.gitignore" ] && grep -qE '^[[:space:]]*/?\.claude/?[[:space:]]*$' "$PARENT_ROOT/.gitignore"; then
     echo "STATE_TEMPLATE_DOWNSTREAM_GITIGNORED:$PARENT_ROOT"
     echo "  ⚠ .claude/ is gitignored in $PARENT_ROOT/.gitignore — Forge files never reach worktrees." >&2
@@ -240,6 +244,32 @@ fi
 - `STATE_NEEDS_INIT_FROM:<path>` →
   1. Use the **Read** tool on `<path>` (the template path from the sentinel line)
   2. Use the **Write** tool to create `.claude/local/state.md` with the template's content. Write creates the missing `.claude/local/` parent directory in the same call. The v5.21 PermissionRequest hook auto-approves writes to `.claude/local/**`, so this won't prompt.
+  3. **If `SEED_FROM_MAIN:<main-state-path>` is ALSO present** (seeding a fresh worktree from main — state-continuity-roundtrip): after the full-template Write above, seed the developer's narrative forward so a new feature starts from the accumulated continuity instead of a blank slate.
+     - **Overlay the narrative:** Use the **Read** tool on `<main-state-path>`. Then, using the **Edit** tool on `.claude/local/state.md`, replace the `## State` (Done/Next/Deferred), `## Open Questions`, and `## Blockers` sections with main's versions **verbatim**, and reset `### Now` to its empty placeholder (`- (what you're actively working on)`). Leave `## Workflow` / `## /goal session` / `## PR authorization` as the fresh template values — gate sections are NOT seeded.
+     - **Write the seed snapshot:** First run this **read-only** Bash block to print main's foldable narrative to **stdout** (it defines `extract_foldable` locally — NOT in scope from step 2a — and does NOT redirect into `.claude/`, which would be a banned step-2b write):
+
+       ```bash
+       # EXTRACT-FOLDABLE-BEGIN (byte-identical, indent-normalized, across new-feature.md, fix-bug.md, finish-branch.md — enforced by test-contracts.sh)
+       # extract_foldable <state.md path> — prints foldable narrative with Now body blanked
+       extract_foldable() {
+         awk '
+           /^## State$/        { f=1 }
+           /^## Update Rules$/ { f=0 }
+           f {
+             if ($0 ~ /^### Now$/)            { now=1; print; next }
+             if (now && $0 ~ /^### /)         { now=0 }
+             if (now && $0 ~ /^---[[:space:]]*$/) { now=0 }
+             if (now) next
+             print
+           }
+         ' "$1"
+       }
+       # EXTRACT-FOLDABLE-END
+       extract_foldable "<main-state-path>"   # prints to stdout — capture this; do NOT redirect
+       ```
+
+       Then use the **Write** tool to create `.claude/local/.state-seed-snapshot.md` with that stdout content verbatim. The snapshot records main's foldable narrative (Now blanked) at seed time; `/finish-branch` reads it once to detect divergence. It is gitignored (`.claude/local/`) and worktree-local; the Write is auto-approved by the `auto-approve-local-writes` hook.
+
 - `STATE_TEMPLATE_DOWNSTREAM_GITIGNORED:<parent_root>` → STOP. The downstream repo at `<parent_root>` gitignores `.claude/` (the entire directory). The Forge convention gitignores only `.claude/local/`, so worktrees based on `origin/<default-branch>` reach a tree without any Forge files. Tell the user to fix the gitignore and commit `.claude/`:
   1. Edit `<parent_root>/.gitignore` — remove the bare `.claude/` line. Keep `.claude/local/` (it should already be there from setup; if not, add it).
   2. `cd <parent_root> && git add .gitignore .claude/ && git commit -m "chore: track .claude/ per Forge convention" && git push origin <default-branch>`
@@ -562,6 +592,8 @@ Gather severity-tagged findings from all available reviewers. Use this rubric:
 | P1    | Wrong — incorrect behavior, logic error, missing edge case             | Must fix before proceeding |
 | P2    | Poor — code smell, maintainability issue, unclear intent, missing test | Must fix before proceeding |
 | P3    | Nit — style, naming, minor suggestion                                  | May fix, does not block    |
+
+**Plan-stage severity — spec-loss is P1:** at the plan stage, an omission that could cause the **wrong feature to be built** is a **P1**, not a P2 — because implementation subagents build FROM the plan's task list + test stubs, so a gap propagates and Gate 2 (code review) can only see code that is internally consistent with the _incomplete_ plan (plan-level spec-loss is invisible downstream). Classify as P1: missing required behavior, missing edge-case handling, a missing acceptance criterion needed to disambiguate implementation, or a missing test stub for a known-important behavior. Pure wording, organization, or maintainability smell stays P2. This sharpens classification only — it does **not** relax the exit (still no P0/P1/P2 below).
 
 **Step C — Exit criteria:**
 
