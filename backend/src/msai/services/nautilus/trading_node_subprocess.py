@@ -90,6 +90,50 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# IB exec-side pacing/throttle detection (PR 1b T7)
+# ---------------------------------------------------------------------------
+#
+# IB rejects orders with a throttle indication when the client exceeds the
+# message rate. We surface that as a per-account metric so an operator can see
+# pacing pressure before it becomes a halt. Discrimination matters: the numeric
+# codes 100 / 162 / 420 appear ONLY as legacy MARKET-DATA pacing and must NOT
+# be treated as exec-side throttle. We match exec-side throttle PHRASES instead,
+# case-insensitively.
+
+_IB_EXEC_PACING_PHRASES: tuple[str, ...] = (
+    "pacing violation",
+    "max rate of messages",
+    "throttle",
+)
+
+
+def is_ib_exec_pacing_reason(reason: str | None) -> bool:
+    """Return True if an OrderRejected *reason* indicates IB EXEC-side
+    pacing/throttle (NOT the legacy market-data pacing codes 100/162/420)."""
+    if not reason:
+        return False
+    lowered = reason.lower()
+    return any(phrase in lowered for phrase in _IB_EXEC_PACING_PHRASES)
+
+
+async def record_ib_exec_pacing(redis: Any, *, reason: str | None, account_id: str | None) -> None:
+    """INCR the per-account IB exec-pacing counter when *reason* is a throttle.
+
+    No-ops when the reason is not a pacing/throttle indication or when no
+    account is known. Swallows Redis errors — a metrics counter must NEVER
+    propagate into the engine-level audit hook (which would drop the audit
+    write for an order rejection)."""
+    if account_id is None or not is_ib_exec_pacing_reason(reason):
+        return
+    from msai.core.halt_keys import ib_exec_pacing_key
+
+    try:
+        await redis.incr(ib_exec_pacing_key(account_id))
+    except Exception:  # noqa: BLE001 — metrics INCR must not break the audit hook
+        log.warning("ib_exec_pacing_incr_failed", extra={"account_id": account_id})
+
+
+# ---------------------------------------------------------------------------
 # Node-crash child reaping (PR 2 T7) — os.setsid session detachment
 # ---------------------------------------------------------------------------
 #
@@ -471,6 +515,23 @@ class TradingNodePayload:
     shim's resolution. Threaded into the SymbologyShimActor config
     so its ``on_start`` knows which native bar types to subscribe
     to. Empty dict means "not populated — use the legacy builder"."""
+
+    # ------------------------------------------------------------------
+    # PR 1b — data-stale auto-halt (Task T4)
+    # ------------------------------------------------------------------
+    data_freshness_enabled: bool = True
+    """Master switch for the in-node Databento freshness monitor + the
+    reconciled-marker writes. When True (the default), the live run loop
+    builds a :class:`~msai.services.nautilus.data_stale_monitor.DataStaleMonitor`
+    (even on a legacy node with no Databento feeds — it then publishes an
+    EMPTY manifest) and DELETEs/SETs the reconciled marker. When False the
+    whole freshness/marker path is a no-op (existing flows unaffected).
+    Primitive bool so the payload stays picklable under the spawn context."""
+
+    data_freshness_grace_json: str | None = None
+    """Optional JSON override for :class:`GraceConfig`, flowing into
+    ``GraceConfig.from_env_json`` at monitor-wiring time. ``None`` → defaults.
+    Primitive string (not a model) so the payload stays picklable."""
 
     @property
     def use_per_account_topology(self) -> bool:
@@ -936,6 +997,8 @@ async def run_subprocess_async(
     on_node_constructed: Any = None,
     on_post_build: Any = None,
     async_cleanup: Any = None,
+    data_freshness_monitor_factory: Any = None,
+    reconciled_marker_factory: Any = None,
 ) -> int:
     """Execute one trading subprocess lifecycle end-to-end.
 
@@ -1021,6 +1084,32 @@ async def run_subprocess_async(
             ``node = node_factory(payload)`` returns. Production
             uses it to capture the node for the post-loop dispose
             step (paired with ``skip_dispose=True``).
+        data_freshness_monitor_factory: Optional async callable
+            ``(payload, node) -> monitor | None`` (PR 1b T4). When
+            present AND ``payload.data_freshness_enabled`` is True, the
+            run loop calls it AFTER the node reaches ``running`` (same
+            point as ``disconnect_handler_factory``); the production
+            factory builds the shared ``FreshnessRegistry``, retrieves
+            the ``DataFreshnessActor`` from ``node.trader.actors()`` and
+            injects the registry via ``set_registry``, derives
+            ``required_feeds`` from the actor's dataset map, and returns
+            a :class:`DataStaleMonitor`. The run loop then ``await``s the
+            monitor's ``start()`` and ``stop()``s it in the finally block.
+            A legacy node (empty bar-type map) STILL runs the monitor with
+            an empty required-feed universe (it publishes the EMPTY
+            manifest). Tests pass a stub; ``None`` skips the path.
+        reconciled_marker_factory: Optional async callable
+            ``(payload) -> marker | None`` (PR 1b T4). When present AND
+            ``payload.data_freshness_enabled`` is True, the run loop calls
+            it BEFORE node start and ``await``s ``marker.clear()`` (DELETE
+            the reconciled marker so a restart re-arms fail-closed), then
+            ``await``s ``marker.mark_reconciled()`` (SET it) ONLY after
+            ``_mark_running`` succeeds — i.e. after ``wait_until_ready``
+            proved ``trader.is_running`` (which in nautilus 1.223.0 cannot
+            flip True without a healthy reconcile; see
+            :func:`~msai.core.halt_keys.reconciled_key`). If readiness
+            fails the marker stays absent (fail-closed). Tests pass a stub;
+            ``None`` skips the path.
     """
     # Note: ``_self_write_pid`` and the heartbeat-thread start are
     # NOT run here — they live inside the main ``try`` block below
@@ -1041,6 +1130,13 @@ async def run_subprocess_async(
     # and the whole path is a no-op.
     disconnect_handler: Any = None
     disconnect_task: asyncio.Task[None] | None = None
+
+    # PR 1b T4: in-node Databento data-stale monitor + reconciled marker.
+    # Both nullable so a caller that omits the factories (or disables
+    # freshness via the payload) gets a complete no-op path.
+    data_stale_monitor: Any = None
+    reconciled_marker: Any = None
+    freshness_enabled = bool(payload.data_freshness_enabled)
 
     # Async-loop-aware SIGTERM handler. Runs in the context of the
     # running event loop (thanks to ``loop.add_signal_handler``), so
@@ -1129,6 +1225,17 @@ async def run_subprocess_async(
         if heartbeat_factory is not None:
             heartbeat = heartbeat_factory(payload)
             heartbeat.start()
+
+        # PR 1b T4: build the reconciled marker + DELETE it BEFORE the node
+        # is built/started. A restart of the same deployment must RE-ARM the
+        # fail-closed default — the marker can never be carried over from a
+        # prior incarnation. The marker is SET only after ``_mark_running``
+        # below (i.e. after a healthy reconcile). Gated on
+        # ``data_freshness_enabled`` so a disabled deployment is a full no-op.
+        if freshness_enabled and reconciled_marker_factory is not None:
+            reconciled_marker = await _maybe_await(reconciled_marker_factory(payload))
+            if reconciled_marker is not None:
+                await reconciled_marker.clear()
 
         # Earliest shutdown checkpoint (Codex batch 3 iter6 P2 fix).
         # If SIGTERM lands between ``loop.add_signal_handler`` and
@@ -1267,6 +1374,53 @@ async def run_subprocess_async(
 
         await _mark_ready(session_factory, payload.row_id)
         await _mark_running(session_factory, payload.row_id)
+
+        # PR 1b T4: SET the reconciled marker NOW — immediately AFTER
+        # ``_mark_running`` succeeds. ``_mark_running`` is gated by
+        # ``wait_until_ready`` proving ``trader.is_running``, which in
+        # nautilus 1.223.0 cannot flip True without a healthy reconciliation
+        # (``kernel.py:1025-1037`` returns early from ``start_async`` on a
+        # failed/timed-out reconcile so ``trader.start()`` is never reached).
+        # We deliberately do NOT read ``ExecutionEngine.reconciliation`` —
+        # that property is the config FLAG, not a completion signal
+        # (``execution_engine.py:260``). The SET lives at the run-loop level,
+        # NOT inside ``_mark_running`` (a DB-only helper with no Redis/node
+        # handle). If readiness failed above we already returned, so the
+        # marker stays absent (fail-closed).
+        if reconciled_marker is not None:
+            await reconciled_marker.mark_reconciled()
+
+        # PR 1b T4: build + START the in-node data-stale monitor, AFTER the
+        # node is running (same point as the IB disconnect handler) so the
+        # DataFreshnessActor exists and the registry has a live actor feeding
+        # it. The production factory retrieves the actor via
+        # ``node.trader.actors()``, injects the shared registry, derives the
+        # required-feed universe, and returns the monitor. A legacy node (no
+        # Databento feeds) STILL runs the monitor with an empty universe — it
+        # publishes the EMPTY manifest. Gated on ``data_freshness_enabled`` so
+        # a disabled deployment is a full no-op.
+        #
+        # Codex iter-2 P1 — FAIL-CLOSED on monitor-wiring failure. When
+        # freshness is ENABLED but the factory/``start()`` raises (e.g. a bad
+        # ``DATA_FRESHNESS_GRACE_JSON`` makes ``GraceConfig.from_env_json``
+        # raise inside the factory, or the monitor's ``start()`` fails to open
+        # its Redis client / publish the manifest), we must NOT let the node
+        # keep trading with no freshness manifest and no data-stale
+        # protection. The exception PROPAGATES — it is caught by the run-loop's
+        # catch-all ``except`` (below, ~line 1548) which records
+        # ``terminal_status="failed"`` + ``SPAWN_FAILED_PERMANENT`` + exit
+        # code 1 and returns, so the node tears down through the SAME
+        # finally/terminal path as any other startup failure and the
+        # deployment row is marked ``failed``. We do NOT latch the fleet halt
+        # here: a single node's config typo must not halt OTHER healthy
+        # accounts. ``data_freshness_enabled=False`` is the explicit opt-out
+        # (no factory call, no failure). NOTE: the monitor is LIVE-ONLY — this
+        # entry point is never used in backtests, so it can never be wired
+        # there.
+        if freshness_enabled and data_freshness_monitor_factory is not None:
+            data_stale_monitor = await _maybe_await(data_freshness_monitor_factory(payload, node))
+            if data_stale_monitor is not None:
+                await data_stale_monitor.start()
 
         # Phase 4 task 4.2 iter-2 wiring: spawn the IB disconnect
         # monitor as a sibling task. We start it AFTER the node is
@@ -1442,6 +1596,28 @@ async def run_subprocess_async(
         # with ``Event loop stopped before Future completed``.
         # Tests use the default ``False`` because their fake
         # ``dispose()`` is a no-op and the test loop is unaffected.
+        # PR 1b T4: STOP the data-stale monitor first — it owns its own
+        # background loop + Redis client (mirrors the IBDisconnectHandler
+        # discipline). ``stop`` cancels the loop, deletes the per-feed /
+        # manifest keys it published, and closes its Redis client. It never
+        # raises out (errors are swallowed), but we guard anyway so a monitor
+        # teardown bug can never block node/heartbeat cleanup. NOTE: we do NOT
+        # clear the reconciled marker here — an operator-resumable halt and a
+        # clean stop are both expected to leave the marker's lifecycle to the
+        # NEXT spawn's start-of-loop clear (restart re-arms fail-closed).
+        if data_stale_monitor is not None:
+            with contextlib.suppress(Exception):
+                await data_stale_monitor.stop()
+
+        # Close the reconciled marker's Redis client (if it owns one). The
+        # marker is NOT cleared here — the NEXT spawn's start-of-loop clear
+        # owns that, so a restart re-arms fail-closed.
+        if reconciled_marker is not None:
+            _marker_close = getattr(reconciled_marker, "aclose", None)
+            if _marker_close is not None:
+                with contextlib.suppress(Exception):
+                    await _marker_close()
+
         # Cancel the disconnect handler task FIRST — it's a
         # sibling of ``node_run_task`` and should wind down before
         # ``node.stop_async()`` because the handler may still be
@@ -1690,6 +1866,100 @@ def _safe_dispose(node: Any) -> Iterator[None]:
             log.exception("trading_node_dispose_failed")
 
 
+async def real_data_freshness_monitor_factory(
+    p: TradingNodePayload,
+    node: Any,
+) -> Any:
+    """PR 1b T4: build the in-node :class:`DataStaleMonitor` for THIS node.
+
+    Module-level (not nested in ``_trading_node_subprocess``) so the
+    fail-closed wiring path can be exercised by the real factory in tests
+    (Codex iter-2 P1) — in particular, the ``GraceConfig.from_env_json`` call
+    below is INSIDE this factory, so a bad ``DATA_FRESHNESS_GRACE_JSON`` raises
+    HERE and the run loop fails the subprocess fail-closed.
+
+    Steps (all POST-build/start, mirroring the disconnect-handler factory):
+
+    1. Build the shared :class:`FreshnessRegistry`.
+    2. Retrieve the (single) :class:`DataFreshnessActor` from
+       ``node.trader.actors()`` and inject the registry via
+       ``set_registry`` so the actor's ``on_bar`` starts recording.
+    3. Derive ``required_feeds`` from the SAME ``bar_type_datasets`` the
+       actor config carries (``actor._fresh_config.bar_type_datasets``) so
+       the manifest and the actor never drift. A LEGACY node (no
+       DataFreshnessActor, empty map) yields ``required_feeds=set()`` — the
+       monitor STILL runs and publishes the EMPTY manifest.
+    4. Construct the monitor with its OWN ``decode_responses=False`` Redis
+       client (mirroring ``_real_disconnect_handler_factory``), the node
+       clock, and ``GraceConfig`` from the optional payload override.
+
+    Returns ``None`` when ``redis_url`` is empty (no Redis → no monitor),
+    which keeps tests that don't wire Redis on the legacy no-op path.
+    """
+    if not p.redis_url:
+        return None
+
+    import redis.asyncio as aioredis
+
+    from msai.services.live.data_freshness import (
+        FeedKey,
+        FreshnessRegistry,
+        GraceConfig,
+        resolve_session_phase,
+    )
+    from msai.services.nautilus.data_freshness_actor import DataFreshnessActor
+    from msai.services.nautilus.data_stale_monitor import DataStaleMonitor
+
+    registry = FreshnessRegistry()
+
+    # Retrieve the freshness actor + inject the registry. There is at most
+    # one (appended by build_per_account_trading_node_config); a legacy
+    # node has none, so the loop simply finds nothing and required_feeds
+    # stays empty.
+    bar_type_datasets: dict[str, str] = {}
+    for actor in node.trader.actors():
+        if isinstance(actor, DataFreshnessActor):
+            actor.set_registry(registry)
+            bar_type_datasets = dict(actor._fresh_config.bar_type_datasets)  # noqa: SLF001
+            break
+
+    required_feeds: set[FeedKey] = {
+        FeedKey(dataset=dataset, native_bar_type_str=native_str)
+        for native_str, dataset in bar_type_datasets.items()
+    }
+
+    # Derive node_id from the node's TraderId so the per-feed JSON +
+    # cause attribution carry a stable, node-unique identity. Fall back to
+    # the deployment slug if the trader_id isn't reachable.
+    try:
+        node_id = str(node.trader_id)
+    except Exception:  # noqa: BLE001
+        node_id = p.deployment_slug
+
+    redis_url = p.redis_url
+
+    def _redis_factory() -> Any:
+        return aioredis.from_url(  # type: ignore[no-untyped-call]
+            redis_url, decode_responses=False
+        )
+
+    # NOTE: this is the fail-closed point for a bad DATA_FRESHNESS_GRACE_JSON —
+    # a raise here propagates to the run-loop catch-all and fails the node.
+    cfg = GraceConfig.from_env_json(p.data_freshness_grace_json)
+
+    return DataStaleMonitor(
+        registry=registry,
+        required_feeds=required_feeds,
+        redis_factory=_redis_factory,
+        cfg=cfg,
+        phase_resolver=resolve_session_phase,
+        deployment_id=str(p.deployment_id),
+        account_id=p.ib_account_id,
+        node_id=node_id,
+        clock=node.kernel.clock,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Production entry point — top-level function so mp.Process can pickle it
 # ---------------------------------------------------------------------------
@@ -1825,6 +2095,41 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
 
         handler.aclose = _aclose  # type: ignore[attr-defined]
         return handler
+
+    async def _real_reconciled_marker_factory(p: TradingNodePayload) -> Any:
+        """PR 1b T4: the reconciled-marker writer for THIS deployment.
+
+        ``clear()`` DELETEs :func:`~msai.core.halt_keys.reconciled_key` at
+        subprocess start (restart re-arms fail-closed); ``mark_reconciled()``
+        SETs it (ISO-now, NO TTL) AFTER ``_mark_running`` proves a healthy
+        reconcile. Owns its OWN ``decode_responses=False`` Redis client and
+        ``aclose``s it when the run loop is done with it. Returns ``None``
+        (no-op) when ``redis_url`` is empty.
+        """
+        if not p.redis_url:
+            return None
+
+        import redis.asyncio as aioredis
+
+        from msai.core.halt_keys import reconciled_key
+
+        redis_client = aioredis.from_url(  # type: ignore[no-untyped-call]
+            p.redis_url, decode_responses=False
+        )
+        key = reconciled_key(str(p.deployment_id))
+
+        class _ReconciledMarker:
+            async def clear(self) -> None:
+                await redis_client.delete(key)
+
+            async def mark_reconciled(self) -> None:
+                await redis_client.set(key, datetime.now(UTC).isoformat())
+
+            async def aclose(self) -> None:
+                with contextlib.suppress(Exception):
+                    await redis_client.aclose()
+
+        return _ReconciledMarker()
 
     # Codex batch 3 iter11 P0 fix: dispose() must run AFTER
     # ``asyncio.run`` exits, because Nautilus 1.223.0
@@ -2148,6 +2453,19 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
                         elif event_type == "OrderRejected":
                             reason = str(event.reason) if hasattr(event, "reason") else None
                             await writer.update_rejected(str(event.client_order_id), reason=reason)
+                            # PR 1b T7: if the rejection is an IB EXEC-side
+                            # pacing/throttle, INCR the per-account counter the
+                            # data-health API hydrates into IB_EXEC_PACING_ERRORS.
+                            # Reuse the node's halt-gate Redis client (the only
+                            # client in scope at this hook); swallows its own
+                            # errors so a counter blip never drops the audit.
+                            _pacing_redis = halt_refresh_box.get("redis")
+                            if _pacing_redis is not None:
+                                await record_ib_exec_pacing(
+                                    _pacing_redis,
+                                    reason=reason,
+                                    account_id=p.ib_account_id,
+                                )
                     except Exception as _evt_exc:  # noqa: BLE001
                         print(f"[MSAI] Audit event {event_type} FAILED: {_evt_exc!r}", flush=True)  # noqa: T201
 
@@ -2228,6 +2546,8 @@ def _trading_node_subprocess(payload: TradingNodePayload) -> NoReturn:
             on_node_constructed=_capture_node,
             on_post_build=_wire_market_hours,
             async_cleanup=_async_cleanup,
+            data_freshness_monitor_factory=real_data_freshness_monitor_factory,
+            reconciled_marker_factory=_real_reconciled_marker_factory,
         )
     )
 

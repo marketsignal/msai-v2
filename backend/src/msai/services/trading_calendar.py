@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
-__all__ = ["asset_class_to_exchange", "trading_days"]
+__all__ = ["asset_class_to_exchange", "get_calendar", "trading_days"]
 
 
 _ASSET_CLASS_TO_EXCHANGE: dict[str, str] = {
@@ -71,6 +71,16 @@ def _calendar(exchange_key: str) -> Any:
     import exchange_calendars as ec
 
     return ec.get_calendar(exchange_key)
+
+
+def get_calendar(exchange_key: str) -> Any:
+    """Return the cached ``exchange_calendars`` calendar for *exchange_key*.
+
+    Thin public delegate over the per-process ``@lru_cache``d :func:`_calendar`
+    so other modules (e.g. the data-freshness phase resolver) reuse ONE cached
+    calendar instance per exchange instead of re-constructing it on every call
+    (``exchange_calendars`` calendar construction is non-trivial)."""
+    return _calendar(exchange_key)
 
 
 def trading_days(start: date, end: date, *, asset_class: str) -> set[date]:

@@ -743,6 +743,78 @@ def live_kill_all(
     typer.echo(f"Stopped {data['stopped']} strategies. Risk halted: {data['risk_halted']}")
 
 
+def _fmt_feed_age_s(last_event_ts: Any) -> str:
+    """Render a feed's age from its ``last_event_ts`` (Unix nanoseconds).
+
+    The route reports ``last_event_ts`` as nanoseconds since the epoch (the
+    native Nautilus event timestamp). We render the wall-clock age relative to
+    now so the operator sees freshness at a glance — ``stale`` when the feed has
+    no last-event timestamp (``None`` — feed never produced a row / missing)."""
+    if last_event_ts is None:
+        return "stale"
+    try:
+        age = time.time() - (int(last_event_ts) / 1_000_000_000)
+    except (TypeError, ValueError):
+        return "stale"
+    return f"{age:.1f}s"
+
+
+@live_app.command("data-health")
+def live_data_health() -> None:
+    """Show every required Databento feed's freshness across the active fleet
+    plus the fleet halt-latch state + parsed cause (PR 1b T8).
+
+    Thin HTTP client of ``GET /api/v1/live/data-health`` — read-only window onto
+    the in-node data-stale monitor. A halted fleet renders a banner that names
+    WHICH cause (e.g. ``data_stale`` vs a manual ``fleet_emergency`` kill-all) so
+    the operator can tell a freshness trip apart from a manual halt."""
+    response = _api_call("GET", "/api/v1/live/data-health", timeout=10.0)
+    data = response.json()
+
+    feeds = data.get("feeds") or []
+    typer.echo(f"Required feeds ({len(feeds)}):")
+    if not feeds:
+        # Explicit line so an empty fleet never renders as a blank table.
+        typer.echo("  (no active feeds)")
+    else:
+        for feed in feeds:
+            account = feed.get("account_id") or "-"
+            dataset = feed.get("dataset") or "-"
+            symbol = feed.get("symbol") or "-"
+            feed_type = feed.get("feed") or "-"
+            phase = feed.get("phase") or "-"
+            grace = feed.get("grace_s")
+            grace_s = "-" if grace is None else f"{grace}s"
+            verdict = feed.get("verdict") or "-"
+            age = _fmt_feed_age_s(feed.get("last_event_ts"))
+            typer.echo(
+                f"  [{verdict}] account={account}  dataset={dataset}  "
+                f"symbol={symbol}  feed={feed_type}  "
+                f"phase={phase}  grace={grace_s}  age={age}"
+            )
+
+    # Fleet halt banner — parse the cause so the operator sees WHICH cause.
+    # ``halt_cause.reason`` is a HaltCause value (data_stale / fleet_emergency /
+    # operator_drain / ib_disconnect). A data-stale trip also names the source
+    # feed (dataset/symbol/feed) so the operator knows where to look; any other
+    # cause is named but distinguished from a freshness halt.
+    if data.get("fleet_halted"):
+        cause = data.get("halt_cause") or {}
+        reason = cause.get("reason") or "unknown"
+        if reason == "data_stale":
+            feed_type = cause.get("feed") or "-"
+            dataset = cause.get("dataset") or "-"
+            symbol = cause.get("symbol") or "-"
+            typer.echo(
+                f"FLEET HALTED — cause=data_stale  "
+                f"source feed={feed_type}  dataset={dataset}  symbol={symbol}"
+            )
+        else:
+            typer.echo(f"FLEET HALTED — cause={reason}")
+    else:
+        typer.echo("Fleet halted: False")
+
+
 # ----------------------------------------------------------------------
 # live: portfolio compose + deploy + observability (T10)
 # Thin shims over the /api/v1/live-portfolios/* + /api/v1/live/* APIs

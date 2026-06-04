@@ -67,6 +67,53 @@ ORDERS_DENIED = _r.counter("msai_orders_denied_total", "Orders denied by risk ch
 # IB connectivity
 IB_DISCONNECTS = _r.counter("msai_ib_disconnects_total", "IB Gateway disconnect events")
 
+# Data freshness (PR 1b) — fleet halts fired by the in-node data-stale monitor
+# when a required Databento feed/dataset goes stale past its grace budget. One
+# increment per stale TRANSITION (warm→stale), not per tick — the monitor is
+# idempotent while a feed remains stale.
+#
+# This is a Redis-hydrated GAUGE (not a counter): the monitor's local registry
+# inc happens in the live SUBPROCESS, invisible to the API /metrics registry,
+# so the account-labeled series here is REPLACED each scrape from the
+# ``msai:metrics:data_stale_halts:{account_id}`` Redis counter
+# (hydrate_data_health_metrics, same SCAN pattern as IB_EXEC_PACING_ERRORS).
+DATA_STALE_HALTS = _r.gauge(
+    "msai_data_stale_halts_total",
+    "Fleet halts fired by the in-node data-stale monitor (warm→stale "
+    "transition), per account. Redis-hydrated from the "
+    "msai:metrics:data_stale_halts:{account_id} counter INCRed by the monitor.",
+)
+
+# Data-feed health (PR 1b T7) — Redis-hydrated, labeled gauges. ALL series are
+# populated by ``hydrate_data_health_metrics`` (manifest-first reader, same as
+# the GET /api/v1/live/data-health route) and REPLACED each hydrate via
+# ``Gauge.replace_children`` so a feed that drops out of the monitor's manifest
+# disappears from the next scrape rather than lingering forever.
+DATA_FEED_AGE_SECONDS = _r.gauge(
+    "msai_data_feed_age_seconds",
+    "Seconds since the last observed event for a required Databento feed, "
+    "labeled by account/node/dataset/symbol/feed. Redis-hydrated from the "
+    "in-node data-stale monitor's per-feed freshness rows.",
+)
+DATA_FEED_STALE = _r.gauge(
+    "msai_data_feed_stale",
+    "1 if a required Databento feed is not warm (stale, pending, or missing), "
+    "else 0, labeled by account/node/dataset/symbol/feed. Redis-hydrated "
+    "alongside msai_data_feed_age_seconds.",
+)
+DATABENTO_DATASET_ALIVE = _r.gauge(
+    "msai_databento_dataset_alive",
+    "1 if every required feed in a Databento dataset is warm, else 0 — "
+    "dataset-granularity connection health derived from the per-feed verdicts, "
+    "labeled by account/node/dataset.",
+)
+IB_EXEC_PACING_ERRORS = _r.gauge(
+    "msai_ib_exec_pacing_errors",
+    "Count of IB EXEC-side pacing/throttle order rejections per account, "
+    "Redis-hydrated from the msai:metrics:ib_exec_pacing:{account_id} counter "
+    "INCRed by the live node's OrderRejected audit branch.",
+)
+
 # Active deployments gauge
 ACTIVE_DEPLOYMENTS = _r.gauge("msai_active_deployments", "Currently active deployments")
 

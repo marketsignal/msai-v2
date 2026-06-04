@@ -45,28 +45,41 @@ PEL recovery threshold, so a single number governs both
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from msai.core.halt_keys import fleet_halt_key
+from msai.core.halt_keys import (
+    HALT_SET_BACKOFF_S,
+    HALT_SET_MAX_ATTEMPTS,
+    HALT_TTL_SECONDS,
+    HALT_WRITE_LUA,
+    HaltCause,
+    fleet_halt_write_args,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from redis.asyncio import Redis as AsyncRedis
 
-# Module-local reference to the consolidated halt key (PR 1 T2). Same key the
-# API's /kill-all writes — setting it from inside the trading subprocess
-# triggers the same downstream behavior: supervisor blocks new starts, running
-# deployments get a stop command, and the strategy mixin's defense-in-depth
-# check refuses any new orders. See msai.core.halt_keys for the canonical
-# helpers (fleet_halt_key, account_halt_key, halt_cause_key).
-_HALT_KEY = fleet_halt_key()
+# Same latch the API's /kill-all writes — setting it from inside the trading
+# subprocess triggers the same downstream behavior: supervisor blocks new
+# starts, running deployments get a stop command, and the strategy mixin's
+# defense-in-depth check refuses any new orders. ``_fire_halt`` writes it (plus
+# the canonical cause) via ``HALT_WRITE_LUA``; see msai.core.halt_keys for the
+# canonical helpers (fleet_halt_key, account_halt_key, halt_cause_key).
 
 
 log = logging.getLogger(__name__)
 
 
+# DEPRECATED (PR 1b T5): these ad-hoc keys are NO LONGER written. ``_fire_halt``
+# now writes the canonical fleet cause via ``HALT_WRITE_LUA`` (same path the
+# data-stale monitor uses). The constants are retained ONLY so Task 6's
+# ``/resume`` transition-compat clear can delete any residue left by a pre-T5
+# node still running across a deploy. Remove once that compat window closes.
 _HALT_REASON_KEY = "msai:risk:halt:reason"
 _HALT_SOURCE_KEY = "msai:risk:halt:source"
 
@@ -81,23 +94,6 @@ DEFAULT_POLL_INTERVAL_S = 1.0
 fast enough that we react inside the grace window even at
 the boundary, slow enough that the loop is essentially
 free."""
-
-_HALT_TTL_SECONDS = 86400
-"""Same 24h TTL the API's /kill-all uses, so the disconnect
-halt has the same expiry as a manual kill switch — operators
-get the same recovery window either way."""
-
-_HALT_SET_MAX_ATTEMPTS = 5
-"""Codex batch 10 P2: how many times ``_fire_halt`` retries
-the Redis SET sequence before giving up. With exponential
-backoff starting at 100ms and doubling, the total wait is
-~3.1 seconds — long enough to ride out a transient Redis
-blip without delaying the halt past the point where the
-strategy could send another order."""
-
-_HALT_SET_BACKOFF_S = 0.1
-"""Initial backoff between halt-set retry attempts. Doubles
-on each attempt: 100ms, 200ms, 400ms, 800ms, 1.6s."""
 
 
 class IBDisconnectHandler:
@@ -199,33 +195,65 @@ class IBDisconnectHandler:
         except TimeoutError:
             return
 
-    async def _fire_halt(self) -> None:
-        """Set the persistent halt flag in Redis and call the
-        optional ``on_halt`` callback. The flag is the same
-        one ``/api/v1/live/kill-all`` sets, so the supervisor
-        and the strategy mixin both react to it identically.
+    def _build_cause(self, detected_at: str) -> dict[str, object | None]:
+        """Canonical fleet halt-cause JSON for an IB-disconnect halt.
 
-        Codex batch 10 P2 fix: previously this swallowed
-        Redis write errors and exited one-shot, leaving the
-        platform in a fail-OPEN state where an extended IB
-        outage produced NO halt signal. The new behavior:
-        retry with exponential backoff up to
-        ``_HALT_SET_MAX_ATTEMPTS``, log critical on every
-        failure, and the on_halt callback still fires even
-        if the Redis writes never succeed (so a flatten hook
+        Mirrors the data-stale monitor's cause shape (see the
+        :data:`~msai.core.halt_keys.HALT_WRITE_LUA` docstring) so an operator
+        reads ONE consistent cause representation regardless of which safety
+        layer latched the halt. ``account_id`` / ``node_id`` are ``None`` here —
+        the disconnect handler is constructed with only the ``deployment_slug``
+        (it watches one node's IB connection, not a per-account feed), so the
+        slug carries the deployment identity and the ``source`` field records
+        the handler that fired it.
+        """
+        return {
+            "reason": HaltCause.IB_DISCONNECT.value,
+            "account_id": None,
+            "node_id": None,
+            "deployment_id": self._deployment_slug,
+            "detected_at": detected_at,
+            "source": f"ib_disconnect_handler:{self._deployment_slug}",
+        }
+
+    async def _fire_halt(self) -> None:
+        """Latch the fleet halt via the atomic Lua script and call the optional
+        ``on_halt`` callback. The latch is the same one
+        ``/api/v1/live/kill-all`` sets, so the supervisor and the strategy mixin
+        both react to it identically.
+
+        PR 1b T5: writes the CANONICAL fleet cause (:func:`halt_cause_key`) via
+        the SHARED :data:`~msai.core.halt_keys.HALT_WRITE_LUA` script the
+        data-stale monitor uses — one atomic round-trip writes the latch +
+        ``:set_by`` / ``:set_at`` companions, sets the cause ONLY-IF-ABSENT
+        (preserving a pre-existing manual ``/kill-all`` or data-stale cause), and
+        LPUSH/LTRIMs the cause onto the capped history list. This replaces the
+        prior ad-hoc ``:reason`` / ``:source`` SETs, which diverged from the
+        canonical representation and were never cleared by ``/resume``.
+
+        Codex batch 10 P2 fix (preserved): previously the write swallowed Redis
+        errors and exited one-shot, leaving the platform fail-OPEN. The current
+        behavior retries with exponential backoff up to
+        ``_HALT_SET_MAX_ATTEMPTS``, logs critical on every failure, and fires the
+        ``on_halt`` callback even if the writes never succeed (so a flatten hook
         runs regardless of Redis health).
         """
+        detected_at = datetime.now(UTC).isoformat()
+        cause_json = json.dumps(self._build_cause(detected_at))
+        set_by = f"ib_disconnect_handler:{self._deployment_slug}"
+
+        keys, argv = fleet_halt_write_args(
+            set_by=set_by,
+            set_at=detected_at,
+            cause_json=cause_json,
+            ttl_s=HALT_TTL_SECONDS,
+        )
+
         success = False
         last_exc: Exception | None = None
-        for attempt in range(_HALT_SET_MAX_ATTEMPTS):
+        for attempt in range(HALT_SET_MAX_ATTEMPTS):
             try:
-                await self._redis.set(_HALT_KEY, "true", ex=_HALT_TTL_SECONDS)
-                await self._redis.set(_HALT_REASON_KEY, "ib_disconnect", ex=_HALT_TTL_SECONDS)
-                await self._redis.set(
-                    _HALT_SOURCE_KEY,
-                    f"ib_disconnect_handler:{self._deployment_slug}",
-                    ex=_HALT_TTL_SECONDS,
-                )
+                await self._redis.eval(HALT_WRITE_LUA, len(keys), *keys, *argv)  # type: ignore[misc]
                 success = True
                 break
             except Exception as exc:  # noqa: BLE001
@@ -234,13 +262,13 @@ class IBDisconnectHandler:
                     "ib_disconnect_halt_set_failed",
                     extra={
                         "attempt": attempt + 1,
-                        "max_attempts": _HALT_SET_MAX_ATTEMPTS,
+                        "max_attempts": HALT_SET_MAX_ATTEMPTS,
                         "deployment_slug": self._deployment_slug,
                     },
                     exc_info=exc,
                 )
-                if attempt + 1 < _HALT_SET_MAX_ATTEMPTS:
-                    backoff = _HALT_SET_BACKOFF_S * (2**attempt)
+                if attempt + 1 < HALT_SET_MAX_ATTEMPTS:
+                    backoff = HALT_SET_BACKOFF_S * (2**attempt)
                     await asyncio.sleep(backoff)
 
         if not success:

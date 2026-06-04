@@ -647,6 +647,9 @@ def _build_production_payload_factory(
                     native_instrument_ids=native_instrument_ids,
                     venue_dataset_map=venue_dataset_map,
                     canonical_to_native_bar_types=canonical_to_native_bar_types,
+                    # PR 1b — operator GraceConfig override for the in-node
+                    # data-stale monitor. None → subprocess uses defaults.
+                    data_freshness_grace_json=settings.data_freshness_grace_json,
                 )
                 log.info(
                     "trading_node_payload_built",

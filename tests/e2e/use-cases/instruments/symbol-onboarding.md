@@ -88,7 +88,17 @@
 
 **Intent:** Validate that `backtest_data_available` is never `true` without a window scope. This is the Contrarian's binding objection from the iter-1 council.
 
-**Setup:** UC-SYM-001 has landed; SPY has full 2024 coverage.
+> **Changelog 2026-06-04 (UC-SYM-004 self-arranging Setup):** this UC previously
+> assumed UC-SYM-001 residual SPY-full-2024 state, which is no longer present in
+> the accumulated dev data. Setup is now self-arranging — it ensures SPY full-2024
+> coverage via the sanctioned ingest path before asserting `full`/`true`. The
+> no-window refuse-to-claim arm (Step 1) is unchanged.
+
+**Setup (ARRANGE):** Ensure SPY has full 2024 coverage via the sanctioned ingest
+path before running the assertions (do NOT assume prior-UC residual state):
+
+1. `POST /api/v1/symbols/onboard` with `{"watchlist_name":"sym004", "symbols":[{"symbol":"SPY","asset_class":"equity","start":"2024-01-01","end":"2024-12-31"}]}` (or the equivalent `msai symbols onboard` CLI invocation).
+2. Poll `GET /onboard/{run_id}/status` until terminal `completed` so SPY's full-2024 coverage exists. This is a sanctioned public-API/CLI arrange — it ingests coverage, it does NOT pre-compute the readiness answer under test (the readiness scoping behavior in Steps is what's being verified).
 
 **Steps:**
 
@@ -98,7 +108,7 @@
 
 **Verification:** Response shapes match the `ReadinessResponse` Pydantic contract. `coverage_status` transitions `null → full → gapped` across the three calls. The `null` case is **structural**, not a workaround — the API explicitly refuses to claim data is "available" without specifying a window.
 
-**Persistence:** Read-only endpoint; no persistence required.
+**Persistence:** Re-request the windowed call `GET /readiness?symbol=SPY&asset_class=equity&start=2024-01-01&end=2024-12-31` after a short delay (and after a `docker compose down/up` if exercising restart durability) — it still returns `backtest_data_available=true`, `coverage_status=full`; the ingested coverage from Setup persists and the no-window arm still returns `null`.
 
 ---
 

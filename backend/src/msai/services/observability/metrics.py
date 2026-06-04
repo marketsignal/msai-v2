@@ -55,7 +55,7 @@ import threading
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterable, Mapping
 
 
 def _format_labels(labels: Mapping[str, str]) -> str:
@@ -158,6 +158,22 @@ class Gauge(_LabeledMetric):
 
     def labels(self, **labels: str) -> _GaugeChild:
         return _GaugeChild(self, labels)
+
+    def replace_children(self, samples: Iterable[tuple[Mapping[str, str], float]]) -> None:
+        """Atomically REPLACE every labeled child of this gauge with *samples*.
+
+        ``samples`` is an iterable of ``(label_set, value)`` pairs, where
+        ``label_set`` is a mapping like ``{"account": "DU1", ...}``. Any prior
+        child not present in *samples* is pruned — this is the mechanism a
+        Redis-hydrated gauge uses so a series that disappears from the source
+        (e.g. a stopped data feed) stops being exported on the next scrape,
+        instead of lingering forever. The whole swap happens under the metric
+        lock so a concurrent ``render()`` sees either the full old set or the
+        full new set, never a torn mix.
+        """
+        new_values = {self._key(labels): float(value) for labels, value in samples}
+        with self._lock:
+            self._values = new_values
 
 
 class _GaugeChild:

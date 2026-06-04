@@ -81,6 +81,18 @@ def mock_command_bus() -> MagicMock:
     fake_redis.set = AsyncMock(return_value=True)
     fake_redis.delete = AsyncMock(return_value=1)
     fake_redis.exists = AsyncMock(return_value=0)
+    # PR 1b T6: /kill-all uses eval(HALT_WRITE_LUA, ...) (returns 1) and
+    # /resume uses eval(RESUME_CLEAR_LUA, ...) (returns "OK" on a clean
+    # clear). With the unit mock_db returning ZERO active deployments,
+    # /resume probes no manifests and the clear is vacuously "OK".
+    fake_redis.eval = AsyncMock(return_value="OK")
+
+    async def _empty_scan_iter(*_a: object, **_k: object):
+        # /resume scans `stop_unknown:*`; yield nothing for the unit path.
+        return
+        yield  # pragma: no cover — makes this an async generator
+
+    fake_redis.scan_iter = _empty_scan_iter
     # Flatness service (Bug #2) uses get/rpush/expire on bus._redis.
     # Default `get` returns a stub report so the API doesn't wait for
     # the 15-30s deadline on every existing test. Tests that care
@@ -227,51 +239,55 @@ class TestLiveKillAll:
         """Layer 1: ``msai:risk:halt`` must be SET on every
         kill-all so subsequent ``/start`` calls return 503.
 
-        F9 fix (Codex iter 2 P1): kill-all now batches the 4 halt-set
-        writes (latch, set_by, set_at, cause) into a single Redis
-        transactional pipeline (MULTI/EXEC) so a connection drop
-        mid-sequence can't leave partial state. Inspect the recorded
-        pipeline SET calls.
+        PR 1b T6: kill-all now writes the halt keyset via the atomic
+        ``HALT_WRITE_LUA`` script (one ``eval`` round-trip) instead of a
+        MULTI/EXEC pipeline. The latch key + 24h TTL are passed as
+        eval KEYS/ARGV. Inspect the recorded eval call.
         """
         await client_with_mock_db.post("/api/v1/live/kill-all")
 
-        pipeline_set_calls = mock_command_bus._redis._pipeline_set_calls  # noqa: SLF001
-        halt_keys = [k for (k, _v, _kw) in pipeline_set_calls]
-        assert "msai:risk:halt" in halt_keys
-        # 24h TTL applied to every halt-set
-        for key, _value, kw in pipeline_set_calls:
-            if key == "msai:risk:halt":
-                assert kw.get("ex") == 86400
+        eval_call = mock_command_bus._redis.eval.call_args  # noqa: SLF001
+        assert eval_call is not None
+        # eval(script, numkeys, *keys, *argv) — the latch key is KEYS[1].
+        args = eval_call.args
+        numkeys = args[1]
+        keys = list(args[2 : 2 + numkeys])
+        argv = list(args[2 + numkeys :])
+        assert "msai:risk:halt" in keys
+        # The 24h TTL (last ARGV) is applied to the halt keyset.
+        assert "86400" in argv
 
-    async def test_kill_all_uses_transactional_pipeline_for_halt_writes(
+    async def test_kill_all_uses_atomic_halt_write_lua(
         self,
         client_with_mock_db: httpx.AsyncClient,
         mock_command_bus: MagicMock,
     ) -> None:
-        """F9 fix: the 4 halt-set writes (latch, set_by, set_at,
-        cause-companion) MUST go through a single Redis MULTI/EXEC
-        transaction so either all keys are set or none. The previous
-        implementation issued 5 sequential ``await SET`` calls; a
-        connection drop mid-sequence would silently leave partial
-        state (latch set, cause-companion missing).
+        """PR 1b T6: the halt-set writes (latch, set_by, set_at,
+        cause, cause-history) MUST go through the shared atomic
+        ``HALT_WRITE_LUA`` script so the keyset is all-or-nothing AND the
+        cause is written ONLY-IF-ABSENT — preserving a pre-existing
+        data-stale auto-halt's attribution instead of erasing it. The
+        previous MULTI/EXEC pipeline blindly SET the cause key, silently
+        clobbering a data-stale cause on a manual kill-all.
         """
+        from msai.core.halt_keys import HALT_WRITE_LUA
+
         await client_with_mock_db.post("/api/v1/live/kill-all")
 
-        # Pipeline was called with transaction=True.
-        pipeline_call = mock_command_bus._redis.pipeline.call_args  # noqa: SLF001
-        assert pipeline_call.kwargs.get("transaction") is True, (
-            "F9: halt-set must use a transactional pipeline so the keyset "
-            "is atomic w.r.t. operator-visible state"
-        )
+        eval_call = mock_command_bus._redis.eval.call_args  # noqa: SLF001
+        assert eval_call is not None
+        # The shared atomic script is used (NOT a transactional pipeline).
+        assert eval_call.args[0] == HALT_WRITE_LUA
+        assert mock_command_bus._redis.pipeline.called is False  # noqa: SLF001
 
-        # All 4 halt-set writes landed inside ONE pipeline batch.
-        pipeline_set_calls = mock_command_bus._redis._pipeline_set_calls  # noqa: SLF001
-        keys = {k for (k, _v, _kw) in pipeline_set_calls}
-        # Every halt-related key written in the same transaction.
+        numkeys = eval_call.args[1]
+        keys = set(eval_call.args[2 : 2 + numkeys])
+        # All five halt-related keys are written in the same atomic call.
         assert "msai:risk:halt" in keys
         assert "msai:risk:halt:set_by" in keys
         assert "msai:risk:halt:set_at" in keys
         assert "msai:risk:halt:cause" in keys
+        assert "msai:risk:halt:cause:history" in keys
 
     async def test_kill_all_publishes_stop_for_each_active_row(
         self,
@@ -379,20 +395,34 @@ class TestLiveResume:
         body = response.json()
         assert body["resumed"] is True
 
-    async def test_resume_deletes_halt_flag(
+    async def test_resume_clears_halt_flag_via_atomic_lua(
         self,
         client_with_mock_db: httpx.AsyncClient,
         mock_command_bus: MagicMock,
     ) -> None:
-        """The endpoint must delete the persistent halt flag
-        AND its metadata keys (set_by, set_at)."""
+        """PR 1b T6: with zero active deployments (mock_db default), resume
+        is a vacuous pass — it clears the halt keyset via the atomic
+        ``RESUME_CLEAR_LUA`` script. The latch + metadata + cause +
+        history + legacy transition-compat keys are passed as the script's
+        DELETE keys (the tail of KEYS after the manifest/verdict/reconciled
+        segments, all of which are empty here)."""
+        from msai.core.halt_keys import RESUME_CLEAR_LUA
+
         await client_with_mock_db.post("/api/v1/live/resume")
 
-        delete_calls = mock_command_bus._redis.delete.call_args_list  # noqa: SLF001
-        deleted_keys = [call.args[0] for call in delete_calls]
-        assert "msai:risk:halt" in deleted_keys
-        assert "msai:risk:halt:set_by" in deleted_keys
-        assert "msai:risk:halt:set_at" in deleted_keys
+        eval_call = mock_command_bus._redis.eval.call_args  # noqa: SLF001
+        assert eval_call is not None
+        assert eval_call.args[0] == RESUME_CLEAR_LUA
+        numkeys = eval_call.args[1]
+        keys = set(eval_call.args[2 : 2 + numkeys])
+        # ARGV segment counts are all zero (no active deployments).
+        argv = list(eval_call.args[2 + numkeys :])
+        assert argv == ["0", "0", "0"]
+        # The halt keyset is the script's delete-list.
+        assert "msai:risk:halt" in keys
+        assert "msai:risk:halt:set_by" in keys
+        assert "msai:risk:halt:set_at" in keys
+        assert "msai:risk:halt:cause" in keys
 
 
 # ---------------------------------------------------------------------------
