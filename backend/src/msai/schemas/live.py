@@ -259,11 +259,98 @@ class LiveKillAllResponse(BaseModel):
     flatness_reports: list[dict[str, Any]] = []
 
 
+class ResumeVerifiedPreconditions(BaseModel):
+    """Fail-closed preconditions the fleet ``/resume`` route verified before
+    clearing the halt latch (PR 1b T6).
+
+    The operator gets a receipt of exactly what was checked so a green resume
+    is auditable: how many active deployments were inspected, which per-feed
+    freshness verdicts were confirmed ``warm``, and that every active node still
+    carries a reconciliation marker."""
+
+    active_deployments_checked: int = Field(
+        description="Count of ACTIVE-status deployments inspected before clearing."
+    )
+    feeds_verified: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Per-feed freshness keys confirmed present + ``warm`` "
+            "(``<deployment_id>:<dataset>:<native_bar_type>``)."
+        ),
+    )
+    reconciled_verified: list[str] = Field(
+        default_factory=list,
+        description="Deployment ids whose reconciliation marker was confirmed present.",
+    )
+
+
 class LiveResumeResponse(BaseModel):
-    """Response schema for the resume endpoint that clears the
-    persistent halt flag set by ``/kill-all``."""
+    """Response schema for the fleet ``/resume`` endpoint that clears the
+    persistent halt flag set by ``/kill-all`` (or PR 1b's data-stale auto-halt).
+
+    PR 1b T6: resume is now fail-closed — it refuses (409) unless every active
+    deployment's required Databento feeds are warm and the node is reconciled.
+    ``verified`` records the preconditions that passed; ``resumed_by`` names the
+    operator on the audit receipt."""
 
     resumed: bool
+    resumed_by: str | None = None
+    verified: ResumeVerifiedPreconditions
+
+
+class DataFeedHealth(BaseModel):
+    """One required Databento feed's freshness as the operator sees it (PR 1b T7).
+
+    Built MANIFEST-FIRST: a feed the in-node monitor declared but for which no
+    live freshness row exists is reported with ``verdict == "missing"`` (never
+    silently absent). A feed WITH a live row carries the monitor verdict —
+    ``warm`` (fresh data observed), ``pending`` (monitor alive but no data
+    observed yet, within startup grace), or ``stale`` (past budget). Only
+    ``warm`` is resumable. ``feed`` is the native Nautilus bar-type string."""
+
+    account_id: str | None = None
+    node_id: str | None = None
+    deployment_id: str
+    dataset: str
+    feed: str
+    symbol: str | None = None
+    last_event_ts: int | None = None
+    phase: str | None = None
+    grace_s: int | None = None
+    verdict: str
+    published_at: str | None = None
+
+
+class MonitorMissingDeployment(BaseModel):
+    """A RUNNING deployment whose in-node data-stale monitor is missing/dead
+    (FIX 4).
+
+    Surfaced when an active deployment's freshness manifest is ABSENT (monitor
+    never started, or its node died and the manifest TTL lapsed) or MALFORMED.
+    This is distinct from an empty fleet: the deployment IS running but its
+    data-stale protection is dark, so an operator must see it explicitly rather
+    than have it silently drop out of the feeds list."""
+
+    deployment_id: str
+    account_id: str | None = None
+    reason: str  # 'manifest absent' | 'manifest malformed'
+
+
+class DataHealthResponse(BaseModel):
+    """Response schema for ``GET /api/v1/live/data-health`` (PR 1b T7).
+
+    The operator's read-only window onto the in-node data-stale monitor: every
+    required feed across the active fleet, plus the fleet halt latch + parsed
+    halt-cause for context. An empty fleet yields ``feeds: []`` with a 200.
+
+    FIX 4: ``monitor_missing`` lists RUNNING deployments whose monitor is
+    missing/dead (absent/malformed manifest) so a dead monitor is distinguishable
+    from a quiet fleet."""
+
+    feeds: list[DataFeedHealth] = Field(default_factory=list)
+    monitor_missing: list[MonitorMissingDeployment] = Field(default_factory=list)
+    fleet_halted: bool
+    halt_cause: dict[str, Any] | None = None
 
 
 class StrategyMemberInfo(BaseModel):

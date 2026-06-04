@@ -1052,6 +1052,57 @@ def build_per_account_trading_node_config(
         },
     )
 
+    # --- Data-freshness observer actor (PR 1b Task 2) -------------------
+    # A SEPARATE actor that subscribes to the same NATIVE Databento bar
+    # types the shim already streams and records each bar's event/arrival
+    # timestamps into a shared FreshnessRegistry (injected post-build by
+    # the subprocess). Subscribing to an already-subscribed EXTERNAL bar
+    # type is a free observation tap — no duplicate upstream Databento
+    # subscription (engine.pyx:1191 + msgbus fan-out).
+    #
+    # bar_type_datasets is DERIVED ONCE here from the canonical→native map
+    # + venue_dataset_map: each native bar-type string's venue suffix
+    # (``<SYM>.<VENUE>-...``) keys into venue_dataset_map for its dataset.
+    # Gate on the same data the shim needs — empty canonical map means the
+    # legacy path, so no freshness actor is added.
+    actors: list[ImportableActorConfig] = [shim_actor_config]
+    if canonical_to_native_bar_types:
+        # Defer-import BarType so this module's top-level import cost stays low
+        # (and the uvloop-policy install at nautilus import time stays deferred,
+        # gotcha #1). BarType.from_str is the AUTHORITATIVE venue parser: a hand
+        # ``split('.', 1)[-1]`` mis-parses dotted share-class symbols like
+        # ``BRK.B.XNYS-...`` (venue would be ``B.XNYS``), missing
+        # venue_dataset_map and SILENTLY dropping the feed from the freshness
+        # manifest — no auto-halt for that feed.
+        from nautilus_trader.model.data import BarType
+
+        native_bar_types = list(canonical_to_native_bar_types.values())
+        bar_type_datasets: dict[str, str] = {}
+        for native_str in native_bar_types:
+            venue = BarType.from_str(native_str).instrument_id.venue.value
+            dataset = venue_dataset_map.get(venue)
+            if dataset is None:
+                # FAIL CLOSED: a required feed that cannot be mapped to a
+                # Databento dataset must fail the deploy loudly, not lose its
+                # freshness protection silently.
+                raise ValueError(
+                    "build_per_account_trading_node_config: native bar type "
+                    f"{native_str!r} resolves to venue {venue!r}, which has no "
+                    f"entry in venue_dataset_map ({sorted(venue_dataset_map)}); "
+                    "the data-stale monitor cannot protect a feed it cannot map "
+                    "to a dataset."
+                )
+            bar_type_datasets[native_str] = dataset
+        freshness_actor_config = ImportableActorConfig(
+            actor_path="msai.services.nautilus.data_freshness_actor:DataFreshnessActor",
+            config_path="msai.services.nautilus.data_freshness_actor:DataFreshnessActorConfig",
+            config={
+                "native_bar_types": native_bar_types,
+                "bar_type_datasets": bar_type_datasets,
+            },
+        )
+        actors.append(freshness_actor_config)
+
     # --- Assemble the TradingNodeConfig --------------------------------
     config = TradingNodeConfig(
         trader_id=trader_id,
@@ -1082,7 +1133,7 @@ def build_per_account_trading_node_config(
         # for symmetry with the legacy builders (existing tests at
         # tests/unit/test_live_node_config.py:278 already assert this).
         exec_clients={IB_VENUE.value: exec_client},
-        actors=[shim_actor_config],
+        actors=actors,
         strategies=strategies or [],
     )
 

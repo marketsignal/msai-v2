@@ -174,6 +174,17 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("AZURE_KV_MI_CLIENT_ID"),
     )
+    # PR 1b — optional JSON override for the in-node data-stale monitor's
+    # ``GraceConfig`` (per-(asset_class, phase) grace seconds + tick cadence).
+    # ``None``/blank → built-in defaults. The supervisor threads this into the
+    # ``TradingNodePayload.data_freshness_grace_json`` field, which the
+    # subprocess feeds to ``GraceConfig.from_env_json`` at monitor-wiring time
+    # (fail-loud on invalid JSON / unknown keys). Declared here so operators can
+    # list it in ``.env`` without tripping pydantic-settings ``extra="forbid"``.
+    data_freshness_grace_json: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("DATA_FRESHNESS_GRACE_JSON"),
+    )
     # One-time, env-driven backfill string consumed by the broker-accounts
     # backfill Alembic migration (``d97a64e13e4e``) to seed legacy per-env
     # accounts. The migration reads ``BROKER_ACCOUNT_BACKFILL`` directly via

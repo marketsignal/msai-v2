@@ -440,7 +440,10 @@ async def test_mark_running_forward_syncs_deployment_to_running(
         assert dep is not None
         assert dep.status == "starting"
 
-    await _mark_running(session_factory, seeded_row.id)
+    promoted = await _mark_running(session_factory, seeded_row.id)
+    # A real promotion happened → the caller is cleared to SET the reconciled
+    # marker (Codex iter-20 P1 contract).
+    assert promoted is True
 
     # The node row is running AND the deployment forward-synced to running.
     node_row = await _fetch_row(session_factory, seeded_row.id)
@@ -577,7 +580,12 @@ async def test_mark_running_skips_promotion_when_node_row_carries_stop_intent(
         row.stop_requested_at = datetime.now(UTC)
         row.status = "stopping"
 
-    await _mark_running(session_factory, seeded_row.id)
+    promoted = await _mark_running(session_factory, seeded_row.id)
+    # Promotion was SKIPPED (stop intent present) → the caller must NOT set the
+    # reconciled marker (Codex iter-20 P1: a stop-raced node must not present as
+    # reconciled to /resume, which would let it clear a halt off a node going
+    # down).
+    assert promoted is False
 
     # The node row was NOT resurrected to ``running`` — stop intent preserved.
     node_row = await _fetch_row(session_factory, seeded_row.id)

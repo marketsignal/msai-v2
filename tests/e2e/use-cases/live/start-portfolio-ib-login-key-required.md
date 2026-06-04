@@ -9,10 +9,18 @@ UNIQUE index and surfaced another opaque 500.
 
 This PR makes the API reject both cases with explicit 422 responses.
 
-## UC1.1 — Missing `ib_login_key` → 422 (not 500)
+> **Changelog 2026-06-04 (UC1.1 retarget):** the broker-account either/or
+> validator from PR #88 moved the missing-`ib_login_key` rejection from a
+> field-level `missing` error to a **model-level `value_error`** at
+> `loc: ["body"]`. Status stays 422; only the error shape moved. UC1.1
+> Verification updated to the current contract. UC1.2 (empty-string →
+> field-level `string_too_short`) is unchanged.
 
-**Intent:** A client that forgets to send `ib_login_key` gets a Pydantic
-validation error, not an opaque internal-server error.
+## UC1.1 — Missing identity (no `broker_account_id`, no `ib_login_key`) → 422 (not 500)
+
+**Intent:** A client that sends neither `broker_account_id` nor a complete
+`(account_id, ib_login_key)` pair gets a Pydantic validation error, not an
+opaque internal-server error.
 
 **Interface:** API.
 
@@ -36,12 +44,25 @@ curl -sf -X POST http://localhost:8800/api/v1/live/start-portfolio \
 
 - HTTP status `422`.
 - Response body contains a `detail` array (FastAPI's validation-error
-  shape) with at least one entry whose `loc` ends in `ib_login_key` and
-  `type` is `missing`.
-- Sample (FastAPI 0.115):
+  shape) with at least one entry whose `type` is `value_error` and whose
+  `loc` is `["body"]` (a **model-level** validator error, not a field-level
+  one — the broker-fleet either/or validator from PR #88 fires on the model
+  root, not on a single field).
+- That entry's `msg` contains the operator hint
+  `"provide broker_account_id, or both account_id and ib_login_key"`.
+- Sample (FastAPI 0.115 / Pydantic v2 model validator):
 
   ```json
-  {"detail": [{"type": "missing", "loc": ["body", "ib_login_key"], "msg": "Field required", ...}]}
+  {
+    "detail": [
+      {
+        "type": "value_error",
+        "loc": ["body"],
+        "msg": "Value error, provide broker_account_id, or both account_id and ib_login_key",
+        ...
+      }
+    ]
+  }
   ```
 
 **Persistence (negative):**

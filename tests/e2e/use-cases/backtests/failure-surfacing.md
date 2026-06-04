@@ -7,20 +7,31 @@ Every use case assumes:
 - Dev stack up (`docker compose -f docker-compose.dev.yml up -d`)
 - `MSAI_API_KEY=msai-dev-key` in the environment
 - `example.ema_cross` strategy registered (from `strategies/example/ema_cross.py`)
-- Dev DB has no ingested Parquet data for ES (default — so submitting ES backtests fails with `missing_data`)
+- UC-BFS-001 relies on the auto-heal **guardrail** (>10-year window rejected before any ingest), not on ES being un-ingested — so it is deterministic regardless of accumulated dev Parquet state (auto-ingest, PR #40, auto-heals normal cold paths).
 
 ---
 
-## UC-BFS-001 — Failed backtest exposes structured envelope via API
+## UC-BFS-001 — Failed backtest exposes structured envelope via API (guardrail short-circuit)
+
+> **Changelog 2026-06-04 (UC-BFS-001 retarget):** the old cold-path
+> `missing_data` trigger (submit a never-ingested symbol → fail) was
+> superseded by auto-ingest (PR #40): the cold path now **auto-heals**, and a
+> provider/ingest failure classifies as `engine_crash` (per UC-BAI-003) — so
+> the original UC no longer deterministically produces `missing_data`. This UC
+> is retargeted to the **guardrail short-circuit path** (a >10-year `ES.n.0`
+> window), which fails BEFORE auto-ingest is ever enqueued and is therefore a
+> deterministic `missing_data` envelope. This mirrors UC-BAI-002. The structured
+> envelope contract (`code` / `message` / `suggested_action` / `remediation`)
+> is what's under test here — the same contract regardless of which path raised it.
 
 **Interface:** API
 
-**Setup (ARRANGE):** `POST /api/v1/backtests/run` with `instruments=["ES.n.0"]`, any valid EMA config, and the example EMA cross strategy id.
+**Setup (ARRANGE):** authenticated client, the example EMA cross strategy id.
 
 **Steps:**
 
-1. Submit backtest via `POST /api/v1/backtests/run`.
-2. Wait ~5–7 seconds for the worker to process.
+1. `POST /api/v1/backtests/run` with `instruments=["ES.n.0"]`, `start_date=2013-01-01`, `end_date=2024-12-31` (~12 years — exceeds the 10-year auto-heal guardrail cap), any valid EMA config.
+2. Wait ~5 seconds for the worker to process (guardrail short-circuit is near-instant — no provider round-trips).
 3. `GET /api/v1/backtests/{id}/status`.
 
 **Verification:**
@@ -28,9 +39,10 @@ Every use case assumes:
 - HTTP 200.
 - `body.status == "failed"`.
 - `body.error.code == "missing_data"`.
-- `body.error.message` contains `<DATA_ROOT>` AND does NOT contain `/app/` (sanitizer stripped container path).
+- `body.error.message` mentions the year cap (contains "year" and "10"), and does NOT contain `/app/` (sanitizer stripped container path).
 - `body.error.suggested_action` starts with `"Run: msai ingest"`.
-- `body.error.remediation.kind == "ingest_data"` with `symbols` array + `start_date` / `end_date` matching submission + `auto_available == false`.
+- `body.error.remediation.kind == "ingest_data"` with `symbols` array + `start_date` / `end_date` matching submission + `auto_available == false` (guardrail short-circuits before any auto-ingest enqueue).
+- `body.error.remediation.asset_class == "futures"` (derived server-side from `ES.n.0`).
 
 **Persistence:** GET again — identical envelope returned (stable read; idempotent).
 
@@ -128,7 +140,7 @@ Every use case assumes:
 
 - **Stack down:** `curl /health` returns connection-refused. Bring up with `docker compose -f docker-compose.dev.yml up -d`.
 - **Strategy not registered:** `api/v1/strategies/` returns empty. Add a sample strategy under `strategies/` and restart backend.
-- **Parquet ingested:** UC-BFS-001 may return `status=completed` instead of `failed` if someone ran `msai ingest stocks ES ...` before this test. Either switch symbol (e.g., `NONEXISTENT.n.0`) or use a different asset class the dev DB hasn't ingested.
+- **UC-BFS-001 returns `completed` or `engine_crash` instead of `missing_data`:** that means the window was inside the 10-year guardrail cap and auto-ingest (PR #40) took over. Keep the >10-year window (`2013-01-01`→`2024-12-31`) so the guardrail short-circuits BEFORE auto-ingest — that is the deterministic `missing_data` path now.
 - **Radix Tooltip on mobile:** tooltip won't open on touch (WAI-ARIA design). Mobile users should reach the failure via UC-BFS-005 click-through. Flag FAIL_STALE if spec is ever rewritten to require mobile tooltip display.
 
 ## Known limitations (documented scope-defer in this PR)

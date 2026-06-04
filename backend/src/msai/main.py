@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING, Any
 from uuid import UUID  # noqa: TC003 — FastAPI resolves the type at runtime for path params
 
-from fastapi import FastAPI, Request, Response, WebSocket
+from fastapi import Depends, FastAPI, Request, Response, WebSocket
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +26,9 @@ from sqlalchemy import func, select
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from msai.services.live_command_bus import LiveCommandBus
     from msai.services.nautilus.projection.registry import StreamRegistry
 
 from msai.api.account import router as account_router
@@ -41,6 +44,7 @@ from msai.api.broker_accounts import router as broker_accounts_router
 from msai.api.graduation import router as graduation_router
 from msai.api.instruments import router as instruments_router
 from msai.api.live import router as live_router
+from msai.api.live_deps import get_command_bus
 from msai.api.market_data import router as market_data_router
 from msai.api.portfolio import router as portfolio_router
 from msai.api.portfolios import (
@@ -56,6 +60,7 @@ from msai.api.system import router as system_router
 from msai.api.websocket import live_stream
 from msai.core.auth import _API_KEY_CLAIMS, init_validator
 from msai.core.config import settings
+from msai.core.database import get_db
 from msai.core.logging import get_logger, logging_middleware, setup_logging
 
 setup_logging(settings.environment)
@@ -495,13 +500,38 @@ async def ws_live_stream(websocket: WebSocket, deployment_id: UUID) -> None:
 # Prometheus metrics endpoint (Phase 4 task 4.6)
 # ---------------------------------------------------------------------------
 @app.get("/metrics")
-async def metrics() -> Response:
+async def metrics(
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+    bus: LiveCommandBus = Depends(get_command_bus),  # noqa: B008
+) -> Response:
     """Prometheus scrape endpoint. Exposes every counter and
     gauge registered in :func:`get_registry`. The endpoint is
     intentionally unauthenticated — operators expose it on a
     private network or behind a reverse proxy, matching the
-    standard Prometheus deployment model."""
+    standard Prometheus deployment model.
+
+    PR 1b T7: before rendering, hydrate the Redis-backed data-feed
+    health gauges (``msai_data_feed_age_seconds`` /
+    ``msai_data_feed_stale`` / ``msai_databento_dataset_alive`` /
+    ``msai_ib_exec_pacing_errors``) from the SAME manifest-first
+    reader the ``/api/v1/live/data-health`` route uses, so a bare
+    scrape exposes the current feed health. The DB session + command
+    bus come through the same overridable dependencies the live
+    routes use. Hydration degrades gracefully — if Redis or the DB
+    is down it renders whatever is already registered and NEVER 500s
+    the scrape. FIX 3: when the active-deployment enumeration FAILS
+    (transient DB/Redis error) the snapshot is flagged
+    ``collection_ok=False`` and hydration SKIPS the gauge prune, so the
+    previously-hydrated feed/stale/halt children stay standing through
+    the blip rather than momentarily vanishing (which would clear a
+    firing Prometheus alert). A successful-but-empty fleet still prunes
+    to empty."""
     from msai.services.observability import get_registry
+
+    with suppress(Exception):
+        from msai.services.observability.data_health import hydrate_data_health_metrics
+
+        await hydrate_data_health_metrics(db, bus._redis)  # noqa: SLF001
 
     body = get_registry().render()
     return Response(

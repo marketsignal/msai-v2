@@ -140,6 +140,8 @@ async def test_factory_embeds_per_account_databento_fields() -> None:
         mock_settings.database_url = ""
         mock_settings.redis_url = ""
         mock_settings.startup_health_timeout_s = 60.0
+        # PR 1b — operator GraceConfig override threaded into the payload.
+        mock_settings.data_freshness_grace_json = '{"interval_s": 10}'
         mock_settings.strategies_root.joinpath = MagicMock(
             return_value=MagicMock(is_file=MagicMock(return_value=False)),
         )
@@ -154,6 +156,11 @@ async def test_factory_embeds_per_account_databento_fields() -> None:
 
     # ---- account_id (already wired via ib_account_id pre-T12) ----
     assert payload.ib_account_id == "DUP733214"
+
+    # ---- data_freshness_grace_json (PR 1b) ----
+    # The supervisor threads the operator override from settings into the
+    # payload verbatim; None → subprocess uses GraceConfig defaults.
+    assert payload.data_freshness_grace_json == '{"interval_s": 10}'
 
     # ---- ibg_client_id ----
     # Derived from deployment_slug via the shared helper; non-zero,

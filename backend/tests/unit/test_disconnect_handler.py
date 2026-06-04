@@ -11,20 +11,29 @@ doesn't) at the expected moments.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
-from unittest.mock import AsyncMock
 
+import fakeredis.aioredis
 import pytest
 
+from msai.core.halt_keys import fleet_halt_key, halt_cause_key
 from msai.services.nautilus.disconnect_handler import IBDisconnectHandler
 
 
 def _build_redis() -> Any:
-    """Stub async Redis with the two methods the handler
-    actually calls. Records every set so tests can assert."""
-    redis = AsyncMock()
-    redis.set = AsyncMock(return_value=True)
-    return redis
+    """Real in-memory Redis (``fakeredis`` with the ``lua`` extra) so the
+    handler's atomic ``HALT_WRITE_LUA`` script runs for real and tests can
+    assert on the canonical keys it writes (PR 1b T5 swapped the write path
+    from ad-hoc ``:reason`` / ``:source`` SETs to the shared Lua script)."""
+    return fakeredis.aioredis.FakeRedis(decode_responses=False)
+
+
+async def _read_str(redis: Any, key: str) -> str | None:
+    raw = await redis.get(key)
+    if raw is None:
+        return None
+    return raw.decode() if isinstance(raw, bytes) else str(raw)
 
 
 @pytest.mark.asyncio
@@ -48,7 +57,7 @@ async def test_no_halt_when_always_connected() -> None:
 
     await asyncio.gather(handler.run(stop), stop_after())
 
-    redis.set.assert_not_called()
+    assert await redis.get(fleet_halt_key()) is None
 
 
 @pytest.mark.asyncio
@@ -80,7 +89,7 @@ async def test_no_halt_on_quick_reconnect() -> None:
     await asyncio.gather(handler.run(stop), flip_disconnect_then_reconnect(), stop_after())
 
     # No halt — the reconnect happened inside the grace window
-    redis.set.assert_not_called()
+    assert await redis.get(fleet_halt_key()) is None
 
 
 @pytest.mark.asyncio
@@ -101,14 +110,15 @@ async def test_halt_fires_when_grace_expires() -> None:
     # we don't need to set the stop event.
     await asyncio.wait_for(handler.run(stop), timeout=1.0)
 
-    # Halt flag was set
-    set_calls = redis.set.call_args_list
-    keys = [call.args[0] for call in set_calls]
-    assert "msai:risk:halt" in keys
-    assert "msai:risk:halt:reason" in keys
-    # Reason marks ib_disconnect
-    reason_call = next(call for call in set_calls if call.args[0] == "msai:risk:halt:reason")
-    assert reason_call.args[1] == "ib_disconnect"
+    # Halt latch was set.
+    assert await _read_str(redis, fleet_halt_key()) == "true"
+    # The CANONICAL fleet cause records ib_disconnect (PR 1b T5 — no longer the
+    # ad-hoc :reason / :source keys, which must NOT exist).
+    cause = json.loads((await redis.get(halt_cause_key("fleet"))).decode())
+    assert cause["reason"] == "ib_disconnect"
+    assert cause["deployment_id"] == "test"
+    assert await redis.get("msai:risk:halt:reason") is None
+    assert await redis.get("msai:risk:halt:source") is None
 
 
 @pytest.mark.asyncio
@@ -127,8 +137,9 @@ async def test_halt_includes_24h_ttl() -> None:
     stop = asyncio.Event()
     await asyncio.wait_for(handler.run(stop), timeout=1.0)
 
-    halt_call = next(call for call in redis.set.call_args_list if call.args[0] == "msai:risk:halt")
-    assert halt_call.kwargs.get("ex") == 86400
+    assert await _read_str(redis, fleet_halt_key()) == "true"
+    ttl = await redis.ttl(fleet_halt_key())
+    assert 86000 < ttl <= 86400
 
 
 @pytest.mark.asyncio
@@ -149,20 +160,16 @@ async def test_no_auto_resume_after_halt() -> None:
 
     await asyncio.wait_for(handler.run(stop), timeout=1.0)
 
-    # Halt fired
-    initial_set_count = redis.set.call_count
+    # Halt fired — latch is set.
+    assert await _read_str(redis, fleet_halt_key()) == "true"
 
-    # Now reconnect and try to keep running — but the loop
-    # has returned, so nothing happens. To prove it, simulate
-    # the reconnect and verify no DELETE on the halt key.
+    # Now reconnect and try to keep running — but the loop has returned, so
+    # nothing happens. The handler does NOT auto-clear the halt on reconnect.
     state["connected"] = True
     await asyncio.sleep(0.05)
 
-    # No additional Redis writes happened after the loop
-    # returned (it's one-shot)
-    assert redis.set.call_count == initial_set_count
-    # And specifically, no delete of the halt key was issued
-    redis.delete.assert_not_called()
+    # The latch is STILL set — recovery never clears it (resume is operator-only).
+    assert await _read_str(redis, fleet_halt_key()) == "true"
 
 
 @pytest.mark.asyncio
@@ -186,7 +193,7 @@ async def test_connection_check_exception_treated_as_disconnect() -> None:
 
     # The loop treated each failed probe as disconnected and
     # eventually fired the halt
-    assert any(call.args[0] == "msai:risk:halt" for call in redis.set.call_args_list)
+    assert await _read_str(redis, fleet_halt_key()) == "true"
 
 
 @pytest.mark.asyncio
@@ -217,25 +224,21 @@ async def test_on_halt_callback_invoked() -> None:
 
 @pytest.mark.asyncio
 async def test_redis_set_failure_retries_then_succeeds() -> None:
-    """Codex batch 10 P2 regression: previously a Redis SET
-    error swallowed silently and the halt was lost. The new
-    behavior retries up to 5 times. Verify the retry path
-    when the FIRST attempt fails but the SECOND succeeds.
+    """Codex batch 10 P2 regression: previously a Redis write error swallowed
+    silently and the halt was lost. The handler retries up to 5 times. PR 1b T5:
+    the write is now ONE atomic ``HALT_WRITE_LUA`` ``eval`` call per attempt — so
+    a first-attempt failure plus a second-attempt success is exactly 2 calls, and
+    the canonical cause lands.
     """
+    redis = _build_redis()
+    real_eval = redis.eval
     call_count = {"n": 0}
 
-    async def flaky_set(*args: Any, **kwargs: Any) -> bool:
+    async def flaky_eval(*args: Any, **kwargs: Any) -> Any:
         call_count["n"] += 1
-        # First attempt's first set call fails; everything
-        # after succeeds. The handler retries the WHOLE
-        # 3-key sequence on failure, so attempt 2 makes
-        # 3 fresh set calls.
         if call_count["n"] == 1:
             raise RuntimeError("redis blip")
-        return True
-
-    redis = AsyncMock()
-    redis.set = flaky_set
+        return await real_eval(*args, **kwargs)
 
     callback_fired = False
 
@@ -243,56 +246,12 @@ async def test_redis_set_failure_retries_then_succeeds() -> None:
         nonlocal callback_fired
         callback_fired = True
 
-    handler = IBDisconnectHandler(
-        redis=redis,
-        is_connected=lambda: False,
-        deployment_slug="test",
-        grace_seconds=0.01,
-        poll_interval_s=0.005,
-        on_halt=on_halt,
-    )
-    stop = asyncio.Event()
-    await asyncio.wait_for(handler.run(stop), timeout=5.0)
-
-    # Attempt 1 = 1 failed call; attempt 2 = 3 successful
-    # calls (one for each halt key)
-    assert call_count["n"] == 4
-    assert callback_fired is True
-
-
-@pytest.mark.asyncio
-async def test_redis_set_all_retries_exhaust_still_fires_callback() -> None:
-    """Codex batch 10 P3 iter 2: the previous test only
-    exercised the eventual-success path. This one exercises
-    the EXHAUSTED path: every Redis SET raises, the handler
-    retries _HALT_SET_MAX_ATTEMPTS times, gives up, and the
-    on_halt callback STILL fires so a flatten hook runs
-    regardless of Redis health.
-    """
-    from msai.services.nautilus.disconnect_handler import _HALT_SET_MAX_ATTEMPTS
-
-    call_count = {"n": 0}
-
-    async def always_fails(*args: Any, **kwargs: Any) -> bool:
-        call_count["n"] += 1
-        raise RuntimeError("redis dead")
-
-    redis = AsyncMock()
-    redis.set = always_fails
-
-    callback_fired = False
-
-    async def on_halt() -> None:
-        nonlocal callback_fired
-        callback_fired = True
-
-    # Tighten the backoff so the test runs in ms instead of
-    # seconds
     import msai.services.nautilus.disconnect_handler as dh_mod
 
-    real_backoff = dh_mod._HALT_SET_BACKOFF_S
-    dh_mod._HALT_SET_BACKOFF_S = 0.001  # type: ignore[assignment]
+    real_backoff = dh_mod.HALT_SET_BACKOFF_S
+    dh_mod.HALT_SET_BACKOFF_S = 0.001  # type: ignore[assignment]
     try:
+        redis.eval = flaky_eval  # type: ignore[assignment]
         handler = IBDisconnectHandler(
             redis=redis,
             is_connected=lambda: False,
@@ -304,14 +263,68 @@ async def test_redis_set_all_retries_exhaust_still_fires_callback() -> None:
         stop = asyncio.Event()
         await asyncio.wait_for(handler.run(stop), timeout=5.0)
     finally:
-        dh_mod._HALT_SET_BACKOFF_S = real_backoff  # type: ignore[assignment]
+        dh_mod.HALT_SET_BACKOFF_S = real_backoff  # type: ignore[assignment]
+        redis.eval = real_eval  # type: ignore[assignment]
 
-    # Each attempt makes ONE set call (the first one always
-    # raises, so the remaining 2 of the 3-key sequence
-    # never execute). Total = max attempts.
-    assert call_count["n"] == _HALT_SET_MAX_ATTEMPTS
-    # Callback STILL fired despite all retries failing
+    # Attempt 1 raised; attempt 2 succeeded — exactly 2 eval calls.
+    assert call_count["n"] == 2
     assert callback_fired is True
+    assert await _read_str(redis, fleet_halt_key()) == "true"
+    cause = json.loads((await redis.get(halt_cause_key("fleet"))).decode())
+    assert cause["reason"] == "ib_disconnect"
+
+
+@pytest.mark.asyncio
+async def test_redis_set_all_retries_exhaust_still_fires_callback() -> None:
+    """Codex batch 10 P3 iter 2: exercises the EXHAUSTED path — every halt write
+    raises, the handler retries HALT_SET_MAX_ATTEMPTS times, gives up, and the
+    on_halt callback STILL fires so a flatten hook runs regardless of Redis
+    health. PR 1b T5: the write is one atomic ``eval`` per attempt, so the call
+    count equals max attempts and nothing is written.
+    """
+    from msai.services.nautilus.disconnect_handler import HALT_SET_MAX_ATTEMPTS
+
+    redis = _build_redis()
+    real_eval = redis.eval
+    call_count = {"n": 0}
+
+    async def always_fails(*args: Any, **kwargs: Any) -> Any:
+        call_count["n"] += 1
+        raise RuntimeError("redis dead")
+
+    callback_fired = False
+
+    async def on_halt() -> None:
+        nonlocal callback_fired
+        callback_fired = True
+
+    # Tighten the backoff so the test runs in ms instead of seconds.
+    import msai.services.nautilus.disconnect_handler as dh_mod
+
+    real_backoff = dh_mod.HALT_SET_BACKOFF_S
+    dh_mod.HALT_SET_BACKOFF_S = 0.001  # type: ignore[assignment]
+    try:
+        redis.eval = always_fails  # type: ignore[assignment]
+        handler = IBDisconnectHandler(
+            redis=redis,
+            is_connected=lambda: False,
+            deployment_slug="test",
+            grace_seconds=0.01,
+            poll_interval_s=0.005,
+            on_halt=on_halt,
+        )
+        stop = asyncio.Event()
+        await asyncio.wait_for(handler.run(stop), timeout=5.0)
+    finally:
+        dh_mod.HALT_SET_BACKOFF_S = real_backoff  # type: ignore[assignment]
+        redis.eval = real_eval  # type: ignore[assignment]
+
+    # One eval per attempt, all failing → exactly max attempts.
+    assert call_count["n"] == HALT_SET_MAX_ATTEMPTS
+    # Callback STILL fired despite all retries failing.
+    assert callback_fired is True
+    # Nothing was written.
+    assert await redis.get(fleet_halt_key()) is None
 
 
 @pytest.mark.asyncio

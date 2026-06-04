@@ -26,10 +26,18 @@ from msai.core.audit import log_audit
 from msai.core.auth import get_current_user, resolve_user_id
 from msai.core.database import get_db
 from msai.core.halt_keys import (
+    HALT_TTL_SECONDS,
+    HALT_WRITE_LUA,
+    RESUME_CLEAR_LUA,
+    VERDICT_KEY_SUFFIX,
     HaltCause,
     account_halt_key,
+    data_freshness_key,
+    data_freshness_manifest_key,
     fleet_halt_key,
+    fleet_halt_write_args,
     halt_cause_key,
+    reconciled_key,
 )
 from msai.core.logging import get_logger
 from msai.models.broker_account import BrokerAccount
@@ -40,6 +48,7 @@ from msai.models.live_portfolio_revision import LivePortfolioRevision
 from msai.models.live_portfolio_revision_strategy import LivePortfolioRevisionStrategy
 from msai.models.strategy import Strategy
 from msai.schemas.live import (
+    DataHealthResponse,
     LiveDeploymentInfo,
     LiveDeploymentStatusResponse,
     LiveKillAllResponse,
@@ -50,7 +59,9 @@ from msai.schemas.live import (
     LiveStopRequest,
     LiveTradesResponse,
     PortfolioStartRequest,
+    ResumeVerifiedPreconditions,
 )
+from msai.services.live.broker_account_service import ACTIVE_DEPLOYMENT_STATUSES
 from msai.services.live.deployment_account_resolver import (
     AccountNotResolvable,
     lock_and_assert_account_active,
@@ -2647,38 +2658,35 @@ async def live_kill_all(
     # (and PR 1b's data-stale auto-halt) can distinguish a manual
     # /kill-all from an automated halt.
     #
-    # F9 fix (Codex iter 2 P1 / silent-failure-hunter F3): batch all
-    # halt-set writes into a single Redis transaction (MULTI/EXEC) so
-    # an emergency-stop endpoint cannot leave Redis in a partial state.
-    # The prior implementation issued 5 sequential ``await SET`` calls;
-    # a connection drop mid-sequence would set the latch but skip the
-    # cause-companion (or vice-versa), leaving operators with a
-    # half-finished kill switch. With a transactional pipeline, either
-    # ALL keys are set or NONE — and any RedisError propagates as a 5xx
-    # so the operator sees the failure instead of a green response.
+    # F9 fix (Codex iter 2 P1 / silent-failure-hunter F3): all halt-set
+    # writes are atomic (all-or-nothing) so an emergency-stop endpoint
+    # cannot leave Redis in a partial state. The prior implementation
+    # issued 5 sequential ``await SET`` calls; a connection drop
+    # mid-sequence would set the latch but skip the cause-companion (or
+    # vice-versa), leaving operators with a half-finished kill switch.
+    #
+    # PR 1b T6: switched from a MULTI/EXEC pipeline that UNCONDITIONALLY
+    # SET the cause key to the shared ``HALT_WRITE_LUA`` (one atomic
+    # round-trip). The pipeline's blind cause SET silently ERASED a
+    # data-stale auto-halt's attribution if the operator hit /kill-all
+    # while a data-stale halt was already latched. ``HALT_WRITE_LUA``
+    # writes the cause ONLY-IF-ABSENT (``SET ... NX``) so a pre-existing
+    # auto-halt cause is PRESERVED, and ALWAYS appends this manual cause
+    # onto the capped ``:history`` list so the kill-all is still recorded.
+    # Any RedisError propagates as a 5xx so the operator sees the failure
+    # instead of a green response.
     cause_payload = {
         "reason": HaltCause.FLEET_EMERGENCY.value,
         "detected_at": halt_set_at.isoformat(),
         "source": str(user_id) if user_id else "operator",
     }
-    async with bus._redis.pipeline(transaction=True) as _halt_pipe:  # noqa: SLF001
-        _halt_pipe.set(_HALT_KEY, "true", ex=86400)
-        _halt_pipe.set(
-            f"{_HALT_KEY}:set_by",
-            str(user_id) if user_id else "unknown",
-            ex=86400,
-        )
-        _halt_pipe.set(
-            f"{_HALT_KEY}:set_at",
-            halt_set_at.isoformat(),
-            ex=86400,
-        )
-        _halt_pipe.set(
-            halt_cause_key("fleet"),
-            json.dumps(cause_payload),
-            ex=86400,
-        )
-        await _halt_pipe.execute()
+    _halt_keys, _halt_argv = fleet_halt_write_args(
+        set_by=str(user_id) if user_id else "unknown",
+        set_at=halt_set_at.isoformat(),
+        cause_json=json.dumps(cause_payload),
+        ttl_s=HALT_TTL_SECONDS,
+    )
+    await bus._redis.eval(HALT_WRITE_LUA, len(_halt_keys), *_halt_keys, *_halt_argv)  # type: ignore[misc]  # noqa: SLF001
 
     # Layer 3: query active live_node_processes rows and
     # publish a stop command for each. Use the explicit
@@ -3163,6 +3171,37 @@ async def live_drain_account(
     return body
 
 
+def _resume_blocked_data_stale(message: str) -> NoReturn:
+    """Raise a 409 ``RESUME_BLOCKED_DATA_STALE`` (PR 1b T6 fail-closed gate).
+
+    Uses the project error envelope (``{error: {code, message}}``) and
+    ``HTTPException`` so FastAPI renders the 409 — the fleet halt latch stays
+    set and NOTHING was cleared."""
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"error": {"code": "RESUME_BLOCKED_DATA_STALE", "message": message}},
+    )
+
+
+def _resume_blocked_reconciliation(deployment_id: str) -> NoReturn:
+    """Raise a 409 ``RESUME_BLOCKED_RECONCILIATION`` (PR 1b T6 fail-closed gate).
+
+    An active deployment is missing its reconciliation marker — the node is not
+    proven to be genuinely running, so resume refuses and clears nothing."""
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "error": {
+                "code": "RESUME_BLOCKED_RECONCILIATION",
+                "message": (
+                    f"deployment {deployment_id} has no reconciliation marker — "
+                    "node not proven reconciled; refusing to resume"
+                ),
+            }
+        },
+    )
+
+
 @router.post("/resume")
 async def live_resume(
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
@@ -3184,16 +3223,180 @@ async def live_resume(
     individually via ``/start`` (which is the right policy:
     after a kill switch the operator should review the
     state before re-deploying).
+
+    PR 1b T6 — FAIL-CLOSED preconditions. Before clearing ANYTHING the
+    route verifies, for every ACTIVE deployment, that (a) the data-stale
+    monitor's required-feed manifest is present (an ABSENT manifest means
+    the monitor never started / its node is gone → refuse), (b) every
+    manifest feed has a present, TTL-alive freshness row whose verdict is
+    ``warm`` (a ``pending`` feed — no data observed yet within startup grace —
+    blocks with a distinct "no data observed yet" message; ``stale``/absent
+    blocks too), and (c) the node still carries a reconciliation marker. A
+    failure returns 409 (``RESUME_BLOCKED_DATA_STALE`` /
+    ``RESUME_BLOCKED_RECONCILIATION``) and clears NOTHING. The success
+    path then re-verifies the SAME preconditions atomically inside
+    ``RESUME_CLEAR_LUA`` (closing the monitor-death race between this
+    probe and the clear) before deleting the halt keyset. An EMPTY
+    manifest (legacy / non-Databento node) is vacuously warm for
+    freshness but still requires the reconciliation marker; zero active
+    deployments is a vacuous pass.
     """
     user_id = await _resolve_user_id(db, claims)
 
-    deleted = await bus._redis.delete(_HALT_KEY)  # noqa: SLF001
-    await bus._redis.delete(f"{_HALT_KEY}:set_by")  # noqa: SLF001
-    await bus._redis.delete(f"{_HALT_KEY}:set_at")  # noqa: SLF001
-    # Codex iter 5 P2-1: clear the halt-cause companion key written by
-    # /kill-all so post-resume readers don't see stale fleet_emergency
-    # metadata while starts are re-enabled.
-    await bus._redis.delete(halt_cause_key("fleet"))  # noqa: SLF001
+    # (1) Load ACTIVE deployments using the canonical 5-tuple (incl.
+    # 'stopping') — a node mid-teardown still holds IB positions.
+    active_deployments = (
+        (
+            await db.execute(
+                select(LiveDeployment).where(LiveDeployment.status.in_(ACTIVE_DEPLOYMENT_STATUSES))
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # Probe each active deployment's freshness manifest + per-feed verdicts +
+    # reconciliation marker. Build the Lua key lists as we go so the atomic
+    # clear re-verifies EXACTLY what passed here.
+    manifest_keys: list[str] = []
+    expected_manifests: list[str] = []
+    verdict_keys: list[str] = []
+    reconciled_keys: list[str] = []
+    feeds_verified: list[str] = []
+    reconciled_verified: list[str] = []
+
+    for dep in active_deployments:
+        dep_id = str(dep.id)
+        manifest_key = data_freshness_manifest_key(dep_id)
+        raw_manifest = await bus._redis.get(manifest_key)  # noqa: SLF001
+        if raw_manifest is None:
+            # ABSENT manifest → monitor never started (or node gone + TTL
+            # lapsed). Fail-closed: we cannot prove the feeds are warm.
+            return _resume_blocked_data_stale(
+                f"deployment {dep_id} has no data-freshness manifest "
+                "(monitor not running) — cannot prove feeds are warm"
+            )
+        try:
+            manifest = json.loads(raw_manifest)
+        except (ValueError, TypeError):
+            return _resume_blocked_data_stale(
+                f"deployment {dep_id} freshness manifest is malformed"
+            )
+        # Fail-closed shape validation: a non-list manifest, or any entry that
+        # is not a dict carrying both 'dataset' and 'feed', is treated as a
+        # malformed manifest and BLOCKS the resume (409) — never a 500. We
+        # cannot prove the listed feeds are warm if we can't read their shape.
+        if not isinstance(manifest, list) or not all(
+            isinstance(entry, dict)
+            and isinstance(entry.get("dataset"), str)
+            and entry.get("dataset")
+            and isinstance(entry.get("feed"), str)
+            and entry.get("feed")
+            for entry in manifest
+        ):
+            return _resume_blocked_data_stale(
+                f"deployment {dep_id} freshness manifest is malformed"
+            )
+
+        manifest_keys.append(manifest_key)
+        # Pin the EXACT raw value Python validated (content-pin closing the
+        # changed-universe TOCTOU). ``bus._redis`` decodes responses, so
+        # ``raw_manifest`` is the str the monitor wrote; coerce bytes defensively
+        # in case a future bus uses a byte client. The Lua compares this to the
+        # CURRENT manifest value before clearing on the verdict-key list we
+        # derived FROM it.
+        expected_manifests.append(
+            raw_manifest.decode() if isinstance(raw_manifest, bytes) else raw_manifest
+        )
+        reconciled_marker = reconciled_key(dep_id)
+        reconciled_keys.append(reconciled_marker)
+
+        # (3) reconciliation marker MUST be present for every active node.
+        if not await bus._redis.exists(reconciled_marker):  # noqa: SLF001
+            return _resume_blocked_reconciliation(dep_id)
+        reconciled_verified.append(dep_id)
+
+        # (2) Non-empty manifest → every listed feed must have a present
+        # (TTL-alive) verdict row equal to 'warm'. EMPTY manifest → vacuous.
+        # PR 1b T6 / Codex iter-2 P1: 'pending' (no data observed yet, within
+        # startup grace) is BLOCKING — distinct from stale/absent so the
+        # operator sees that the feed simply hasn't delivered any data yet
+        # (e.g. a node restart DURING an ongoing outage). 'warm' is the ONLY
+        # resumable verdict; the same 409 RESUME_BLOCKED_DATA_STALE code covers
+        # both, but the message names which.
+        stale_feeds: list[str] = []
+        pending_feeds: list[str] = []
+        for entry in manifest:
+            dataset = entry["dataset"]
+            native_bar_type = entry["feed"]
+            feed_label = f"{dep_id}:{dataset}:{native_bar_type}"
+            verdict_key = data_freshness_key(dep_id, dataset, native_bar_type) + VERDICT_KEY_SUFFIX
+            verdict = await bus._redis.get(verdict_key)  # noqa: SLF001
+            if verdict == "pending":
+                pending_feeds.append(feed_label)
+                continue
+            if verdict is None or verdict != "warm":
+                stale_feeds.append(feed_label)
+                continue
+            verdict_keys.append(verdict_key)
+            feeds_verified.append(feed_label)
+        if pending_feeds:
+            return _resume_blocked_data_stale(
+                "refusing to resume — no data observed yet (within startup "
+                "grace) for feed(s): " + ", ".join(pending_feeds)
+            )
+        if stale_feeds:
+            return _resume_blocked_data_stale(
+                "refusing to resume — stale/absent feed(s): " + ", ".join(stale_feeds)
+            )
+
+    # Success-path CLEAR: re-verify the preconditions atomically and delete the
+    # halt keyset only if every check still holds. ``delete_keys`` are the halt
+    # latch + companions + cause + history + legacy transition-compat keys.
+    delete_keys = [
+        _HALT_KEY,
+        f"{_HALT_KEY}:set_by",
+        f"{_HALT_KEY}:set_at",
+        halt_cause_key("fleet"),
+        f"{halt_cause_key('fleet')}:history",
+        # Legacy transition-compat keys a pre-T5 node left on the latch key
+        # itself (``disconnect_handler._HALT_REASON_KEY`` /
+        # ``_HALT_SOURCE_KEY`` = ``msai:risk:halt:reason`` / ``:source``).
+        # Derive from the fleet latch key — NOT ``halt_cause_key`` (which is
+        # the ``:cause`` namespace) — so the clear actually targets the keys
+        # those nodes wrote.
+        f"{_HALT_KEY}:reason",
+        f"{_HALT_KEY}:source",
+    ]
+    lua_keys = [*manifest_keys, *verdict_keys, *reconciled_keys, *delete_keys]
+    # ARGV: 3 counts, then the expected raw manifest VALUE per manifest key (in
+    # KEYS order) — the content-pin closing the changed-universe TOCTOU.
+    lua_argv = [
+        str(len(manifest_keys)),
+        str(len(verdict_keys)),
+        str(len(reconciled_keys)),
+        *expected_manifests,
+    ]
+    result = await bus._redis.eval(  # type: ignore[misc]  # noqa: SLF001
+        RESUME_CLEAR_LUA, len(lua_keys), *lua_keys, *lua_argv
+    )
+    result_str = result.decode() if isinstance(result, bytes) else str(result)
+    if result_str != "OK":
+        # A precondition re-staled between the Python probe and the clear
+        # (monitor-death race / feed flipped to stale / manifest feed universe
+        # changed). Nothing was deleted.
+        reason, _, offending = result_str.partition(":")
+        if reason == "RECONCILED_MISSING":
+            return _resume_blocked_reconciliation(offending or "(unknown)")
+        if reason == "MANIFEST_CHANGED":
+            return _resume_blocked_data_stale(
+                "refusing to resume — manifest changed during resume "
+                f"(feed universe differs from the probed value) on key {offending}; "
+                "the monitor re-published a different required-feed set — retry resume"
+            )
+        return _resume_blocked_data_stale(
+            f"refusing to resume — precondition re-check failed ({reason}) on key {offending}"
+        )
 
     # PR #65 Codex P2 round-4: clear all `stop_unknown:*` markers on
     # /resume. After the operator has verified IB-portal positions
@@ -3214,14 +3417,29 @@ async def live_resume(
         action="live_resume",
         resource_type="live_deployment",
         details={
-            "halt_flag_was_set": bool(deleted),
+            "active_deployments_checked": len(active_deployments),
+            "feeds_verified": feeds_verified,
+            "reconciled_verified": reconciled_verified,
             "stop_unknown_cleared": unknown_cleared,
         },
     )
 
-    log.warning("kill_switch_resumed", resumed_by=str(user_id))
+    log.warning(
+        "kill_switch_resumed",
+        resumed_by=str(user_id),
+        active_deployments_checked=len(active_deployments),
+        feeds_verified=len(feeds_verified),
+    )
 
-    return LiveResumeResponse(resumed=True)
+    return LiveResumeResponse(
+        resumed=True,
+        resumed_by=str(user_id) if user_id else None,
+        verified=ResumeVerifiedPreconditions(
+            active_deployments_checked=len(active_deployments),
+            feeds_verified=feeds_verified,
+            reconciled_verified=reconciled_verified,
+        ),
+    )
 
 
 @router.post("/resume/{account_id}", response_model=None)
@@ -3272,6 +3490,31 @@ async def live_resume_account(
     )
 
     return {"resumed": True, "account_id": account_id, "keys_deleted": deleted_count}
+
+
+@router.get("/data-health", response_model=DataHealthResponse)
+async def live_data_health(
+    claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+    bus: LiveCommandBus = Depends(get_command_bus),  # noqa: B008
+) -> DataHealthResponse:
+    """Operator read-only window onto the in-node data-stale monitor (PR 1b T7).
+
+    Built MANIFEST-FIRST per active deployment (same ``ACTIVE_DEPLOYMENT_STATUSES``
+    + manifest reader as ``/resume``): returns every required Databento feed with
+    its freshness row (account/node/deployment/dataset/feed/symbol + last_event_ts,
+    phase, grace_s, verdict, published_at). A manifest feed with NO live freshness
+    row is reported with a derived ``missing`` verdict — never silently absent. An
+    empty fleet yields ``feeds: []`` with a 200. The fleet halt latch + parsed
+    halt-cause JSON are included for operator context.
+
+    This shares ``hydrate_data_health_metrics`` with the ``/metrics`` scrape path,
+    so a call here also refreshes the labeled feed-health gauges. A Redis/DB blip
+    degrades to whatever the reader produced — it never 500s the operator."""
+    from msai.services.observability.data_health import hydrate_data_health_metrics
+
+    snapshot = await hydrate_data_health_metrics(db, bus._redis)  # noqa: SLF001
+    return DataHealthResponse(**snapshot.as_dict())
 
 
 @router.get("/status")
