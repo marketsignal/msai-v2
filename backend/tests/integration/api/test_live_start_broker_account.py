@@ -2417,3 +2417,170 @@ async def test_warm_restart_no_new_row_times_out_honest_504(
         dep = await session.get(LiveDeployment, dep_id)
         assert dep is not None
         assert dep.status == "failed"
+
+
+async def _seed_warm_restart_prior_run_stopping(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> tuple[UUID, UUID, UUID, UUID]:
+    """Variant of :func:`_seed_warm_restart_prior_run` whose prior-run node row is
+    seeded ``stopping`` (a PRE-terminal draining row of an EARLIER attempt) rather
+    than ``stopped``. The deployment row stays ``stopped`` (so the handler proceeds
+    exactly as in the other warm-restart tests). The ``stopping`` node row does NOT
+    short-circuit the active-process dedup at live.py (it checks only
+    ``("starting","building","ready","running")``), so the handler reaches the
+    pre-publish snapshot + poll. Returns ``(rev_id, dep_id, acct_id, node_row_id)``
+    — the node-row id lets the fake supervisor transition it to ``stopped``."""
+    async with session_factory() as session:
+        acct = await _seed_broker_account(session, ib_account_id=_BOUND_ACCOUNTS[0])
+        user, strategy, revision, _member = await _seed_deployable_revision(
+            session, entra_id="test-operator"
+        )
+        identity = derive_portfolio_deployment_identity(
+            user_id=user.id,
+            portfolio_revision_id=revision.id,
+            account_id=_BOUND_ACCOUNTS[0],
+            paper_trading=True,
+            ib_login_key=_LOGIN,
+            user_sub="test-operator",
+        )
+        slug = generate_deployment_slug()
+        dep = LiveDeployment(
+            id=uuid4(),
+            strategy_id=strategy.id,
+            status="stopped",
+            paper_trading=True,
+            started_by=user.id,
+            deployment_slug=slug,
+            identity_signature=identity.signature(),
+            trader_id=derive_trader_id(slug),
+            strategy_id_full=derive_strategy_id_full(strategy.strategy_class, slug),
+            account_id=_BOUND_ACCOUNTS[0],
+            ib_login_key=_LOGIN,
+            portfolio_revision_id=revision.id,
+            message_bus_stream=derive_message_bus_stream(slug),
+            broker_account_id=None,
+        )
+        session.add(dep)
+        node_row_id = uuid4()
+        # An EARLIER attempt's node row still DRAINING (``stopping``). It can only
+        # become ``stopped`` — it is PRE-terminal history of a prior attempt and
+        # must stay EXCLUDED from this attempt's poll (the dedup check skips
+        # ``stopping``, so without exclusion its stopped transition would be
+        # mistaken for this attempt's outcome → the original false-503 bug).
+        session.add(
+            LiveNodeProcess(
+                id=node_row_id,
+                deployment_id=dep.id,
+                gateway_session_key="msai-paper-primary:localhost:4002",
+                pid=None,
+                host="prior-run-draining",
+                started_at=datetime.now(UTC),
+                last_heartbeat_at=datetime.now(UTC),
+                status="stopping",
+                failure_kind=None,
+            )
+        )
+        cand = (
+            await session.execute(
+                select(GraduationCandidate).where(GraduationCandidate.strategy_id == strategy.id)
+            )
+        ).scalar_one()
+        cand.stage = "live_running"
+        cand.deployment_id = dep.id
+        await session.commit()
+        return revision.id, dep.id, acct.id, node_row_id
+
+
+async def _fake_supervisor_stopping_to_stopped_after_publish(
+    session_factory: async_sessionmaker[AsyncSession],
+    redis_text: AsyncRedis,
+    stream: str,
+    baseline_len: int,
+    node_row_id: UUID,
+) -> None:
+    """Mirror an old draining node FINISHING its stop AFTER this attempt's START is
+    observed on the per-account stream: UPDATE the existing ``stopping`` node row to
+    ``stopped`` and insert NOTHING new. The publish-gated wait (same as
+    :func:`_fake_supervisor_insert_after_publish`) guarantees the endpoint's
+    pre-publish snapshot was already captured, so this stopped transition is the
+    classic 503-but-spawned trap: with the snapshot narrowed to terminal/stopping
+    rows the old row is excluded and the poll honestly times out (504)."""
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + 10.0
+    while loop.time() < deadline:
+        if await redis_text.xlen(stream) > baseline_len:
+            break
+        await asyncio.sleep(0.02)
+    else:
+        return  # START never appeared — let the endpoint hit its own timeout.
+    async with session_factory() as session, session.begin():
+        node = await session.get(LiveNodeProcess, node_row_id)
+        if node is not None:
+            node.status = "stopped"
+
+
+@pytest.mark.asyncio
+async def test_warm_restart_old_stopping_row_excluded_honest_504(
+    client: tuple[httpx.AsyncClient, _StubStore, _ResolveSpy],
+    redis_text: AsyncRedis,
+    bus: LiveCommandBus,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR #90 review P2 (chatgpt-codex-connector) regression guard: a PRIOR
+    attempt's node row left ``stopping`` (PRE-terminal draining history) must stay
+    EXCLUDED from this attempt's poll even after it transitions to ``stopped``.
+
+    The active-process dedup at live.py checks only
+    ``("starting","building","ready","running")`` — it does NOT include
+    ``stopping`` — so a ``stopping`` row does not short-circuit the handler; it
+    reaches the pre-publish snapshot + poll. If the snapshot were narrowed to only
+    ``("failed","stopped")`` (the bot's naive suggestion), the old ``stopping`` row
+    would NOT be snapshotted, and its later stopped transition would be returned as
+    THIS attempt's outcome — resurrecting the original false-503 bug. The correct
+    narrowing keeps ``stopping`` in the snapshot, so the poll honestly times out
+    (504), not a false 503 ``unknown failure``.
+
+    This test passes against BOTH the current (snapshot=all rows) code AND the
+    narrowed code — it pins the stopping-exclusion so the narrowing cannot later be
+    over-narrowed to terminal-only."""
+    ac, _store, _spy = client
+    # Run the REAL hybrid-scoped poll (the ``client`` fixture stubs it).
+    monkeypatch.setattr(live_module, "_poll_for_terminal", _REAL_POLL_FOR_TERMINAL)
+    monkeypatch.setattr(live_module, "START_POLL_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(live_module, "START_POLL_INTERVAL_S", 0.05)
+
+    rev_id, dep_id, acct_id, node_row_id = await _seed_warm_restart_prior_run_stopping(
+        session_factory
+    )
+
+    stream = bus.account_stream(_BOUND_ACCOUNTS[0])
+    baseline = await redis_text.xlen(stream)
+
+    # The old draining node finishes its stop (stopping → stopped) AFTER the START
+    # is published, and inserts NOTHING new — modelling a concurrent prior-attempt
+    # drain landing during this attempt's poll window.
+    supervisor = asyncio.create_task(
+        _fake_supervisor_stopping_to_stopped_after_publish(
+            session_factory,
+            redis_text,
+            stream,
+            baseline,
+            node_row_id,
+        )
+    )
+
+    key = f"sw-stopping-{uuid4().hex}"
+    body = {"portfolio_revision_id": str(rev_id), "broker_account_id": str(acct_id)}
+    try:
+        resp = await ac.post(
+            "/api/v1/live/start-portfolio", json=body, headers={"Idempotency-Key": key}
+        )
+    finally:
+        await supervisor
+
+    # The old stopping→stopped row is EXCLUDED, so the poll never sees a fresh
+    # outcome → honest, non-cacheable 504 (NOT the false 503 "unknown failure").
+    assert resp.status_code == 504, resp.text
+    assert "unknown failure" not in resp.text
+    assert resp.json().get("failure_kind") != "unknown"

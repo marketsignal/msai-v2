@@ -20,8 +20,9 @@ Deterministic 3/3 because the stale row always exists at poll start and the supe
 
 ## Solution (approach A′ — hybrid attempt-scoped poll, contrarian-validated)
 
-- `start_portfolio` snapshots the deployment's **existing node-row ids** (`prior_node_row_ids`) between `db.commit()` and `bus.publish_start`.
+- `start_portfolio` snapshots the deployment's **existing terminal/stopping node-row ids** (`prior_node_row_ids`) between `db.commit()` and `bus.publish_start`.
 - `_poll_for_terminal` gains `exclude_terminal_row_ids`: **terminal** rows count only if their id is NOT in the snapshot; **ready/running rows count unconditionally** — the partial unique index `uq_live_node_processes_active_deployment` guarantees at most one active row, and terminal rows never re-activate, so an active row IS the current node even if it predates the snapshot (concurrent-START case).
+- PR #90 review refinement: the snapshot is narrowed to `("failed","stopped","stopping")` rather than every existing row, so raced-in active rows (`starting`/`building`/`ready`/`running` inserted by a concurrent START between the dedup check and the snapshot) stay observable and report their real `failure_kind` if they fail; `stopping` stays excluded because the active-process dedup check skips it, so an old draining node's `stopped` transition would otherwise be mistaken for this attempt's outcome.
 - Exact id-set semantics — no clocks/timestamps (a `created_at > max(created_at)` marker has no tie-breaker; plan-review caught this).
 - `/stop` and `/drain` call sites pass no snapshot → behavior unchanged. Supervisor untouched; no schema change.
 - Sibling fixes shipped in the same branch: a latent `MissingGreenlet` 500 masking the honest 504 (the poll's per-iteration `db.rollback()` expires ORM attributes even with `expire_on_commit=False` — rollback always expires; use the plain `deployment_id` local), and `portfolio_revision_id` exposed on both live-status responses (operators could not rediscover the revision id needed to redeploy — found by verify-e2e as a broken sanctioned path).

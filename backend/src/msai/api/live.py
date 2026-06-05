@@ -312,7 +312,9 @@ async def _poll_for_terminal(
 
     ``exclude_terminal_row_ids`` (fix/start-portfolio-503-but-spawned —
     2026-06-05 LVP drill): the caller's pre-publish snapshot of the
-    deployment's EXISTING row ids. When provided, TERMINAL rows count
+    deployment's EXISTING terminal/stopping row ids (PR #90 review P2:
+    the caller narrows the snapshot to ("failed","stopped","stopping")
+    so raced-in active rows stay observable). When provided, TERMINAL rows count
     only if their id is NOT in the snapshot, so a warm restart's poll
     can never mistake the PREVIOUS run's stopped/failed row for this
     attempt's outcome (every outcome of an attempt lands on a NEW
@@ -2034,16 +2036,39 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
                 )
             await db.commit()
             # fix/start-portfolio-503-but-spawned (LVP drill 2026-06-05): snapshot
-            # the deployment's EXISTING node-row ids BEFORE publishing the START.
-            # Every outcome of this attempt lands on a NEW Phase-A-inserted row
-            # (fleet_router.py Phase A); the poll below uses this snapshot to
-            # ignore stale terminal rows — the source of the false cacheable
-            # 503 "unknown failure" returned while the spawn actually succeeded.
+            # the deployment's EXISTING terminal/stopping node-row ids BEFORE
+            # publishing the START. Every outcome of this attempt lands on a NEW
+            # Phase-A-inserted row (fleet_router.py Phase A); the poll below uses
+            # this snapshot to ignore stale rows — the source of the false
+            # cacheable 503 "unknown failure" returned while the spawn actually
+            # succeeded.
+            #
+            # PR #90 review P2 (chatgpt-codex-connector): the snapshot is NARROWED
+            # to rows whose status is ("failed","stopped","stopping") — NOT every
+            # existing row. The bot suggested "snapshot only terminal rows"; that
+            # alone is WRONG, hence the explicit ``stopping`` inclusion:
+            #   - ``failed``/``stopped`` rows are HISTORY (the original 503-but-
+            #     spawned bug) — exclude them.
+            #   - ``stopping`` rows are PRE-terminal history of a PRIOR attempt
+            #     that can ONLY become ``stopped``. They MUST stay excluded
+            #     because the active-process dedup check above checks only
+            #     ("starting","building","ready","running") — it does NOT include
+            #     ``stopping`` — so the handler proceeds past an old draining node.
+            #     Without exclusion, that old node's stopped transition during this
+            #     poll would be returned as THIS attempt's outcome and resurrect
+            #     the original false-503 bug.
+            #   - Rows in starting/building/ready/running at snapshot time can only
+            #     be raced-in CURRENT rows (a pre-existing active row would have
+            #     short-circuited at the dedup check, and terminal rows never
+            #     re-activate), so they are deliberately NOT snapshotted — they
+            #     stay observable. If such a raced-in row later FAILS, its REAL
+            #     ``failure_kind`` is reported instead of a misleading 504.
             prior_node_row_ids = frozenset(
                 (
                     await db.execute(
                         select(LiveNodeProcess.id).where(
-                            LiveNodeProcess.deployment_id == deployment.id
+                            LiveNodeProcess.deployment_id == deployment.id,
+                            LiveNodeProcess.status.in_(("failed", "stopped", "stopping")),
                         )
                     )
                 )
