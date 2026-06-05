@@ -299,7 +299,7 @@ All API routes are versioned under `/api/v1/` (see `.claude/rules/api-design.md`
 
 1. `curl -sf http://localhost:8800/health` — if it fails, start the stack: `docker compose -f docker-compose.dev.yml up -d`.
 2. Confirm the UI responds at `http://localhost:3300` (only if UI use cases are in scope).
-3. For live-trading use cases: confirm IB Gateway is reachable (paper account `DU...` on port 4004 — socat proxy to internal 4002; live account on 4003 — socat to internal 4001) — see `.claude/rules/nautilus.md` gotcha #6.
+3. For live-trading use cases: confirm IB Gateway is reachable for the live test account (LVP locally — `lvp` gateway, port 4003, socat to internal 4001; `GET /api/v1/account/health` → `gateway_connected:true`) — see `.claude/rules/nautilus.md` gotcha #6. (Paper `DU…`/4004 is unprovisioned and not used — operator decision 2026-06-05; see "Live-trading safety rails" below.)
 
 **Auth.** The app uses Azure Entra ID (MSAL on the frontend, PyJWT on the backend). E2E runs should authenticate via the documented login flow OR use a dev-mode bypass token if one is configured — never by forging JWTs or reading secrets from disk.
 
@@ -318,7 +318,7 @@ All API routes are versioned under `/api/v1/` (see `.claude/rules/api-design.md`
 
 **VERIFY (assertions) MUST go through the same interface the use case targets.** API use cases check response bodies and subsequent GETs; UI use cases check what Playwright sees on screen (`data-testid`, role selectors) and reload to confirm persistence. Never peek at Postgres, DuckDB, or Parquet to "confirm" — if it isn't visible through the API or UI, it doesn't count as verified.
 
-**Live-trading safety rails.** Default every E2E use case that touches order submission to a paper IB account (see `reference_ib_accounts.md`). Live-account use cases must be opt-in, explicit in the use-case file, and never triggered from the standard regression suite. Stop-the-world when any API use case returns 5xx during a live/paper flow — do not continue UI verification against a node in unknown state (gotcha #13: stopping Nautilus does not close positions).
+**Live-trading safety rails.** Paper accounts are NOT used (operator decision 2026-06-05 — none is provisioned). Live-trading E2E runs on the live TEST accounts in two legs: **LVP (`U4705114`) on the local stack pre-PR**, then **HVP (`U4715997`) on the prod VM post-merge**. This is a standing authorization for short deploy→verify→stop cycles ONLY — keep exposure minimal (prompt `/live/stop`, confirm `broker_flat:true`); it does NOT extend to the real fund account (untouched until post-PR-3). Live UCs must still name their account explicitly in the use-case file and are never triggered from an unattended regression cron. Stop-the-world when any API use case returns 5xx during a live flow — do not continue UI verification against a node in unknown state (gotcha #13: stopping Nautilus does not close positions).
 
 **Core use-case categories** (for inventory in `tests/e2e/use-cases/`):
 
