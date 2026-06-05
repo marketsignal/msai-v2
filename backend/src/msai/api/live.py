@@ -17,7 +17,7 @@ from uuid import UUID  # noqa: TC003 — FastAPI resolves the type at runtime fo
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
-from sqlalchemy import case, delete, func, select
+from sqlalchemy import case, delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from msai.api._broker_account_deps import build_broker_account_service
@@ -301,6 +301,7 @@ async def _poll_for_terminal(
     terminal_statuses: frozenset[str],
     timeout_s: float,
     interval_s: float,
+    exclude_terminal_row_ids: frozenset[UUID] | None = None,
 ) -> LiveNodeProcess | None:
     """Poll the latest ``live_node_processes`` row for this deployment
     until its ``status`` lands in ``ready_statuses`` or
@@ -308,6 +309,21 @@ async def _poll_for_terminal(
 
     Returns the row on success; returns ``None`` on timeout so the
     caller can produce :meth:`EndpointOutcome.api_poll_timeout`.
+
+    ``exclude_terminal_row_ids`` (fix/start-portfolio-503-but-spawned —
+    2026-06-05 LVP drill): the caller's pre-publish snapshot of the
+    deployment's EXISTING row ids. When provided, TERMINAL rows count
+    only if their id is NOT in the snapshot, so a warm restart's poll
+    can never mistake the PREVIOUS run's stopped/failed row for this
+    attempt's outcome (every outcome of an attempt lands on a NEW
+    Phase-A-inserted row; old terminal rows never re-open).
+    Ready/running rows count UNCONDITIONALLY: the partial unique index
+    ``uq_live_node_processes_active_deployment`` guarantees at most one
+    active row per deployment and terminal rows never re-activate, so
+    an active row IS the current node even if it predates the snapshot
+    (e.g. a concurrent START won the spawn race). ``None``/empty
+    preserves the legacy unscoped behavior used by the /stop and
+    /drain sites.
 
     Why a module-level function: tests monkeypatch this name to
     inject deterministic row transitions without driving a real
@@ -323,20 +339,22 @@ async def _poll_for_terminal(
     """
     deadline = monotonic() + timeout_s
     match_statuses = ready_statuses | terminal_statuses
+    stmt = select(LiveNodeProcess).where(LiveNodeProcess.deployment_id == deployment_id)
+    if exclude_terminal_row_ids:
+        stmt = stmt.where(
+            or_(
+                LiveNodeProcess.status.in_(ready_statuses),
+                LiveNodeProcess.id.notin_(exclude_terminal_row_ids),
+            )
+        )
+    stmt = stmt.order_by(LiveNodeProcess.started_at.desc()).limit(1)
     while monotonic() < deadline:
         # Start a fresh transaction every poll so we see writes the
         # supervisor committed from another session. Without this,
         # the caller's session keeps a snapshot of the row and the
         # status update never becomes visible.
         await db.rollback()
-        row = (
-            await db.execute(
-                select(LiveNodeProcess)
-                .where(LiveNodeProcess.deployment_id == deployment_id)
-                .order_by(LiveNodeProcess.started_at.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
+        row = (await db.execute(stmt)).scalar_one_or_none()
         if row is not None and row.status in match_statuses:
             return row
         await asyncio.sleep(interval_s)
@@ -2015,6 +2033,23 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
                     },
                 )
             await db.commit()
+            # fix/start-portfolio-503-but-spawned (LVP drill 2026-06-05): snapshot
+            # the deployment's EXISTING node-row ids BEFORE publishing the START.
+            # Every outcome of this attempt lands on a NEW Phase-A-inserted row
+            # (fleet_router.py Phase A); the poll below uses this snapshot to
+            # ignore stale terminal rows — the source of the false cacheable
+            # 503 "unknown failure" returned while the spawn actually succeeded.
+            prior_node_row_ids = frozenset(
+                (
+                    await db.execute(
+                        select(LiveNodeProcess.id).where(
+                            LiveNodeProcess.deployment_id == deployment.id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
             await bus.publish_start(
                 deployment_id=deployment.id,
                 payload={
@@ -2088,16 +2123,21 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
             terminal_statuses=frozenset({"failed", "stopped"}),
             timeout_s=START_POLL_TIMEOUT_S,
             interval_s=START_POLL_INTERVAL_S,
+            exclude_terminal_row_ids=prior_node_row_ids,
         )
 
         if row is None:
-            # Capture the PK as a plain value NOW, while ``deployment`` is still a
-            # live persistent instance. The ``db.rollback()`` below expires every
-            # attribute on the session's objects, so any later ``deployment.id``
-            # access triggers a lazy refresh — illegal in this sync context (no
-            # greenlet) and the source of a ``MissingGreenlet`` 500 that masked the
-            # honest 504 on the poll-timeout path (E2E 2026-06-01).
-            deployment_id = deployment.id
+            # Use the plain ``deployment_id`` UUID captured at the upsert
+            # (``upsert_row.id``, above) — do NOT re-read ``deployment.id`` here.
+            # ``_poll_for_terminal`` calls ``db.rollback()`` on every iteration (so
+            # a fresh read-committed snapshot sees the supervisor's cross-session
+            # row writes), which EXPIRES every attribute on the session's
+            # persistent objects. By the time the poll returns ``None`` the
+            # ``deployment`` instance is already expired, so re-reading
+            # ``deployment.id`` would trigger a lazy refresh outside the greenlet —
+            # the ``MissingGreenlet`` 500 that masked the honest 504 on the
+            # poll-timeout path (E2E 2026-06-01). The plain local is immune to ORM
+            # expiry.
             # PR 2 T4 review P1 — stranded-START flip guard (API side).
             #
             # The poll timed out (60s). TWO very different states look the
@@ -3633,6 +3673,10 @@ async def live_status(
                 # deployment_slug via the shared helper (no DB column needed).
                 account_id=d.account_id,
                 ib_login_key=d.ib_login_key,
+                # operator-redeploy discoverability — the frozen revision id
+                # POST /live/start-portfolio needs to warm-restart-redeploy
+                # (found by verify-e2e 2026-06-05).
+                portfolio_revision_id=d.portfolio_revision_id,
                 # Task 5 — control-plane broker-account linkage (NULL for
                 # pre-registry / legacy deployments).
                 broker_account_id=d.broker_account_id,
@@ -3727,6 +3771,10 @@ async def get_live_deployment_status(
         instruments=[],
         last_started_at=deployment.last_started_at,
         last_stopped_at=deployment.last_stopped_at,
+        # operator-redeploy discoverability — the frozen revision id
+        # POST /live/start-portfolio needs to warm-restart-redeploy
+        # (found by verify-e2e 2026-06-05).
+        portfolio_revision_id=deployment.portfolio_revision_id,
         broker_account_id=deployment.broker_account_id,
         process_id=process.id if process else None,
         pid=process.pid if process else None,

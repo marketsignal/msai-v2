@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -143,3 +144,89 @@ class TestLiveStatusReadsPersistentHaltFlag:
         assert response.status_code == 200
         assert response.json()["risk_halted"] is False
         mock_command_bus._redis.exists.assert_awaited_with("msai:risk:halt")  # noqa: SLF001
+
+
+def _fake_deployment(revision_id):
+    """Minimal stand-in for a ``LiveDeployment`` row carrying the attributes
+    the status builders read. Only the fields the builders touch are set."""
+    d = MagicMock()
+    d.id = uuid4()
+    d.strategy_id = uuid4()
+    d.status = "running"
+    d.paper_trading = True
+    d.last_started_at = None
+    d.last_stopped_at = None
+    d.account_id = None
+    d.ib_login_key = None
+    d.broker_account_id = None
+    d.deployment_slug = "abc123def456"
+    d.portfolio_revision_id = revision_id
+    return d
+
+
+class TestLiveStatusExposesPortfolioRevisionId:
+    """Both ``/live/status`` and ``/live/status/{id}`` must surface
+    ``portfolio_revision_id`` so an operator can rediscover the frozen
+    revision id needed to warm-restart-redeploy via
+    ``POST /live/start-portfolio`` (found by verify-e2e 2026-06-05)."""
+
+    @pytest.mark.asyncio
+    async def test_list_status_item_includes_portfolio_revision_id(
+        self,
+        client: httpx.AsyncClient,
+        mock_db: AsyncMock,
+    ) -> None:
+        # Arrange — seed a single deployment row carrying a revision id.
+        revision_id = uuid4()
+        deployment = _fake_deployment(revision_id)
+
+        deployments_result = MagicMock()
+        deployments_scalars = MagicMock()
+        deployments_scalars.all.return_value = [deployment]
+        deployments_result.scalars.return_value = deployments_scalars
+
+        empty_result = MagicMock()
+        empty_scalars = MagicMock()
+        empty_scalars.all.return_value = []
+        empty_result.scalars.return_value = empty_scalars
+        empty_result.scalar_one.return_value = 0
+
+        # First execute = deployments query; subsequent = latest-process etc.
+        mock_db.execute.side_effect = [deployments_result, empty_result, empty_result]
+
+        # Act
+        async with client as ac:
+            response = await ac.get("/api/v1/live/status")
+
+        # Assert
+        assert response.status_code == 200
+        body = response.json()
+        assert len(body["deployments"]) == 1
+        assert body["deployments"][0]["portfolio_revision_id"] == str(revision_id)
+
+    @pytest.mark.asyncio
+    async def test_detail_status_includes_portfolio_revision_id(
+        self,
+        client: httpx.AsyncClient,
+        mock_db: AsyncMock,
+    ) -> None:
+        # Arrange — the detail endpoint fetches the deployment via
+        # scalar_one_or_none, then the latest process via scalar_one_or_none.
+        revision_id = uuid4()
+        deployment = _fake_deployment(revision_id)
+
+        deployment_result = MagicMock()
+        deployment_result.scalar_one_or_none.return_value = deployment
+
+        process_result = MagicMock()
+        process_result.scalar_one_or_none.return_value = None
+
+        mock_db.execute.side_effect = [deployment_result, process_result]
+
+        # Act
+        async with client as ac:
+            response = await ac.get(f"/api/v1/live/status/{deployment.id}")
+
+        # Assert
+        assert response.status_code == 200
+        assert response.json()["portfolio_revision_id"] == str(revision_id)

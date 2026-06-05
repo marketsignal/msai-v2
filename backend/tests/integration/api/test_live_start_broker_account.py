@@ -49,7 +49,7 @@ import contextlib
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -71,6 +71,7 @@ from msai.models.broker_account import (
 )
 from msai.models.graduation_candidate import GraduationCandidate
 from msai.models.live_deployment import LiveDeployment
+from msai.models.live_node_process import LiveNodeProcess
 from msai.models.live_portfolio import LivePortfolio
 from msai.models.live_portfolio_revision import LivePortfolioRevision
 from msai.models.live_portfolio_revision_strategy import LivePortfolioRevisionStrategy
@@ -2026,3 +2027,393 @@ async def test_failed_closed_deploy_leaves_credentials_last_accessed_unchanged(
         refreshed = await session.get(BrokerAccount, acct_id)
         assert refreshed is not None
         assert refreshed.credentials_last_accessed is None
+
+
+# ---------------------------------------------------------------------------
+# fix/start-portfolio-503-but-spawned: response-path attribution -------------
+#
+# The 2026-06-05 LVP drill showed POST /live/start-portfolio returning a false,
+# cacheable 503 {"detail":"unknown failure","failure_kind":"unknown"} 3/3 times
+# while the spawn actually succeeded: the response-path poll's FIRST read
+# returned the PREVIOUS run's terminal `stopped` row (warm restart). These
+# endpoint-level regressions pin the fix — the start handler captures the
+# deployment's pre-existing node-row ids BEFORE publishing the START and passes
+# them to ``_poll_for_terminal`` as ``exclude_terminal_row_ids`` so a stale
+# terminal row can never be mistaken for THIS attempt's outcome.
+# ---------------------------------------------------------------------------
+
+# Saved BEFORE the ``client`` fixture stubs ``_poll_for_terminal`` (module-level
+# stub via monkeypatch). The three tests below restore THIS real helper so the
+# actual hybrid-scoped DB poll runs against the fake supervisor's row writes.
+_REAL_POLL_FOR_TERMINAL = live_module._poll_for_terminal  # noqa: SLF001
+
+
+async def _fake_supervisor_insert_after_publish(
+    session_factory: async_sessionmaker[AsyncSession],
+    redis_text: AsyncRedis,
+    stream: str,
+    baseline_len: int,
+    deployment_id_getter,  # callable returning the deployment UUID once known
+    *,
+    status: str,
+    failure_kind: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    """Insert THIS attempt's node row only AFTER the START is observed on the
+    per-account command stream — mirrors the real Phase-A ordering
+    (fleet_router.py Phase A) and guarantees the endpoint's pre-publish snapshot
+    was already captured (Codex plan-review P1-2). A fixed sleep could otherwise
+    insert the row BEFORE the handler's pre-publish snapshot, masking the bug."""
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + 10.0
+    while loop.time() < deadline:
+        if await redis_text.xlen(stream) > baseline_len:
+            break
+        await asyncio.sleep(0.02)
+    else:
+        return  # START never appeared — let the endpoint hit its own timeout.
+    deployment_id = await deployment_id_getter()
+    async with session_factory() as session, session.begin():
+        session.add(
+            LiveNodeProcess(
+                id=uuid4(),
+                deployment_id=deployment_id,
+                gateway_session_key="msai-paper-primary:localhost:4002",
+                pid=4242,
+                host="fake-supervisor",
+                started_at=datetime.now(UTC),
+                last_heartbeat_at=datetime.now(UTC),
+                status=status,
+                failure_kind=failure_kind,
+                error_message=error_message,
+            )
+        )
+
+
+async def _seed_warm_restart_prior_run(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> tuple[UUID, UUID, UUID]:
+    """Seed the warm-restart anchor: an ACTIVE broker account + a deployable
+    revision + a pre-created ``stopped`` deployment (identity matching what the
+    handler recomputes for the ``broker_account_id`` selector) carrying ONE
+    prior-run ``stopped`` LiveNodeProcess row (the previous run that ended
+    cleanly — the exact row that produced the false ``unknown`` 503 in the
+    drill). Returns ``(rev_id, dep_id, acct_id)``."""
+    async with session_factory() as session:
+        acct = await _seed_broker_account(session, ib_account_id=_BOUND_ACCOUNTS[0])
+        user, strategy, revision, _member = await _seed_deployable_revision(
+            session, entra_id="test-operator"
+        )
+        identity = derive_portfolio_deployment_identity(
+            user_id=user.id,
+            portfolio_revision_id=revision.id,
+            account_id=_BOUND_ACCOUNTS[0],
+            paper_trading=True,
+            ib_login_key=_LOGIN,
+            user_sub="test-operator",
+        )
+        slug = generate_deployment_slug()
+        dep = LiveDeployment(
+            id=uuid4(),
+            strategy_id=strategy.id,
+            status="stopped",
+            paper_trading=True,
+            started_by=user.id,
+            deployment_slug=slug,
+            identity_signature=identity.signature(),
+            trader_id=derive_trader_id(slug),
+            strategy_id_full=derive_strategy_id_full(strategy.strategy_class, slug),
+            account_id=_BOUND_ACCOUNTS[0],
+            ib_login_key=_LOGIN,
+            portfolio_revision_id=revision.id,
+            message_bus_stream=derive_message_bus_stream(slug),
+            broker_account_id=None,
+        )
+        session.add(dep)
+        # The PREVIOUS run's terminal node-process row — the stale row whose
+        # first-read won the race in the drill and produced the false 503.
+        session.add(
+            LiveNodeProcess(
+                id=uuid4(),
+                deployment_id=dep.id,
+                gateway_session_key="msai-paper-primary:localhost:4002",
+                pid=None,
+                host="prior-run",
+                started_at=datetime.now(UTC),
+                last_heartbeat_at=datetime.now(UTC),
+                status="stopped",
+                failure_kind=None,
+            )
+        )
+        cand = (
+            await session.execute(
+                select(GraduationCandidate).where(GraduationCandidate.strategy_id == strategy.id)
+            )
+        ).scalar_one()
+        cand.stage = "live_running"
+        cand.deployment_id = dep.id
+        await session.commit()
+        return revision.id, dep.id, acct.id
+
+
+@pytest.mark.asyncio
+async def test_warm_restart_with_stale_stopped_row_returns_201_not_unknown_503(
+    client: tuple[httpx.AsyncClient, _StubStore, _ResolveSpy],
+    redis_text: AsyncRedis,
+    bus: LiveCommandBus,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LVP drill 2026-06-05 regression: redeploying a deployment whose previous
+    run left a terminal ``stopped`` row must NOT return the stale row as this
+    attempt's outcome (false cacheable 503 ``unknown failure``). With the fake
+    supervisor inserting the fresh ``ready`` row only AFTER the START is
+    published, the endpoint must wait for it and return 201 ready
+    (EndpointOutcome.ready — idempotency.py:95-98). The same Idempotency-Key
+    replayed afterward must return the CACHED success, not a stale failure."""
+    ac, _store, _spy = client
+    # Run the REAL hybrid-scoped poll (the ``client`` fixture stubs it).
+    monkeypatch.setattr(live_module, "_poll_for_terminal", _REAL_POLL_FOR_TERMINAL)
+    monkeypatch.setattr(live_module, "START_POLL_TIMEOUT_S", 5.0)
+    monkeypatch.setattr(live_module, "START_POLL_INTERVAL_S", 0.05)
+
+    rev_id, dep_id, acct_id = await _seed_warm_restart_prior_run(session_factory)
+
+    stream = bus.account_stream(_BOUND_ACCOUNTS[0])
+    baseline = await redis_text.xlen(stream)
+
+    async def _get_dep_id() -> object:
+        return dep_id
+
+    supervisor = asyncio.create_task(
+        _fake_supervisor_insert_after_publish(
+            session_factory,
+            redis_text,
+            stream,
+            baseline,
+            _get_dep_id,
+            status="ready",
+        )
+    )
+
+    key = f"sw-warm-{uuid4().hex}"
+    body = {"portfolio_revision_id": str(rev_id), "broker_account_id": str(acct_id)}
+    try:
+        resp = await ac.post(
+            "/api/v1/live/start-portfolio", json=body, headers={"Idempotency-Key": key}
+        )
+    finally:
+        await supervisor
+
+    assert resp.status_code == 201, resp.text  # pre-fix this returned 503 "unknown failure"
+    rbody = resp.json()
+    assert rbody["status"] in ("ready", "running")
+    # No false-failure leakage: the body must NOT carry an "unknown" failure_kind.
+    assert rbody.get("failure_kind") in (None, "none")
+    deployment_id = rbody["id"]
+
+    # REPLAY (Codex iter-1 P2-1): the same key + body returns the CACHED success
+    # (201, same deployment id), NOT a stale 503.
+    replay = await ac.post(
+        "/api/v1/live/start-portfolio", json=body, headers={"Idempotency-Key": key}
+    )
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["id"] == deployment_id
+
+
+@pytest.mark.asyncio
+async def test_warm_restart_new_failed_row_still_classified(
+    client: tuple[httpx.AsyncClient, _StubStore, _ResolveSpy],
+    redis_text: AsyncRedis,
+    bus: LiveCommandBus,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case 5: with a stale ``stopped`` row present, THIS attempt's GENUINE
+    failure (a new row outside the pre-publish snapshot) must still surface with
+    its real ``failure_kind`` — scoping must not break failure classification.
+
+    DEVIATION from the plan's pseudocode (documented): the plan inserted
+    ``failure_kind="halt_active"`` and asserted ``resp.json()["failure_kind"] ==
+    "halt_active"``. But a ``halt_active`` row routes to
+    ``EndpointOutcome.halt_active()`` whose 503 body is ``{"detail": ...}`` with
+    NO top-level ``failure_kind`` key (idempotency.py:126-133), so that frozen
+    assertion is unsatisfiable against the real code. ``spawn_failed_permanent``
+    is a permanent failure kind whose 503 body DOES carry
+    ``failure_kind`` (idempotency.py:299-307), so it preserves the test's intent
+    (this attempt's failure is classified, NOT the false ``unknown``) while
+    keeping the assertion shape ``resp.json()["failure_kind"] == <kind>``."""
+    ac, _store, _spy = client
+    monkeypatch.setattr(live_module, "_poll_for_terminal", _REAL_POLL_FOR_TERMINAL)
+    monkeypatch.setattr(live_module, "START_POLL_TIMEOUT_S", 5.0)
+    monkeypatch.setattr(live_module, "START_POLL_INTERVAL_S", 0.05)
+
+    rev_id, dep_id, acct_id = await _seed_warm_restart_prior_run(session_factory)
+
+    stream = bus.account_stream(_BOUND_ACCOUNTS[0])
+    baseline = await redis_text.xlen(stream)
+
+    async def _get_dep_id() -> object:
+        return dep_id
+
+    supervisor = asyncio.create_task(
+        _fake_supervisor_insert_after_publish(
+            session_factory,
+            redis_text,
+            stream,
+            baseline,
+            _get_dep_id,
+            status="failed",
+            failure_kind="spawn_failed_permanent",
+            error_message="spawn failed during build",
+        )
+    )
+
+    body = {"portfolio_revision_id": str(rev_id), "broker_account_id": str(acct_id)}
+    try:
+        resp = await ac.post("/api/v1/live/start-portfolio", json=body)
+    finally:
+        await supervisor
+
+    # Pre-fix the stale stopped row won the race → false "unknown" 503.
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["failure_kind"] == "spawn_failed_permanent"
+
+
+@pytest.mark.asyncio
+async def test_warm_restart_slow_build_times_out_without_flipping_deployment(
+    client: tuple[httpx.AsyncClient, _StubStore, _ResolveSpy],
+    redis_text: AsyncRedis,
+    bus: LiveCommandBus,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex iter-1 P2-2: stale terminal history + THIS attempt's row stuck in
+    ``building`` → the poll must time out (504 api_poll_timeout), the stranded-
+    START flip guard must NOT flip the deployment to ``failed`` (an active row
+    exists — live.py flip guard + _active_node_process_exists), and the
+    Idempotency-Key must be RELEASED (api_poll_timeout is non-cacheable —
+    idempotency.py:175-186) so a retry executes. After flipping the building row
+    to ``ready`` via the session factory (NOT a second active row — the partial
+    unique index forbids it), a re-POST with the SAME key reaches the
+    active-process dedup and returns 200 already_active (same deployment id),
+    proving the key was released rather than serving a cached 504."""
+    ac, _store, _spy = client
+    monkeypatch.setattr(live_module, "_poll_for_terminal", _REAL_POLL_FOR_TERMINAL)
+    monkeypatch.setattr(live_module, "START_POLL_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(live_module, "START_POLL_INTERVAL_S", 0.05)
+
+    rev_id, dep_id, acct_id = await _seed_warm_restart_prior_run(session_factory)
+
+    stream = bus.account_stream(_BOUND_ACCOUNTS[0])
+    baseline = await redis_text.xlen(stream)
+
+    async def _get_dep_id() -> object:
+        return dep_id
+
+    supervisor = asyncio.create_task(
+        _fake_supervisor_insert_after_publish(
+            session_factory,
+            redis_text,
+            stream,
+            baseline,
+            _get_dep_id,
+            status="building",  # never flips → poll must time out honestly
+        )
+    )
+
+    key = f"sw-slow-{uuid4().hex}"
+    body = {"portfolio_revision_id": str(rev_id), "broker_account_id": str(acct_id)}
+    try:
+        resp = await ac.post(
+            "/api/v1/live/start-portfolio", json=body, headers={"Idempotency-Key": key}
+        )
+    finally:
+        await supervisor
+
+    assert resp.status_code == 504, resp.text  # honest poll-timeout, not a 503
+
+    # The deployment is NOT flipped to "failed" — an active (building) row exists,
+    # so the stranded-START flip guard leaves it non-terminal.
+    async with session_factory() as session:
+        dep = await session.get(LiveDeployment, dep_id)
+        assert dep is not None
+        assert dep.status in ("starting", "building")
+
+    # Operator-side recovery: the slow build reaches "ready". UPDATE the EXISTING
+    # building row (a second active row would violate the partial unique index).
+    async with session_factory() as session, session.begin():
+        node = (
+            await session.execute(
+                select(LiveNodeProcess)
+                .where(
+                    LiveNodeProcess.deployment_id == dep_id,
+                    LiveNodeProcess.status == "building",
+                )
+                .order_by(LiveNodeProcess.started_at.desc())
+                .limit(1)
+            )
+        ).scalar_one()
+        node.status = "ready"
+
+    # The SAME key re-executes (the 504 released the reservation — not cached):
+    # the active-process dedup sees the now-"ready" row and returns 200
+    # already_active with the SAME deployment id.
+    retry = await ac.post(
+        "/api/v1/live/start-portfolio", json=body, headers={"Idempotency-Key": key}
+    )
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["id"] == str(dep_id)
+
+
+@pytest.mark.asyncio
+async def test_warm_restart_no_new_row_times_out_honest_504(
+    client: tuple[httpx.AsyncClient, _StubStore, _ResolveSpy],
+    redis_text: AsyncRedis,
+    bus: LiveCommandBus,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plan case 4 (docs/plans/2026-06-05-start-portfolio-503-but-spawned.md
+    "Case analysis" row 4): START during an old node's ``stopping`` window where
+    the supervisor ACKs already-active and inserts NO new node row. The ONLY row
+    that exists is the prior run's ``stopped`` row (in the pre-publish snapshot).
+
+    With attempt-scoping, that stale terminal row is ignored, so the poll never
+    sees a fresh outcome and times out — returning an HONEST, non-cacheable 504
+    (api_poll_timeout) instead of the pre-fix FALSE, cacheable 503 ``unknown
+    failure``. Because NO active node row exists, the stranded-START flip guard's
+    case (a) applies (live.py — ``_active_node_process_exists`` False → flip), so
+    the stranded deployment is flipped to ``failed`` and is observable as terminal
+    via GET status — strictly more honest than the pre-fix false 503.
+
+    No fake supervisor runs here: nothing inserts a new node row, modelling the
+    supervisor's already-active / no-insert ACK exactly."""
+    ac, _store, _spy = client
+    # Run the REAL hybrid-scoped poll (the ``client`` fixture stubs it).
+    monkeypatch.setattr(live_module, "_poll_for_terminal", _REAL_POLL_FOR_TERMINAL)
+    monkeypatch.setattr(live_module, "START_POLL_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(live_module, "START_POLL_INTERVAL_S", 0.05)
+
+    rev_id, dep_id, acct_id = await _seed_warm_restart_prior_run(session_factory)
+
+    # NO fake supervisor: the supervisor ACKs already-active and inserts no row,
+    # so the only node row is the prior run's stale ``stopped`` row (snapshotted).
+    key = f"sw-noinsert-{uuid4().hex}"
+    body = {"portfolio_revision_id": str(rev_id), "broker_account_id": str(acct_id)}
+    resp = await ac.post(
+        "/api/v1/live/start-portfolio", json=body, headers={"Idempotency-Key": key}
+    )
+
+    # Honest poll-timeout — NOT the pre-fix false 503 "unknown failure".
+    assert resp.status_code == 504, resp.text
+    rbody = resp.json()
+    assert "unknown failure" not in resp.text
+    assert rbody.get("failure_kind") != "unknown"
+
+    # The stranded deployment WAS flipped to "failed" (no active node row → flip
+    # guard case (a)), so it is visible as terminal.
+    async with session_factory() as session:
+        dep = await session.get(LiveDeployment, dep_id)
+        assert dep is not None
+        assert dep.status == "failed"
