@@ -111,7 +111,7 @@ export default function ResearchPage(): React.ReactElement {
         pollRef.current = null;
       }
     };
-  }, [jobs, load]);
+  }, [jobs, refreshJobs]);
 
   // Derive KPI counts
   const pendingCount = jobs.filter((j) => j.status === "pending").length;
