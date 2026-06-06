@@ -47,9 +47,14 @@ class AmbiguousSymbolError(Exception):
        ``(raw_symbol, asset_class)`` pair has aliases under multiple
        providers (e.g. AAPL registered under both ``databento`` and
        ``interactive_brokers``), each pointing at distinct instrument_uids.
-       Caller would need to specify provider — but the readiness/resolver
-       handlers don't expose that yet, so they raise with this richer
-       context instead.
+       Callers disambiguate via the ``provider`` filter on
+       :meth:`SecurityMaster.find_active_aliases`: the ``/symbols/readiness``
+       GET accepts an optional ``provider`` query param and defaults the
+       unpinned read to the provider-preference policy
+       (``on_ambiguity="prefer_primary"``), while the destructive
+       ``DELETE /symbols/{symbol}`` keeps ``on_ambiguity="raise"`` and maps
+       this error to a satisfiable 422 (re-issue with ``provider``). This
+       error therefore still fires for unpinned destructive callers.
 
     Distinguish via ``providers``: empty list ⇒ asset_class ambiguity;
     non-empty ⇒ provider ambiguity. Callers (e.g. ``lookup_for_live``,

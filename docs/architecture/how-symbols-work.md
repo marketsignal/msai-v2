@@ -180,7 +180,7 @@ The registry is two tables.
   - `effective_to IS NULL OR effective_to >= effective_from` (relaxed from strict `>` by migration `b6c7d8e9f0a1` so same-day rotations work).
 - Other columns: `alias_string` (indexed; the venue-qualified instrument ID like `AAPL.XNAS` or `ES.Z.24`), `source_venue_raw` (raw Databento MIC pre-normalization), `effective_from` (Date, inclusive), `effective_to` (Date, exclusive; NULL = currently active).
 
-The reason aliases are time-windowed: futures roll. When the front-month rolls, the orchestrator sets `effective_to` on the old row and inserts a new one with the next expiry. Backtests reading historical data must resolve `ES` to whatever was front-month _on that historical date_, not today's. See `SecurityMaster.resolve_for_backtest` (`backend/src/msai/services/nautilus/security_master/service.py:400-503`), which honors a `start` kwarg for historical alias windowing.
+The reason aliases are time-windowed: futures roll. When the front-month rolls, the orchestrator sets `effective_to` on the old row and inserts a new one with the next expiry. Backtests reading historical data must resolve `ES` to whatever was front-month _on that historical date_, not today's. See `SecurityMaster.resolve_for_backtest` (`backend/src/msai/services/nautilus/security_master/service.py:428-672`), which honors a `start` kwarg for historical alias windowing.
 
 ### 1.4 Asset-class taxonomy bridges
 
@@ -189,7 +189,7 @@ Three separate naming conventions need to agree, and they don't. The canonical m
 | Layer               | Type alias                                                                          | Values                                              |
 | ------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------- |
 | Registry (DB CHECK) | `RegistryAssetClass` (`security_master/types.py:14`)                                | `equity, futures, fx, option, crypto`               |
-| API surface         | `AssetClass` (`schemas/symbol_onboarding.py:53`) + `ReadinessAssetClass` (`api:63`) | `equity, futures, fx, option` — **no `crypto`**     |
+| API surface         | `AssetClass` (`schemas/symbol_onboarding.py:53`) + `ReadinessAssetClass` (`api:72`) | `equity, futures, fx, option` — **no `crypto`**     |
 | Parquet storage     | `IngestAssetClass` (`security_master/types.py:19`)                                  | `stocks, futures, options, forex, crypto`           |
 | Nautilus spec       | (constructed inline)                                                                | `equity, future, forex, option, crypto` (singular!) |
 | Provider            | `Provider` (`security_master/types.py:22`)                                          | `interactive_brokers, databento`                    |
@@ -207,7 +207,7 @@ Onboarding can reach a real money spend, so the dry-run path is mandatory before
 - `CostLine` (lines 71-76): per-symbol breakdown row.
 - `CostEstimate` (lines 79-85): aggregate result with `total_usd`, `basis`, `confidence` (`high|medium|low`), `breakdown[]`.
 
-The dry-run path requires `DATABENTO_API_KEY` to be configured server-side. `_get_databento_client` (`api/symbol_onboarding.py:90-107`) raises `RuntimeError` if the key is unset; the `/onboard/dry-run` handler only catches `UnpriceableAssetClassError`, so an unconfigured key surfaces as **HTTP 500**, not 422. Operators running dry-runs against an environment without Databento credentials should expect 500 — fix it by setting `DATABENTO_API_KEY`, not by retrying.
+The dry-run path requires `DATABENTO_API_KEY` to be configured server-side. `_get_databento_client` (`api/symbol_onboarding.py:99-117`) raises `RuntimeError` if the key is unset; the `/onboard/dry-run` handler only catches `UnpriceableAssetClassError`, so an unconfigured key surfaces as **HTTP 500**, not 422. Operators running dry-runs against an environment without Databento credentials should expect 500 — fix it by setting `DATABENTO_API_KEY`, not by retrying.
 
 ### 1.6 Coverage check
 
@@ -219,7 +219,7 @@ The dry-run path requires `DATABENTO_API_KEY` to be configured server-side. `_ge
 
 ### 1.7 Futures alias rotation
 
-For continuous futures (`<root>.Z.<N>` form), `SecurityMaster._resolve_databento_continuous` (`backend/src/msai/services/nautilus/security_master/service.py:505-595`) is the only path that synthesizes on cold-miss. Two steps:
+For continuous futures (`<root>.Z.<N>` form), `SecurityMaster._resolve_databento_continuous` (`backend/src/msai/services/nautilus/security_master/service.py:673-765`) is the only path that synthesizes on cold-miss. Two steps:
 
 1. Warm-hit by `raw_symbol`: if a definition row exists, return its current alias.
 2. Cold-miss: fetch the Databento definition, synthesize a `ResolvedInstrumentDefinition`, upsert via `_upsert_definition_and_alias` (scoped on `(raw_symbol, provider, asset_class)` for the def + `(alias_string, provider, effective_from)` for the alias — the same UNIQUE constraint described in § 1.3 — so repeats refresh timestamps without `IntegrityError`).
@@ -247,7 +247,7 @@ Every operator-facing 422 from `/onboard` and `/onboard/dry-run` originates eith
 
 These all surface as standard FastAPI 422 with the Pydantic detail array. They run before any DB write or queue interaction, so they cost nothing.
 
-The `cost_ceiling_usd` field has a second layer: when `/onboard` is called with a non-`None` ceiling, `_compute_cost_estimate` runs synchronously inline (one `metadata.get_cost` per `(dataset, start, end)` bucket). If the resulting `total_usd` exceeds the ceiling, the API returns **422 `COST_CEILING_EXCEEDED`** — a real load-bearing 422 that gates job enqueue (`api/symbol_onboarding.py:343-357`). Same code path the dry-run uses, so a passing dry-run guarantees a passing ceiling check.
+The `cost_ceiling_usd` field has a second layer: when `/onboard` is called with a non-`None` ceiling, `_compute_cost_estimate` runs synchronously inline (one `metadata.get_cost` per `(dataset, start, end)` bucket). If the resulting `total_usd` exceeds the ceiling, the API returns **422 `COST_CEILING_EXCEEDED`** — a real load-bearing 422 that gates job enqueue (`api/symbol_onboarding.py:377-390`). Same code path the dry-run uses, so a passing dry-run guarantees a passing ceiling check.
 
 ---
 
@@ -270,9 +270,9 @@ Every onboarding operation has three peer entry points and one observation surfa
 
 **Why the UI is read-only.** Phase 1 made the explicit decision that the trigger surface is API + CLI; the UI exists to show what is registered (and, in later phases, will gain a manifest-upload page). This is consistent with the project's API-first / UI-third order — see `CLAUDE.md` and `00-developer-journey.md`. The `/data-management` page (`frontend/src/app/data-management/page.tsx:32-134`) renders a "Trigger Download" button (lines 63-78) that scrolls into a future feature; today it is a stub.
 
-**Why dry-run before onboard.** `OnboardRequest` (`backend/src/msai/schemas/symbol_onboarding.py:80-102`) accepts a `cost_ceiling_usd` field. When `/onboard` is invoked with a non-`None` ceiling, `_compute_cost_estimate` runs synchronously inline (`api/symbol_onboarding.py:343-357`) and the API returns **422 `COST_CEILING_EXCEEDED`** if the total exceeds the ceiling — the job is never enqueued. So the dry-run is both informational (does this fit my budget?) and load-bearing (it's the same code path that gates `/onboard`).
+**Why dry-run before onboard.** `OnboardRequest` (`backend/src/msai/schemas/symbol_onboarding.py:80-102`) accepts a `cost_ceiling_usd` field. When `/onboard` is invoked with a non-`None` ceiling, `_compute_cost_estimate` runs synchronously inline (`api/symbol_onboarding.py:377-390`) and the API returns **422 `COST_CEILING_EXCEEDED`** if the total exceeds the ceiling — the job is never enqueued. So the dry-run is both informational (does this fit my budget?) and load-bearing (it's the same code path that gates `/onboard`).
 
-**The dry-run is pure** (`backend/src/msai/api/symbol_onboarding.py:110-157`). It does not write to the DB, does not enqueue, does not touch Databento beyond the `metadata.get_cost()` calls. You can call it freely.
+**The dry-run is pure** (`backend/src/msai/api/symbol_onboarding.py:120-168`). It does not write to the DB, does not enqueue, does not touch Databento beyond the `metadata.get_cost()` calls. You can call it freely.
 
 **The CLI is a thin HTTP client.** `backend/src/msai/cli_symbols.py:1-154` shells out to `_api_call` (imported from `cli.py`), which uses `MSAI_API_KEY` for auth via `X-API-Key` (the dev/CLI bypass over the JWT). The CLI does no business logic — every behavior listed above is enforced server-side.
 
@@ -428,15 +428,17 @@ For the question "is this single instrument ready to use for a specific date ran
 
 - `instrument_uid`: UUID from the registry, the stable identifier across UI / API / DB.
 - `registered`: any active alias exists.
-- `provider`: which provider's row won (preference: `databento` first, then `interactive_brokers`, then `sorted(provider_set)[0]` of whatever else is left, per `SecurityMaster.find_active_aliases` at `service.py:778-783`).
-- `backtest_data_available`: bool or null. Null means you didn't pass **either** `start` **or** `end` — the gate is `if start is None or end is None:` (`api/symbol_onboarding.py:609`), so omitting just one is enough to skip the Parquet scan.
+- `provider`: which provider's row won (preference: `databento` first, then `interactive_brokers`, then `sorted(provider_set)[0]` of whatever else is left). The policy lives in the `SecurityMaster._preferred_provider` helper (`service.py:932-943`), called by `find_active_aliases` (`service.py:945-1088`) on both the single-uid and the unpinned-`prefer_primary` paths.
+- `backtest_data_available`: bool or null. Null means you didn't pass **either** `start` **or** `end` — the gate is `if start is None or end is None:` (`api/symbol_onboarding.py:744`), so omitting just one is enough to skip the Parquet scan.
 - `coverage_status`: `full | gapped | none` or null.
 - `covered_range`: human string of what's there.
 - `missing_ranges`: list of gaps.
-- `live_qualified`: bool — independent flag, set if **any** active alias row has `provider=interactive_brokers`.
+- `live_qualified`: bool — independent flag. When the request is **unpinned** it is the aggregate signal, set if **any** active alias row for the symbol has `provider=interactive_brokers`. When a `provider` is pinned (see § 4.6) it is **scoped** to that provider's rows, so pinning `provider=databento` on a dual-provider symbol returns `false` even though the symbol has an IB alias under the other provider.
 - `coverage_summary`: short hint when start/end weren't passed.
 
-The endpoint returns 422 with `code=AMBIGUOUS_INSTRUMENT` if the symbol + asset_class match more than one definition (e.g., the same ticker registered under multiple providers with conflicting metadata) — see `AmbiguousSymbolError` (`registry.py:33-66`).
+The ambiguity that `find_active_aliases` can detect is **not** a metadata conflict: it fires when the same `(symbol, asset_class)` has active alias rows under **multiple providers** — each provider gets its own `InstrumentDefinition` (one per `(raw_symbol, provider, asset_class)`, § 1.3) and therefore its own `instrument_uid`, so collapsing the rows by `instrument_uid` yields `len(uids) > 1` (`service.py:1045`). No conflicting fields are required — `SPY` registered under both `databento` and `interactive_brokers` (the normal state after IB qualification) is enough. `AmbiguousSymbolError` carries the `providers` list (`registry.py:37-88`).
+
+The readiness endpoint **no longer dead-ends on this**: it calls `find_active_aliases(..., on_ambiguity="prefer_primary")`, so an unpinned dual-provider read resolves to the preferred provider and returns 200 (see § 4.6). The 422 `AMBIGUOUS_INSTRUMENT` branch survives only as a defensive fallback on the readiness path, and remains the active behavior on the destructive `DELETE /symbols/{symbol}` path.
 
 ### 4.5 Log scan
 
@@ -448,11 +450,24 @@ docker compose -f docker-compose.dev.yml logs -f worker | grep $RUN_ID
 
 You'll see one line per `(symbol, phase)` transition plus the run-level COMPLETED / COMPLETED_WITH_FAILURES emission with elapsed wall-clock.
 
+### 4.6 The optional `provider` query param (readiness + remove)
+
+Both `GET /api/v1/symbols/readiness` (`api/symbol_onboarding.py:667`) and `DELETE /api/v1/symbols/{symbol}` (`remove_symbol`, `api/symbol_onboarding.py:876`) accept an optional `provider` query param (`Provider | None`, default `None`). It threads into `find_active_aliases(..., provider=...)` (`service.py:945`), which filters the row-select on `InstrumentDefinition.provider` so the uid-collapse can no longer be provider-ambiguous. The two endpoints differ only in their ambiguity behavior, because one is a read and one is destructive:
+
+| Call                                    | Behavior                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Readiness, unpinned** (no `provider`) | `on_ambiguity="prefer_primary"`. A dual-provider symbol resolves to the preferred provider (`databento` > `interactive_brokers` > sorted-first, via `_preferred_provider`) and returns **200** — the response names the resolved `provider`. Coverage is provider-invariant (`coverage.py` is keyed on `(asset_class, symbol)` only, no provider dimension), so this answers readiness without picking a "wrong" data answer. `live_qualified` stays the cross-provider aggregate. This replaces the former unsatisfiable 422 dead-end. |
+| **Readiness, pinned** (`?provider=...`) | Scopes resolution to that provider's definition. The `provider` field echoes the pin and `live_qualified` is scoped to the pinned provider's rows. Pinning a provider the symbol isn't registered under → **404** whose message names the provider.                                                                                                                                                                                                                                                                                     |
+| **Remove (DELETE), unpinned**           | `on_ambiguity="raise"`. A dual-provider symbol returns **422 `AMBIGUOUS_INSTRUMENT`** — destructive ops stay explicit so you can't silently delete the wrong provider's row. The error is now **satisfiable**: re-issue with `?provider=...`. (Before this fix `remove_symbol` had no `AmbiguousSymbolError` handler, so the unpinned dual-provider delete escaped as an unhandled **500**.)                                                                                                                                            |
+| **Remove (DELETE), pinned**             | Scopes the soft-delete to the pinned provider's definition only; the other provider's row remains.                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+
+Coverage being provider-invariant is the load-bearing fact that makes the unpinned-read default safe: the data-readiness answer (`coverage_status`, `backtest_data_available`, `covered_range`, `missing_ranges`) is identical regardless of which provider's metadata block is attached, so defaulting the read to the preferred provider cannot mislead the caller about whether the data is ready.
+
 ---
 
 ## 5. Common failures
 
-When `per_symbol[].status == "failed"`, the row carries an `error.code` and `_suggest_next_action` (`backend/src/msai/api/symbol_onboarding.py:534-554`) maps it to a one-line operator hint. The mapping below is the canonical "what does this mean and what do I do" reference for the codes that have hints. The orchestrator can also emit `BOOTSTRAP_FAILED` (`orchestrator.py:127-146`) — a catch-all when bootstrap raises or returns empty results — and `_suggest_next_action` returns `None` for it, so callers see `next_action == null` and need to consult the structured error message and worker logs directly.
+When `per_symbol[].status == "failed"`, the row carries an `error.code` and `_suggest_next_action` (`backend/src/msai/api/symbol_onboarding.py:602-624`) maps it to a one-line operator hint. The mapping below is the canonical "what does this mean and what do I do" reference for the codes that have hints. The orchestrator can also emit `BOOTSTRAP_FAILED` (`orchestrator.py:127-146`) — a catch-all when bootstrap raises or returns empty results — and `_suggest_next_action` returns `None` for it, so callers see `next_action == null` and need to consult the structured error message and worker logs directly.
 
 | Error code                 | Phase      | Hint (verbatim from `_suggest_next_action`)                                                   | What it actually means                                                                                                                                                                                                                              |
 | -------------------------- | ---------- | --------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -467,17 +482,17 @@ When `per_symbol[].status == "failed"`, the row carries an `error.code` and `_su
 
 A failure on bootstrap always pre-empts the later phases for that symbol (`_BOOTSTRAP_FAILURE_OUTCOMES`); a failure on ingest pre-empts coverage and ib_qualify; a failure on coverage marks `step=coverage_failed` and skips ib_qualify; an `IB_NOT_CONFIGURED` outcome marks `step=ib_skipped` rather than failing if `request_live_qualification=False` was the operator's choice.
 
-Errors on the readiness endpoint are different — they're not pipeline outcomes, they're query errors. The two you'll hit:
+Errors on the readiness / remove endpoints are different — they're not pipeline outcomes, they're query errors. What you'll hit (see § 4.6 for the full `provider`-param semantics):
 
-- `404 NOT_FOUND`: no active alias rows for `(symbol, asset_class)` as of today. The symbol is genuinely not registered.
-- `422 AMBIGUOUS_INSTRUMENT`: the symbol matches more than one definition (typically across providers with different `asset_class` recorded). Pin one explicitly or call `msai instruments bootstrap --exact-id` to register the canonical alias.
+- `404 NOT_FOUND`: no active alias rows for `(symbol, asset_class)` as of today — either the symbol is genuinely not registered, **or** you pinned a `provider` the symbol isn't registered under. When `provider` is pinned the message names it (e.g. `Symbol 'SPY' (asset_class='equity') is not registered under provider 'interactive_brokers'`), so the caller can drop the pin or fix it.
+- `422 AMBIGUOUS_INSTRUMENT`: the same `(symbol, asset_class)` is registered under **multiple providers** (each with its own `instrument_uid` — no conflicting metadata required; `SPY` under both `databento` and `interactive_brokers` is the canonical case). This now fires only on the destructive `DELETE /symbols/{symbol}` path when no `provider` is pinned (destructive ops stay explicit) — and is **satisfiable**: re-issue the DELETE with `?provider=...`. The unpinned readiness GET no longer returns this; it resolves to the preferred provider and returns 200.
 
 Pre-enqueue `/onboard` and `/onboard/dry-run` errors (these never produce a `run_id` — fix the request and resubmit):
 
 - **422 `UNPRICEABLE_ASSET_CLASS`**: an `OnboardSymbolSpec.asset_class` falls outside `_ASSET_TO_DATASET` (`equity`, `futures`). Today this means a `fx` or `option` spec — there is no Databento dataset mapped for cost estimation, so the orchestrator can't enforce the ceiling.
-- **422 `COST_CEILING_EXCEEDED`** (`api/symbol_onboarding.py:343-357`): when `cost_ceiling_usd` is set and the live `metadata.get_cost` total tops it, the API blocks the enqueue. Re-run the dry-run, lower the scope or raise the ceiling.
-- **409 `DUPLICATE_IN_FLIGHT`** (`:281-285`): two writers raced for the same digest and the second one's `enqueue_job` returned `None` while the row hadn't materialized yet. Retry in ~1 s.
-- **503 `QUEUE_UNAVAILABLE`** (`:250-263`): Redis/arq pool was unreachable. Restart the worker stack and retry.
+- **422 `COST_CEILING_EXCEEDED`** (`api/symbol_onboarding.py:377-390`): when `cost_ceiling_usd` is set and the live `metadata.get_cost` total tops it, the API blocks the enqueue. Re-run the dry-run, lower the scope or raise the ceiling.
+- **409 `DUPLICATE_IN_FLIGHT`** (`:301-305`): two writers raced for the same digest and the second one's `enqueue_job` returned `None` while the row hadn't materialized yet. Retry in ~1 s.
+- **503 `QUEUE_UNAVAILABLE`** (`:270-283`): Redis/arq pool was unreachable. Restart the worker stack and retry.
 - **HTTP 500 (uncoded) on dry-run when `DATABENTO_API_KEY` is unset**: `_get_databento_client` raises `RuntimeError`, which isn't caught by `onboard_dry_run`. Set the key server-side.
 
 ---
@@ -486,7 +501,7 @@ Pre-enqueue `/onboard` and `/onboard/dry-run` errors (these never produce a `run
 
 ### 6.1 The blake2b digest job_id
 
-`_dedup_job_id` (`backend/src/msai/api/symbol_onboarding.py:178-200`) computes a deterministic arq job id from a canonical fingerprint of the request:
+`_dedup_job_id` (`backend/src/msai/api/symbol_onboarding.py:187-211`) computes a deterministic arq job id from a canonical fingerprint of the request:
 
 ```python
 canonical = [
@@ -507,15 +522,15 @@ return f"symbol-onboarding:{digest:x}"
 
 Three things to notice:
 
-1. **Symbols are sorted before digesting** (line 189) so the same request submitted with reordered symbols hashes the same way.
-2. **`cost_ceiling_usd` is part of the fingerprint** (line 191). If you submitted `[AAPL]` with no ceiling, then re-submitted with a $5 ceiling, the second call must enqueue a new job — the first ran without a budget cap and you'd want the second to apply the cap. Same symbols, different intent → different digest.
-3. **`request_live_qualification` is part of the fingerprint** (line 195). A run that didn't ask for IB qualification is a different run from one that did, even with identical symbols.
+1. **Symbols are sorted before digesting** (line 198) so the same request submitted with reordered symbols hashes the same way.
+2. **`cost_ceiling_usd` is part of the fingerprint** (line 200). If you submitted `[AAPL]` with no ceiling, then re-submitted with a $5 ceiling, the second call must enqueue a new job — the first ran without a budget cap and you'd want the second to apply the cap. Same symbols, different intent → different digest.
+3. **`request_live_qualification` is part of the fingerprint** (line 204). A run that didn't ask for IB qualification is a different run from one that did, even with identical symbols.
 
 The digest is stamped onto the row's `job_id_digest` column (UNIQUE) **and** used as the arq `_job_id`. Both layers reject duplicates — Postgres on commit conflict, arq on enqueue.
 
 ### 6.2 The enqueue-first-then-commit dance
 
-`_enqueue_and_persist_run` (`backend/src/msai/api/symbol_onboarding.py:203-317`) is the shared helper for `/onboard` and `/repair`. The order matters and the comments in the file enumerate every branch:
+`_enqueue_and_persist_run` (`backend/src/msai/api/symbol_onboarding.py:212-344`) is the shared helper for `/onboard` and `/repair`. The order matters and the comments in the file enumerate every branch:
 
 1. `SELECT FOR UPDATE` on `job_id_digest`. If a row exists → return 200 OK with the existing `run_id` (no enqueue).
 2. `enqueue_job` with `_job_id=digest_str`. Three sub-branches:
@@ -542,7 +557,7 @@ The repair endpoint creates a **child** `SymbolOnboardingRun` with its own diges
 
 ### 7.1 The repair endpoint
 
-`POST /api/v1/symbols/onboard/{run_id}/repair` (`backend/src/msai/api/symbol_onboarding.py:433-516`) re-runs **only the failed symbols** of a parent run. Two scopes:
+`POST /api/v1/symbols/onboard/{run_id}/repair` (`backend/src/msai/api/symbol_onboarding.py:506-586`) re-runs **only the failed symbols** of a parent run. Two scopes:
 
 - **No body**: retry every symbol in the parent that ended `failed`.
 - **Body `{"symbols": ["AAPL", "ES"]}`**: retry only the listed subset (must all be from the parent's failed set; otherwise 422).
@@ -579,103 +594,108 @@ There is no cancel endpoint. The pragmatic approach is:
 
 ## 8. Key files
 
-| Path                                                                        | What lives there                                                         |
-| --------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `backend/src/msai/api/symbol_onboarding.py`                                 | Onboard router (dry-run, onboard, status, repair, readiness)             |
-| `:110-157` `onboard_dry_run`                                                | Pure preflight cost estimate                                             |
-| `:178-200` `_dedup_job_id`                                                  | blake2b idempotency digest                                               |
-| `:203-317` `_enqueue_and_persist_run`                                       | Enqueue-first-then-commit helper                                         |
-| `:320-383` `onboard`                                                        | Start onboarding (202 Accepted)                                          |
-| `:386-430` `onboard_status`                                                 | Poll job progress                                                        |
-| `:433-516` `onboard_repair`                                                 | Re-run failed subset as child run                                        |
-| `:519-531` `_summarize`                                                     | Aggregate progress counts                                                |
-| `:534-554` `_suggest_next_action`                                           | Error-code → operator hint mapping                                       |
-| `:557-641` `readiness`                                                      | Three-state per-instrument readiness aggregate                           |
-| `backend/src/msai/api/instruments.py`                                       | Instruments router                                                       |
-| `:40-85` `bootstrap_instruments`                                            | Batch bootstrap (200 / 207 / 422)                                        |
-| `backend/src/msai/schemas/symbol_onboarding.py`                             | Onboarding request/response schemas                                      |
-| `:27-35` `SymbolStepStatus`                                                 | Per-symbol step enum                                                     |
-| `:38-42` `SymbolStatus`                                                     | Per-symbol status enum                                                   |
-| `:45-50` `RunStatus`                                                        | Run-level status enum                                                    |
-| `:53` `AssetClass`                                                          | API-surface literal: `equity \| futures \| fx \| option`                 |
-| `:56-77` `OnboardSymbolSpec`                                                | Per-symbol entry; symbol regex + date validators                         |
-| `:80-102` `OnboardRequest`                                                  | Onboard / dry-run / repair request; 100-symbol cap, kebab name           |
-| `:105-115` `SymbolStateRow`                                                 | Per-symbol state in `StatusResponse`                                     |
-| `:118-123` `OnboardProgress`                                                | Aggregate counts                                                         |
-| `:134-141` `StatusResponse`                                                 | Status poll response                                                     |
-| `:144-151` `DryRunResponse`                                                 | Dry-run cost estimate response                                           |
-| `:154-165` `ReadinessResponse`                                              | Readiness query response                                                 |
-| `backend/src/msai/workers/symbol_onboarding_job.py`                         | arq worker entrypoint                                                    |
-| `:51-163` `run_symbol_onboarding`                                           | Parent task; orchestrates per-symbol pipeline                            |
-| `:166-178` `_hydrate_specs`                                                 | Reconstruct `OnboardSymbolSpec` list from JSONB                          |
-| `:181-192` `_compute_terminal_status`                                       | Per-symbol → run-level terminal state                                    |
-| `backend/src/msai/services/symbol_onboarding/orchestrator.py`               | Per-symbol seam                                                          |
-| `:62-70` `_BOOTSTRAP_FAILURE_OUTCOMES`                                      | Outcomes that terminate the per-symbol pipeline                          |
-| `:73-83` `OrchestratorBootstrapProto`                                       | Bootstrap-service injection seam                                         |
-| `:85-89` `OrchestratorIBProto`                                              | IB-qualifier injection seam                                              |
-| `:92+` `_onboard_one_symbol`                                                | bootstrap → ingest → coverage → ib_qualify                               |
-| `backend/src/msai/services/symbol_onboarding/cost_estimator.py`             | Databento cost estimation                                                |
-| `:28-31` `_ASSET_TO_DATASET`                                                | equity → XNAS.ITCH, futures → GLBX.MDP3                                  |
-| `:34-51` `UnpriceableAssetClassError`                                       | Raised when asset_class lacks a Databento dataset mapping (422)          |
-| `:88-174` `estimate_cost`                                                   | Bucketed `metadata.get_cost` integration                                 |
-| `backend/src/msai/services/symbol_onboarding/coverage.py`                   | Parquet catalog coverage scan                                            |
-| `:26-62` `compute_coverage`                                                 | full / gapped / none determination                                       |
-| `:103-107` `_apply_trailing_edge_tolerance`                                 | Suppress recent-date misses (last 7 days)                                |
-| `backend/src/msai/services/symbol_onboarding/__init__.py`                   | Asset-class normalization                                                |
-| `:24-36` `normalize_asset_class_for_ingest`                                 | Registry → ingest taxonomy bridge (fail-loud)                            |
-| `backend/src/msai/services/nautilus/security_master/registry.py`            | Low-level alias lookup                                                   |
-| `:37-66` `AmbiguousSymbolError`                                             | Raised when raw_symbol matches multiple asset classes                    |
-| `:73-117` `find_by_alias`                                                   | Alias-string + provider + as_of_date → definition                        |
-| `:119-157` `find_by_aliases_bulk`                                           | One SELECT for batch                                                     |
-| `:159-196` `find_by_raw_symbol`                                             | raw_symbol + provider ± asset_class → definition                         |
-| `:198-219` `require_definition`                                             | `find_by_alias` that raises on miss                                      |
-| `backend/src/msai/services/nautilus/security_master/service.py`             | High-level resolver                                                      |
-| `:98-116` `compute_advisory_lock_key`                                       | Postgres int8 advisory-lock key                                          |
-| `:119-130` `compute_blake2b_digest_key`                                     | Generic blake2b digest helper (used by `_dedup_job_id`)                  |
-| `:133-150` `DatabentoDefinitionMissing` / `DatabentoClientUnavailableError` | Resolver-side exceptions                                                 |
-| `:154-176` `AliasResolution`                                                | Aggregate readiness dataclass                                            |
-| `:196-209` `SecurityMaster.__init__`                                        | qualifier / databento_client injection                                   |
-| `:211-251` `resolve`                                                        | Single-spec hot-path                                                     |
-| `:253-285` `bulk_resolve`                                                   | Batched warm-hit + residual qualification                                |
-| `:400-503` `resolve_for_backtest`                                           | Backtest canonical-id resolution (honors `start` for windowing)          |
-| `:505-595` `_resolve_databento_continuous`                                  | `<root>.Z.<N>` warm-hit or synthesize                                    |
-| `:686-790` `find_active_aliases`                                            | Aggregate readiness view (provider preference at `:778-783`)             |
-| `backend/src/msai/services/nautilus/security_master/types.py`               | Type bridges                                                             |
-| `:14` `RegistryAssetClass`                                                  | `equity \| futures \| fx \| option \| crypto`                            |
-| `:19` `IngestAssetClass`                                                    | `stocks \| futures \| options \| forex \| crypto`                        |
-| `:22` `Provider`                                                            | `interactive_brokers \| databento`                                       |
-| `:26` `VenueFormat`                                                         | `exchange_name \| mic_code \| databento_continuous`                      |
-| `:32-50` `REGISTRY_TO_INGEST_ASSET_CLASS`                                   | Canonical taxonomy map (shared by SecurityMaster + orchestrator)         |
-| `backend/src/msai/services/nautilus/live_instrument_bootstrap.py`           | Time-aware helpers                                                       |
-| `:61-69` `exchange_local_today`                                             | CME-local today (writer + reader)                                        |
-| `:72-82` `third_friday_of`                                                  | CME quarterly expiration helper                                          |
-| `:85-104` `current_quarterly_expiry`                                        | Next quarterly contract id                                               |
-| `backend/src/msai/models/symbol_onboarding_run.py`                          | Run row model                                                            |
-| `:23-28` `SymbolOnboardingRunStatus`                                        | Run-level enum                                                           |
-| `:31-80` `SymbolOnboardingRun`                                              | Table model + constraints                                                |
-| `backend/src/msai/models/instrument_definition.py`                          | Definitions table                                                        |
-| `:34-95` `InstrumentDefinition`                                             | UUID-keyed; unique on `(raw_symbol, provider, asset_class)`              |
-| `backend/src/msai/models/instrument_alias.py`                               | Aliases table                                                            |
-| `:33-86` `InstrumentAlias`                                                  | Effective-windowed; unique on `(alias_string, provider, effective_from)` |
-| `backend/src/msai/cli.py`                                                   | Top-level CLI                                                            |
-| `:785-979` `instruments refresh`                                            | Pre-warm registry via Databento or IB                                    |
-| `:1175-1277` `instruments bootstrap`                                        | Databento batch bootstrap (handles 207)                                  |
-| `:1282-1284` `symbols` sub-app registration                                 | Wire `cli_symbols` into `msai`                                           |
-| `backend/src/msai/cli_symbols.py`                                           | Symbols sub-app                                                          |
-| `:17-75` `onboard`                                                          | `--manifest` + optional `--dry-run`                                      |
-| `:78-96` `status`                                                           | `--watch` polls every 5s                                                 |
-| `:99-111` `repair`                                                          | `--symbols` to scope                                                     |
-| `:148-154` `_exit_for_status`                                               | CLI exit codes (0/1/2/3)                                                 |
-| `frontend/src/app/data-management/page.tsx`                                 | Data-management UI page                                                  |
-| `:32-134` `DataManagementPage`                                              | Read-only browse of registered symbols                                   |
-| `backend/alembic/versions/v0q1r2s3t4u5_instrument_registry.py`              | Registry tables migration                                                |
-| `:19-93` `instrument_definitions`                                           | Initial table create                                                     |
-| `:95-160+` `instrument_aliases`                                             | Initial table create                                                     |
-| `backend/alembic/versions/b6c7d8e9f0a1_*.py`                                | Relax `effective_window` CHECK for same-day rotations                    |
-| `backend/alembic/versions/d1e2f3g4h5i6_*.py`                                | Add `trading_hours` JSONB to `instrument_definitions`                    |
-| `backend/alembic/versions/a5b6c7d8e9f0_*.py`                                | Add `source_venue_raw` to `instrument_aliases`                           |
-| `backend/alembic/versions/e2f3g4h5i6j7_*.py`                                | Drop deprecated `instrument_cache` table (migration to registry)         |
-| `docs/runbooks/instrument-cache-migration.md`                               | Manual alias close-out + cache-to-registry migration runbook             |
+| Path                                                                        | What lives there                                                                                            |
+| --------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `backend/src/msai/api/symbol_onboarding.py`                                 | Onboard router (dry-run, onboard, status, repair, readiness, inventory, remove)                             |
+| `:120-168` `onboard_dry_run`                                                | Pure preflight cost estimate                                                                                |
+| `:187-211` `_dedup_job_id`                                                  | blake2b idempotency digest                                                                                  |
+| `:212-344` `_enqueue_and_persist_run`                                       | Enqueue-first-then-commit helper                                                                            |
+| `:345-454` `onboard`                                                        | Start onboarding (202 Accepted)                                                                             |
+| `:455-505` `onboard_status`                                                 | Poll job progress                                                                                           |
+| `:506-586` `onboard_repair`                                                 | Re-run failed subset as child run                                                                           |
+| `:587-601` `_summarize`                                                     | Aggregate progress counts                                                                                   |
+| `:602-624` `_suggest_next_action`                                           | Error-code → operator hint mapping                                                                          |
+| `:625-638` `_not_registered_message`                                        | 404 message that names the pinned provider when `provider` is set                                           |
+| `:640-665` `_ambiguous_provider_response`                                   | 422 `AMBIGUOUS_INSTRUMENT` envelope (shared by readiness fallback + remove)                                 |
+| `:667-782` `readiness`                                                      | Three-state per-instrument readiness aggregate; optional `provider` param, defaults to `prefer_primary`     |
+| `:783-875` `inventory`                                                      | Per-provider rows for a symbol (one row per provider)                                                       |
+| `:876-931` `remove_symbol`                                                  | Soft-delete; optional `provider` param, unpinned-ambiguous → 422 (`on_ambiguity="raise"`)                   |
+| `backend/src/msai/api/instruments.py`                                       | Instruments router                                                                                          |
+| `:40-85` `bootstrap_instruments`                                            | Batch bootstrap (200 / 207 / 422)                                                                           |
+| `backend/src/msai/schemas/symbol_onboarding.py`                             | Onboarding request/response schemas                                                                         |
+| `:27-35` `SymbolStepStatus`                                                 | Per-symbol step enum                                                                                        |
+| `:38-42` `SymbolStatus`                                                     | Per-symbol status enum                                                                                      |
+| `:45-50` `RunStatus`                                                        | Run-level status enum                                                                                       |
+| `:53` `AssetClass`                                                          | API-surface literal: `equity \| futures \| fx \| option`                                                    |
+| `:56-77` `OnboardSymbolSpec`                                                | Per-symbol entry; symbol regex + date validators                                                            |
+| `:80-102` `OnboardRequest`                                                  | Onboard / dry-run / repair request; 100-symbol cap, kebab name                                              |
+| `:105-115` `SymbolStateRow`                                                 | Per-symbol state in `StatusResponse`                                                                        |
+| `:118-123` `OnboardProgress`                                                | Aggregate counts                                                                                            |
+| `:134-141` `StatusResponse`                                                 | Status poll response                                                                                        |
+| `:144-151` `DryRunResponse`                                                 | Dry-run cost estimate response                                                                              |
+| `:154-165` `ReadinessResponse`                                              | Readiness query response                                                                                    |
+| `backend/src/msai/workers/symbol_onboarding_job.py`                         | arq worker entrypoint                                                                                       |
+| `:51-163` `run_symbol_onboarding`                                           | Parent task; orchestrates per-symbol pipeline                                                               |
+| `:166-178` `_hydrate_specs`                                                 | Reconstruct `OnboardSymbolSpec` list from JSONB                                                             |
+| `:181-192` `_compute_terminal_status`                                       | Per-symbol → run-level terminal state                                                                       |
+| `backend/src/msai/services/symbol_onboarding/orchestrator.py`               | Per-symbol seam                                                                                             |
+| `:62-70` `_BOOTSTRAP_FAILURE_OUTCOMES`                                      | Outcomes that terminate the per-symbol pipeline                                                             |
+| `:73-83` `OrchestratorBootstrapProto`                                       | Bootstrap-service injection seam                                                                            |
+| `:85-89` `OrchestratorIBProto`                                              | IB-qualifier injection seam                                                                                 |
+| `:92+` `_onboard_one_symbol`                                                | bootstrap → ingest → coverage → ib_qualify                                                                  |
+| `backend/src/msai/services/symbol_onboarding/cost_estimator.py`             | Databento cost estimation                                                                                   |
+| `:28-31` `_ASSET_TO_DATASET`                                                | equity → XNAS.ITCH, futures → GLBX.MDP3                                                                     |
+| `:34-51` `UnpriceableAssetClassError`                                       | Raised when asset_class lacks a Databento dataset mapping (422)                                             |
+| `:88-174` `estimate_cost`                                                   | Bucketed `metadata.get_cost` integration                                                                    |
+| `backend/src/msai/services/symbol_onboarding/coverage.py`                   | Parquet catalog coverage scan                                                                               |
+| `:26-62` `compute_coverage`                                                 | full / gapped / none determination                                                                          |
+| `:103-107` `_apply_trailing_edge_tolerance`                                 | Suppress recent-date misses (last 7 days)                                                                   |
+| `backend/src/msai/services/symbol_onboarding/__init__.py`                   | Asset-class normalization                                                                                   |
+| `:24-36` `normalize_asset_class_for_ingest`                                 | Registry → ingest taxonomy bridge (fail-loud)                                                               |
+| `backend/src/msai/services/nautilus/security_master/registry.py`            | Low-level alias lookup                                                                                      |
+| `:37-88` `AmbiguousSymbolError`                                             | Raised when `(symbol, asset_class)` matches definitions under multiple providers (carries `providers` list) |
+| `:73-117` `find_by_alias`                                                   | Alias-string + provider + as_of_date → definition                                                           |
+| `:119-157` `find_by_aliases_bulk`                                           | One SELECT for batch                                                                                        |
+| `:159-196` `find_by_raw_symbol`                                             | raw_symbol + provider ± asset_class → definition                                                            |
+| `:198-219` `require_definition`                                             | `find_by_alias` that raises on miss                                                                         |
+| `backend/src/msai/services/nautilus/security_master/service.py`             | High-level resolver                                                                                         |
+| `:98-116` `compute_advisory_lock_key`                                       | Postgres int8 advisory-lock key                                                                             |
+| `:119-132` `compute_blake2b_digest_key`                                     | Generic blake2b digest helper (used by `_dedup_job_id`)                                                     |
+| `:133-150` `DatabentoDefinitionMissing` / `DatabentoClientUnavailableError` | Resolver-side exceptions                                                                                    |
+| `:164-187` `AliasResolution`                                                | Aggregate readiness dataclass                                                                               |
+| `:224-238` `SecurityMaster.__init__`                                        | qualifier / databento_client injection                                                                      |
+| `:239-280` `resolve`                                                        | Single-spec hot-path                                                                                        |
+| `:281-314` `bulk_resolve`                                                   | Batched warm-hit + residual qualification                                                                   |
+| `:428-672` `resolve_for_backtest`                                           | Backtest canonical-id resolution (honors `start` for windowing)                                             |
+| `:673-765` `_resolve_databento_continuous`                                  | `<root>.Z.<N>` warm-hit or synthesize                                                                       |
+| `:932-943` `_preferred_provider`                                            | Provider-preference policy (`databento` > `interactive_brokers` > sorted)                                   |
+| `:945-1088` `find_active_aliases`                                           | Aggregate readiness view + optional `provider` filter / `on_ambiguity` knob (calls `_preferred_provider`)   |
+| `backend/src/msai/services/nautilus/security_master/types.py`               | Type bridges                                                                                                |
+| `:14` `RegistryAssetClass`                                                  | `equity \| futures \| fx \| option \| crypto`                                                               |
+| `:19` `IngestAssetClass`                                                    | `stocks \| futures \| options \| forex \| crypto`                                                           |
+| `:22` `Provider`                                                            | `interactive_brokers \| databento`                                                                          |
+| `:26` `VenueFormat`                                                         | `exchange_name \| mic_code \| databento_continuous`                                                         |
+| `:32-50` `REGISTRY_TO_INGEST_ASSET_CLASS`                                   | Canonical taxonomy map (shared by SecurityMaster + orchestrator)                                            |
+| `backend/src/msai/services/nautilus/live_instrument_bootstrap.py`           | Time-aware helpers                                                                                          |
+| `:61-69` `exchange_local_today`                                             | CME-local today (writer + reader)                                                                           |
+| `:72-82` `third_friday_of`                                                  | CME quarterly expiration helper                                                                             |
+| `:85-104` `current_quarterly_expiry`                                        | Next quarterly contract id                                                                                  |
+| `backend/src/msai/models/symbol_onboarding_run.py`                          | Run row model                                                                                               |
+| `:23-28` `SymbolOnboardingRunStatus`                                        | Run-level enum                                                                                              |
+| `:31-80` `SymbolOnboardingRun`                                              | Table model + constraints                                                                                   |
+| `backend/src/msai/models/instrument_definition.py`                          | Definitions table                                                                                           |
+| `:34-95` `InstrumentDefinition`                                             | UUID-keyed; unique on `(raw_symbol, provider, asset_class)`                                                 |
+| `backend/src/msai/models/instrument_alias.py`                               | Aliases table                                                                                               |
+| `:33-86` `InstrumentAlias`                                                  | Effective-windowed; unique on `(alias_string, provider, effective_from)`                                    |
+| `backend/src/msai/cli.py`                                                   | Top-level CLI                                                                                               |
+| `:785-979` `instruments refresh`                                            | Pre-warm registry via Databento or IB                                                                       |
+| `:1175-1277` `instruments bootstrap`                                        | Databento batch bootstrap (handles 207)                                                                     |
+| `:1282-1284` `symbols` sub-app registration                                 | Wire `cli_symbols` into `msai`                                                                              |
+| `backend/src/msai/cli_symbols.py`                                           | Symbols sub-app                                                                                             |
+| `:17-75` `onboard`                                                          | `--manifest` + optional `--dry-run`                                                                         |
+| `:78-96` `status`                                                           | `--watch` polls every 5s                                                                                    |
+| `:99-111` `repair`                                                          | `--symbols` to scope                                                                                        |
+| `:148-154` `_exit_for_status`                                               | CLI exit codes (0/1/2/3)                                                                                    |
+| `frontend/src/app/data-management/page.tsx`                                 | Data-management UI page                                                                                     |
+| `:32-134` `DataManagementPage`                                              | Read-only browse of registered symbols                                                                      |
+| `backend/alembic/versions/v0q1r2s3t4u5_instrument_registry.py`              | Registry tables migration                                                                                   |
+| `:19-93` `instrument_definitions`                                           | Initial table create                                                                                        |
+| `:95-160+` `instrument_aliases`                                             | Initial table create                                                                                        |
+| `backend/alembic/versions/b6c7d8e9f0a1_*.py`                                | Relax `effective_window` CHECK for same-day rotations                                                       |
+| `backend/alembic/versions/d1e2f3g4h5i6_*.py`                                | Add `trading_hours` JSONB to `instrument_definitions`                                                       |
+| `backend/alembic/versions/a5b6c7d8e9f0_*.py`                                | Add `source_venue_raw` to `instrument_aliases`                                                              |
+| `backend/alembic/versions/e2f3g4h5i6j7_*.py`                                | Drop deprecated `instrument_cache` table (migration to registry)                                            |
+| `docs/runbooks/instrument-cache-migration.md`                               | Manual alias close-out + cache-to-registry migration runbook                                                |
 
 ---
 

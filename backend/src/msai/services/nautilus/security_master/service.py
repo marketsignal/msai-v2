@@ -39,7 +39,7 @@ from __future__ import annotations
 import uuid  # noqa: TC003 — used in dataclass field annotation evaluated at runtime
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -928,12 +928,28 @@ class SecurityMaster:
             for r in rows
         ]
 
+    @staticmethod
+    def _preferred_provider(provider_set: set[str]) -> str:
+        """Return the preferred provider under the registry policy.
+
+        Policy: ``databento`` > ``interactive_brokers`` > the
+        lexicographically-first remaining provider (deterministic
+        fallback). Callers pass a non-empty set.
+        """
+        if "databento" in provider_set:
+            return "databento"
+        if "interactive_brokers" in provider_set:
+            return "interactive_brokers"
+        return sorted(provider_set)[0]
+
     async def find_active_aliases(
         self,
         *,
         symbol: str,
         asset_class: RegistryAssetClass,
         as_of_date: date,
+        provider: Provider | None = None,
+        on_ambiguity: Literal["raise", "prefer_primary"] = "raise",
     ) -> AliasResolution:
         """Aggregate readiness view for a ``(symbol, asset_class)`` pair.
 
@@ -943,6 +959,26 @@ class SecurityMaster:
         off an :class:`InstrumentDefinition` with the requested
         ``asset_class``.
 
+        Soft-deleted definitions (``hidden_from_inventory=True``) are
+        EXCLUDED from the row set (PR #91 review). This is a user-surface
+        view (readiness + delete only), so it tracks the inventory's
+        soft-delete semantics. Consequences:
+
+        - One provider hidden, sibling visible → unpinned readiness
+          resolves the *visible* provider (the hidden one can no longer be
+          chosen by ``prefer_primary``); unpinned DELETE resolves the
+          single visible row (no ``AmbiguousSymbolError`` 422).
+        - Pinning a hidden provider → ``instrument_uid=None`` → caller's
+          404 (soft-deleted == gone from the user surface until
+          re-onboarded).
+        - All providers hidden → ``instrument_uid=None`` → 404, matching
+          empty inventory.
+        - Repeat-delete of an already-hidden single-provider symbol →
+          ``instrument_uid=None`` → caller's 404 (correct REST: the
+          resource is gone). NOTE: the backtest/live resolvers
+          (``InstrumentRegistry.find_by_alias`` / ``find_by_raw_symbol``)
+          do NOT consult this flag — inventory-hidden is not registry-dead.
+
         ``asset_class`` is the registry/user-facing taxonomy
         (``equity`` | ``futures`` | ``fx`` | ``option`` | ``crypto``) per
         the ``ck_instrument_definitions_asset_class`` CHECK.
@@ -951,19 +987,40 @@ class SecurityMaster:
         caller owns the time-zone decision — same discipline as
         :meth:`InstrumentRegistry.find_by_alias` after PR #37.
 
-        Raises :class:`AmbiguousSymbolError` when more than one
-        :class:`InstrumentDefinition` row matches (same raw_symbol and
-        asset_class but different ``instrument_uid`` across providers).
+        ``provider`` (keyword-only, optional) pins resolution to a single
+        provider's definition. When set, the row-select WHERE filters on
+        ``InstrumentDefinition.provider``, so the uid-collapse can no
+        longer be provider-ambiguous and ``has_ib_alias`` is scoped to the
+        pinned provider's rows. A pinned provider with no matching row
+        returns ``instrument_uid=None`` (the existing not-found path) —
+        the caller turns that into an actionable 404.
+
+        ``on_ambiguity`` selects the unpinned dual-provider behavior
+        (fixes the ``/symbols/readiness`` provider dead-end —
+        2026-06-06):
+
+        - ``"raise"`` (default) → :class:`AmbiguousSymbolError`, preserving
+          the explicit-provider requirement for destructive callers
+          (``DELETE /symbols/{symbol}``).
+        - ``"prefer_primary"`` → the read path picks the uid whose
+          definition ranks first under the provider-preference policy
+          (``databento`` > ``interactive_brokers`` > sorted-first) and
+          scopes the metadata block to it, while ``has_ib_alias`` stays
+          aggregate across ALL the symbol's active alias rows. Coverage is
+          provider-invariant, so this answers readiness without weakening
+          deletes.
+
         Returns an :class:`AliasResolution` with ``instrument_uid=None``
         when no row matches — caller turns that into HTTP 404.
 
         Provider-preference policy: ``databento`` >
         ``interactive_brokers`` > anything else (deterministic fallback
-        to the lexicographically-first remaining provider). The
-        ``has_ib_alias`` flag is independent and reflects whether ANY
-        active alias row carries ``provider="interactive_brokers"`` —
-        that is the live-qualification signal for the Symbol Onboarding
-        readiness contract.
+        to the lexicographically-first remaining provider). When unpinned,
+        the ``has_ib_alias`` flag reflects whether ANY active alias row
+        carries ``provider="interactive_brokers"``; when pinned it is
+        scoped to the pinned provider's rows. That flag is the
+        live-qualification signal for the Symbol Onboarding readiness
+        contract.
         """
         from msai.models.instrument_alias import InstrumentAlias
         from msai.models.instrument_definition import InstrumentDefinition
@@ -971,26 +1028,38 @@ class SecurityMaster:
             AmbiguousSymbolError,
         )
 
-        rows = (
-            (
-                await self._db.execute(
-                    select(InstrumentAlias)
-                    .join(
-                        InstrumentDefinition,
-                        InstrumentDefinition.instrument_uid == InstrumentAlias.instrument_uid,
-                    )
-                    .where(InstrumentDefinition.raw_symbol == symbol)
-                    .where(InstrumentDefinition.asset_class == asset_class)
-                    .where(InstrumentAlias.effective_from <= as_of_date)
-                    .where(
-                        (InstrumentAlias.effective_to.is_(None))
-                        | (InstrumentAlias.effective_to > as_of_date)
-                    )
-                )
+        stmt = (
+            select(InstrumentAlias)
+            .join(
+                InstrumentDefinition,
+                InstrumentDefinition.instrument_uid == InstrumentAlias.instrument_uid,
             )
-            .scalars()
-            .all()
+            .where(InstrumentDefinition.raw_symbol == symbol)
+            .where(InstrumentDefinition.asset_class == asset_class)
+            # PR #91 review (chatgpt-codex-connector, service.py:1026 area):
+            # exclude soft-deleted (``hidden_from_inventory``) definitions from
+            # the active row set so the readiness/delete view (the ONLY callers
+            # of this method) is aligned with the inventory's soft-delete
+            # semantics. Without this, a hidden definition still participated:
+            # ``prefer_primary`` could return the HIDDEN provider's uid, and an
+            # unpinned DELETE still 422'd "ambiguous" though only one provider
+            # remained visible in the inventory. ``find_active_aliases`` is a
+            # user-surface (inventory) view — inventory-hidden == gone here.
+            # NOTE: the backtest/live resolvers (``find_by_alias`` /
+            # ``find_by_raw_symbol``) deliberately do NOT filter this flag —
+            # inventory-hidden is not registry-dead, so a soft-deleted symbol is
+            # still resolvable for an in-flight backtest/deployment.
+            .where(InstrumentDefinition.hidden_from_inventory.is_(False))
+            .where(InstrumentAlias.effective_from <= as_of_date)
+            .where(
+                (InstrumentAlias.effective_to.is_(None))
+                | (InstrumentAlias.effective_to > as_of_date)
+            )
         )
+        if provider is not None:
+            stmt = stmt.where(InstrumentDefinition.provider == provider)
+
+        rows = (await self._db.execute(stmt)).scalars().all()
 
         if not rows:
             return AliasResolution(
@@ -1001,8 +1070,26 @@ class SecurityMaster:
             )
 
         uids = {r.instrument_uid for r in rows}
+        # ``has_ib_alias`` aggregates across every selected alias row. When
+        # ``provider`` is pinned the row set is already scoped to that
+        # provider, so this is automatically the scoped (per-provider)
+        # value; when unpinned it is the cross-provider aggregate.
+        has_ib = "interactive_brokers" in {r.provider for r in rows}
+
         if len(uids) > 1:
             sorted_providers = sorted({r.provider for r in rows})
+            if on_ambiguity == "prefer_primary":
+                # Read path: pick the preferred provider's uid and scope the
+                # metadata block to it. ``has_ib`` stays the aggregate
+                # computed above (live-qualification is symbol-wide).
+                primary = self._preferred_provider({r.provider for r in rows})
+                instrument_uid = next(r.instrument_uid for r in rows if r.provider == primary)
+                return AliasResolution(
+                    instrument_uid=instrument_uid,
+                    primary_provider=primary,
+                    has_ib_alias=has_ib,
+                    registry_asset_class=asset_class,
+                )
             # ``AmbiguousSymbolError.provider`` is typed as :data:`Provider`
             # (registry-namespaced); the SQLA-stub-typed ``r.provider`` is
             # ``str``. DB rows reach this branch only after passing the
@@ -1012,11 +1099,11 @@ class SecurityMaster:
                 "Provider",
                 sorted_providers[0] if sorted_providers else "interactive_brokers",
             )
-            # iter-5 verify-e2e Issue F (P2): this branch fires when the
-            # same (symbol, asset_class) has aliases under multiple
-            # providers (e.g. AAPL on databento AND interactive_brokers).
-            # Pass ``providers`` to surface the real disambiguator
-            # instead of misleading the caller about asset_class.
+            # This branch fires when the same (symbol, asset_class) has
+            # aliases under multiple providers (e.g. AAPL on databento AND
+            # interactive_brokers). Pass ``providers`` to surface the real
+            # disambiguator instead of misleading the caller about
+            # asset_class.
             raise AmbiguousSymbolError(
                 symbol=symbol,
                 provider=first_provider,
@@ -1024,14 +1111,7 @@ class SecurityMaster:
                 providers=sorted_providers,
             )
         instrument_uid = next(iter(uids))
-        provider_set = {r.provider for r in rows}
-        has_ib = "interactive_brokers" in provider_set
-        if "databento" in provider_set:
-            primary = "databento"
-        elif has_ib:
-            primary = "interactive_brokers"
-        else:
-            primary = sorted(provider_set)[0]
+        primary = self._preferred_provider({r.provider for r in rows})
 
         return AliasResolution(
             instrument_uid=instrument_uid,

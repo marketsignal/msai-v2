@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,19 @@ console = Console()
 # routes' ``ReadinessAssetClass`` enum). NOT ``stocks`` — that's an ingest-side
 # alias; registry uses ``equity``.
 _VALID_ASSET_CLASSES = ("equity", "futures", "fx", "option")
+
+
+class ProviderOption(StrEnum):
+    """Provider choices for the ``--provider`` option on readiness/delete.
+
+    Mirrors ``services.nautilus.security_master.types.Provider`` — kept in step
+    with the endpoints' ``provider`` query param so the CLI rejects unknown
+    providers up front (Typer renders the choices in helptext) and forwards the
+    string value verbatim as the ``provider`` query param.
+    """
+
+    databento = "databento"
+    interactive_brokers = "interactive_brokers"
 
 
 @app.command()
@@ -216,6 +230,15 @@ def readiness(
         help="Optional window start (YYYY-MM-DD); without both, backtest_data_available=null",
     ),
     end: str = typer.Option("", "--end", help="Optional window end (YYYY-MM-DD)"),
+    provider: ProviderOption | None = typer.Option(
+        None,
+        "--provider",
+        help=(
+            "Optional: pin a dual-provider symbol's view "
+            "(databento|interactive_brokers). Omit to use the server's default "
+            "preference (databento > interactive_brokers)."
+        ),
+    ),
 ) -> None:
     """Window-scoped per-instrument readiness."""
     from msai.cli import _api_call, _emit_json  # noqa: PLC0415
@@ -226,6 +249,8 @@ def readiness(
         params["start"] = start
     if end:
         params["end"] = end
+    if provider is not None:
+        params["provider"] = provider.value
     response = _api_call("GET", "/api/v1/symbols/readiness", params=params)
     _emit_json(response.json())
 
@@ -245,12 +270,27 @@ def delete(
         "--asset-class",
         help="Asset class: equity|futures|fx|option",
     ),
+    provider: ProviderOption | None = typer.Option(
+        None,
+        "--provider",
+        help=(
+            "Optional: pin which provider's definition to soft-delete "
+            "(databento|interactive_brokers). REQUIRED for a dual-provider "
+            "symbol — without it the API returns 422 AMBIGUOUS_INSTRUMENT "
+            "naming the providers to choose from."
+        ),
+    ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
 ) -> None:
     """Soft-delete a registered instrument (hidden from inventory; Parquet preserved).
 
     The route returns HTTP 204 with an empty body — we synthesize a success
     message instead of trying to parse JSON.
+
+    For a symbol carried by BOTH providers the destructive delete stays explicit:
+    omit ``--provider`` and the API returns a satisfiable 422 AMBIGUOUS_INSTRUMENT
+    (surfaced to stderr) telling you which providers to pin; re-run with
+    ``--provider <name>`` to scope the delete to one provider's definition.
     """
     from msai.cli import _api_call, _url_id  # noqa: PLC0415
 
@@ -264,15 +304,21 @@ def delete(
             "Track as a follow-up (route would need /{symbol:path})."
         )
     if not yes:
+        prompt_suffix = f", provider={provider.value}" if provider is not None else ""
         typer.confirm(
-            f"Soft-delete {symbol} (asset_class={asset_class})?",
+            f"Soft-delete {symbol} (asset_class={asset_class}{prompt_suffix})?",
             abort=True,
         )
+    params: dict[str, Any] = {"asset_class": asset_class}
+    if provider is not None:
+        params["provider"] = provider.value
     # 204 success → no JSON body. _api_call accepts 2xx as success; we MUST
-    # NOT call .json() on the response.
+    # NOT call .json() on the response. On a 4xx (e.g. the ambiguous-provider
+    # 422), _api_call renders the API error envelope to stderr via _fail and
+    # raises typer.Exit — so the satisfiable instruction reaches the operator.
     _api_call(
         "DELETE",
         f"/api/v1/symbols/{_url_id(symbol)}",
-        params={"asset_class": asset_class},
+        params=params,
     )
     typer.echo(f"Deleted {symbol}")

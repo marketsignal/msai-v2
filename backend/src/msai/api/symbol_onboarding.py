@@ -54,6 +54,7 @@ from msai.services.nautilus.security_master.service import (
     SecurityMaster,
     compute_blake2b_digest_key,
 )
+from msai.services.nautilus.security_master.types import Provider
 from msai.services.symbol_onboarding import normalize_asset_class_for_ingest
 from msai.services.symbol_onboarding.cost_estimator import (
     UnpriceableAssetClassError,
@@ -412,12 +413,23 @@ async def onboard(
     # error branches it returns without committing, so the pending unhide
     # gets rolled back when the session is disposed — a rejected re-onboard
     # no longer leaks visibility.
+    #
+    # PR-91 review fix (chatgpt-codex-connector, P2): scope the un-hide to
+    # ``provider="databento"`` rows ONLY. This handler IS the Databento
+    # onboarding path — it never creates/touches ``interactive_brokers`` rows
+    # (those are registered exclusively via ``msai instruments refresh
+    # --provider interactive_brokers``; the orchestrator/databento_bootstrap
+    # always write ``provider="databento"``). Without this predicate a normal
+    # Databento re-onboard would silently un-hide an ``interactive_brokers``
+    # definition that a provider-scoped DELETE deliberately hid, undoing the
+    # scoped soft-delete this branch added.
     for spec in request.symbols:
         await db.execute(
             update(InstrumentDefinition)
             .where(
                 InstrumentDefinition.raw_symbol == spec.symbol,
                 InstrumentDefinition.asset_class == spec.asset_class,
+                InstrumentDefinition.provider == "databento",
                 InstrumentDefinition.hidden_from_inventory.is_(True),
             )
             .values(hidden_from_inventory=False)
@@ -621,12 +633,54 @@ def _suggest_next_action(entry: dict[str, Any]) -> str | None:
     return mapping.get(code)
 
 
+def _not_registered_message(
+    symbol: str,
+    asset_class: ReadinessAssetClass,
+    provider: Provider | None,
+) -> str:
+    """Not-found message that names the pinned provider when one is set, so a
+    caller pinning a provider with no row gets an actionable correction."""
+    if provider is not None:
+        return (
+            f"Symbol {symbol!r} (asset_class={asset_class!r}) is not registered "
+            f"under provider {provider!r}"
+        )
+    return f"Symbol {symbol!r} not registered for asset_class={asset_class!r}"
+
+
+def _ambiguous_provider_response(
+    symbol: str,
+    asset_class: ReadinessAssetClass,
+    exc: AmbiguousSymbolError,
+) -> JSONResponse:
+    """Map :class:`AmbiguousSymbolError` to the 422 AMBIGUOUS_INSTRUMENT
+    envelope. The instruction is now satisfiable: the destructive caller can
+    re-issue the request with the ``provider`` query param."""
+    if exc.providers:
+        message = (
+            f"Symbol {symbol!r} (asset_class={asset_class!r}) matches "
+            f"definitions under multiple providers ({sorted(exc.providers)}); "
+            "pin provider explicitly via the provider query param."
+        )
+    else:
+        message = (
+            f"Symbol {symbol!r} matches {len(exc.asset_classes)} asset classes "
+            f"({sorted(exc.asset_classes)}); pin asset_class explicitly."
+        )
+    return error_response(
+        status_code=422,
+        code="AMBIGUOUS_INSTRUMENT",
+        message=message,
+    )
+
+
 @router.get("/readiness", response_model=ReadinessResponse)
 async def readiness(
     symbol: str = Query(..., min_length=1, max_length=20),  # noqa: B008
     asset_class: ReadinessAssetClass = Query(...),  # noqa: B008
     start: _date | None = Query(default=None),  # noqa: B008
     end: _date | None = Query(default=None),  # noqa: B008
+    provider: Provider | None = Query(default=None),  # noqa: B008
     _user: Any = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> ReadinessResponse | JSONResponse:
@@ -642,8 +696,16 @@ async def readiness(
     ``coverage_status`` reports ``full`` | ``gapped`` | ``none`` plus
     any ``missing_ranges``.
 
+    ``provider`` (optional) pins the resolved provider's view of a
+    dual-provider symbol (``live_qualified`` scoped to that provider).
+    When omitted, resolution defaults to the provider-preference policy
+    (``databento`` > ``interactive_brokers``) — coverage is
+    provider-invariant, so the read answers without a dead-end, and
+    ``live_qualified`` stays aggregate across providers.
+
     **Errors:**
-    - 404 NOT_FOUND — no active alias rows for ``(symbol, asset_class)``.
+    - 404 NOT_FOUND — no active alias rows for ``(symbol, asset_class)``
+      (message names the pinned provider when ``provider`` is set).
     - 401 Unauthorized — JWT missing or invalid.
     """
     master = SecurityMaster(db=db)
@@ -652,11 +714,15 @@ async def readiness(
             symbol=symbol,
             asset_class=asset_class,
             as_of_date=exchange_local_today(),
+            provider=provider,
+            on_ambiguity="prefer_primary",
         )
     except AmbiguousSymbolError as exc:
-        # iter-5 verify-e2e Issue F (P2): the exception carries either
-        # provider-multiplicity OR asset-class-multiplicity context;
-        # surface whichever applies so the caller gets actionable advice.
+        # Defensive fallback: with ``on_ambiguity="prefer_primary"`` the
+        # service no longer raises provider-multiplicity ambiguity on this
+        # path, so this handler is now unreachable from readiness. It is
+        # retained to keep the contract explicit (and to map any future
+        # asset-class-multiplicity ambiguity to a 422 rather than a 500).
         if exc.providers:
             message = (
                 f"Symbol {symbol!r} (asset_class={asset_class!r}) matches "
@@ -677,18 +743,20 @@ async def readiness(
         return error_response(
             status_code=404,
             code="NOT_FOUND",
-            message=f"Symbol {symbol!r} not registered for asset_class={asset_class!r}",
+            message=_not_registered_message(symbol, asset_class, provider),
         )
 
     live_qualified = resolution.has_ib_alias
-    provider = resolution.primary_provider
+    # Distinct name from the ``provider`` query param: this is the RESOLVED
+    # provider (``str``), which when unpinned is the preference-ordered primary.
+    resolved_provider = resolution.primary_provider
     ingest_asset = normalize_asset_class_for_ingest(asset_class)
 
     if start is None or end is None:
         return ReadinessResponse(
             instrument_uid=resolution.instrument_uid,
             registered=True,
-            provider=provider,
+            provider=resolved_provider,
             backtest_data_available=None,
             coverage_status=None,
             covered_range=None,
@@ -710,7 +778,7 @@ async def readiness(
     return ReadinessResponse(
         instrument_uid=resolution.instrument_uid,
         registered=True,
-        provider=provider,
+        provider=resolved_provider,
         backtest_data_available=(report.status == "full"),
         coverage_status=report.status,
         covered_range=report.covered_range,
@@ -819,6 +887,7 @@ async def inventory(
 async def remove_symbol(
     symbol: str,
     asset_class: ReadinessAssetClass = Query(...),  # noqa: B008
+    provider: Provider | None = Query(default=None),  # noqa: B008
     _user: Any = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> Response | JSONResponse:
@@ -830,21 +899,38 @@ async def remove_symbol(
     Per Pablo's intent (single-user product): does NOT block on usage in
     active strategies / live deployments. The user owns inventory state.
 
+    Destructive ops stay explicit: a dual-provider symbol deleted WITHOUT a
+    ``provider`` query param returns 422 AMBIGUOUS_INSTRUMENT (now
+    satisfiable — re-issue with ``provider``). Pinning ``provider`` scopes
+    the soft-delete to that provider's definition only.
+
     **Errors:**
-    - 404 NOT_FOUND — no active alias rows for ``(symbol, asset_class)``.
+    - 404 NOT_FOUND — no active alias rows for ``(symbol, asset_class)``
+      (message names the pinned provider when ``provider`` is set).
+    - 422 AMBIGUOUS_INSTRUMENT — dual-provider symbol deleted without a
+      pinned ``provider``.
     - 401 Unauthorized — JWT missing or invalid.
     """
     master = SecurityMaster(db=db)
-    resolution = await master.find_active_aliases(
-        symbol=symbol,
-        asset_class=asset_class,
-        as_of_date=exchange_local_today(),
-    )
+    try:
+        resolution = await master.find_active_aliases(
+            symbol=symbol,
+            asset_class=asset_class,
+            as_of_date=exchange_local_today(),
+            provider=provider,
+            on_ambiguity="raise",
+        )
+    except AmbiguousSymbolError as exc:
+        # remove_symbol previously had NO handler here — AmbiguousSymbolError
+        # escaped as an unhandled 500 (plan-review iter-1 P1). Destructive
+        # deletes keep the explicit-provider requirement, but the error is now
+        # a satisfiable 422 naming the provider param.
+        return _ambiguous_provider_response(symbol, asset_class, exc)
     if resolution.instrument_uid is None:
         return error_response(
             status_code=404,
             code="NOT_FOUND",
-            message=f"Symbol {symbol!r} not registered for asset_class={asset_class!r}",
+            message=_not_registered_message(symbol, asset_class, provider),
         )
 
     await db.execute(
