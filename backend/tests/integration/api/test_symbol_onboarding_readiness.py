@@ -100,6 +100,200 @@ async def _seed_active_alias(
         return defn
 
 
+async def _seed_dual_provider(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    raw_symbol: str,
+    asset_class: str = "equity",
+    listing_venue: str = "XNAS",
+    routing_venue: str = "XNAS",
+) -> dict[str, InstrumentDefinition]:
+    """Seed coexisting ``databento`` + ``interactive_brokers`` definition+alias
+    rows for the SAME ``(raw_symbol, asset_class)``.
+
+    Mirrors the cross-provider coexistence pattern in
+    ``test_instrument_registry.py::test_find_by_raw_symbol_requires_provider``
+    (schema uniqueness is ``(raw_symbol, provider, asset_class)``). This is the
+    structurally-always-ambiguous state that the readiness/remove handlers must
+    now disambiguate via the ``provider`` query param.
+
+    Returns the two definitions keyed by provider so callers can assert on the
+    surviving uid after a provider-scoped delete.
+    """
+    defns: dict[str, InstrumentDefinition] = {}
+    for provider in ("databento", "interactive_brokers"):
+        defns[provider] = await _seed_active_alias(
+            session_factory,
+            raw_symbol=raw_symbol,
+            asset_class=asset_class,
+            provider=provider,
+            listing_venue=listing_venue,
+            routing_venue=routing_venue,
+        )
+    return defns
+
+
+@pytest.mark.asyncio
+async def test_readiness_dual_provider_unpinned_returns_primary(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """THE BUG: unpinned readiness on a dual-provider symbol must answer 200
+    with the preferred primary (databento) named — pre-fix this 422'd with an
+    unsatisfiable 'pin provider explicitly'."""
+    await _seed_dual_provider(session_factory, raw_symbol="SPY")
+
+    resp = await client.get(
+        "/api/v1/symbols/readiness",
+        params={"symbol": "SPY", "asset_class": "equity"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    body: dict[str, Any] = resp.json()
+    assert body["registered"] is True
+    assert body["provider"] == "databento"
+    # No window → coverage fields are null, but the symbol resolves and the
+    # caller gets a usable readiness answer instead of the 422 dead-end.
+    assert body["backtest_data_available"] is None
+    assert body["coverage_status"] is None
+    # Aggregate live-qualification: an IB alias exists somewhere across the
+    # symbol's providers, so unpinned readiness reports True.
+    assert body["live_qualified"] is True
+
+
+@pytest.mark.asyncio
+async def test_readiness_dual_provider_pinned_ib_returns_ib_view(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Pinning provider=interactive_brokers scopes the metadata block to the
+    IB row; coverage stays provider-invariant."""
+    await _seed_dual_provider(session_factory, raw_symbol="SPY")
+
+    resp = await client.get(
+        "/api/v1/symbols/readiness",
+        params={
+            "symbol": "SPY",
+            "asset_class": "equity",
+            "provider": "interactive_brokers",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    body: dict[str, Any] = resp.json()
+    assert body["registered"] is True
+    assert body["provider"] == "interactive_brokers"
+    # Scoped: the IB row itself carries an IB alias → qualifies.
+    assert body["live_qualified"] is True
+    assert body["backtest_data_available"] is None
+    assert body["coverage_status"] is None
+
+
+@pytest.mark.asyncio
+async def test_readiness_dual_provider_pinned_databento_scopes_live_qualified(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Pinning provider=databento scopes live_qualified to the databento row,
+    which has no IB alias → False (contrast the unpinned aggregate True)."""
+    await _seed_dual_provider(session_factory, raw_symbol="SPY")
+
+    resp = await client.get(
+        "/api/v1/symbols/readiness",
+        params={
+            "symbol": "SPY",
+            "asset_class": "equity",
+            "provider": "databento",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    body: dict[str, Any] = resp.json()
+    assert body["registered"] is True
+    assert body["provider"] == "databento"
+    # SCOPED: the databento row alone has no IB alias.
+    assert body["live_qualified"] is False
+
+
+@pytest.mark.asyncio
+async def test_readiness_pinned_provider_with_no_row_is_actionable_4xx(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Pinning a provider that has no row for the symbol returns an actionable
+    404 NOT_FOUND whose message names BOTH the symbol and the pinned provider so
+    the caller can correct the request."""
+    await _seed_active_alias(
+        session_factory,
+        raw_symbol="DBONLY",
+        asset_class="equity",
+        provider="databento",
+    )
+
+    resp = await client.get(
+        "/api/v1/symbols/readiness",
+        params={
+            "symbol": "DBONLY",
+            "asset_class": "equity",
+            "provider": "interactive_brokers",
+        },
+    )
+
+    assert resp.status_code == 404, resp.text
+    body: dict[str, Any] = resp.json()
+    assert body["error"]["code"] == "NOT_FOUND"
+    assert "DBONLY" in body["error"]["message"]
+    assert "interactive_brokers" in body["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_remove_dual_provider_unpinned_is_satisfiable_422_not_500(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Unpinned DELETE on a dual-provider symbol stays explicit (destructive ops
+    require a provider) but is now a SATISFIABLE 422 — pre-fix it bubbled as an
+    unhandled 500 because remove_symbol had no AmbiguousSymbolError handler."""
+    await _seed_dual_provider(session_factory, raw_symbol="SPY")
+
+    resp = await client.delete(
+        "/api/v1/symbols/SPY",
+        params={"asset_class": "equity"},
+    )
+
+    assert resp.status_code == 422, resp.text
+    body: dict[str, Any] = resp.json()
+    assert body["error"]["code"] == "AMBIGUOUS_INSTRUMENT"
+    # The instruction is now satisfiable: it names the providers to pin.
+    assert "provider" in body["error"]["message"].lower()
+    # The 422 must name BOTH providers so the operator knows which to pin.
+    assert "interactive_brokers" in body["error"]["message"]
+    assert "databento" in body["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_remove_dual_provider_pinned_deletes_only_that_provider(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Pinned DELETE removes only that provider's row; the other provider's row
+    survives and remains visible in the inventory."""
+    await _seed_dual_provider(session_factory, raw_symbol="SPY")
+
+    resp = await client.delete(
+        "/api/v1/symbols/SPY",
+        params={"asset_class": "equity", "provider": "interactive_brokers"},
+    )
+    assert resp.status_code == 204, resp.text
+
+    inv = await client.get("/api/v1/symbols/inventory")
+    assert inv.status_code == 200, inv.text
+    rows = [r for r in inv.json() if r["symbol"] == "SPY"]
+    providers = {r["provider"] for r in rows}
+    # Only the IB row was hidden; the databento row remains.
+    assert providers == {"databento"}
+
+
 @pytest.mark.asyncio
 async def test_readiness_404_for_unregistered_symbol(
     client: httpx.AsyncClient,
