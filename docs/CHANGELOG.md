@@ -4,6 +4,16 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-06-06 — Fix: /symbols/readiness provider dead-end (`fix/symbols-readiness-provider-param`)
+
+**Status:** fixes the user-reachable dead-end surfaced by the 2026-06-05 regression sweep — `GET /api/v1/symbols/readiness` returned `422 AMBIGUOUS_INSTRUMENT "pin provider explicitly"` for every dual-provider symbol while exposing NO `provider` parameter (unsatisfiable instruction). E2E PASS (API + CLI). De-flags 3 graduated UCs (uc-cdp-002/004, UC-SYM-004).
+
+- **Fix (approach C, contrarian-validated):** optional `provider` query param on readiness + remove; `find_active_aliases` gains a provider filter + `on_ambiguity` knob. Unpinned READS resolve dual-provider via the existing `databento`>`interactive_brokers` preference (extracted `_preferred_provider`, unit-tested against lexicographic masquerade) — justified because coverage is provider-invariant (Parquet has no provider dimension); pinned reads scope `live_qualified`; pinned-missing 404 names the provider.
+- **Worse sibling fixed:** `DELETE /symbols/{symbol}` had NO `AmbiguousSymbolError` handler — dual-provider deletes were an unhandled **500** (plan-review find). Now a satisfiable 422; pinned deletes are provider-scoped (sibling row survives, verified through inventory).
+- **CLI surface (code-review find):** `msai symbols readiness|delete` gained `--provider` — the plan's surface audit had missed `cli_symbols.py` (mounted at `cli.py:3011`, invisible to a `cli.py` sub-app grep).
+- **Docs:** `how-symbols-work.md` full cite-sweep (~25 drifted line references incl. a second appendix table) + new §4.6.
+- **Tests:** 6 new integration (dual-provider matrix incl. scoped-vs-aggregate discriminator + 422-not-500 + scoped-delete-through-inventory), `_preferred_provider` unit tests, 6 CLI tests.
+
 ### 2026-06-05 — Fix: start-portfolio 503-but-spawned (stale terminal-row race) (`fix/start-portfolio-503-but-spawned`)
 
 **Status:** fixes the operator-UX hazard observed 3/3 in the 2026-06-05 LVP drill — `POST /api/v1/live/start-portfolio` returned a false, **cacheable** `503 {"detail":"unknown failure","failure_kind":"unknown"}` (committed under the operator's Idempotency-Key) while the spawn actually succeeded. E2E PASS on LVP live (API 201 `ready`/`warm_restart:true` + CLI success; honest-504 contract additionally pinned under an induced not-ready condition).
