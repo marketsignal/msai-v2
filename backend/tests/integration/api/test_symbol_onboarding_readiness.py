@@ -14,6 +14,7 @@ from __future__ import annotations
 import calendar as _calendar
 from datetime import date
 from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -291,6 +292,76 @@ async def test_remove_dual_provider_pinned_deletes_only_that_provider(
     rows = [r for r in inv.json() if r["symbol"] == "SPY"]
     providers = {r["provider"] for r in rows}
     # Only the IB row was hidden; the databento row remains.
+    assert providers == {"databento"}
+
+
+@pytest.mark.asyncio
+async def test_reonboard_does_not_unhide_provider_scoped_delete(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """PR-91 review (chatgpt-codex-connector): a provider-scoped DELETE of the
+    ``interactive_brokers`` row must NOT be silently undone by a later Databento
+    re-onboard/repair of the same symbol.
+
+    The onboard handler's pre-dedup ``hidden_from_inventory=False`` clear is the
+    DATABENTO onboarding path — it must scope the un-hide to ``provider=databento``
+    rows only. Before the fix it cleared EVERY row matching raw_symbol+asset_class,
+    so the deleted IB definition resurfaced.
+
+    Exercised cheaply: the un-hide UPDATE runs synchronously in the API handler
+    BEFORE enqueue (and is committed by the mocked-pool success path), so patching
+    ``_get_arq_pool`` reaches it without any Databento ingest / network. The cost
+    cap is skipped because the test settings carry no ``databento_api_key``.
+    """
+    await _seed_dual_provider(session_factory, raw_symbol="SPY")
+
+    # Operator deletes ONLY the interactive_brokers definition.
+    deleted = await client.delete(
+        "/api/v1/symbols/SPY",
+        params={"asset_class": "equity", "provider": "interactive_brokers"},
+    )
+    assert deleted.status_code == 204, deleted.text
+
+    # A normal Databento re-onboard for the same symbol exercises the restore path.
+    pool = MagicMock()
+    job_obj = MagicMock()
+    job_obj.job_id = "fake-job-id"
+    pool.enqueue_job = AsyncMock(return_value=job_obj)
+    pool.abort_job = AsyncMock(return_value=None)
+    # Hermetic guard (PR #91 review iter-3 P2): the cost-cap preflight runs
+    # BEFORE the queue is touched and instantiates a real Databento client
+    # whenever ``settings.databento_api_key`` is set in the environment.
+    # Clear it explicitly so the test never depends on the env being bare.
+    with (
+        patch.object(settings, "databento_api_key", None),
+        patch(
+            "msai.api.symbol_onboarding._get_arq_pool",
+            new=AsyncMock(return_value=pool),
+        ),
+    ):
+        onboarded = await client.post(
+            "/api/v1/symbols/onboard",
+            json={
+                "watchlist_name": "core",
+                "symbols": [
+                    {
+                        "symbol": "SPY",
+                        "asset_class": "equity",
+                        "start": "2024-01-01",
+                        "end": "2024-12-31",
+                    }
+                ],
+                "request_live_qualification": False,
+            },
+        )
+    assert onboarded.status_code == 202, onboarded.text
+
+    inv = await client.get("/api/v1/symbols/inventory")
+    assert inv.status_code == 200, inv.text
+    rows = [r for r in inv.json() if r["symbol"] == "SPY"]
+    providers = {r["provider"] for r in rows}
+    # The databento row is visible; the IB row stays hidden (scoped delete holds).
     assert providers == {"databento"}
 
 

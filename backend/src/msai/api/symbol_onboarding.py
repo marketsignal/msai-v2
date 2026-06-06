@@ -413,12 +413,23 @@ async def onboard(
     # error branches it returns without committing, so the pending unhide
     # gets rolled back when the session is disposed — a rejected re-onboard
     # no longer leaks visibility.
+    #
+    # PR-91 review fix (chatgpt-codex-connector, P2): scope the un-hide to
+    # ``provider="databento"`` rows ONLY. This handler IS the Databento
+    # onboarding path — it never creates/touches ``interactive_brokers`` rows
+    # (those are registered exclusively via ``msai instruments refresh
+    # --provider interactive_brokers``; the orchestrator/databento_bootstrap
+    # always write ``provider="databento"``). Without this predicate a normal
+    # Databento re-onboard would silently un-hide an ``interactive_brokers``
+    # definition that a provider-scoped DELETE deliberately hid, undoing the
+    # scoped soft-delete this branch added.
     for spec in request.symbols:
         await db.execute(
             update(InstrumentDefinition)
             .where(
                 InstrumentDefinition.raw_symbol == spec.symbol,
                 InstrumentDefinition.asset_class == spec.asset_class,
+                InstrumentDefinition.provider == "databento",
                 InstrumentDefinition.hidden_from_inventory.is_(True),
             )
             .values(hidden_from_inventory=False)
