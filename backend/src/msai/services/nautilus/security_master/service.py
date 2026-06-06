@@ -959,6 +959,26 @@ class SecurityMaster:
         off an :class:`InstrumentDefinition` with the requested
         ``asset_class``.
 
+        Soft-deleted definitions (``hidden_from_inventory=True``) are
+        EXCLUDED from the row set (PR #91 review). This is a user-surface
+        view (readiness + delete only), so it tracks the inventory's
+        soft-delete semantics. Consequences:
+
+        - One provider hidden, sibling visible → unpinned readiness
+          resolves the *visible* provider (the hidden one can no longer be
+          chosen by ``prefer_primary``); unpinned DELETE resolves the
+          single visible row (no ``AmbiguousSymbolError`` 422).
+        - Pinning a hidden provider → ``instrument_uid=None`` → caller's
+          404 (soft-deleted == gone from the user surface until
+          re-onboarded).
+        - All providers hidden → ``instrument_uid=None`` → 404, matching
+          empty inventory.
+        - Repeat-delete of an already-hidden single-provider symbol →
+          ``instrument_uid=None`` → caller's 404 (correct REST: the
+          resource is gone). NOTE: the backtest/live resolvers
+          (``InstrumentRegistry.find_by_alias`` / ``find_by_raw_symbol``)
+          do NOT consult this flag — inventory-hidden is not registry-dead.
+
         ``asset_class`` is the registry/user-facing taxonomy
         (``equity`` | ``futures`` | ``fx`` | ``option`` | ``crypto``) per
         the ``ck_instrument_definitions_asset_class`` CHECK.
@@ -1016,6 +1036,20 @@ class SecurityMaster:
             )
             .where(InstrumentDefinition.raw_symbol == symbol)
             .where(InstrumentDefinition.asset_class == asset_class)
+            # PR #91 review (chatgpt-codex-connector, service.py:1026 area):
+            # exclude soft-deleted (``hidden_from_inventory``) definitions from
+            # the active row set so the readiness/delete view (the ONLY callers
+            # of this method) is aligned with the inventory's soft-delete
+            # semantics. Without this, a hidden definition still participated:
+            # ``prefer_primary`` could return the HIDDEN provider's uid, and an
+            # unpinned DELETE still 422'd "ambiguous" though only one provider
+            # remained visible in the inventory. ``find_active_aliases`` is a
+            # user-surface (inventory) view — inventory-hidden == gone here.
+            # NOTE: the backtest/live resolvers (``find_by_alias`` /
+            # ``find_by_raw_symbol``) deliberately do NOT filter this flag —
+            # inventory-hidden is not registry-dead, so a soft-deleted symbol is
+            # still resolvable for an in-flight backtest/deployment.
+            .where(InstrumentDefinition.hidden_from_inventory.is_(False))
             .where(InstrumentAlias.effective_from <= as_of_date)
             .where(
                 (InstrumentAlias.effective_to.is_(None))

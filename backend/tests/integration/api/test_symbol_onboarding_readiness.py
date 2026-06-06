@@ -366,6 +366,143 @@ async def test_reonboard_does_not_unhide_provider_scoped_delete(
 
 
 @pytest.mark.asyncio
+async def test_readiness_unpinned_with_one_provider_hidden_returns_visible_provider(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """PR #91 review (chatgpt-codex-connector, service.py:1026 area): once the
+    ``databento`` definition is soft-deleted, an unpinned readiness query must
+    no longer SEE it — it should resolve to the single remaining visible
+    provider (``interactive_brokers``), not return the hidden databento uid via
+    prefer_primary.
+
+    Pre-fix ``find_active_aliases`` joined ``InstrumentDefinition`` with no
+    ``hidden_from_inventory`` filter, so the soft-deleted databento row stayed
+    in the row set and the provider-preference policy (databento first) returned
+    the HIDDEN provider.
+    """
+    await _seed_dual_provider(session_factory, raw_symbol="SPY")
+
+    # Soft-delete ONLY the databento definition (the preference-policy primary).
+    deleted = await client.delete(
+        "/api/v1/symbols/SPY",
+        params={"asset_class": "equity", "provider": "databento"},
+    )
+    assert deleted.status_code == 204, deleted.text
+
+    resp = await client.get(
+        "/api/v1/symbols/readiness",
+        params={"symbol": "SPY", "asset_class": "equity"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    body: dict[str, Any] = resp.json()
+    assert body["registered"] is True
+    # The hidden databento row is gone from the resolver's row set, so the only
+    # visible provider answers — NOT the soft-deleted databento.
+    assert body["provider"] == "interactive_brokers"
+    # Only the IB alias remains in the (now-scoped) active row set.
+    assert body["live_qualified"] is True
+
+
+@pytest.mark.asyncio
+async def test_remove_unpinned_with_one_provider_hidden_resolves_single_visible(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """PR #91 review: after one provider is soft-deleted, an UNPINNED DELETE is
+    no longer ambiguous — only one provider is visible in the inventory, so the
+    delete resolves that single row (no 422). Pre-fix the hidden databento row
+    still participated, so ``on_ambiguity='raise'`` saw two uids and 422'd.
+    """
+    await _seed_dual_provider(session_factory, raw_symbol="SPY")
+
+    # Hide the databento definition first.
+    first = await client.delete(
+        "/api/v1/symbols/SPY",
+        params={"asset_class": "equity", "provider": "databento"},
+    )
+    assert first.status_code == 204, first.text
+
+    # Unpinned DELETE: only interactive_brokers is visible now, so this must
+    # succeed (deleting that single visible row), NOT 422 as ambiguous.
+    second = await client.delete(
+        "/api/v1/symbols/SPY",
+        params={"asset_class": "equity"},
+    )
+    assert second.status_code == 204, second.text
+
+    # Both providers are now hidden → inventory has no SPY row.
+    inv = await client.get("/api/v1/symbols/inventory")
+    assert inv.status_code == 200, inv.text
+    rows = [r for r in inv.json() if r["symbol"] == "SPY"]
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_readiness_pinned_hidden_provider_returns_404_naming_it(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """PR #91 review: pinning a provider whose definition has been soft-deleted
+    returns 404 NOT_FOUND naming that provider — a hidden definition is gone
+    from the user surface until re-onboarded. Pre-fix this returned 200 because
+    the hidden row was still resolvable.
+    """
+    await _seed_dual_provider(session_factory, raw_symbol="SPY")
+
+    deleted = await client.delete(
+        "/api/v1/symbols/SPY",
+        params={"asset_class": "equity", "provider": "databento"},
+    )
+    assert deleted.status_code == 204, deleted.text
+
+    resp = await client.get(
+        "/api/v1/symbols/readiness",
+        params={"symbol": "SPY", "asset_class": "equity", "provider": "databento"},
+    )
+
+    assert resp.status_code == 404, resp.text
+    body: dict[str, Any] = resp.json()
+    message = body["error"]["message"]
+    assert "SPY" in message
+    assert "databento" in message
+
+
+@pytest.mark.asyncio
+async def test_remove_repeat_single_provider_returns_404_after_delete(
+    client: httpx.AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """PR #91 review: deleting an already-soft-deleted single-provider symbol
+    returns 404 NOT_FOUND — once hidden, the definition is absent from the
+    resolver's row set, which is correct REST semantics (the resource is gone
+    from the user surface). No prior test pins repeat-delete as idempotent 204,
+    so this nails the post-fix behavior.
+    """
+    await _seed_active_alias(
+        session_factory,
+        raw_symbol="ONLY1",
+        asset_class="equity",
+        provider="databento",
+    )
+
+    first = await client.delete(
+        "/api/v1/symbols/ONLY1",
+        params={"asset_class": "equity"},
+    )
+    assert first.status_code == 204, first.text
+
+    second = await client.delete(
+        "/api/v1/symbols/ONLY1",
+        params={"asset_class": "equity"},
+    )
+    assert second.status_code == 404, second.text
+    body: dict[str, Any] = second.json()
+    assert "ONLY1" in body["error"]["message"]
+
+
+@pytest.mark.asyncio
 async def test_readiness_404_for_unregistered_symbol(
     client: httpx.AsyncClient,
 ) -> None:
