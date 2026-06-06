@@ -526,10 +526,12 @@ class TestRunNightlyIngestIfDue:
     async def test_ingest_daily_window_fetches_target_session(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Codex iter 3 P1: `ingest_daily(target_date=X)` must request
-        # [X, X+1) so Databento's end-exclusive date window returns that
-        # session's bars, not the prior day's. Regression guard against
-        # regressing to the old `end=target_date` semantics.
+        # `ingest_daily(target_date=X)` passes the INCLUSIVE operator window
+        # `start = end = X` to `ingest_historical`; the per-provider
+        # translation (Databento's end-exclusive `+1d`) now lives below in
+        # `_fetch_bars`, invisible to this capture point. Regression guard
+        # against re-introducing the old caller-side `end = target_date + 1`
+        # pre-compensation (which would double-`+1` after the boundary fix).
         from datetime import date as _date
 
         from msai.services.data_ingestion import DataIngestionService
@@ -559,10 +561,11 @@ class TestRunNightlyIngestIfDue:
             target_date=_date(2026, 4, 14),
         )
 
-        # Window must be [target_date, target_date + 1) — end-exclusive
-        # semantics so Databento returns only April 14's session.
+        # Inclusive operator window: start == end == target_date. The
+        # Databento end-exclusive `+1d` is applied below in `_fetch_bars`,
+        # not here.
         assert captured_window["start"] == "2026-04-14"
-        assert captured_window["end"] == "2026-04-15"
+        assert captured_window["end"] == "2026-04-14"
 
     @pytest.mark.asyncio
     async def test_now_parameter_overrides_wall_clock(

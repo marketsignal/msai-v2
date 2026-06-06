@@ -93,7 +93,11 @@ class DataIngestionService:
                 ``"equities"`` internally for Databento routing.
             symbols: List of ticker symbols to ingest.
             start: ISO-8601 start date (``"YYYY-MM-DD"``).
-            end: ISO-8601 end date (``"YYYY-MM-DD"``).
+            end: ISO-8601 end date (``"YYYY-MM-DD"``), **INCLUSIVE** —
+                operator semantics matching ``compute_coverage``'s closed
+                ``[start, end]`` window and every caller's intent. The
+                per-provider translation to native (e.g. Databento's
+                end-exclusive) semantics happens in ``_fetch_bars``.
             provider: Data provider (``"auto"``, ``"databento"``, or
                 ``"polygon"``). Default ``"auto"`` routes equities and
                 futures to Databento with Polygon as fallback.
@@ -191,26 +195,17 @@ class DataIngestionService:
         """Fetch a single trading session's data.
 
         ``target_date`` is the session date to fetch (caller's calendar,
-        typically the scheduled-tz date post-close). This method asks
-        the provider for ``[target_date, target_date + 1)`` so Databento's
-        end-exclusive window yields just that session's bars — Codex iter
-        3 P1.
+        typically the scheduled-tz date post-close). This method passes
+        ``start = end = target_date`` as the **inclusive** operator window;
+        the per-provider translation now lives in ``_fetch_bars`` (the
+        Databento branch adds ``+1d`` for its end-exclusive ``get_range``,
+        Polygon passes ``end`` through). The net Databento window is the
+        same ``[target_date, target_date + 1)`` it always was, and the
+        Polygon path no longer over-fetches a spurious extra day.
 
         ``target_date`` defaults to ``yesterday`` in the process tz so
         existing CLI / manual-trigger callers preserve the "yesterday's
         session" semantics the method previously had.
-
-        **Provider window semantics** (Codex iter 5 P2 — follow-up): the
-        ``[target_date, target_date + 1)`` window is exclusive on the
-        ``end`` boundary. Databento honours that. Polygon's ``/v2/aggs``
-        range endpoint is end-*inclusive*, so a Polygon-routed
-        ``ingest_daily(target_date=X)`` call fetches both ``X`` and
-        ``X + 1``. The duplicate ``X + 1`` rows are dropped by
-        ``ParquetStore`` (timestamp-keyed dedup on write), so no data
-        corruption — only wasted download bandwidth. Normalising the
-        per-provider semantics is tracked as a separate improvement; the
-        prior codepath (``end = date.today()``) had the same Polygon
-        2-day overlap, so this isn't a Phase 2 #3 regression.
 
         **Mixed-exchange limitation** (Codex iter 5 P2 — follow-up): a
         single ``target_date`` is applied to every asset regardless of
@@ -236,7 +231,7 @@ class DataIngestionService:
         """
         session_date = target_date if target_date is not None else date.today() - timedelta(days=1)
         start = session_date.isoformat()
-        end = (session_date + timedelta(days=1)).isoformat()
+        end = session_date.isoformat()
         return await self.ingest_historical(
             asset_class,
             symbols,
@@ -324,12 +319,31 @@ class DataIngestionService:
         start: str,
         end: str,
     ) -> pd.DataFrame:
-        """Route to the correct data source and fetch bars."""
+        """Route to the correct data source and fetch bars.
+
+        ``end`` arrives as the operator's **inclusive** date (see
+        ``ingest_historical``). This is the single point where the resolved
+        provider is known, so it owns the per-provider translation:
+
+        - **Databento**: ``get_range`` is end-EXCLUSIVE (SDK
+          ``databento/historical/api/timeseries.py:68``), so fetch
+          ``[start, end + 1d)`` to include the operator's final day.
+        - **Polygon**: ``/v2/aggs`` is end-INCLUSIVE, so ``end`` passes
+          through unchanged.
+        """
         if plan.provider == "databento":
+            try:
+                provider_end = (date.fromisoformat(end) + timedelta(days=1)).isoformat()
+            except ValueError as exc:
+                # First parse point on this path — the CLI passes raw operator
+                # strings (cli.py `ingest`), so make the failure actionable
+                # instead of a bare "Invalid isoformat string" deep in the
+                # translation arithmetic.
+                raise ValueError(f"end date must be ISO YYYY-MM-DD, got {end!r}") from exc
             return await self.databento.fetch_bars(
                 symbol,
                 start,
-                end,
+                provider_end,
                 dataset=plan.dataset,
                 schema=plan.schema,
             )
