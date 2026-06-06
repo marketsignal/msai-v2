@@ -4,6 +4,16 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-06-05 — Fix: start-portfolio 503-but-spawned (stale terminal-row race) (`fix/start-portfolio-503-but-spawned`)
+
+**Status:** fixes the operator-UX hazard observed 3/3 in the 2026-06-05 LVP drill — `POST /api/v1/live/start-portfolio` returned a false, **cacheable** `503 {"detail":"unknown failure","failure_kind":"unknown"}` (committed under the operator's Idempotency-Key) while the spawn actually succeeded. E2E PASS on LVP live (API 201 `ready`/`warm_restart:true` + CLI success; honest-504 contract additionally pinned under an induced not-ready condition).
+
+- **Root cause:** `_poll_for_terminal` read _the latest `live_node_processes` row_ for the deployment with no attempt-scoping; on a warm restart the previous run's terminal `stopped`/`failed` row always wins the race against the supervisor's Phase-A insert, and its NULL/`"none"` `failure_kind` coerces to `UNKNOWN` → cacheable 503.
+- **Fix (A′, contrarian-validated):** the endpoint snapshots the deployment's existing node-row ids before `publish_start`; the poll accepts ready/running rows **unconditionally** (partial unique index ⇒ an active row IS the current node — preserves the concurrent-START case) and terminal rows only when their id is **outside** the snapshot. Exact id-set semantics — no clock markers (no tie-breaker). `/stop` + `/drain` call sites unchanged; no schema or supervisor change.
+- **Sibling fixes (same branch, found during verification):** latent `MissingGreenlet` 500 masking the honest 504 on the poll-timeout path (the poll's per-iteration `db.rollback()` expires ORM attributes regardless of `expire_on_commit=False`); `portfolio_revision_id` now exposed on `GET /live/status` + `/live/status/{id}` (operators could not rediscover the revision id required to redeploy — a broken sanctioned path found by verify-e2e); CLAUDE.md live-trading rails updated to the no-paper / LVP-local + HVP-prod two-leg E2E policy (operator decision 2026-06-05).
+- **Tests:** 4 helper-level scoping tests (PG testcontainers, real poll helper) + 4 endpoint warm-restart regressions (publish-gated fake supervisor reproduces the exact drill signature RED pre-fix: stale-row 201, this-attempt failure classification, slow-build honest 504 + no deployment flip + key released, no-row honest 504) + 4 status-field tests. Review: 2-iteration plan loop + 3-iteration dual-engine code loop (Codex + PR toolkit), all clean.
+- **E2E:** `tests/e2e/use-cases/live/start-portfolio-warm-restart-truth.md` graduated (UC1 API `@smoke` + UC2 CLI, LVP live). Post-merge leg: re-run on HVP against the prod VM.
+
 ### 2026-06-03 — Multi-Account Broker Fleet: PR 1b — Data-Stale Auto-Halt (`feat/pr1b-data-stale-auto-halt`)
 
 **Status:** satisfies blocking objection #9 (the last engineering gate before real-money LVP/HVP N-account graduation; does NOT gate PR 1 merge). Contrarian-validated **in-node** shape: each TradingNode observes its own Databento feeds and halts the fleet directly — supervisor-independent, the same philosophy as the F6 node-side order gate. Plan-review loop: Claude + Codex, **7 iterations** to both-clean.

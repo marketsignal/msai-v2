@@ -122,6 +122,11 @@ class LiveDeploymentInfo(BaseModel):
     account_id: str | None = None
     ib_login_key: str | None = None
     ibg_client_id: int | None = None
+    # operator-redeploy discoverability — POST /live/start-portfolio requires
+    # this id and no other sanctioned read exposed it (found by verify-e2e
+    # 2026-06-05 during fix/start-portfolio-503-but-spawned). Nullable for
+    # schema-compat even though the column is NOT NULL.
+    portfolio_revision_id: UUID | None = None
     # Task 4 — control-plane broker-account linkage. The id of the
     # broker-account registry row this deployment is bound to, so an API
     # caller can observe the deployment↔account relationship without a DB
@@ -195,6 +200,11 @@ class LiveDeploymentStatusResponse(BaseModel):
     instruments: list[str] = []
     last_started_at: datetime | None = None
     last_stopped_at: datetime | None = None
+    # operator-redeploy discoverability — POST /live/start-portfolio requires
+    # this id and no other sanctioned read exposed it (found by verify-e2e
+    # 2026-06-05 during fix/start-portfolio-503-but-spawned). Nullable for
+    # schema-compat even though the column is NOT NULL.
+    portfolio_revision_id: UUID | None = None
     # Control-plane broker-account linkage (parity with LiveDeploymentInfo on
     # the list endpoint) so the per-deployment detail GET also surfaces the
     # deployment↔account relationship. ``None`` for deployments not linked to a
