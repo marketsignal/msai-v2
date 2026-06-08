@@ -42,7 +42,7 @@ Migration applied; index backfilled. Stack running.
   ```
 
   - `min_ts.date() == 2025-01-22` (or earlier if previous data remained on disk and was merged).
-  - `max_ts.date() == 2025-01-23` (Friday before the inclusive end).
+  - `max_ts.date() == 2025-01-24` (Friday — the inclusive end day, covered since the 2026-06-06 bulk-ingest end-exclusivity fix; pre-fix this incorrectly stopped at 2025-01-23).
   - `row_count > 0`.
 
 - Step 3 (`data-status`) exits 0; doesn't crash.

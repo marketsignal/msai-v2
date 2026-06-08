@@ -309,7 +309,7 @@ def ingest(
     asset: str = typer.Argument(..., help="Asset class (stocks, equities, futures, crypto)"),
     symbols: str = typer.Argument(..., help="Comma-separated ticker symbols"),
     start: str = typer.Argument(..., help="Start date YYYY-MM-DD"),
-    end: str = typer.Argument(..., help="End date YYYY-MM-DD"),
+    end: str = typer.Argument(..., help="End date YYYY-MM-DD (inclusive)"),
     provider: str = typer.Option("auto", help="Data provider: auto, databento, or polygon"),
     dataset: str = typer.Option("", help="Override default Databento dataset"),
     schema: str = typer.Option("", help="Override default Databento schema"),
@@ -2946,7 +2946,7 @@ def market_data_ingest(
     ),
     symbols: str = typer.Option(..., "--symbols", help="Comma-separated tickers"),
     start: str = typer.Option(..., "--start", help="Start date YYYY-MM-DD"),
-    end: str = typer.Option(..., "--end", help="End date YYYY-MM-DD"),
+    end: str = typer.Option(..., "--end", help="End date YYYY-MM-DD (inclusive)"),
     provider: str = typer.Option(
         "auto",
         "--provider",

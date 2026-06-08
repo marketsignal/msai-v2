@@ -59,6 +59,9 @@ class OnboardSymbolSpec(BaseModel):
     symbol: str = Field(min_length=1, max_length=32)
     asset_class: AssetClass
     start: date
+    # Operator window — both endpoints INCLUSIVE (coverage judges the closed
+    # [start, end]; the Databento-exclusive translation lives in
+    # DataIngestionService._fetch_bars / cost_estimator).
     end: date
 
     @field_validator("symbol")

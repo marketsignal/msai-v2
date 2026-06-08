@@ -4,6 +4,17 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-06-06 — Fix: bulk-ingest end-exclusivity off-by-one (`fix/bulk-ingest-end-exclusive`)
+
+**Status:** fixes a silent data-completeness bug affecting EVERY bulk-ingest entrypoint (CLI `msai ingest`, API `/market-data/ingest`, symbol onboarding, smoke runner, backtest auto-heal): the operator's inclusive `end` date was forwarded verbatim to Databento's **exclusive** `get_range` (SDK `timeseries.py:68`), while `compute_coverage` judges the closed `[start, end]` window — so every onboarded window permanently missed its final day and reported `gapped`/`backtest_data_available=false`. Empirically proven in dev (SPY missing exactly 2024-12-31, NFLX 2024-04-30, AAPL 2024-01-31 — each its window's last day). Previously misdiagnosed as a "Databento dev data edge" in the 2026-06-05 regression report.
+
+- **Fix (Option A, contrarian-validated):** `ingest_historical.end` is now declared **inclusive** (operator semantics); the per-provider translation lives at the single provider-aware boundary `_fetch_bars` (Databento `+1d`; Polygon `/v2/aggs` already inclusive — pass-through). `ingest_daily` no longer pre-compensates (passes `session_date` as end — net Databento window unchanged, and the documented Polygon daily double-fetch quirk is fixed as a side effect). `cost_estimator` quotes `get_cost` with the same `+1d` (SDK `metadata.py:426` — quote == fetched window; bucket keys stay operator-windowed).
+- **Error quality:** malformed `end` strings (CLI is the unvalidated surface) now raise an actionable `end date must be ISO YYYY-MM-DD, got '...'` at the first parse point instead of a bare `Invalid isoformat string`.
+- **Help-text:** both CLI ingest surfaces + `IngestRequest.end` + `OnboardSymbolSpec` now state "(inclusive)".
+- **Tests:** new `test_data_ingestion_window_semantics.py` (6 tests running the REAL `ingest_historical` against capturing provider stubs: Databento `+1d`, Polygon verbatim, daily no-double-`+1` both providers, operator window pinned in the status payload, end<start unconditional-translation + existing all-empty guard, actionable malformed-end error); cost-estimator exclusive-quote test; nightly-scheduler window assertion flipped to the inclusive contract. Full suite 3604 passed; ruff + mypy --strict clean.
+- **Review:** 4-iteration plan loop (Codex; incl. a dispatch-plan delta pass) + dual-engine code loop (Codex native review + 4 PR-toolkit agents).
+- **Operational note:** already-onboarded symbols keep their phantom last-day gap until re-ingested — heal by re-onboarding under a FRESH watchlist name (idempotency digest is per watchlist+window; ParquetStore dedup merges the missing day). The E2E leg heals SPY full-2024, which also un-breaks UC-SYM-004 as-written.
+
 ### 2026-06-06 — Fix: /symbols/readiness provider dead-end (`fix/symbols-readiness-provider-param`)
 
 **Status:** fixes the user-reachable dead-end surfaced by the 2026-06-05 regression sweep — `GET /api/v1/symbols/readiness` returned `422 AMBIGUOUS_INSTRUMENT "pin provider explicitly"` for every dual-provider symbol while exposing NO `provider` parameter (unsatisfiable instruction). E2E PASS (API + CLI). De-flags 3 graduated UCs (uc-cdp-002/004, UC-SYM-004).

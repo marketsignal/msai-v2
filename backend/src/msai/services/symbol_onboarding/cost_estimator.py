@@ -98,6 +98,12 @@ async def estimate_cost(
     Worst case (every symbol on a different dataset and window) collapses to
     one call per symbol; the common case (same dataset, same window across
     the watchlist) collapses to one call total.
+
+    Inclusive→exclusive end translation: ``OnboardSymbolSpec.end`` is the
+    operator's INCLUSIVE date, but Databento's ``metadata.get_cost`` end is
+    EXCLUSIVE (SDK ``metadata.py:426``). The bucket KEY stays the operator
+    window; only the ``get_cost`` ARGUMENT is translated ``end + 1d`` so the
+    quote == the fetched window (mirrors ``DataIngestionService._fetch_bars``).
     """
     today = today or date.today()
 
@@ -125,7 +131,7 @@ async def estimate_cost(
                 schema="ohlcv-1m",
                 stype_in="raw_symbol",
                 start=start.isoformat(),
-                end=end.isoformat(),
+                end=(end + timedelta(days=1)).isoformat(),
             )
         except Exception as exc:  # noqa: BLE001
             log.warning(

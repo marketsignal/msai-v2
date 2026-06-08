@@ -235,8 +235,11 @@ async def run_nightly_ingest(
     """Fetch one trading session's bars for all enabled assets in the universe.
 
     ``target_date`` is the session date to ingest. ``ingest_daily``
-    queries ``[target_date, target_date + 1)`` so Databento's end-
-    exclusive window returns only that session's bars.
+    passes the inclusive operator window ``start = end = target_date``;
+    the per-provider translation (Databento's end-exclusive ``+1d``)
+    lives in ``DataIngestionService._fetch_bars``, so the net Databento
+    HTTP window is still ``[target_date, target_date + 1)`` and the
+    Polygon path fetches exactly ``target_date``.
 
     Defaults to ``yesterday`` (process tz) when called directly (CLI /
     manual trigger), matching the pre-scheduler behavior. The tz-aware

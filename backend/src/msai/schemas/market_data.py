@@ -24,7 +24,7 @@ class IngestRequest(BaseModel):
     )
     symbols: list[str] = Field(..., min_length=1, description="Ticker symbols to ingest")
     start: date = Field(..., description="Start date YYYY-MM-DD")
-    end: date = Field(..., description="End date YYYY-MM-DD")
+    end: date = Field(..., description="End date YYYY-MM-DD (inclusive)")
     provider: str = Field("auto", description="Data provider: auto, databento, or polygon")
     dataset: str | None = Field(None, description="Override default Databento dataset")
     data_schema: str | None = Field(None, description="Override default Databento schema")

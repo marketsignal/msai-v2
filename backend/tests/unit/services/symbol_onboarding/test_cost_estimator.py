@@ -73,6 +73,22 @@ async def test_estimate_batches_symbols_per_dataset(fake_client):
 
 
 @pytest.mark.asyncio
+async def test_estimate_quotes_exclusive_end_plus_one_to_databento(fake_client):
+    # Databento's metadata.get_cost end is EXCLUSIVE (SDK metadata.py:426), but
+    # OnboardSymbolSpec.end is the operator's INCLUSIVE date. The estimator must
+    # translate +1d so the quoted window equals the fetched window (mirrors
+    # DataIngestionService._fetch_bars).
+    manifest = ParsedManifest(
+        watchlist_name="m",
+        symbols=[_spec("SPY", "equity", date(2024, 1, 1), date(2024, 12, 31))],
+    )
+    await estimate_cost(manifest, client=fake_client, today=date(2026, 4, 24))
+    _, kwargs = fake_client.metadata.get_cost.call_args
+    assert kwargs["start"] == "2024-01-01"
+    assert kwargs["end"] == "2025-01-01"
+
+
+@pytest.mark.asyncio
 async def test_estimate_returns_low_confidence_on_upstream_failure(fake_client):
     fake_client.metadata.get_cost.side_effect = RuntimeError("auth failed")
     manifest = ParsedManifest(
