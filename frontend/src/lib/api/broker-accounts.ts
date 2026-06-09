@@ -29,6 +29,10 @@ export interface BrokerAccount {
   status: string;
   gateway_slot: string;
   trading_mode: string;
+  /** "paper" | "test" | "real" — explicit account class (PR4). */
+  account_class: string;
+  /** True only for the production fund — drives the real-money label + gate. */
+  is_real_money: boolean;
   credentials_backend: string;
   credentials_secret_ref: string;
   credentials_secret_version: string | null;
@@ -50,6 +54,12 @@ export interface BrokerAccountCreate {
   label?: string | null;
   /** "paper" | "live" (backend defaults to "paper"). */
   trading_mode: string;
+  /**
+   * "paper" | "test" | "real" — explicit account class (PR4). Optional;
+   * backend defaults from trading_mode when omitted (paper→paper, live→test).
+   * Pass "real" (live only) to register the production fund.
+   */
+  account_class?: string;
   /** Omit to auto-allocate a free gateway slot. */
   gateway_slot?: string | null;
   tws_userid: string;

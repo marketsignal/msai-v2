@@ -159,6 +159,7 @@ def _resolve_cli_account_payload(
     selector_pair_hint: str,
     account_flag_label: str,
     account_value_label: str,
+    confirm_account_id: str = "",
 ) -> dict[str, str]:
     """Validate the either/or account selection (Task 5/6 contract) and return
     the account-bearing payload fields for ``POST /api/v1/live/start-portfolio``.
@@ -221,13 +222,25 @@ def _resolve_cli_account_payload(
             if trimmed_broker_account_id
             else trimmed_account
         )
+        # Task 6 iter-4 P2: relabeled REAL-MONEY → LIVE. Live test accounts (LVP/
+        # HVP) are NOT the fund under the new account-class taxonomy; the
+        # fund-specific identity gate is the server's --confirm-account-id check
+        # (Task 5), satisfied via the option threaded below — not this prompt.
         typer.confirm(
-            f"This will start REAL-MONEY trading on {confirm_target}. Continue?",
+            f"This will start LIVE trading on {confirm_target}. Continue?",
             abort=True,
         )
-    if trimmed_broker_account_id:
-        return {"broker_account_id": trimmed_broker_account_id}
-    return {"account_id": trimmed_account, "ib_login_key": ib_login_key.strip()}
+    payload: dict[str, str] = (
+        {"broker_account_id": trimmed_broker_account_id}
+        if trimmed_broker_account_id
+        else {"account_id": trimmed_account, "ib_login_key": ib_login_key.strip()}
+    )
+    # Real-money identity confirmation (Task 5/6). Include only when non-blank —
+    # the server requires it for real-money (fund) accounts and ignores it
+    # otherwise, so a blank value must not be sent.
+    if confirm_account_id.strip():
+        payload["confirm_account_id"] = confirm_account_id.strip()
+    return payload
 
 
 def _api_call(
@@ -566,6 +579,15 @@ def live_start(
         help="IB login username — required for the legacy ACCOUNT_ID form (Bug #1 trio).",
     ),
     paper: bool = typer.Option(True, help="Paper trading mode (default: True)"),
+    confirm_account_id: str = typer.Option(
+        "",
+        "--confirm-account-id",
+        help=(
+            "Real-money identity confirmation: the exact IB account id. REQUIRED by "
+            "the server when the resolved account is a real-money (fund) account; "
+            "harmless for test/paper accounts."
+        ),
+    ),
     idempotency_key: str = typer.Option(
         "",
         "--idempotency-key",
@@ -610,6 +632,7 @@ def live_start(
             selector_pair_hint="ACCOUNT_ID --ib-login-key <key>",
             account_flag_label="ACCOUNT_ID",
             account_value_label="account_id",
+            confirm_account_id=confirm_account_id,
         )
     )
     # Codex iter-7 P2 + PR #67 review: send Idempotency-Key so timeout /
@@ -954,7 +977,16 @@ def live_start_portfolio(
     paper: bool = typer.Option(
         True,
         "--paper/--no-paper",
-        help="Paper trading (default). --no-paper triggers a real-money confirm.",
+        help="Paper trading (default). --no-paper triggers a live-trading confirm.",
+    ),
+    confirm_account_id: str = typer.Option(
+        "",
+        "--confirm-account-id",
+        help=(
+            "Real-money identity confirmation: the exact IB account id. REQUIRED by "
+            "the server when the resolved account is a real-money (fund) account; "
+            "harmless for test/paper accounts."
+        ),
     ),
     idempotency_key: str = typer.Option(
         "",
@@ -994,6 +1026,7 @@ def live_start_portfolio(
             selector_pair_hint="--account <ib-account> --ib-login-key <key>",
             account_flag_label="--account",
             account_value_label="--account",
+            confirm_account_id=confirm_account_id,
         )
     )
     ikey = idempotency_key or uuid.uuid4().hex
@@ -1264,6 +1297,15 @@ def broker_add(
     ib_login_key: str = typer.Option(..., "--ib-login-key", help="Logical IB login key"),
     tws_userid: str = typer.Option(..., "--tws-userid", help="TWS / IB Gateway username"),
     trading_mode: str = typer.Option("paper", "--trading-mode", help="paper or live"),
+    account_class: str | None = typer.Option(
+        None,
+        "--account-class",
+        help=(
+            "Account taxonomy: paper | test | real. The fund is `real`; LVP/HVP "
+            "are `test`. Omit to let the server default it from --trading-mode "
+            "(paper→paper, live→test)."
+        ),
+    ),
     label: str | None = typer.Option(None, "--label", help="Optional human-readable label"),
     gateway_slot: str | None = typer.Option(
         None, "--gateway-slot", help="Pinned gateway slot (default: auto-allocate)"
@@ -1282,6 +1324,10 @@ def broker_add(
         "tws_userid": tws_userid,
         "tws_password": tws_password,
     }
+    # Only send account_class when the operator set it; the schema defaults it
+    # from trading_mode when omitted (Task 3), so a blank value must not be sent.
+    if account_class is not None:
+        payload["account_class"] = account_class
     if label is not None:
         payload["label"] = label
     if gateway_slot is not None:
@@ -1311,7 +1357,9 @@ def broker_list() -> None:
     if not rows:
         typer.echo("No broker accounts.")
         return
-    header = f"{'IB ACCOUNT':<14}{'STATUS':<10}{'MODE':<8}{'SLOT':<14}{'CRED VER':<14}ID"
+    header = (
+        f"{'IB ACCOUNT':<14}{'STATUS':<10}{'MODE':<8}{'CLASS':<8}{'SLOT':<14}{'CRED VER':<14}ID"
+    )
     typer.echo(header)
     typer.echo("-" * len(header))
     for row in rows:
@@ -1319,6 +1367,10 @@ def broker_list() -> None:
             f"{_broker_cell(row['ib_account_id'], 14)}"
             f"{_broker_cell(row['status'], 10)}"
             f"{_broker_cell(row['trading_mode'], 8)}"
+            # account_class (Task 6 iter-4 P2) — shows which account is the fund
+            # (`real`) vs test/paper. `.get` + '-' fallback tolerates older API
+            # responses that predate the column.
+            f"{_broker_cell(row.get('account_class') or '-', 8)}"
             f"{_broker_cell(row['gateway_slot'], 14)}"
             f"{_broker_cell(row.get('credentials_secret_version') or '-', 14)}"
             f"{row['id']}"

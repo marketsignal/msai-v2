@@ -17,6 +17,8 @@ import {
   type StrategyListResponse,
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
+import { useAccountScope } from "@/lib/account-scope";
+import { useMemo } from "react";
 
 /**
  * Dashboard — landing page after sign-in.
@@ -28,6 +30,7 @@ import { useAuth } from "@/lib/auth";
  */
 export default function DashboardPage(): React.ReactElement {
   const { getToken, isAuthenticated } = useAuth();
+  const { scope } = useAccountScope();
 
   const strategiesQuery = useQuery<StrategyListResponse, Error>({
     queryKey: ["dashboard", "strategies-count"],
@@ -54,15 +57,37 @@ export default function DashboardPage(): React.ReactElement {
     queryKey: ["dashboard", "live-status"],
     queryFn: async (): Promise<LiveStatusResponse> => {
       const token = await getToken();
-      return getLiveStatus(token);
+      // activeOnly: scoped running-count + ActiveStrategies must reflect the
+      // COMPLETE active set, not the default 50-most-recent cap that could drop
+      // a long-running active deployment (Codex code-review iter-7 P2).
+      return getLiveStatus(token, { activeOnly: true });
     },
     enabled: isAuthenticated,
     refetchInterval: 15_000,
     staleTime: 10_000,
   });
 
-  const deployments = liveQuery.data?.deployments ?? [];
-  const runningCount = deployments.filter((d) => d.status === "running").length;
+  // US-005: the connected gateway account id labels the (gateway-bound) balance
+  // cards. Codex code-review iter-5 P2: source it from the SUMMARY payload
+  // (`accountQuery.data.account_id`) — NOT a separate /account/health query —
+  // so the label and the balances it names always come from the SAME fetch and
+  // can never diverge (health refreshing to account B while the cached summary
+  // still holds account A's numbers). Stays UNSCOPED: the balances are the
+  // connected account's, never the selector's scope.
+
+  const deployments = useMemo(
+    () => liveQuery.data?.deployments ?? [],
+    [liveQuery.data],
+  );
+  // US-001: scope the deployment-derived cards by the global account selector.
+  const scopedDeployments = useMemo(() => {
+    if (scope === "all") return deployments;
+    if (scope === "unassigned") return deployments.filter((d) => !d.account_id);
+    return deployments.filter((d) => d.account_id === scope);
+  }, [deployments, scope]);
+  const runningCount = scopedDeployments.filter(
+    (d) => d.status === "running",
+  ).length;
 
   const errors: { label: string; message: string }[] = [];
   if (strategiesQuery.isError) {
@@ -127,13 +152,14 @@ export default function DashboardPage(): React.ReactElement {
         totalUnavailable={strategiesQuery.isError}
         runningUnavailable={liveQuery.isError}
         accountUnavailable={accountQuery.isError}
+        connectedAccountId={accountQuery.data?.account_id ?? null}
       />
 
       {/* Recent alerts + Active strategies (was permanently-empty EquityChart) */}
       <div className="grid gap-6 lg:grid-cols-7">
         <AlertsFeed limit={5} />
         <ActiveStrategies
-          deployments={deployments}
+          deployments={scopedDeployments}
           unavailable={liveQuery.isError}
         />
       </div>

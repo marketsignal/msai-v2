@@ -36,6 +36,16 @@ export interface PortfolioSummaryProps {
    * account connected" as a confirmed fact.
    */
   accountUnavailable?: boolean;
+  /**
+   * PR4 / US-005: the IB account id the gateway is currently connected to,
+   * sourced ATOMICALLY from the `/account/summary` payload (the same response
+   * that carried these balances — never a separately-fetched `/account/health`
+   * id that could diverge), or null/undefined before the first successful
+   * snapshot. When present the gateway-bound cards honestly label the balances
+   * as belonging to "Account <id>" instead of the generic "From IB Gateway" —
+   * never inferred from any account-id string.
+   */
+  connectedAccountId?: string | null;
 }
 
 interface StatCardProps {
@@ -102,6 +112,7 @@ export function PortfolioSummary({
   totalUnavailable,
   runningUnavailable,
   accountUnavailable,
+  connectedAccountId,
 }: PortfolioSummaryProps = {}): React.ReactElement {
   const total = totalStrategies ?? 0;
   const running = runningStrategies ?? 0;
@@ -116,6 +127,10 @@ export function PortfolioSummary({
   const totalValue = accountData?.net_liquidation ?? 0;
   const dailyPnl = accountData?.unrealized_pnl ?? 0;
   const hasAccount = accountData != null;
+  // US-005: honest gateway-bound label — name the connected account when known.
+  const gatewayLabel = connectedAccountId
+    ? `Account ${connectedAccountId}`
+    : "From IB Gateway";
 
   return (
     <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -130,7 +145,7 @@ export function PortfolioSummary({
           accountUnavailable
             ? "Unavailable"
             : hasAccount
-              ? "From IB Gateway"
+              ? gatewayLabel
               : "No account connected"
         }
         trend={signTrend(totalValue, hasAccount)}
@@ -147,7 +162,7 @@ export function PortfolioSummary({
           accountUnavailable
             ? "Unavailable"
             : hasAccount
-              ? "From IB Gateway"
+              ? gatewayLabel
               : "No account connected"
         }
         trend={signTrend(dailyPnl, hasAccount)}

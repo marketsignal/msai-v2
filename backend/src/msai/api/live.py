@@ -98,6 +98,7 @@ from msai.services.live_command_bus import (
 from msai.services.nautilus.ibg_client_id import derive_ibg_client_id
 from msai.services.nautilus.trading_node import TradingNodeManager
 from msai.services.observability.broker_account_metrics import (
+    DEPLOY_TARGET_DIVERGENCE,
     DEPLOY_VALIDATION_FAILED,
     KV_SECRET_AGE,
 )
@@ -1203,6 +1204,95 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
     )
     effective_account_id = effective.account_id
     effective_ib_login_key = effective.ib_login_key
+
+    # ------------------------------------------------------------------
+    # PR4: ambiguous-target rejection (iter-2 P1#2 / PRD US-003 "ambiguous
+    # deploy target → 422"). The either/or schema validator accepts
+    # broker_account_id ALONGSIDE legacy account_id for back-compat, and the
+    # resolver silently PREFERS the registry row. If the caller also sent a
+    # legacy account_id that names a DIFFERENT account than the one resolved,
+    # the intended target is ambiguous — fail closed rather than silently
+    # deploying to the resolved (registry) account. Matching legacy strings
+    # (the documented back-compat shape) pass. Post-PR4 UI/CLI send ONLY
+    # broker_account_id, so this only ever bites a genuinely conflicting body.
+    # ------------------------------------------------------------------
+    if request.broker_account_id is not None and (
+        (request.account_id is not None and request.account_id != effective_account_id)
+        or (request.ib_login_key is not None and request.ib_login_key != effective_ib_login_key)
+    ):
+        # A sidecar legacy pair is accepted for back-compat ONLY when it MATCHES
+        # the resolved registry row on BOTH account_id AND ib_login_key. A
+        # divergent account_id OR a divergent ib_login_key (Codex code-review
+        # iter-2 P2 — the login was silently ignored, so the deploy could target
+        # a different gateway/login than the request named) is ambiguous → 422.
+        _deploy_error(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "AMBIGUOUS_DEPLOY_TARGET",
+            (
+                f"broker_account_id resolves to account {effective_account_id} / "
+                f"login {effective_ib_login_key}, but the request also names a "
+                "different legacy account_id/ib_login_key. Send exactly one target "
+                "(omit the legacy account_id + ib_login_key when using broker_account_id)."
+            ),
+            {
+                "resolved_account_id": effective_account_id,
+                "resolved_ib_login_key": effective_ib_login_key,
+                "request_account_id": request.account_id,
+                "request_ib_login_key": request.ib_login_key,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # PR4: real-money identity gate. Runs on the RESOLVED effective account
+    # (never the raw request string — same halt-bypass concern as the
+    # account-halt latch below). Fires ONLY when a registry row resolved and
+    # it is the production fund (is_real_money). Genuine pre-registry legacy
+    # warm-restarts (broker_account is None) keep today's behavior (plan D4).
+    # Enforced here so UI/API/CLI share one server-side gate (PRD US-003).
+    # ------------------------------------------------------------------
+    resolved = effective.broker_account
+    if resolved is not None and resolved.is_real_money:
+        confirm = request.confirm_account_id  # already body-normalized
+        if confirm is None:
+            _deploy_error(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "REAL_MONEY_CONFIRM_REQUIRED",
+                (
+                    f"Account {effective_account_id} is a real-money (fund) account. "
+                    "Re-send with confirm_account_id set to the exact account id to deploy."
+                ),
+                {"account_id": effective_account_id},
+            )
+        if confirm != effective_account_id:
+            _deploy_error(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "REAL_MONEY_CONFIRM_MISMATCH",
+                (
+                    "confirm_account_id does not match the resolved real-money account. "
+                    "Deploy refused."
+                ),
+                {"account_id": effective_account_id},
+            )
+
+    # PR4: divergence audit (council #7) — non-gating. If the UI told us which
+    # account it was scoped to and it differs from the actual deploy target,
+    # record it (durable, server-side). API/CLI omit selector_context. The
+    # bucket sentinels ("all"/"unassigned") are not a focused target → never a
+    # divergence (plan D6 / iter-1 P2).
+    selector_ctx = request.selector_context_account_id
+    if (
+        selector_ctx is not None
+        and selector_ctx not in ("all", "unassigned")
+        and selector_ctx != effective_account_id
+    ):
+        DEPLOY_TARGET_DIVERGENCE.inc(account_id=effective_account_id)
+        log.warning(
+            "deploy_target_divergence",
+            extra={
+                "selector_context_account_id": selector_ctx,
+                "deploy_target_account_id": effective_account_id,
+            },
+        )
 
     (
         binding_fingerprint,

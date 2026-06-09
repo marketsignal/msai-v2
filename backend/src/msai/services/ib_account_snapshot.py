@@ -159,6 +159,11 @@ class IBAccountSnapshot:
 
         self._summary: dict[str, float] = dict(_ZERO_SUMMARY)
         self._portfolio: list[dict[str, Any]] = []
+        # PR4 Task 9 Step 3: the gateway-connected account id, captured
+        # from ``IB.managedAccounts()`` during refresh. ``None`` until the
+        # first successful connect populates it — the dashboard uses this
+        # to label balance cards with the account they actually belong to.
+        self._account_id: str | None = None
         self._connected: bool = False
         # SF iter-2 P1: track per-source last-success timestamps so the
         # /summary and /portfolio handlers can each route through their
@@ -262,6 +267,18 @@ class IBAccountSnapshot:
         return self._connected
 
     @property
+    def account_id(self) -> str | None:
+        """The gateway-connected IB account id, ``None`` pre-first-success.
+
+        Populated from ``IB.managedAccounts()`` on the first successful
+        connect (PR4 Task 9 Step 3). Stays ``None`` if the gateway is
+        unreachable or reports no managed accounts — the dashboard falls
+        back to a generic "From IB Gateway" label in that case rather than
+        fabricating an account identity.
+        """
+        return self._account_id
+
+    @property
     def last_summary_success_at(self) -> datetime | None:
         """Timestamp of the most recent successful summary fetch.
 
@@ -353,6 +370,41 @@ class IBAccountSnapshot:
                     pid=os.getpid(),
                 )
 
+            # PR4 Task 9 Step 3: capture the gateway-connected account id.
+            # ``managedAccounts()`` reads the cached wrapper state populated by
+            # the connection handshake — synchronous, no IO. This runs only AFTER
+            # a confirmed connection, so the read is authoritative for the current
+            # login. Assign UNCONDITIONALLY (Codex code-review iter-2 P2): if the
+            # login later becomes zero- or multi-account, ``_resolve_account_id``
+            # returns ``None`` and we MUST clear the previously-cached id rather
+            # than keep labeling balances with a stale account — an honest
+            # "unknown" beats a wrong account label on operator-facing balances.
+            #
+            # Codex code-review iter-3 P2: capture the resolved id BEFORE the
+            # fetches but COMMIT it ONLY alongside a successful summary, so
+            # ``_account_id`` always labels the account the cached ``_summary``
+            # actually belongs to. If the summary fetch times out/errors after a
+            # reconnect-to-a-different-account, ``_account_id`` is NOT advanced —
+            # it stays consistent with the preserved prior summary rather than
+            # reporting the new account while the balances are still the old one's.
+            resolved_account_id = self._resolve_account_id()
+            # Codex code-review iter-4 P2: detect a gateway re-login to a
+            # DIFFERENT account. ``_summary``/``_portfolio`` commit independently
+            # (iter-3 P2 — a bad position row must not blank the balances), so a
+            # single ``_account_id`` could otherwise end up labeling a PORTFOLIO
+            # still holding the OLD account's positions (if the portfolio fetch
+            # below times out right after a re-login). When the account changes,
+            # invalidate the now-stale cached portfolio FIRST, so we never show
+            # account A's positions labeled as account B — an empty/honest
+            # positions view is correct until B's portfolio actually loads.
+            # Any identity change invalidates the cached portfolio — including
+            # transitions to/from ``None`` (known→zero/multiple, or unknown→known).
+            # Codex code-review iter-5 P2: the prior "both sides non-None" guard
+            # missed those None transitions, so a summary-success + portfolio-fail
+            # right after the gateway became ambiguous (or first resolved) could
+            # serve the old portfolio under the new/unknown account context.
+            account_changed = resolved_account_id != self._account_id
+
             # Codex iter-3 P2: commit summary success independently
             # of portfolio. A bad position row should not blank the
             # account-value dashboard.
@@ -361,7 +413,20 @@ class IBAccountSnapshot:
                 timeout=_FETCH_TIMEOUT_S,
             )
             self._summary = new_summary
+            self._account_id = resolved_account_id  # consistent with _summary
             self._last_summary_success_at = datetime.now(UTC)
+            if account_changed:
+                # The cached portfolio belongs to the prior account — drop it so
+                # a subsequent portfolio-fetch failure can't leave it labeled as
+                # the new account (Codex iter-4 P2). Also reset the freshness
+                # marker (Codex iter-7 P2): otherwise a failed re-fetch below
+                # leaves ``_last_portfolio_success_at`` pointing at the OLD
+                # account's success, so ``/account/portfolio`` would pass its
+                # cold-start guard and serve ``[]`` — reporting "unavailable" as a
+                # genuinely-flat account. Clearing it makes the endpoint 503 until
+                # the NEW account's portfolio actually loads (honest "unknown").
+                self._portfolio = []
+                self._last_portfolio_success_at = None
             new_portfolio = await asyncio.wait_for(
                 self._fetch_portfolio(),
                 timeout=_FETCH_TIMEOUT_S,
@@ -423,6 +488,32 @@ class IBAccountSnapshot:
     # ------------------------------------------------------------------
     # IB fetches (private)
     # ------------------------------------------------------------------
+
+    def _resolve_account_id(self) -> str | None:
+        """Return the connected account id ONLY when the gateway login exposes
+        exactly ONE managed account, else ``None``.
+
+        ``IB.managedAccounts()`` returns ``list[str]`` (the gateway login's
+        visible accounts) synchronously from cached handshake state. The
+        ``/account/health.account_id`` label this feeds confirms which single
+        account the gateway-bound summary/portfolio belong to. ``get_summary``/
+        ``get_portfolio`` are NOT filtered to a specific account, so in a
+        MULTI-account / FA login the cached data may be aggregate or another
+        account's — labeling it with the first managed account would mislead
+        (Codex code-review P2). MSAI's broker logins are single-account, so the
+        unambiguous single-account case is the only one we label; a
+        multi-account login yields ``None`` (honest "unknown") rather than a
+        wrong id. Defensive against a non-list return (e.g. a test MagicMock)
+        and against empty/whitespace entries.
+        """
+        if self._ib is None:
+            return None
+        accounts = self._ib.managedAccounts()
+        if not isinstance(accounts, (list, tuple)):
+            return None
+        non_empty = [a.strip() for a in accounts if isinstance(a, str) and a.strip()]
+        # Exactly one → unambiguous, safe to label. Zero or many → None.
+        return non_empty[0] if len(non_empty) == 1 else None
 
     async def _fetch_summary(self) -> dict[str, float]:
         """Pull account-summary tags from the live IB connection.

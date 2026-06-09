@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { MobileSidebarTrigger } from "./sidebar";
 import { NotificationsBell } from "./notifications-bell";
+import { AccountSelector } from "./account-selector";
 
 function getInitials(name: string | undefined): string {
   if (!name) return "U";
@@ -24,6 +25,7 @@ export function Header(): React.ReactElement {
     <header className="flex h-14 shrink-0 items-center justify-between border-b border-border/50 bg-card px-4">
       <div className="flex items-center gap-2">
         <MobileSidebarTrigger />
+        <AccountSelector />
       </div>
 
       <div className="flex items-center gap-3">

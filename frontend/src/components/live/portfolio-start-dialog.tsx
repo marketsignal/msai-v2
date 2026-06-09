@@ -1,21 +1,34 @@
 "use client";
 
 /**
- * PortfolioStartDialog — 4-stage deploy flow for a frozen
- * LivePortfolioRevision.
+ * PortfolioStartDialog — registry-backed deploy flow for a frozen
+ * LivePortfolioRevision (PR4 rewrite).
  *
- *   Stage 1: Form (account_id, ib_login_key, paper_trading toggle)
- *   Stage 2: Preview (GET revision members)
- *   Stage 3: Real-money confirm (paper skips this stage)
- *   Stage 4: Submit (POST /api/v1/live/start-portfolio with Idempotency-Key)
+ *   Stage 1: Form — pick an EXPLICIT target account from the registered
+ *            broker-account registry (shadcn Select). NO free-text account-id,
+ *            NO browser prefix-parse (PRD §6 — never infer real-money from a
+ *            string). Pre-filled from the global account selector ONLY when
+ *            that scope is a single concrete account; "all"/"unassigned"
+ *            leave it unset and DISABLE Deploy with a "pick a target" notice
+ *            (US-002). `paper_trading` is DERIVED from the chosen account's
+ *            trading_mode.
+ *   Stage 2: Preview (GET revision members).
+ *   Stage 3: Real-money confirm — shown ONLY when the chosen account is the
+ *            production fund (`is_real_money`). The operator types the exact
+ *            `ib_account_id`; that value is sent as `confirm_account_id` so the
+ *            SERVER is the authority (test/paper accounts skip this stage).
+ *   Stage 4: Submit (POST /api/v1/live/start-portfolio with Idempotency-Key,
+ *            `broker_account_id` + `selector_context_account_id`).
  *
  * 422 envelopes are decoded inline:
- *   - BINDING_MISMATCH    → mismatches table (field/member_value/candidate_value)
- *   - LIVE_DEPLOY_CONFLICT → remediation callout (no retry CTA — Codex iter-2 P2
- *                            found stop+retry hits the same 422 since the
- *                            backend collision check runs against the persistent
- *                            row regardless of active status)
- *   - other 422 codes      → red callout with body.error.message
+ *   - BINDING_MISMATCH            → mismatches table
+ *   - LIVE_DEPLOY_CONFLICT        → remediation callout (no retry CTA)
+ *   - REAL_MONEY_CONFIRM_REQUIRED → confirm-stage callout (server authority)
+ *   - REAL_MONEY_CONFIRM_MISMATCH → confirm-stage callout (server authority)
+ *   - AMBIGUOUS_DEPLOY_TARGET     → callout (should be unreachable from the UI
+ *                                   happy path — the dialog sends exactly one
+ *                                   target — but the server is authoritative)
+ *   - other 422 codes             → red callout with body.error.message
  *
  * Accepts HTTP 200 OR 201 as success (warm-restart vs cold). `startPortfolio`
  * throws ApiError on non-2xx, so both reach the success path naturally.
@@ -23,6 +36,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 
+import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -35,6 +49,13 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   Table,
   TableBody,
   TableCell,
@@ -43,6 +64,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { useAuth } from "@/lib/auth";
+import { useAccountScope } from "@/lib/account-scope";
 import {
   ApiError,
   describeApiError,
@@ -54,6 +76,10 @@ import type {
   LivePortfolioRevision,
   PortfolioStartResponse,
 } from "@/lib/api";
+import {
+  listBrokerAccounts,
+  type BrokerAccount,
+} from "@/lib/api/broker-accounts";
 
 // ---------------------------------------------------------------------------
 // Props
@@ -142,6 +168,13 @@ function isLiveDeployConflict(
   return !!details && typeof details.existing_deployment_id === "string";
 }
 
+function errorCode(body: unknown): string | null {
+  const normalized = unwrapError(body);
+  if (!normalized) return null;
+  const err = (normalized as GenericErrorEnvelope).error;
+  return typeof err.code === "string" ? err.code : null;
+}
+
 function genericErrorMessage(body: unknown): string | null {
   const normalized = unwrapError(body);
   if (!normalized) return null;
@@ -172,13 +205,31 @@ export function PortfolioStartDialog(
 ): React.ReactElement {
   const { revision, open, onOpenChange, onSuccess } = props;
   const { getToken } = useAuth();
+  const { scope } = useAccountScope();
 
-  // Form state
-  const [accountId, setAccountId] = useState<string>("");
-  const [ibLoginKey, setIbLoginKey] = useState<string>("");
-  const [paperTrading, setPaperTrading] = useState<boolean>(true);
+  // Registry of registered broker accounts — the explicit target options.
+  const accountsQ = useQuery({
+    queryKey: ["broker-accounts"],
+    queryFn: async () => listBrokerAccounts(await getToken()),
+    enabled: open,
+  });
+  const accounts = useMemo<BrokerAccount[]>(
+    () => accountsQ.data ?? [],
+    [accountsQ.data],
+  );
+
+  // Form state — an EXPLICIT target account (replaces free-text account_id).
+  const [selectedAccountId, setSelectedAccountId] = useState<string>("");
   const [confirmInput, setConfirmInput] = useState<string>("");
   const [formError, setFormError] = useState<string | null>(null);
+
+  const selectedAccount = useMemo<BrokerAccount | null>(
+    () => accounts.find((a) => a.id === selectedAccountId) ?? null,
+    [accounts, selectedAccountId],
+  );
+  // paper_trading is DERIVED from the chosen account, never a separate toggle.
+  const paperTrading = selectedAccount?.trading_mode === "paper";
+  const isRealMoney = selectedAccount?.is_real_money === true;
 
   // Workflow state
   const [stage, setStage] = useState<Stage>("form");
@@ -197,23 +248,29 @@ export function PortfolioStartDialog(
     status?: string;
   } | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
-  // Codex iter-8 P2: persist the Idempotency-Key across deploy retries
-  // within the same dialog session. If the POST reaches the backend but
-  // the browser loses the response, a retry with a fresh key would
-  // bypass the Redis reservation and could publish a second START
-  // before active-process de-dupe observes the first. Key resets when
-  // the dialog re-opens or when identity-bearing inputs change.
+  // Persist the Idempotency-Key across deploy retries within the same dialog
+  // session. Key resets when the dialog re-opens or when the identity-bearing
+  // input (the chosen account) changes.
   const [idempotencyKey, setIdempotencyKey] = useState<string>(() =>
     newIdempotencyKey(),
   );
+
+  // Pre-fill the target from the global account selector ONLY when scope is a
+  // single concrete account that is registered. "all"/"unassigned" leave it
+  // unset (operator must pick — US-002).
+  useEffect(() => {
+    if (!open) return;
+    if (selectedAccountId) return; // don't override an explicit pick
+    if (scope === "all" || scope === "unassigned") return;
+    const match = accounts.find((a) => a.ib_account_id === scope);
+    if (match) setSelectedAccountId(match.id);
+  }, [open, scope, accounts, selectedAccountId]);
 
   // Reset when dialog closes
   useEffect(() => {
     if (!open) {
       setStage("form");
-      setAccountId("");
-      setIbLoginKey("");
-      setPaperTrading(true);
+      setSelectedAccountId("");
       setConfirmInput("");
       setFormError(null);
       setMembers(null);
@@ -226,38 +283,18 @@ export function PortfolioStartDialog(
     }
   }, [open]);
 
-  // Codex iter-8 P2: rotate the key when the *identity-bearing* fields
-  // change (a different account or login is genuinely a new request,
-  // not a retry). Paper toggle is part of identity_signature too.
+  // Rotate the idempotency key when the identity-bearing input (the chosen
+  // account) changes — a different target is a genuinely new request.
   useEffect(() => {
     setIdempotencyKey(newIdempotencyKey());
-  }, [accountId, ibLoginKey, paperTrading]);
+  }, [selectedAccountId]);
 
-  // ── Stage 1 → 2: validate + load members ────────────────────────────────
+  // ── Stage 1 → 2: validate target + load members ──────────────────────────
   const onPreview = useCallback(async (): Promise<void> => {
     setFormError(null);
 
-    if (!accountId.trim()) {
-      setFormError("Account ID is required.");
-      return;
-    }
-    if (!ibLoginKey.trim()) {
-      setFormError("IB login key is required.");
-      return;
-    }
-    // Codex iter-4 P2: match backend IB_PAPER_PREFIXES = ("DU", "DF").
-    // DU = personal paper; DF/DFP = FA sub-account paper. Live accounts
-    // start with U (not DU/DF). Trim before checking — operators paste
-    // account IDs with trailing whitespace from the IB portal.
-    const trimmedAccount = accountId.trim();
-    const isPaperPrefix =
-      trimmedAccount.startsWith("DU") || trimmedAccount.startsWith("DF");
-    if (paperTrading && !isPaperPrefix) {
-      setFormError("Paper accounts must start with 'DU' or 'DF'.");
-      return;
-    }
-    if (!paperTrading && (isPaperPrefix || !trimmedAccount.startsWith("U"))) {
-      setFormError("Live accounts must start with 'U' (not DU/DF).");
+    if (!selectedAccount) {
+      setFormError("Pick a target account to deploy.");
       return;
     }
 
@@ -268,38 +305,38 @@ export function PortfolioStartDialog(
       setMembers(rows);
       setStage("preview");
     } catch (err) {
-      // iter-3 describeApiError sweep: surface the backend's HTTPException
-      // detail (e.g. "revision_not_found") instead of the bare HTTP status.
       setFormError(describeApiError(err, "Failed to load revision members."));
     } finally {
       setMembersLoading(false);
     }
-  }, [accountId, ibLoginKey, paperTrading, revision.id, getToken]);
+  }, [selectedAccount, revision.id, getToken]);
 
-  // ── Submit (Stage 4) ────────────────────────────────────────────────────
+  // ── Submit (Stage 4) ──────────────────────────────────────────────────────
   const doSubmit = useCallback(async (): Promise<void> => {
+    if (!selectedAccount) {
+      setFormError("Pick a target account to deploy.");
+      setStage("form");
+      return;
+    }
     setSubmitting(true);
     setSubmitError(null);
     setMismatches(null);
     setConflict(null);
     setStage("submitting");
 
+    const realMoney = selectedAccount.is_real_money === true;
+    const errorStage: Stage = realMoney ? "confirm" : "preview";
+
     try {
       const token = await getToken();
-      // Codex iter-5 P2: submit trimmed values. onPreview validates the
-      // trimmed account_id but the raw input could still carry leading/
-      // trailing whitespace from a paste. The backend uses these strings
-      // verbatim for identity_signature + IB login routing, so " DU123"
-      // vs "DU123" can become distinct deployment rows targeting the
-      // same broker account, and " mslvp000" fails gateway-route lookup.
       const result = await startPortfolio(
         {
           portfolio_revision_id: revision.id,
-          account_id: accountId.trim(),
-          paper_trading: paperTrading,
-          ib_login_key: ibLoginKey.trim(),
+          broker_account_id: selectedAccount.id,
+          paper_trading: selectedAccount.trading_mode === "paper",
+          confirm_account_id: realMoney ? confirmInput.trim() : undefined,
+          selector_context_account_id: scope,
         },
-        // Codex iter-8 P2: reuse the dialog's sticky key across retries.
         idempotencyKey,
         token,
       );
@@ -307,7 +344,6 @@ export function PortfolioStartDialog(
       onOpenChange(false);
     } catch (err) {
       if (err instanceof ApiError && err.status === 422) {
-        const errorStage: Stage = paperTrading ? "preview" : "confirm";
         if (isBindingMismatch(err.body)) {
           const env = unwrapError(err.body) as BindingMismatchEnvelope;
           setMismatches(env.error.details.mismatches);
@@ -318,62 +354,65 @@ export function PortfolioStartDialog(
             status: env.error.details.status,
           });
         } else {
+          // Decode the PR4 real-money / ambiguous-target codes; fall back to
+          // the server's message. These should be unreachable from the UI
+          // happy path (the dialog gates client-side + sends exactly one
+          // target), but the server is the authority and its message must
+          // render if it ever returns.
+          const code = errorCode(err.body);
           const msg = genericErrorMessage(err.body);
-          setSubmitError(msg ?? "Deployment was rejected (422).");
+          if (
+            code === "REAL_MONEY_CONFIRM_REQUIRED" ||
+            code === "REAL_MONEY_CONFIRM_MISMATCH" ||
+            code === "AMBIGUOUS_DEPLOY_TARGET"
+          ) {
+            setSubmitError(msg ?? `Deployment rejected (${code}).`);
+          } else {
+            setSubmitError(msg ?? "Deployment was rejected (422).");
+          }
         }
         setStage(errorStage);
         return;
       }
-      // iter-3 describeApiError sweep: extract HTTPException detail.
       setSubmitError(describeApiError(err, "Deploy failed."));
-      setStage(paperTrading ? "preview" : "confirm");
+      setStage(errorStage);
     } finally {
       setSubmitting(false);
     }
   }, [
-    accountId,
-    ibLoginKey,
-    paperTrading,
+    selectedAccount,
     revision.id,
     getToken,
+    confirmInput,
+    scope,
+    idempotencyKey,
     onSuccess,
     onOpenChange,
-    idempotencyKey,
   ]);
 
-  // ── Continue from Preview ───────────────────────────────────────────────
+  // ── Continue from Preview ──────────────────────────────────────────────────
   const onContinueFromPreview = useCallback((): void => {
     setMismatches(null);
     setConflict(null);
     setSubmitError(null);
-    if (paperTrading) {
-      void doSubmit();
-    } else {
+    if (isRealMoney) {
       setStage("confirm");
+    } else {
+      void doSubmit();
     }
-  }, [paperTrading, doSubmit]);
+  }, [isRealMoney, doSubmit]);
 
-  // Codex code-review iter-2 P2: removed the "stop existing + retry"
-  // resolver for LIVE_DEPLOY_CONFLICT. The backend check raises against
-  // the persistent deployment row regardless of active status, so /stop
-  // alone wouldn't clear the conflict — it would just loop. The UI now
-  // surfaces the real remediation in the conflict callout instead.
-
-  // PR #67 review P2: the preview path validates + the submit path
-  // sends the TRIMMED account_id (Codex iter-9 fix), so the confirm
-  // challenge must use the trimmed value on both sides too. Otherwise
-  // operator who pasted " DU... " (leading/trailing whitespace) sees
-  // a Deploy button that never enables — they'd have to type the same
-  // invisible whitespace to satisfy the raw equality check, even though
-  // the request will send the trimmed value regardless.
-  const trimmedAccountId = useMemo(() => accountId.trim(), [accountId]);
+  // Real-money confirm: the operator must type the exact ib_account_id.
+  const confirmChallenge = selectedAccount?.ib_account_id ?? "";
   const confirmMatches = useMemo<boolean>(
     () =>
-      confirmInput.trim() === trimmedAccountId && trimmedAccountId.length > 0,
-    [confirmInput, trimmedAccountId],
+      confirmInput.trim() === confirmChallenge && confirmChallenge.length > 0,
+    [confirmInput, confirmChallenge],
   );
 
-  // ── Render ──────────────────────────────────────────────────────────────
+  const noTargetPicked = !selectedAccount;
+
+  // ── Render ──────────────────────────────────────────────────────────────────
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-2xl">
@@ -387,58 +426,122 @@ export function PortfolioStartDialog(
           </DialogDescription>
         </DialogHeader>
 
-        {/* ─── Stage 1: Form ─────────────────────────────────────────── */}
+        {/* ─── Stage 1: Form (explicit target picker) ─────────────────── */}
         {stage === "form" && (
           <div className="flex flex-col gap-4">
             <div className="flex flex-col gap-2">
-              <Label htmlFor="portfolio-start-account-id">Account ID</Label>
-              <Input
-                id="portfolio-start-account-id"
-                data-testid="portfolio-start-account-id"
-                value={accountId}
-                onChange={(e) => setAccountId(e.target.value)}
-                placeholder={paperTrading ? "DU1234567" : "U1234567"}
-                autoComplete="off"
-              />
-            </div>
-
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="portfolio-start-ib-login-key">IB login key</Label>
-              <Input
-                id="portfolio-start-ib-login-key"
-                data-testid="portfolio-start-ib-login-key"
-                value={ibLoginKey}
-                onChange={(e) => setIbLoginKey(e.target.value)}
-                placeholder="ib-paper-1"
-                autoComplete="off"
-              />
-            </div>
-
-            <div className="flex flex-col gap-2">
-              <Label
-                htmlFor="portfolio-start-paper-toggle"
-                className="cursor-pointer"
-              >
-                <input
-                  id="portfolio-start-paper-toggle"
-                  data-testid="portfolio-start-paper-toggle"
-                  type="checkbox"
-                  checked={paperTrading}
-                  onChange={(e) => setPaperTrading(e.target.checked)}
-                  className="size-4 cursor-pointer rounded border-input accent-primary focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
-                />
-                <span>Paper trading (recommended)</span>
+              <Label htmlFor="portfolio-start-target-account">
+                Target account
               </Label>
+              <Select
+                value={selectedAccountId}
+                onValueChange={setSelectedAccountId}
+                disabled={accountsQ.isPending || accounts.length === 0}
+              >
+                <SelectTrigger
+                  id="portfolio-start-target-account"
+                  data-testid="portfolio-start-target-account"
+                  aria-label="Target account"
+                >
+                  <SelectValue
+                    placeholder={
+                      accountsQ.isPending
+                        ? "Loading accounts…"
+                        : accountsQ.isError
+                          ? "Couldn't load accounts"
+                          : accounts.length === 0
+                            ? "No registered accounts"
+                            : "Pick a target account"
+                    }
+                  />
+                </SelectTrigger>
+                <SelectContent>
+                  {accounts.map((a) => (
+                    <SelectItem
+                      key={a.id}
+                      value={a.id}
+                      data-testid={`portfolio-start-target-option-${a.id}`}
+                      className={
+                        a.is_real_money
+                          ? "font-semibold text-destructive"
+                          : undefined
+                      }
+                    >
+                      {a.is_real_money
+                        ? `⚠ REAL FUND — ${a.label ?? a.ib_account_id} (${a.ib_account_id}) — LIVE MONEY`
+                        : `${a.label ?? a.ib_account_id} (${a.ib_account_id}) — ${a.trading_mode}`}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                Deploys go to an EXPLICIT registered account. Paper vs live is
+                taken from the account, not a toggle.
+              </p>
             </div>
 
-            {!paperTrading && (
+            {/* Codex code-review iter-3 P2: distinguish a FAILED /broker-accounts
+                load from a genuinely empty list. On error, surface it + a retry
+                instead of silently showing "No registered accounts" (which would
+                block the operator when accounts actually exist). */}
+            {accountsQ.isError && (
+              <div
+                role="alert"
+                data-testid="portfolio-start-accounts-error"
+                className="flex w-full items-center justify-between gap-3 rounded-md border border-destructive/30 bg-destructive/15 px-4 py-2 text-sm text-destructive"
+              >
+                <span>
+                  Couldn&apos;t load broker accounts —{" "}
+                  {describeApiError(accountsQ.error, "try again")}.
+                </span>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void accountsQ.refetch()}
+                >
+                  Retry
+                </Button>
+              </div>
+            )}
+
+            {!accountsQ.isError && noTargetPicked && (
+              <div
+                role="status"
+                data-testid="portfolio-start-no-target-notice"
+                className="w-full rounded-md border border-amber-500/40 bg-amber-500/10 px-4 py-2 text-sm text-amber-300"
+              >
+                Pick a target account to deploy.
+              </div>
+            )}
+
+            {selectedAccount && isRealMoney && (
               <div
                 role="alert"
                 className="w-full rounded-md border border-destructive/30 bg-destructive/15 px-4 py-3 text-sm text-destructive"
               >
-                <strong className="font-semibold">⚠ REAL MONEY:</strong> orders
-                submitted by this deployment will execute against your live IB
-                account. Verify account_id matches your intent.
+                <strong className="font-semibold">⚠ REAL FUND:</strong> this is
+                the production fund account (
+                <span className="font-mono">
+                  {selectedAccount.ib_account_id}
+                </span>
+                ). You will be asked to type the account id to confirm before
+                deploy.
+              </div>
+            )}
+
+            {selectedAccount && !isRealMoney && !paperTrading && (
+              <div
+                role="alert"
+                className="w-full rounded-md border border-destructive/30 bg-destructive/15 px-4 py-3 text-sm text-destructive"
+              >
+                <strong className="font-semibold">⚠ LIVE:</strong> orders
+                submitted by this deployment execute against the live test
+                account{" "}
+                <span className="font-mono">
+                  {selectedAccount.ib_account_id}
+                </span>
+                .
               </div>
             )}
 
@@ -462,7 +565,7 @@ export function PortfolioStartDialog(
               <Button
                 data-testid="portfolio-start-preview-button"
                 onClick={() => void onPreview()}
-                disabled={membersLoading}
+                disabled={membersLoading || noTargetPicked}
               >
                 {membersLoading ? "Loading…" : "Preview"}
               </Button>
@@ -505,9 +608,13 @@ export function PortfolioStartDialog(
             </div>
 
             <p className="text-xs text-muted-foreground">
-              Binding contract: matching config + instruments will be verified
-              server-side. Mismatches will be returned as 422 with field-level
-              diff.
+              Target:{" "}
+              <span className="font-mono">
+                {selectedAccount?.ib_account_id}
+              </span>{" "}
+              ({paperTrading ? "paper" : "live"}). Binding contract: matching
+              config + instruments will be verified server-side. Mismatches will
+              be returned as 422 with field-level diff.
             </p>
 
             {renderErrors({ mismatches, conflict, submitError })}
@@ -521,35 +628,41 @@ export function PortfolioStartDialog(
                 onClick={onContinueFromPreview}
                 disabled={submitting}
               >
-                {paperTrading ? "Deploy (paper)" : "Continue to Deploy"}
+                {isRealMoney
+                  ? "Continue to Deploy"
+                  : paperTrading
+                    ? "Deploy (paper)"
+                    : "Deploy (live)"}
               </Button>
             </DialogFooter>
           </div>
         )}
 
-        {/* ─── Stage 3: Confirm (real-money only) ───────────────────── */}
+        {/* ─── Stage 3: Confirm (real-money / fund only) ────────────── */}
         {stage === "confirm" && (
           <div className="flex flex-col gap-4">
             <div
               role="alert"
               className="w-full rounded-md border border-destructive/30 bg-destructive/15 px-4 py-3 text-sm text-destructive"
             >
-              <strong className="font-semibold">⚠ REAL MONEY DEPLOY.</strong>{" "}
-              Type the account ID{" "}
-              <span className="font-mono">{trimmedAccountId}</span> exactly to
+              <strong className="font-semibold">
+                ⚠ REAL FUND — {confirmChallenge} — LIVE MONEY.
+              </strong>{" "}
+              Type the account id{" "}
+              <span className="font-mono">{confirmChallenge}</span> exactly to
               confirm.
             </div>
 
             <div className="flex flex-col gap-2">
               <Label htmlFor="portfolio-start-confirm-input">
-                Confirm account ID
+                Confirm account id
               </Label>
               <Input
                 id="portfolio-start-confirm-input"
                 data-testid="portfolio-start-confirm-input"
                 value={confirmInput}
                 onChange={(e) => setConfirmInput(e.target.value)}
-                placeholder={trimmedAccountId}
+                placeholder={confirmChallenge}
                 autoComplete="off"
               />
             </div>
@@ -657,24 +770,12 @@ function renderErrors(args: {
             .
           </p>
           <p className="text-xs text-destructive">
-            {/* Codex code-review iter-2 P2: LIVE_DEPLOY_CONFLICT is
-               raised against the persistent live_deployments row
-               regardless of active status (api/live.py "LIVE_DEPLOY_CONFLICT"
-               check). A /stop call only marks the row as `stopped`; it
-               doesn't archive it. Re-deploying with a different identity
-               would hit the same 422. The actual remediation is either:
-               (a) re-submit with the SAME identity (ib_login_key,
-               paper_trading) as the existing row, or (b) operator deletes
-               the deployment row via DB/admin path. We surface that here
-               instead of offering a "Stop existing + retry" CTA that
-               would lead the operator into a retry loop. */}
             <strong>Remediation:</strong> re-submit with the same{" "}
             <span className="font-mono">ib_login_key</span> +{" "}
             <span className="font-mono">paper_trading</span> as the existing
             row, OR archive the existing deployment row (manual operator step —
             there is no public archive endpoint yet).
           </p>
-          {/* Intentionally NO retry CTA — see comment above. */}
         </div>
       )}
 

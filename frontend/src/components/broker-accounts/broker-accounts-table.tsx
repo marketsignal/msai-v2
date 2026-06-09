@@ -52,10 +52,34 @@ function statusBadgeClass(status: string): string {
 }
 
 function tradingModeBadgeClass(mode: string): string {
-  // Live trades real money — make it visually distinct from paper.
+  // Live is operationally distinct from paper, but NOT automatically real
+  // money — the fund flag is is_real_money (see classBadge). Keep live amber
+  // (operational) and reserve destructive-red for the actual fund.
   return mode.toLowerCase() === "live"
-    ? "bg-red-500/15 text-red-400"
+    ? "bg-amber-500/15 text-amber-400"
     : "bg-sky-500/15 text-sky-400";
+}
+
+/**
+ * Honest real-money classification for the account, keyed off the explicit
+ * `is_real_money` field (PRD §6 — NEVER inferred from trading_mode / id). Three
+ * states: paper, live test (LVP/HVP — live but not the fund), and the REAL
+ * FUND (destructive styling).
+ */
+function classBadge(account: BrokerAccount): {
+  label: string;
+  className: string;
+} {
+  if (account.is_real_money) {
+    return {
+      label: "Live · REAL FUND",
+      className: "bg-red-500/15 text-red-400",
+    };
+  }
+  if (account.trading_mode.toLowerCase() === "paper") {
+    return { label: "Paper", className: "bg-sky-500/15 text-sky-400" };
+  }
+  return { label: "Live · Test", className: "bg-amber-500/15 text-amber-400" };
 }
 
 export function BrokerAccountsTable({
@@ -129,6 +153,7 @@ export function BrokerAccountsTable({
             <TableHead>Status</TableHead>
             <TableHead>Gateway slot</TableHead>
             <TableHead>Trading mode</TableHead>
+            <TableHead>Class</TableHead>
             <TableHead className="text-right">Secret version</TableHead>
           </TableRow>
         </TableHeader>
@@ -175,6 +200,20 @@ export function BrokerAccountsTable({
                   {account.trading_mode}
                 </Badge>
               </TableCell>
+              <TableCell>
+                {(() => {
+                  const c = classBadge(account);
+                  return (
+                    <Badge
+                      variant="secondary"
+                      className={c.className}
+                      data-testid={`broker-account-class-${account.id}`}
+                    >
+                      {c.label}
+                    </Badge>
+                  );
+                })()}
+              </TableCell>
               <TableCell className="text-right font-mono text-xs text-muted-foreground">
                 {account.credentials_secret_version ?? "—"}
               </TableCell>
@@ -200,6 +239,7 @@ function TableSkeleton(): React.ReactElement {
             <TableHead>Status</TableHead>
             <TableHead>Gateway slot</TableHead>
             <TableHead>Trading mode</TableHead>
+            <TableHead>Class</TableHead>
             <TableHead className="text-right">Secret version</TableHead>
           </TableRow>
         </TableHeader>
@@ -217,6 +257,9 @@ function TableSkeleton(): React.ReactElement {
               </TableCell>
               <TableCell>
                 <Skeleton className="h-5 w-14" />
+              </TableCell>
+              <TableCell>
+                <Skeleton className="h-5 w-20" />
               </TableCell>
               <TableCell className="text-right">
                 <Skeleton className="ml-auto h-4 w-10" />

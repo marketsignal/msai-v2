@@ -36,6 +36,47 @@ class PortfolioStartRequest(BaseModel):
     account_id: str | None = None
     paper_trading: bool = True
     ib_login_key: str | None = Field(default=None, min_length=1, max_length=64)
+    # PR4: real-money identity confirmation. Body-only preconditions are
+    # checked here (blank / "all" / "unassigned" → 422). The SEMANTIC identity
+    # match (confirm_account_id == resolved ib_account_id when the account is
+    # real-money) CANNOT run here — it needs a DB lookup — so it runs in the
+    # handler after _resolve_effective_account (plan §gate; research §3).
+    confirm_account_id: str | None = None
+    # PR4: the active global-selector value the UI was scoped to at deploy time
+    # (None on API/CLI — no global selector). The handler emits a divergence
+    # metric/log when this is present and != the resolved effective account
+    # (council objection #7). NEVER drives a safety decision (plan D6).
+    selector_context_account_id: str | None = None
+
+    @field_validator("confirm_account_id")
+    @classmethod
+    def _normalize_confirm_account_id(cls, v: str | None) -> str | None:
+        """Body-only precondition: reject blank / 'all' / 'unassigned'. A present
+        confirm token must be a concrete account id; the bucket sentinels are
+        never a real target (PRD US-003)."""
+        if v is None:
+            return None
+        normalized = v.strip()
+        if not normalized:
+            raise ValueError("confirm_account_id cannot be empty / whitespace-only")
+        if normalized.lower() in ("all", "unassigned"):
+            raise ValueError(
+                "confirm_account_id must be a concrete account id, not 'all'/'unassigned'"
+            )
+        return normalized
+
+    @field_validator("selector_context_account_id")
+    @classmethod
+    def _normalize_selector_context(cls, v: str | None) -> str | None:
+        """Trim the UI selector-context value (Codex code-review iter-9 P3),
+        mirroring confirm_account_id. Without this a whitespace-padded `" all "`
+        would slip past the handler's `in ("all", "unassigned")` exclusion and
+        register a spurious divergence metric. Non-gating (plan D6), so a blank
+        value is normalized to None rather than rejected."""
+        if v is None:
+            return None
+        normalized = v.strip()
+        return normalized or None
 
     @field_validator("account_id")
     @classmethod

@@ -45,8 +45,12 @@ class _StubSnapshot:
         *,
         summary_at: datetime | None = None,
         portfolio_at: datetime | None = None,
+        account_id: str | None = None,
     ) -> None:
         now = datetime.now(UTC)
+        # Mirror IBAccountSnapshot.account_id (Codex iter-5 P2: /summary now
+        # returns the connected account id atomically with the balances).
+        self.account_id: str | None = account_id
         self.last_summary_success_at: datetime | None = (
             summary_at if summary_at is not None else now
         )
@@ -115,6 +119,10 @@ class TestAccountSummary:
         assert "buying_power" in body
         assert "margin_used" in body
         assert isinstance(body["net_liquidation"], float)
+        # Codex code-review iter-5 P2: the connected account id rides ALONGSIDE
+        # the balances (atomic labeling). Key always present; value may be None
+        # when the connected account is unknown/ambiguous.
+        assert "account_id" in body
 
     async def test_account_summary_has_all_fields(
         self, client: httpx.AsyncClient, seeded_snapshot_app: None
@@ -182,6 +190,9 @@ class TestAccountHealth:
         body = response.json()
         assert "status" in body
         assert "gateway_connected" in body
+        # PR4 Task 9 Step 3: the connected account id is always present in
+        # the body (value may be None before the snapshot's first refresh).
+        assert "account_id" in body
 
     async def test_account_health_reports_unhealthy_by_default(
         self, client: httpx.AsyncClient

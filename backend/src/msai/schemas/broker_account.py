@@ -34,6 +34,11 @@ class BrokerAccountCreateRequest(BaseModel):
     ib_login_key: str = Field(min_length=1, max_length=64)
     label: str | None = None
     trading_mode: str = Field(default="paper", pattern=r"^(paper|live)$")
+    # PR4: explicit real-money classification. When omitted, defaulted from
+    # trading_mode by the model_validator (paper→paper, live→test). Explicit
+    # 'real' requires trading_mode='live' (a paper account can never be real
+    # money). NEVER inferred from ib_account_id (PRD §6 / plan D5).
+    account_class: str | None = Field(default=None, pattern=r"^(paper|test|real)$")
     gateway_slot: str | None = None  # None → auto-allocate a free slot
     # SecretStr so a rejected value (e.g. too-long password) is masked in
     # FastAPI's 422 ``input`` echo. Field min/max_length validate the wrapped
@@ -70,6 +75,34 @@ class BrokerAccountCreateRequest(BaseModel):
         assert_account_mode_consistent(self.ib_account_id, self.trading_mode)
         return self
 
+    @model_validator(mode="after")
+    def _default_and_validate_account_class(self) -> BrokerAccountCreateRequest:
+        """Default account_class from trading_mode when omitted (paper→paper,
+        live→test) and enforce the FULL class/mode matrix so the taxonomy can
+        never contradict the trading mode (Codex code-review iter-2 P2 —
+        otherwise `live`+`paper` or `paper`+`test` would persist and downstream
+        operator labels [CLI/detail CLASS] would say a live account is `paper`):
+
+        * paper mode  ⟺ account_class == 'paper' (a paper account holds no real
+          funds, so it is neither 'test' nor 'real').
+        * live  mode  ⟺ account_class in ('test', 'real'); 'real' is the
+          deliberate fund-registration path (plan D5), 'test' is a live test
+          account (LVP/HVP).
+        """
+        if self.account_class is None:
+            self.account_class = "paper" if self.trading_mode == "paper" else "test"
+        if self.trading_mode == "paper" and self.account_class != "paper":
+            raise ValueError(
+                f"account_class={self.account_class!r} is invalid for trading_mode='paper' "
+                "(paper accounts must be account_class='paper')"
+            )
+        if self.trading_mode == "live" and self.account_class == "paper":
+            raise ValueError(
+                "account_class='paper' is invalid for trading_mode='live' "
+                "(live accounts must be account_class='test' or 'real')"
+            )
+        return self
+
 
 class BrokerAccountUpdateRequest(BaseModel):
     """PATCH body for a broker account — label and trading_mode only."""
@@ -103,6 +136,11 @@ class BrokerAccountResponse(BaseModel):
     status: str
     gateway_slot: str
     trading_mode: str
+    account_class: str
+    # Derived convenience so the frontend reads real-money status from an
+    # explicit field, NEVER by parsing ib_account_id (PRD §6). Populated from
+    # the model property via from_attributes.
+    is_real_money: bool
     credentials_backend: str
     credentials_secret_ref: str
     credentials_secret_version: str | None

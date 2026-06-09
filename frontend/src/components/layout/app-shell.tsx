@@ -7,6 +7,7 @@ import { useEffect } from "react";
 import { Sidebar } from "./sidebar";
 import { Header } from "./header";
 import { isAuthBypassed } from "@/lib/auth";
+import { AccountScopeProvider } from "@/lib/account-scope";
 
 const PUBLIC_ROUTES = ["/login"];
 
@@ -63,12 +64,14 @@ export function AppShell({
   }
 
   return (
-    <div className="flex h-screen overflow-hidden">
-      <Sidebar />
-      <div className="flex flex-1 flex-col overflow-hidden">
-        <Header />
-        <main className="flex-1 overflow-y-auto p-6">{children}</main>
+    <AccountScopeProvider>
+      <div className="flex h-screen overflow-hidden">
+        <Sidebar />
+        <div className="flex flex-1 flex-col overflow-hidden">
+          <Header />
+          <main className="flex-1 overflow-y-auto p-6">{children}</main>
+        </div>
       </div>
-    </div>
+    </AccountScopeProvider>
   );
 }
