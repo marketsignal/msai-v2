@@ -34,3 +34,24 @@ def test_broker_account_tablename_and_columns():
         "updated_at",
     ):
         assert required in cols, f"missing column {required}"
+
+
+def test_account_class_column_present_and_string_backed() -> None:
+    from msai.models.broker_account import BrokerAccount
+
+    col = {c.name: c for c in BrokerAccount.__table__.columns}["account_class"]
+    assert col.nullable is False
+    # String-backed (NOT native PG enum) — matches status/trading_mode convention.
+    assert col.type.__class__.__name__ == "String"
+    assert col.server_default is not None  # existing rows backfill to the default
+
+
+def test_is_real_money_only_true_for_real_class() -> None:
+    from msai.models.broker_account import AccountClass, BrokerAccount
+
+    real = BrokerAccount(account_class=AccountClass.REAL)
+    test = BrokerAccount(account_class=AccountClass.TEST)
+    paper = BrokerAccount(account_class=AccountClass.PAPER)
+    assert real.is_real_money is True
+    assert test.is_real_money is False
+    assert paper.is_real_money is False

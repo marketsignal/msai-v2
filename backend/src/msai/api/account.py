@@ -154,8 +154,8 @@ def _get_snapshot_dep() -> IBAccountSnapshot:
 async def account_summary(
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
     snapshot: IBAccountSnapshot = Depends(_get_snapshot_dep),  # noqa: B008
-) -> dict[str, float]:
-    """IB account summary with key financial metrics.
+) -> dict[str, float | str | None]:
+    """IB account summary with key financial metrics + the connected account id.
 
     SF iter-2 P1: when the snapshot has NEVER successfully refreshed
     (cold-start + IB unreachable), the cached values are the
@@ -165,6 +165,13 @@ async def account_summary(
     path and the dashboard's per-source error banner fires honestly.
     Once a single refresh has succeeded, we serve cached values across
     transient gateway flaps (last-known-good).
+
+    Codex code-review iter-5 P2: ``account_id`` is returned ALONGSIDE the
+    balances (committed atomically with ``_summary`` server-side) so the UI
+    labels these gateway-bound numbers with the account they actually belong
+    to from a SINGLE payload — never a separately-fetched ``/account/health``
+    id that could have refreshed to a different account in between. ``None``
+    when the connected account is unknown/ambiguous (multi-account login).
     """
     _ = claims  # auth dependency only — claims are validated in get_current_user
     if snapshot.last_summary_success_at is None:
@@ -177,7 +184,9 @@ async def account_summary(
                 "refreshes within 30 seconds."
             ),
         )
-    return snapshot.get_summary()
+    summary: dict[str, float | str | None] = dict(snapshot.get_summary())
+    summary["account_id"] = snapshot.account_id
+    return summary
 
 
 @router.get("/portfolio")
@@ -206,17 +215,26 @@ async def account_portfolio(
 @router.get("/health")
 async def account_health(
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
-) -> dict[str, str | bool | int]:
+) -> dict[str, str | bool | int | None]:
     """IB Gateway connection health status.
 
     iter-5 verify-e2e Issue G (P2): consecutive_failures was returned as
     a string ("1525") which broke numeric comparisons + clients reading
     the OpenAPI spec. Switched to int — matches the underlying
     ``IBProbe.consecutive_failures`` type.
+
+    PR4 Task 9 Step 3: ``account_id`` is the gateway-connected IB account
+    id (``None`` before the snapshot's first successful refresh). The
+    dashboard uses it to label balance cards with the account they
+    actually belong to. Read directly from the module-level snapshot
+    singleton — ``get_snapshot()`` lazy-creates and never raises, and the
+    direct-call lifecycle test relies on this handler taking only
+    ``claims`` (no ``Depends`` snapshot param).
     """
     _ = claims
     return {
         "status": "healthy" if _ib_probe.is_healthy else "unhealthy",
         "gateway_connected": _ib_probe.is_healthy,
         "consecutive_failures": _ib_probe.consecutive_failures,
+        "account_id": get_snapshot().account_id,
     }

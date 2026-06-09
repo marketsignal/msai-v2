@@ -333,8 +333,17 @@ export interface LiveStatusResponse {
 /** Fetch the current list of live deployments + global state. */
 export async function getLiveStatus(
   token?: string | null,
+  opts?: { activeOnly?: boolean },
 ): Promise<LiveStatusResponse> {
-  return apiGet<LiveStatusResponse>("/api/v1/live/status", token);
+  // active_only=true returns ALL active deployments (starting/building/ready/
+  // running, up to 1000) instead of the default 50-most-recent-by-activity cap.
+  // Account-scoped views MUST use it: the default cap can push a long-running
+  // active deployment off the list, which would silently drop its open
+  // positions from the scoped P&L/table (Codex code-review iter-7 P2).
+  const path = opts?.activeOnly
+    ? "/api/v1/live/status?active_only=true"
+    : "/api/v1/live/status";
+  return apiGet<LiveStatusResponse>(path, token);
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +357,10 @@ export interface AccountSummary {
   margin_used: number;
   unrealized_pnl: number;
   realized_pnl: number;
+  /** Connected gateway account id, returned ATOMICALLY with these balances so
+   * the UI labels them with the right account from one payload (never a
+   * separately-fetched /account/health id). null when unknown/ambiguous. */
+  account_id: string | null;
 }
 
 export async function getAccountSummary(
@@ -967,9 +980,12 @@ export interface LivePortfolioMemberFrozen {
 export async function startPortfolio(
   body: {
     portfolio_revision_id: string;
-    account_id: string;
+    account_id?: string;
+    broker_account_id?: string;
     paper_trading: boolean;
-    ib_login_key: string;
+    ib_login_key?: string;
+    confirm_account_id?: string;
+    selector_context_account_id?: string;
   },
   idempotencyKey: string,
   token?: string | null,
@@ -1108,6 +1124,13 @@ export interface AccountHealth {
    * the value directly for numeric comparisons + thresholding.
    */
   consecutive_failures: number;
+  /**
+   * PR4 / US-005: the IB account id the gateway is currently connected to,
+   * or null before the first successful snapshot refresh. Lets the dashboard
+   * + /account page honestly label that the gateway-bound balances belong to
+   * THIS connected account (never inferred from an account-id string).
+   */
+  account_id: string | null;
 }
 
 export async function getAccountHealth(

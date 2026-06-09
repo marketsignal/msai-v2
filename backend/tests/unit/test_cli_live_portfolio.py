@@ -217,7 +217,10 @@ class TestStartPortfolio:
             )
         assert result.exit_code != 0
         assert m.call_count == 0
-        assert "REAL-MONEY" in result.output
+        # Task 6 iter-4 P2: prompt relabeled REAL-MONEY → LIVE (the fund-specific
+        # identity gate is the server's --confirm-account-id, not this prompt).
+        assert "LIVE" in result.output
+        assert "REAL-MONEY" not in result.output
 
     def test_no_paper_confirmed_sends_paper_false(self, runner: CliRunner) -> None:
         body = {"id": "dep-real", "status": "starting", "paper_trading": False}
@@ -265,6 +268,54 @@ class TestStartPortfolio:
         assert len(sent_headers["Idempotency-Key"]) > 0
         sent_body = m.call_args.kwargs["json"]
         assert "idempotency_key" not in sent_body
+
+    def test_confirm_account_id_sent_in_payload(self, runner: CliRunner) -> None:
+        """Task 6: --confirm-account-id flows into the start payload so the
+        server's real-money identity gate (Task 5) is satisfiable from the CLI.
+        It rides in the JSON body (PortfolioStartRequest.confirm_account_id),
+        NOT the Idempotency-Key header."""
+        body = {"id": "dep-fund", "status": "starting", "paper_trading": False}
+        with patch("msai.cli.httpx.request", return_value=_ok_response(body, status_code=201)) as m:
+            result = runner.invoke(
+                app,
+                [
+                    "live",
+                    "start-portfolio",
+                    "--revision",
+                    "rev-1",
+                    "--broker-account-id",
+                    "ba-uuid-1",
+                    "--no-paper",
+                    "--confirm-account-id",
+                    "U4715997",
+                ],
+                input="y\n",  # answer the typer.confirm prompt
+            )
+        assert result.exit_code == 0, result.output
+        sent = m.call_args.kwargs["json"]
+        assert sent["confirm_account_id"] == "U4715997"
+        assert sent["broker_account_id"] == "ba-uuid-1"
+
+    def test_confirm_account_id_omitted_when_blank(self, runner: CliRunner) -> None:
+        """No --confirm-account-id → the key is absent from the payload (the
+        server only requires it for real-money/fund accounts)."""
+        body = {"id": "dep-1", "status": "starting", "paper_trading": True}
+        with patch("msai.cli.httpx.request", return_value=_ok_response(body, status_code=201)) as m:
+            result = runner.invoke(
+                app,
+                [
+                    "live",
+                    "start-portfolio",
+                    "--revision",
+                    "rev-1",
+                    "--account",
+                    "DU1",
+                    "--ib-login-key",
+                    "k",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "confirm_account_id" not in m.call_args.kwargs["json"]
 
 
 class TestLiveStartAliasPrefixGuard:
@@ -374,6 +425,30 @@ class TestLiveStartAliasPrefixGuard:
         sent = m.call_args.kwargs["json"]
         assert sent["account_id"] == "DU1234567"
         assert sent["ib_login_key"] == "key"
+
+    def test_confirm_account_id_sent_in_payload(self, runner: CliRunner) -> None:
+        """Task 6 iter-1 P2#8: the legacy `live start` alias also posts to
+        /start-portfolio, so it must accept --confirm-account-id too — otherwise
+        the server's real-money gate is un-satisfiable from this command."""
+        body = {"id": "dep-fund", "status": "starting", "paper_trading": False}
+        with patch("msai.cli.httpx.request", return_value=_ok_response(body, status_code=201)) as m:
+            result = runner.invoke(
+                app,
+                [
+                    "live",
+                    "start",
+                    "rev-1",
+                    "U4715997",
+                    "--ib-login-key",
+                    "k",
+                    "--no-paper",
+                    "--confirm-account-id",
+                    "U4715997",
+                ],
+                input="y\n",
+            )
+        assert result.exit_code == 0, result.output
+        assert m.call_args.kwargs["json"]["confirm_account_id"] == "U4715997"
 
 
 class TestResume:

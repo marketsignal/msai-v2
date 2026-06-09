@@ -166,3 +166,67 @@ class TestLiveDeploymentStrategyModel:
         assert "EMACross-0-testslug" in ids
         assert "EMACross-1-testslug" in ids
         assert "SmokeMarketOrder-2-testslug" in ids
+
+
+# ---------------------------------------------------------------------------
+# Task 4: confirm_account_id + selector_context_account_id (body-only checks)
+# ---------------------------------------------------------------------------
+
+
+def test_confirm_account_id_blank_rejected() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        PortfolioStartRequest(
+            portfolio_revision_id=uuid4(),
+            broker_account_id=uuid4(),
+            confirm_account_id="   ",
+        )
+
+
+def test_confirm_account_id_all_or_unassigned_rejected() -> None:
+    from pydantic import ValidationError
+
+    for bad in ("all", "ALL", "unassigned", "Unassigned"):
+        with pytest.raises(ValidationError):
+            PortfolioStartRequest(
+                portfolio_revision_id=uuid4(),
+                broker_account_id=uuid4(),
+                confirm_account_id=bad,
+            )
+
+
+def test_confirm_account_id_concrete_value_accepted() -> None:
+    req = PortfolioStartRequest(
+        portfolio_revision_id=uuid4(),
+        broker_account_id=uuid4(),
+        confirm_account_id="U4715997",
+    )
+    assert req.confirm_account_id == "U4715997"
+
+
+def test_confirm_account_id_strips_surrounding_whitespace() -> None:
+    req = PortfolioStartRequest(
+        portfolio_revision_id=uuid4(),
+        broker_account_id=uuid4(),
+        confirm_account_id="  U4715997  ",
+    )
+    assert req.confirm_account_id == "U4715997"
+
+
+def test_selector_context_is_optional_and_passthrough() -> None:
+    req = PortfolioStartRequest(
+        portfolio_revision_id=uuid4(),
+        broker_account_id=uuid4(),
+        selector_context_account_id="all",
+    )
+    assert req.selector_context_account_id == "all"
+
+
+def test_confirm_and_selector_default_to_none_when_omitted() -> None:
+    req = PortfolioStartRequest(
+        portfolio_revision_id=uuid4(),
+        broker_account_id=uuid4(),
+    )
+    assert req.confirm_account_id is None
+    assert req.selector_context_account_id is None

@@ -291,6 +291,7 @@ async def _seed_broker_account(
     secret_version: str | None = "v1",
     secret_ref: str | None = None,
     has_credentials_updated_at: bool = True,
+    account_class: str = "test",
 ) -> BrokerAccount:
     acct = BrokerAccount(
         id=uuid4(),
@@ -300,6 +301,7 @@ async def _seed_broker_account(
         status=status,
         gateway_slot=f"slot-{uuid4().hex[:6]}",
         trading_mode=trading_mode,
+        account_class=account_class,
         credentials_backend=backend,
         credentials_secret_ref=secret_ref or f"ref-{ib_account_id}",
         credentials_secret_version=secret_version,
@@ -1290,16 +1292,23 @@ async def test_effective_account_halt_uses_derived_not_raw_request_account(
     redis_text: AsyncRedis,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """When ``broker_account_id`` resolves to account X but the caller ALSO
-    sends a divergent raw ``account_id`` Y, the DERIVED account X is
-    authoritative for the per-account halt gate: a halt on X blocks the deploy
-    even though Y is not halted. (Closes the halt-bypass: the raw request
-    account must never drive a safety check once an effective account exists.)"""
+    """When a deploy selects its account by ``broker_account_id`` (the post-PR4
+    shape), the DERIVED account is authoritative for the per-account halt gate:
+    a halt on the derived account blocks the deploy. (Closes the halt-bypass:
+    the raw request account must never drive a safety check once an effective
+    account exists.)
+
+    PR4 note: this test previously ALSO sent a divergent raw ``account_id`` to
+    prove the halt used the derived account rather than the raw one. That
+    divergent shape is now rejected EARLIER by the AMBIGUOUS_DEPLOY_TARGET gate
+    (see ``test_conflicting_broker_account_id_and_legacy_account_id_rejected_422``),
+    so it can no longer reach the halt check. The derived-account invariant is
+    preserved by deploying with ONLY ``broker_account_id`` and halting the
+    account it resolves to."""
     ac, _store, _spy = client
     derived_account = _BOUND_ACCOUNTS[0]
-    divergent_raw = _BOUND_ACCOUNTS[1]
 
-    # Drain (halt) the DERIVED account only.
+    # Drain (halt) the DERIVED account.
     await redis_text.set(account_halt_key(derived_account), "true")
 
     async with session_factory() as session:
@@ -1314,10 +1323,6 @@ async def test_effective_account_halt_uses_derived_not_raw_request_account(
         json={
             "portfolio_revision_id": str(rev_id),
             "broker_account_id": str(acct_id),
-            # A divergent raw account_id + login that, if (wrongly) used for the
-            # halt check, would NOT be blocked.
-            "account_id": divergent_raw,
-            "ib_login_key": _LOGIN,
         },
     )
     # The derived account is halted → 503 account_halt_active.
@@ -2584,3 +2589,246 @@ async def test_warm_restart_old_stopping_row_excluded_honest_504(
     assert resp.status_code == 504, resp.text
     assert "unknown failure" not in resp.text
     assert resp.json().get("failure_kind") != "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Task 5: PR4 server-side real-money identity gate + ambiguous-target rejection
+#
+# A real/test account is trading_mode="live", so its ib_account_id must be
+# U-prefixed AND bound in the GatewayRouter, or validate_account_row_state 422s
+# (route_not_found / mode_inconsistent) BEFORE the new gate. These tests install
+# their OWN live GatewayRouter config binding the U accounts under a live login,
+# and deploy with paper_trading=False so requested_mode resolves to "live".
+# ---------------------------------------------------------------------------
+
+_LIVE_LOGIN = "msai-live-primary"
+_REAL_ACCT = "U4715997"  # account_class="real"
+_TEST_ACCT = "U4705114"  # account_class="test" (live, not the fund)
+_GATEWAY_CONFIG_LIVE = f"{_LIVE_LOGIN}:ib-gateway:4001:accounts={_REAL_ACCT}|{_TEST_ACCT}"
+
+
+def _install_live_router() -> None:
+    """Swap the app's gateway router to one that binds the U accounts under a
+    live login so row-state validation passes and execution reaches the PR4
+    gate. The store stub returns resolvable creds for any secret ref, so it is
+    reused unchanged."""
+    app.state.gateway_router = GatewayRouter(_GATEWAY_CONFIG_LIVE)
+
+
+@pytest.mark.asyncio
+async def test_real_money_deploy_without_confirm_rejected_422(
+    client: tuple[httpx.AsyncClient, _StubStore, _ResolveSpy],
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Deploying to a real-money (fund) account with no confirm_account_id is
+    refused with 422 REAL_MONEY_CONFIRM_REQUIRED — the operator must echo the
+    exact account id."""
+    ac, _store, _spy = client
+    _install_live_router()
+    async with session_factory() as session:
+        acct = await _seed_broker_account(
+            session,
+            ib_account_id=_REAL_ACCT,
+            ib_login_key=_LIVE_LOGIN,
+            trading_mode="live",
+            account_class="real",
+        )
+        _u, _s, revision, _m = await _seed_deployable_revision(session)
+        await session.commit()
+        acct_id = acct.id
+        rev_id = revision.id
+
+    resp = await ac.post(
+        "/api/v1/live/start-portfolio",
+        json={
+            "portfolio_revision_id": str(rev_id),
+            "broker_account_id": str(acct_id),
+            "paper_trading": False,
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["error"]["code"] == "REAL_MONEY_CONFIRM_REQUIRED"
+
+
+@pytest.mark.asyncio
+async def test_real_money_deploy_confirm_mismatch_rejected_422(
+    client: tuple[httpx.AsyncClient, _StubStore, _ResolveSpy],
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A confirm_account_id that does NOT match the resolved real-money account
+    is refused with 422 REAL_MONEY_CONFIRM_MISMATCH."""
+    ac, _store, _spy = client
+    _install_live_router()
+    async with session_factory() as session:
+        acct = await _seed_broker_account(
+            session,
+            ib_account_id=_REAL_ACCT,
+            ib_login_key=_LIVE_LOGIN,
+            trading_mode="live",
+            account_class="real",
+        )
+        _u, _s, revision, _m = await _seed_deployable_revision(session)
+        await session.commit()
+        acct_id = acct.id
+        rev_id = revision.id
+
+    resp = await ac.post(
+        "/api/v1/live/start-portfolio",
+        json={
+            "portfolio_revision_id": str(rev_id),
+            "broker_account_id": str(acct_id),
+            "paper_trading": False,
+            "confirm_account_id": "U0000000",  # != _REAL_ACCT
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["error"]["code"] == "REAL_MONEY_CONFIRM_MISMATCH"
+
+
+@pytest.mark.asyncio
+async def test_real_money_deploy_confirm_match_passes_gate(
+    client: tuple[httpx.AsyncClient, _StubStore, _ResolveSpy],
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A matching confirm_account_id clears the real-money gate; the deploy
+    proceeds past it (it may then succeed or hit a later non-gate path) — assert
+    it is NOT rejected by either confirm-gate 422."""
+    ac, _store, _spy = client
+    _install_live_router()
+    async with session_factory() as session:
+        acct = await _seed_broker_account(
+            session,
+            ib_account_id=_REAL_ACCT,
+            ib_login_key=_LIVE_LOGIN,
+            trading_mode="live",
+            account_class="real",
+        )
+        _u, _s, revision, _m = await _seed_deployable_revision(session)
+        await session.commit()
+        acct_id = acct.id
+        rev_id = revision.id
+
+    resp = await ac.post(
+        "/api/v1/live/start-portfolio",
+        json={
+            "portfolio_revision_id": str(rev_id),
+            "broker_account_id": str(acct_id),
+            "paper_trading": False,
+            "confirm_account_id": _REAL_ACCT,
+        },
+    )
+    if resp.status_code == 422:
+        code = resp.json()["detail"]["error"]["code"]
+        assert code not in ("REAL_MONEY_CONFIRM_REQUIRED", "REAL_MONEY_CONFIRM_MISMATCH"), resp.text
+
+
+@pytest.mark.asyncio
+async def test_test_account_deploy_needs_no_identity_echo(
+    client: tuple[httpx.AsyncClient, _StubStore, _ResolveSpy],
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """account_class='test' (live LVP/HVP) requires no confirm_account_id: the
+    real-money gate does not reject for confirmation. The explicit target is
+    still required, which broker_account_id satisfies."""
+    ac, _store, _spy = client
+    _install_live_router()
+    async with session_factory() as session:
+        acct = await _seed_broker_account(
+            session,
+            ib_account_id=_TEST_ACCT,
+            ib_login_key=_LIVE_LOGIN,
+            trading_mode="live",
+            account_class="test",
+        )
+        _u, _s, revision, _m = await _seed_deployable_revision(session)
+        await session.commit()
+        acct_id = acct.id
+        rev_id = revision.id
+
+    resp = await ac.post(
+        "/api/v1/live/start-portfolio",
+        json={
+            "portfolio_revision_id": str(rev_id),
+            "broker_account_id": str(acct_id),
+            "paper_trading": False,
+        },
+    )
+    assert not (
+        resp.status_code == 422
+        and resp.json()["detail"]["error"]["code"].startswith("REAL_MONEY_CONFIRM")
+    ), resp.text
+
+
+@pytest.mark.asyncio
+async def test_conflicting_broker_account_id_and_legacy_account_id_rejected_422(
+    client: tuple[httpx.AsyncClient, _StubStore, _ResolveSpy],
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """broker_account_id resolves to one account, but the body ALSO names a
+    DIFFERENT legacy account_id → ambiguous target → 422 AMBIGUOUS_DEPLOY_TARGET
+    (fail closed rather than silently deploying to the resolved registry row)."""
+    ac, _store, _spy = client
+    _install_live_router()
+    async with session_factory() as session:
+        acct = await _seed_broker_account(
+            session,
+            ib_account_id=_TEST_ACCT,
+            ib_login_key=_LIVE_LOGIN,
+            trading_mode="live",
+            account_class="test",
+        )
+        _u, _s, revision, _m = await _seed_deployable_revision(session)
+        await session.commit()
+        acct_id = acct.id
+        rev_id = revision.id
+
+    resp = await ac.post(
+        "/api/v1/live/start-portfolio",
+        json={
+            "portfolio_revision_id": str(rev_id),
+            "broker_account_id": str(acct_id),
+            "account_id": "U0000000",  # != _TEST_ACCT
+            "ib_login_key": "whatever",
+            "paper_trading": False,
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["error"]["code"] == "AMBIGUOUS_DEPLOY_TARGET"
+
+
+@pytest.mark.asyncio
+async def test_conflicting_broker_account_id_and_legacy_login_rejected_422(
+    client: tuple[httpx.AsyncClient, _StubStore, _ResolveSpy],
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Codex code-review iter-2 P2: broker_account_id resolves to a row whose
+    account_id MATCHES the sidecar legacy account_id, but the sidecar
+    ib_login_key DIFFERS from the resolved login → still ambiguous (the named
+    login would be silently ignored) → 422 AMBIGUOUS_DEPLOY_TARGET."""
+    ac, _store, _spy = client
+    _install_live_router()
+    async with session_factory() as session:
+        acct = await _seed_broker_account(
+            session,
+            ib_account_id=_TEST_ACCT,
+            ib_login_key=_LIVE_LOGIN,
+            trading_mode="live",
+            account_class="test",
+        )
+        _u, _s, revision, _m = await _seed_deployable_revision(session)
+        await session.commit()
+        acct_id = acct.id
+        rev_id = revision.id
+
+    resp = await ac.post(
+        "/api/v1/live/start-portfolio",
+        json={
+            "portfolio_revision_id": str(rev_id),
+            "broker_account_id": str(acct_id),
+            "account_id": _TEST_ACCT,  # matches the resolved account
+            "ib_login_key": "some-other-login",  # but the login DIFFERS
+            "paper_trading": False,
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["error"]["code"] == "AMBIGUOUS_DEPLOY_TARGET"

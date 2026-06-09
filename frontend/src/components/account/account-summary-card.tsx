@@ -15,23 +15,38 @@ interface Props {
   data: AccountSummary | undefined;
   isPending: boolean;
   error: Error | null;
+  /**
+   * PR4 / US-005: the IB account id the gateway is connected to. These
+   * balances are gateway-bound (the connected account ONLY) regardless of
+   * the global account-scope selector, so the caption names the account to
+   * stop an operator who scoped to account B from reading account A's
+   * balance as B's. Null before the first successful snapshot.
+   */
+  connectedAccountId?: string | null;
 }
 
-const FIELDS: { key: keyof AccountSummary; label: string; isPnl?: boolean }[] =
-  [
-    { key: "net_liquidation", label: "Net liquidation" },
-    { key: "buying_power", label: "Buying power" },
-    { key: "available_funds", label: "Available funds" },
-    { key: "margin_used", label: "Margin used" },
-    { key: "unrealized_pnl", label: "Unrealized P&L", isPnl: true },
-    { key: "realized_pnl", label: "Realized P&L", isPnl: true },
-  ];
+// Numeric balance fields only — excludes the non-numeric `account_id` label
+// that now rides on AccountSummary (Codex code-review iter-5 P2). Keeping the
+// key type to the float fields preserves `data[f.key]: number` for SummaryField.
+type BalanceKey = Exclude<keyof AccountSummary, "account_id">;
+const FIELDS: { key: BalanceKey; label: string; isPnl?: boolean }[] = [
+  { key: "net_liquidation", label: "Net liquidation" },
+  { key: "buying_power", label: "Buying power" },
+  { key: "available_funds", label: "Available funds" },
+  { key: "margin_used", label: "Margin used" },
+  { key: "unrealized_pnl", label: "Unrealized P&L", isPnl: true },
+  { key: "realized_pnl", label: "Realized P&L", isPnl: true },
+];
 
 export function AccountSummaryCard({
   data,
   isPending,
   error,
+  connectedAccountId,
 }: Props): React.ReactElement {
+  const boundCaption = connectedAccountId
+    ? `connected account only — ${connectedAccountId}`
+    : "connected account only (gateway-bound)";
   return (
     <Card className="border-border/50">
       <CardHeader>
@@ -40,7 +55,8 @@ export function AccountSummaryCard({
           <CardTitle className="text-base">Account summary</CardTitle>
         </div>
         <CardDescription>
-          Snapshot from IBAccountSnapshot (background-refreshed every 30 s).
+          Snapshot from IBAccountSnapshot (background-refreshed every 30 s) —{" "}
+          {boundCaption}.
         </CardDescription>
       </CardHeader>
       <CardContent>

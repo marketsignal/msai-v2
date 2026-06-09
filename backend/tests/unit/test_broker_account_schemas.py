@@ -119,3 +119,102 @@ def test_create_request_accepts_live_account_with_live_mode() -> None:
         tws_password="p",
     )
     assert req.trading_mode == "live"
+
+
+# PR4 (dashboard-account-selector): account_class on response + create.
+
+
+def test_response_carries_account_class_and_is_real_money() -> None:
+    from datetime import UTC, datetime
+    from uuid import uuid4
+
+    from msai.models.broker_account import AccountClass, BrokerAccount
+    from msai.schemas.broker_account import BrokerAccountResponse
+
+    acct = BrokerAccount(
+        id=uuid4(),
+        ib_account_id="U4715997",
+        ib_login_key="mshvp000",
+        label="HVP",
+        status="active",
+        gateway_slot="slot-1",
+        trading_mode="live",
+        account_class=AccountClass.REAL,
+        credentials_backend="env",
+        credentials_secret_ref="ref",
+        credentials_secret_version=None,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    resp = BrokerAccountResponse.model_validate(acct)
+    assert resp.account_class == "real"
+    assert resp.is_real_money is True
+
+
+def test_create_defaults_account_class_from_trading_mode() -> None:
+    from msai.schemas.broker_account import BrokerAccountCreateRequest
+
+    paper = BrokerAccountCreateRequest(
+        ib_account_id="DU123",
+        ib_login_key="k",
+        trading_mode="paper",
+        tws_userid="u",
+        tws_password="p",
+    )
+    assert paper.account_class == "paper"
+    live = BrokerAccountCreateRequest(
+        ib_account_id="U123",
+        ib_login_key="k",
+        trading_mode="live",
+        tws_userid="u",
+        tws_password="p",
+    )
+    assert live.account_class == "test"
+
+
+def test_create_rejects_real_class_on_paper_account() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    from msai.schemas.broker_account import BrokerAccountCreateRequest
+
+    with pytest.raises(ValidationError):
+        BrokerAccountCreateRequest(
+            ib_account_id="DU123",
+            ib_login_key="k",
+            trading_mode="paper",
+            account_class="real",
+            tws_userid="u",
+            tws_password="p",
+        )
+
+
+def test_create_rejects_contradictory_class_mode_pairs() -> None:
+    """Codex code-review iter-2 P2: the full class/mode matrix is enforced —
+    paper mode must be account_class='paper'; live mode must be 'test'|'real'.
+    A live+paper or paper+test pair is a contradictory taxonomy → 422."""
+    import pytest
+    from pydantic import ValidationError
+
+    from msai.schemas.broker_account import BrokerAccountCreateRequest
+
+    # live account labeled 'paper' — rejected
+    with pytest.raises(ValidationError):
+        BrokerAccountCreateRequest(
+            ib_account_id="U123",
+            ib_login_key="k",
+            trading_mode="live",
+            account_class="paper",
+            tws_userid="u",
+            tws_password="p",
+        )
+    # paper account labeled 'test' — rejected
+    with pytest.raises(ValidationError):
+        BrokerAccountCreateRequest(
+            ib_account_id="DU123",
+            ib_login_key="k",
+            trading_mode="paper",
+            account_class="test",
+            tws_userid="u",
+            tws_password="p",
+        )

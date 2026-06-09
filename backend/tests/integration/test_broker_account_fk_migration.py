@@ -36,9 +36,13 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 
-# Revision that ADDS the FK + validation-stamp columns (this PR, Task 1).
-_FK_REVISION = "head"
-# The revision immediately BELOW the FK migration (current head before this PR).
+# Revision that ADDS the FK + validation-stamp columns. Pinned to the explicit
+# revision id (NOT "head") so later migrations stacked on top — e.g. the
+# dashboard-account-selector `account_class` migration b50fd33a0a8c — do not
+# move "head" out from under this test: `upgrade _FK_REVISION` must stop AT the
+# FK migration and `downgrade -1` must drop the FK columns, not a newer column.
+_FK_REVISION = "81e7efe6d772"
+# The revision immediately BELOW the FK migration (current head before that PR).
 _DOWN_REVISION = "d97a64e13e4e"
 
 

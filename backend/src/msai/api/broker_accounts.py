@@ -110,6 +110,7 @@ async def create_broker_account(
             actor=actor,
             label=body.label,
             created_by=created_by,
+            account_class=body.account_class,
         )
     except CredentialResolutionError as exc:
         raise HTTPException(

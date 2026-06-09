@@ -1642,3 +1642,89 @@ async def _seed_portfolio_revision(session):
     session.add(revision)
     await session.flush()
     return revision
+
+
+# PR4 (dashboard-account-selector): account_class threading through create().
+
+
+@pytest.mark.asyncio
+async def test_create_persists_account_class_real(broker_db_session, tmp_path):
+    store = EnvFileBrokerCredentialsStore(path=tmp_path / "c.json")
+    svc = BrokerAccountService(db=broker_db_session, store=store, slots=["slot-a", "slot-b"])
+    acct = await svc.create(
+        ib_account_id="U4715997",
+        ib_login_key="mshvp000",
+        trading_mode="live",
+        gateway_slot=None,
+        creds=Credentials("u", "p"),
+        actor="op",
+        account_class="real",
+    )
+    # iter-3 P1#2: the column is a plain String(16), so after flush/refresh
+    # account_class reloads as a bare str — assert via == "real" (StrEnum
+    # equality), never .value. is_real_money works either way.
+    assert acct.account_class == "real"
+    assert acct.is_real_money is True
+
+
+@pytest.mark.asyncio
+async def test_create_defaults_account_class_paper_for_paper_mode(broker_db_session, tmp_path):
+    store = EnvFileBrokerCredentialsStore(path=tmp_path / "c.json")
+    svc = BrokerAccountService(db=broker_db_session, store=store, slots=["slot-a"])
+    acct = await svc.create(
+        ib_account_id="DU123456",
+        ib_login_key="lvp",
+        trading_mode="paper",
+        gateway_slot=None,
+        creds=Credentials("u", "p"),
+        actor="op",
+    )
+    assert acct.account_class == "paper"
+    assert acct.is_real_money is False
+
+
+@pytest.mark.asyncio
+async def test_create_defaults_account_class_test_for_live_mode(broker_db_session, tmp_path):
+    store = EnvFileBrokerCredentialsStore(path=tmp_path / "c.json")
+    svc = BrokerAccountService(db=broker_db_session, store=store, slots=["slot-a"])
+    acct = await svc.create(
+        ib_account_id="U4705114",
+        ib_login_key="lvp",
+        trading_mode="live",
+        gateway_slot=None,
+        creds=Credentials("u", "p"),
+        actor="op",
+    )
+    assert acct.account_class == "test"
+    assert acct.is_real_money is False
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_contradictory_class_mode_in_service(broker_db_session, tmp_path):
+    """Codex iter-7 P2: the service enforces the class/mode matrix too, so a
+    DIRECT BrokerAccountService.create() caller (bypassing the request schema)
+    cannot persist a contradictory row that the real-money gate + labels read."""
+    store = EnvFileBrokerCredentialsStore(path=tmp_path / "c.json")
+    svc = BrokerAccountService(db=broker_db_session, store=store, slots=["slot-a"])
+    # live account explicitly labeled 'paper' — rejected
+    with pytest.raises(BrokerAccountError):
+        await svc.create(
+            ib_account_id="U4705114",
+            ib_login_key="lvp",
+            trading_mode="live",
+            gateway_slot=None,
+            creds=Credentials("u", "p"),
+            actor="op",
+            account_class="paper",
+        )
+    # paper account explicitly labeled 'test' — rejected
+    with pytest.raises(BrokerAccountError):
+        await svc.create(
+            ib_account_id="DUP000001",
+            ib_login_key="paper",
+            trading_mode="paper",
+            gateway_slot=None,
+            creds=Credentials("u", "p"),
+            actor="op",
+            account_class="test",
+        )

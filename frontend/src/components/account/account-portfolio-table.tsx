@@ -23,13 +23,23 @@ interface Props {
   data: AccountPortfolioItem[] | undefined;
   isPending: boolean;
   error: Error | null;
+  /**
+   * PR4 / US-005: the IB account id the gateway is connected to. These
+   * positions are gateway-bound (the connected account ONLY), independent of
+   * the global account-scope selector. Null before the first snapshot.
+   */
+  connectedAccountId?: string | null;
 }
 
 export function AccountPortfolioTable({
   data,
   isPending,
   error,
+  connectedAccountId,
 }: Props): React.ReactElement {
+  const boundCaption = connectedAccountId
+    ? `connected account only — ${connectedAccountId}`
+    : "connected account only (gateway-bound)";
   return (
     <Card className="border-border/50">
       <CardHeader>
@@ -41,7 +51,7 @@ export function AccountPortfolioTable({
           <CardTitle className="text-base">Broker positions</CardTitle>
         </div>
         <CardDescription>
-          Open positions from the IB account, snapshot-cached.
+          Open positions from the IB account, snapshot-cached — {boundCaption}.
         </CardDescription>
       </CardHeader>
       <CardContent>

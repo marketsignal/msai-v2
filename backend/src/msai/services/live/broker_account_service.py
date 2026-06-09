@@ -42,6 +42,7 @@ from sqlalchemy.exc import IntegrityError
 from msai.core.logging import get_logger
 from msai.core.secrets import EnvSecretsProvider
 from msai.models.broker_account import (
+    AccountClass,
     BrokerAccount,
     BrokerAccountStatus,
     CredentialsBackend,
@@ -240,6 +241,7 @@ class BrokerAccountService:
         actor: str,
         label: str | None = None,
         created_by: UUID | None = None,
+        account_class: str | None = None,
     ) -> BrokerAccount:
         """Create an ACTIVE broker account: write secret first, then allocate a slot.
 
@@ -259,6 +261,28 @@ class BrokerAccountService:
             raise DuplicateAccountError(f"active account {ib_account_id} already exists")
         if gateway_slot and gateway_slot not in self._slots:
             raise BrokerAccountError(f"unknown gateway slot {gateway_slot}")
+
+        # Derive account_class IN THE SERVICE when omitted so a direct service
+        # caller (not just the router) gets the D5-correct default and a paper
+        # account never becomes 'test' (paper→paper, live→test). Explicit value
+        # passes through (the router supplies the schema-validated one).
+        resolved_class = account_class or ("paper" if trading_mode == "paper" else "test")
+        # Enforce the class/mode matrix at the SERVICE boundary too (Codex iter-7
+        # P2): the BrokerAccountCreateRequest validator covers the API/CLI path,
+        # but a direct ``BrokerAccountService.create(...)`` caller bypasses it and
+        # could otherwise persist a contradictory row (e.g. live+paper or
+        # paper+test) — and the real-money gate + operator labels read this field
+        # directly. paper mode ⟺ 'paper'; live mode ⟺ 'test'|'real'.
+        if trading_mode == "paper" and resolved_class != "paper":
+            raise BrokerAccountError(
+                f"account_class={resolved_class!r} is invalid for trading_mode='paper' "
+                "(paper accounts must be account_class='paper')"
+            )
+        if trading_mode == "live" and resolved_class == "paper":
+            raise BrokerAccountError(
+                "account_class='paper' is invalid for trading_mode='live' "
+                "(live accounts must be account_class='test' or 'real')"
+            )
 
         new_id = uuid4()
         secret_ref = f"broker-cred-{new_id}"
@@ -290,6 +314,7 @@ class BrokerAccountService:
                 actor=actor,
                 label=label,
                 created_by=created_by,
+                account_class=resolved_class,
             )
             await self._db.commit()
         except BrokerAccountError:
@@ -328,6 +353,7 @@ class BrokerAccountService:
         actor: str,
         label: str | None,
         created_by: UUID | None,
+        account_class: str,
     ) -> BrokerAccount:
         """Allocate a slot and INSERT the row inside the bounded retry loop.
 
@@ -359,6 +385,7 @@ class BrokerAccountService:
                 status=BrokerAccountStatus.ACTIVE,
                 gateway_slot=slot,
                 trading_mode=trading_mode,
+                account_class=AccountClass(account_class),  # iter-1 P1#1 / iter-2 P2
                 credentials_backend=self._backend,
                 credentials_secret_ref=write.secret_ref,
                 credentials_secret_version=write.version,

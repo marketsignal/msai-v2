@@ -57,3 +57,15 @@ DEPLOY_VALIDATION_FAILED = _r.counter(
     "msai_broker_account_deploy_validation_failed_total",
     "Broker account deploy-validation rejections by account and row-state reason",
 )
+
+# PR4: NON-GATING divergence audit (council objection #7). Incremented when the
+# UI told the handler which account its global selector was scoped to
+# (``selector_context_account_id``) AND that concrete account differs from the
+# resolved deploy target. The bucket sentinels ("all"/"unassigned") are NOT a
+# focused target and are excluded by the caller. Labeled by the resolved deploy
+# target account at increment time via ``.inc(account_id=...)``. Never blocks a
+# deploy — it is a server-side audit signal only.
+DEPLOY_TARGET_DIVERGENCE = _r.counter(
+    "msai_broker_account_deploy_target_divergence_total",
+    "Deploys where the UI global-selector context differed from the resolved target account",
+)

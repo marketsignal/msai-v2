@@ -97,12 +97,17 @@ def _make_fake_ib(
     summary_tags: list[_FakeAccountValue] | None = None,
     portfolio_items: list[_FakePortfolioItem] | None = None,
     connect_side_effect: BaseException | None = None,
+    managed_accounts: list[str] | None = None,
 ) -> MagicMock:
     """Build a MagicMock standing in for ``ib_async.IB()``.
 
     ``connect_counter`` is a single-element-mutable list used so the
     test can read the number of ``connectAsync`` calls after the act
     phase (closure-captured mutation; integers are immutable).
+
+    ``managed_accounts`` mirrors ``ib_async.IB.managedAccounts()`` which
+    returns the list of account names the gateway login can see. When
+    omitted the fake returns an empty list (no account known yet).
     """
     summary_tags = summary_tags or []
     portfolio_items = portfolio_items or []
@@ -118,6 +123,7 @@ def _make_fake_ib(
     fake.connectAsync = AsyncMock(side_effect=_connect)
     fake.accountSummaryAsync = AsyncMock(return_value=summary_tags)
     fake.portfolio = MagicMock(return_value=portfolio_items)
+    fake.managedAccounts = MagicMock(return_value=list(managed_accounts or []))
     fake.disconnect = MagicMock(return_value=None)
     return fake
 
@@ -352,6 +358,159 @@ class TestRefreshOnce:
         assert snapshot.last_refresh_success_at == snapshot.last_summary_success_at
 
 
+class TestAccountIdentity:
+    """:attr:`IBAccountSnapshot.account_id` reflects the gateway-connected
+    account after a successful refresh, ``None`` before.
+
+    PR4 Task 9 Step 3: the dashboard labels balance cards with the
+    connected account so an operator who scoped the selector to account
+    B cannot mistake account A's gateway-bound balance for B's.
+    """
+
+    async def test_account_id_is_none_before_first_refresh(
+        self, reset_snapshot_singleton: None
+    ) -> None:
+        _ = reset_snapshot_singleton
+        snapshot = snap_module.IBAccountSnapshot(host="ib-gateway", port=4002)
+        snapshot._ib = _make_fake_ib(  # noqa: SLF001
+            connect_counter=[0], managed_accounts=["U4705114"]
+        )
+
+        # No refresh has run yet — identity is unknown.
+        assert snapshot.account_id is None
+
+    async def test_account_id_reflects_managed_account_after_refresh(
+        self, reset_snapshot_singleton: None
+    ) -> None:
+        _ = reset_snapshot_singleton
+        fake_ib = _make_fake_ib(
+            connect_counter=[0],
+            summary_tags=[_FakeAccountValue("NetLiquidation", "10000.00")],
+            managed_accounts=["U4705114"],
+        )
+        snapshot = snap_module.IBAccountSnapshot(host="ib-gateway", port=4002)
+        snapshot._ib = fake_ib  # noqa: SLF001
+
+        await snapshot.refresh_once()
+
+        assert snapshot.account_id == "U4705114"
+
+    async def test_account_id_stays_none_when_no_managed_accounts(
+        self, reset_snapshot_singleton: None
+    ) -> None:
+        """A connected gateway that reports no managed accounts (empty
+        list) must leave the identity ``None`` rather than fabricate one."""
+        _ = reset_snapshot_singleton
+        fake_ib = _make_fake_ib(
+            connect_counter=[0],
+            summary_tags=[_FakeAccountValue("NetLiquidation", "10000.00")],
+            managed_accounts=[],
+        )
+        snapshot = snap_module.IBAccountSnapshot(host="ib-gateway", port=4002)
+        snapshot._ib = fake_ib  # noqa: SLF001
+
+        await snapshot.refresh_once()
+
+        assert snapshot.account_id is None
+
+    async def test_account_id_cleared_when_login_becomes_ambiguous(
+        self, reset_snapshot_singleton: None
+    ) -> None:
+        """Codex code-review iter-2 P2: a previously-resolved single-account id
+        must be CLEARED (not left stale) if a later refresh reports zero or
+        multiple managed accounts — labeling balances with the old account when
+        the login is now unknown/ambiguous would mislead the operator."""
+        _ = reset_snapshot_singleton
+        fake_ib = _make_fake_ib(
+            connect_counter=[0],
+            summary_tags=[_FakeAccountValue("NetLiquidation", "10000.00")],
+            managed_accounts=["U4705114"],
+        )
+        snapshot = snap_module.IBAccountSnapshot(host="ib-gateway", port=4002)
+        snapshot._ib = fake_ib  # noqa: SLF001
+
+        await snapshot.refresh_once()
+        assert snapshot.account_id == "U4705114"  # single-account → labeled
+
+        # The login now exposes MULTIPLE accounts (e.g. re-login to an FA umbrella).
+        fake_ib.managedAccounts = MagicMock(return_value=["U4705114", "U4715997"])
+        await snapshot.refresh_once()
+        assert snapshot.account_id is None  # stale id cleared, not preserved
+
+    async def test_portfolio_cleared_on_account_change_even_if_refetch_fails(
+        self, reset_snapshot_singleton: None
+    ) -> None:
+        """Codex code-review iter-4 P2: when the gateway re-logs into a DIFFERENT
+        account and the new portfolio fetch then fails, the OLD account's cached
+        positions must NOT remain — otherwise they'd be shown labeled as the new
+        account. The stale portfolio is invalidated on detected account change."""
+        _ = reset_snapshot_singleton
+        fake_ib = _make_fake_ib(
+            connect_counter=[0],
+            summary_tags=[_FakeAccountValue("NetLiquidation", "10000.00")],
+            managed_accounts=["U4705114"],
+            portfolio_items=[
+                _FakePortfolioItem(
+                    symbol="AAPL",
+                    position=10.0,
+                    market_price=150.0,
+                    market_value=1500.0,
+                    average_cost=140.0,
+                    unrealized_pnl=100.0,
+                    realized_pnl=0.0,
+                )
+            ],
+        )
+        snapshot = snap_module.IBAccountSnapshot(host="ib-gateway", port=4002)
+        snapshot._ib = fake_ib  # noqa: SLF001
+
+        await snapshot.refresh_once()
+        assert snapshot.account_id == "U4705114"
+        assert len(snapshot.get_portfolio()) == 1  # account A's position cached
+
+        # Re-login to a DIFFERENT account, and make the new portfolio fetch fail.
+        fake_ib.managedAccounts = MagicMock(return_value=["U4715997"])
+
+        class _BadItem:
+            contract = _FakeContract(symbol="MSFT")
+            position = 1.0
+            # marketPrice absent → AttributeError in _fetch_portfolio
+
+        fake_ib.portfolio = MagicMock(return_value=[_BadItem()])
+
+        await snapshot.refresh_once()
+        # Summary succeeded → id advanced to B; the stale A portfolio was dropped
+        # before the failing refetch, so positions are empty, NOT A's rows under B.
+        assert snapshot.account_id == "U4715997"
+        assert snapshot.get_portfolio() == []
+        # Codex iter-7 P2: the portfolio freshness marker is ALSO reset on the
+        # account change, so /account/portfolio reports 503 "unavailable" for B
+        # rather than passing its cold-start guard and serving [] as a false
+        # "flat account" (the failed re-fetch left no fresh B portfolio).
+        assert snapshot.last_portfolio_success_at is None
+
+    async def test_account_id_none_for_multi_account_login(
+        self, reset_snapshot_singleton: None
+    ) -> None:
+        """A gateway login exposing MULTIPLE managed accounts (FA / multi-account)
+        must yield ``None`` — the cached summary/portfolio are not filtered to a
+        single account, so labeling it with the first id would mislabel aggregate
+        or other-account data (Codex code-review P2). Only the unambiguous
+        single-account case is labeled."""
+        _ = reset_snapshot_singleton
+        fake_ib = _make_fake_ib(
+            connect_counter=[0],
+            summary_tags=[_FakeAccountValue("NetLiquidation", "10000.00")],
+            managed_accounts=["U4705114", "U4715997"],
+        )
+        snapshot = snap_module.IBAccountSnapshot(host="ib-gateway", port=4002)
+        snapshot._ib = fake_ib  # noqa: SLF001
+
+        await snapshot.refresh_once()
+
+        assert snapshot.account_id is None
+
+
 class TestPortfolioShape:
     """The portfolio response shape must stay identical to the old
     :meth:`IBAccountService.get_portfolio` so the frontend types do
@@ -456,7 +615,9 @@ class TestConcurrentRequestsShareSnapshot:
             body = response.json()
             assert body["net_liquidation"] == pytest.approx(10000.0)
             assert body["buying_power"] == pytest.approx(5000.0)
-            # Old shape — still six known keys, all floats.
+            # Six float balance keys + the atomic connected-account label
+            # (Codex code-review iter-5 P2: /summary returns account_id alongside
+            # the balances so the UI labels them from one payload).
             assert set(body.keys()) == {
                 "net_liquidation",
                 "buying_power",
@@ -464,6 +625,7 @@ class TestConcurrentRequestsShareSnapshot:
                 "available_funds",
                 "unrealized_pnl",
                 "realized_pnl",
+                "account_id",
             }
 
     async def test_request_with_unconnected_snapshot_returns_503(

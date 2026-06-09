@@ -81,18 +81,26 @@ export default function AccountPage(): React.ReactElement {
         </TabsList>
 
         <TabsContent value="summary">
+          {/* Codex code-review iter-5 P2: label balances with the account id
+              from the SUMMARY payload (atomic with these numbers), not the
+              separately-fetched /account/health id that could diverge. */}
           <AccountSummaryCard
             data={summary.data}
             isPending={summary.isPending}
             error={summary.error}
+            connectedAccountId={summary.data?.account_id ?? null}
           />
         </TabsContent>
 
         <TabsContent value="portfolio">
+          {/* Label positions with the summary payload's account id: the backend
+              clears the cached portfolio on any account change, so the summary's
+              account correctly names whatever positions are shown (or none). */}
           <AccountPortfolioTable
             data={portfolio.data}
             isPending={portfolio.isPending}
             error={portfolio.error}
+            connectedAccountId={summary.data?.account_id ?? null}
           />
         </TabsContent>
 

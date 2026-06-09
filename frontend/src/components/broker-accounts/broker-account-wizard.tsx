@@ -68,6 +68,11 @@ export interface BrokerAccountWizardProps {
 
 type Step = "identity" | "credentials" | "review";
 type TradingMode = "paper" | "live";
+/** For live accounts the operator chooses whether it is a Test account
+ * (LVP/HVP — live IB, limited capital, NOT the fund) or the production Fund
+ * (real money — identity-echo gated on deploy). Paper accounts are always the
+ * "paper" class server-side. */
+type LiveClass = "test" | "real";
 
 // ---------------------------------------------------------------------------
 // Component
@@ -86,6 +91,10 @@ export function BrokerAccountWizard({
   const [ibAccountId, setIbAccountId] = useState("");
   const [ibLoginKey, setIbLoginKey] = useState("");
   const [tradingMode, setTradingMode] = useState<TradingMode>("paper");
+  // For live accounts only: Test (default) vs Fund (real money). Ignored for
+  // paper (server derives "paper"). Default Test so the fund is never the
+  // accidental default.
+  const [liveClass, setLiveClass] = useState<LiveClass>("test");
   const [gatewaySlot, setGatewaySlot] = useState("");
   const [twsUserid, setTwsUserid] = useState("");
   const [twsPassword, setTwsPassword] = useState("");
@@ -101,6 +110,7 @@ export function BrokerAccountWizard({
       setIbAccountId("");
       setIbLoginKey("");
       setTradingMode("paper");
+      setLiveClass("test");
       setGatewaySlot("");
       setTwsUserid("");
       setTwsPassword("");
@@ -117,6 +127,9 @@ export function BrokerAccountWizard({
           ib_account_id: ibAccountId.trim(),
           ib_login_key: ibLoginKey.trim(),
           trading_mode: tradingMode,
+          // PR4: paper → server derives "paper"; live → operator's Test/Fund
+          // choice ("test" | "real"). The fund is registered as "real".
+          account_class: tradingMode === "live" ? liveClass : undefined,
           gateway_slot: trimmedSlot === "" ? null : trimmedSlot,
           tws_userid: twsUserid.trim(),
           tws_password: twsPassword,
@@ -246,10 +259,42 @@ export function BrokerAccountWizard({
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="paper">Paper</SelectItem>
-                  <SelectItem value="live">Live (real money)</SelectItem>
+                  <SelectItem value="live">Live</SelectItem>
                 </SelectContent>
               </Select>
             </div>
+
+            {tradingMode === "live" && (
+              <div className="flex flex-col gap-2">
+                <Label htmlFor="broker-account-account-class">
+                  Account class
+                </Label>
+                <Select
+                  value={liveClass}
+                  onValueChange={(v) => setLiveClass(v as LiveClass)}
+                >
+                  <SelectTrigger
+                    id="broker-account-account-class"
+                    data-testid="broker-account-account-class"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="test">
+                      Test account (LVP/HVP — live, not the fund)
+                    </SelectItem>
+                    <SelectItem value="real">
+                      Fund (REAL MONEY — the production fund)
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  Test = a live IB account with limited capital for drills. Fund
+                  = the real production fund; deploys to it require typing the
+                  account id to confirm.
+                </p>
+              </div>
+            )}
 
             <div className="flex flex-col gap-2">
               <Label htmlFor="broker-account-gateway-slot">
@@ -269,14 +314,15 @@ export function BrokerAccountWizard({
               </p>
             </div>
 
-            {tradingMode === "live" && (
+            {tradingMode === "live" && liveClass === "real" && (
               <div
                 role="alert"
                 className="w-full rounded-md border border-destructive/30 bg-destructive/15 px-4 py-3 text-sm text-destructive"
               >
-                <strong className="font-semibold">⚠ REAL MONEY:</strong> orders
-                routed through this account will execute against your live IB
-                account.
+                <strong className="font-semibold">⚠ REAL FUND:</strong> this
+                registers the production fund. Orders routed through it execute
+                against real money, and deploys require typing the account id to
+                confirm.
               </div>
             )}
 
@@ -364,6 +410,16 @@ export function BrokerAccountWizard({
               />
               <ReviewRow label="IB login key" value={ibLoginKey.trim()} mono />
               <ReviewRow label="Trading mode" value={tradingMode} />
+              <ReviewRow
+                label="Account class"
+                value={
+                  tradingMode === "paper"
+                    ? "paper"
+                    : liveClass === "real"
+                      ? "REAL FUND"
+                      : "test"
+                }
+              />
               <ReviewRow
                 label="Gateway slot"
                 value={trimmedSlot === "" ? "Auto-allocate" : trimmedSlot}

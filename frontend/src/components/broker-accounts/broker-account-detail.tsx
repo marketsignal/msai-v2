@@ -129,7 +129,12 @@ function DetailBody({
         <SheetDescription>
           Gateway slot <code className="font-mono">{account.gateway_slot}</code>{" "}
           · {account.trading_mode} ·{" "}
-          {account.label ?? <span className="italic">no label</span>}
+          <span data-testid="broker-account-detail-class">
+            {account.is_real_money
+              ? "REAL FUND"
+              : (account.account_class ?? "—")}
+          </span>{" "}
+          · {account.label ?? <span className="italic">no label</span>}
         </SheetDescription>
       </SheetHeader>
 
@@ -372,7 +377,7 @@ function EditAccountDialog({
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="paper">Paper</SelectItem>
-                <SelectItem value="live">Live (real money)</SelectItem>
+                <SelectItem value="live">Live</SelectItem>
               </SelectContent>
             </Select>
           </div>
