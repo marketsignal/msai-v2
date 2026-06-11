@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic trigger for MSAI v2 IB Gateway watchdog
+
+[Timer]
+OnBootSec=90
+OnUnitInactiveSec=30s
+AccuracySec=5s
+Unit=msai-gateway-watchdog.service
+
+[Install]
+WantedBy=timers.target

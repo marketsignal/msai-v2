@@ -579,8 +579,10 @@ jobs:
               scripts/deploy-smoke.sh \
               scripts/backup-to-blob.service scripts/backup-to-blob.timer \
               scripts/msai-render-env.service scripts/render-env-from-kv.sh \
+              scripts/gateway-watchdog.sh \
+              scripts/msai-gateway-watchdog.service scripts/msai-gateway-watchdog.timer \
               "${VM_USER}@${VM_IP}:/opt/msai/scripts/"
-          ssh "${VM_USER}@${VM_IP}" "sudo chmod +x /opt/msai/scripts/backup-to-blob.sh /opt/msai/scripts/deploy-on-vm.sh /opt/msai/scripts/install-azcopy.sh /opt/msai/scripts/deploy-smoke.sh /opt/msai/scripts/render-env-from-kv.sh"
+          ssh "${VM_USER}@${VM_IP}" "sudo chmod +x /opt/msai/scripts/backup-to-blob.sh /opt/msai/scripts/deploy-on-vm.sh /opt/msai/scripts/install-azcopy.sh /opt/msai/scripts/deploy-smoke.sh /opt/msai/scripts/render-env-from-kv.sh /opt/msai/scripts/gateway-watchdog.sh"
           # Also stage the per-run script at /tmp for the next step (kept in /tmp so the
           # `sudo bash /tmp/...` below is unambiguous about which run is firing)
           scp scripts/deploy-on-vm.sh "${VM_USER}@${VM_IP}:/tmp/deploy-on-vm-${{ github.run_id }}.sh"

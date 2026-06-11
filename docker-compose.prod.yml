@@ -161,6 +161,19 @@ services:
       MSAI_API_KEY: ${MSAI_API_KEY:-}
       POLYGON_API_KEY: ${POLYGON_API_KEY:-}
       DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+      # IB Gateway watchdog threshold overrides (all OPTIONAL — empty ⇒ the
+      # PRD defaults baked into ``cli.py:_watchdog_config_from_env`` apply;
+      # ``_f``/``_i`` treat an empty string as "use default"). The host timer
+      # runs the tick via ``docker exec`` into THIS backend container, so the
+      # CLI reads these from the container env. To actually change one, set the
+      # matching KV secret (``msai-watchdog-grace-secs`` etc. — see
+      # ``msai-render-env.service`` OPTIONAL_SECRETS + the ib-gateway runbook)
+      # and redeploy; render writes it into /run/msai.env which interpolates here.
+      MSAI_WATCHDOG_GRACE_SECS: ${MSAI_WATCHDOG_GRACE_SECS:-}
+      MSAI_WATCHDOG_RESTART_CAP: ${MSAI_WATCHDOG_RESTART_CAP:-}
+      MSAI_WATCHDOG_WINDOW_SECS: ${MSAI_WATCHDOG_WINDOW_SECS:-}
+      MSAI_WATCHDOG_COOLDOWN_SECS: ${MSAI_WATCHDOG_COOLDOWN_SECS:-}
+      MSAI_WATCHDOG_ALERT_THROTTLE_SECS: ${MSAI_WATCHDOG_ALERT_THROTTLE_SECS:-}
       # Codex iter4 P1: ``api/live.py`` reads
       # ``settings.ib_account_id`` when creating the deployment
       # row; the live-supervisor's payload factory reads it again
