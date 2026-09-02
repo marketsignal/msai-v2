@@ -1,0 +1,189 @@
+<!-- forge:state-schema v6 -->
+# Project State (per-developer, gitignored)
+
+> This file holds your active workflow state. It is NOT shared with the team.
+> Hooks read this file on demand. Claude reads it when the workflow rule says to.
+>
+> If you started a workflow with `/new-feature` or `/fix-bug`, the Workflow section below tracks your progress.
+> The Done / Now / Next sections capture your current focus across sessions.
+
+## Identity
+
+| Field                | Value |
+| -------------------- | ----- |
+| Worktree root        |       |
+| Git common directory |       |
+| Last active host     |       |
+| Workflow base ref    |       |
+| Workflow base SHA    |       |
+
+The worktree root and Git common directory are resolved physical paths. The workflow
+base ref and SHA remain immutable for one workflow. Switching between Claude and Codex
+changes only `Last active host`; it never restarts completed gates.
+
+## Workflow
+
+| Field     | Value |
+| --------- | ----- |
+| Command   | none  |
+| Phase     |       |
+| Next step |       |
+
+### Checklist
+
+(populated by `/new-feature` or `/fix-bug` Pre-Flight)
+
+---
+
+## /goal session
+
+(populated by `/new-feature` at the PRD-complete checkpoint, or by `/fix-bug` at the
+Plan-Approved checkpoint, when the user opts into the `/forge-goal` autonomous loop)
+
+Format when active:
+
+| Field            | Value                                  |
+| ---------------- | -------------------------------------- |
+| nonce            | <uuid-v4-lowercase>                    |
+| objective_hash   | <externally-authorized-objective-hash> |
+| workflow_command | /new-feature <name> OR /fix-bug <name> |
+| issued_at        | <ISO-8601-UTC-timestamp>               |
+| turn_count       | <derived-from-hook-owned-records>       |
+| turn_ceiling     | <derived-from-external-authorization>   |
+| evidence_path    | .forge/local/evidence/latest.json       |
+
+**REPLACE semantics:** the entire `## /goal session` block (heading + table) is
+replaced atomically on each new autonomous-loop kickoff. A stale session from a
+previous run is never appended to — it is overwritten in full. When no session is
+active, this section is absent from the file.
+
+**Guard "active" definition:** the `/goal session` is considered ACTIVE when the nonce
+row is non-empty (`nonce` column has a UUID value). A heading with no nonce row, or a
+missing section entirely, is treated as INACTIVE by all guards and hooks.
+
+---
+
+## PR authorization
+
+(populated when the user authorizes `gh pr create` via the PR-create gate's
+AskUserQuestion modal during a `/forge-goal`-driven run)
+
+**REPLACE semantics:** this section holds exactly ONE authorization line at a time.
+On a new authorization, the agent REPLACES any existing content in this section with
+the new line — never appends. Multiple lines would cause the guard to use the LAST
+one (defensive), but proper REPLACE semantics keep the section as a singleton.
+
+Format when authorized:
+
+- [x] PR creation authorized — `<ISO-8601-UTC-timestamp>` — nonce=`<session-nonce>` — head=`<current-HEAD-SHA>`
+
+**Stale auth defense:** if state.md is somehow corrupted and contains multiple
+authorization lines (should not happen with REPLACE semantics), the guard uses the
+LAST matching line. Multiple lines in this section indicate a state.md corruption —
+surface to user.
+
+---
+
+## Receipts
+
+| Field                  | Value |
+| ---------------------- | ----- |
+| Review iteration       | <integer> |
+| Candidate receipt      | .forge/local/evidence/<task-id>/candidate.receipt |
+| Spec review receipt    | .forge/local/reviews/<task-id>/spec.receipt |
+| Quality review receipt | .forge/local/reviews/<task-id>/quality.receipt |
+| Verify app receipt     | .forge/local/evidence/<task-id>/verify-app.receipt |
+| E2E receipt            | .forge/local/evidence/<task-id>/e2e.receipt |
+| Promotion receipt      | .forge/local/evidence/<task-id>/promotion.receipt |
+| Council receipt        | .forge/local/council/<council-id>/receipt.json |
+
+Each action receipt records `host=<claude|codex>`. Receipt paths are worktree-local;
+they cannot satisfy gates in a sibling worktree.
+
+## State
+
+### Done (recent 2-3 only)
+
+- (your most recent completed work)
+
+### Now
+
+- (what you're actively working on)
+
+### Next
+
+- (what's queued)
+
+### Deferred
+
+- (parked items with reason)
+
+---
+
+## Open Questions
+
+- (questions needing resolution)
+
+## Blockers
+
+- (anything blocking forward progress)
+
+---
+
+## Update Rules
+
+The currently active host is responsible for updating this file. The Stop hook reminds
+Claude or Codex of the active workflow; the ship hook gates commit/push/PR on the checklist.
+
+**On task completion:**
+
+1. Add to Done (keep last 2-3; older history goes to `docs/CHANGELOG.md`)
+2. Move top of Next → Now
+3. Add to CHANGELOG.md if significant
+
+**On new feature start (`/new-feature` or `/fix-bug` Pre-Flight step 3):**
+
+1. REPLACE the `## Workflow` section entirely
+2. Delete any orphaned checkbox lines outside `### Checklist`
+
+**On code-review iteration completion (during a `/forge-goal`-driven run):**
+
+1. Freeze one staged-clean `git:working-tree` candidate and set `Candidate receipt`.
+2. Record distinct `code-spec` and `code-quality` review receipts for the same review iteration and candidate. Engine choice is neutral: same-engine reviews and a visible fallback are valid when each receipt records requested engine, actual engine, and fallback reason.
+3. Persist candidate-bound `verify-app` and `e2e` receipts only after their reports are written under `.forge/local/evidence/` and hashed by `verification-receipt`.
+4. Any staged, unstaged, or in-scope untracked mutation invalidates the complete final receipt set. Freeze the new candidate and rerun both review lenses plus both verifiers; never relabel an old receipt.
+5. Genuine unmigrated v5 fixtures retain the legacy checklist reader during dual-read. Once receipt-v2 linkage is present, legacy clean rows cannot certify the workflow.
+6. Exact-tree promotion revalidates the receipt set before hook execution and compare-and-swap, then records `Promotion receipt`; the real branch is not advanced early.
+7. **Convergence breaker (v5.54):** after the first receipt-certified iteration, more than `POST_CERT_REVIEW_ROUND_LIMIT` (=3) further rounds trips a hook-enforced breaker that blocks commit/push/PR. Only a HUMAN releases it by recording, in `### Checklist`:
+   - `- [x] Post-certification tail adjudicated by human — <decision> — head=\`<sha>\` — ts=\`<ISO8601>\``
+   The line is head-bound; the agent never writes it on its own initiative. If the loop line carries an iteration count, an N/A escape must KEEP it (`- [x] Code review loop (<N> iterations) — N/A: <reason>`) — a count-less `Code review loop — N/A:` after certification reads as counter erasure and trips the breaker.
+
+**On plan-review iteration completion (during any complex-fix workflow):**
+
+1. Append a checklist line to `### Checklist` capturing the iteration number, plan file, and plan content sha256:
+   - `- [x] Plan review iteration <N> — codex clean — plan=\`docs/plans/<name>.md\` — plan_sha=\`<sha256>\` — ts=\`<ISO8601>\``
+2. Compute `plan_sha` with `shasum -a 256 <path>` (macOS), `sha256sum <path>` (Linux), or `(Get-FileHash -Algorithm SHA256 <path>).Hash` (PowerShell).
+3. When checking the loop-complete checkbox `- [x] Plan review loop (<N> iterations) — PASS`, the per-iter clean line for iteration N must be present AND its `plan_sha` must match the current plan file content. The PreToolUse `check-workflow-gates` hook enforces this on ship actions.
+4. If a fix changes the plan, re-run reviewers and append a NEW iteration row; do NOT mutate existing rows.
+5. Reviewer selection is not an escape: prefer the other engine, then visibly dispatch a fresh same-engine reviewer when that engine is missing or lacks the required capability. Do not halt solely because the preferred engine is unavailable. A justified `- [x] Plan review loop — N/A: <reason>` still does NOT set the evidence gate clean; `/goal` can complete only from a real current-artifact receipt, and blocks only if the fallback also fails.
+
+**On PR creation authorization (during a `/forge-goal`-driven run):**
+
+1. Agent calls `AskUserQuestion` asking the user to authorize `gh pr create`.
+2. On YES, agent REPLACES the entire `## PR authorization` section content with:
+   - `- [x] PR creation authorized — \`<ISO-8601 timestamp>\` — nonce=\`<session nonce>\` — head=\`<current HEAD SHA>\``
+3. The PR-create PreToolUse guard blocks `gh pr create` unless this line is present with a matching nonce AND head SHA.
+4. On re-authorization (user re-authorizes after new commits): REPLACE the existing auth line with the fresh one; do NOT append.
+
+**On worktree seed (`/new-feature` / `/fix-bug` Pre-Flight, when seeding from main):**
+
+The continuity narrative **round-trips** through main so it survives worktree teardown (it is otherwise gitignored and dies with the worktree). The **foldable** sections are `### Done` / `### Next` / `### Deferred` (under `## State`), plus `## Open Questions` and `## Blockers`. The **gate** sections (`## Workflow`, `## /goal session`, `## PR authorization`) NEVER travel — they stay worktree-local with their REPLACE/singleton semantics.
+
+1. A fresh worktree's foldable narrative is copied **verbatim** from main's `state.md`, with `### Now` cleared (a new feature has no active "Now").
+2. A narrative-only **seed snapshot** is written to `.forge/local/.state-seed-snapshot.md` (gitignored, worktree-local) — a record of main's foldable narrative at seed time, used by `/finish-branch` to detect divergence.
+
+**On `/finish-branch` (round-trip fold-back, BEFORE the worktree is removed):**
+
+1. Compare main's current foldable narrative to the seed snapshot.
+2. **Unchanged** → deterministically replace main's foldable sections with the worktree's; set main's `### Now` empty. Gate sections on main are left untouched.
+3. **Changed / snapshot missing / worktree state absent / structurally incomplete** → **loud safe-stop**: warn and do NOT overwrite; leave files intact for manual reconciliation. (No LLM merge — divergence is a safe-stop in this version.)
