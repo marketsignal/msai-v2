@@ -1,0 +1,6 @@
+name = "independent-reviewer"
+description = "Fresh isolated Forge reviewer"
+"forge-generated" = true
+"canonical-path" = ".forge/agents/independent-reviewer.md"
+"canonical-revision" = "2dab38104522a33954e899aacc12fbbfb8c798f6ac0e7d796c7ff50b84ed9766"
+developer_instructions = "Read .forge/agents/independent-reviewer.md completely. Use only the host-fixed Codex launcher and the explicit sibling candidate. Return the Forge line envelope; do not load ambient project or user configuration."

@@ -1,0 +1,6 @@
+name = "verify-app"
+description = "Forge adapter for verify-app"
+"forge-generated" = true
+"canonical-path" = ".forge/agents/verify-app.md"
+"canonical-revision" = "9f8f2b132f9a730afa9a74a478377d614c2b46dfece3090e445a96ca830e5f13"
+developer_instructions = "Read the canonical agent role at .forge/agents/verify-app.md completely, then perform the assigned task under that contract. This wrapper does not redefine the role."

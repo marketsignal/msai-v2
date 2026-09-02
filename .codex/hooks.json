@@ -1,0 +1,88 @@
+{
+  "hooks": {
+    "post_tool_use": [
+      {
+        "command": [
+          ".forge/hooks/lib/codex-worktree-dispatch.sh",
+          "post-tool-format.sh"
+        ],
+        "forgeManagedId": "format"
+      }
+    ],
+    "pre_compact": [
+      {
+        "command": [
+          ".forge/hooks/lib/codex-worktree-dispatch.sh",
+          "pre-compact-memory.sh"
+        ],
+        "forgeManagedId": "precompact-memory"
+      }
+    ],
+    "pre_tool_use": [
+      {
+        "command": [
+          ".forge/hooks/lib/codex-worktree-dispatch.sh",
+          "check-bash-safety.sh"
+        ],
+        "forgeManagedId": "bash-safety"
+      },
+      {
+        "command": [
+          ".forge/hooks/lib/codex-worktree-dispatch.sh",
+          "check-workflow-gates.sh"
+        ],
+        "forgeManagedId": "workflow-gates"
+      },
+      {
+        "command": [
+          ".forge/hooks/lib/codex-worktree-dispatch.sh",
+          "check-external-mutation-auth.sh"
+        ],
+        "forgeManagedId": "external-mutation-auth"
+      }
+    ],
+    "session_start": [
+      {
+        "command": [
+          ".forge/hooks/lib/host-context.sh",
+          "hook",
+          "--host",
+          "codex"
+        ],
+        "forgeManagedId": "host-context"
+      },
+      {
+        "command": [
+          ".forge/hooks/lib/codex-worktree-dispatch.sh",
+          "session-start.sh"
+        ],
+        "forgeManagedId": "session-start"
+      }
+    ],
+    "stop": [
+      {
+        "command": [
+          ".forge/hooks/lib/codex-worktree-dispatch.sh",
+          "build-evidence.sh"
+        ],
+        "forgeManagedId": "build-evidence"
+      },
+      {
+        "command": [
+          ".forge/hooks/lib/codex-worktree-dispatch.sh",
+          "check-state-updated.sh"
+        ],
+        "forgeManagedId": "state-updated"
+      }
+    ],
+    "subagent_stop": [
+      {
+        "command": [
+          ".forge/hooks/lib/codex-worktree-dispatch.sh",
+          "check-subagent-review.sh"
+        ],
+        "forgeManagedId": "subagent-review-receipt"
+      }
+    ]
+  }
+}
