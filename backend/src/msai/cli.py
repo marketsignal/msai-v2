@@ -69,12 +69,19 @@ if TYPE_CHECKING:
 
     from nautilus_trader.adapters.interactive_brokers.common import IBContract
 
+    from msai.services.gateway_watchdog import (
+        GatewayHealth,
+        WatchdogConfig,
+        WatchdogState,
+    )
+
 import httpx
 import typer
 
 from msai.core.config import settings
 from msai.core.database import async_session_factory
 from msai.core.logging import get_logger, setup_logging
+from msai.core.queue import get_redis_pool
 from msai.services.data_ingestion import DataIngestionService
 from msai.services.data_sources.databento_client import DatabentoClient
 from msai.services.nautilus.security_master.service import SecurityMaster
@@ -1494,6 +1501,461 @@ def system_health() -> None:
         except httpx.RequestError as exc:
             parts[label] = {"error": f"{type(exc).__name__}: {exc}"}
     _emit_json(parts)
+
+
+# ----------------------------------------------------------------------
+# IB Gateway watchdog (prod) — see docs/plans/2026-06-10-ib-gateway-watchdog.md
+# ----------------------------------------------------------------------
+
+_WATCHDOG_STATE_KEY = "msai:gateway_watchdog:state"
+_WATCHDOG_HOST_FAILURE_ALERT_KEY = "msai:gateway_watchdog:last_host_failure_alert_at"
+# Separate throttle key for probe-auth failures: a persistent auth misconfig fires
+# every tick, so it MUST NOT share the host-failure throttle (it would otherwise mask
+# a genuine, rarer host-action-failure CRITICAL for up to a full throttle window).
+_WATCHDOG_PROBE_AUTH_ALERT_KEY = "msai:gateway_watchdog:last_probe_auth_alert_at"
+
+
+class _WatchdogProbeAuthError(Exception):
+    """Raised when the watchdog's own ``/account/health`` probe is rejected with
+    401/403 — i.e. the WATCHDOG cannot authenticate (e.g. ``MSAI_API_KEY`` unset
+    in a JWT-only prod), NOT evidence that the gateway is down. The tick converts
+    this to a throttled CRITICAL + a NONE decision so a healthy gateway is never
+    force-recreated because the watchdog couldn't auth to its own API.
+    """
+
+
+def _watchdog_load_state(raw: bytes | str | None) -> WatchdogState:
+    """Deserialize a persisted ``WatchdogState`` JSON blob from Redis.
+
+    ``None`` (no key yet) → a fresh default state. A malformed/corrupt blob
+    is treated as an UNEXPECTED fatal error (the caller surfaces it as a
+    non-zero exit with no token) — silently resetting state would let the
+    anti-flap counters be erased by a single bad write, defeating the
+    restart cap. Raising here keeps that path honest.
+    """
+    from msai.services.gateway_watchdog import WatchdogState
+
+    if raw is None:
+        return WatchdogState()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    data = json.loads(raw)  # JSONDecodeError → fatal (caught by caller)
+    return WatchdogState(
+        down_since=data.get("down_since"),
+        restart_events=list(data.get("restart_events", [])),
+        cooldown_until=data.get("cooldown_until"),
+        escalated=bool(data.get("escalated", False)),
+        post_cooldown_retry_used=bool(data.get("post_cooldown_retry_used", False)),
+        last_alert_reason=data.get("last_alert_reason"),
+        last_alert_at=data.get("last_alert_at"),
+    )
+
+
+def _watchdog_dump_state(state: WatchdogState) -> str:
+    """Serialize a ``WatchdogState`` to a JSON string for Redis."""
+    return json.dumps(
+        {
+            "down_since": state.down_since,
+            "restart_events": list(state.restart_events),
+            "cooldown_until": state.cooldown_until,
+            "escalated": state.escalated,
+            "post_cooldown_retry_used": state.post_cooldown_retry_used,
+            "last_alert_reason": state.last_alert_reason,
+            "last_alert_at": state.last_alert_at,
+        }
+    )
+
+
+def _watchdog_config_from_env() -> WatchdogConfig:
+    """Build a ``WatchdogConfig``, allowing operators to override the
+    thresholds via env vars (all optional — defaults match the PRD)."""
+    from msai.services.gateway_watchdog import WatchdogConfig
+
+    def _f(name: str, default: float) -> float:
+        val = os.environ.get(name)
+        return float(val) if val else default
+
+    def _i(name: str, default: int) -> int:
+        val = os.environ.get(name)
+        return int(val) if val else default
+
+    return WatchdogConfig(
+        grace_secs=_f("MSAI_WATCHDOG_GRACE_SECS", 60.0),
+        restart_cap=_i("MSAI_WATCHDOG_RESTART_CAP", 3),
+        window_secs=_f("MSAI_WATCHDOG_WINDOW_SECS", 900.0),
+        cooldown_secs=_f("MSAI_WATCHDOG_COOLDOWN_SECS", 1800.0),
+        alert_throttle_secs=_f("MSAI_WATCHDOG_ALERT_THROTTLE_SECS", 1800.0),
+    )
+
+
+async def _watchdog_probe_gateway_health(
+    container_running: bool,
+    container_health: str | None,
+) -> tuple[bool, GatewayHealth]:
+    """Combine the host-passed ``docker inspect`` signals with the web
+    process's in-memory IB probe (via ``GET /api/v1/account/health``).
+
+    Returns ``(gateway_connected, GatewayHealth)``.
+
+    The HTTP endpoint returns 200 EVEN WHEN the gateway is down (the body
+    carries ``status``/``gateway_connected``) — so we parse the BODY, never
+    ``response.is_success``. EXPECTED httpx errors (connect/timeout/request)
+    are conservative: treat the gateway as down + health unknown — never
+    falsely healthy. These still produce a valid decision + token.
+
+    Container-health precedence: an explicit ``unhealthy``/``starting`` from
+    the host wins over the body (it reflects the docker healthcheck the
+    decision logic is designed around). ``healthy``/unknown defers to the
+    body's connectivity signal.
+    """
+    from msai.services.gateway_watchdog import GatewayHealth
+
+    if not container_running:
+        return False, GatewayHealth.UNKNOWN
+
+    # Host-passed health takes precedence for the explicit non-healthy states.
+    host_health = (container_health or "").lower()
+    if host_health == "unhealthy":
+        return False, GatewayHealth.UNHEALTHY
+    if host_health == "starting":
+        return False, GatewayHealth.STARTING
+
+    # Otherwise consult the web process's IB probe via the health endpoint.
+    try:
+        response = httpx.get(
+            f"{_api_base()}/api/v1/account/health",
+            headers=_api_headers(),
+            timeout=10.0,
+        )
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError):
+        # Conservative: the backend (or gateway) is unreachable → treat as
+        # down + unknown health. Never report healthy on a probe failure.
+        return False, GatewayHealth.UNKNOWN
+
+    if response.status_code in (401, 403):
+        # AUTH failure: the WATCHDOG can't authenticate to its own API (e.g.
+        # MSAI_API_KEY unset in a JWT-only prod). This says NOTHING about the
+        # gateway — treating it as down would force-recreate a healthy gateway.
+        # Signal the tick to alert (throttled) + decide NONE instead.
+        raise _WatchdogProbeAuthError(f"/account/health returned {response.status_code}")
+
+    if not response.is_success:
+        # Other non-2xx (500/503/etc.) → do NOT trust the body. A healthy-looking
+        # body behind an error status must never be classified HEALTHY. These DO
+        # indicate the backend/gateway is unwell, so conservatively treat as down.
+        return False, GatewayHealth.UNKNOWN
+
+    body: Any = None
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        return False, GatewayHealth.UNKNOWN
+
+    connected = bool(body.get("gateway_connected"))
+    body_status = str(body.get("status") or "")
+    if connected and body_status == "healthy":
+        return True, GatewayHealth.HEALTHY
+    return False, GatewayHealth.UNHEALTHY
+
+
+async def _watchdog_count_active_deployments() -> bool | None:
+    """Live-active signal: DB-direct count of ``LiveDeployment`` rows in an
+    active lifecycle status. ``> 0`` → ``True``. ANY DB error → ``None``
+    (conservative — ``decide()`` returns ``ALERT_ONLY``, never restarts).
+
+    Reads the DB directly (NOT the 50-capped ``GET /live/status``) so a
+    long deployment list can't drop an active row and falsely permit a
+    restart under live trading.
+    """
+    from sqlalchemy import func, select
+
+    from msai.models.live_deployment import LiveDeployment
+    from msai.services.live.broker_account_service import ACTIVE_DEPLOYMENT_STATUSES
+
+    try:
+        async with async_session_factory() as session:
+            count = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(LiveDeployment)
+                    .where(LiveDeployment.status.in_(ACTIVE_DEPLOYMENT_STATUSES))
+                )
+            ).scalar_one()
+        return count > 0
+    except Exception:
+        # Conservative: cannot confirm idle → unknown. Do NOT restart.
+        log.warning("watchdog_live_active_query_failed", exc_info=True)
+        return None
+
+
+async def _watchdog_emit_throttled_critical(subject: str, text: str, throttle_key: str) -> bool:
+    """Emit a CRITICAL alert via ``AlertService``, THROTTLED on ``throttle_key``.
+    The throttle is FAIL-OPEN: if the throttle read/write raises (e.g. Redis is the
+    failed dependency that prompted the alert) the CRITICAL is emitted UNTHROTTLED —
+    it must never be swallowed by its own throttle. Returns ``True`` if emitted,
+    ``False`` if suppressed by the throttle window. Distinct throttle keys keep
+    one persistent failure class (e.g. an auth misconfig firing every tick) from
+    masking another, rarer class for a full window.
+    """
+    from msai.services.alerting import AlertService
+
+    cfg = _watchdog_config_from_env()
+    now = time.time()
+    suppress = False
+    redis = None
+    try:
+        redis = await get_redis_pool()
+        last_raw = await redis.get(throttle_key)
+        if last_raw is not None:
+            last = float(last_raw if not isinstance(last_raw, bytes) else last_raw.decode())
+            if now - last < cfg.alert_throttle_secs:
+                suppress = True
+        if not suppress:
+            await redis.set(throttle_key, str(now))
+    except Exception:
+        # FAIL-OPEN: throttle unavailable → emit unthrottled.
+        log.warning("watchdog_throttle_unavailable", throttle_key=throttle_key, exc_info=True)
+        suppress = False
+    finally:
+        if redis is not None:
+            await redis.aclose()
+
+    if suppress:
+        log.info("watchdog_alert_throttled", subject=subject, detail=text)
+        return False
+
+    await AlertService().send_alert(subject, text, level="critical")
+    return True
+
+
+async def _watchdog_report_host_failure(text: str) -> int:
+    """``--report-host-failure`` mode: skip the decision/counter logic and emit a
+    throttled CRITICAL that a host watchdog action failed."""
+    emitted = await _watchdog_emit_throttled_critical(
+        "IB Gateway watchdog host-action FAILED", text, _WATCHDOG_HOST_FAILURE_ALERT_KEY
+    )
+    typer.echo("host-failure-alert-sent" if emitted else "host-failure-alert-throttled")
+    return 0
+
+
+async def _watchdog_tick(
+    *,
+    container_running: bool,
+    container_health: str | None,
+    dry_run: bool,
+    inject_health: str | None,
+    inject_idle: bool,
+) -> int:
+    """Async core of ``gateway-watchdog-tick``. Returns the process exit code.
+
+    Two error classes (per plan Task 2 error-handling split):
+    - EXPECTED probe degradations → conservative signals + normal decision +
+      token + exit 0 (handled inside the probe helpers).
+    - UNEXPECTED fatal (Redis unreachable, state-JSON decode failure, any
+      unhandled exception) → propagates out of this function; the caller logs
+      and exits NON-ZERO with NO valid token line, so the host rc-guard fires.
+    """
+    from msai.services.alerting import AlertService
+    from msai.services.gateway_watchdog import GatewayHealth, Signals, decide
+
+    cfg = _watchdog_config_from_env()
+    now = time.time()
+
+    # --- gather signals -------------------------------------------------
+    if inject_health == "down":
+        # Operator dry-run: force a down gateway.
+        gateway_connected = False
+        health = GatewayHealth.UNHEALTHY
+    elif inject_health == "healthy":
+        gateway_connected = True
+        health = GatewayHealth.HEALTHY
+        container_running = True
+    else:
+        try:
+            gateway_connected, health = await _watchdog_probe_gateway_health(
+                container_running, container_health
+            )
+        except _WatchdogProbeAuthError as exc:
+            # The watchdog can't authenticate to its OWN /account/health (401/403)
+            # — NOT gateway-down evidence. Alert (throttled, own key) + decide NONE
+            # so a healthy gateway is never force-recreated over a watchdog misconfig.
+            await _watchdog_emit_throttled_critical(
+                "IB Gateway watchdog cannot authenticate its health probe",
+                f"The watchdog's /api/v1/account/health probe was rejected ({exc}). "
+                "Set MSAI_API_KEY in Key Vault so the watchdog can read gateway health. "
+                "Gateway health is UNKNOWN; the watchdog is NOT restarting it.",
+                _WATCHDOG_PROBE_AUTH_ALERT_KEY,
+            )
+            typer.echo("decision=NONE reason=probe-auth-failed restart_count=0")
+            typer.echo("WATCHDOG_ACTION=none")
+            return 0
+
+    if inject_idle:
+        live_active: bool | None = False
+    else:
+        live_active = await _watchdog_count_active_deployments()
+
+    # --- read persisted state (UNEXPECTED-fatal on Redis/JSON failure) --
+    redis = await get_redis_pool()
+    try:
+        raw_state = await redis.get(_WATCHDOG_STATE_KEY)
+        state = _watchdog_load_state(raw_state)
+
+        # Inject semantics: seed down_since past grace so the dry-run shows
+        # the ACTIONABLE decision on the first tick rather than NONE-within-
+        # grace. Only when the persisted down_since is None or still within
+        # grace — never overwrite a genuine older down_since.
+        if inject_health == "down":
+            within_grace = state.down_since is None or (now - state.down_since) < cfg.grace_secs
+            if within_grace:
+                from dataclasses import replace as _replace
+
+                state = _replace(state, down_since=now - cfg.grace_secs - 1)
+
+        signals = Signals(
+            container_running=container_running if inject_health != "healthy" else True,
+            health=health,
+            gateway_connected=gateway_connected,
+            consecutive_failures=0,
+            live_deployment_active=live_active,
+            state=state,
+            now=now,
+            config=cfg,
+        )
+        decision = decide(signals)
+
+        # Persist the next state (UNEXPECTED-fatal if Redis write fails).
+        await redis.set(_WATCHDOG_STATE_KEY, _watchdog_dump_state(decision.new_state))
+    finally:
+        await redis.aclose()
+
+    # --- emit alert (best-effort, after state is durably persisted) -----
+    if decision.alert_level:
+        await AlertService().send_alert(
+            decision.alert_title or "IB Gateway watchdog",
+            decision.alert_message or "",
+            level=decision.alert_level,
+        )
+
+    restart_count = len(decision.new_state.restart_events)
+    typer.echo(
+        f"decision={decision.action.value.upper()} "
+        f"reason={decision.reason} restart_count={restart_count}"
+    )
+    # Action token for the host script, emitted with a SENTINEL prefix so the
+    # host can grep it unambiguously. The prod logger (structlog PrintLoggerFactory
+    # → stdout, JSON renderer) shares this stdout stream, and a late async log line
+    # (e.g. the alert-history timeout done-callback firing during asyncio teardown)
+    # could otherwise land after a bare token and make `tail -1` drop a real
+    # `restart`. The sentinel makes the parse robust against any stdout noise.
+    # In dry-run we still emit the token (the host's restart side-effect is
+    # the operator's responsibility to suppress); counters + alerts persisted.
+    _ = dry_run
+    typer.echo(f"WATCHDOG_ACTION={decision.action.value}")
+    return 0
+
+
+@system_app.command("gateway-watchdog-tick")
+def gateway_watchdog_tick(
+    container_running: bool = typer.Option(
+        True,
+        "--container-running/--no-container-running",
+        help="Whether `docker inspect` reports the ib-gateway container as running.",
+    ),
+    container_health: str = typer.Option(
+        "unknown",
+        "--container-health",
+        help="Container healthcheck status: healthy|unhealthy|starting|unknown.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Operator diagnostic: still persists counters + emits alerts, but the "
+        "host script is expected to suppress the real recreate.",
+    ),
+    inject_health: str | None = typer.Option(
+        None,
+        "--inject-health",
+        help="Operator dry-run: force gateway signals to healthy|down.",
+    ),
+    inject_idle: bool = typer.Option(
+        False,
+        "--inject-idle/--no-inject-idle",
+        help="Operator dry-run: force live_deployment_active=False (skip the DB query).",
+    ),
+    report_host_failure: str | None = typer.Option(
+        None,
+        "--report-host-failure",
+        help="Skip the decision logic and emit a throttled CRITICAL alert that the "
+        "host watchdog action failed (compose error / missing env / tick exec failure).",
+    ),
+) -> None:
+    """Run one IB Gateway watchdog tick: gather signals, run the pure
+    decision, persist anti-flap counters in Redis, alert if needed, and
+    print the action token on the LAST stdout line for the host script.
+
+    See ``docs/plans/2026-06-10-ib-gateway-watchdog.md`` Task 2.
+    """
+    if inject_health is not None and inject_health not in ("healthy", "down"):
+        _fail("--inject-health must be one of: healthy, down", code=2)
+    if container_health.lower() not in ("healthy", "unhealthy", "starting", "unknown"):
+        _fail(
+            "--container-health must be one of: healthy, unhealthy, starting, unknown",
+            code=2,
+        )
+
+    if report_host_failure is not None:
+        try:
+            rc = asyncio.run(_watchdog_report_host_failure(report_host_failure))
+        except Exception:
+            # The host-failure reporter must never crash the host script with
+            # a traceback; log and exit non-zero (host already logs to journal).
+            log.exception("watchdog_report_host_failure_fatal")
+            raise typer.Exit(code=1) from None
+        raise typer.Exit(code=rc)
+
+    try:
+        rc = asyncio.run(
+            _watchdog_tick(
+                container_running=container_running,
+                container_health=container_health.lower(),
+                dry_run=dry_run,
+                inject_health=inject_health,
+                inject_idle=inject_idle,
+            )
+        )
+    except Exception:
+        # UNEXPECTED fatal (Redis down, state-JSON decode failure, unhandled).
+        # Do NOT swallow into a `none` token + exit 0 — exit non-zero with NO
+        # token line so the host rc-guard fires --report-host-failure.
+        log.exception("watchdog_tick_fatal")
+        raise typer.Exit(code=1) from None
+    raise typer.Exit(code=rc)
+
+
+@system_app.command("gateway-watchdog-reset")
+def gateway_watchdog_reset() -> None:
+    """Clear the persisted watchdog state key in Redis.
+
+    Operator/test convenience: starts the anti-flap counters clean so a
+    subsequent ``gateway-watchdog-tick`` begins from a fresh state.
+    """
+
+    async def _reset() -> None:
+        redis = await get_redis_pool()
+        try:
+            await redis.delete(_WATCHDOG_STATE_KEY)
+        finally:
+            await redis.aclose()
+
+    try:
+        asyncio.run(_reset())
+    except Exception:
+        log.exception("watchdog_reset_fatal")
+        _fail("Failed to reset watchdog state (Redis unavailable?)")
+    typer.echo("watchdog state cleared")
 
 
 @system_app.command("smoke-alert")

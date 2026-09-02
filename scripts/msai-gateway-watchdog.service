@@ -1,0 +1,14 @@
+[Unit]
+Description=MSAI v2 IB Gateway watchdog (keep gateway session up)
+# Order after docker + the KV env renderer so a post-reboot tick doesn't fire its
+# env-missing fail-safe (and a false CRITICAL) before /run/msai.env is regenerated.
+# After= only orders when both start in the same boot transaction; the 30s timer
+# re-fire is the backstop if render-env is still running at the first tick.
+After=docker.service msai-render-env.service
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gateway-watchdog.sh
+TimeoutStartSec=120

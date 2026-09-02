@@ -41,6 +41,12 @@ readonly COMPOSE_FILE="/opt/msai/docker-compose.prod.yml"
 readonly IMAGES_ENV="/run/msai-images.env"
 readonly IMAGES_LAST_GOOD="/run/msai-images.last-good.env"
 readonly RENDERED_ENV="/run/msai.env"
+# Non-volatile mirror of IMAGES_ENV. /run is tmpfs (cleared on reboot) and
+# /run/msai-images.env is written only here at deploy; the boot-enabled IB
+# gateway watchdog needs the image refs to `docker compose --force-recreate`
+# the gateway, so it falls back to this persistent copy after a reboot (the
+# render service only regenerates /run/msai.env, not the images env).
+readonly IMAGES_ENV_PERSIST="/opt/msai/msai-images.env"
 readonly DEFAULT_PROFILE_SERVICES=(
     postgres redis migrate
     backend backtest-worker research-worker portfolio-worker ingest-worker
@@ -191,6 +197,12 @@ MSAI_FRONTEND_IMAGE=$MSAI_FRONTEND_IMAGE
 MSAI_HOSTNAME=$MSAI_HOSTNAME
 EOF
 mv "${IMAGES_ENV}.tmp" "$IMAGES_ENV"
+
+# Mirror to a non-volatile path so the IB gateway watchdog can recreate the
+# gateway after a reboot clears /run (the watchdog reads this when
+# /run/msai-images.env is absent). Atomic write under the same umask 077.
+cp -p "$IMAGES_ENV" "${IMAGES_ENV_PERSIST}.tmp"
+mv "${IMAGES_ENV_PERSIST}.tmp" "$IMAGES_ENV_PERSIST"
 
 # ─── Phase 5: Refresh KV-rendered env (msai-render-env.service) ────────────────
 
@@ -522,6 +534,50 @@ esac
 # Success — clear the rollback flag so trap exits cleanly.
 rollback_required=0
 trap - EXIT
+
+# ─── Phase 13: install + enable msai-gateway-watchdog.timer ────────────────────
+#
+# Always-on IB Gateway watchdog: a host systemd oneshot + timer that recreates the
+# ib-gateway container when its IB *session* is wedged (container "up" but API dead)
+# or idle-down, with anti-flap escalation + halt-awareness. Decision logic lives in
+# the app (`msai system gateway-watchdog-tick`); this installs the host script + units.
+#
+# Ordered AFTER Phase 12 smoke success + `trap - EXIT` ON PURPOSE (Codex code-review
+# iter-2 P2): the watchdog depends on the JUST-DEPLOYED backend image's CLI command.
+# If a smoke failure rolled the image back to a last-good that lacks
+# `gateway-watchdog-tick`, an already-enabled timer would fail every 30s. By enabling
+# only after smoke certifies the new image is staying, the watchdog can never outlive
+# a rolled-back image. The trap is already cleared, so a FATAL `exit 1` here fails the
+# deploy step WITHOUT rolling back the (healthy, smoke-passed) app — same intent as
+# backup-to-blob; for an "always-on" watchdog, shipping with no active timer is spec loss.
+echo "→ Phase 13: install gateway-watchdog host script + enable msai-gateway-watchdog.timer"
+install -m 0755 /opt/msai/scripts/gateway-watchdog.sh /usr/local/bin/gateway-watchdog.sh
+cp /opt/msai/scripts/msai-gateway-watchdog.service /etc/systemd/system/
+cp /opt/msai/scripts/msai-gateway-watchdog.timer /etc/systemd/system/
+systemctl daemon-reload
+if ! systemctl enable --now msai-gateway-watchdog.timer; then
+    echo "FAIL_WATCHDOG_TIMER: systemctl enable --now msai-gateway-watchdog.timer failed" >&2
+    echo "  Check: sudo journalctl -u msai-gateway-watchdog.timer + 'systemctl status msai-gateway-watchdog.timer'" >&2
+    exit 1
+fi
+# `enable --now` does NOT re-load the running timer's definition if the unit-file
+# content changed since last deploy. Explicit restart is idempotent and ensures
+# future timer-content edits land without operator action. WARN-only.
+systemctl restart msai-gateway-watchdog.timer 2>&1 \
+    || echo "  WARN: msai-gateway-watchdog.timer restart non-zero (already-running OK; see journalctl)" >&2
+
+# Confirm the timer is actually active — defense against `enable --now` returning 0
+# but the timer immediately falling out of active state.
+# `|| true`: `systemctl is-active` exits non-zero for any non-active state, which
+# under `set -e` would abort at the assignment BEFORE the explicit
+# FAIL_WATCHDOG_TIMER_INACTIVE marker below ever prints (the marker is the
+# documented last-stderr-line diagnostic for this failure).
+watchdog_timer_state=$(systemctl is-active msai-gateway-watchdog.timer || true)
+if [[ "$watchdog_timer_state" != "active" ]]; then
+    echo "FAIL_WATCHDOG_TIMER_INACTIVE: timer reports state='$watchdog_timer_state' after enable+restart" >&2
+    exit 1
+fi
+echo "  msai-gateway-watchdog.timer: $watchdog_timer_state"
 
 echo "=== SUCCESS sha=$GIT_SHA hostname=$MSAI_HOSTNAME ==="
 exit 0
