@@ -8,7 +8,6 @@ can pass to the backtest endpoint.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -26,6 +25,7 @@ from msai.core.logging import get_logger
 from msai.models.strategy import Strategy
 from msai.schemas.common import MessageResponse
 from msai.schemas.strategy import StrategyListResponse, StrategyResponse, StrategyUpdate
+from msai.services.strategy_paths import resolve_strategy_file
 from msai.services.strategy_registry import (
     sync_strategies_to_db,
     validate_strategy_file,
@@ -229,7 +229,7 @@ async def validate_strategy(
             detail=f"Strategy {strategy_id} not found",
         )
 
-    file_path = Path(strategy.file_path) if strategy.file_path else None
+    file_path = resolve_strategy_file(strategy.file_path) if strategy.file_path else None
     if file_path is None or not file_path.is_file():
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

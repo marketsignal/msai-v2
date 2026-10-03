@@ -82,6 +82,7 @@ from msai.services.nautilus.trading_node_subprocess import (
     TradingNodePayload,
     _trading_node_subprocess,
 )
+from msai.services.strategy_paths import resolve_strategy_file
 from msai.services.strategy_registry import compute_file_hash
 
 if TYPE_CHECKING:
@@ -376,15 +377,7 @@ def _build_production_payload_factory(
                     # Compute per-member code hash
                     member_code_hash = ""
                     try:
-                        from pathlib import Path as _Path
-
-                        rel = _Path(strat.file_path)
-                        if rel.is_absolute():
-                            abs_path = rel
-                        elif rel.parts and rel.parts[0] == "strategies":
-                            abs_path = settings.strategies_root.joinpath(*rel.parts[1:])
-                        else:
-                            abs_path = settings.strategies_root / rel
+                        abs_path = resolve_strategy_file(strat.file_path)
                         if abs_path.is_file():
                             member_code_hash = compute_file_hash(abs_path)
                     except Exception:  # noqa: BLE001

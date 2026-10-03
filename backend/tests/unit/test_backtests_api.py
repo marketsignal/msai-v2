@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
@@ -14,6 +13,7 @@ from msai.core.database import get_db
 from msai.main import app
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
     from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -139,6 +139,29 @@ class TestPrepareAndValidateBacktestConfig:
         assert prepared["bar_type"] == "AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL"
         # Caller-supplied values preserved
         assert prepared["fast_ema_period"] == 5
+
+    def test_relative_registry_path_still_runs_server_side_validation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Relative DB paths must not silently skip malformed-config validation."""
+        from pathlib import Path
+
+        from msai.api.backtests import (
+            StrategyConfigValidationError,
+            _prepare_and_validate_backtest_config,
+        )
+        from msai.core.config import settings
+
+        strategies_root = Path(__file__).resolve().parents[3] / "strategies"
+        monkeypatch.setattr(settings, "strategies_root", strategies_root)
+
+        with pytest.raises(StrategyConfigValidationError):
+            _prepare_and_validate_backtest_config(
+                {"fast_ema_period": "not-an-int", "slow_ema_period": 20},
+                strategy_file_path="example/ema_cross.py",
+                config_class_name="EMACrossConfig",
+                canonical_instruments=["AAPL.NASDAQ"],
+            )
 
     def test_bar_type_preserves_user_step_and_aggregation(self) -> None:
         """Bar-type rewrite must preserve caller-selected

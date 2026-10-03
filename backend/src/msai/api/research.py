@@ -7,7 +7,6 @@ listing / polling job status, and promoting the best result to a
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import UUID  # noqa: TC003 — FastAPI resolves path param types at runtime
 
@@ -36,6 +35,7 @@ from msai.schemas.research import (
     ResearchWalkForwardRequest,
 )
 from msai.services.graduation import GraduationService
+from msai.services.strategy_paths import resolve_strategy_file
 
 log = get_logger(__name__)
 
@@ -359,15 +359,12 @@ def _resolve_strategy_path(strategy: Strategy) -> str:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Strategy {strategy.id} has no file_path configured",
         )
-    strategy_file = Path(strategy.file_path)
+    strategy_file = resolve_strategy_file(strategy.file_path)
     if not strategy_file.exists():
-        # Try resolving relative to strategies_root
-        strategy_file = settings.strategies_root / strategy.file_path
-        if not strategy_file.exists():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Strategy file not found: {strategy.file_path}",
-            )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Strategy file not found: {strategy.file_path}",
+        )
 
     resolved = strategy_file.resolve()
     strategies_root = settings.strategies_root.resolve()

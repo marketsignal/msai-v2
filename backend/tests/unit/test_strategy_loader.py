@@ -33,6 +33,18 @@ class TestResolveImportableStrategyPaths:
             "strategies.example.ema_cross" in resolved.config_path
         )
 
+    def test_resolves_registry_relative_path_against_strategies_root(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Removing shared resolution would make workers depend on their cwd."""
+        from msai.core.config import settings
+
+        monkeypatch.setattr(settings, "strategies_root", _STRATEGY_FILE.parents[1])
+
+        resolved = resolve_importable_strategy_paths("example/ema_cross.py")
+
+        assert resolved.strategy_path.endswith(":EMACrossStrategy")
+
     def test_missing_file_raises_file_not_found(self, tmp_path: Path) -> None:
         """A nonexistent strategy file raises FileNotFoundError."""
         bogus = tmp_path / "does_not_exist.py"

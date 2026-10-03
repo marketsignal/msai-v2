@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -14,6 +15,9 @@ from msai.services.strategy_registry import (
     load_strategy_class,
     validate_strategy_file,
 )
+
+if TYPE_CHECKING:
+    from msai.models.strategy import Strategy
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -81,6 +85,18 @@ class TestDiscoverStrategies:
         results = discover_strategies(tmp_path / "nonexistent")
 
         assert results == []
+
+    def test_discovery_skips_literal_dot_path_components(self, tmp_path: Path) -> None:
+        """Dotted names remain reversible to exactly one root-relative file."""
+        strategy_file = tmp_path / "foo.bar.py"
+        strategy_file.write_text(
+            "from nautilus_trader.trading.strategy import Strategy\n"
+            "class LiteralDotStrategy(Strategy):\n"
+            "    pass\n",
+            encoding="utf-8",
+        )
+
+        assert discover_strategies(tmp_path) == []
 
 
 # ---------------------------------------------------------------------------
@@ -467,8 +483,6 @@ class _FakeAsyncSession:
     """
 
     def __init__(self, existing: list[Strategy] | None = None) -> None:
-        from msai.models.strategy import Strategy
-
         self._rows: list[Strategy] = list(existing or [])
         self.deleted: list[Strategy] = []
 
@@ -479,8 +493,6 @@ class _FakeAsyncSession:
         return self
 
     def all(self) -> list[Strategy]:
-        from msai.models.strategy import Strategy  # noqa: F401  (used in annotation)
-
         return [r for r in self._rows if r not in self.deleted]
 
     def add(self, row: Strategy) -> None:
@@ -602,3 +614,147 @@ class TestSyncStrategiesToDb:
 
         # Assert: description was NOT clobbered by the on-disk docstring.
         assert existing_row.description == "USER PATCHED DESCRIPTION — must survive sync"
+
+    async def test_sync_matches_existing_row_by_canonical_name_across_filesystems(
+        self, example_strategies_dir: Path
+    ) -> None:
+        """A foreign absolute path must not make the same strategy look orphaned."""
+        from msai.models.strategy import Strategy
+        from msai.services.strategy_registry import sync_strategies_to_db
+
+        strategies_root = example_strategies_dir.parent
+        discovered = discover_strategies(strategies_root)
+        info = next(item for item in discovered if item.name == "example.ema_cross")
+        row = Strategy(
+            name=info.name,
+            file_path="/guaranteed-foreign-root/strategies/example/ema_cross.py",
+            strategy_class=info.strategy_class_name,
+            config_class=info.config_class_name,
+            config_schema=info.config_schema,
+            default_config=info.default_config,
+            config_schema_status=info.config_schema_status,
+            code_hash=info.code_hash,
+        )
+        session = _FakeAsyncSession(existing=[row])
+
+        paired = await sync_strategies_to_db(
+            session,  # type: ignore[arg-type]
+            strategies_root,
+            prune_missing=True,
+        )
+
+        assert row.deleted_at is None
+        assert [db_row for db_row in session._rows if db_row.name == info.name] == [row]
+        assert any(db_row is row for db_row, _ in paired)
+
+    async def test_sync_persists_new_file_path_relative_to_strategies_root(
+        self, example_strategies_dir: Path
+    ) -> None:
+        """A fresh sync stores a portable root-relative path, not a host path."""
+        from msai.services.strategy_registry import sync_strategies_to_db
+
+        strategies_root = example_strategies_dir.parent
+        session = _FakeAsyncSession()
+
+        await sync_strategies_to_db(
+            session,  # type: ignore[arg-type]
+            strategies_root,
+            prune_missing=False,
+        )
+
+        row = next(item for item in session._rows if item.name == "example.ema_cross")
+        assert row.file_path == "example/ema_cross.py"
+
+    @pytest.mark.parametrize("root_kind", ["missing", "file"])
+    async def test_sync_prune_fails_closed_when_root_is_not_a_directory(
+        self, tmp_path: Path, root_kind: str
+    ) -> None:
+        """An absent or invalid mount is not authoritative evidence of deletion."""
+        from msai.models.strategy import Strategy
+        from msai.services.strategy_registry import sync_strategies_to_db
+
+        strategies_root = tmp_path / "strategies"
+        if root_kind == "file":
+            strategies_root.write_text("not a directory", encoding="utf-8")
+        row = Strategy(
+            name="example.ema_cross",
+            file_path="example/ema_cross.py",
+            strategy_class="EMACrossStrategy",
+            config_class=None,
+            config_schema=None,
+            default_config=None,
+            config_schema_status="no_config_class",
+            code_hash="deadbeef",
+        )
+        session = _FakeAsyncSession(existing=[row])
+
+        result = await sync_strategies_to_db(
+            session,  # type: ignore[arg-type]
+            strategies_root,
+            prune_missing=True,
+        )
+
+        assert result == []
+        assert row.deleted_at is None
+
+    async def test_sync_excludes_smoke_rows_from_file_discovery_prune(
+        self, tmp_path: Path
+    ) -> None:
+        """Migration-seeded smoke rows are outside the filesystem registry lifecycle."""
+        from msai.models.strategy import Strategy
+        from msai.services.strategy_registry import sync_strategies_to_db
+
+        strategies_root = tmp_path / "strategies"
+        strategies_root.mkdir()
+        row = Strategy(
+            name="__smoke__/ema_cross/AAPL",
+            file_path="example/ema_cross.py",
+            strategy_class="EMACrossStrategy",
+            config_class=None,
+            config_schema=None,
+            default_config=None,
+            config_schema_status="no_config_class",
+            code_hash="deadbeef",
+        )
+        session = _FakeAsyncSession(existing=[row])
+
+        await sync_strategies_to_db(
+            session,  # type: ignore[arg-type]
+            strategies_root,
+            prune_missing=True,
+        )
+
+        assert row.deleted_at is None
+
+    async def test_sync_keeps_undiscovered_row_while_stored_file_exists(
+        self, tmp_path: Path
+    ) -> None:
+        """A governance/import skip is not evidence that an on-disk file was deleted."""
+        from msai.models.strategy import Strategy
+        from msai.services.strategy_registry import sync_strategies_to_db
+
+        strategies_root = tmp_path / "strategies"
+        strategies_root.mkdir()
+        # Literal dots are deliberately undiscoverable because dotted names
+        # cannot reverse them uniquely, but an existing row must remain safe.
+        stored_file = strategies_root / "foo.bar.py"
+        stored_file.write_text("not importable by design\n", encoding="utf-8")
+        row = Strategy(
+            name="foo.bar",
+            file_path="foo.bar.py",
+            strategy_class="LegacyStrategy",
+            config_class=None,
+            config_schema=None,
+            default_config=None,
+            config_schema_status="no_config_class",
+            code_hash="deadbeef",
+        )
+        session = _FakeAsyncSession(existing=[row])
+
+        await sync_strategies_to_db(
+            session,  # type: ignore[arg-type]
+            strategies_root,
+            prune_missing=True,
+        )
+
+        assert row.deleted_at is None

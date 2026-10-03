@@ -56,6 +56,7 @@ from msai.services.report_signer import (
     sign_report_token,
     verify_report_token,
 )
+from msai.services.strategy_paths import resolve_strategy_file
 from msai.services.strategy_registry import load_strategy_class
 
 log = get_logger(__name__)
@@ -213,7 +214,7 @@ def _prepare_and_validate_backtest_config(
         )
         return prepared
 
-    strategy_path = Path(strategy_file_path)
+    strategy_path = resolve_strategy_file(strategy_file_path)
     if not strategy_path.exists():
         log.warning(
             "backtest_config_validation_skipped",
@@ -319,7 +320,7 @@ async def run_backtest(
     # reproducibly pinned to the exact code version used at enqueue time.
     strategy_hash = "unknown"
     if strategy.file_path:
-        strategy_file = Path(strategy.file_path)
+        strategy_file = resolve_strategy_file(strategy.file_path)
         if strategy_file.exists():
             import hashlib
 

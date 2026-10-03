@@ -35,7 +35,6 @@ import inspect
 import re
 import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select
@@ -50,8 +49,10 @@ from msai.services.nautilus.schema_hooks import (
     build_user_schema,
 )
 from msai.services.strategy_governance import StrategyGovernanceService
+from msai.services.strategy_paths import resolve_strategy_file
 
 if TYPE_CHECKING:
+    from pathlib import Path
     from types import ModuleType
 
 
@@ -168,6 +169,15 @@ def discover_strategies(strategies_dir: Path) -> list[DiscoveredStrategy]:
         if py_file.name in _SKIP_FILENAMES or py_file.name.startswith("_"):
             continue
 
+        rel = py_file.relative_to(strategies_dir)
+        if any("." in part for part in rel.with_suffix("").parts):
+            log.warning(
+                "strategy_path_not_bijective",
+                path=str(py_file),
+                reason="literal_dot_in_path_component",
+            )
+            continue
+
         # Run governance check BEFORE importing — prevents dangerous
         # module-scope side effects (os.system, subprocess, etc.)
         violations = governance.validate_file(py_file)
@@ -216,7 +226,6 @@ def discover_strategies(strategies_dir: Path) -> list[DiscoveredStrategy]:
                 config_class=(config_cls.__name__ if config_cls else None),
             )
 
-        rel = py_file.relative_to(strategies_dir)
         dotted_name = rel.with_suffix("").as_posix().replace("/", ".")
 
         discovered.append(
@@ -546,8 +555,10 @@ async def sync_strategies_to_db(
     ``strategies/<pkg>/config.py`` wouldn't bump the strategy file's
     hash, so persisted schema would go stale. Combined hash fixes that.
 
-    ``prune_missing`` deletes rows whose ``file_path`` no longer exists
-    on disk (rename / delete). Orphaned rows would otherwise remain
+    ``prune_missing`` archives registry rows whose canonical ``name`` is no
+    longer discovered and whose expected root-relative file no longer exists.
+    A missing/non-directory root is non-authoritative and never prunes.
+    Orphaned rows would otherwise remain
     addressable by their stable UUID from backtest + portfolio foreign
     keys — leaking rows only users with an old bookmark would hit.
 
@@ -564,25 +575,32 @@ async def sync_strategies_to_db(
     # SYNC path opts into the soft-delete filter (plan R20). Without
     # ``include_deleted=True``, an archived row would be invisible to
     # ``existing_by_path`` and sync would silently re-create a NEW
-    # active row for the same file_path on every GET — un-archiving the
+    # active row for the same name on every GET — un-archiving the
     # strategy.
     existing_rows = (
         (await session.execute(select(Strategy).execution_options(include_deleted=True)))
         .scalars()
         .all()
     )
-    existing_by_path: dict[str, Strategy] = {row.file_path: row for row in existing_rows}
+    registry_rows = [row for row in existing_rows if not row.name.startswith("__smoke__/")]
+    existing_by_name: dict[str, Strategy] = {}
+    for existing_row in registry_rows:
+        indexed = existing_by_name.get(existing_row.name)
+        if indexed is None or (
+            indexed.deleted_at is not None and existing_row.deleted_at is None
+        ):
+            existing_by_name[existing_row.name] = existing_row
 
-    discovered_paths = {str(info.module_path) for info in discovered}
+    discovered_names = {info.name for info in discovered}
 
     paired: list[tuple[Strategy, DiscoveredStrategy]] = []
     for info in discovered:
-        file_path = str(info.module_path)
+        file_path = info.module_path.relative_to(strategies_dir).as_posix()
         # Combined hash: strategy file + sibling config.py (if any).
         # A schema/defaults change in config.py must invalidate the
         # memoized schema cache even if the strategy file is unchanged.
         combined_hash = _combined_strategy_hash(info)
-        row = existing_by_path.get(file_path)
+        row = existing_by_name.get(info.name)
         if row is None:
             row = Strategy(
                 name=info.name,
@@ -603,7 +621,6 @@ async def sync_strategies_to_db(
             # Explicit operator restoration is a future PR (R2).
             continue
         else:
-            row.name = info.name
             row.strategy_class = info.strategy_class_name
             # NOTE: description is NOT re-synced from disk after the row
             # exists — it is user-editable via PATCH /api/v1/strategies/{id}
@@ -626,12 +643,20 @@ async def sync_strategies_to_db(
     # Soft-prune (set ``deleted_at``) instead of hard-delete so historical
     # backtest + deployment FKs keep resolving (plan R2). Skip rows that
     # are already archived to keep the operation idempotent.
-    if prune_missing:
+    if prune_missing and strategies_dir.is_dir():
         now = datetime.now(UTC)
-        for path, stale_row in existing_by_path.items():
-            if path in discovered_paths:
+        for stale_row in registry_rows:
+            if stale_row.name in discovered_names:
                 continue
-            if Path(path).exists():
+            expected_path = strategies_dir.joinpath(*stale_row.name.split(".")).with_suffix(
+                ".py"
+            )
+            if expected_path.is_file():
+                continue
+            if resolve_strategy_file(
+                stale_row.file_path,
+                strategies_root=strategies_dir,
+            ).is_file():
                 continue
             if stale_row.deleted_at is None:
                 stale_row.deleted_at = now
