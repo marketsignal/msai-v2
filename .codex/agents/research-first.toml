@@ -1,0 +1,6 @@
+name = "research-first"
+description = "Forge adapter for research-first"
+"forge-generated" = true
+"canonical-path" = ".forge/agents/research-first.md"
+"canonical-revision" = "9b14f96e4b1e9be38cd6c012dc34269e23f70e0123f675b17322d0d684c5db20"
+developer_instructions = "Read the canonical agent role at .forge/agents/research-first.md completely, then perform the assigned task under that contract. This wrapper does not redefine the role."

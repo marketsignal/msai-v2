@@ -1,0 +1,6 @@
+name = "verify-e2e"
+description = "Forge adapter for verify-e2e"
+"forge-generated" = true
+"canonical-path" = ".forge/agents/verify-e2e.md"
+"canonical-revision" = "3db73eb203991c687f2b4710216ddb4510323062b3af32dc02fef7b6916d1759"
+developer_instructions = "Read the canonical agent role at .forge/agents/verify-e2e.md completely, then perform the assigned task under that contract. This wrapper does not redefine the role."

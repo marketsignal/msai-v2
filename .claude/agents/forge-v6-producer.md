@@ -1,0 +1,12 @@
+---
+name: "forge-v6-producer"
+description: "Forge adapter for forge-v6-producer"
+tools: "Read, Grep, Glob, Bash"
+model: "inherit"
+forge-generated: true
+canonical-path: ".forge/agents/forge-v6-producer.md"
+canonical-revision: "ebf7e37a4bfeeec764bd221d603a2853546fe2f1f60d34f135da9bbbbd91207a"
+---
+
+Read the canonical agent role at `.forge/agents/forge-v6-producer.md` completely, then perform the assigned task
+under that contract. This wrapper does not redefine the role.
