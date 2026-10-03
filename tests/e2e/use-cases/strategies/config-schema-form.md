@@ -71,18 +71,19 @@
 
 ---
 
-## UC-SCS-003 — 422 inline field error on malformed instrument ID
+## UC-SCS-003 — backtest submit rejects a malformed config field inline, and ignores dispatch-injected fields
 
 **Interface:** API (UI variant is parallel — the RunBacktestForm consumes the same 422 envelope into `fieldErrors` state).
 
-**Intent:** When the submitted config fails `StrategyConfig.parse()`, the server returns 422 with a structured `details[].field` payload identifying the bad field, and the frontend surfaces the message inline under the field.
+> **Changelog 2026-06-07 (envelope retarget):** the original Step 2 expected `config.instrument_id:"garbage"` to 422. That is **stale** — `instrument_id`/`bar_type` are now **dispatch-injected** from the top-level `Instruments` input and OVERRIDE any config-supplied value, so a garbage `config.instrument_id` is silently ignored (→ 201), not parsed. The genuine inline-422 path is now exercised on a config field the dispatch does NOT override (e.g. `fast_ema_period` type error). Both behaviors are pinned below.
 
-**Setup:** Same as UC-SCS-001.
+**Intent:** A strategy author submitting a backtest gets a precise inline field error when a config value is the wrong type, while values the system derives for them (instrument id / bar type) can't break the submit even if malformed.
+
+**Setup:** Same as UC-SCS-001 (EMACrossStrategy discovered; `X-API-Key: msai-dev-key`). Capture `GET /api/v1/backtests/history` total before the run.
 
 **Steps:**
 
-1. `POST /api/v1/backtests/run` with `X-API-Key: msai-dev-key`, body:
-
+1. `POST /api/v1/backtests/run` with a registry-miss instrument:
    ```json
    {
      "strategy_id": "<the EMACrossStrategy id>",
@@ -92,10 +93,17 @@
      "end_date": "2025-01-15"
    }
    ```
-
-   (The instrument resolution will fail first — this tests the existing 422 path that the validation helper runs AFTER.)
-
-2. `POST /api/v1/backtests/run` with a VALID instrument but malformed config:
+2. `POST /api/v1/backtests/run` with a VALID instrument but a wrong-TYPE config field (the field the dispatch does NOT inject):
+   ```json
+   {
+     "strategy_id": "<id>",
+     "config": { "fast_ema_period": "garbage" },
+     "instruments": ["AAPL.NASDAQ"],
+     "start_date": "2025-01-01",
+     "end_date": "2025-01-15"
+   }
+   ```
+3. `POST /api/v1/backtests/run` with a VALID instrument and a garbage `config.instrument_id` (a dispatch-injected field):
    ```json
    {
      "strategy_id": "<id>",
@@ -108,10 +116,11 @@
 
 **Verification:**
 
-- Step 1 → 422 with a `detail` string (existing instrument-resolve path unchanged).
-- Step 2 → 422 with `detail.error.code == "VALIDATION_ERROR"` and `detail.error.details[0].field` containing `instrument_id`. The `detail.error.details[0].message` quotes the msgspec error message (`Error parsing 'InstrumentId' from 'garbage': missing '.' separator ...`).
+- Step 1 → `422` with a `detail` STRING naming the unregistered symbol + the copy-pastable `msai instruments bootstrap` hint (instrument-resolve path runs before config validation).
+- Step 2 → `422` with `error.code == "VALIDATION_ERROR"` and `error.details[0].field == "fast_ema_period"`; `error.details[0].message` quotes the msgspec type error (`Expected \`int\`, got \`str\` - at \`$.fast_ema_period\``). This is the inline field error the form renders under the field.
+- Step 3 → `201` with `id`/`status`. The garbage `config.instrument_id` is **ignored** — dispatch injects the resolved `AAPL.NASDAQ` from `Instruments`. (Author cannot break the submit via a field the system owns; the resolved instrument is what runs.)
 
-**Persistence:** No backtest row should have been created for either request — verify `GET /api/v1/backtests/history` total count is unchanged.
+**Persistence:** `GET /api/v1/backtests/history` total increased by exactly **1** (Step 3 only — Steps 1 & 2 created no row). Following Step 3's run id back via `GET /api/v1/backtests/{id}/status` shows it `pending`/`running`/`failed` (failure only if AAPL price data isn't cached — a worker concern, not a submit concern).
 
 ---
 
