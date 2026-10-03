@@ -199,6 +199,7 @@ parse_goal_session() {
 
 parse_workflow() {
     # Output (printed to stdout, pipe-friendly key|value lines):
+    #   COMMAND|<workflow command>
     #   PHASE|<phase>
     #   NEXT|<next_step>
     #   TOTAL|<int>
@@ -207,12 +208,15 @@ parse_workflow() {
 
     # CRLF normalize BEFORE awk anchors (Codex P1.7 from plan-review).
     tr -d '\r' < "$STATE_MD" | awk '
-        BEGIN { phase=""; next_step=""; total=0; done=0; in_workflow=0; in_checklist=0 }
+        BEGIN { command=""; phase=""; next_step=""; total=0; done=0; in_workflow=0; in_checklist=0 }
         /^## Workflow$/        { in_workflow=1; next }
         in_workflow && /^## /  { in_workflow=0; in_checklist=0 }
         in_workflow && /^### Checklist/ { in_checklist=1; next }
         in_workflow && /^### / && !/^### Checklist/ { in_checklist=0 }
-        # Markdown table: |  Phase  | <value> |
+        # Markdown table: | Command | <value> |
+        in_workflow && /\|[[:space:]]*Command[[:space:]]*\|/ {
+            split($0,a,"|"); command=a[3]; gsub(/^[[:space:]]+|[[:space:]]+$/,"",command)
+        }
         in_workflow && /\|[[:space:]]*Phase[[:space:]]*\|/ {
             split($0,a,"|"); phase=a[3]; gsub(/^[[:space:]]+|[[:space:]]+$/,"",phase)
         }
@@ -222,6 +226,7 @@ parse_workflow() {
         in_workflow && in_checklist && /^- \[x\]/ { done++; total++ }
         in_workflow && in_checklist && /^- \[ \]/ { total++ }
         END {
+            print "COMMAND|" command
             print "PHASE|" phase
             print "NEXT|" next_step
             print "TOTAL|" total
@@ -308,8 +313,8 @@ compute_breaker_fields() {
 
 compute_plan_review_gate() {
     # Output: "clean_same_iteration|matched_iteration|matched_plan_sha"
-    # Canonical clean-line stem (referenced by tests/template/test-contracts.sh
-    # parity check): Plan review iteration N — codex clean — plan=`<path>` — plan_sha=`<sha>`
+    # Canonical clean-line stem: Plan review iteration N — <actual-engine> clean —
+    # plan=`<path>` — plan_sha=`<sha>`. Actual engine is claude or codex.
     # Canonical code stem: Code review iteration N — codex clean — head=`<sha>`
     # Scope extraction to ## Workflow / ### Checklist (mirror compute_reviewer_gate
     # scoping above). A whole-file grep would pick up stray "Plan review iteration"
@@ -337,16 +342,29 @@ compute_plan_review_gate() {
     n=$(echo "$pass_line" | sed -E 's/.*Plan review loop \(([0-9]+) iterations\).*/\1/')
     [ -z "$n" ] && { echo "false||"; return 0; }
 
-    # Find matching per-iter clean line for iteration n (scoped lookup)
+    # Find the LAST matching iteration row and fold only contiguous, indented
+    # non-list Markdown continuations. Never cross into another checklist row.
     local clean_line
-    clean_line=$(echo "$checklist" \
-        | grep -E "^\s*-\s*\[x\]\s+Plan review iteration $n — " \
-        | tail -1)
+    clean_line=$(echo "$checklist" | awk -v n="$n" '
+        function finish() {
+            if (active) { selected=record; active=0 }
+        }
+        $0 ~ "^[[:space:]]*-[[:space:]]*\\[x\\][[:space:]]+Plan review iteration " n " — " {
+            finish(); record=$0; active=1; next
+        }
+        active && $0 ~ /^[[:space:]]+[^[:space:]]/ \
+            && $0 !~ /^[[:space:]]*[-*+][[:space:]]/ \
+            && $0 !~ /^[[:space:]]*#/ {
+            line=$0; sub(/^[[:space:]]+/, "", line); record=record " " line; next
+        }
+        { finish() }
+        END { finish(); if (selected != "") print selected }
+    ')
     [ -z "$clean_line" ] && { echo "false||"; return 0; }
 
-    # Match codex clean variant + verify plan_sha (read from file, hash, compare).
-    # Canonical delimited form only (— codex clean —), so "not-codex clean" can't pass.
-    if echo "$clean_line" | grep -qF -- "— codex clean —"; then
+    # Accept only the delimited actual-engine variants so malformed labels such
+    # as "not-claude clean" remain non-certifying.
+    if echo "$clean_line" | grep -qE -- "— (claude|codex) clean —"; then
         local plan_path claimed_sha actual_sha
         plan_path=$(echo "$clean_line" | sed -E 's/.*plan=`([^`]+)`.*/\1/')
         claimed_sha=$(echo "$clean_line" | sed -E 's/.*plan_sha=`([^`]+)`.*/\1/')
@@ -368,10 +386,8 @@ compute_plan_review_gate() {
             echo "false|$n|$claimed_sha"
         fi
     else
-        # Codex is mandatory: only a `codex clean` line with matching plan_sha
-        # sets clean_same_iteration=true. There is no "codex unavailable" escape.
-        # A plan-review N/A escape does NOT set it true — so /goal can't
-        # self-complete without real Codex evidence (mirrors e2e_report).
+        # Unknown or malformed engine labels never certify. A plan-review N/A
+        # escape likewise does not set this evidence gate true.
         echo "false||"
     fi
 }
@@ -441,6 +457,7 @@ WORKFLOW_CMD_JSON=$(json_str_field "workflow_command" "$GOAL_CMD")
 
 # Parse ## Workflow section (checklist counts).
 WF=$(parse_workflow)
+ACTIVE_WORKFLOW_CMD=$(echo "$WF" | grep '^COMMAND|' | head -1 | cut -d'|' -f2-)
 PHASE=$(echo "$WF"       | grep '^PHASE|' | head -1 | cut -d'|' -f2-)
 NEXT_STEP=$(echo "$WF"   | grep '^NEXT|'  | head -1 | cut -d'|' -f2-)
 TOTAL_COUNT=$(echo "$WF" | grep '^TOTAL|' | head -1 | cut -d'|' -f2-)
@@ -456,20 +473,57 @@ RG_REST="${RG_RESULT#*|}"
 RG_ITER="${RG_REST%%|*}"
 RG_HEAD="${RG_REST##*|}"
 
-# Receipt-v2 is activated by an explicit Candidate receipt state linkage. Until
-# Task 9 converts a workflow producer, the existing checklist reader remains the
-# compatibility path. Migrated v5 evidence cannot enter it because translation
-# removes legacy clean rows and receipt state.
+# Every active canonical v6 workflow is receipt-v2, including its initial
+# placeholder state. Receipt linkage is evidence to validate, not an activation
+# switch. Inactive v6 state and genuine pre-migration state remain readable.
 CANDIDATE_CLEAN=false
 VERIFY_APP_CLEAN=false
 E2E_RECEIPT_CLEAN=false
 SHIP_RECEIPTS_CLEAN=false
 RECEIPT_GATE_OK=true
 CANDIDATE_ID=""
-RECEIPT_CANDIDATE=$(tr -d '\r' < "$STATE_MD" 2>/dev/null | awk -F'|' '{k=$2; gsub(/^[ \t]+|[ \t]+$/, "", k); if(k=="Candidate receipt"){v=$3; gsub(/^[ \t]+|[ \t]+$/, "", v); print v; exit}}')
-case "$RECEIPT_CANDIDATE" in ''|*'<'*) ;; *)
+WORKFLOW_ACTIVE=true
+case "$ACTIVE_WORKFLOW_CMD" in ''|none|'—'|'-') WORKFLOW_ACTIVE=false ;; esac
+QUICK_FIX_DIRECT=false
+if printf '%s\n' "$ACTIVE_WORKFLOW_CMD" | grep -qE '^/quick-fix [a-z0-9]+(-[a-z0-9]+)*$'; then
+    QUICK_BASE_COUNT=$(tr -d '\r' < "$STATE_MD" | awk -F'|' '
+        /^## Identity$/ { in_identity=1; next }
+        in_identity && /^## / { in_identity=0 }
+        in_identity {
+            key=$2; gsub(/^[ \t]+|[ \t]+$/, "", key)
+            if (key == "Workflow base SHA") n++
+        }
+        END { print n+0 }
+    ')
+    QUICK_BASE_SHA=$(tr -d '\r' < "$STATE_MD" | awk -F'|' '
+        /^## Identity$/ { in_identity=1; next }
+        in_identity && /^## / { in_identity=0 }
+        in_identity {
+            key=$2; gsub(/^[ \t]+|[ \t]+$/, "", key)
+            if (key == "Workflow base SHA") { value=$3; gsub(/^[ \t]+|[ \t]+$/, "", value); print value; exit }
+        }
+    ')
+    if [ "$QUICK_BASE_COUNT" -eq 1 ] \
+        && printf '%s\n' "$QUICK_BASE_SHA" | grep -qE '^[0-9a-f]{40}([0-9a-f]{24})?$' \
+        && git cat-file -e "${QUICK_BASE_SHA}^{commit}" 2>/dev/null \
+        && git merge-base --is-ancestor "$QUICK_BASE_SHA" HEAD 2>/dev/null; then
+        QUICK_SCOPE_OK=true
+        QUICK_COMMITTED=$(git diff --no-renames --name-only "${QUICK_BASE_SHA}..HEAD" -- 2>/dev/null) || QUICK_SCOPE_OK=false
+        QUICK_CACHED=$(git diff --cached --no-renames --name-only "$QUICK_BASE_SHA" -- 2>/dev/null) || QUICK_SCOPE_OK=false
+        QUICK_UNSTAGED=$(git diff --no-renames --name-only -- 2>/dev/null) || QUICK_SCOPE_OK=false
+        if [ "$QUICK_SCOPE_OK" = true ]; then
+            QUICK_IMPL_COUNT=$(printf '%s\n%s\n%s\n' "$QUICK_COMMITTED" "$QUICK_CACHED" "$QUICK_UNSTAGED" \
+                | LC_ALL=C sort -u \
+                | awk '$0 != "README.md" && $0 != "docs/CHANGELOG.md" && length($0) > 0 { n++ } END { print n+0 }')
+            [ "$QUICK_IMPL_COUNT" -le 3 ] && QUICK_FIX_DIRECT=true
+        fi
+    fi
+fi
+if [ "$STATE_IS_V6" = true ] && [ "$WORKFLOW_ACTIVE" = true ]; then
     RECEIPT_GATE_OK=false
-    if [ "$STATE_IS_V6" = true ] && [ -f "$VR" ]; then
+    RG_CLEAN=false
+    E2E_FRESH=false
+    if [ -f "$VR" ]; then
         VR_OUT=$(bash "$VR" check --state "$STATE_MD" 2>/dev/null || true)
         [ "$(printf '%s\n' "$VR_OUT" | sed -n 's/^CANDIDATE_VALID://p' | tail -1)" = true ] && CANDIDATE_CLEAN=true
         [ "$(printf '%s\n' "$VR_OUT" | sed -n 's/^REVIEWS_VALID://p' | tail -1)" = true ] && RG_CLEAN=true || RG_CLEAN=false
@@ -482,8 +536,7 @@ case "$RECEIPT_CANDIDATE" in ''|*'<'*) ;; *)
         [ "$CANDIDATE_CLEAN" = true ] && RG_HEAD="$HEAD_SHA" || RG_HEAD=""
         E2E_FRESH="$E2E_RECEIPT_CLEAN"
     fi
-    ;;
-esac
+fi
 
 # Convergence breaker fields (full-state helper run). Sets POST_CERT_ROUNDS,
 # BREAKER, BREAKER_OK (false only when tripped AND unadjudicated).
@@ -530,9 +583,9 @@ PR_HEAD_MATCH="false"
 
 PR_READY="false"
 if [ "$PR_OPEN" = "true" ] && [ "$PR_HEAD_MATCH" = "true" ] && \
-   [ "$RG_CLEAN" = "true" ] && [ "$E2E_FRESH" = "true" ] && \
    [ "$PA_AUTH" = "true" ] && [ "$BREAKER_OK" = "true" ] && \
-   [ "$RECEIPT_GATE_OK" = "true" ]; then
+   { [ "$QUICK_FIX_DIRECT" = "true" ] || { [ "$RG_CLEAN" = "true" ] \
+       && [ "$E2E_FRESH" = "true" ] && [ "$RECEIPT_GATE_OK" = "true" ]; }; }; then
     PR_READY="true"
 fi
 
@@ -619,6 +672,7 @@ CANDIDATE_ID_JSON=$(json_str_field "candidate_id" "$CANDIDATE_ID")
     printf '"produced_at_unix":%d,' "$NOW_UNIX"
     printf '%s,' "$SESSION_NONCE_JSON"
     printf '%s,' "$WORKFLOW_CMD_JSON"
+    printf '"quick_fix_direct":%s,' "$QUICK_FIX_DIRECT"
     printf '"state":{%s,%s,"checklist_total":%d,"checklist_done":%d},' \
         "$PHASE_JSON" "$NEXT_STEP_JSON" "$TOTAL_COUNT" "$DONE_COUNT"
     printf '"reviewer_gate":{"clean_same_iteration":%s,%s,%s,"post_cert_rounds":%d,"breaker":"%s"},' \

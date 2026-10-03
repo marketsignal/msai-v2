@@ -1,8 +1,9 @@
 # Forge opinion workflow — Fresh Review and Investigation
 
-Use the host-fixed launcher registered by the active Claude Code or Codex adapter. Never invent a
-`main` engine flag: the SessionStart context determines the main host. User-facing reviewer choices
-map only to `--engine auto|claude|codex`; `auto` means the other engine. A healthy explicit
+Use the fixed-target compatibility launcher registered by the active Claude Code or Codex adapter.
+It declares the current host to the dispatcher; `main_host` is routing metadata, not authenticated
+session identity or reviewer evidence. Never invent a `main` engine flag. User-facing reviewer
+choices map only to `--engine auto|claude|codex`; `auto` means the other engine. A healthy explicit
 same-engine request is a fresh independent reviewer, not a fallback.
 
 ## Inputs
@@ -14,6 +15,19 @@ Otherwise classify the request as one of: general second opinion/analysis/brains
 General is hermetic and read-only. Resolve the workflow's persisted immutable base SHA/ref from
 `.forge/local/state.md`; never recompute it from a moving default branch. Put the exact request in a
 regular prompt file under `.forge/local/reviews/`.
+
+For the ordinary review profile, `FORGE_REVIEW_TRANSPORT_AUTHORIZED` communicates the developer's
+standing human approval in the canonical Human-Approved Reviews section (`.forge/instructions.md`;
+source: `FORGE.template.md`). Send the complete bounded immutable candidate
+snapshot, prompt, and evidence to the configured Claude Code or Codex reviewer service without
+a separate Forge consent question, including follow-up reviews, fallback, and resumed sessions.
+This approves review execution, not acceptance of findings or shipping. Private or unchanged
+tracked content does not require another approval. This transport is not an external mutation and
+does not grant arbitrary network tools, additional secrets or credentials, gitignored developer
+state beyond the candidate, outside-worktree access, other projects, arbitrary destinations, or
+external mutations. Respect host security controls and cite the actual human standing instruction
+when authorization provenance is required.
+This standing review consent does not authorize `investigate`.
 
 Invoke the fixed launcher for this host:
 
@@ -36,11 +50,17 @@ the blocker to the developer. P3, cosmetic, speculative, purely theoretical, and
 candidate concerns do not keep the loop open; a concrete material P2 still prevents certification.
 
 - `CLEAN` certifies only when maximum severity is `NONE` or `P3` and no P0/P1/P2 record exists.
-- `FINDINGS` is a successful review result, not an engine fallback. Repair and invoke only within
+- `FINDINGS/P3` with only P3 finding rows is also certifying: keep the advisory notes without
+  production repair or another review solely for those notes. Never rewrite its envelope to CLEAN.
+- Other `FINDINGS` is a successful review result, not an engine fallback. Repair and invoke only within
   the bounded broad/repair/closure policy above.
 - `BLOCKED artifact|authorization|invariant` stops without fallback.
 - Engine/capability launch failure follows the dispatcher's visible one-retry policy. With
   `--fallback-policy none`, no retry occurs.
+- When exhausted ordinary review attempts emit `AUTH_REQUIRED`, follow the main-agent
+  [authentication recovery](../rules/workflow.md#reviewer-authentication-recovery) handoff:
+  one coordinated official login, then one retry of unfinished roles only. A completed
+  fallback needs no login; authentication is not a request to reapprove review transport.
 
 Code requires two distinct fresh receipts over the identical candidate: `code-spec` and
 `code-quality`. Validate them with `agent-dispatch verify-pair`; neither lens substitutes for the
@@ -52,6 +72,17 @@ row. An unsupported or false claimed-current-behavior edge is a P1 finding; expl
 inferred Gate-1 briefing edges are exempt.
 
 ## Investigation
+
+Ordinary reviewer transport consent does not authorize `investigate`. An explicit user-authored
+`/opinion investigate` or `$opinion investigate` invocation authorizes the separately disclosed
+full-agent launch. If the main agent inferred investigation from ordinary prose, ask exactly:
+
+> May I launch a fresh full-capability reviewer agent in the real worktree? It will inherit the
+> normal user/project configuration, Forge state and memory, tools, MCP servers, network, databases,
+> APIs, and worktree write access. Individual external or destructive mutations still require their
+> existing host approvals.
+
+Stop until the developer answers. Do not substitute ordinary review consent for this authorization.
 
 Use `--profile investigate --role investigation`. This launches a fresh full-capability process of
 the selected engine in the real worktree. It inherits the normal user/project configuration,

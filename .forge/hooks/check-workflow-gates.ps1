@@ -127,10 +127,10 @@ $hookDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $configCheck = Join-Path $hookDir "check-config-change.ps1"
 $forgeVersionPath = Join-Path (Get-Location).Path ".forge\version"
 $forgeVersion = if (Test-Path -LiteralPath $forgeVersionPath -PathType Leaf) { (@(Get-Content -LiteralPath $forgeVersionPath)[0]).Trim() } else { "" }
-if ($forgeVersion -eq "6" -and (Test-Path -LiteralPath $configCheck)) {
+if ($forgeVersion -match '^6(\.\d+){0,2}$' -and (Test-Path -LiteralPath $configCheck)) {
     $null = '{}' | & $configCheck -Mode boundary -Root (Get-Location).Path 2>$null
     if ($LASTEXITCODE -ne 0) {
-        [Console]::Error.WriteLine("FORGE_CONFIG_TAMPERED: managed hook configuration changed; run setup -F and inspect the diff before shipping.")
+        [Console]::Error.WriteLine("FORGE_CONFIG_TAMPERED: managed hook configuration changed; run setup -f and inspect the diff before shipping.")
         exit 2
     }
 }
@@ -162,11 +162,11 @@ if (Test-Path -LiteralPath $stateHelper) {
 }
 $stateIsV6 = (-not [string]::IsNullOrEmpty($stateFile)) -and (($stateFile -replace '\\', '/') -match '/\.forge/local/state\.md$')
 
-if (-not (Test-Path $stateFile)) {
+if ([string]::IsNullOrEmpty($stateFile) -or -not (Test-Path -LiteralPath $stateFile)) {
     # Hard-cut: do NOT fall back to CONTINUITY.md.
     # Breadcrumb wording byte-equivalent to bash variant for AC-4 parity.
     [Console]::Error.WriteLine("ℹ check-workflow-gates: Forge state.md not found.")
-    [Console]::Error.WriteLine("  Run setup -FullRefresh -DryRun, resolve every reported blocker, then run setup -FullRefresh.")
+    [Console]::Error.WriteLine("  Run setup -Force -DryRun, resolve every reported blocker, then run setup -Force.")
     Exit-ForgeAllow
 }
 
@@ -196,7 +196,7 @@ if (-not $cmdLine) { Exit-ForgeAllow }
 $cmd = ($cmdLine -split '\|')[2].Trim()
 if (-not $cmd -or $cmd -eq "none" -or $cmd -eq ([char]0x2014).ToString() -or $cmd -eq "-") { Exit-ForgeAllow }
 if (-not $stateIsV6) {
-    [Console]::Error.WriteLine("WORKFLOW GATE: legacy Forge state cannot certify shipping; run setup -FullRefresh -DryRun, resolve blockers, then setup -FullRefresh.")
+    [Console]::Error.WriteLine("WORKFLOW GATE: legacy Forge state cannot certify shipping; run setup -Force -DryRun, resolve blockers, then setup -Force.")
     exit 2
 }
 
@@ -287,6 +287,50 @@ if ($command -match $prCreatePattern) {
     }
 }
 
+# Exact quick fixes use a direct focused check instead of the full candidate
+# receipt pipeline. Fail closed unless one valid ancestral base is recorded and
+# the complete base diff stays within the three implementation-path cap.
+if ($cmd -cmatch '^/quick-fix [a-z0-9]+(-[a-z0-9]+)*$') {
+    $quickBaseRows = @()
+    $inIdentity = $false
+    foreach ($line in (($content -replace "`r", "") -split "`n")) {
+        if ($line -ceq '## Identity') { $inIdentity = $true; continue }
+        if ($inIdentity -and $line.StartsWith('## ')) { $inIdentity = $false }
+        if (-not $inIdentity) { continue }
+        $parts = $line -split '\|'
+        if ($parts.Count -ge 4 -and $parts[1].Trim() -ceq 'Workflow base SHA') {
+            $quickBaseRows += $parts[2].Trim()
+        }
+    }
+    if ($quickBaseRows.Count -eq 1 -and $quickBaseRows[0] -cmatch '^[0-9a-f]{40}([0-9a-f]{24})?$') {
+        $quickBaseSha = [string]$quickBaseRows[0]
+        $null = & git cat-file -e "$quickBaseSha`^{commit}" 2>$null
+        $quickBaseValid = $LASTEXITCODE -eq 0
+        if ($quickBaseValid) {
+            $null = & git merge-base --is-ancestor $quickBaseSha HEAD 2>$null
+            $quickBaseValid = $LASTEXITCODE -eq 0
+        }
+        if ($quickBaseValid) {
+            $quickCommitted = @(& git diff --no-renames --name-only "$quickBaseSha..HEAD" -- 2>$null)
+            $quickBaseValid = $LASTEXITCODE -eq 0
+            if ($quickBaseValid) {
+                $quickCached = @(& git diff --cached --no-renames --name-only $quickBaseSha -- 2>$null)
+                $quickBaseValid = $LASTEXITCODE -eq 0
+            }
+            if ($quickBaseValid) {
+                $quickUnstaged = @(& git diff --no-renames --name-only -- 2>$null)
+                $quickBaseValid = $LASTEXITCODE -eq 0
+            }
+            if ($quickBaseValid) {
+                $quickPaths = @($quickCommitted + $quickCached + $quickUnstaged | Sort-Object -Unique -CaseSensitive | Where-Object {
+                    -not [string]::IsNullOrEmpty($_) -and $_ -cne 'README.md' -and $_ -cne 'docs/CHANGELOG.md'
+                })
+                if ($quickPaths.Count -le 3) { Exit-ForgeAllow }
+            }
+        }
+    }
+}
+
 # --- Convergence breaker (hook-enforced backstop; ADR 0009) ---
 # Placement: BEFORE the docs-only commit carve-out and OUTSIDE the PASS-evidence
 # branch — neither a docs-only staged diff, a `Code review loop — N/A:` escape,
@@ -321,43 +365,6 @@ if ($brkHead -and (Test-Path -LiteralPath $ReviewBreakerPs1) -and (Test-Path $st
         [Console]::Error.WriteLine("(severities + in-delta vs certified-unchanged) to the human. Ship is")
         [Console]::Error.WriteLine("blocked until the human records:")
         [Console]::Error.WriteLine("  - [x] Post-certification tail adjudicated by human — <decision> — head=``$brkHead`` — ts=``<ISO8601>``")
-        exit 2
-    }
-}
-
-# Receipt-v2 compatibility switch. An explicit Candidate receipt linkage means
-# all final evidence must bind to one current staged-clean candidate. Genuine
-# unconverted workflows continue through the legacy checklist evidence below.
-$ReceiptV2Active = $false
-$receiptCandidate = ""
-$receiptCandidateRows = @()
-foreach ($line in (($content -replace "`r", "") -split "`n")) {
-    $parts = $line -split '\|'
-    if ($parts.Count -ge 4 -and $parts[1].Trim() -ceq 'Candidate receipt') {
-        $receiptCandidateRows += $parts[2].Trim()
-    }
-}
-if ($receiptCandidateRows.Count -eq 1) { $receiptCandidate = [string]$receiptCandidateRows[0] }
-if ($receiptCandidate -and -not $receiptCandidate.Contains('<')) {
-    $ReceiptV2Active = $true
-    $verificationReceipt = Join-Path $hookDir 'lib\verification-receipt.ps1'
-    if (-not (Test-Path -LiteralPath $verificationReceipt)) {
-        $verificationReceipt = Join-Path $topLevel 'hooks\lib\verification-receipt.ps1'
-    }
-    $vrOut = @()
-    $vrStatus = 2
-    if (Test-Path -LiteralPath $verificationReceipt) {
-        . $verificationReceipt
-        $vrResponse = Invoke-VerificationReceipt -ReceiptMode check -StatePath $stateFile
-        $vrOut = @($vrResponse.Lines)
-        if ($vrResponse.Error) { $vrOut += $vrResponse.Error }
-        $vrStatus = $vrResponse.Status
-    }
-    if ($vrStatus -ne 0) {
-        [Console]::Error.WriteLine('WORKFLOW GATE: final receipt set is missing, stale, mixed-candidate, or non-clean.')
-        foreach ($line in $vrOut) { [Console]::Error.WriteLine([string]$line) }
-        if (-not $vrOut) { [Console]::Error.WriteLine('verification-receipt helper unavailable') }
-        [Console]::Error.WriteLine('Freeze the staged-clean candidate, then rerun both review lenses, verify-app, and E2E.')
         exit 2
     }
 }
@@ -460,6 +467,22 @@ if ($unchecked.Count -gt 0) {
     exit 2
 }
 
+# A concrete candidate path selects receipt-native diagnostics below, avoiding
+# duplicate legacy evidence errors. This flag does NOT activate enforcement;
+# every active canonical v6 workflow validates receipts before the final allow.
+$ReceiptV2Active = $false
+$receiptCandidateRows = @()
+foreach ($line in (($content -replace "`r", "") -split "`n")) {
+    $parts = $line -split '\|'
+    if ($parts.Count -ge 4 -and $parts[1].Trim() -ceq 'Candidate receipt') {
+        $receiptCandidateRows += $parts[2].Trim()
+    }
+}
+if ($receiptCandidateRows.Count -eq 1) {
+    $receiptCandidate = [string]$receiptCandidateRows[0]
+    if ($receiptCandidate -and -not $receiptCandidate.Contains('<')) { $ReceiptV2Active = $true }
+}
+
 # ---------------------------------------------------------------------------
 # Evidence-based gate for E2E verified. Mirrors the .sh logic:
 # a checked '[x] E2E verified' without 'N/A:' must have a fresh report file
@@ -548,8 +571,7 @@ if (-not $ReceiptV2Active -and $e2eCheckedLine -and ($e2eCheckedLine -notmatch '
 # ($checklistLines was built once above the E2E gate and is reused here.)
 
 # N/A escape: any `[x] Plan review loop ... N/A:` line skips the evidence check
-# (mirrors the E2E verified — N/A: gate). Codex is mandatory; there is no
-# "codex unavailable" escape.
+# (mirrors the E2E verified — N/A: gate).
 $planNaLine = ($checklistLines `
     | Where-Object { $_ -match '^\s*-\s*\[x\]\s+Plan review loop' -and $_ -match 'N/A:' } `
     | Select-Object -First 1)
@@ -586,25 +608,43 @@ if ($planPassLine) {
         $planN = $null
     }
 
-    $planClean = ($checklistLines `
-        | Where-Object { $_ -match "^\s*-\s*\[x\]\s+Plan review iteration $planN — " } `
-        | Select-Object -Last 1)
+    # Select the LAST matching iteration row and fold only contiguous,
+    # indented non-list Markdown continuations. Never cross into another
+    # checklist item or section.
+    $planCleanCandidates = @()
+    for ($i = 0; $i -lt $checklistLines.Count; $i++) {
+        $line = [string]$checklistLines[$i]
+        if ($line -notmatch "^\s*-\s*\[x\]\s+Plan review iteration $planN — ") { continue }
+        $record = $line
+        $j = $i + 1
+        while ($j -lt $checklistLines.Count) {
+            $continuation = [string]$checklistLines[$j]
+            if ($continuation -notmatch '^\s+\S' -or
+                $continuation -match '^\s*[-*+]\s' -or
+                $continuation -match '^\s*#') { break }
+            $record += " " + $continuation.TrimStart()
+            $j++
+        }
+        $planCleanCandidates += $record
+    }
+    $planClean = ($planCleanCandidates | Select-Object -Last 1)
 
     if (-not $planClean) {
         [Console]::Error.WriteLine("WORKFLOW GATE: [x] Plan review loop ($planN iterations) — PASS lacks per-iter clean evidence.")
         [Console]::Error.WriteLine("")
         [Console]::Error.WriteLine("Required: matching line in state.md (### Checklist):")
-        [Console]::Error.WriteLine("  - [x] Plan review iteration $planN — codex clean — plan=``<plan-file>`` — plan_sha=``<sha256>`` — ts=``<ts>``")
+        [Console]::Error.WriteLine("  - [x] Plan review iteration $planN — <actual-engine> clean — plan=``<plan-file>`` — plan_sha=``<sha256>`` — ts=``<ts>``")
         exit 2
     }
 
-    # Codex is mandatory: only `codex clean` (plan_sha bound) is accepted.
-    if ($planClean -match '— codex clean —') {
+    # Accept only an exact delimited actual-engine label, never a substring
+    # such as `not-claude clean`.
+    if ($planClean -match '— (claude|codex) clean —') {
         # Presence check BEFORE extraction (mirror .sh): a clean line missing
         # plan=/plan_sha= tokens must hit "malformed", not a garbled missing-file error.
         if ($planClean -notmatch 'plan=`[^`]+`.*plan_sha=`[^`]+`') {
             [Console]::Error.WriteLine("WORKFLOW GATE: Plan review iteration $planN clean line is malformed.")
-            [Console]::Error.WriteLine("Expected format: codex clean — plan=``<path>`` — plan_sha=``<sha256>`` — ts=``<ts>``")
+            [Console]::Error.WriteLine("Expected format: <actual-engine> clean — plan=``<path>`` — plan_sha=``<sha256>`` — ts=``<ts>``")
             [Console]::Error.WriteLine("Got: $planClean")
             exit 2
         }
@@ -630,7 +670,8 @@ if ($planPassLine) {
         [Console]::Error.WriteLine("WORKFLOW GATE: Plan review iteration $planN clean line variant not recognized.")
         [Console]::Error.WriteLine("Got: $planClean")
         [Console]::Error.WriteLine("")
-        [Console]::Error.WriteLine("Codex is mandatory in this repo. Accepted forms (see rules/workflow.md):")
+        [Console]::Error.WriteLine("Accepted actual-engine forms:")
+        [Console]::Error.WriteLine("  - claude clean — plan=``<path>`` — plan_sha=``<sha>`` — ts=``<ts>``")
         [Console]::Error.WriteLine("  - codex clean — plan=``<path>`` — plan_sha=``<sha>`` — ts=``<ts>``")
         [Console]::Error.WriteLine("  - mark the loop N/A:  - [x] Plan review loop — N/A: <reason>")
         exit 2
@@ -644,6 +685,10 @@ if ($planPassLine) {
 # Canonical clean-line stem (test-contracts.sh parity check):
 #   Code review iteration N — codex clean — head=`<sha>`
 # ---------------------------------------------------------------------------
+# Receipt-native V6 is rejected or accepted by structured receipts before this
+# historical parser can authorize anything. Keep the unreachable pre-V6 parser
+# here only as dual-read documentation; it cannot certify a V6 ship action.
+if (-not $stateIsV6) {
 # N/A escape: any `[x] Code review loop ... N/A:` line skips the evidence check.
 # Codex is mandatory; there is no "tool unavailable" escape.
 $codeNaLine = ($checklistLines `
@@ -677,7 +722,7 @@ if ($codePassLine) {
     exit 2
 }
 
-if (-not $ReceiptV2Active -and $codePassLine -and $headShaCode) {
+if ($codePassLine -and $headShaCode) {
     if ($codePassLine -match 'Code review loop \((\d+) iterations\)') {
         $codeN = $matches[1]
     } else {
@@ -731,6 +776,31 @@ if (-not $ReceiptV2Active -and $codePassLine -and $headShaCode) {
             exit 2
         }
     }
+}
+}
+
+# Strict v6 boundary: receipt linkage never controls whether enforcement runs.
+# Placeholder, absent, and stale receipt sets all fail closed here after any
+# more-specific checklist diagnostic has had a chance to guide the developer.
+$verificationReceipt = Join-Path $hookDir 'lib\verification-receipt.ps1'
+if (-not (Test-Path -LiteralPath $verificationReceipt)) {
+    $verificationReceipt = Join-Path $topLevel 'hooks\lib\verification-receipt.ps1'
+}
+$vrOut = @()
+$vrStatus = 2
+if (Test-Path -LiteralPath $verificationReceipt) {
+    . $verificationReceipt
+    $vrResponse = Invoke-VerificationReceipt -ReceiptMode check -StatePath $stateFile
+    $vrOut = @($vrResponse.Lines)
+    if ($vrResponse.Error) { $vrOut += $vrResponse.Error }
+    $vrStatus = $vrResponse.Status
+}
+if ($vrStatus -ne 0) {
+    [Console]::Error.WriteLine('WORKFLOW GATE: final receipt set is missing, stale, mixed-candidate, or non-clean.')
+    foreach ($line in $vrOut) { [Console]::Error.WriteLine([string]$line) }
+    if (-not $vrOut) { [Console]::Error.WriteLine('verification-receipt helper unavailable') }
+    [Console]::Error.WriteLine('Initialize the v6 receipt paths and Review iteration, freeze the staged-clean candidate, then rerun both review lenses, verify-app, and E2E.')
+    exit 2
 }
 
 Exit-ForgeAllow

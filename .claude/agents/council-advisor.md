@@ -1,7 +1,11 @@
 ---
 name: "council-advisor"
 description: "Forge adapter for council-advisor"
-tools: "Read, Grep, Glob, Bash"
+tools:
+  - Read
+  - Grep
+  - Glob
+  - Bash(git:*)
 model: "inherit"
 forge-generated: true
 canonical-path: ".forge/agents/council-advisor.md"
