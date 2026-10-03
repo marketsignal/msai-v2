@@ -2,6 +2,30 @@
 # Canonical Forge workflow-state resolver. Source this file, then call:
 #   forge_state_path <repository-root> read|write
 
+forge_state_v6_valid() {
+    local path="$1"
+    [ -f "$path" ] && [ ! -L "$path" ] || return 1
+    awk '
+        { sub(/\r$/, "") }
+        NR==1 { if ($0!="<!-- forge:state-schema v6 -->") bad=1 }
+        /^## Workflow$/ {
+            workflow_count++
+            section="workflow"; next
+        }
+        /^## / { section="other"; next }
+        section=="workflow" && /^\|/ {
+            split($0, cell, "|"); key=cell[2]
+            gsub(/^[ \t]+|[ \t]+$/, "", key)
+            if (key=="Command") command_count++
+            else if (key=="Phase") phase_count++
+            else if (key=="Next step") next_count++
+        }
+        END {
+            if (bad || workflow_count!=1 || command_count!=1 || phase_count>1 || next_count>1) exit 1
+        }
+    ' "$path" >/dev/null
+}
+
 forge_state_path() {
     local requested_root="${1:-.}" mode="${2:-read}" root version canonical legacy candidate version_present
     root=$(cd "$requested_root" 2>/dev/null && pwd -P) || {
@@ -45,9 +69,8 @@ forge_state_path() {
     # state is an error. Falling back here could resurrect stale v5 goal/review
     # authorization evidence after migration.
     if [ -e "$canonical" ] || [ "$version_present" = true ]; then
-        if { [ "$version_present" = true ] && [ "$version" != 6 ]; } \
-            || [ ! -f "$canonical" ] || [ -L "$canonical" ] \
-            || ! head -1 "$canonical" 2>/dev/null | grep -qxF '<!-- forge:state-schema v6 -->'; then
+        if { [ "$version_present" = true ] && ! printf '%s\n' "$version" | grep -Eq '^6(\.[0-9]+){0,2}$'; } \
+            || ! forge_state_v6_valid "$canonical"; then
             echo "BLOCKED: invalid Forge v6 state at $canonical" >&2
             return 1
         fi

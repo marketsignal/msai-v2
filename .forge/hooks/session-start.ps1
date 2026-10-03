@@ -31,7 +31,7 @@ if ($LASTEXITCODE -eq 0 -and $top) { $projectRoot = $top }
 $configCheck = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "check-config-change.ps1"
 if (Test-Path -LiteralPath $configCheck) {
     $null = '{}' | & $configCheck -Mode boundary -Root $projectRoot 2>$null
-    if ($LASTEXITCODE -ne 0) { $context += " (FORGE_CONFIG_TAMPERED: managed config changed; run setup -F and inspect the diff before shipping)" }
+    if ($LASTEXITCODE -ne 0) { $context += " (FORGE_CONFIG_TAMPERED: managed config changed; run setup -f and inspect the diff before shipping)" }
 }
 
 $hookDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -40,8 +40,7 @@ if (-not (Test-Path -LiteralPath $stateHelper)) { $stateHelper = Join-Path (Get-
 if (Test-Path -LiteralPath $stateHelper) {
     try {
         . $stateHelper
-        $root = $env:CLAUDE_PROJECT_DIR
-        if (-not $root) { $root = (Get-Location).Path }
+        $root = $projectRoot
         $stateMd = Get-ForgeStatePath -Root $root -Mode Read
         if ($stateMd -and (Test-Path -LiteralPath $stateMd)) {
             $rawState = (Get-Content -LiteralPath $stateMd -Raw -ErrorAction SilentlyContinue) -replace "`r", ""
@@ -53,13 +52,30 @@ if (Test-Path -LiteralPath $stateHelper) {
             }
             $cmdLine = $workflowLines | Select-String '\|\s*Command\s*\|' | Select-Object -First 1
             $phaseLine = $workflowLines | Select-String '\|\s*Phase\s*\|' | Select-Object -First 1
+            $nextLine = $workflowLines | Select-String '\|\s*Next step\s*\|' | Select-Object -First 1
             $resumeCmd = if ($cmdLine) { ($cmdLine -split '\|')[2].Trim() } else { "" }
             $resumePhase = if ($phaseLine) { ($phaseLine -split '\|')[2].Trim() } else { "" }
+            $resumeNext = if ($nextLine) { ($nextLine -split '\|')[2].Trim() } else { "" }
             if ($resumeCmd -and $resumeCmd -ne "none" -and $resumeCmd -ne "-" -and $resumeCmd -ne ([char]0x2014).ToString()) {
-                $context = "$context (Forge resume: $resumeCmd; phase: $resumePhase)"
+                if (-not $resumePhase -or -not $resumeNext) {
+                    $context += " (FORGE_STATE_INVALID: active workflow in .forge/local/state.md is missing Phase or Next step; repair it before continuing)"
+                } else {
+                    $context = "$context (Forge resume from .forge/local/state.md: $resumeCmd; phase: $resumePhase; next step: $resumeNext - run .forge/hooks/lib/workflow-state.ps1 show before continuing)"
+                }
+            }
+            if (Test-Path -LiteralPath (Join-Path $root ".forge\local\memory\MEMORY.md") -PathType Leaf) {
+                $context += " (local memory index: .forge/local/memory/MEMORY.md)"
+            }
+            if (Test-Path -LiteralPath (Join-Path $root ".forge\memory\MEMORY.md") -PathType Leaf) {
+                $context += " (durable memory index: .forge/memory/MEMORY.md)"
             }
         }
-    } catch {}
+    } catch {
+        if ((Test-Path -LiteralPath (Join-Path $root ".forge\version")) -or
+            (Test-Path -LiteralPath (Join-Path $root ".forge\local\state.md"))) {
+            $context += " (FORGE_STATE_INVALID: canonical .forge/local/state.md could not be resolved; repair it before continuing)"
+        }
+    }
 }
 
 if ($source -eq "startup" -or $source -eq "resume") {
@@ -117,26 +133,6 @@ if ($source -eq "startup" -or $source -eq "resume") {
         }
     }
 
-    # Forge version drift (advisory) — mirror of session-start.sh. Compare the project
-    # pin vs this machine's stamp; direction via a [version] numeric compare (NOT string —
-    # 5.50 vs 5.9). Fail-open ($ErrorActionPreference is already SilentlyContinue); never blocks.
-    $proj = $env:CLAUDE_PROJECT_DIR
-    if (-not $proj) { try { $proj = (git rev-parse --show-toplevel 2>$null) } catch { $proj = "" } }
-    if ($proj -and $HOME) {
-        $pin = ""; $mine = ""
-        try { if (Test-Path (Join-Path $proj ".claude/.forge-version")) { $pin = (@(Get-Content (Join-Path $proj ".claude/.forge-version"))[0]).Trim() } } catch {}
-        try { if (Test-Path (Join-Path $HOME ".claude/.forge-version")) { $mine = (@(Get-Content (Join-Path $HOME ".claude/.forge-version"))[0]).Trim() } } catch {}
-        # Require a clean X.Y on BOTH sides — malformed/multiline fails open (no advisory).
-        if (($pin -match '^\d+\.\d+$') -and ($mine -match '^\d+\.\d+$') -and $pin -ne $mine) {
-            $mineOlder = $false
-            try { $mineOlder = ([version]("$mine.0") -lt [version]("$pin.0")) } catch {}
-            if ($mineOlder) {
-                $context = "$context (this project pins Forge $pin; you're on $mine — the project is on a newer Forge, so you may want to upgrade yours to match)"
-            } else {
-                $context = "$context (this project pins Forge $pin; you're on $mine — your Forge is newer; running setup -Upgrade here would change the project to $mine, which other clones would pull)"
-            }
-        }
-    }
 }
 
 $output = @{

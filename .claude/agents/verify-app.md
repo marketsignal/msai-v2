@@ -5,7 +5,7 @@ tools: "Read, Grep, Glob, Bash"
 model: "inherit"
 forge-generated: true
 canonical-path: ".forge/agents/verify-app.md"
-canonical-revision: "9f8f2b132f9a730afa9a74a478377d614c2b46dfece3090e445a96ca830e5f13"
+canonical-revision: "88f2d1fc7daa6adc7c9dadef18241b4dd91ee85481d4c0b9b56e910032332e97"
 ---
 
 Read the canonical agent role at `.forge/agents/verify-app.md` completely, then perform the assigned task

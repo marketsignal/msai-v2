@@ -27,7 +27,7 @@ TOP=$(git -C "$PROJECT_ROOT" rev-parse --show-toplevel 2>/dev/null || true)
 CONFIG_CHECK="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/check-config-change.sh"
 if [ -f "$CONFIG_CHECK" ]; then
     if ! printf '{}' | bash "$CONFIG_CHECK" --verify-boundary "$PROJECT_ROOT" >/dev/null 2>&1; then
-        CONTEXT="$CONTEXT (FORGE_CONFIG_TAMPERED: managed config changed; run setup -F and inspect the diff before shipping)"
+        CONTEXT="$CONTEXT (FORGE_CONFIG_TAMPERED: managed config changed; run setup -f and inspect the diff before shipping)"
     fi
 fi
 
@@ -39,12 +39,29 @@ STATE_HELPER="$HOOK_DIR/lib/state-path.sh"
 if [ -f "$STATE_HELPER" ]; then
     # shellcheck disable=SC1090
     . "$STATE_HELPER"
-    STATE_MD=$(forge_state_path "$PROJECT_ROOT" read 2>/dev/null || true)
-    if [ -f "$STATE_MD" ]; then
+    STATE_MD=""
+    if STATE_MD=$(forge_state_path "$PROJECT_ROOT" read 2>/dev/null); then
         WORKFLOW_BLOCK=$(tr -d '\r' < "$STATE_MD" | awk '/^## Workflow$/{f=1;next} f && /^## /{f=0} f')
         RESUME_CMD=$(printf '%s\n' "$WORKFLOW_BLOCK" | grep -iE '\|[[:space:]]*Command[[:space:]]*\|' | head -1 | awk -F'|' '{print $3}' | xargs)
         RESUME_PHASE=$(printf '%s\n' "$WORKFLOW_BLOCK" | grep -iE '\|[[:space:]]*Phase[[:space:]]*\|' | head -1 | awk -F'|' '{print $3}' | xargs)
-        case "$RESUME_CMD" in ""|none|-|—) ;; *) CONTEXT="$CONTEXT (Forge resume: $RESUME_CMD; phase: $RESUME_PHASE)" ;; esac
+        RESUME_NEXT=$(printf '%s\n' "$WORKFLOW_BLOCK" | grep -iE '\|[[:space:]]*Next step[[:space:]]*\|' | head -1 | awk -F'|' '{print $3}' | xargs)
+        case "$RESUME_CMD" in
+            ""|none|-|—) ;;
+            *)
+                if [ -z "$RESUME_PHASE" ] || [ -z "$RESUME_NEXT" ]; then
+                    CONTEXT="$CONTEXT (FORGE_STATE_INVALID: active workflow in .forge/local/state.md is missing Phase or Next step; repair it before continuing)"
+                else
+                    CONTEXT="$CONTEXT (Forge resume from .forge/local/state.md: $RESUME_CMD; phase: $RESUME_PHASE; next step: $RESUME_NEXT — run .forge/hooks/lib/workflow-state.sh show before continuing)"
+                fi
+                ;;
+        esac
+        [ -f "$PROJECT_ROOT/.forge/local/memory/MEMORY.md" ] \
+            && CONTEXT="$CONTEXT (local memory index: .forge/local/memory/MEMORY.md)"
+        [ -f "$PROJECT_ROOT/.forge/memory/MEMORY.md" ] \
+            && CONTEXT="$CONTEXT (durable memory index: .forge/memory/MEMORY.md)"
+    elif [ -e "$PROJECT_ROOT/.forge/version" ] || [ -e "$PROJECT_ROOT/.forge/local/state.md" ] \
+        || [ -L "$PROJECT_ROOT/.forge" ] || [ -L "$PROJECT_ROOT/.forge/local" ]; then
+        CONTEXT="$CONTEXT (FORGE_STATE_INVALID: canonical .forge/local/state.md could not be resolved; repair it before continuing)"
     fi
 fi
 
@@ -87,28 +104,6 @@ if [[ "$SOURCE" == "startup" || "$SOURCE" == "resume" ]]; then
         fi
     fi
 
-    # Forge version drift (advisory): compare the project's pinned version
-    # (.claude/.forge-version, committed downstream) against THIS machine's version
-    # (~/.claude/.forge-version, written by setup). Direction-aware; fail-open under
-    # `set -u` (guard ${HOME:-} / ${CLAUDE_PROJECT_DIR:-}); never blocks.
-    PROJ="${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || echo "")}"
-    if [[ -n "$PROJ" ]] && [[ -n "${HOME:-}" ]]; then
-        # Take only the first line + strip whitespace, then require a clean X.Y on
-        # BOTH sides — a malformed/multiline stamp fails open (no advisory) and can
-        # never inject a newline into the emitted context (Codex code-review P2-2).
-        PIN=$(head -1 "$PROJ/.claude/.forge-version" 2>/dev/null | tr -d '[:space:]')
-        MINE=$(head -1 "$HOME/.claude/.forge-version" 2>/dev/null | tr -d '[:space:]')
-        if [[ "$PIN" =~ ^[0-9]+\.[0-9]+$ ]] && [[ "$MINE" =~ ^[0-9]+\.[0-9]+$ ]] && [[ "$PIN" != "$MINE" ]]; then
-            # Portable numeric compare (no GNU-only `sort -V`; Codex iter-3 P2). Both
-            # validated X.Y; 10# forces base-10. "mine older" → warn against upgrading.
-            if [ "$((10#${MINE%%.*}))" -lt "$((10#${PIN%%.*}))" ] \
-               || { [ "$((10#${MINE%%.*}))" -eq "$((10#${PIN%%.*}))" ] && [ "$((10#${MINE#*.}))" -lt "$((10#${PIN#*.}))" ]; }; then
-                CONTEXT="$CONTEXT (this project pins Forge $PIN; you're on $MINE — the project is on a newer Forge, so you may want to upgrade yours to match)"
-            else
-                CONTEXT="$CONTEXT (this project pins Forge $PIN; you're on $MINE — your Forge is newer; running setup --upgrade here would change the project to $MINE, which other clones would pull)"
-            fi
-        fi
-    fi
 fi
 
 # Emit JSON

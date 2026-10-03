@@ -1,17 +1,29 @@
 # Engineering Council — Peer Review Protocol
 
-> How the council runs: dispatch, anonymization, escalation, and synthesis rules.
+> How the council runs: eligibility, topology, anonymization, fallback, and synthesis rules.
 
 ---
+
+## Eligibility
+
+Run this full topology only for an explicit developer request, an unresolved concrete high-impact
+architectural fork, or a genuine non-destructive product or engineering decision required to
+continue an active native Goal. The cheapest safe falsifying check is the
+smallest reversible check that can disprove the disputed assumption without changing production.
+If it produces a deterministic smallest answer, use that answer instead of Council. Ordinary
+plan/code-review findings, soft warnings, implementation choices, and engine failures stay with
+their owning workflow and are not council triggers.
 
 ## Dispatch Rules
 
 ### Dynamic six-seat topology (CRITICAL)
 
-Use the protected host launcher with its exact council target: `host-context.sh
+Use the fixed-target compatibility launcher with its exact council target: `host-context.sh
 launch --host <host> -- .forge/hooks/lib/council-dispatch.sh ...` on Unix, or
 `host-context.ps1 -Mode launch -Host <host> -LaunchTarget council
--LaunchArgumentsJson ...` on Windows. It starts five fresh advisor sessions, resumes those exact sessions for
+-LaunchArgumentsJson ...` on Windows. `main_host` is routing metadata, not
+authenticated session identity; candidate and worktree evidence remain the
+review authority. The dispatcher starts five fresh advisor sessions, resumes those exact sessions for
 anonymous peer critique, then starts one fresh chairman session: six sessions
 and eleven turns. The healthy assignment is three advisor seats on the main
 engine, two advisor seats plus chairman on the other engine. Every seat uses
@@ -22,21 +34,32 @@ per-seat fallback.
 
 ### Parallelism (CRITICAL)
 
-All advisors dispatch IN PARALLEL. The only serial dependency is the chairman, which runs after all advisors complete.
+The dispatcher runs three dependency waves. All five initial advice turns run in parallel.
+After every advice turn succeeds, it builds the anonymous bundle in fixed A–E order and resumes
+all five exact advisor sessions for peer review in parallel. Each peer sees the other four initial
+answers, excluding its own answer. After every peer turn succeeds, a fresh chairman synthesizes
+both complete bundles. Completion order never changes bundle order.
 
 ```
-Step 1: All advisors fire simultaneously
-  ├── Claude subagents via Agent tool (multiple tool calls in one message)
-  ├── Codex advisors via codex exec (run_in_background: true)
-  │
-  ▼ Wait for all to complete
-  │
-Step 2: Chairman (Codex exec) — SEQUENTIAL
-  │   Receives all raw outputs
-  │
-  ▼
-Step 3: Present to user
+Wave 1: Advice A | B | C | D | E (parallel)
+        Wait for all five; build anonymous advice bundle
+Wave 2: Peer   A | B | C | D | E (parallel, exact-session resumes)
+        Wait for all five; build anonymous peer-review bundle
+Wave 3: Chairman (receives both complete bundles)
+        Present the verdict
 ```
+
+Each wave collects every worker's exit status before fallback or removal of attempt artifacts.
+A main-engine failure blocks even if an other-engine seat also failed in that wave. Workers use
+their existing bounded transport timeouts; the orchestrator drains the failed wave before
+starting the all-main rerun. Per-seat dispatcher diagnostics are captured as
+`<seat>-<advice|peer>.dispatch.log` in the attempt directory, with failure diagnostics surfaced
+before a failed mixed attempt is discarded.
+
+### Historical manual dispatch (DO NOT EXECUTE)
+
+The following commands document the older transport. Use the canonical dispatcher above for
+the complete three-wave council; do not launch these commands alongside it.
 
 ### Claude Advisor Dispatch
 
@@ -110,24 +133,12 @@ After the call completes, read `/tmp/council_chairman_response.txt` (the clean v
 
 ---
 
-## Escalation Rules
+## Full Topology
 
-### 3-then-5 Model (auto-triggered council only)
-
-**Quick Council (3 advisors):** Simplifier (Claude) + Contrarian (Codex) + Pragmatist (Claude)
-
-**Escalation triggers (any one is sufficient):**
-
-- Any advisor returns OBJECT
-- Any advisor reports low confidence
-- Decision affects irreversible surface (see High-Impact Surfaces below)
-- No majority verdict (3-way split)
-
-**Full Council (+2 advisors):** Add Scalability Hawk (Claude) + Maintainer (Codex)
-
-### Standalone `/council`
-
-Always uses all 5 advisors. No escalation needed.
+The executable dispatcher always runs five advisor starts, five anonymous peer-review resumes, and
+one fresh chairman synthesis. There is no quick or three-seat mode. If the other engine is known
+unavailable, the dispatcher starts one all-main-engine topology. If it fails during a mixed attempt,
+the dispatcher discards that attempt and reruns the complete topology on main.
 
 ---
 
@@ -142,60 +153,6 @@ This is the single source of truth for what constitutes a "high-impact surface."
 - **Configuration defaults affecting all users** — feature flags, rate limits, default settings
 - **Rollout/deployment strategy** — blue-green, canary, migration ordering
 - **Architecture boundaries** — service boundaries, shared libraries, database ownership, message contracts
-
----
-
-## Contrarian Gate (Auto-Trigger Only)
-
-Before firing the full council, the Contrarian/Codex validates the "default wins" claim:
-
-```bash
-.forge/hooks/lib/codex-pty.sh exec \
-  -m "gpt-5.6-sol" \
-  -c model_reasoning_effort="high" \
-  -c service_tier="fast" \
-  --sandbox read-only \
-  --ephemeral \
-  --color never \
-  --output-last-message /tmp/council_contrarian_gate_response.txt \
-  "Review this approach comparison for [project]. The author claims the Default approach dominates.
-
-[Insert approach comparison table here]
-
-Your job: validate or object.
-- If the default clearly wins on most axes: respond VALIDATE with a one-line rationale.
-- If the alternative has a credible case: respond OBJECT with your strongest counter-argument.
-- If you need more information to decide: respond INSUFFICIENT with what's missing.
-
-Respond with EXACTLY one of: VALIDATE, OBJECT, or INSUFFICIENT followed by your rationale." \
-  > /tmp/council_contrarian_gate.txt 2>&1
-```
-
-Read `/tmp/council_contrarian_gate_response.txt` for the verdict; fall back to the stdout capture for diagnostics if the response file is empty or missing (per "Output Capture").
-
-**Decision flow after Contrarian gate:**
-
-- VALIDATE → skip council, proceed with default
-- OBJECT → check cheapest falsifying test (< 30 min → spike first; else check high-impact surface → fire council)
-- INSUFFICIENT → fire council (ambiguity = risk)
-
----
-
-## Fallback (No Codex)
-
-When Codex CLI is not installed:
-
-| Component          | Replacement                                        |
-| ------------------ | -------------------------------------------------- |
-| Codex advisors     | Skipped (run Claude advisors only)                 |
-| Contrarian gate    | User validates the "default wins" claim            |
-| Chairman synthesis | User is chairman — raw outputs shown, user decides |
-
-**Detection:**
-
-```bash
-command -v codex &>/dev/null && echo "available" || echo "unavailable"
-```
 
 ---
 

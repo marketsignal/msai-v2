@@ -34,21 +34,11 @@
       "Bash(dd:*)",
       "Bash(mkfs:*)",
       "Write(~/.forge/bin/**)",
-      "Edit(~/.forge/bin/**)",
-      "Bash(*.forge/bin*:*)",
-      "Read(~/.forge/goal-captures/**)",
       "Write(~/.forge/goal-captures/**)",
-      "Edit(~/.forge/goal-captures/**)",
       "Write(~/.forge/goal-authorizations/**)",
-      "Edit(~/.forge/goal-authorizations/**)",
-      "Bash(*.forge/goal-captures*:*)",
-      "Bash(*.forge/goal-authorizations*:*)",
-      "Bash(*forge-goal-authorize*:*)",
-      "Bash(*forge-goal-capture*:*)",
-      "Read(~/.forge/host-contexts/**)",
       "Write(~/.forge/host-contexts/**)",
-      "Edit(~/.forge/host-contexts/**)",
-      "Bash(*.forge/host-contexts*:*)"
+      "Edit(**/.git/forge-goals/**)",
+      "Bash(*forge-goals*:*)"
     ],
     "ask": [
       "Bash(gh pr create:*)",
@@ -222,6 +212,18 @@
           {
             "type": "command",
             "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/post-tool-format.sh"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "forgeManagedId": "host-context",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.forge/hooks/lib/host-context.sh\" hook --host claude"
           }
         ]
       }

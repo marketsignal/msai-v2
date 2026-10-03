@@ -2,11 +2,19 @@
 # Forge v6 stable fresh-agent dispatcher. Deterministic selection; visible degradation.
 set -u
 
+# Keep the host's HTTP transport through the outer sandbox. Do not inherit
+# unrelated environment or pass these settings to the no-network repro runner.
+proxy_env_dispatch=()
+for proxy_name_dispatch in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+    if [ "${!proxy_name_dispatch+x}" = x ]; then
+        proxy_env_dispatch+=("$proxy_name_dispatch=${!proxy_name_dispatch}")
+    fi
+done
+
 SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 FORGE_ROOT=$(cd "$SELF_DIR/../.." && pwd -P)
 CAPABILITIES_FILE="$FORGE_ROOT/host-capabilities.tsv"
 [ -f "$CAPABILITIES_FILE" ] || CAPABILITIES_FILE="$FORGE_ROOT/manifests/host-capabilities.tsv"
-HOST_CONTEXT="$SELF_DIR/host-context.sh"
 FINGERPRINT="$SELF_DIR/candidate-fingerprint.sh"
 RENDER_CONFIG="$FORGE_ROOT/bin/render-dispatch-config"
 [ -x "$RENDER_CONFIG" ] || RENDER_CONFIG="$FORGE_ROOT/../scripts/render-dispatch-config.sh"
@@ -68,6 +76,11 @@ prepare_session_dispatch() {
         ensure_reserved_review_dir_dispatch "session-stores/$invocation_id/home" true >/dev/null || die_dispatch invariant 'cannot create private council session home'
         ensure_reserved_review_dir_dispatch "session-stores/$invocation_id/codex-home" true >/dev/null || die_dispatch invariant 'cannot create private Codex session home'
         chmod 700 "$SESSION_STORE" 2>/dev/null || true
+        # Bind cleanup before the engine runs, including unsuccessful new turns.
+        printf '%s\n' "$session_id_output.store-id" > "$SESSION_STORE/session-owner"
+        printf '%s\n' "$invocation_id" > "$SESSION_STORE/store-id"
+        validate_owned_review_path_dispatch "$session_id_output.store-id" 'session store ownership'
+        publish_owned_review_file_dispatch "$SESSION_STORE/store-id" "$VALID_REVIEW_PATH" 'session store ownership'
         return 0
     fi
     safe_session_id_dispatch "$session_id" || die_dispatch invariant 'unsafe exact session id'
@@ -82,7 +95,6 @@ prepare_session_dispatch() {
     [ "$(strict_kv_dispatch "$SESSION_META" seat_id)" = "$seat_id" ] || die_dispatch invariant 'cross-seat council resume rejected'
     [ "$(strict_kv_dispatch "$SESSION_META" question_hash)" = "$question_hash" ] || die_dispatch invariant 'council resume question mismatch'
     [ "$(strict_kv_dispatch "$SESSION_META" active_host)" = "$active_host" ] || die_dispatch invariant 'council resume host mismatch'
-    [ "$(strict_kv_dispatch "$SESSION_META" context_hash)" = "$context_hash" ] || die_dispatch invariant 'council resume context mismatch'
     [ "$(strict_kv_dispatch "$SESSION_META" artifact_hash)" = "$artifact_hash" ] || die_dispatch artifact 'council resume candidate mismatch'
     [ "$(strict_kv_dispatch "$SESSION_META" worktree_identity)" = "$worktree_identity" ] || die_dispatch invariant 'council resume worktree mismatch'
     [ "$(strict_kv_dispatch "$SESSION_META" qualification_revision)" = "$qualification_revision" ] || die_dispatch capability 'council resume qualification changed'
@@ -102,10 +114,11 @@ write_session_metadata_dispatch() {
     SESSION_META="$meta_dir/$SESSION_FINAL_ID.meta"; [ ! -e "$SESSION_META" ] && [ ! -L "$SESSION_META" ] || return 2
     tmp="$SESSION_META.tmp.$$"; umask 077
     {
-      printf 'schema_version=1\ncompleted=false\nsession_id=%s\nengine=%s\nrole=%s\nseat_id=%s\nquestion_hash=%s\nactive_host=%s\ncontext_hash=%s\nartifact_hash=%s\nworktree_identity=%s\nturn_prompt_hash=%s\nconfig_hash=%s\ncanary_hash=%s\nseat_hash=%s\nqualification_revision=%s\nstore_id=%s\nsnapshot_path=%s\nsnapshot_manifest_hash=%s\n' \
-        "$SESSION_FINAL_ID" "$actual" "$role" "$seat_id" "$question_hash" "$active_host" "$context_hash" "$artifact_hash" "$worktree_identity" "$prompt_hash" "$ATTEMPT_CONFIG_HASH" "$ATTEMPT_CANARY_HASH" "$ATTEMPT_SEAT_HASH" "$qualification_revision" "$invocation_id" "$ATTEMPT_SNAPSHOT" "$snapshot_hash"
+      printf 'schema_version=1\ncompleted=false\nsession_id=%s\nengine=%s\nrole=%s\nseat_id=%s\nquestion_hash=%s\nactive_host=%s\nartifact_hash=%s\nworktree_identity=%s\nturn_prompt_hash=%s\nconfig_hash=%s\ncanary_hash=%s\nseat_hash=%s\nqualification_revision=%s\nstore_id=%s\nsnapshot_path=%s\nsnapshot_manifest_hash=%s\n' \
+        "$SESSION_FINAL_ID" "$actual" "$role" "$seat_id" "$question_hash" "$active_host" "$artifact_hash" "$worktree_identity" "$prompt_hash" "$ATTEMPT_CONFIG_HASH" "$ATTEMPT_CANARY_HASH" "$ATTEMPT_SEAT_HASH" "$qualification_revision" "$invocation_id" "$ATTEMPT_SNAPSHOT" "$snapshot_hash"
     } > "$tmp" || return 2
     chmod 600 "$tmp" 2>/dev/null || true; mv "$tmp" "$SESSION_META" || return 2
+    printf '%s\n' "$SESSION_FINAL_ID" > "$SESSION_STORE/session-id" || return 2
     output_tmp="$meta_dir/$SESSION_FINAL_ID.session-id.$$"; printf '%s\n' "$SESSION_FINAL_ID" > "$output_tmp" || return 2; chmod 600 "$output_tmp" 2>/dev/null || true
     publish_owned_review_file_dispatch "$output_tmp" "$session_id_output" 'session id output'; rm -f "$output_tmp"
 }
@@ -158,6 +171,9 @@ EOF
       FINDINGS)
         [ "$blocked" = none ] || return 1; [ -n "$findings" ] || return 1
         case "$severity" in P0|P1|P2|P3) ;; *) return 1 ;; esac
+        if [ "$severity" = P3 ]; then
+            printf '%s\n' "$findings" | grep -Eq '\|(P0|P1|P2)\|' && return 1
+        fi
         ;;
       BLOCKED)
         [ "$blocked" != none ] || return 1; [ -z "$findings" ] || return 1
@@ -358,11 +374,11 @@ attempt_full_investigation_dispatch() {
       printf '\nRequired envelope:\nschema_version=1\nverdict=CLEAN|FINDINGS|BLOCKED\nmax_severity=NONE|P0|P1|P2|P3\nblocked_class=none|engine|capability|artifact|authorization|invariant\n'
     } > "$scratch/prompt.txt"
     if [ "$selected" = claude ]; then
-      engine_args=(-p --permission-mode auto --model "$model" --effort "$effort" --output-format json --no-session-persistence "$(cat "$scratch/prompt.txt")")
+      engine_args=(-p --settings '{"fastMode":true}' --permission-mode auto --model "$model" --effort "$effort" --output-format json --no-session-persistence "$(cat "$scratch/prompt.txt")")
       run_with_timeout_dispatch "$timeout_seconds" "$raw" "$stderr_file" "$root" "$binary" "${engine_args[@]}"
       rc=$?; cp "$raw" "$bound_output"
     else
-      engine_args=(-a on-request --search exec -C "$root" --sandbox danger-full-access -m "$model" -c "model_reasoning_effort=$effort" --output-last-message "$bound_output" --ephemeral "$(cat "$scratch/prompt.txt")")
+      engine_args=(-a on-request --search exec -C "$root" --sandbox danger-full-access -m "$model" -c "model_reasoning_effort=$effort" -c service_tier=fast --output-last-message "$bound_output" --ephemeral "$(cat "$scratch/prompt.txt")")
       run_with_timeout_dispatch "$timeout_seconds" "$raw" "$stderr_file" "$root" "$binary" "${engine_args[@]}"
       rc=$?
     fi
@@ -390,7 +406,7 @@ attempt_full_investigation_dispatch() {
 
 attempt_engine_dispatch() {
     local selected="$1" attempt_number="$2" binary row provider model effort mechanism observable minout qualified fallback_col help missing flag
-    local scratch raw stderr_file prompt bound_output rc snapshot primary config_hash computed_config_hash profile_mode extracted observed observed_provider sandbox tools snapshot_check captured_thread attempt_fingerprint auth_source executable parent
+    local scratch raw stderr_file prompt bound_output rc snapshot primary config_hash computed_config_hash profile_mode extracted observed observed_provider sandbox tools snapshot_check snapshot_after snapshot_ref snapshot_head captured_thread attempt_fingerprint auth_source executable parent review_patch review_paths
     ATTEMPT_ENGINE="$selected"; ATTEMPT_CLASS=engine; ATTEMPT_REASON=binary-unavailable; ATTEMPT_VERDICT=BLOCKED; ATTEMPT_SEVERITY=NONE; ATTEMPT_SCHEMA=none; ATTEMPT_FINDINGS_DIGEST=MISSING
     ATTEMPT_REQUESTED_PROVIDER=UNQUALIFIED; ATTEMPT_REQUESTED_MODEL=UNQUALIFIED; ATTEMPT_REQUESTED_EFFORT=UNQUALIFIED
     ATTEMPT_ACTUAL_PROVIDER=UNOBSERVABLE; ATTEMPT_ACTUAL_MODEL=UNOBSERVABLE; ATTEMPT_ACTUAL_EFFORT=UNOBSERVABLE; ATTEMPT_CONFIG_HASH=MISSING; ATTEMPT_SESSION_ID=none; ATTEMPT_EXIT=127
@@ -405,7 +421,7 @@ EOF
     if [ "${FORGE_DISPATCH_TEST_MODE:-0}" != 1 ]; then
       help=$($binary --help 2>&1 || true); [ "$selected" != codex ] || help="$help $($binary exec --help 2>&1 || true)"
       if [ "$selected" = claude ]; then
-        if [ "$role" = investigation ]; then required='-p --permission-mode --model --effort --output-format --no-session-persistence'
+        if [ "$role" = investigation ]; then required='-p --settings --permission-mode --model --effort --output-format --no-session-persistence'
         else required='-p --safe-mode --strict-mcp-config --mcp-config --settings --setting-sources --tools --permission-mode --add-dir --model --effort --output-format'; fi
         case "$conversation" in ephemeral) required="$required --no-session-persistence" ;; new) required="$required --session-id" ;; resume) required="$required --resume" ;; esac
       else
@@ -435,11 +451,17 @@ EOF
       [ "$(hash_file_dispatch "$snapshot_check")" = "$SESSION_SNAPSHOT_HASH" ] || { ATTEMPT_CLASS=artifact; ATTEMPT_REASON=resume-snapshot-mismatch; return 2; }
     else
       attempt_fingerprint="$reviews_dir/$invocation_id.attempt-$attempt_number.candidate"
-      if ! bash "$FINGERPRINT" capture --artifact "$artifact" --workflow-base-sha "$workflow_base_sha" --workflow-base-ref "$workflow_base_ref" --output "$attempt_fingerprint" >/dev/null 2>&1; then ATTEMPT_CLASS=artifact; ATTEMPT_REASON=candidate-capture-failed; return 2; fi
+      local capture_args=(); [ "$conversation" != new ] || capture_args=(--snapshot-parent "$SESSION_STORE")
+      if ! bash "$FINGERPRINT" capture --artifact "$artifact" --workflow-base-sha "$workflow_base_sha" --workflow-base-ref "$workflow_base_ref" --output "$attempt_fingerprint" ${capture_args[@]+"${capture_args[@]}"} >/dev/null 2>&1; then ATTEMPT_CLASS=artifact; ATTEMPT_REASON=candidate-capture-failed; return 2; fi
       [ "$(kv_dispatch "$attempt_fingerprint" artifact_hash)" = "$artifact_hash" ] && [ "$(kv_dispatch "$attempt_fingerprint" worktree_identity)" = "$worktree_identity" ] || { ATTEMPT_CLASS=artifact; ATTEMPT_REASON=candidate-binding-mismatch; return 2; }
       snapshot=$(kv_dispatch "$attempt_fingerprint" snapshot_path); [ -d "$snapshot" ] && [ ! -L "$snapshot" ] || { ATTEMPT_CLASS=artifact; ATTEMPT_REASON=candidate-snapshot-unavailable; return 2; }
     fi
     ATTEMPT_SNAPSHOT="$snapshot"; ATTEMPT_SNAPSHOT_BEFORE="$scratch/snapshot-before.manifest"; snapshot_manifest_dispatch "$snapshot" "$ATTEMPT_SNAPSHOT_BEFORE"
+    snapshot_ref=""; snapshot_head=""
+    if [ "$artifact_kind" != file ]; then
+      snapshot_ref=$(git -C "$snapshot" rev-parse refs/heads/candidate 2>/dev/null) || { ATTEMPT_CLASS=artifact; ATTEMPT_REASON=candidate-ref-missing; return 2; }
+      snapshot_head=$(git -C "$snapshot" rev-parse HEAD 2>/dev/null) || { ATTEMPT_CLASS=artifact; ATTEMPT_REASON=candidate-head-missing; return 2; }
+    fi
     {
       printf 'forge_canary_hash=%s\nforge_config_hash=%s\nforge_qualification_revision=%s\n' "$ATTEMPT_CANARY_HASH" "$config_hash" "$qualification_revision"
     } > "$primary/.forge-dispatch-canary"
@@ -456,21 +478,37 @@ EOF
       chmod 700 "$REPRO_RUNNER" || { ATTEMPT_CLASS=capability; ATTEMPT_REASON=reproduction-runner-render-failed; return 1; }
     fi
     {
-      printf 'You are a fresh independent %s reviewer. Your cwd is a clean primary. First read .forge-dispatch-canary there and copy its three exact observation lines into the result. The logical project root is %s. Run Git/project commands there. Review immutable scope %s..candidate. Ambient instructions, hooks, plugins, skills, and write-capable MCP are absent by contract. Return ONLY the Forge line envelope below.\n' "$selected" "$snapshot" "$workflow_base_sha"
+      printf 'You are a fresh independent %s reviewer. Your cwd is a clean primary. First read .forge-dispatch-canary there and copy its three exact observation lines into the result. ' "$selected"
+      if [ "$artifact_kind" = file ]; then
+        printf 'The isolated review root is %s and contains only the requested file artifact. Do not assume repository, PRD, or Git access; if the requested review needs absent context, return BLOCKED with blocked_class=artifact. ' "$snapshot"
+      else
+        review_patch="$primary/.forge-review.patch"; review_paths="$primary/.forge-review-paths"
+        git -C "$snapshot" diff --no-ext-diff --binary "$workflow_base_sha..candidate" > "$review_patch" \
+          && git -C "$snapshot" diff --no-ext-diff --name-only "$workflow_base_sha..candidate" > "$review_paths" \
+          || { ATTEMPT_CLASS=artifact; ATTEMPT_REASON=candidate-diff-unavailable; return 2; }
+        printf 'The logical project root is %s. The dispatcher materialized the exact immutable %s..candidate diff at %s and its changed-path list at %s; read those files and the candidate root. ' "$snapshot" "$workflow_base_sha" "$review_patch" "$review_paths"
+      fi
+      if [ "$selected" = codex ] && [ "${REPRO_MODE:-false}" != true ]; then
+        printf 'Use your available command tool for read-only inspection of the primary directory and candidate root only. Do not edit files or run network commands. '
+      fi
+      printf 'Ambient instructions, hooks, plugins, skills, and write-capable MCP are absent by contract.\n'
+      printf 'P3-only notes are non-blocking: use CLEAN with max_severity=P3 and retain finding lines. Schema-valid FINDINGS/P3 is also advisory, never a reason by itself to repair or reopen review. Never label P0/P1/P2 finding rows as a P3 maximum.\n'
+      printf 'FORGE_REVIEW_TRANSPORT_AUTHORIZED: The main session obtained explicit user authorization before sending this complete bounded immutable candidate snapshot, prompt, and evidence to the developer-configured Claude Code or Codex reviewer service. Do not block solely because the candidate is private, sensitive, or contains unchanged tracked files. The complete candidate may include sensitive tracked or in-scope non-ignored content. This expected review transport is not an external mutation and does not authorize sourcing additional secrets, credentials, or gitignored developer state from outside the candidate; paths outside the workflow worktree; other projects; arbitrary destinations; arbitrary network tools; or any external mutation.\n'
       if [ "${REPRO_MODE:-false}" = true ]; then
         printf 'This is the dispatcher-owned %s reproduction check. Under the already-qualified no-network workspace boundary, execute the exact dispatcher-owned runner %s once. Do not edit it or synthesize its stdout/exit files.\n' "$REPRO_CHECK_KIND" "$REPRO_RUNNER"
       fi
       cat "$prompt_file"
-      printf '\nRequired envelope:\nschema_version=1\nverdict=CLEAN|FINDINGS|BLOCKED\nmax_severity=NONE|P0|P1|P2|P3\nblocked_class=none|engine|capability|artifact|authorization|invariant\nforge_canary_hash=<observed>\nforge_config_hash=<observed>\nforge_qualification_revision=<observed>\n'
+      printf '\nReturn ONLY newline-delimited fields with no Markdown or surrounding prose. Required envelope:\nschema_version=1\nverdict=CLEAN|FINDINGS|BLOCKED\nmax_severity=NONE|P0|P1|P2|P3\nblocked_class=none|engine|capability|artifact|authorization|invariant\nforge_canary_hash=<observed>\nforge_config_hash=<observed>\nforge_qualification_revision=<observed>\nFor FINDINGS add one line per finding: finding=<sequence>|P0|P1|P2|P3|open|<concise evidence>. BLOCKED must contain no finding lines.\n'
     } > "$scratch/prompt.txt"
     profile_mode=review; [ "$profile" = investigate ] && profile_mode=investigate
     if [ "$selected" = claude ]; then
       tools='Read,Grep,Glob'; [ "$profile" = investigate ] && tools='Read,Write,Edit,Bash,WebSearch,WebFetch'; [ "${REPRO_MODE:-false}" != true ] || tools='Read,Write,Edit,Bash'
-      claude_args=(-p --safe-mode --strict-mcp-config --mcp-config "$scratch/mcp.json" --settings "$scratch/claude-settings.json" --setting-sources '' --tools "$tools" --permission-mode dontAsk --add-dir "$snapshot" --model "$model" --effort "$effort" --output-format json)
+      claude_args=(-p --safe-mode --strict-mcp-config --mcp-config "$scratch/mcp.json" --settings "$scratch/claude-settings.json" --setting-sources '' --tools "$tools")
+      claude_args+=(--permission-mode dontAsk --add-dir "$snapshot" --model "$model" --effort "$effort" --output-format json)
       case "$conversation" in ephemeral) claude_args+=(--no-session-persistence) ;; new) claude_args+=(--session-id "$SESSION_PROVISIONAL_ID") ;; resume) claude_args+=(--resume "$session_id") ;; esac
       claude_args+=("$(cat "$scratch/prompt.txt")")
       run_with_timeout_dispatch "$timeout_seconds" "$raw" "$stderr_file" "$primary" env -i PATH="$PATH" HOME="${HOME:-}" USER="${USER:-}" LOGNAME="${LOGNAME:-${USER:-}}" TMPDIR="${TMPDIR:-/tmp}" FORGE_DISPATCH_MODE="$profile_mode" FORGE_CANDIDATE_ROOT="$snapshot" FORGE_REPRO_RUNNER="${REPRO_RUNNER:-}" FORGE_DISPATCH_SESSION_ID="${SESSION_PROVISIONAL_ID:-$session_id}" FORGE_DISPATCH_SEAT_HASH="$ATTEMPT_SEAT_HASH" FORGE_DISPATCH_CONFIG_HASH="$config_hash" FORGE_DISPATCH_CANARY_HASH="$ATTEMPT_CANARY_HASH" FORGE_DISPATCH_QUALIFICATION_REVISION="$qualification_revision" FORGE_DISPATCH_TEST_MODE="${FORGE_DISPATCH_TEST_MODE:-0}" FORGE_TEST_DISABLE_ENGINE="${FORGE_TEST_DISABLE_ENGINE:-}" FAKE_CLAUDE_BEHAVIOR="${FAKE_CLAUDE_BEHAVIOR:-clean}" FAKE_CLAUDE_LOG="${FAKE_CLAUDE_LOG:-}" FAKE_CLAUDE_CWD_FILE="${FAKE_CLAUDE_CWD_FILE:-}" FAKE_REAL_ROOT="${FAKE_REAL_ROOT:-}" \
-        "$binary" "${claude_args[@]}"
+        ${proxy_env_dispatch[@]+"${proxy_env_dispatch[@]}"} "$binary" "${claude_args[@]}"
       rc=$?
       cp "$raw" "$bound_output"
       [ "$conversation" != new ] || ATTEMPT_SESSION_ID="$SESSION_PROVISIONAL_ID"
@@ -484,15 +522,15 @@ EOF
         mkdir -p "$codex_home"; cp "$auth_source" "$codex_home/auth.json" || { ATTEMPT_CLASS=authorization; ATTEMPT_REASON=codex-auth-copy-failed; return 2; }; chmod 600 "$codex_home/auth.json" 2>/dev/null || true
       fi
       if [ "$conversation" = resume ]; then
-        codex_args=(-a never --sandbox "$sandbox" exec resume --disable hooks --disable plugins --disable plugin_sharing --disable apps --disable remote_plugin --disable in_app_browser --disable browser_use --disable computer_use --ignore-user-config --ignore-rules --json -m "$model" -c "model_reasoning_effort=$effort" --output-last-message "$bound_output" "$session_id" "$(cat "$scratch/prompt.txt")")
+        codex_args=(-a never --sandbox "$sandbox" exec resume --disable hooks --disable plugins --disable plugin_sharing --disable apps --disable remote_plugin --disable in_app_browser --disable browser_use --disable computer_use --ignore-user-config --ignore-rules --json -m "$model" -c "model_reasoning_effort=$effort" -c service_tier=fast --output-last-message "$bound_output" "$session_id" "$(cat "$scratch/prompt.txt")")
       else
-        codex_args=(-a never exec --disable hooks --disable plugins --disable plugin_sharing --disable apps --disable remote_plugin --disable in_app_browser --disable browser_use --disable computer_use -C "$primary" --add-dir "$snapshot" --ignore-user-config --ignore-rules --sandbox "$sandbox" -m "$model" -c "model_reasoning_effort=$effort" --output-last-message "$bound_output")
+        codex_args=(-a never exec --disable hooks --disable plugins --disable plugin_sharing --disable apps --disable remote_plugin --disable in_app_browser --disable browser_use --disable computer_use -C "$primary" --add-dir "$snapshot" --ignore-user-config --ignore-rules --sandbox "$sandbox" -m "$model" -c "model_reasoning_effort=$effort" -c service_tier=fast --output-last-message "$bound_output")
         [ "$readonly_server" != context7 ] || codex_args+=(-c 'mcp_servers.context7.url=https://mcp.context7.com/mcp' -c 'mcp_servers.context7.read_only=true')
         if [ "$conversation" = ephemeral ]; then codex_args+=(--ephemeral); else codex_args+=(--json); fi
         codex_args+=("$(cat "$scratch/prompt.txt")")
       fi
       run_with_timeout_dispatch "$timeout_seconds" "$raw" "$stderr_file" "$primary" env -i PATH="$PATH" HOME="$scratch/home" CODEX_HOME="$codex_home" TMPDIR="${TMPDIR:-/tmp}" FORGE_DISPATCH_MODE="$profile_mode" FORGE_CANDIDATE_ROOT="$snapshot" FORGE_REPRO_RUNNER="${REPRO_RUNNER:-}" FORGE_DISPATCH_SESSION_ID="${SESSION_PROVISIONAL_ID:-$session_id}" FORGE_DISPATCH_SEAT_HASH="$ATTEMPT_SEAT_HASH" FORGE_DISPATCH_CONFIG_HASH="$config_hash" FORGE_DISPATCH_CANARY_HASH="$ATTEMPT_CANARY_HASH" FORGE_DISPATCH_QUALIFICATION_REVISION="$qualification_revision" FORGE_DISPATCH_TEST_MODE="${FORGE_DISPATCH_TEST_MODE:-0}" FORGE_TEST_DISABLE_ENGINE="${FORGE_TEST_DISABLE_ENGINE:-}" FAKE_CODEX_BEHAVIOR="${FAKE_CODEX_BEHAVIOR:-clean}" FAKE_CODEX_LOG="${FAKE_CODEX_LOG:-}" \
-        "$binary" "${codex_args[@]}"
+        ${proxy_env_dispatch[@]+"${proxy_env_dispatch[@]}"} "$binary" "${codex_args[@]}"
       rc=$?
       rm -f "$codex_home/auth.json"
       if [ "$conversation" = new ]; then
@@ -503,6 +541,13 @@ EOF
     fi
     ATTEMPT_EXIT="$rc"
     if [ "$rc" -eq 124 ]; then ATTEMPT_REASON=timeout; return 1; fi
+    # Only the provider's typed error wrapper is an authentication signal, never review prose.
+    if [ "$selected" = claude ] && command -v jq >/dev/null 2>&1 && jq -es '
+      length == 1 and (.[0] | type == "object" and .is_error == true and
+        .result == "Failed to authenticate. API Error: 401 OAuth access token has expired. Re-authenticate to continue.")
+      ' "$raw" >/dev/null 2>&1; then
+      ATTEMPT_REASON=authentication-required; return 1
+    fi
     if [ "$rc" -ne 0 ]; then ATTEMPT_REASON=process-exit-$rc; return 1; fi
     if [ "${REPRO_MODE:-false}" = true ]; then
       [ -f "$ATTEMPT_REPRO_STDOUT" ] && [ ! -L "$ATTEMPT_REPRO_STDOUT" ] && [ -f "$ATTEMPT_REPRO_STDERR" ] && [ ! -L "$ATTEMPT_REPRO_STDERR" ] && [ -f "$ATTEMPT_REPRO_EXIT_FILE" ] && [ ! -L "$ATTEMPT_REPRO_EXIT_FILE" ] \
@@ -526,7 +571,15 @@ EOF
       [ "$identity_match" = true ] || { ATTEMPT_CLASS=capability; ATTEMPT_REASON=observable-identity-mismatch; return 1; }
     fi
     if ! validate_envelope_dispatch "$bound_output"; then ATTEMPT_REASON="$RESULT_REASON"; ATTEMPT_CLASS=engine; return 1; fi
+    snapshot_after="$scratch/snapshot-after.manifest"; snapshot_manifest_dispatch "$snapshot" "$snapshot_after"
+    if ! cmp -s "$ATTEMPT_SNAPSHOT_BEFORE" "$snapshot_after" \
+       || { [ "$artifact_kind" != file ] \
+         && { [ "$(git -C "$snapshot" rev-parse refs/heads/candidate 2>/dev/null || true)" != "$snapshot_ref" ] \
+           || [ "$(git -C "$snapshot" rev-parse HEAD 2>/dev/null || true)" != "$snapshot_head" ]; }; }; then
+      ATTEMPT_CLASS=artifact; ATTEMPT_REASON=candidate-snapshot-mutated; return 2
+    fi
     [ "$(awk -F= '$1=="forge_canary_hash" {n++} END {print n+0}' "$bound_output")" -ge 1 ] || { ATTEMPT_CLASS=capability; ATTEMPT_REASON=isolation-canary-missing; return 1; }
+    if observation_matches_dispatch "$bound_output" forge_canary_hash unobserved; then ATTEMPT_CLASS=capability; ATTEMPT_REASON=isolation-canary-unobserved; return 1; fi
     observation_matches_dispatch "$bound_output" forge_canary_hash "$ATTEMPT_CANARY_HASH" || { ATTEMPT_CLASS=capability; ATTEMPT_REASON=isolation-canary-mismatch; return 1; }
     observation_matches_dispatch "$bound_output" forge_config_hash "$config_hash" || { ATTEMPT_CLASS=capability; ATTEMPT_REASON=observed-config-mismatch; return 1; }
     observation_matches_dispatch "$bound_output" forge_qualification_revision "$qualification_revision" || { ATTEMPT_CLASS=capability; ATTEMPT_REASON=qualification-revision-mismatch; return 1; }
@@ -550,7 +603,10 @@ verify_pair_dispatch() {
         [ "$(kv_dispatch "$f" schema_version)" = 1 ] && [ "$(kv_dispatch "$f" fresh_process)" = true ] \
           && [ "$(kv_dispatch "$f" process_exit_status)" = 0 ] && [ "$(kv_dispatch "$f" blocked_class)" = none ] \
           && [ "$(kv_dispatch "$f" result_schema_version)" = 1 ] || die_dispatch artifact 'review receipt execution schema is not certifying'
-        [ "$(kv_dispatch "$f" semantic_verdict)" = CLEAN ] && case "$(kv_dispatch "$f" max_severity)" in NONE|P3) ;; *) die_dispatch artifact 'both review lenses must be certifying clean' ;; esac
+        case "$(kv_dispatch "$f" semantic_verdict):$(kv_dispatch "$f" max_severity)" in
+            CLEAN:NONE|CLEAN:P3|FINDINGS:P3) ;;
+            *) die_dispatch artifact 'both review lenses must be certifying clean' ;;
+        esac
         output_path=$(kv_dispatch "$f" output_path)
         case "$output_path" in "$pair_root"/.forge/local/reviews/*) ;; *) die_dispatch invariant 'review output escaped the bound worktree' ;; esac
         [ -f "$output_path" ] && [ ! -L "$output_path" ] || die_dispatch artifact 'review output must be a no-follow regular file'
@@ -558,6 +614,15 @@ verify_pair_dispatch() {
         [ "$output_parent" = "$(dirname "$output_path")" ] || die_dispatch artifact 'review output ancestor is linked'
         output_hash=$(kv_dispatch "$f" output_hash)
         [ "$(hash_file_dispatch "$output_path")" = "$output_hash" ] || die_dispatch artifact 'review output hash changed'
+        [ "$(kv_dispatch "$output_path" schema_version)" = 1 ] \
+            && [ "$(kv_dispatch "$output_path" blocked_class)" = none ] \
+            && [ "$(kv_dispatch "$output_path" verdict)" = "$(kv_dispatch "$f" semantic_verdict)" ] \
+            && [ "$(kv_dispatch "$output_path" max_severity)" = "$(kv_dispatch "$f" max_severity)" ] \
+            || die_dispatch artifact 'review output contradicts its receipt'
+        awk -F= -v verdict="$(kv_dispatch "$output_path" verdict)" '
+            $1=="finding" { n++; sub(/^[^=]*=/, ""); split($0, fields, "|"); if(fields[2]!="P3") bad=1 }
+            END { exit (bad || (verdict=="FINDINGS" && !n)) ? 1 : 0 }
+        ' "$output_path" || die_dispatch artifact 'review output has material or missing findings'
     done
     current="$pair_root/.forge/local/reviews/.verify-pair-$$-$RANDOM.candidate"
     base_sha=$(kv_dispatch "$spec" workflow_base_sha); base_ref=$(kv_dispatch "$spec" workflow_base_ref)
@@ -592,6 +657,7 @@ case "$fallback_policy" in automatic|none) ;; *) die_dispatch invariant 'fallbac
 case "$role" in general|plan|code-spec|code-quality|investigation|investigation-repro|prd|comments|council-advisor|council-chair) ;; *) die_dispatch invariant 'unsupported role' ;; esac
 case "$profile" in review|investigate) ;; *) die_dispatch invariant 'unsupported profile' ;; esac
 case "$role:$profile" in investigation:investigate|investigation-repro:investigate) ;; investigation:*|investigation-repro:*) die_dispatch authorization 'investigation roles require the investigate profile' ;; *:review) ;; *) die_dispatch authorization 'only investigation roles may use the investigate profile' ;; esac
+case "$role:$fallback_policy" in plan:none|code-spec:none|code-quality:none) die_dispatch authorization 'certifying review roles require automatic fallback' ;; esac
 case "$conversation" in ephemeral|new|resume) ;; *) die_dispatch invariant 'unsupported conversation transport' ;; esac
 case "$timeout_seconds" in ''|*[!0-9]*) die_dispatch invariant 'timeout must be a positive integer' ;; esac; [ "$timeout_seconds" -gt 0 ] || die_dispatch invariant 'timeout must be positive'
 [ -f "$prompt_file" ] && [ ! -L "$prompt_file" ] || die_dispatch artifact 'regular prompt file required'; [ -n "$output" ] || die_dispatch invariant 'output is required'
@@ -628,8 +694,11 @@ esac
 if [ "$role" != investigation ]; then
   [ "$(awk -F= '$1=="requires_read_only_channel" && $2=="true" {n++} END {print n+0}' "$prompt_file")" -eq 0 ] || [ -n "$readonly_server" ] || die_dispatch authorization 'required read-only investigation channel was not selected'
 fi
-if ! active_host=$(bash "$HOST_CONTEXT" verify 2>/dev/null); then write_early_receipt invariant host-context-mismatch; printf 'BLOCKED[invariant]: host context mismatch; receipt=%s\n' "$receipt" >&2; exit 2; fi
-context_hash=$(strict_kv_dispatch "$FORGE_HOST_CONTEXT_FILE" receipt_hash)
+active_host=${FORGE_NATIVE_HOST:-}
+case "$active_host" in
+  claude|codex) ;;
+  *) write_early_receipt invariant declared-main-host-missing; printf 'BLOCKED[invariant]: declared main host must be claude or codex; receipt=%s\n' "$receipt" >&2; exit 2 ;;
+esac
 case "$engine" in auto) [ "$active_host" = claude ] && first=codex || first=claude ;; *) first="$engine" ;; esac
 [ "$first" = claude ] && second=codex || second=claude
 
@@ -688,11 +757,24 @@ if [ "$final_rc" -eq 0 ] && [ "$conversation" = resume ]; then
   if ! complete_session_dispatch; then ATTEMPT_CLASS=invariant; ATTEMPT_REASON=session-cleanup-failed; ATTEMPT_VERDICT=BLOCKED; ATTEMPT_SEVERITY=NONE; final_rc=2; fi
 fi
 output_hash=$(hash_file_dispatch "$output"); invocation_config_hash=$(printf '%s\n' "$attempted" "${ATTEMPT_CONFIG_HASH:-MISSING}" "$qualification_revision" "$artifact_hash" "$prompt_hash" "$role" "$profile" | hash_stream_dispatch)
+auth_recovery_engine=none
+if [ "$profile" = review ] && [ "$conversation" = ephemeral ] && [ "$final_rc" -ne 0 ] \
+   && [ "${ATTEMPT_VERDICT:-BLOCKED}" = BLOCKED ]; then
+  case "$role" in council-advisor|council-chair) ;; *)
+    case "${ATTEMPT_CLASS:-engine}" in engine|capability)
+      if [ "$ATTEMPT_REASON" = authentication-required ] || [ "$fallback_reason" = authentication-required ]; then auth_recovery_engine=claude; fi
+      ;; esac
+    ;; esac
+fi
 receipt="$reviews_dir/$invocation_id.receipt"
 {
  printf 'schema_version=1\ninvocation_id=%s\ntimestamp=%s\nmain_host=%s\nrequested_engine=%s\nfirst_attempted_engine=%s\nactual_engine=%s\nfallback=%s\nfallback_reason=%s\nattempted_engines=%s\nrole=%s\nprofile=%s\nreview_iteration=%s\nfresh_process=true\nconversation=%s\nsession_id=%s\nartifact_kind=%s\nartifact_identity=%s\nartifact_hash=%s\nworktree_identity=%s\ngit_head=%s\nprompt_hash=%s\nworkflow_base_ref=%s\nworkflow_base_sha=%s\noutput_path=%s\noutput_hash=%s\nprocess_exit_status=%s\nsemantic_verdict=%s\nmax_severity=%s\nfindings_digest=%s\nresult_schema_version=%s\nrequested_provider=%s\nrequested_model=%s\nrequested_reasoning_effort=%s\nbound_provider=%s\nbound_model=%s\nbound_reasoning_effort=%s\nactual_provider=%s\nactual_model=%s\nactual_reasoning_effort=%s\ninvocation_config_hash=%s\nmodel_qualification_revision=%s\nblocked_class=%s\ninvestigation_mode=%s\ninvestigation_replay=%s\nreproduction_status=%s\nhypothesis_hash=%s\nprimary_check_hash=%s\ncontrol_hash=%s\n' \
   "$invocation_id" "$(now_dispatch)" "$active_host" "$engine" "$first_attempted" "$actual" "$fallback" "$(escape_dispatch "$fallback_reason")" "$attempted" "$role" "$profile" "$review_iteration" "$conversation" "${ATTEMPT_SESSION_ID:-none}" "$artifact_kind" "$artifact_hash" "$artifact_hash" "$worktree_identity" "$git_head" "$prompt_hash" "$(escape_dispatch "$workflow_base_ref")" "$base_resolved" "$(escape_dispatch "$output")" "$output_hash" "${ATTEMPT_EXIT:-127}" "${ATTEMPT_VERDICT:-BLOCKED}" "${ATTEMPT_SEVERITY:-NONE}" "${ATTEMPT_FINDINGS_DIGEST:-MISSING}" "${ATTEMPT_SCHEMA:-none}" "${ATTEMPT_REQUESTED_PROVIDER:-UNQUALIFIED}" "${ATTEMPT_REQUESTED_MODEL:-UNQUALIFIED}" "${ATTEMPT_REQUESTED_EFFORT:-UNQUALIFIED}" "${ATTEMPT_REQUESTED_PROVIDER:-UNQUALIFIED}" "${ATTEMPT_REQUESTED_MODEL:-UNQUALIFIED}" "${ATTEMPT_REQUESTED_EFFORT:-UNQUALIFIED}" "${ATTEMPT_ACTUAL_PROVIDER:-UNOBSERVABLE}" "${ATTEMPT_ACTUAL_MODEL:-UNOBSERVABLE}" "${ATTEMPT_ACTUAL_EFFORT:-UNOBSERVABLE}" "$invocation_config_hash" "$qualification_revision" "${ATTEMPT_CLASS:-engine}" "$INVESTIGATION_MODE" "$INVESTIGATION_REPLAY" "$REPRODUCTION_STATUS" "${REPRO_HYPOTHESIS_HASH:-MISSING}" "${REPRO_PRIMARY_HASH:-MISSING}" "${REPRO_CONTROL_HASH:-MISSING}"
+ printf 'failure_reason=%s\nauth_recovery_engine=%s\n' "$(escape_dispatch "$ATTEMPT_REASON")" "$auth_recovery_engine"
 } > "$receipt"
 printf 'Reviewer selection: main=%s requested=%s actual=%s fallback=%s role=%s receipt=%s\n' "$active_host" "$engine" "$actual" "$fallback" "$role" "$receipt"
+if [ "$auth_recovery_engine" = claude ]; then
+  printf 'AUTH_REQUIRED: engine=claude; main agent must follow reviewer authentication recovery in .forge/rules/workflow.md (check host credential access, open claude auth login if needed, retry only unfinished reviews once); receipt=%s\n' "$receipt"
+fi
 [ "$final_rc" -eq 0 ] || exit 2
 exit 0

@@ -1,7 +1,13 @@
 ---
 name: "forge-v6-producer"
 description: "Forge adapter for forge-v6-producer"
-tools: "Read, Grep, Glob, Bash"
+tools:
+  - Read
+  - Grep
+  - Glob
+  - Bash
+  - Edit
+  - Write
 model: "inherit"
 forge-generated: true
 canonical-path: ".forge/agents/forge-v6-producer.md"

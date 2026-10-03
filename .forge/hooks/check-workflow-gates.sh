@@ -144,9 +144,9 @@ _TOPLEVEL=$(git rev-parse --show-toplevel 2>/dev/null || true)
 HOOK_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
 CONFIG_CHECK="$HOOK_DIR/check-config-change.sh"
 FORGE_VERSION=$(head -1 .forge/version 2>/dev/null | tr -d '[:space:]')
-if [ "$FORGE_VERSION" = 6 ] && [ -f "$CONFIG_CHECK" ]; then
+if printf '%s\n' "$FORGE_VERSION" | grep -Eq '^6(\.[0-9]+){0,2}$' && [ -f "$CONFIG_CHECK" ]; then
     if ! printf '{}' | bash "$CONFIG_CHECK" --verify-boundary "$(pwd)" >/dev/null 2>&1; then
-        echo "FORGE_CONFIG_TAMPERED: managed hook configuration changed; run setup -F and inspect the diff before shipping." >&2
+        echo "FORGE_CONFIG_TAMPERED: managed hook configuration changed; run setup -f and inspect the diff before shipping." >&2
         exit 2
     fi
 fi
@@ -175,7 +175,7 @@ if [ ! -f "$STATE_FILE" ]; then
     # Hard-cut: do NOT fall back to CONTINUITY.md.
     # Emit friendly breadcrumb on stderr, exit 0 (don't gate — nothing to enforce).
     echo "ℹ check-workflow-gates: Forge state.md not found." >&2
-    echo "  Run setup -F --dry-run, resolve every reported blocker, then run setup -F." >&2
+    echo "  Run setup -f --dry-run, resolve every reported blocker, then run setup -f." >&2
     forge_allow
 fi
 
@@ -202,7 +202,7 @@ WORKFLOW_CMD=$(echo "$WORKFLOW_BLOCK" | grep -iE '\|\s*Command\s*\|' | head -1 |
 # Legacy workflow prose remains readable for migration context, but v5 review,
 # goal, and authorization lines can never certify a v6 ship action.
 if [ "$STATE_IS_V6" != true ]; then
-    echo "WORKFLOW GATE: legacy Forge state cannot certify shipping; run setup -F --dry-run, resolve blockers, then setup -F." >&2
+    echo "WORKFLOW GATE: legacy Forge state cannot certify shipping; run setup -f --dry-run, resolve blockers, then setup -f." >&2
     exit 2
 fi
 
@@ -297,6 +297,44 @@ if echo "$COMMAND" | grep -qE "^[[:space:]]*${_ENVP}gh[[:space:]]+pr[[:space:]]+
     fi
 fi
 
+# Exact quick fixes use a direct focused check instead of the full candidate
+# receipt pipeline. Fail closed unless the immutable base is uniquely recorded,
+# valid, ancestral, and the complete base diff stays within the three-path cap.
+if printf '%s\n' "$WORKFLOW_CMD" | grep -qE '^/quick-fix [a-z0-9]+(-[a-z0-9]+)*$'; then
+    QUICK_BASE_COUNT=$(tr -d '\r' < "$STATE_FILE" | awk -F'|' '
+        /^## Identity$/ { in_identity=1; next }
+        in_identity && /^## / { in_identity=0 }
+        in_identity {
+            key=$2; gsub(/^[ \t]+|[ \t]+$/, "", key)
+            if (key == "Workflow base SHA") n++
+        }
+        END { print n+0 }
+    ')
+    QUICK_BASE_SHA=$(tr -d '\r' < "$STATE_FILE" | awk -F'|' '
+        /^## Identity$/ { in_identity=1; next }
+        in_identity && /^## / { in_identity=0 }
+        in_identity {
+            key=$2; gsub(/^[ \t]+|[ \t]+$/, "", key)
+            if (key == "Workflow base SHA") { value=$3; gsub(/^[ \t]+|[ \t]+$/, "", value); print value; exit }
+        }
+    ')
+    if [ "$QUICK_BASE_COUNT" -eq 1 ] \
+        && printf '%s\n' "$QUICK_BASE_SHA" | grep -qE '^[0-9a-f]{40}([0-9a-f]{24})?$' \
+        && git cat-file -e "${QUICK_BASE_SHA}^{commit}" 2>/dev/null \
+        && git merge-base --is-ancestor "$QUICK_BASE_SHA" HEAD 2>/dev/null; then
+        QUICK_SCOPE_OK=true
+        QUICK_COMMITTED=$(git diff --no-renames --name-only "${QUICK_BASE_SHA}..HEAD" -- 2>/dev/null) || QUICK_SCOPE_OK=false
+        QUICK_CACHED=$(git diff --cached --no-renames --name-only "$QUICK_BASE_SHA" -- 2>/dev/null) || QUICK_SCOPE_OK=false
+        QUICK_UNSTAGED=$(git diff --no-renames --name-only -- 2>/dev/null) || QUICK_SCOPE_OK=false
+        QUICK_IMPL_COUNT=$(printf '%s\n%s\n%s\n' "$QUICK_COMMITTED" "$QUICK_CACHED" "$QUICK_UNSTAGED" \
+            | LC_ALL=C sort -u \
+            | awk '$0 != "README.md" && $0 != "docs/CHANGELOG.md" && length($0) > 0 { n++ } END { print n+0 }')
+        if [ "$QUICK_SCOPE_OK" = true ] && [ "$QUICK_IMPL_COUNT" -le 3 ]; then
+            forge_allow
+        fi
+    fi
+fi
+
 # --- Convergence breaker (hook-enforced backstop; ADR 0009) ---
 # Placement: BEFORE the docs-only commit carve-out and OUTSIDE the PASS-evidence
 # branch — neither a docs-only staged diff, a `Code review loop — N/A:` escape,
@@ -324,25 +362,6 @@ if [ -n "$BRK_HEAD" ] && [ -f "$RS" ] && [ -f "$STATE_FILE" ]; then
         exit 2
     fi
 fi
-
-# Receipt-v2 compatibility switch. An explicit Candidate receipt linkage means
-# this workflow has migrated its final gates: all review/verify/E2E receipts
-# must validate against the same current staged-clean candidate. Workflows not
-# yet converted by Task 9 continue through the legacy checklist evidence below.
-RECEIPT_V2_ACTIVE=false
-RECEIPT_CANDIDATE=$(tr -d '\r' < "$STATE_FILE" | awk -F'|' '{k=$2; gsub(/^[ \t]+|[ \t]+$/, "", k); if(k=="Candidate receipt"){v=$3; gsub(/^[ \t]+|[ \t]+$/, "", v); print v; exit}}')
-case "$RECEIPT_CANDIDATE" in ''|*'<'*) ;; *)
-    RECEIPT_V2_ACTIVE=true
-    VR="$HOOK_DIR/lib/verification-receipt.sh"
-    [ -f "$VR" ] || VR="$_TOPLEVEL/hooks/lib/verification-receipt.sh"
-    if [ ! -f "$VR" ] || ! VR_OUT=$(bash "$VR" check --state "$STATE_FILE" 2>&1); then
-        echo "WORKFLOW GATE: final receipt set is missing, stale, mixed-candidate, or non-clean." >&2
-        printf '%s\n' "${VR_OUT:-verification-receipt helper unavailable}" >&2
-        echo "Freeze the staged-clean candidate, then rerun both review lenses, verify-app, and E2E." >&2
-        exit 2
-    fi
-    ;;
-esac
 
 # ---------------------------------------------------------------------------
 # No-code carve-out (git commit only) — closes the integrity hole
@@ -475,6 +494,13 @@ if [ -n "$UNCHECKED" ]; then
     exit 2
 fi
 
+# A concrete candidate path selects receipt-native diagnostics below, avoiding
+# duplicate legacy evidence errors. This flag does NOT activate enforcement;
+# every active canonical v6 workflow validates receipts before the final allow.
+RECEIPT_V2_ACTIVE=false
+RECEIPT_CANDIDATE=$(tr -d '\r' < "$STATE_FILE" | awk -F'|' '{k=$2; gsub(/^[ \t]+|[ \t]+$/, "", k); if(k=="Candidate receipt"){v=$3; gsub(/^[ \t]+|[ \t]+$/, "", v); print v; exit}}')
+case "$RECEIPT_CANDIDATE" in ''|*'<'*) ;; *) RECEIPT_V2_ACTIVE=true ;; esac
+
 # ---------------------------------------------------------------------------
 # Evidence-based gate for E2E verified
 #
@@ -572,13 +598,9 @@ fi
 #   - a matching per-iter clean line for iteration N
 #   - the line's plan_sha matches sha256 of the referenced plan file
 #
-# Canonical clean-line stem (referenced by tests/template/test-contracts.sh
-# parity check): Plan review iteration N — codex clean — plan=`<path>`
-#
-# Codex is MANDATORY in this repo (Claude × Codex dual-engine). The ONLY escape
-# is an N/A justification on the loop line (mirrors the E2E verified — N/A:
-# gate). There is no "codex unavailable" escape: if Codex is genuinely down,
-# /goal halts and a human takes over.
+# Canonical clean-line stem: Plan review iteration N — <actual-engine> clean —
+# plan=`<path>`. The actual engine is `claude` or `codex`; wrapped fields may
+# continue on contiguous indented non-list Markdown lines.
 #
 # N/A escape: if the `Plan review loop (N iterations) — PASS` line OR a
 # dedicated `- [x] Plan review loop — N/A: <reason>` line carries `N/A:`, the
@@ -623,28 +645,39 @@ if [ -n "$PLAN_PASS_LINE" ]; then
     # Extract N from "Plan review loop (N iterations) — PASS"
     PLAN_N=$(echo "$PLAN_PASS_LINE" | sed -E 's/.*Plan review loop \(([0-9]+) iterations\).*/\1/')
 
-    # Find the per-iter clean line for iteration N (LAST matching line — defensive
-    # against stale duplicates, matches PR-authorization pattern at line 115-117).
-    PLAN_CLEAN=$(echo "$CHECKLIST" | tr -d '\r' \
-        | grep -E "^\s*-\s*\[x\]\s+Plan review iteration $PLAN_N — " \
-        | tail -1)
+    # Find the LAST matching iteration row and fold only its contiguous,
+    # indented non-list Markdown continuations. A next checklist item (checked
+    # or unchecked) and section content remain separate evidence boundaries.
+    PLAN_CLEAN=$(echo "$CHECKLIST" | tr -d '\r' | awk -v n="$PLAN_N" '
+        function finish() {
+            if (active) { selected=record; active=0 }
+        }
+        $0 ~ "^[[:space:]]*-[[:space:]]*\\[x\\][[:space:]]+Plan review iteration " n " — " {
+            finish(); record=$0; active=1; next
+        }
+        active && $0 ~ /^[[:space:]]+[^[:space:]]/ \
+            && $0 !~ /^[[:space:]]*[-*+][[:space:]]/ \
+            && $0 !~ /^[[:space:]]*#/ {
+            line=$0; sub(/^[[:space:]]+/, "", line); record=record " " line; next
+        }
+        { finish() }
+        END { finish(); if (selected != "") print selected }
+    ')
 
     if [ -z "$PLAN_CLEAN" ]; then
         echo "WORKFLOW GATE: [x] Plan review loop ($PLAN_N iterations) — PASS lacks per-iter clean evidence." >&2
         echo "" >&2
         echo "Required: a matching line in state.md (### Checklist):" >&2
-        echo "  - [x] Plan review iteration $PLAN_N — codex clean — plan=\`<plan-file>\` — plan_sha=\`<sha256>\` — ts=\`<ts>\`" >&2
+        echo "  - [x] Plan review iteration $PLAN_N — <actual-engine> clean — plan=\`<plan-file>\` — plan_sha=\`<sha256>\` — ts=\`<ts>\`" >&2
         echo "" >&2
         echo "Run iter-$PLAN_N reviewers and append the clean line, OR uncheck the loop" >&2
         echo "and run another iteration. See rules/workflow.md Revision Loop Protocol." >&2
         exit 2
     fi
 
-    # Branch on the clean-line variant. Match the canonical delimited form
-    # (— codex clean —), not a bare substring, so "not-codex clean" can't pass.
-    # Codex is mandatory: only `codex clean`
-    # (plan_sha bound) is accepted. No "codex unavailable" escapes.
-    if echo "$PLAN_CLEAN" | grep -qF -- "— codex clean —"; then
+    # Match the canonical delimited actual-engine form, not a bare substring,
+    # so labels such as "not-claude clean" cannot pass.
+    if echo "$PLAN_CLEAN" | grep -qE -- "— (claude|codex) clean —"; then
         # Presence check BEFORE sed extraction. `sed -E 's/.*plan=`...`.*/\1/'`
         # returns the WHOLE line on no-match, so a clean line missing the
         # plan=/plan_sha= tokens would slip past a non-empty check and hit a
@@ -652,7 +685,7 @@ if [ -n "$PLAN_PASS_LINE" ]; then
         # gate's `grep -qE 'head=`[0-9a-f]+`'` presence check).
         if ! echo "$PLAN_CLEAN" | grep -qE 'plan=`[^`]+`.*plan_sha=`[^`]+`'; then
             echo "WORKFLOW GATE: Plan review iteration $PLAN_N clean line is malformed." >&2
-            echo "Expected format: codex clean — plan=\`<path>\` — plan_sha=\`<sha256>\` — ts=\`<ts>\`" >&2
+            echo "Expected format: <actual-engine> clean — plan=\`<path>\` — plan_sha=\`<sha256>\` — ts=\`<ts>\`" >&2
             echo "Got: $PLAN_CLEAN" >&2
             exit 2
         fi
@@ -663,7 +696,7 @@ if [ -n "$PLAN_PASS_LINE" ]; then
 
         if [ -z "$PLAN_PATH" ] || [ -z "$CLAIMED_SHA" ]; then
             echo "WORKFLOW GATE: Plan review iteration $PLAN_N clean line is malformed." >&2
-            echo "Expected format: codex clean — plan=\`<path>\` — plan_sha=\`<sha256>\` — ts=\`<ts>\`" >&2
+            echo "Expected format: <actual-engine> clean — plan=\`<path>\` — plan_sha=\`<sha256>\` — ts=\`<ts>\`" >&2
             echo "Got: $PLAN_CLEAN" >&2
             exit 2
         fi
@@ -701,7 +734,8 @@ if [ -n "$PLAN_PASS_LINE" ]; then
         echo "WORKFLOW GATE: Plan review iteration $PLAN_N clean line variant not recognized." >&2
         echo "Got: $PLAN_CLEAN" >&2
         echo "" >&2
-        echo "Codex is mandatory in this repo. Accepted forms (see rules/workflow.md):" >&2
+        echo "Accepted actual-engine forms:" >&2
+        echo "  - claude clean — plan=\`<path>\` — plan_sha=\`<sha>\` — ts=\`<ts>\`" >&2
         echo "  - codex clean — plan=\`<path>\` — plan_sha=\`<sha>\` — ts=\`<ts>\`" >&2
         echo "  - mark the loop N/A:  - [x] Plan review loop — N/A: <reason>" >&2
         exit 2
@@ -721,6 +755,10 @@ fi
 # Canonical clean-line stem (referenced by tests/template/test-contracts.sh
 # parity check): Code review iteration N — codex clean — head=`<sha>`
 # ---------------------------------------------------------------------------
+# Receipt-native V6 is rejected or accepted by structured receipts before this
+# historical parser can authorize anything. Keep the unreachable pre-V6 parser
+# here only as dual-read documentation; it cannot certify a V6 ship action.
+if [ "$STATE_IS_V6" != true ]; then
 # N/A escape: any `[x] Code review loop ... N/A:` line skips the evidence check.
 CODE_NA_LINE=$(echo "$CHECKLIST" | tr -d '\r' \
     | grep -E '^\s*-\s*\[x\]\s+Code review loop' \
@@ -759,7 +797,7 @@ elif [ -n "$CODE_CHECKED_ANY" ]; then
     exit 2
 fi
 
-if [ "$RECEIPT_V2_ACTIVE" != true ] && [ -n "$CODE_PASS_LINE" ] && [ -n "$HEAD_SHA" ]; then
+if [ -n "$CODE_PASS_LINE" ] && [ -n "$HEAD_SHA" ]; then
     CODE_N=$(echo "$CODE_PASS_LINE" | sed -E 's/.*Code review loop \(([0-9]+) iterations\).*/\1/')
 
     # Validate codex side (last-line semantics — defensive against stale duplicates)
@@ -815,6 +853,19 @@ if [ "$RECEIPT_V2_ACTIVE" != true ] && [ -n "$CODE_PASS_LINE" ] && [ -n "$HEAD_S
             exit 2
         fi
     done
+fi
+fi
+
+# Strict v6 boundary: receipt linkage never controls whether enforcement runs.
+# Placeholder, absent, and stale receipt sets all fail closed here after any
+# more-specific checklist diagnostic has had a chance to guide the developer.
+VR="$HOOK_DIR/lib/verification-receipt.sh"
+[ -f "$VR" ] || VR="$_TOPLEVEL/hooks/lib/verification-receipt.sh"
+if [ ! -f "$VR" ] || ! VR_OUT=$(bash "$VR" check --state "$STATE_FILE" 2>&1); then
+    echo "WORKFLOW GATE: final receipt set is missing, stale, mixed-candidate, or non-clean." >&2
+    printf '%s\n' "${VR_OUT:-verification-receipt helper unavailable}" >&2
+    echo "Initialize the v6 receipt paths and Review iteration, freeze the staged-clean candidate, then rerun both review lenses, verify-app, and E2E." >&2
+    exit 2
 fi
 
 forge_allow

@@ -1,7 +1,7 @@
 ---
 forge-generated: true
 canonical-path: ".forge/workflows/finish-branch.md"
-canonical-revision: "cdd6f926c6cf474484b1f1dea47e6416a2cb94ff0381ec2ad0dc97d2f2f144ab"
+canonical-revision: "752de08bc6b8134c58efb04a119f9af8537bcc73cfed38a9b7ee1e0eafd85f00"
 description: "Forge adapter for finish-branch"
 ---
 

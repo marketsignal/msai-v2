@@ -2,16 +2,20 @@ param([Parameter(Position=0)][string]$Mode, [string]$HostName, [string]$Fixture,
 $ErrorActionPreference = "Stop"
 if ($Mode -eq "identity") {
     if ($HostName -eq "claude") {
-        if ($RequestedModel -and @("opus", "claude-opus-4-1") -notcontains $RequestedModel) { throw "BLOCKED: unsupported Claude model profile" }
+        if ($RequestedModel -and @("opus", "claude-opus-4-1", "claude-opus-5-5") -notcontains $RequestedModel) { throw "BLOCKED: unsupported Claude model profile" }
         $event = Get-Content -Raw $Fixture | ConvertFrom-Json
         $model = $event.modelUsage.PSObject.Properties.Name | Select-Object -First 1
         $provider = $event.modelUsage.$model.provider
         @{host="claude"; actual_provider=$provider; actual_model=$model; invocation_hash=$InvocationHash} | ConvertTo-Json -Compress
     } elseif ($HostName -eq "codex") {
-        if ($RequestedModel -and $RequestedModel -ne "gpt-5.6-sol") { throw "BLOCKED: unsupported Codex model profile" }
+        if ($RequestedModel -and @("gpt-5.6-sol", "gpt-6-astra") -notcontains $RequestedModel) { throw "BLOCKED: unsupported Codex model profile" }
         @{host="codex"; invocation_hash=$InvocationHash} | ConvertTo-Json -Compress
     } else { throw "unknown host" }
 } elseif ($Mode -eq "discovery") {
+    $versionPath = Join-Path $ProjectRoot ".forge\version"
+    if (-not (Test-Path -LiteralPath $versionPath -PathType Leaf)) { throw "FORGE_VERSION: BLOCKED missing project release" }
+    $version = [IO.File]::ReadAllText($versionPath).Trim()
+    if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "FORGE_VERSION: BLOCKED malformed project release" }
     if (Test-Path -LiteralPath (Join-Path $ProjectRoot ".claude\commands\goal.md")) {
         [Console]::Error.WriteLine("RUNTIME_READY=BLOCKED host=claude custom native goal collision; rename .claude/commands/goal.md")
         exit 5
@@ -22,9 +26,14 @@ if ($Mode -eq "identity") {
     }
     $rules = @(Get-ChildItem (Join-Path $ProjectRoot ".forge\rules") -Filter "*.md" -File)
     $duplicates = @($rules | Group-Object Name | Where-Object Count -gt 1)
+    Write-Host "FORGE_VERSION: $version"
     Write-Host "canonical_rule_count=$($rules.Count)"
     Write-Host "duplicate_rule_count=$($duplicates.Count)"
 } elseif ($Mode -eq "live") {
+    if (@("claude", "codex") -notcontains $HostName) {
+        Write-Host "BLOCKED: -HostName must be claude or codex"
+        exit 2
+    }
     if ($HostName -eq "claude" -and (Test-Path -LiteralPath (Join-Path $ProjectRoot ".claude\commands\goal.md"))) {
         Write-Host "RUNTIME_READY=BLOCKED host=claude custom native goal collision; rename .claude/commands/goal.md"
         exit 14
