@@ -49,20 +49,20 @@ class _FakeAsyncSession:
 
 # Real on-disk strategies used by the project's example dir — sync needs
 # real importable files (it shells out to ``discover_strategies``).
-STRATEGIES_DIR = Path(__file__).resolve().parents[3] / "strategies" / "example"
+STRATEGIES_ROOT = Path(__file__).resolve().parents[3] / "strategies"
 
 
 async def test_sync_leaves_archived_row_archived_when_file_still_on_disk() -> None:
     """An archived row + the same file still on disk → sync MUST NOT
     un-archive the row and MUST NOT create a duplicate active row."""
     # Arrange: pre-archived row pointing at one of the real example files.
-    target_file = STRATEGIES_DIR / "ema_cross.py"
+    target_file = STRATEGIES_ROOT / "example" / "ema_cross.py"
     assert target_file.is_file()
 
     archived_row = Strategy(
         id=uuid4(),
         name="example.ema_cross",
-        file_path=str(target_file),
+        file_path="example/ema_cross.py",
         strategy_class="EMACrossStrategy",
         config_class="EMACrossConfig",
         config_schema=None,
@@ -75,16 +75,13 @@ async def test_sync_leaves_archived_row_archived_when_file_still_on_disk() -> No
     session = _FakeAsyncSession(existing=[archived_row])
 
     # Act: trigger the sync the list/detail endpoints run before reading.
-    paired = await sync_strategies_to_db(session, STRATEGIES_DIR)  # type: ignore[arg-type]
+    paired = await sync_strategies_to_db(session, STRATEGIES_ROOT)  # type: ignore[arg-type]
 
     # Assert:
     # - The archived row stays archived (deleted_at unchanged).
     assert archived_row.deleted_at == archived_stamp
-    # - No new row was added for the same file_path.
-    new_rows_same_path = [r for r in session.added if r.file_path == str(target_file)]
-    assert new_rows_same_path == [], (
-        "sync must not create a NEW active row for an archived file_path"
-    )
+    # - No new active row was added for the same canonical name.
+    assert [r for r in session.added if r.name == archived_row.name] == []
     # - The archived row is NOT returned in ``paired`` so list views hide it.
     archived_in_paired = [row for row, _ in paired if row.id == archived_row.id]
     assert archived_in_paired == [], "archived rows must not surface to list views"

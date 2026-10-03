@@ -101,8 +101,7 @@ class GraduationService:
         # — such a strategy would defeat the real-money kill-switch. Linting here
         # blocks it from ENTERING the graduation pipeline, so it can never reach
         # `live_candidate` and can never be deployed to a real account.
-        from pathlib import Path  # noqa: PLC0415
-
+        from msai.services.strategy_paths import resolve_strategy_file  # noqa: PLC0415
         from msai.services.strategy_registry import _lint_supported_submit_api  # noqa: PLC0415
 
         # Only lint when the strategy file actually exists on disk. A real,
@@ -110,7 +109,7 @@ class GraduationService:
         # it), so the bypass it guards against is fully covered; synthetic test
         # fixtures (rows with a placeholder file_path) have no file and can
         # never deploy, so skipping them here is safe and keeps the gate honest.
-        strategy_file = Path(strategy.file_path)
+        strategy_file = resolve_strategy_file(strategy.file_path)
         if strategy_file.is_file():
             lint_ok, lint_msg = _lint_supported_submit_api(strategy_file)
             if not lint_ok:

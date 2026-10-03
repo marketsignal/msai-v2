@@ -102,7 +102,9 @@ async def test_account_class_column_added_and_backfilled(
     assert by_mode["live"] == "test"
 
     # ASSERT (post-downgrade): the additive column is gone, nothing else broke.
-    run_alembic(url, "downgrade", "-1")
+    # Downgrade this migration explicitly. Newer additive migrations may sit
+    # above it, so relative ``-1`` no longer guarantees account_class is removed.
+    run_alembic(url, "downgrade", _DOWN_REVISION)
     async with engine.connect() as conn:
         assert await conn.run_sync(_account_class_col) is None, (
             "account_class column not dropped on downgrade"

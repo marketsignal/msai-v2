@@ -57,6 +57,7 @@ from msai.services.portfolio.computation import (
 )
 from msai.services.portfolio.lifecycle import PortfolioLifecycle
 from msai.services.report_generator import ReportGenerator
+from msai.services.strategy_paths import resolve_strategy_file
 
 if TYPE_CHECKING:
     import builtins
@@ -1287,7 +1288,7 @@ class PortfolioService:
         strategy_config = _prepare_strategy_config(dict(allocation["config"]), instrument_ids)
 
         result: BacktestResult = runner.run(
-            strategy_file=str(allocation["strategy_file_path"]),
+            strategy_file=str(resolve_strategy_file(allocation["strategy_file_path"])),
             strategy_config=strategy_config,
             instrument_ids=instrument_ids,
             start_date=start_date,

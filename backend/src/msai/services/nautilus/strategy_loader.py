@@ -33,6 +33,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from msai.services.strategy_paths import resolve_strategy_file
+
 if TYPE_CHECKING:
     from types import ModuleType
 
@@ -85,7 +87,7 @@ def resolve_importable_strategy_paths(
         ValueError: The file is not under a ``strategies/`` directory, or
             the module does not contain a ``*Strategy`` / ``*Config`` pair.
     """
-    file_path = Path(strategy_file).resolve()
+    file_path = resolve_strategy_file(strategy_file)
     if not file_path.exists():
         raise FileNotFoundError(f"Strategy file not found: {file_path}")
 

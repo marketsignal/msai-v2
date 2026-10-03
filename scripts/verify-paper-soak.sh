@@ -285,7 +285,7 @@ from msai.models.user import User
 async def main() -> None:
     engine = create_async_engine(settings.database_url)
     Session = async_sessionmaker(engine, expire_on_commit=False)
-    SMOKE_FILE = '/app/strategies/example/smoke_market_order.py'
+    SMOKE_FILE = 'example/smoke_market_order.py'
     SMOKE_CLASS = 'SmokeMarketOrderStrategy'
     async with Session() as session:
         user = (await session.execute(select(User).where(User.entra_id == 'e2e-operator'))).scalar_one_or_none()

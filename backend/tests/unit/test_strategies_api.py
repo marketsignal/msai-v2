@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
@@ -14,6 +14,9 @@ import pytest
 from msai.core.database import get_db
 from msai.main import app
 from msai.models.strategy import Strategy
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -197,11 +200,11 @@ class TestValidateStrategy:
         fake_db_session: _FakeSession,
     ) -> None:
         """POST /api/v1/strategies/{id}/validate returns 200 for a valid strategy."""
-        # Arrange: seed a real Strategy row pointing at the example EMA file.
+        # Arrange: seed the canonical root-relative path persisted by registry sync.
         strategy = Strategy(
             name="example.ema_cross",
             description="EMA Cross",
-            file_path=str(STRATEGIES_DIR / "ema_cross.py"),
+            file_path="example/ema_cross.py",
             strategy_class="EMACrossStrategy",
             config_schema=None,
             default_config=None,
