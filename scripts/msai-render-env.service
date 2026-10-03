@@ -42,7 +42,12 @@ Environment="REQUIRED_SECRETS=REPORT_SIGNING_SECRET,POSTGRES_PASSWORD,AZURE_TENA
 # (the migrate service reads it during `alembic upgrade head`); set it in KV to
 # seed this VM's account→slot mapping. The render must provide it so the migrate
 # container actually receives the var.
-Environment="OPTIONAL_SECRETS=JWT_TENANT_ID,JWT_CLIENT_ID,POLYGON_API_KEY,DATABENTO_API_KEY,MSAI_API_KEY,AZURE_KV_MI_CLIENT_ID,BROKER_ACCOUNT_BACKFILL"
+# MSAI_WATCHDOG_* are optional IB-gateway-watchdog threshold overrides — empty =
+# the PRD defaults baked into the backend CLI apply. They flow KV (e.g.
+# `msai-watchdog-grace-secs`) → /run/msai.env → docker-compose.prod.yml backend
+# env → the `docker exec` watchdog tick. Listed here so an operator can tune them
+# in KV without editing the compose file; absent = harmless skip on every render.
+Environment="OPTIONAL_SECRETS=JWT_TENANT_ID,JWT_CLIENT_ID,POLYGON_API_KEY,DATABENTO_API_KEY,MSAI_API_KEY,AZURE_KV_MI_CLIENT_ID,BROKER_ACCOUNT_BACKFILL,MSAI_WATCHDOG_GRACE_SECS,MSAI_WATCHDOG_RESTART_CAP,MSAI_WATCHDOG_WINDOW_SECS,MSAI_WATCHDOG_COOLDOWN_SECS,MSAI_WATCHDOG_ALERT_THROTTLE_SECS"
 # Image-version vars (MSAI_REGISTRY, MSAI_BACKEND_IMAGE, MSAI_FRONTEND_IMAGE, MSAI_GIT_SHA)
 # are NOT rendered here — they come from Slice 3's deploy step (set at unit-invocation
 # time via /run/msai-images.env or direct Environment= in docker-compose-msai.service).
