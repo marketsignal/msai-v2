@@ -2,6 +2,8 @@
 
 This is the **top-level orientation doc** — what infrastructure runs where, how local dev works, and how prod deploys flow from `git push` to a running container on the Azure VM. Operational deep-dives live in `docs/runbooks/`; this file points at them.
 
+**October 3 release-safety candidate:** read the [current release contract](operations/release-safety.md) before executing this orientation's commands. Exact-target CI/auth evidence, complete fleet readiness and owned-rule cleanup replace the earlier list-only and age-only decisions. The candidate is not yet installed in Azure; an old readiness contract refuses automated release and needs a supervised first upgrade. All commands below require their applicable operational authorization.
+
 ---
 
 ## TL;DR
@@ -39,7 +41,7 @@ git push origin main
         ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │ deploy.yml  (Slice 3 — .github/workflows/deploy.yml)             │
-│   Pre-flight: refuse if active live_deployments (Slice 4 gate)   │
+│   Pre-flight: exact-target CI/auth + complete fleet readiness    │
 │   OIDC → open transient NSG SSH rule for runner IP               │
 │   scp scripts + Caddyfile + compose to VM                        │
 │   ssh: sudo bash deploy-on-vm.sh <sha> <env-file>                │
@@ -147,7 +149,7 @@ Manual rollback is also right for "the new code is fine but we want to revert be
 
 ## The active-deployments gate (Slice 4)
 
-`deploy.yml` refuses to deploy if `/api/v1/live/status?active_only=true` reports any deployment in `starting`/`building`/`ready`/`running` state. This is a hard safety gate — broker subprocesses running through a deploy is the failure mode that loses money.
+The release-safety candidate uses authenticated `/api/v1/live/release-readiness`, with a versioned complete fleet contract. Nonterminal/unknown deployment or process rows, including `stopping`, and unresolved failed-process restart/redelivery blockers refuse deployment. The capped status list remains an operator view, not release proof. Exact-target CI/auth must also pass before optional preflight or Azure access. Readiness is checked again immediately before VM execution; keep starts/resumes suspended and settle in-flight starts throughout the maintenance window. It is not an atomic release lock or broker-flatness proof.
 
 To clear the gate:
 
@@ -178,8 +180,8 @@ STATUS=$(curl -s -o /tmp/stop.json -w "%{http_code}" -X POST \
 echo "HTTP $STATUS"   # 200 = stop accepted (read broker_flat from body); 504 = stop did not reach a clean terminal — see (d)/(e) below
 jq '{broker_flat, remaining_positions, detail}' /tmp/stop.json
 # NB: 200 alone does NOT mean flat. Five observable cases:
-#   (a) 200 + broker_flat=true                                       → flat, safe to proceed.
-#   (b) 200 + broker_flat=false                                      → residual positions; flatten in IB first.
+#   (a) 200 + broker_flat=true                                       → deployment-cache flatness only; reconcile actual account state.
+#   (b) 200 + broker_flat=false                                      → reconcile MSAI-owned residual positions under authorized scope.
 #   (c) 200 + no flatness fields                                     → already-stopped shortcut (no live child).
 #   (d) 504 + broker_flat=null + detail.error.code=FLATNESS_UNKNOWN  → stopped, no flatness report from child.
 #   (e) 504 + detail.error.code=API_POLL_TIMEOUT                     → child never reached terminal in the poll window.
@@ -193,9 +195,9 @@ echo "HTTP $STATUS"   # 200 = all flat; 207 = any_non_flat / partial
 jq '{any_non_flat, flatness_reports}' /tmp/kill.json
 ```
 
-If `broker_flat=false` (or `any_non_flat=true`, which may also mean _unknown_-flatness rather than confirmed-non-flat), verify residual positions via the IB portal and flatten any that remain before re-attempting the deploy.
+If `broker_flat=false` (or `any_non_flat=true`, which may also mean unknown flatness), verify actual account identity and residual positions through the broker. Resolve MSAI-owned positions only within the authorized maintenance scope; preserve unrelated holdings. Even `broker_flat=true` is scoped to the deployment's engine cache and is not fresh account-wide reconciliation.
 
-**Fresh-VM bypass:** if `curl` to `/api/v1/live/status` fails with DNS-resolution-error or connection-refused (exit code 6/7) — i.e., Caddy/backend aren't running yet — the gate normally **fails closed**. For a genuine fresh-VM bootstrap or DR rebuild, pass `-f bootstrap=true`. **Never use `bootstrap=true` for routine re-deploys** — broker subprocesses live in a separate compose profile and can keep trading even when the API listener is dead.
+**Fresh-VM exception:** readiness normally refuses any network or contract failure. Only explicit `bootstrap=true` for a verified fresh target/DR rebuild allows DNS/connect-refused errors (curl 6/7). It does not permit HTTP/auth/TLS/timeout errors or an old/404 readiness endpoint, and does not waive CI. Never use it for routine redeploys: the broker profile can continue trading while the API listener is down. Follow the [supervised first-upgrade procedure](operations/release-safety.md#first-upgrade-from-the-old-api) for the existing API.
 
 ---
 
@@ -209,7 +211,7 @@ This is the **load-bearing safety property** that bounds routine-deploy blast ra
 
 1. **F4 — routine deploys exclude the `broker` profile.** `scripts/deploy-on-vm.sh` performs `docker compose pull` + `up -d --wait` (and rollback) ONLY against the explicit `DEFAULT_PROFILE_SERVICES` array (`scripts/deploy-on-vm.sh:44` — `postgres redis migrate backend backtest-worker research-worker portfolio-worker ingest-worker frontend caddy`). `live-supervisor`, `ib-gateway`, and the rest of the `broker` compose profile are **not** in that array, so a routine push-to-main deploy never recreates the supervisor container or interrupts any running live node. Broker-profile containers stay up across routine deploys.
 
-2. **F5 — the deploy workflow refuses while any live deployment is active.** `.github/workflows/deploy.yml:399` ("Refuse if active live_deployments") queries `GET /api/v1/live/status?active_only=true` **before** Azure login and fails closed (exit 1, `FAIL_ACTIVE_DEPLOYMENTS_REFUSAL`) if any deployment is in `{starting, building, ready, running}`. See [§The active-deployments gate](#the-active-deployments-gate-slice-4) above for how to clear it. This guarantees a deploy can only land while the broker profile is idle — so even though F4 leaves broker containers untouched, a deploy can't race against a node that's mid-trade.
+2. **F5 — the candidate refuses unresolved persisted trading state.** Versioned fleet readiness checks deployment, process and restart blockers before Azure access and again immediately before VM execution. See [the release contract](operations/release-safety.md). This is a point-in-time prerequisite; operators must prevent new starts/resumes and settle already-in-flight starts during maintenance. It does not guarantee concurrent-start exclusion or actual broker flatness.
 
 3. **Broker-profile supervisor-image changes are DELIBERATE, sequenceable maintenance — never part of a routine deploy.** Because F4 deliberately excludes the broker profile, a change to the supervisor image does NOT ship on push-to-main. Rolling out a new supervisor image is an explicit maintenance operation: you must intentionally recreate the broker-profile containers, which restarts **all** co-located accounts at once (there is no per-account isolation on the single VM yet). Sequence it as maintenance — drain every account first (`msai live stop <id>` per deployment, confirming `broker_flat`), or accept and announce an all-account restart — then recreate the broker profile out-of-band:
 
@@ -241,10 +243,10 @@ COMPOSE_PROFILES=broker sudo docker compose \
 
 Until you do this, `/start-portfolio` returns **503 ("live-supervisor is not running…")** — because the new API gates on a fresh `router_heartbeat` key that only the NEW supervisor publishes (`backend/src/msai/api/live.py:937`, which already names the recreate command in its message). **This 503 is the intended FAIL-LOUD guard, not a bug** — it refuses to START live trading against a mismatched old supervisor.
 
-**Why no in-flight command can be stranded across this window:**
+**Maintenance conditions across this window:**
 
-- **F5** (the active-`live_deployments` gate, [§The binding deploy contract](#the-binding-deploy-contract-broker-isolation) clause 2) refuses to deploy while any live deployment is active, so there are **zero running nodes / zero in-flight commands** at deploy time — nothing to strand.
-- The **fail-loud 503** guarantees no NEW trading starts under the (new-API + old-supervisor) pairing, so no STOP / kill-all / drain command is ever issued against a mismatched supervisor.
+- **F5** refuses the persisted lifecycle blockers it observes; it cannot prove the absence of every in-flight command. Establish and hold the no-start/no-resume maintenance interval separately.
+- A stale/missing supervisor heartbeat can refuse a new start, but it does not establish version compatibility or prevent all stop/drain commands. Verify the actual API/supervisor pair and lifecycle state before coordinated maintenance.
 
 Recreating the broker profile is the same all-account maintenance operation as clause 3 above (it restarts all co-located accounts at once on the single VM); sequence it the same way (drain or accept-and-announce). The coordinated-release requirement is purely additive to clause 3 — it documents that the broker-profile recreate is **mandatory** (not merely "deliberate maintenance") whenever the routing/heartbeat contract changed, and must complete before live trading resumes.
 
@@ -254,7 +256,7 @@ Recreating the broker profile is the same all-account maintenance operation as c
 
 Run through these before any prod deploy. Most routine push-to-main deploys clear them trivially; the broker-related lines matter when a change touches live-trading code or the supervisor image.
 
-- [ ] **Active-live gate clear.** No live deployment in `{starting, building, ready, running}` (`msai live status`). The F5 gate ([§The active-deployments gate](#the-active-deployments-gate-slice-4)) enforces this — clear it via `msai live stop <id>` per deployment (or `msai live kill-all --yes`) and confirm `broker_flat` before deploying.
+- [ ] **Exact revision and quiet fleet.** Required CI/auth evidence is successful for the target SHA. Complete fleet readiness reports zero deployment/process/restart blockers; old or unavailable contracts refuse. Stop only authorized deployments, maintain no new starts/resumes, and reconcile actual account state independently of `broker_flat`. Use the supervised procedure for an old API.
 - [ ] **Routine deploy does not touch the broker profile.** Confirm the change is shipping via the normal push-to-main path (which excludes broker per F4). If the change is to a broker-profile image, it is NOT a routine deploy — see the next line.
 - [ ] **Broker-profile supervisor-image change → sequence as maintenance** (drain or accept all-account restart); routine deploys never touch broker. Recreate the broker profile out-of-band per [§The binding deploy contract](#the-binding-deploy-contract-broker-isolation) clause 3 — do NOT fold it into a push-to-main deploy.
 - [ ] **(PR 2 — per-account supervisors) Live strategy MRO pre-flight.** Before deploying PR 2, every live/queued strategy file MUST declare `class X(RiskAwareStrategy, Strategy)` — the mixin FIRST — so the halt-gated submit override wins the MRO. The PR-2 node startup gate fails-closed (`SPAWN_FAILED_PERMANENT`) any live strategy that is bare-`Strategy` OR mixes the order wrong. Test-only fixtures (e.g. `strategies/intentionally_failing_strategy.py`) are intentionally not migrated.
@@ -410,7 +412,7 @@ gh secret set MSAI_API_KEY                              # then paste the X-API-K
 | Runner-side `/health` probe fails                         | DNS / Caddy / cert                                | `ssh msaiadmin@<VM>` → `sudo docker compose -f /opt/msai/docker-compose.prod.yml logs caddy backend`                                                                                       |
 | `/health` returns 502 from Caddy                          | Backend container unhealthy                       | `docker compose logs backend`; check `/run/msai.env` rendered correctly                                                                                                                    |
 | AMA heartbeat missing                                     | DCR misconfigured (Linux+stream)                  | [`feedback_ama_dcr_kind_linux_required`](#) — `sudo systemctl restart azuremonitoragent` after DCR fix                                                                                     |
-| Orphan transient NSG rule                                 | Cleanup job failed                                | `reap-orphan-nsg-rules.yml` runs every 15 min (`cron: '7,22,37,52 * * * *'`) and reaps `gha-transient-*` rules older than 30 min — so cleanup lands 30-45 min after the orphan was created |
+| Orphan transient NSG rule                                 | Cleanup job failed                                | Candidate create/reap paths verify exact ownership and completed GitHub attempt, preserve active/unknown/unrelated rules, and prove deletion. Preview first. Scheduling is supplementary; the audit found the schedule disabled, and source cron alone does not prove it is running. |
 
 ---
 

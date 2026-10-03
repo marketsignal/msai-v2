@@ -212,6 +212,56 @@ class TestLiveStatus:
         assert "active_count" in body
 
 
+class TestReleaseReadiness:
+    """Authentication and DB-failure boundaries for the release precondition."""
+
+    async def test_requires_authentication(self, client_with_mock_db: httpx.AsyncClient) -> None:
+        from msai.core.auth import get_current_user
+
+        app.dependency_overrides.pop(get_current_user, None)
+        response = await client_with_mock_db.get("/api/v1/live/release-readiness")
+        assert response.status_code == 401
+
+    async def test_accepts_configured_api_key(
+        self,
+        client_with_mock_db: httpx.AsyncClient,
+        mock_db: AsyncMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from msai.core.auth import get_current_user, settings
+
+        monkeypatch.setattr(settings, "msai_api_key", "release-readiness-test-key")
+        app.dependency_overrides.pop(get_current_user, None)
+        mock_db.execute.return_value.one.return_value = (0, 0, 0)
+        response = await client_with_mock_db.get(
+            "/api/v1/live/release-readiness", headers={"X-API-Key": "release-readiness-test-key"}
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "contract_version": 1,
+            "scope": "fleet",
+            "complete": True,
+            "ready": True,
+            "blocking_deployments": 0,
+            "blocking_processes": 0,
+            "restart_blockers": 0,
+        }
+
+    async def test_db_failure_never_returns_ready(
+        self, client_with_mock_db: httpx.AsyncClient, mock_db: AsyncMock
+    ) -> None:
+        from sqlalchemy.exc import OperationalError
+
+        mock_db.execute.side_effect = OperationalError("readiness", {}, RuntimeError("unavailable"))
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://testserver",
+        ) as client:
+            response = await client.get("/api/v1/live/release-readiness")
+        assert response.status_code == 500
+        assert '"ready":true' not in response.text
+
+
 # ---------------------------------------------------------------------------
 # Tests: POST /api/v1/live/kill-all
 # ---------------------------------------------------------------------------
