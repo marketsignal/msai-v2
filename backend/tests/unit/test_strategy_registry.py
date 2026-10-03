@@ -646,6 +646,53 @@ class TestSyncStrategiesToDb:
         assert row.deleted_at is None
         assert [db_row for db_row in session._rows if db_row.name == info.name] == [row]
         assert any(db_row is row for db_row, _ in paired)
+        assert row.file_path == "example/ema_cross.py"
+
+    async def test_sync_retires_redundant_active_row_for_discovered_name(
+        self, example_strategies_dir: Path
+    ) -> None:
+        """Path-era duplicates must not remain active and addressable by UUID."""
+        from uuid import uuid4
+
+        from msai.models.strategy import Strategy
+        from msai.services.strategy_registry import sync_strategies_to_db
+
+        strategies_root = example_strategies_dir.parent
+        discovered = discover_strategies(strategies_root)
+        info = next(item for item in discovered if item.name == "example.ema_cross")
+        duplicate = Strategy(
+            id=uuid4(),
+            name=info.name,
+            file_path="/legacy-host/strategies/example/ema_cross.py",
+            strategy_class=info.strategy_class_name,
+            config_class=info.config_class_name,
+            config_schema=info.config_schema,
+            default_config=info.default_config,
+            config_schema_status=info.config_schema_status,
+            code_hash=info.code_hash,
+        )
+        canonical = Strategy(
+            id=uuid4(),
+            name=info.name,
+            file_path="example/ema_cross.py",
+            strategy_class=info.strategy_class_name,
+            config_class=info.config_class_name,
+            config_schema=info.config_schema,
+            default_config=info.default_config,
+            config_schema_status=info.config_schema_status,
+            code_hash=info.code_hash,
+        )
+        session = _FakeAsyncSession(existing=[duplicate, canonical])
+
+        paired = await sync_strategies_to_db(
+            session,  # type: ignore[arg-type]
+            strategies_root,
+            prune_missing=True,
+        )
+
+        assert canonical.deleted_at is None
+        assert duplicate.deleted_at is not None
+        assert [row for row, found in paired if found.name == info.name] == [canonical]
 
     async def test_sync_persists_new_file_path_relative_to_strategies_root(
         self, example_strategies_dir: Path

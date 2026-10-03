@@ -18,11 +18,30 @@ branch_labels: tuple[str, ...] | None = None
 depends_on: str | None = None
 
 
-def _normalize_path(value: str) -> str:
+def _canonical_path_for_name(strategy_name: str | None) -> str | None:
+    if not strategy_name or strategy_name.startswith("__smoke__/") or "/" in strategy_name:
+        return None
+    return f"{strategy_name.replace('.', '/')}.py"
+
+
+def _normalize_path(value: str, *, strategy_name: str | None = None) -> str:
     """Return the portable portion below the nearest ``strategies`` root."""
     portable = value.replace("\\", "/")
     while portable.startswith("./"):
         portable = portable[2:]
+    expected = _canonical_path_for_name(strategy_name)
+    if expected is not None and (
+        portable == expected or portable.endswith(f"/strategies/{expected}")
+    ):
+        return expected
+    if not portable.startswith("/") and not (
+        len(portable) >= 3 and portable[1:3] == ":/"
+    ):
+        if not portable.startswith("strategies/"):
+            return portable
+        if expected == portable:
+            return portable
+        return portable.removeprefix("strategies/")
     if portable.startswith("strategies/"):
         return portable.removeprefix("strategies/")
     marker = "/strategies/"
@@ -33,10 +52,13 @@ def _normalize_path(value: str) -> str:
 
 def upgrade() -> None:
     bind = op.get_bind()
-    rows = bind.execute(sa.text("SELECT id, file_path FROM strategies")).mappings().all()
+    rows = bind.execute(sa.text("SELECT id, name, file_path FROM strategies")).mappings().all()
     update = sa.text("UPDATE strategies SET file_path = :file_path WHERE id = :id")
     for row in rows:
-        normalized = _normalize_path(str(row["file_path"]))
+        normalized = _normalize_path(
+            str(row["file_path"]),
+            strategy_name=str(row["name"]),
+        )
         if normalized != row["file_path"]:
             bind.execute(update, {"id": row["id"], "file_path": normalized})
 

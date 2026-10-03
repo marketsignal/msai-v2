@@ -15,15 +15,18 @@ def resolve_strategy_file(
     """Resolve a stored strategy path independently of the process cwd.
 
     Canonical registry values are relative to ``strategies_root``.  Absolute
-    paths remain readable during rolling upgrades, and the historical
-    ``strategies/...`` relative form is accepted without duplicating the root
-    directory segment.
+    paths remain readable during rolling upgrades.  The historical
+    ``strategies/...`` relative form falls back to its old interpretation only
+    when the canonical nested path does not exist.
     """
     path = Path(file_path).expanduser()
     if path.is_absolute():
         return path.resolve()
 
     root = (strategies_root or settings.strategies_root).expanduser().resolve()
+    canonical = (root / path).resolve()
     if path.parts and path.parts[0] == root.name:
-        path = Path(*path.parts[1:])
-    return (root / path).resolve()
+        legacy = root.joinpath(*path.parts[1:]).resolve()
+        if not canonical.is_file() and legacy.is_file():
+            return legacy
+    return canonical

@@ -42,3 +42,17 @@ def test_normalize_strategy_file_path_is_portable_and_idempotent() -> None:
         normalized = migration._normalize_path(source)
         assert normalized == expected
         assert migration._normalize_path(normalized) == expected
+
+
+def test_normalize_strategy_file_path_preserves_nested_strategies_component() -> None:
+    """A canonical nested package named strategies must never be truncated."""
+    migration = _load_migration()
+
+    assert migration._normalize_path("desk/strategies/foo.py") == "desk/strategies/foo.py"
+    assert (
+        migration._normalize_path(
+            "/app/strategies/strategies/foo.py",
+            strategy_name="strategies.foo",
+        )
+        == "strategies/foo.py"
+    )

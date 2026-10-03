@@ -574,7 +574,7 @@ async def sync_strategies_to_db(
 
     # SYNC path opts into the soft-delete filter (plan R20). Without
     # ``include_deleted=True``, an archived row would be invisible to
-    # ``existing_by_path`` and sync would silently re-create a NEW
+    # ``existing_by_name`` and sync would silently re-create a NEW
     # active row for the same name on every GET — un-archiving the
     # strategy.
     existing_rows = (
@@ -583,16 +583,13 @@ async def sync_strategies_to_db(
         .all()
     )
     registry_rows = [row for row in existing_rows if not row.name.startswith("__smoke__/")]
-    existing_by_name: dict[str, Strategy] = {}
+    existing_by_name: dict[str, list[Strategy]] = {}
     for existing_row in registry_rows:
-        indexed = existing_by_name.get(existing_row.name)
-        if indexed is None or (
-            indexed.deleted_at is not None and existing_row.deleted_at is None
-        ):
-            existing_by_name[existing_row.name] = existing_row
+        existing_by_name.setdefault(existing_row.name, []).append(existing_row)
 
     discovered_names = {info.name for info in discovered}
 
+    now = datetime.now(UTC)
     paired: list[tuple[Strategy, DiscoveredStrategy]] = []
     for info in discovered:
         file_path = info.module_path.relative_to(strategies_dir).as_posix()
@@ -600,8 +597,26 @@ async def sync_strategies_to_db(
         # A schema/defaults change in config.py must invalidate the
         # memoized schema cache even if the strategy file is unchanged.
         combined_hash = _combined_strategy_hash(info)
-        row = existing_by_name.get(info.name)
-        if row is None:
+        matching_rows = existing_by_name.get(info.name, [])
+        active_rows = [candidate for candidate in matching_rows if candidate.deleted_at is None]
+        if active_rows:
+            row = min(
+                active_rows,
+                key=lambda candidate: (
+                    candidate.file_path != file_path,
+                    str(candidate.id or ""),
+                ),
+            )
+            row.file_path = file_path
+            for duplicate in active_rows:
+                if duplicate is not row:
+                    duplicate.deleted_at = now
+        elif matching_rows:
+            # Archived row + file still on disk: leave every matching row
+            # archived (plan R2 — do NOT silently un-archive) and do not
+            # create a replacement active row.
+            continue
+        else:
             row = Strategy(
                 name=info.name,
                 description=info.description,
@@ -614,13 +629,8 @@ async def sync_strategies_to_db(
                 code_hash=combined_hash,
             )
             session.add(row)
-        elif row.deleted_at is not None:
-            # Archived row + file still on disk: leave the row archived
-            # (plan R2 — do NOT silently un-archive). Skip from the
-            # returned ``paired`` list so list views continue to hide it.
-            # Explicit operator restoration is a future PR (R2).
-            continue
-        else:
+
+        if active_rows:
             row.strategy_class = info.strategy_class_name
             # NOTE: description is NOT re-synced from disk after the row
             # exists — it is user-editable via PATCH /api/v1/strategies/{id}
@@ -644,7 +654,6 @@ async def sync_strategies_to_db(
     # backtest + deployment FKs keep resolving (plan R2). Skip rows that
     # are already archived to keep the operation idempotent.
     if prune_missing and strategies_dir.is_dir():
-        now = datetime.now(UTC)
         for stale_row in registry_rows:
             if stale_row.name in discovered_names:
                 continue

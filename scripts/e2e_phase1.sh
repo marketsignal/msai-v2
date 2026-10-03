@@ -81,7 +81,7 @@ async def main() -> None:
         strat = Strategy(
             id=uuid.uuid4(),
             name="smoke_market_order",
-            file_path="/app/strategies/example/smoke_market_order.py",
+            file_path="example/smoke_market_order.py",
             strategy_class="SmokeMarketOrderStrategy",
             default_config={},
             created_by=user.id,

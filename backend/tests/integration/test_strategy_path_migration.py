@@ -33,6 +33,8 @@ async def test_upgrade_normalizes_absolute_relative_and_smoke_paths(
         "absolute-container": "/app/strategies/example/ema_cross.py",
         "absolute-host": "/Users/dev/msai-v2/strategies/custom/momentum.py",
         "already-relative": "example/ema_cross.py",
+        "desk.strategies.foo": "desk/strategies/foo.py",
+        "strategies.foo": "/app/strategies/strategies/foo.py",
         "__smoke__/ema_cross/AAPL": "strategies/example/ema_cross.py",
     }
     engine = create_async_engine(isolated_postgres_url)
@@ -73,5 +75,7 @@ async def test_upgrade_normalizes_absolute_relative_and_smoke_paths(
         "absolute-container": "example/ema_cross.py",
         "absolute-host": "custom/momentum.py",
         "already-relative": "example/ema_cross.py",
+        "desk.strategies.foo": "desk/strategies/foo.py",
+        "strategies.foo": "strategies/foo.py",
         "__smoke__/ema_cross/AAPL": "example/ema_cross.py",
     }
