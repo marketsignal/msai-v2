@@ -1,0 +1,1700 @@
+{
+  "observed_at": "2026-10-03T17:38:37.623139+00:00",
+  "bars": {
+    "http": 200,
+    "count": 1728,
+    "first": {
+      "timestamp": "2025-01-22T12:00:00Z",
+      "open": 222.46,
+      "high": 222.5,
+      "low": 222.46,
+      "close": 222.48,
+      "volume": 427.0
+    },
+    "last": {
+      "timestamp": "2025-01-24T23:57:00Z",
+      "open": 222.19,
+      "high": 222.19,
+      "low": 222.19,
+      "close": 222.19,
+      "volume": 5.0
+    }
+  },
+  "strategy": {
+    "id": "19131631-1d46-4095-ab0b-8702aabac9d1",
+    "name": "example.ema_cross",
+    "file_path": "example/ema_cross.py",
+    "code_hash": "7407923f667a07a42bbfeba9f2c6ccbcf71c0cc84e6fbe6c8d9f94bdb83b6d38"
+  },
+  "validation": [
+    200,
+    {
+      "message": "Strategy 'EMACrossStrategy' validated successfully"
+    }
+  ],
+  "backtest_request": {
+    "strategy_id": "19131631-1d46-4095-ab0b-8702aabac9d1",
+    "instruments": [
+      "AAPL.NASDAQ"
+    ],
+    "start_date": "2025-01-22",
+    "end_date": "2025-01-25",
+    "smoke": false,
+    "config": {
+      "fast_ema_period": 5,
+      "slow_ema_period": 20,
+      "trade_size": "1"
+    }
+  },
+  "backtest_submission": [
+    201,
+    {
+      "id": "7e10e3c7-74ec-4e99-96df-817ecda44653",
+      "status": "pending",
+      "progress": 0
+    }
+  ],
+  "backtest_status": {
+    "id": "7e10e3c7-74ec-4e99-96df-817ecda44653",
+    "status": "completed",
+    "progress": 100,
+    "started_at": "2026-10-03T17:38:46.925554Z",
+    "completed_at": "2026-10-03T17:39:04.408440Z"
+  },
+  "backtest_results": {
+    "id": "7e10e3c7-74ec-4e99-96df-817ecda44653",
+    "metrics": {
+      "win_rate": 0.36,
+      "num_trades": 100,
+      "max_drawdown": -8.699997041672347e-07,
+      "sharpe_ratio": -4.32786031404986,
+      "total_return": -5.299999999115244e-05,
+      "sortino_ratio": -5.502869104311565
+    },
+    "trade_count": 100,
+    "series": {
+      "daily": [
+        {
+          "date": "2025-01-22",
+          "equity": 100000.0,
+          "drawdown": 0.0,
+          "daily_return": 0.0
+        },
+        {
+          "date": "2025-01-23",
+          "equity": 100000.03800000153,
+          "drawdown": 0.0,
+          "daily_return": 3.800000152320848e-07
+        },
+        {
+          "date": "2025-01-24",
+          "equity": 99999.95099999805,
+          "drawdown": -8.699997041672347e-07,
+          "daily_return": -8.699997041672347e-07
+        }
+      ],
+      "monthly_returns": [
+        {
+          "month": "2025-01",
+          "pct": -4.900000195595666e-07
+        }
+      ]
+    },
+    "series_status": "ready",
+    "has_report": true
+  },
+  "backtest_trades": {
+    "items": [
+      {
+        "id": "4d238ee0-eeed-4fec-b021-0e65a0f27f22",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.18,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T12:37:00Z"
+      },
+      {
+        "id": "84f8136f-db42-4504-ad57-39e654316486",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.03,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T12:52:00Z"
+      },
+      {
+        "id": "b5d62728-0771-4ebf-8c4c-9ad8fad00cc8",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.13,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T12:54:00Z"
+      },
+      {
+        "id": "fe503def-874e-4620-b4ce-72da6b48d392",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.01,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T12:58:00Z"
+      },
+      {
+        "id": "488fa5d0-83da-4c6f-b991-27ab921c4934",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 221.46,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T14:14:00Z"
+      },
+      {
+        "id": "982ff589-4f92-4a74-936b-2625bef1f266",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 221.01,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T14:25:00Z"
+      },
+      {
+        "id": "eb37cf14-86f0-4923-b939-813d2a724f81",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 221.98,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T14:32:00Z"
+      },
+      {
+        "id": "cfbab7ea-79ff-48e6-967f-4175d006ea41",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 221.45,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T14:44:00Z"
+      },
+      {
+        "id": "29eec215-f372-4ce6-bd64-ec23209a5af3",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.22,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T14:48:00Z"
+      },
+      {
+        "id": "f44d1282-38aa-47e3-8271-9f4a697a9f5a",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.69,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T15:10:00Z"
+      },
+      {
+        "id": "68b5334e-94bb-48ad-b43d-fef636058ef1",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.77,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T15:11:00Z"
+      },
+      {
+        "id": "5ffd3ece-8e97-4a4e-b44d-74c2854b4d2a",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.68,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T15:12:00Z"
+      },
+      {
+        "id": "38edf01c-7911-44d7-ab7c-34b1b4e4e86e",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.05,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T15:46:00Z"
+      },
+      {
+        "id": "70e0a6fe-ff35-480b-bca7-c2606a96af4a",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.57,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T16:21:00Z"
+      },
+      {
+        "id": "c4755a05-f17e-48c7-99f8-457d7f4dda73",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.78,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T16:27:00Z"
+      },
+      {
+        "id": "e31d24f9-c40d-46ab-9a76-8db330194310",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.59,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T16:33:00Z"
+      },
+      {
+        "id": "7e265baa-bda3-41f0-9755-b856b2dde906",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.2,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T17:17:00Z"
+      },
+      {
+        "id": "6ddeb630-99ae-4e87-a064-6950b4405190",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.52,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T17:52:00Z"
+      },
+      {
+        "id": "92352559-f51a-4e25-9350-b4d99a67d28c",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.72,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T17:57:00Z"
+      },
+      {
+        "id": "ad4f908c-d9b0-42a3-858f-a4f996c4dea1",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.54,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T18:05:00Z"
+      },
+      {
+        "id": "7b870fb0-77f1-4784-83d6-ec4f164025bd",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.23,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T18:47:00Z"
+      },
+      {
+        "id": "9bb753ae-9713-438f-b846-83f54eac6553",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.59,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T19:38:00Z"
+      },
+      {
+        "id": "dbd3cad4-6ea0-4031-aa81-b9d37611d82a",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.89,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T19:49:00Z"
+      },
+      {
+        "id": "85db052e-10e7-4461-99c4-9b78a77b629f",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.97,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T20:10:00Z"
+      },
+      {
+        "id": "794af5a0-fd8c-424b-9503-f5d288a7a579",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 223.13,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T20:22:00Z"
+      },
+      {
+        "id": "409d43e8-cdff-45c9-9045-ffdf4b561999",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 223.25,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T20:41:00Z"
+      },
+      {
+        "id": "47c70507-1750-401a-baef-7873412f9055",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 223.38,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T20:52:00Z"
+      },
+      {
+        "id": "152d4d73-cf0f-4dc4-8124-766c6a9e0cce",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 223.51,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T21:10:00Z"
+      },
+      {
+        "id": "6d6aa884-3d92-46ca-9aaa-068e25b9672e",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 223.64,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T21:17:00Z"
+      },
+      {
+        "id": "b1549446-904c-43e1-8c7f-c1403a50b3d1",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 223.48,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T21:27:00Z"
+      },
+      {
+        "id": "05d2949f-4f2d-4985-9f36-2fc5bc92ac12",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 223.53,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T21:53:00Z"
+      },
+      {
+        "id": "dc264591-74fe-4a38-9767-0e700b2ce26b",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 223.41,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T22:07:00Z"
+      },
+      {
+        "id": "3192345b-e99e-427f-9b20-3e1471170334",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 223.36,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T22:52:00Z"
+      },
+      {
+        "id": "672339ca-80ea-4245-a879-2853d504f8ed",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 223.31,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-22T23:47:00Z"
+      },
+      {
+        "id": "90f4cc92-df02-48bb-880c-e476548f8189",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 223.27,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T12:32:00Z"
+      },
+      {
+        "id": "2cd6dbfa-b51d-48c3-9dbe-72192d3ceb24",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 224.15,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T13:37:00Z"
+      },
+      {
+        "id": "6be2cd5b-6966-46a7-89c0-fd8804c368f5",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 224.49,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T13:53:00Z"
+      },
+      {
+        "id": "7228f66f-fd74-4568-9ee0-f3d08c414b54",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 224.37,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T14:07:00Z"
+      },
+      {
+        "id": "56d17d67-99cf-4a98-8c2c-ee7637a26433",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 224.5,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T14:20:00Z"
+      },
+      {
+        "id": "21ec48fe-f804-4c49-9db0-d94474e5da3d",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 224.77,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T14:44:00Z"
+      },
+      {
+        "id": "df35f8d8-5302-4e29-bba0-dc4cc8232688",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 225.28,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T14:52:00Z"
+      },
+      {
+        "id": "3305aae3-7c24-4b0a-91c9-410d319c8b67",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 224.98,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T15:01:00Z"
+      },
+      {
+        "id": "9644432c-271e-4aee-a0d5-71ffc63c3526",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 225.1,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T15:02:00Z"
+      },
+      {
+        "id": "066dec6d-537f-4a67-b769-b1af66b63b1a",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 225.98,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T15:29:00Z"
+      },
+      {
+        "id": "2b3bbc70-396e-46ad-90c7-2d10f5accc81",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 226.27,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T15:39:00Z"
+      },
+      {
+        "id": "f2a162da-1571-4396-abab-5bf1edd9222d",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 225.89,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T15:45:00Z"
+      },
+      {
+        "id": "1b5e9291-009a-4f4f-a6ab-b7f20541490f",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 225.08,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T16:27:00Z"
+      },
+      {
+        "id": "4b55fd99-493b-4991-ae49-55e1268737dd",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 224.56,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T16:33:00Z"
+      },
+      {
+        "id": "91aca169-a00d-421c-a18e-3c8f7a0bc8e4",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 224.09,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T17:13:00Z"
+      },
+      {
+        "id": "70afd1ce-8005-48ae-93f9-22c460566570",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 223.87,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T17:18:00Z"
+      },
+      {
+        "id": "559d7838-128d-47f9-a04a-81c7af51b28b",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 223.46,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T17:48:00Z"
+      },
+      {
+        "id": "030275b1-e4e9-4fab-bf6c-8f0ac24d8bfa",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 223.49,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T18:05:00Z"
+      },
+      {
+        "id": "5e5e537c-17b8-4f24-9dda-bbfcc0ad2e87",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 223.66,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T18:11:00Z"
+      },
+      {
+        "id": "039fc5a7-dbed-432f-8430-9f3924cb55fe",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 223.48,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T18:17:00Z"
+      },
+      {
+        "id": "604d265a-fd4e-4f7a-ab0b-e43c6d137e8a",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 223.63,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T18:21:00Z"
+      },
+      {
+        "id": "89fdb741-0de6-4458-9628-b00ae6ac679f",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 223.55,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T18:27:00Z"
+      },
+      {
+        "id": "da451944-9101-412e-b475-1d59f7d6168c",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 223.61,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T18:31:00Z"
+      },
+      {
+        "id": "8f79e928-91b4-415c-87df-95160b17a5f8",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 223.55,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T18:32:00Z"
+      },
+      {
+        "id": "b00307e7-0a87-4377-8ce8-b8ea5eae90ea",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 223.62,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T18:35:00Z"
+      },
+      {
+        "id": "ff66b8bc-8791-4d17-af04-4032f3db1be8",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 223.57,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T18:36:00Z"
+      },
+      {
+        "id": "2054fbf8-f3ee-4472-908d-bac06d868dbe",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.86,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T19:24:00Z"
+      },
+      {
+        "id": "c9136a25-efd4-42a5-aad5-1b950721f960",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.71,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T19:36:00Z"
+      },
+      {
+        "id": "71f7853f-434f-4bcd-9024-d32f89514804",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.79,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T19:54:00Z"
+      },
+      {
+        "id": "fd1761f0-a023-433d-bce7-17b4607d1cba",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.9,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T20:30:00Z"
+      },
+      {
+        "id": "61d66a7c-ce95-4d49-a6e4-e52ad31c9cda",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.78,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T20:51:00Z"
+      },
+      {
+        "id": "c33f6f23-5f1d-403a-909b-f8af80ae0af1",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 223.17,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T21:28:00Z"
+      },
+      {
+        "id": "2a271279-738a-4727-84ea-c629aa402c72",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 223.35,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T21:37:00Z"
+      },
+      {
+        "id": "c1832038-70c1-4831-b862-fac0190046ca",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 223.18,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T21:46:00Z"
+      },
+      {
+        "id": "518dc3cd-edaf-44a7-915d-6dce414d0e5d",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 223.3,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T21:50:00Z"
+      },
+      {
+        "id": "f70d9fa7-7e32-48f1-bce7-10cbe7bb9f37",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 223.35,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-23T23:11:00Z"
+      },
+      {
+        "id": "99c5a502-78b5-4da4-b673-99690d3e6fd1",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 225.2,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T12:00:00Z"
+      },
+      {
+        "id": "47631265-dfff-4306-a672-18d5a073c8ab",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 225.03,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T12:56:00Z"
+      },
+      {
+        "id": "b75a0782-db0a-4222-8198-2a23e8e3122f",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 225.18,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T13:00:00Z"
+      },
+      {
+        "id": "a39485d7-677b-4b0a-b065-777533c99332",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 225.56,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T14:25:00Z"
+      },
+      {
+        "id": "2b19c02b-f743-4b4a-a003-35f268469ab5",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 225.31,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T14:45:00Z"
+      },
+      {
+        "id": "e011ffb5-7649-4344-b23e-d8427795bc32",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 224.76,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T14:47:00Z"
+      },
+      {
+        "id": "59d0c067-a239-49aa-b367-0ebbec8266d5",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 223.08,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T15:38:00Z"
+      },
+      {
+        "id": "4f11ab1f-27d4-46a5-93bd-ded93c2be34f",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.99,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T15:54:00Z"
+      },
+      {
+        "id": "f372c1b3-5ff7-4394-bcc0-394bbe68c3c1",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 223.24,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T15:56:00Z"
+      },
+      {
+        "id": "2ad53081-cde0-44fc-a6b6-39a2bfade849",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.98,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T15:58:00Z"
+      },
+      {
+        "id": "e80f06b0-cf1c-4978-8009-ff76db825a21",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.82,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T16:30:00Z"
+      },
+      {
+        "id": "2364b077-9d54-40dd-9ef3-563530bf5950",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.63,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T16:35:00Z"
+      },
+      {
+        "id": "0d540505-4600-490c-a437-39db61ffa6cd",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.89,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T16:36:00Z"
+      },
+      {
+        "id": "eb0c84ed-aae2-49b6-a39d-aa84d4f758f3",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.98,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T16:55:00Z"
+      },
+      {
+        "id": "45c74970-346f-4eb0-bee3-37e31eec574c",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 223.0,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T17:10:00Z"
+      },
+      {
+        "id": "4fd7c0fb-9c10-4b45-b662-3cd65aafd11e",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.92,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T17:19:00Z"
+      },
+      {
+        "id": "8d8ea3bc-093e-41f8-8efe-365af42a7569",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.52,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T17:46:00Z"
+      },
+      {
+        "id": "cdaff0cc-458d-4bbe-8033-c8af1e51f6ce",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.37,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T18:00:00Z"
+      },
+      {
+        "id": "812c3c68-65c4-427a-9cdc-e8e89111b191",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.35,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T18:22:00Z"
+      },
+      {
+        "id": "67e1168d-0c55-432c-8dec-d8464b7e856d",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.23,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T18:25:00Z"
+      },
+      {
+        "id": "367fc16d-f435-407e-b8af-825cdaff5c27",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.31,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T18:39:00Z"
+      },
+      {
+        "id": "51833ed1-6409-4dd0-a5f1-91e13b23d84e",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.24,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T18:55:00Z"
+      },
+      {
+        "id": "fa9e5377-7558-42b5-9598-74324e722f9b",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.26,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T19:06:00Z"
+      },
+      {
+        "id": "b31612ff-7bf5-4b23-bea1-eb1ddf8ae72d",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.21,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T19:09:00Z"
+      },
+      {
+        "id": "ab9a09d6-119b-49c6-b197-db9a87f14663",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.24,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T19:16:00Z"
+      },
+      {
+        "id": "519c83bb-dbb9-42d7-bb5e-c79eb0f3b01f",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.56,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T19:59:00Z"
+      },
+      {
+        "id": "e5d073a4-ffca-4a6f-8214-ab6969bf1e30",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.8,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T20:03:00Z"
+      },
+      {
+        "id": "eae6ec62-6042-4c14-8bc1-49018691aab1",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.76,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T20:25:00Z"
+      },
+      {
+        "id": "2bd5ef14-1b73-4d0c-9eda-e18521d6a321",
+        "instrument": "AAPL.XNAS",
+        "side": "BUY",
+        "quantity": 1.0,
+        "price": 222.55,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T20:48:00Z"
+      },
+      {
+        "id": "3d0b6820-72fb-424c-bdef-5d796596889a",
+        "instrument": "AAPL.XNAS",
+        "side": "SELL",
+        "quantity": 1.0,
+        "price": 222.66,
+        "pnl": 0.0,
+        "commission": 0.0,
+        "executed_at": "2025-01-24T21:30:00Z"
+      }
+    ],
+    "total": 100,
+    "page": 1,
+    "page_size": 500
+  },
+  "backtest_report": {
+    "http": 200,
+    "bytes": 327766,
+    "content_type": "text/html; charset=utf-8",
+    "empty_fallback": false,
+    "basic_fallback": false,
+    "quantstats": true
+  },
+  "research_request": {
+    "strategy_id": "19131631-1d46-4095-ab0b-8702aabac9d1",
+    "instruments": [
+      "AAPL.XNAS"
+    ],
+    "start_date": "2025-01-22",
+    "end_date": "2025-01-25",
+    "asset_class": "stocks",
+    "base_config": {
+      "instrument_id": "AAPL.XNAS",
+      "bar_type": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL",
+      "fast_ema_period": 5,
+      "slow_ema_period": 20,
+      "trade_size": "1"
+    },
+    "parameter_grid": {
+      "fast_ema_period": [
+        5,
+        10
+      ],
+      "slow_ema_period": [
+        20
+      ]
+    },
+    "objective": "sharpe",
+    "max_parallelism": 1,
+    "search_strategy": "grid",
+    "require_positive_return": false,
+    "holdout_fraction": null,
+    "holdout_days": null,
+    "purge_days": 5
+  },
+  "research_submission": {
+    "http": 201,
+    "body": {
+      "id": "4f39f4ff-3c54-44e1-a190-b0123feba503",
+      "strategy_id": "19131631-1d46-4095-ab0b-8702aabac9d1",
+      "job_type": "parameter_sweep",
+      "status": "pending",
+      "progress": 0,
+      "progress_message": null,
+      "best_config": null,
+      "best_metrics": null,
+      "error_message": null,
+      "started_at": null,
+      "completed_at": null,
+      "created_at": "2026-10-03T17:39:48.025318"
+    }
+  },
+  "research_result": {
+    "id": "4f39f4ff-3c54-44e1-a190-b0123feba503",
+    "strategy_id": "19131631-1d46-4095-ab0b-8702aabac9d1",
+    "job_type": "parameter_sweep",
+    "status": "completed",
+    "progress": 100,
+    "progress_message": "Completed",
+    "best_config": {
+      "bar_type": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL",
+      "trade_size": "1",
+      "instrument_id": "AAPL.XNAS",
+      "fast_ema_period": 5,
+      "slow_ema_period": 20
+    },
+    "best_metrics": {
+      "win_rate": 0.36,
+      "num_trades": 100,
+      "max_drawdown": -8.699997041672347e-07,
+      "sharpe_ratio": -4.32786031404986,
+      "total_return": -5.299999999115244e-05,
+      "sortino_ratio": -5.502869104311565
+    },
+    "error_message": null,
+    "started_at": "2026-10-03T17:39:49.118088Z",
+    "completed_at": "2026-10-03T17:39:52.685089Z",
+    "created_at": "2026-10-03T17:39:48.025318",
+    "config": {
+      "end_date": "2025-01-25",
+      "objective": "sharpe",
+      "min_trades": null,
+      "purge_days": 5,
+      "start_date": "2025-01-22",
+      "asset_class": "stocks",
+      "base_config": {
+        "bar_type": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL",
+        "trade_size": "1",
+        "instrument_id": "AAPL.XNAS",
+        "fast_ema_period": 5,
+        "slow_ema_period": 20
+      },
+      "instruments": [
+        "AAPL.XNAS"
+      ],
+      "strategy_id": "19131631-1d46-4095-ab0b-8702aabac9d1",
+      "holdout_days": null,
+      "strategy_name": "example.ema_cross",
+      "strategy_path": "/app/strategies/example/ema_cross.py",
+      "parameter_grid": {
+        "fast_ema_period": [
+          5,
+          10
+        ],
+        "slow_ema_period": [
+          20
+        ]
+      },
+      "max_parallelism": 1,
+      "search_strategy": "grid",
+      "holdout_fraction": null,
+      "require_positive_return": false
+    },
+    "results": {
+      "mode": "parameter_sweep",
+      "search": {
+        "holdout": null,
+        "strategy": "grid",
+        "min_trades": null,
+        "stage_fractions": [
+          0.35,
+          0.7,
+          1.0
+        ],
+        "reduction_factor": 2,
+        "require_positive_return": false
+      },
+      "results": [
+        {
+          "error": null,
+          "config": {
+            "bar_type": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL",
+            "trade_size": "1",
+            "instrument_id": "AAPL.XNAS",
+            "fast_ema_period": 5,
+            "slow_ema_period": 20
+          },
+          "pruned": false,
+          "metrics": {
+            "win_rate": 0.36,
+            "num_trades": 100,
+            "max_drawdown": -8.699997041672347e-07,
+            "sharpe_ratio": -4.32786031404986,
+            "total_return": -5.299999999115244e-05,
+            "sortino_ratio": -5.502869104311565
+          },
+          "end_date": "2025-01-25",
+          "start_date": "2025-01-22",
+          "prune_reason": null,
+          "stage_results": [],
+          "train_metrics": {
+            "win_rate": 0.36,
+            "num_trades": 100,
+            "max_drawdown": -8.699997041672347e-07,
+            "sharpe_ratio": -4.32786031404986,
+            "total_return": -5.299999999115244e-05,
+            "sortino_ratio": -5.502869104311565
+          },
+          "selection_basis": "train",
+          "completed_full_run": true,
+          "pruned_after_stage": null
+        },
+        {
+          "error": null,
+          "config": {
+            "bar_type": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL",
+            "trade_size": "1",
+            "instrument_id": "AAPL.XNAS",
+            "fast_ema_period": 10,
+            "slow_ema_period": 20
+          },
+          "pruned": false,
+          "metrics": {
+            "win_rate": 0.2682926829268293,
+            "num_trades": 82,
+            "max_drawdown": -2.080003744020509e-06,
+            "sharpe_ratio": -33.7493167022699,
+            "total_return": -0.0003879999999888241,
+            "sortino_ratio": -14.819199340392554
+          },
+          "end_date": "2025-01-25",
+          "start_date": "2025-01-22",
+          "prune_reason": null,
+          "stage_results": [],
+          "train_metrics": {
+            "win_rate": 0.2682926829268293,
+            "num_trades": 82,
+            "max_drawdown": -2.080003744020509e-06,
+            "sharpe_ratio": -33.7493167022699,
+            "total_return": -0.0003879999999888241,
+            "sortino_ratio": -14.819199340392554
+          },
+          "selection_basis": "train",
+          "completed_full_run": true,
+          "pruned_after_stage": null
+        }
+      ],
+      "summary": {
+        "total_runs": 2,
+        "best_result": {
+          "error": null,
+          "config": {
+            "bar_type": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL",
+            "trade_size": "1",
+            "instrument_id": "AAPL.XNAS",
+            "fast_ema_period": 5,
+            "slow_ema_period": 20
+          },
+          "pruned": false,
+          "metrics": {
+            "win_rate": 0.36,
+            "num_trades": 100,
+            "max_drawdown": -8.699997041672347e-07,
+            "sharpe_ratio": -4.32786031404986,
+            "total_return": -5.299999999115244e-05,
+            "sortino_ratio": -5.502869104311565
+          },
+          "end_date": "2025-01-25",
+          "start_date": "2025-01-22",
+          "prune_reason": null,
+          "stage_results": [],
+          "train_metrics": {
+            "win_rate": 0.36,
+            "num_trades": 100,
+            "max_drawdown": -8.699997041672347e-07,
+            "sharpe_ratio": -4.32786031404986,
+            "total_return": -5.299999999115244e-05,
+            "sortino_ratio": -5.502869104311565
+          },
+          "selection_basis": "train",
+          "completed_full_run": true,
+          "pruned_after_stage": null
+        },
+        "pruned_runs": 0,
+        "successful_runs": 2,
+        "full_period_result": null,
+        "fully_evaluated_runs": 2,
+        "holdout_evaluated_runs": 0
+      },
+      "end_date": "2025-01-25",
+      "objective": "sharpe",
+      "start_date": "2025-01-22",
+      "base_config": {
+        "bar_type": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL",
+        "trade_size": "1",
+        "instrument_id": "AAPL.XNAS",
+        "fast_ema_period": 5,
+        "slow_ema_period": 20
+      },
+      "instruments": [
+        "AAPL.XNAS"
+      ],
+      "generated_at": "2026-10-03T17:39:52.501545+00:00",
+      "strategy_path": "/app/strategies/example/ema_cross.py",
+      "parameter_grid": {
+        "fast_ema_period": [
+          5,
+          10
+        ],
+        "slow_ema_period": [
+          20
+        ]
+      },
+      "stage_summaries": []
+    },
+    "trials": [
+      {
+        "id": "397a2bc4-1200-4df5-a22e-04d9a98ea172",
+        "trial_number": 0,
+        "config": {
+          "bar_type": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL",
+          "trade_size": "1",
+          "instrument_id": "AAPL.XNAS",
+          "fast_ema_period": 5,
+          "slow_ema_period": 20
+        },
+        "metrics": {
+          "win_rate": 0.36,
+          "num_trades": 100,
+          "max_drawdown": -8.699997041672347e-07,
+          "sharpe_ratio": -4.32786031404986,
+          "total_return": -5.299999999115244e-05,
+          "sortino_ratio": -5.502869104311565
+        },
+        "status": "completed",
+        "objective_value": -4.32786031,
+        "backtest_id": null,
+        "created_at": "2026-10-03T17:39:52.681948"
+      },
+      {
+        "id": "48dbed24-5382-4872-9bb2-1cb9c4767b06",
+        "trial_number": 1,
+        "config": {
+          "bar_type": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL",
+          "trade_size": "1",
+          "instrument_id": "AAPL.XNAS",
+          "fast_ema_period": 10,
+          "slow_ema_period": 20
+        },
+        "metrics": {
+          "win_rate": 0.2682926829268293,
+          "num_trades": 82,
+          "max_drawdown": -2.080003744020509e-06,
+          "sharpe_ratio": -33.7493167022699,
+          "total_return": -0.0003879999999888241,
+          "sortino_ratio": -14.819199340392554
+        },
+        "status": "completed",
+        "objective_value": -33.7493167,
+        "backtest_id": null,
+        "created_at": "2026-10-03T17:39:52.681948"
+      }
+    ]
+  },
+  "candidate_request": {
+    "strategy_id": "19131631-1d46-4095-ab0b-8702aabac9d1",
+    "research_job_id": "4f39f4ff-3c54-44e1-a190-b0123feba503",
+    "config": {
+      "bar_type": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL",
+      "trade_size": "1",
+      "instrument_id": "AAPL.XNAS",
+      "fast_ema_period": 5,
+      "slow_ema_period": 20,
+      "instruments": [
+        "AAPL.XNAS"
+      ],
+      "asset_class": "stocks"
+    },
+    "metrics": {
+      "win_rate": 0.36,
+      "num_trades": 100,
+      "max_drawdown": -8.699997041672347e-07,
+      "sharpe_ratio": -4.32786031404986,
+      "total_return": -5.299999999115244e-05,
+      "sortino_ratio": -5.502869104311565
+    },
+    "notes": "Runtime audit 2026-10-03. Operational test only; negative gross results, no investment approval or live promotion."
+  },
+  "candidate_submission": {
+    "http": 201,
+    "body": {
+      "id": "6ac330e0-6dbe-4127-8840-5cab08793b83",
+      "strategy_id": "19131631-1d46-4095-ab0b-8702aabac9d1",
+      "research_job_id": "4f39f4ff-3c54-44e1-a190-b0123feba503",
+      "stage": "discovery",
+      "config": {
+        "bar_type": "AAPL.XNAS-1-MINUTE-LAST-EXTERNAL",
+        "trade_size": "1",
+        "asset_class": "stocks",
+        "instruments": [
+          "AAPL.XNAS"
+        ],
+        "instrument_id": "AAPL.XNAS",
+        "fast_ema_period": 5,
+        "slow_ema_period": 20
+      },
+      "metrics": {
+        "win_rate": 0.36,
+        "num_trades": 100,
+        "max_drawdown": -8.699997041672347e-07,
+        "sharpe_ratio": -4.32786031404986,
+        "total_return": -5.299999999115244e-05,
+        "sortino_ratio": -5.502869104311565
+      },
+      "deployment_id": null,
+      "notes": "Runtime audit 2026-10-03. Operational test only; negative gross results, no investment approval or live promotion.",
+      "promoted_by": "d1d2bfef-0a9c-4bf1-a9db-679ed3992d8a",
+      "promoted_at": "2026-10-03T17:45:56.232285Z",
+      "created_at": "2026-10-03T17:45:56.166827",
+      "updated_at": "2026-10-03T17:45:56.166827"
+    }
+  },
+  "portfolio_request": {
+    "name": "Runtime audit 2026-10-03",
+    "description": "Local operational test only; no live promotion. Existing AAPL data and observed EMA results.",
+    "objective": "manual",
+    "base_capital": 100000,
+    "allocations": [
+      {
+        "candidate_id": "6ac330e0-6dbe-4127-8840-5cab08793b83",
+        "weight": 1.0
+      }
+    ],
+    "default_mode": "quick",
+    "allocator_name": "fixed_weight"
+  },
+  "portfolio_submission": {
+    "http": 201,
+    "body": {
+      "id": "306c1614-c23b-4770-a252-f0b8bec0a424",
+      "name": "Runtime audit 2026-10-03",
+      "description": "Local operational test only; no live promotion. Existing AAPL data and observed EMA results.",
+      "objective": "manual",
+      "base_capital": 100000.0,
+      "requested_leverage": 1.0,
+      "downside_target": null,
+      "benchmark_symbol": null,
+      "account_id": null,
+      "max_position_size": null,
+      "max_drawdown_halt": null,
+      "default_mode": "quick",
+      "allocator_name": "fixed_weight",
+      "created_at": "2026-10-03T17:45:56.375712",
+      "updated_at": "2026-10-03T17:45:56.375712"
+    }
+  },
+  "portfolio_run_request": {
+    "start_date": "2025-01-22",
+    "end_date": "2025-01-25",
+    "max_parallelism": 1,
+    "mode": "quick",
+    "smoke": false
+  },
+  "portfolio_run_submission": {
+    "http": 201,
+    "body": {
+      "id": "2fd27304-967e-4a81-aa03-7087f3404847",
+      "portfolio_id": "306c1614-c23b-4770-a252-f0b8bec0a424",
+      "status": "pending",
+      "metrics": null,
+      "series": null,
+      "allocations": null,
+      "report_path": null,
+      "start_date": "2025-01-22",
+      "end_date": "2025-01-25",
+      "max_parallelism": 1,
+      "error_message": null,
+      "heartbeat_at": null,
+      "created_at": "2026-10-03T17:45:56.449303",
+      "updated_at": "2026-10-03T17:45:56.449303Z",
+      "completed_at": null,
+      "mode": "quick",
+      "optimization_trace": null,
+      "walk_forward_payload": null,
+      "is_metric": null,
+      "oos_metric": null,
+      "smoke": false
+    }
+  },
+  "portfolio_result": {
+    "id": "2fd27304-967e-4a81-aa03-7087f3404847",
+    "portfolio_id": "306c1614-c23b-4770-a252-f0b8bec0a424",
+    "status": "completed",
+    "metrics": {
+      "beta": null,
+      "alpha": null,
+      "sharpe": -4.955568177688989,
+      "sortino": -5.161980295612856,
+      "win_rate": 0.3333333333333333,
+      "max_drawdown": -8.699997041672347e-07,
+      "total_return": -4.900000195595666e-07,
+      "downside_risk": 7.973678997871081e-06,
+      "num_strategies": 1,
+      "effective_leverage": 1.0,
+      "annualized_volatility": 8.305803168214586e-06
+    },
+    "series": [
+      {
+        "equity": 100000.0,
+        "returns": 0.0,
+        "drawdown": 0.0,
+        "timestamp": "2025-01-22T00:00:00+00:00"
+      },
+      {
+        "equity": 100000.03800000153,
+        "returns": 3.800000152320848e-07,
+        "drawdown": 0.0,
+        "timestamp": "2025-01-23T00:00:00+00:00"
+      },
+      {
+        "equity": 99999.95099999805,
+        "returns": -8.699997041672347e-07,
+        "drawdown": -8.699997041672347e-07,
+        "timestamp": "2025-01-24T00:00:00+00:00"
+      }
+    ],
+    "allocations": [
+      {
+        "weight": 1.0,
+        "metrics": {
+          "win_rate": 0.36,
+          "num_trades": 100,
+          "max_drawdown": -8.699997041672347e-07,
+          "sharpe_ratio": -4.32786031404986,
+          "total_return": -5.299999999115244e-05,
+          "sortino_ratio": -5.502869104311565
+        },
+        "returns": [
+          0.0,
+          3.800000152320848e-07,
+          -8.699997041672347e-07
+        ],
+        "timestamps": [
+          "2025-01-22T00:00:00+00:00",
+          "2025-01-23T00:00:00+00:00",
+          "2025-01-24T00:00:00+00:00"
+        ],
+        "instruments": [
+          "AAPL.XNAS"
+        ],
+        "strategy_id": "19131631-1d46-4095-ab0b-8702aabac9d1",
+        "trade_count": 100,
+        "candidate_id": "6ac330e0-6dbe-4127-8840-5cab08793b83",
+        "strategy_name": "example.ema_cross"
+      }
+    ],
+    "report_path": "/app/data/reports/2fd27304-967e-4a81-aa03-7087f3404847.html",
+    "start_date": "2025-01-22",
+    "end_date": "2025-01-25",
+    "max_parallelism": 1,
+    "error_message": null,
+    "heartbeat_at": "2026-10-03T17:46:08.863703Z",
+    "created_at": "2026-10-03T17:45:56.449303",
+    "updated_at": "2026-10-03T17:46:08.878005Z",
+    "completed_at": "2026-10-03T17:46:08.863703Z",
+    "mode": "quick",
+    "optimization_trace": null,
+    "walk_forward_payload": {
+      "drawdown_breakdown": {
+        "19131631-1d46-4095-ab0b-8702aabac9d1": {
+          "recovered": false,
+          "max_drawdown": -8.699997041672347e-07,
+          "duration_days": 1
+        }
+      },
+      "return_correlation": {
+        "19131631-1d46-4095-ab0b-8702aabac9d1": {
+          "19131631-1d46-4095-ab0b-8702aabac9d1": 1.0
+        }
+      },
+      "per_strategy_equity": [
+        {
+          "equity": 100000.0,
+          "timestamp": "2025-01-22T00:00:00+00:00",
+          "strategy_id": "19131631-1d46-4095-ab0b-8702aabac9d1"
+        },
+        {
+          "equity": 100000.03800000153,
+          "timestamp": "2025-01-23T00:00:00+00:00",
+          "strategy_id": "19131631-1d46-4095-ab0b-8702aabac9d1"
+        },
+        {
+          "equity": 99999.95099999805,
+          "timestamp": "2025-01-24T00:00:00+00:00",
+          "strategy_id": "19131631-1d46-4095-ab0b-8702aabac9d1"
+        }
+      ],
+      "drawdown_correlation": {
+        "19131631-1d46-4095-ab0b-8702aabac9d1": {
+          "19131631-1d46-4095-ab0b-8702aabac9d1": 1.0
+        }
+      },
+      "per_strategy_drawdown": [
+        {
+          "drawdown": 0.0,
+          "timestamp": "2025-01-22T00:00:00+00:00",
+          "strategy_id": "19131631-1d46-4095-ab0b-8702aabac9d1"
+        },
+        {
+          "drawdown": 0.0,
+          "timestamp": "2025-01-23T00:00:00+00:00",
+          "strategy_id": "19131631-1d46-4095-ab0b-8702aabac9d1"
+        },
+        {
+          "drawdown": -8.699997041672347e-07,
+          "timestamp": "2025-01-24T00:00:00+00:00",
+          "strategy_id": "19131631-1d46-4095-ab0b-8702aabac9d1"
+        }
+      ]
+    },
+    "is_metric": null,
+    "oos_metric": null,
+    "smoke": false
+  },
+  "portfolio_report": {
+    "http": 200,
+    "bytes": 327741,
+    "content_type": "text/html; charset=utf-8",
+    "quantstats": true,
+    "empty_fallback": false,
+    "basic_fallback": false
+  }
+}

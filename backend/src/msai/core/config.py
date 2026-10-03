@@ -159,17 +159,15 @@ class Settings(BaseSettings):
     # fleet). In production the backend builds the KV-backed store via the VM
     # managed identity; ``main.py`` fails LOUD if this is unset in prod with an
     # active live deployment. Blank/None in dev → file-backed store. Declared
-    # here (not just read via ``os.environ`` in main.py) because operators are
-    # told to set it in ``.env`` (see ``.env.example``); pydantic-settings
-    # ``extra="forbid"`` would otherwise reject the dotenv key and crash
-    # ``Settings()`` at import (iter-5 P2-1).
+    # here (not just read via ``os.environ`` in main.py) so the shared ``.env``
+    # value is available through Settings too (see ``.env.example``).
     azure_keyvault_uri: str | None = Field(
         default=None,
         validation_alias=AliasChoices("AZURE_KEYVAULT_URI"),
     )
     # Optional user-assigned managed-identity client id for the KV store. NEVER
     # reuse ``AZURE_CLIENT_ID`` (the JWT audience) — Codex iter-3 P1. Blank/None
-    # → system-assigned MI. Declared for the same dotenv-extra reason as above.
+    # → system-assigned MI.
     azure_kv_mi_client_id: str | None = Field(
         default=None,
         validation_alias=AliasChoices("AZURE_KV_MI_CLIENT_ID"),
@@ -179,8 +177,7 @@ class Settings(BaseSettings):
     # ``None``/blank → built-in defaults. The supervisor threads this into the
     # ``TradingNodePayload.data_freshness_grace_json`` field, which the
     # subprocess feeds to ``GraceConfig.from_env_json`` at monitor-wiring time
-    # (fail-loud on invalid JSON / unknown keys). Declared here so operators can
-    # list it in ``.env`` without tripping pydantic-settings ``extra="forbid"``.
+    # (fail-loud on invalid JSON / unknown keys).
     data_freshness_grace_json: str | None = Field(
         default=None,
         validation_alias=AliasChoices("DATA_FRESHNESS_GRACE_JSON"),
@@ -188,10 +185,8 @@ class Settings(BaseSettings):
     # One-time, env-driven backfill string consumed by the broker-accounts
     # backfill Alembic migration (``d97a64e13e4e``) to seed legacy per-env
     # accounts. The migration reads ``BROKER_ACCOUNT_BACKFILL`` directly via
-    # ``os.environ`` (NOT via this field) — it is declared here ONLY so that an
-    # operator who lists it in ``.env`` (per ``.env.example``) does not trip the
-    # pydantic-settings ``extra="forbid"`` guard and crash ``Settings()`` at
-    # import. Empty default = no backfill (safe no-op).
+    # ``os.environ`` (NOT via this field). Retained as a Settings field for
+    # compatibility; empty default = no backfill (safe no-op).
     broker_account_backfill: str = Field(
         default="",
         validation_alias=AliasChoices("BROKER_ACCOUNT_BACKFILL"),
@@ -361,7 +356,15 @@ class Settings(BaseSettings):
         ),
     )
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    # The root dotenv is shared with Compose, the gateway and frontend. Ignore
+    # their keys while still validating every declared application setting.
+    # Validation diagnostics must identify the field without echoing its value.
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        hide_input_in_errors=True,
+    )
 
     @field_validator("data_root", "strategies_root", mode="before")
     @classmethod

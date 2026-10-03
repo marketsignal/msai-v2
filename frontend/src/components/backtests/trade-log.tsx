@@ -23,6 +23,7 @@ import {
   ApiError,
   getBacktestTrades,
   type BacktestTradeItem,
+  type BacktestAccounting,
   type BacktestTradesResponse,
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -64,8 +65,10 @@ export function TradeLog({
   const [page, setPage] = useState(1);
   const [items, setItems] = useState<BacktestTradeItem[]>([]);
   const [total, setTotal] = useState(0);
+  const [accounting, setAccounting] = useState<BacktestAccounting | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [reloadCount, setReloadCount] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -82,11 +85,13 @@ export function TradeLog({
         if (cancelled) return;
         setItems(res.items);
         setTotal(res.total);
+        setAccounting(res.accounting ?? null);
       } catch (e: unknown) {
         if (!cancelled) {
           setError(apiErrorToTradesCopy(e));
           setItems([]);
           setTotal(0);
+          setAccounting(null);
         }
       } finally {
         if (!cancelled) setLoading(false);
@@ -96,20 +101,31 @@ export function TradeLog({
     return () => {
       cancelled = true;
     };
-  }, [backtestId, page, pageSize, getToken]);
+  }, [backtestId, page, pageSize, getToken, reloadCount]);
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
-  const canPrev = page > 1 && !loading;
-  const canNext = page < totalPages && !loading;
+  const canPrev = page > 1 && !loading && !error;
+  const canNext = page < totalPages && !loading && !error;
 
   return (
     <Card className="border-border/50" data-testid="trade-log">
       <CardHeader className="flex flex-row items-center justify-between">
         <div>
-          <CardTitle className="text-base">Trade Log</CardTitle>
+          <CardTitle className="text-base">
+            {loading || error
+              ? "Execution Records"
+              : accounting ? "Fill Log" : "Legacy Order Records"}
+          </CardTitle>
           <CardDescription>
-            {total > 0 ? `${total} fills` : "No trades executed"} · Page {page}{" "}
-            of {totalPages}
+            {loading ? "Loading execution records…" : error ? "Record count unavailable." : (
+              <>{total} {accounting ? "fills" : "records"} · Page {page} of {totalPages}</>
+            )}
+            {!loading && !error && !accounting && (
+              <span className="block mt-1">
+                Recorded order quantities and prices are unverified.
+                P&amp;L and fees are unavailable.
+              </span>
+            )}
           </CardDescription>
         </div>
         <div className="flex items-center gap-2">
@@ -143,12 +159,17 @@ export function TradeLog({
             <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
           </div>
         ) : error !== null ? (
-          <p className="py-8 text-center text-sm text-destructive">
-            Unable to load trades: {error}
-          </p>
+          <div className="flex flex-col items-center gap-3 py-8" role="alert">
+            <p className="text-center text-sm text-destructive">
+              Unable to load trades: {error}
+            </p>
+            <Button variant="outline" onClick={() => setReloadCount((count) => count + 1)}>
+              Retry
+            </Button>
+          </div>
         ) : items.length === 0 ? (
           <p className="py-8 text-center text-sm text-muted-foreground">
-            No trades executed in this backtest.
+            No {accounting ? "fills" : "records"} in this backtest.
           </p>
         ) : (
           <Table>
@@ -157,10 +178,14 @@ export function TradeLog({
                 <TableHead>Timestamp</TableHead>
                 <TableHead>Instrument</TableHead>
                 <TableHead>Side</TableHead>
-                <TableHead className="text-right">Quantity</TableHead>
-                <TableHead className="text-right">Price</TableHead>
-                <TableHead className="text-right">P&amp;L</TableHead>
-                <TableHead className="text-right">Commission</TableHead>
+                <TableHead className="text-right">
+                  {accounting ? "Filled quantity" : "Reported quantity"}
+                </TableHead>
+                <TableHead className="text-right">
+                  {accounting ? "Fill price (USD)" : "Reported price"}
+                </TableHead>
+                <TableHead className="text-right">Realized P&amp;L (USD)</TableHead>
+                <TableHead className="text-right">Commission (USD)</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -177,17 +202,19 @@ export function TradeLog({
                   </TableCell>
                   <TableCell className="text-right">{t.quantity}</TableCell>
                   <TableCell className="text-right">
-                    ${t.price.toFixed(2)}
+                    {accounting ? "$" : ""}{t.price.toFixed(2)}
                   </TableCell>
                   <TableCell
                     className={`text-right ${
-                      t.pnl >= 0 ? "text-emerald-500" : "text-red-500"
+                      t.pnl === null
+                        ? "text-muted-foreground"
+                        : t.pnl >= 0 ? "text-emerald-500" : "text-red-500"
                     }`}
                   >
-                    ${t.pnl.toFixed(2)}
+                    {t.pnl === null ? "Unavailable" : `$${t.pnl.toFixed(2)}`}
                   </TableCell>
                   <TableCell className="text-right">
-                    ${t.commission.toFixed(2)}
+                    {t.commission === null ? "Unavailable" : `$${t.commission.toFixed(2)}`}
                   </TableCell>
                 </TableRow>
               ))}

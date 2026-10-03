@@ -2871,11 +2871,11 @@ def backtest_trades(
     all_pages: bool = typer.Option(
         False,
         "--all",
-        help="Loop through all pages and emit a merged ``items`` list",
+        help="Merge all pages, preserving their accounting metadata",
     ),
     out: str = typer.Option("", "--out", help="Output JSON file path (default: stdout)"),
 ) -> None:
-    """Fetch paginated trades for a backtest."""
+    """Fetch fills, or legacy order records when accounting is unavailable."""
     safe_id = _url_id(backtest_id)
     if not all_pages:
         response = _api_call(
@@ -2896,6 +2896,7 @@ def backtest_trades(
     aggregated: list[Any] = []
     current_page = 1
     total: int | None = None
+    accounting: dict[str, Any] | None = None
     while True:
         response = _api_call(
             "GET",
@@ -2903,6 +2904,11 @@ def backtest_trades(
             params={"page": current_page, "page_size": page_size},
         )
         page_payload = response.json()
+        page_accounting = page_payload.get("accounting")
+        if current_page == 1:
+            accounting = page_accounting
+        elif page_accounting != accounting:
+            _fail("accounting metadata changed between pages; retry the export")
         items = page_payload.get("items", [])
         aggregated.extend(items)
         if total is None:
@@ -2911,7 +2917,12 @@ def backtest_trades(
         if len(items) < server_page_size:
             break
         current_page += 1
-    merged: dict[str, Any] = {"items": aggregated, "total": total, "pages_fetched": current_page}
+    merged: dict[str, Any] = {
+        "items": aggregated,
+        "total": total,
+        "pages_fetched": current_page,
+        "accounting": accounting,
+    }
     if out:
         with open(out, "w", encoding="utf-8") as fh:
             json.dump(merged, fh, indent=2, default=str)

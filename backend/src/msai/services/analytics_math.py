@@ -104,7 +104,7 @@ def build_series_from_returns(
         return pd.DataFrame(columns=["timestamp", "returns", "equity", "drawdown"])
 
     equity = (1.0 + series).cumprod() * float(base_value)
-    drawdown = equity / equity.cummax() - 1.0
+    drawdown = equity / equity.cummax().clip(lower=float(base_value)) - 1.0
     frame = pd.DataFrame(
         {
             "timestamp": series.index,
@@ -141,7 +141,7 @@ def compute_series_metrics(
     downside = series.where(series < 0.0, 0.0)
     downside_std = float((downside.pow(2).mean()) ** 0.5)
     equity = (1.0 + series).cumprod()
-    drawdown = equity / equity.cummax() - 1.0
+    drawdown = equity / equity.cummax().clip(lower=1.0) - 1.0
 
     alpha: float | None = None
     beta: float | None = None

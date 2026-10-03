@@ -1,5 +1,8 @@
 import { defineConfig, devices } from "@playwright/test";
 
+const existingTarget = process.env.PLAYWRIGHT_BASE_URL;
+const localTarget = "http://localhost:3300";
+
 /**
  * Playwright configuration.
  * See https://playwright.dev/docs/test-configuration for full options.
@@ -30,7 +33,7 @@ export default defineConfig({
 
   use: {
     // Base URL — override via PLAYWRIGHT_BASE_URL env var
-    baseURL: process.env.PLAYWRIGHT_BASE_URL || "http://localhost:3300",
+    baseURL: existingTarget || localTarget,
 
     // X-API-Key auth bypass (R13/R8 + research finding 5).
     // MSAL storageState is documented-broken (microsoft/playwright#17328),
@@ -96,17 +99,17 @@ export default defineConfig({
     // { name: 'webkit',  use: { ...devices['Desktop Safari'] } },
   ],
 
-  // Dev server auto-start (R13). pnpm dev forwards args via `--`; the
-  // Playwright baseURL above pins port 3300 so dev-server + baseURL stay
-  // aligned. `reuseExistingServer: !CI` lets local Docker-served stacks
-  // be reused; CI starts its own dev server.
-  webServer: {
-    command: "pnpm dev -- --port 3300",
-    url: "http://localhost:3300",
-    reuseExistingServer: !process.env.CI,
-    timeout: 120_000,
-    env: {
-      NEXT_PUBLIC_E2E_AUTH_BYPASS: "1",
-    },
-  },
+  // An explicit target is already running and manages its own authentication.
+  // Otherwise start/reuse the local dev server. pnpm forwards args directly.
+  webServer: existingTarget
+    ? undefined
+    : {
+        command: "pnpm dev --port 3300",
+        url: localTarget,
+        reuseExistingServer: !process.env.CI,
+        timeout: 120_000,
+        env: {
+          NEXT_PUBLIC_E2E_AUTH_BYPASS: "1",
+        },
+      },
 });

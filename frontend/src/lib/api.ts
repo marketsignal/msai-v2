@@ -243,6 +243,8 @@ export interface BacktestMetrics {
   total_return: number;
   win_rate: number;
   num_trades: number;
+  /** Execution count; num_trades is the backward-compatible alias. */
+  num_fills?: number;
   final_equity?: number;
   initial_cash?: number;
 }
@@ -271,12 +273,23 @@ export interface SeriesMonthlyReturn {
 export interface SeriesPayload {
   daily: SeriesDailyPoint[];
   monthly_returns: SeriesMonthlyReturn[];
+  accounting?: BacktestAccounting | null;
+}
+
+export interface BacktestAccounting {
+  version: 1;
+  basis: "realized_account_balance";
+  initial_capital: number;
+  currency: "USD";
+  costs: "engine_recorded";
 }
 
 export interface BacktestResultsResponse {
   id: string;
   metrics: BacktestMetrics | null;
   trade_count: number;
+  /** Missing/null on legacy results with unverified accounting. */
+  accounting?: BacktestAccounting | null;
   /** Canonical normalized series — ``null`` when ``series_status !== "ready"``. */
   series: SeriesPayload | null;
   series_status: SeriesStatus;
@@ -444,14 +457,16 @@ export interface BacktestTradeItem {
   side: "BUY" | "SELL";
   quantity: number;
   price: number;
-  pnl: number;
-  commission: number;
+  pnl: number | null;
+  commission: number | null;
   /** ISO datetime (UTC). */
   executed_at: string;
 }
 
 export interface BacktestTradesResponse {
   items: BacktestTradeItem[];
+  /** Missing/null means these are legacy order records, not verified fills. */
+  accounting?: BacktestAccounting | null;
   total: number;
   page: number;
   page_size: number;

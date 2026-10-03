@@ -769,22 +769,100 @@ async def test_results_returns_404_for_missing_backtest(
 # call gets its tailored result.
 
 
+ACCOUNTING_V1 = {
+    "version": 1,
+    "basis": "realized_account_balance",
+    "initial_capital": 1_000_000.0,
+    "currency": "USD",
+    "costs": "engine_recorded",
+}
+
+
+@pytest.mark.parametrize("versioned", [False, True])
+async def test_results_accounting_survives_missing_series(
+    client: httpx.AsyncClient, versioned: bool
+) -> None:
+    from tests.unit.conftest import _make_backtest_failed_series
+
+    row = _make_backtest_failed_series()
+    row.report_path = None
+    if versioned:
+        row.metrics = {**(row.metrics or {}), "accounting": ACCOUNTING_V1}
+    session = _mock_session_for_results(row, trade_count=6)
+
+    async def _override() -> AsyncGenerator[AsyncSession, None]:
+        yield session
+
+    app.dependency_overrides[get_db] = _override
+    try:
+        async with client as ac:
+            response = await ac.get(f"/api/v1/backtests/{row.id}/results")
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["series"] is None
+        assert body["accounting"] == (ACCOUNTING_V1 if versioned else None)
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+@pytest.mark.parametrize("versioned", [False, True])
+async def test_fill_economics_distinguish_legacy_placeholders_and_actual_values(
+    client: httpx.AsyncClient, versioned: bool
+) -> None:
+    from decimal import Decimal
+
+    from tests.unit.conftest import _make_backtest_with_trades
+
+    row, trades = _make_backtest_with_trades(3)
+    row.metrics = {"accounting": ACCOUNTING_V1} if versioned else {}
+    for trade, value in zip(trades, [None, Decimal("0"), Decimal("1.20")], strict=True):
+        trade.pnl = value
+        trade.commission = value
+    session = _mock_trades_session(
+        backtest_exists=True, total=3, rows=trades, backtest=row
+    )
+
+    async def _override() -> AsyncGenerator[AsyncSession, None]:
+        yield session
+
+    app.dependency_overrides[get_db] = _override
+    try:
+        async with client as ac:
+            response = await ac.get(f"/api/v1/backtests/{row.id}/trades")
+        assert response.status_code == 200, response.text
+        body = response.json()
+        expected = [None, 0.0, 1.2] if versioned else [None, None, None]
+        assert [item["pnl"] for item in body["items"]] == expected
+        assert [item["commission"] for item in body["items"]] == expected
+        assert body["accounting"] == (ACCOUNTING_V1 if versioned else None)
+        # Read-time interpretation must never overwrite the persisted legacy rows.
+        assert trades[1].pnl == Decimal("0")
+        assert trades[2].commission == Decimal("1.20")
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
 def _mock_trades_session(
     *,
     backtest_exists: bool,
     total: int,
     rows: list[Trade],
+    backtest: Backtest | None = None,
 ) -> AsyncMock:
     """Mock session for the /trades handler's three-query flow.
 
-    1. ``SELECT Backtest.id WHERE id == job_id`` (existence check).
+    1. ``SELECT Backtest WHERE id == job_id`` (existence and accounting version).
     2. ``SELECT COUNT(*) FROM trades WHERE backtest_id == job_id``.
     3. ``SELECT Trade rows ORDER BY (executed_at, id) OFFSET LIMIT``.
     """
     session = AsyncMock(spec=AsyncSession)
 
     exists_result = MagicMock()
-    exists_result.scalar_one_or_none.return_value = uuid4() if backtest_exists else None
+    from tests.unit.conftest import _make_backtest
+
+    exists_result.scalar_one_or_none.return_value = (
+        backtest or _make_backtest(status="completed") if backtest_exists else None
+    )
 
     count_result = MagicMock()
     count_result.scalar_one.return_value = total

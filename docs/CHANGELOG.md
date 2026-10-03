@@ -4,6 +4,17 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-10-03 — Research foundation: balance accounting and interface reliability
+
+Candidate implementation in `fix/research-foundation`; release and complete research-validity acceptance remain pending.
+
+- Backtest returns use ratios, preserve the first session, and derive headline metrics and charts from the same configured USD opening capital. Asynchronous account updates carry forward each account's balance; unsupported currency or missing opening state fails explicitly.
+- Execution records come from individual Nautilus fills with actual quantity, price, timestamp and recorded commission. Unknown per-fill P&L remains null. Unversioned historical rows are labeled legacy order records and their placeholder economics are unavailable. Existing eligibility counts now count fills, not requested orders or independent closed outcomes.
+- Results disclose realized-balance and engine-cost limitations. Native charts preserve the opening-capital baseline. Full reports present matching primary balance metrics, including initial-loss drawdown, while identifying supplemental QuantStats conventions.
+- CLI startup tolerates unrelated shared-dotenv keys while retaining known-field and production validation; diagnostic input values are hidden. Browser harness startup uses the correct argument forwarding and leaves an explicit existing target's server management alone.
+- Paginated CLI exports preserve accounting metadata and refuse inconsistent pages. Backtest history distinguishes loading, unavailable and true-empty states, offers Retry/Refresh, and ignores superseded filter responses. The execution log does not imply zero records during a failed load and offers same-page Retry. Responsive metric cards and chart axes keep small percentage values readable. Real-browser acceptance exposed these defects after isolated accounting checks had passed.
+- The revised [Master Map](../MASTER_MAP.md), [Master Plan](../MASTER_PLAN.md) and shared project context retain the broader research, portfolio, account and operational gates. See the [repair explanation](solutions/backtesting/account-balance-and-fill-economics.md) for evidence and limits. No database migration or historical-result rewrite is included.
+
 ### 2026-06-10 — Feature: always-on IB Gateway watchdog (prod, `feat/ib-gateway-watchdog`)
 
 **Status:** new prod-only operational capability that keeps the single prod `ib-gateway` container's IB **session** up — not just the container. Closes the idle-gap surfaced 2026-06-09/10: Docker `restart:unless-stopped` only acts on container EXIT, so a gateway sitting `Up (unhealthy)` with IB API 4001 refused (the HVP paper-vs-live login case) was never remediated or alerted when no live deployment was running. The watchdog keys off IB-session health (4001 probe + `gateway_connected`), not container-up.

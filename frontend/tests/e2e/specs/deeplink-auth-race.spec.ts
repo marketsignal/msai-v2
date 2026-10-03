@@ -20,9 +20,9 @@
  * does not regress the dev render/persist path. The race fix itself is proven by the
  * post-deploy prod re-test (see the use-case file's verification note).
  *
- * Known harness issue (pre-existing, shared by all specs): playwright.config.ts's
- * webServer command (`pnpm dev -- --port 3300`) is misparsed by Next when Playwright
- * has to launch its own server; run against the already-running dev stack instead.
+ * The default harness starts/reuses the dev frontend on :3300. Set
+ * PLAYWRIGHT_BASE_URL to target an already-running environment without local
+ * server management; that environment must supply its own documented auth setup.
  */
 import { test, expect } from "@playwright/test";
 

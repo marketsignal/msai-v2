@@ -22,17 +22,18 @@ avoids pipe deadlocks.
 
 from __future__ import annotations
 
+import math
 import multiprocessing as mp
 import pickle
 import tempfile
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
 import pandas as pd
 
-from msai.services.analytics_math import compute_series_metrics
+from msai.services.analytics_math import compute_series_metrics, normalize_daily_returns
 from msai.services.nautilus.strategy_loader import resolve_importable_strategy_paths
 
 # NautilusTrader is heavy (pulls in Rust extensions).  We import eagerly
@@ -116,6 +117,8 @@ class BacktestResult:
     positions_df: pd.DataFrame
     account_df: pd.DataFrame
     metrics: dict[str, float | int]
+    fills_df: pd.DataFrame = field(default_factory=pd.DataFrame)
+    accounting: dict[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +264,8 @@ class BacktestRunner:
 
             return BacktestResult(
                 orders_df=pd.DataFrame(raw.get("orders", [])),
+                fills_df=pd.DataFrame(raw.get("fills", [])),
+                accounting=raw.get("accounting"),
                 positions_df=pd.DataFrame(raw.get("positions", [])),
                 account_df=pd.DataFrame(raw.get("account", [])),
                 metrics=cast("dict[str, float | int]", raw.get("metrics", _zero_metrics())),
@@ -339,22 +344,48 @@ def _run_in_subprocess(payload: _RunPayload) -> None:
             # (gotcha #2). Phase 2 task 2.9: derive per-venue account
             # reports and concatenate them for multi-venue backtests.
             orders_df = engine.trader.generate_orders_report()
+            fills_df = engine.trader.generate_fills_report()
+            if not fills_df.empty:
+                fills_df = fills_df.reset_index().sort_values("ts_event", kind="stable")
             positions_df = engine.trader.generate_positions_report()
             venue_names = _extract_venues_from_instrument_ids(payload.instrument_ids)
-            account_frames = [
-                engine.trader.generate_account_report(venue=Venue(v)) for v in venue_names
-            ]
+            account_frames = []
+            opening_balances: dict[str, float] = {}
+            for venue_name, venue_config in zip(venue_names, run_config.venues, strict=True):
+                frame = engine.trader.generate_account_report(venue=Venue(venue_name))
+                if frame.empty or "account_id" not in frame:
+                    raise ValueError(f"Missing opening account report for {venue_name}")
+                account_ids = frame["account_id"].dropna().astype(str).unique()
+                if len(account_ids) != 1 or account_ids[0] in opening_balances:
+                    raise ValueError("Ambiguous account identity in backtest report")
+                balances = venue_config.starting_balances
+                if len(balances) != 1:
+                    raise ValueError("Backtest accounting supports one USD balance per account")
+                amount, currency = str(balances[0]).split()
+                if currency != "USD":
+                    raise ValueError("Backtest accounting supports USD only")
+                opening_balances[account_ids[0]] = float(amount)
+                account_frames.append(frame)
             account_df = pd.concat(account_frames) if account_frames else pd.DataFrame()
-            account_payload = _compact_account_report(account_df)
+            account_payload = _compact_account_report(account_df, opening_balances=opening_balances)
+            accounting = {
+                "version": 1,
+                "basis": "realized_account_balance",
+                "initial_capital": sum(opening_balances.values()),
+                "currency": "USD",
+                "costs": "engine_recorded",
+            }
 
             _write_subprocess_result(
                 payload.result_path,
                 {
                     "ok": True,
                     "orders": orders_df.to_dict(orient="records"),
+                    "fills": fills_df.to_dict(orient="records"),
+                    "accounting": accounting,
                     "positions": positions_df.to_dict(orient="records"),
                     "account": account_payload.to_dict(orient="records"),
-                    "metrics": _extract_metrics(primary, orders_df, account_payload, positions_df),
+                    "metrics": _extract_metrics(primary, fills_df, account_payload, positions_df),
                 },
             )
         finally:
@@ -438,83 +469,60 @@ def _build_backtest_run_config(payload: _RunPayload) -> BacktestRunConfig:
 # ---------------------------------------------------------------------------
 
 
-def _compact_account_report(account_df: pd.DataFrame) -> pd.DataFrame:
-    """Reduce the raw Nautilus account report to a daily equity/returns series.
+def _compact_account_report(
+    account_df: pd.DataFrame, *, opening_balances: dict[str, float]
+) -> pd.DataFrame:
+    """Compact USD account balances, preserving every account's opening capital.
 
-    The raw report can have thousands of intraday rows.  We compact it to
-    one row per day with ``timestamp``, ``equity``, and ``returns`` columns
-    so that downstream analytics and the QuantStats tearsheet generator
-    get a clean daily time series.
+    Dates are observed UTC balance-report dates, not an exchange calendar.
+    This is a realized balance series, not marked-to-market NAV.
     """
+    if not opening_balances or any(
+        not math.isfinite(value) or value <= 0 for value in opening_balances.values()
+    ):
+        raise ValueError("Missing or invalid opening account balances")
     if account_df.empty:
-        return pd.DataFrame(columns=["timestamp", "returns", "equity"])
-
+        raise ValueError("Missing account balance observations")
     frame = account_df.copy()
     if isinstance(frame.index, pd.DatetimeIndex):
-        frame = frame.reset_index().rename(columns={frame.index.name or "index": "timestamp"})
-    timestamp_col = _first_present(
-        frame.columns,
-        ("timestamp", "ts_last", "ts_event", "ts_init", "datetime", "date"),
-    )
-    if timestamp_col is None:
-        return frame
-
+        index_name = frame.index.name or "index"
+        frame = frame.reset_index().rename(columns={index_name: "timestamp"})
+    timestamp_col = _first_present(frame.columns, ("timestamp", "ts_event"))
+    if timestamp_col is None or not {"account_id", "currency", "total"}.issubset(frame):
+        raise ValueError("Account report lacks timestamp, account, currency or total")
+    if frame["currency"].isna().any() or set(frame["currency"].astype(str)) != {"USD"}:
+        raise ValueError("Backtest account balances must all be USD")
+    if frame["account_id"].isna().any():
+        raise ValueError("Missing account identity")
+    frame["account_id"] = frame["account_id"].astype(str)
+    if set(frame["account_id"]) != set(opening_balances):
+        raise ValueError("Every reported account must have a known opening balance")
     frame[timestamp_col] = pd.to_datetime(frame[timestamp_col], utc=True, errors="coerce")
-    frame = frame.dropna(subset=[timestamp_col]).sort_values(timestamp_col)
-    if frame.empty:
-        return pd.DataFrame(columns=["timestamp", "returns", "equity"])
-
-    equity_col = _first_present(
-        frame.columns,
-        ("equity", "equity_total", "balance_total", "total", "balance", "net_liquidation"),
+    frame["total"] = pd.to_numeric(frame["total"], errors="coerce")
+    if frame[timestamp_col].isna().any() or not frame["total"].map(math.isfinite).all():
+        raise ValueError("Invalid account timestamp or balance")
+    frame = frame.sort_values(timestamp_col, kind="stable")
+    # Each account is a state stream. Seed from configuration, then carry its
+    # last state forward at the union of all event times before adding accounts.
+    aligned = (
+        frame.pivot_table(index=timestamp_col, columns="account_id", values="total", aggfunc="last")
+        .sort_index()
+        .ffill()
+        .fillna(opening_balances)
     )
-    returns_col = _first_present(frame.columns, ("returns", "return", "pnl_pct", "pnl_percent"))
-
-    if equity_col is not None:
-        frame[equity_col] = pd.to_numeric(frame[equity_col], errors="coerce")
-        frame = frame.dropna(subset=[equity_col])
-        if frame.empty:
-            return pd.DataFrame(columns=["timestamp", "returns", "equity"])
-        account_id_col = _first_present(frame.columns, ("account_id",))
-        if account_id_col is not None:
-            deduped = frame.groupby([timestamp_col, account_id_col], as_index=False)[
-                equity_col
-            ].last()
-            intraday_equity = (
-                deduped.groupby(timestamp_col, as_index=True)[equity_col].sum().sort_index()
-            )
-        else:
-            intraday_equity = (
-                frame.groupby(timestamp_col, as_index=True)[equity_col].last().sort_index()
-            )
-        grouped = intraday_equity.groupby(intraday_equity.index.normalize(), as_index=True).last()
-        compact = pd.DataFrame(
-            {
-                "timestamp": grouped.index,
-                "equity": grouped.values,
-                "returns": grouped.pct_change().fillna(0.0).values,
-            }
-        )
-        return compact
-
-    if returns_col is not None:
-        grouped_returns = (
-            frame.groupby(frame[timestamp_col].dt.normalize(), as_index=True)[returns_col]
-            .apply(
-                lambda values: (
-                    (1.0 + pd.to_numeric(values, errors="coerce").fillna(0.0)).prod() - 1.0
-                )
-            )
-            .sort_index()
-        )
-        return pd.DataFrame(
-            {
-                "timestamp": grouped_returns.index,
-                "returns": grouped_returns.values,
-            }
-        )
-
-    return frame
+    balances = aligned.sum(axis=1)
+    daily = balances.groupby(balances.index.normalize()).last()
+    previous = daily.shift(1)
+    previous.iloc[0] = sum(opening_balances.values())
+    if (previous <= 0).any():
+        raise ValueError("Account returns require a positive prior balance")
+    return pd.DataFrame(
+        {
+            "timestamp": daily.index,
+            "equity": daily.values,
+            "returns": (daily / previous - 1.0).values,
+        }
+    )
 
 
 def _first_present(columns: pd.Index, names: tuple[str, ...]) -> str | None:
@@ -534,86 +542,42 @@ def _first_present(columns: pd.Index, names: tuple[str, ...]) -> str | None:
 
 def _extract_metrics(
     primary_result: object,
-    orders_df: pd.DataFrame,
+    fills_df: pd.DataFrame,
     account_df: pd.DataFrame | None = None,
     positions_df: pd.DataFrame | None = None,
 ) -> dict[str, float | int]:
-    """Pull a normalised metrics dict out of the Nautilus result object.
+    """Use daily account balance returns for account-level performance.
 
-    NautilusTrader exposes two relevant stat dicts with human-readable keys:
-
-    * ``stats_returns`` -- flat dict: ``"Sharpe Ratio (252 days)"``,
-      ``"Sortino Ratio (252 days)"``, ``"Profit Factor"``, etc.
-    * ``stats_pnls`` -- nested dict keyed by currency:
-      ``{"USD": {"PnL% (total)": 0.14, "Win Rate": 0.38, ...}}``
-
-    We look up each metric by a small list of candidate key prefixes so
-    minor version changes ("Sharpe Ratio (252 days)" vs "Sharpe Ratio")
-    don't silently zero-out the dashboard.
-
-    Three-tier fallback for win_rate / total_return / max_drawdown:
-
-    1. Nautilus ``stats_pnls`` / ``stats_returns`` (preferred — Nautilus
-       computes them with full position context).
-    2. Per-position ``realized_pnl`` from ``positions_df`` (covers cases
-       where ``stats_pnls`` is empty or NaN — happens on short windows
-       and certain strategy configs where the engine couldn't aggregate).
-    3. Returns series in ``account_df`` (last resort — account snapshot).
-
-    Without the positions tier, every backtest whose Nautilus stats came
-    back NaN reported ``win_rate=0`` and ``total_return=0`` even when
-    thousands of positions had been closed with real PnL. Surfaced by the
-    first-real-backtest milestone 2026-04-15 (4 448 trades, all metrics
-    zero in the API response).
+    Native ``PnL%`` is percentage-valued; API returns are ratios. Native
+    position-return Sharpe and position-notional returns cannot substitute
+    for daily account metrics. Undefined risk statistics retain the existing
+    numeric zero sentinel. ``num_trades`` remains the eligibility input but
+    now counts actual fills, also exposed explicitly as ``num_fills``.
     """
-    stats_returns = getattr(primary_result, "stats_returns", None) or {}
     stats_pnls = getattr(primary_result, "stats_pnls", None) or {}
-
-    # Flat returns stats -- sharpe / sortino / drawdown
-    sharpe = _find_float(stats_returns, ["sharpe ratio", "sharpe"])
-    sortino = _find_float(stats_returns, ["sortino ratio", "sortino"])
-    max_drawdown = _find_float(stats_returns, ["max drawdown", "maximum drawdown"])
-
-    # PnL stats live under a currency key (usually "USD"). Pick the first one.
     currency_stats: dict[str, object] = {}
     if isinstance(stats_pnls, dict) and stats_pnls:
-        first = next(iter(stats_pnls.values()))
-        if isinstance(first, dict):
-            currency_stats = first
-
-    total_return = _find_float(currency_stats, ["pnl% (total)", "pnl%", "return"])
+        if set(stats_pnls) != {"USD"}:
+            raise ValueError("Backtest PnL statistics must be USD")
+        currency_stats = stats_pnls["USD"]
+    native_percent = _find_float(currency_stats, ["pnl% (total)", "pnl%"])
+    total_return = (
+        native_percent / 100.0
+        if math.isfinite(native_percent)
+        else _find_float(currency_stats, ["return"])
+    )
     win_rate = _find_float(currency_stats, ["win rate"])
-
-    # Account tier — preferred for total_return + max_drawdown when
-    # available. The account snapshot is the EXACT portfolio equity
-    # path so it captures capital recycling and open-position drag
-    # that the positions-derived realized-PnL approximation misses.
-    # Codex review P1: positions tier was wrongly running before
-    # account tier and shadowing the more accurate values.
-    account_derived: dict[str, float] | None = None
-    if account_df is not None:
-        account_derived = _derive_metrics_from_account(account_df)
+    sharpe = sortino = max_drawdown = 0.0
+    account_derived = _derive_metrics_from_account(account_df) if account_df is not None else None
     if account_derived is not None:
-        if _is_missing(max_drawdown):
-            max_drawdown = account_derived["max_drawdown"]
-        if _is_missing(total_return):
-            total_return = account_derived["total_return"]
-
-    # Positions tier — only source for win_rate (account/stats don't
-    # carry per-trade win/loss). For total_return/max_drawdown it
-    # acts as the LAST resort, behind both Nautilus stats and the
-    # account snapshot. The drill 2026-04-15 hit win_rate=0 because
-    # this tier didn't exist; account tier alone has no win_rate.
-    positions_derived: dict[str, float] | None = None
-    if positions_df is not None and not positions_df.empty:
+        max_drawdown = account_derived["max_drawdown"]
+        total_return = account_derived["total_return"]
+        sharpe = account_derived["sharpe_ratio"]
+        sortino = account_derived["sortino_ratio"]
+    if not math.isfinite(win_rate) and positions_df is not None:
         positions_derived = _derive_metrics_from_positions(positions_df)
-    if positions_derived is not None:
-        if _is_missing(win_rate):
+        if positions_derived is not None:
             win_rate = positions_derived["win_rate"]
-        if _is_missing(total_return):
-            total_return = positions_derived["total_return"]
-        if _is_missing(max_drawdown):
-            max_drawdown = positions_derived["max_drawdown"]
 
     return {
         "sharpe_ratio": _nan_safe(sharpe),
@@ -621,28 +585,13 @@ def _extract_metrics(
         "max_drawdown": _nan_safe(max_drawdown),
         "total_return": _nan_safe(total_return),
         "win_rate": _nan_safe(win_rate),
-        "num_trades": int(len(orders_df)),
+        "num_trades": int(len(fills_df)),
+        "num_fills": int(len(fills_df)),
     }
 
 
 def _derive_metrics_from_positions(positions_df: pd.DataFrame) -> dict[str, float] | None:
-    """Compute win_rate / total_return / max_drawdown from Nautilus's
-    ``generate_positions_report`` DataFrame.
-
-    The report has one row per position with ``realized_pnl`` (a Money
-    value rendered as ``"0.11 USD"``) and ``side`` (``"FLAT"`` for
-    closed positions, ``"LONG"``/``"SHORT"`` for still-open). Open
-    positions are ignored because their PnL is unrealized.
-
-    ``total_return`` is rendered as a unit-less ratio against the
-    cumulative absolute opening notional so the value is comparable
-    across strategies and instruments. ``max_drawdown`` is computed
-    from the equity curve formed by cumulative realized PnL, then
-    normalised against the same notional.
-
-    Returns ``None`` if no closed positions are present so the caller
-    can chain to other fallbacks.
-    """
+    """Closed-position win rate only; position notional is not account capital."""
     if "realized_pnl" not in positions_df.columns or positions_df.empty:
         return None
 
@@ -652,83 +601,11 @@ def _derive_metrics_from_positions(positions_df: pd.DataFrame) -> dict[str, floa
     if closed.empty:
         return None
 
-    # Codex review P2: extract (amount, currency) pairs and only
-    # aggregate the dominant currency. A multi-currency portfolio
-    # would otherwise add EUR + USD numerics as if they were the
-    # same unit, producing nonsense totals that can override a valid
-    # account-derived metric.
     raw_pairs = [_money_to_float_with_currency(v) for v in closed["realized_pnl"].tolist()]
-    pairs: list[tuple[float, str]] = [p for p in raw_pairs if p is not None]
-    if not pairs:
-        return None
-
-    by_currency: dict[str, list[float]] = {}
-    by_currency_indices: dict[str, list[int]] = {}
-    for idx, (amount, currency) in enumerate(pairs):
-        by_currency.setdefault(currency, []).append(amount)
-        by_currency_indices.setdefault(currency, []).append(idx)
-
-    # Pick the dominant currency by row count; ties broken by the
-    # currency that sums to the largest absolute amount.
-    dominant = max(
-        by_currency.keys(),
-        key=lambda c: (len(by_currency[c]), abs(sum(by_currency[c]))),
-    )
-    pnl_values = by_currency[dominant]
-    dominant_indices = by_currency_indices[dominant]
-
-    pnl_series = pd.Series(pnl_values, dtype=float)
-    wins = int((pnl_series > 0).sum())
-    win_rate = float(wins / len(pnl_series)) if len(pnl_series) else 0.0
-    total_pnl = float(pnl_series.sum())
-
-    # Notional for the return denominator: prefer ``avg_px_open *
-    # peak_qty`` over the SAME rows that contributed to pnl_series
-    # so multi-currency scenarios stay aligned. Otherwise fall back
-    # to ``len(pnl_series)`` which keeps total_return per-trade.
-    notional = 0.0
-    closed_dominant = closed.iloc[dominant_indices] if dominant_indices else closed
-    if {"avg_px_open", "peak_qty"}.issubset(closed_dominant.columns):
-        avg_open = pd.to_numeric(closed_dominant["avg_px_open"], errors="coerce").fillna(0.0)
-        qty = pd.to_numeric(closed_dominant["peak_qty"], errors="coerce").fillna(0.0)
-        notional = float((avg_open.abs() * qty.abs()).sum())
-    total_return = total_pnl / notional if notional > 0 else total_pnl / len(pnl_series)
-
-    # Codex review P2: seed the cumulative path with 0 so an
-    # immediately-losing strategy registers a real drawdown from
-    # trade one. Without the seed, ``cummax()`` adopts the first
-    # (negative) value as the peak and reports max_drawdown=0.
-    cumulative_with_seed = pd.concat([pd.Series([0.0]), pnl_series.cumsum()], ignore_index=True)
-    running_max = cumulative_with_seed.cummax()
-    drawdown = cumulative_with_seed - running_max
-    max_drawdown = float(drawdown.min()) if not drawdown.empty else 0.0
-    if notional > 0:
-        max_drawdown = max_drawdown / notional
-
-    return {
-        "win_rate": win_rate,
-        "total_return": total_return,
-        "max_drawdown": max_drawdown,
-    }
-
-
-def _is_missing(value: float) -> bool:
-    """A metric counts as "missing" when it's NaN or within 1e-12 of
-    zero. The NaN branch is load-bearing — Nautilus's stats_returns
-    yields NaN on short-window backtests, and ``abs(nan) <= 1e-12``
-    is False because every comparison against NaN is False, which
-    silently skipped the positions fallback before this fix.
-    """
-    import math
-
-    if value is None:
-        return True
-    try:
-        if math.isnan(value):
-            return True
-    except (TypeError, ValueError):
-        return True
-    return abs(value) <= 1e-12
+    if any(pair is None or pair[1] != "USD" or not math.isfinite(pair[0]) for pair in raw_pairs):
+        raise ValueError("Closed position PnL must be finite USD amounts")
+    values = [pair[0] for pair in raw_pairs if pair is not None]
+    return {"win_rate": sum(value > 0 for value in values) / len(values)}
 
 
 def _money_to_float(value: object) -> float | None:
@@ -746,17 +623,7 @@ def _money_to_float(value: object) -> float | None:
 
 
 def _money_to_float_with_currency(value: object) -> tuple[float, str] | None:
-    """Like :func:`_money_to_float` but returns ``(amount, currency)``.
-
-    The currency is needed by :func:`_derive_metrics_from_positions`
-    so it can split a multi-currency positions report by currency
-    and only aggregate one bucket at a time (Codex review P2 — adding
-    USD and EUR as if they were the same unit silently corrupts
-    total_return/max_drawdown).
-
-    Plain numerics (int, float, Decimal-without-currency-suffix)
-    return currency ``""``. Empty/unparseable inputs return ``None``.
-    """
+    """Parse amount/currency without silently converting unsupported currencies."""
     if value is None:
         return None
     if isinstance(value, (int, float)):
@@ -797,17 +664,19 @@ def _derive_metrics_from_account(account_df: pd.DataFrame) -> dict[str, float] |
         pd.to_numeric(frame["returns"], errors="coerce").fillna(0.0).values,
         index=pd.DatetimeIndex(frame[timestamp_col]),
     )
-    derived = compute_series_metrics(returns)
+    derived = compute_series_metrics(normalize_daily_returns(returns))
     return {
         "max_drawdown": float(derived.max_drawdown),
         "total_return": float(derived.total_return),
+        "sharpe_ratio": float(derived.sharpe),
+        "sortino_ratio": float(derived.sortino),
     }
 
 
 def _find_float(stats: dict[str, object] | object, prefixes: list[str]) -> float:
     """Look up a float metric by case-insensitive key prefix match."""
     if not isinstance(stats, dict):
-        return 0.0
+        return float("nan")
     for key, value in stats.items():
         key_lower = str(key).lower()
         for prefix in prefixes:
@@ -815,8 +684,8 @@ def _find_float(stats: dict[str, object] | object, prefixes: list[str]) -> float
                 try:
                     return float(value)  # type: ignore[arg-type]
                 except (TypeError, ValueError):
-                    return 0.0
-    return 0.0
+                    return float("nan")
+    return float("nan")
 
 
 def _nan_safe(value: float) -> float:
@@ -841,4 +710,5 @@ def _zero_metrics() -> dict[str, float | int]:
         "total_return": 0.0,
         "win_rate": 0.0,
         "num_trades": 0,
+        "num_fills": 0,
     }

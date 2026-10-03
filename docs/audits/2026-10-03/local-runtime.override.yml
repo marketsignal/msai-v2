@@ -1,0 +1,55 @@
+services:
+  backend:
+    environment:
+      DATABENTO_API_KEY: ""
+      DAILY_INGEST_ENABLED: "false"
+      AUTO_HEAL_MAX_SYMBOLS: "0"
+      IB_GATEWAY_HOST: "127.0.0.1"
+      IB_PORT: "65534"
+      IB_ALLOW_MOCK_FALLBACK: "false"
+      GATEWAY_CONFIG: ""
+  backtest-worker:
+    environment:
+      DATABENTO_API_KEY: ""
+      DAILY_INGEST_ENABLED: "false"
+      AUTO_HEAL_MAX_SYMBOLS: "0"
+      IB_GATEWAY_HOST: "127.0.0.1"
+      IB_PORT: "65534"
+      IB_ALLOW_MOCK_FALLBACK: "false"
+      GATEWAY_CONFIG: ""
+  research-worker:
+    environment:
+      DATABENTO_API_KEY: ""
+      DAILY_INGEST_ENABLED: "false"
+      AUTO_HEAL_MAX_SYMBOLS: "0"
+      IB_GATEWAY_HOST: "127.0.0.1"
+      IB_PORT: "65534"
+      IB_ALLOW_MOCK_FALLBACK: "false"
+      GATEWAY_CONFIG: ""
+  portfolio-worker:
+    environment:
+      DATABENTO_API_KEY: ""
+      DAILY_INGEST_ENABLED: "false"
+      AUTO_HEAL_MAX_SYMBOLS: "0"
+      IB_GATEWAY_HOST: "127.0.0.1"
+      IB_PORT: "65534"
+      IB_ALLOW_MOCK_FALLBACK: "false"
+      GATEWAY_CONFIG: ""
+  ingest-worker:
+    environment:
+      DATABENTO_API_KEY: ""
+      DAILY_INGEST_ENABLED: "false"
+      AUTO_HEAL_MAX_SYMBOLS: "0"
+      IB_GATEWAY_HOST: "127.0.0.1"
+      IB_PORT: "65534"
+      IB_ALLOW_MOCK_FALLBACK: "false"
+      GATEWAY_CONFIG: ""
+  job-watchdog:
+    environment:
+      DATABENTO_API_KEY: ""
+      DAILY_INGEST_ENABLED: "false"
+      AUTO_HEAL_MAX_SYMBOLS: "0"
+      IB_GATEWAY_HOST: "127.0.0.1"
+      IB_PORT: "65534"
+      IB_ALLOW_MOCK_FALLBACK: "false"
+      GATEWAY_CONFIG: ""

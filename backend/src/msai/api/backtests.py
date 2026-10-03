@@ -29,6 +29,7 @@ from msai.models.backtest import Backtest
 from msai.models.strategy import Strategy
 from msai.models.trade import Trade
 from msai.schemas.backtest import (
+    BacktestAccounting,
     BacktestListItem,
     BacktestListResponse,
     BacktestReportTokenResponse,
@@ -761,6 +762,7 @@ async def get_backtest_results(
     response = BacktestResultsResponse(
         id=backtest.id,
         metrics=backtest.metrics,
+        accounting=(backtest.metrics or {}).get("accounting"),
         # DB stores the JSONB payload as ``dict[str, Any] | None``; Pydantic
         # coerces the dict into ``SeriesPayload`` at response-model build time.
         # The worker only writes dicts that already conform to the schema
@@ -806,7 +808,7 @@ async def get_backtest_trades(
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> BacktestTradesResponse | JSONResponse:
-    """Return paginated individual fills for a backtest.
+    """Return paginated fills, or explicitly unversioned legacy order records.
 
     Sorted by ``(executed_at, id) ASC`` so results are deterministic even
     when multiple fills share the same timestamp.
@@ -825,13 +827,21 @@ async def get_backtest_trades(
         page_size_bucket = f"<={MAX_TRADE_PAGE_SIZE}"
     msai_backtest_trades_page_count.labels(page_size=page_size_bucket).inc()
 
-    exists_result = await db.execute(select(Backtest.id).where(Backtest.id == job_id))
-    if exists_result.scalar_one_or_none() is None:
+    exists_result = await db.execute(select(Backtest).where(Backtest.id == job_id))
+    backtest: Backtest | None = exists_result.scalar_one_or_none()
+    if backtest is None:
         return error_response(
             status.HTTP_404_NOT_FOUND,
             "NOT_FOUND",
             f"Backtest {job_id} not found",
         )
+
+    raw_accounting = (backtest.metrics or {}).get("accounting")
+    accounting = (
+        BacktestAccounting.model_validate(raw_accounting)
+        if raw_accounting is not None
+        else None
+    )
 
     total_result = await db.execute(
         select(func.count()).select_from(Trade).where(Trade.backtest_id == job_id)
@@ -859,8 +869,14 @@ async def get_backtest_trades(
             side=r.side,  # type: ignore[arg-type]
             quantity=float(r.quantity),
             price=float(r.price),
-            pnl=float(r.pnl) if r.pnl is not None else 0.0,
-            commission=float(r.commission) if r.commission is not None else 0.0,
+            # Old order-derived rows contain placeholder zero economics. Do
+            # not certify them as fills or rewrite their stored values.
+            pnl=float(r.pnl) if accounting is not None and r.pnl is not None else None,
+            commission=(
+                float(r.commission)
+                if accounting is not None and r.commission is not None
+                else None
+            ),
             executed_at=r.executed_at,
         )
         for r in rows
@@ -868,6 +884,7 @@ async def get_backtest_trades(
 
     return BacktestTradesResponse(
         items=items,
+        accounting=accounting,
         total=total,
         page=page,
         page_size=effective_page_size,

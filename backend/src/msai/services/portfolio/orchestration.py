@@ -1313,12 +1313,8 @@ class PortfolioService:
             "metrics": dict(result.metrics),
             "returns": returns,
             "timestamps": timestamps,
-            # Iter-3 addition: per-allocation order count for smoke G5 metrics.
-            # ``result.orders_df`` is the Nautilus orders report — its row count
-            # is the number of orders this strategy submitted in the backtest.
-            # For ``smoke_market_order`` this is exactly 1 per instrument; for
-            # ``ema_cross`` it varies. Non-smoke runs ignore this field.
-            "trade_count": int(len(result.orders_df)) if result.orders_df is not None else 0,
+            # Count actual individual fills; unfilled order intents do not qualify.
+            "trade_count": int(len(result.fills_df)),
         }
 
 

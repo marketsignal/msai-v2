@@ -145,6 +145,22 @@ def test_series_payload_accepts_empty_lists() -> None:
     assert restored == empty
 
 
+def test_series_preserves_accounting_and_leaves_legacy_unknown() -> None:
+    accounting = {
+        "version": 1,
+        "basis": "realized_account_balance",
+        "initial_capital": 1_000_000.0,
+        "currency": "USD",
+        "costs": "engine_recorded",
+    }
+    payload = SeriesPayload.model_validate(
+        {"daily": [], "monthly_returns": [], "accounting": accounting}
+    )
+    assert payload.model_dump(mode="json")["accounting"] == accounting
+    legacy = SeriesPayload(daily=[], monthly_returns=[])
+    assert legacy.model_dump(mode="json")["accounting"] is None
+
+
 # ---------------------------------------------------------------------------
 # Extended BacktestResultsResponse (series + series_status + has_report,
 # inline trades field removed in favor of paginated /trades endpoint shipped in B8).

@@ -31,8 +31,11 @@ produces the right :class:`FailureCode`.
 from __future__ import annotations
 
 import asyncio
+import html as html_lib
 import json
+import math
 import os
+import re
 import socket
 import sys
 from datetime import UTC, datetime
@@ -88,6 +91,7 @@ def _materialize_series_payload(
     returns_series: pd.Series,
     backtest_id: str,
     nautilus_version: str | None = None,
+    accounting: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     """Build the canonical :class:`SeriesPayload` from a returns series.
 
@@ -127,7 +131,14 @@ def _materialize_series_payload(
         # round-trip below is the actual shape guard, so a regression in
         # ``build_series_payload`` surfaces here as a failure event rather
         # than at read time in /results.
-        payload: dict[str, Any] = dict(build_series_payload(returns_series))
+        payload: dict[str, Any] = dict(
+            build_series_payload(
+                returns_series,
+                starting_equity=float(accounting["initial_capital"]) if accounting else 100_000.0,
+            )
+        )
+        if accounting is not None:
+            payload["accounting"] = accounting
         SeriesPayload.model_validate(payload)
         payload_bytes = len(json.dumps(payload).encode("utf-8"))
         msai_backtest_results_payload_bytes.observe(payload_bytes)
@@ -384,6 +395,7 @@ async def _execute_backtest(
         returns=returns_series,
         title=f"Backtest {backtest_id}",
     )
+    html = _add_accounting_notice(html, result.accounting, metrics=result.metrics)
     report_path = report_generator.save_report(
         html=html,
         backtest_id=backtest_id,
@@ -401,6 +413,7 @@ async def _execute_backtest(
         returns_series=returns_series,
         backtest_id=backtest_id,
         nautilus_version=nautilus_ver,
+        accounting=result.accounting,
     )
 
     # --- Persist results + trade rows ---------------------------------------
@@ -408,7 +421,8 @@ async def _execute_backtest(
         backtest_id=backtest_id,
         metrics=result.metrics,
         report_path=report_path,
-        orders_df=result.orders_df,
+        fills_df=result.fills_df,
+        accounting=result.accounting,
         strategy_id=strategy_id,
         strategy_code_hash=strategy_code_hash,
         series_payload=series_payload,
@@ -535,11 +549,12 @@ async def _finalize_backtest(
     backtest_id: str,
     metrics: dict[str, float | int],
     report_path: str,
-    orders_df: pd.DataFrame,
+    fills_df: pd.DataFrame,
     strategy_id: Any,
     strategy_code_hash: str,
     series_payload: dict[str, Any] | None,
     series_status: str,
+    accounting: dict[str, Any] | None = None,
 ) -> None:
     """Persist metrics, report path, series, and trade rows atomically.
 
@@ -554,8 +569,7 @@ async def _finalize_backtest(
         backtest_id: UUID string of the backtest row to update.
         metrics: Metrics dict produced by :class:`BacktestRunner`.
         report_path: Absolute path to the generated HTML report.
-        orders_df: DataFrame of executed orders from the Nautilus trader
-            report.  Each row becomes a :class:`Trade` record.
+        fills_df: Individual native execution events, never order intents.
         strategy_id: FK to the :class:`Strategy` row -- denormalised onto
             every trade for easy provenance lookups.
         strategy_code_hash: SHA256 of the strategy source at run time --
@@ -580,14 +594,16 @@ async def _finalize_backtest(
         row.status = "completed"
         row.progress = 100
         row.metrics = dict(metrics)
+        if accounting is not None:
+            row.metrics["accounting"] = accounting
         row.report_path = report_path
         row.completed_at = datetime.now(UTC)
         row.series = series_payload
         row.series_status = series_status
 
-        for order in orders_df.to_dict(orient="records"):
-            trade = _order_row_to_trade(
-                order=order,
+        for fill in fills_df.to_dict(orient="records"):
+            trade = _fill_row_to_trade(
+                fill=fill,
                 backtest_id=row.id,
                 strategy_id=strategy_id,
                 strategy_code_hash=strategy_code_hash,
@@ -778,99 +794,140 @@ def _extract_returns_series(account_df: pd.DataFrame) -> pd.Series:
     return returns
 
 
-def _order_row_to_trade(
+def _fill_row_to_trade(
     *,
-    order: dict[str, Any],
+    fill: dict[str, Any],
     backtest_id: Any,
     strategy_id: Any,
     strategy_code_hash: str,
-) -> Trade | None:
-    """Translate a Nautilus order report row into a :class:`Trade` model.
-
-    The Nautilus report schema is not perfectly stable across versions,
-    so we look at a few candidate field names for each attribute and
-    degrade gracefully if something is missing.
-
-    Args:
-        order: A single row from ``engine.trader.generate_orders_report``.
-        backtest_id: FK value for the owning backtest row.
-        strategy_id: FK value for the strategy that generated the order.
-        strategy_code_hash: SHA256 of the strategy source at run time.
-
-    Returns:
-        A :class:`Trade` ready to be added to the session, or ``None``
-        if the row lacks a usable timestamp and side.
-    """
-    executed_at = _pick_timestamp(order)
-    side = _pick_str(order, ["side", "order_side"], default="BUY").upper()
+) -> Trade:
+    """Persist one actual Nautilus OrderFilled event, preserving unknown PnL."""
+    timestamp = pd.to_datetime(fill.get("ts_event"), utc=True, errors="coerce")
+    if timestamp is None or pd.isna(timestamp):
+        raise ValueError("Fill has no valid execution timestamp")
+    side = str(fill.get("order_side", "")).upper()
     if side not in ("BUY", "SELL"):
-        return None
-
-    quantity = _pick_decimal(order, ["quantity", "filled_qty", "qty"], default=Decimal("0"))
-    price = _pick_decimal(order, ["avg_px", "price", "last_px"], default=Decimal("0"))
-    pnl = _pick_decimal(order, ["pnl", "realized_pnl"], default=Decimal("0"))
-    instrument = _pick_str(order, ["instrument_id", "symbol", "instrument"], default="UNKNOWN")
-
+        raise ValueError("Fill has an invalid side")
+    if str(fill.get("currency", "")) != "USD":
+        raise ValueError("Backtest fill economics support USD only")
+    quantity = _fill_decimal(fill.get("last_qty"), "quantity")
+    price = _fill_decimal(fill.get("last_px"), "price")
+    if quantity <= 0 or price <= 0:
+        raise ValueError("Fill quantity and price must be positive")
+    commission = _fill_money(fill.get("commission"), "commission")
+    if commission is not None and commission < 0:
+        raise ValueError("Negative fill commission is unsupported")
+    pnl = _fill_money(fill.get("realized_pnl"), "realized PnL")
+    for identity in ("instrument_id", "trade_id", "client_order_id"):
+        if not fill.get(identity):
+            raise ValueError(f"Fill has no {identity}")
     return Trade(
         backtest_id=backtest_id,
         deployment_id=None,
         strategy_id=strategy_id,
         strategy_code_hash=strategy_code_hash,
-        instrument=str(instrument),
+        instrument=str(fill["instrument_id"]),
         side=side,
         quantity=quantity,
         price=price,
-        commission=Decimal("0"),
+        commission=commission,
         pnl=pnl,
+        broker_trade_id=str(fill["trade_id"]),
+        client_order_id=str(fill["client_order_id"]),
         is_live=False,
-        executed_at=executed_at,
+        executed_at=timestamp.to_pydatetime(),
     )
 
 
-def _pick_timestamp(row: dict[str, Any]) -> datetime:
-    """Return a UTC datetime from the first populated candidate field.
-
-    Order matters: ``ts_last`` is the fill/event timestamp (when the
-    trade actually executed). ``ts_init`` is just the order creation
-    timestamp, which is earlier and would mis-order the trade log for
-    any strategy that doesn't fill immediately.
-    """
-    for key in ("ts_last", "ts_event", "ts_init", "timestamp"):
-        raw = row.get(key)
-        if raw is None:
-            continue
-        parsed = pd.to_datetime(raw, utc=True, errors="coerce")
-        if not pd.isna(parsed):
-            py_dt: datetime = parsed.to_pydatetime()
-            return py_dt
-    return datetime.now(UTC)
+def _fill_decimal(value: object, field: str) -> Decimal:
+    try:
+        parsed = Decimal(str(value))
+    except (ValueError, ArithmeticError) as exc:
+        raise ValueError(f"Invalid fill {field}") from exc
+    if not parsed.is_finite():
+        raise ValueError(f"Non-finite fill {field}")
+    return parsed
 
 
-def _pick_str(row: dict[str, Any], candidates: list[str], *, default: str) -> str:
-    """Return the first non-empty string value from a list of candidate keys."""
-    for key in candidates:
-        value = row.get(key)
-        if value is not None and str(value).strip():
-            return str(value)
-    return default
+def _fill_money(value: object, field: str) -> Decimal | None:
+    if value is None:
+        return None
+    parts = str(value).split()
+    if len(parts) != 2 or parts[1] != "USD":
+        raise ValueError(f"Fill {field} must specify USD")
+    return _fill_decimal(parts[0], field)
 
 
-def _pick_decimal(
-    row: dict[str, Any],
-    candidates: list[str],
+def _add_accounting_notice(
+    html: str,
+    accounting: dict[str, Any] | None,
     *,
-    default: Decimal,
-) -> Decimal:
-    """Return the first parseable Decimal value from a list of candidate keys."""
-    for key in candidates:
-        value = row.get(key)
-        if value is None:
-            continue
-        try:
-            return Decimal(str(value))
-        except (ValueError, ArithmeticError):
-            continue
-    return default
+    metrics: dict[str, float | int] | None = None,
+) -> str:
+    if accounting is None:
+        return html
+    capital = html_lib.escape(f"{accounting['initial_capital']:,.2f} {accounting['currency']}")
+    notice = (
+        '<section aria-label="Accounting scope"><h2>Accounting scope</h2>'
+        f"<p>Initial capital: {capital}. Performance uses realized account balances; "
+        "it excludes unrealized gains and losses on open positions.</p>"
+        "<p>Fees are engine-recorded. Realistic broker fees and slippage are not certified. "
+        "Daily statistics use observed UTC balance dates, not a verified exchange calendar. "
+        "Zero risk statistics can mean insufficient observations or zero variation.</p></section>"
+    )
+    if metrics is not None:
+        headlines = {
+            "Cumulative Return": _report_percent(metrics["total_return"]),
+            "Max Drawdown": _report_percent(metrics["max_drawdown"]),
+            "Sharpe": f"{metrics['sharpe_ratio']:.2f}",
+            "Sortino": f"{metrics['sortino_ratio']:.2f}",
+        }
+        notice += (
+            '<section aria-label="Canonical balance metrics"><h2>Account balance metrics</h2>'
+            f"<p>Total return: {headlines['Cumulative Return']}; "
+            f"maximum drawdown: {headlines['Max Drawdown']}; "
+            f"daily Sharpe: {headlines['Sharpe']}; daily Sortino: {headlines['Sortino']}.</p>"
+            "<p>These primary metrics use the same daily balance series as the application. "
+            "Risk ratios use 252 periods per year and population variation.</p></section>"
+        )
+        for label, value in headlines.items():
+            # Pinned QuantStats emits two plain cells for this single-strategy
+            # report. Refuse unexpected nested/multi-column markup rather than
+            # silently leaving a wrong headline beside the canonical summary.
+            label_cell = rf"<td\b[^>]*>\s*{re.escape(label)}\s*</td>"
+            row = rf"<tr\b[^>]*>\s*{label_cell}\s*<td\b[^>]*>[^<]*</td>\s*</tr>"
+            if re.search(label_cell, html) is None:
+                continue  # Basic fallback reports have no QuantStats metric table.
+            html, count = re.subn(row, f"<tr><td>{label}</td><td>{value}</td></tr>", html)
+            if count != 1:
+                log.warning("quantstats_headline_layout_unsupported", metric=label)
+                return (
+                    "<!DOCTYPE html><html><body>"
+                    + notice
+                    + "<p>Supplemental report unavailable: unsupported metric layout.</p>"
+                    + "</body></html>"
+                )
+        notice += (
+            "<h2>Supplemental QuantStats statistics</h2>"
+            "<p>Additional statistics use QuantStats conventions. Missing drawdown episode "
+            "details or other unavailable values do not mean zero.</p>"
+        )
+    body_pattern = re.compile(r"(<body\b[^>]*>)", flags=re.I)
+    decorated, count = body_pattern.subn(lambda match: match[0] + notice, html, count=1)
+    if count == 0:
+        return "<!DOCTYPE html><html><body>" + notice + "</body></html>"
+    return decorated
+
+
+def _report_percent(ratio: float) -> str:
+    """Keep tiny nonzero economics visible with three significant figures."""
+    percent = ratio * 100
+    if 0 < abs(percent) < 0.01:
+        if abs(percent) < 0.000001:
+            return f"{percent:.2e}%"
+        digits = 2 - math.floor(math.log10(abs(percent)))
+        return f"{percent:.{digits}f}%"
+    return f"{percent:.2f}%"
 
 
 # Legacy alias -- the old worker dispatched to ``run_backtest``.
