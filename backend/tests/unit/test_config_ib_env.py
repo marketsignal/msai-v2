@@ -153,11 +153,9 @@ def test_dotenv_broker_extras_do_not_crash_settings(
     """A ``.env`` file containing the broker env vars operators are told to set
     does not crash ``Settings()`` with ``extra_forbidden``.
 
-    pydantic-settings forbids extras sourced from a ``.env`` file (env-var
-    extras pass through, but dotenv-file extras are validated against the
-    model). ``.env.example`` documents ``AZURE_KEYVAULT_URI``,
-    ``AZURE_KV_MI_CLIENT_ID``, and ``BROKER_ACCOUNT_BACKFILL`` — all three MUST
-    be declared on ``Settings`` so a populated ``.env`` boots the backend.
+    ``.env.example`` documents ``AZURE_KEYVAULT_URI``, ``AZURE_KV_MI_CLIENT_ID``,
+    and ``BROKER_ACCOUNT_BACKFILL``. These declared fields must still load their
+    values, while unrelated Compose keys are now ignored by Settings.
     """
     from msai.core.config import Settings
 

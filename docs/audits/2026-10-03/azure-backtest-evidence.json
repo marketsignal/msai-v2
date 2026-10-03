@@ -1,0 +1,2110 @@
+{
+  "observed_at": "2026-10-03T17:55:29.702221+00:00",
+  "environment": "Azure",
+  "backtest_id": "6d8e6878-55eb-4b42-8444-6d5a6abc7166",
+  "submission_surface": "Authenticated owner browser",
+  "browser_url": "https://platform.marketsignal.ai/backtests/6d8e6878-55eb-4b42-8444-6d5a6abc7166",
+  "request_observed_in_browser": {
+    "strategy_id": "630f8d0a-3a02-4c39-a8ba-92a26181972f",
+    "instruments": [
+      "AAPL.NASDAQ"
+    ],
+    "start_date": "2024-12-02",
+    "end_date": "2024-12-07",
+    "config": {
+      "fast_ema_period": 5,
+      "slow_ema_period": 20,
+      "trade_size": "1"
+    }
+  },
+  "responses": {
+    "status": {
+      "http_status": 200,
+      "path": "/api/v1/backtests/6d8e6878-55eb-4b42-8444-6d5a6abc7166/status",
+      "body": {
+        "id": "6d8e6878-55eb-4b42-8444-6d5a6abc7166",
+        "status": "completed",
+        "progress": 100,
+        "started_at": "2026-10-03T17:48:46.616120Z",
+        "completed_at": "2026-10-03T17:48:49.117739Z"
+      }
+    },
+    "results": {
+      "http_status": 200,
+      "path": "/api/v1/backtests/6d8e6878-55eb-4b42-8444-6d5a6abc7166/results",
+      "body": {
+        "id": "6d8e6878-55eb-4b42-8444-6d5a6abc7166",
+        "metrics": {
+          "win_rate": 0.24096385542168675,
+          "num_trades": 166,
+          "max_drawdown": -2.5099967371211562e-06,
+          "sharpe_ratio": -3.4605462577777555,
+          "total_return": -0.00012099999999627471,
+          "sortino_ratio": -4.823147473108227
+        },
+        "trade_count": 166,
+        "series": {
+          "daily": [
+            {
+              "date": "2024-12-02",
+              "equity": 100000.0,
+              "drawdown": 0.0,
+              "daily_return": 0.0
+            },
+            {
+              "date": "2024-12-03",
+              "equity": 100000.13900001252,
+              "drawdown": 0.0,
+              "daily_return": 1.3900001252231675e-06
+            },
+            {
+              "date": "2024-12-04",
+              "equity": 100000.01200000108,
+              "drawdown": -1.2699983491515354e-06,
+              "daily_return": -1.2699983490405131e-06
+            },
+            {
+              "date": "2024-12-05",
+              "equity": 99999.89199999027,
+              "drawdown": -2.4699967892116703e-06,
+              "daily_return": -1.1999999640632808e-06
+            },
+            {
+              "date": "2024-12-06",
+              "equity": 99999.88799998992,
+              "drawdown": -2.5099967371211562e-06,
+              "daily_return": -4.00000467193351e-08
+            }
+          ],
+          "monthly_returns": [
+            {
+              "month": "2024-12",
+              "pct": -1.1200001007738436e-06
+            }
+          ]
+        },
+        "series_status": "ready",
+        "has_report": true
+      }
+    },
+    "trades": {
+      "http_status": 200,
+      "path": "/api/v1/backtests/6d8e6878-55eb-4b42-8444-6d5a6abc7166/trades?page=1&page_size=500",
+      "body": {
+        "items": [
+          {
+            "id": "a2288322-6c0b-4f08-83da-f8893039b41f",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 237.6,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T13:19:00Z"
+          },
+          {
+            "id": "57b0158c-9d4e-4b58-aa5c-9cfbeb29cab4",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 237.3,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T13:26:00Z"
+          },
+          {
+            "id": "aa3a94b0-6acd-4af5-848b-7c2c3ec680f0",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 238.72,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T14:30:00Z"
+          },
+          {
+            "id": "9037fd7f-d20a-484d-9056-479feab5e973",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 240.25,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T15:47:00Z"
+          },
+          {
+            "id": "bb5c49e9-b6e1-4c6e-88d3-5c4ad68b1e46",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 240.4,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T15:48:00Z"
+          },
+          {
+            "id": "b8a35597-148c-4568-a4e5-e25d2495cd5b",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 240.21,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T15:50:00Z"
+          },
+          {
+            "id": "f0880dd0-89d7-4283-b590-51a3e317f6cc",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 240.37,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T15:53:00Z"
+          },
+          {
+            "id": "610d7dde-db9d-426e-902e-6c9f7b922a84",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 240.3,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T15:54:00Z"
+          },
+          {
+            "id": "685977f0-aef8-4995-b343-eecda9ae5785",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 240.14,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T16:13:00Z"
+          },
+          {
+            "id": "d80eadbc-c704-4671-a4ce-54fc3d95b083",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 239.88,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T16:20:00Z"
+          },
+          {
+            "id": "2094bf11-882d-4d00-bc71-52377bf080fd",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 239.8,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T16:40:00Z"
+          },
+          {
+            "id": "9aef76d9-5db9-4a05-be79-59e113326a0a",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 239.82,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T16:56:00Z"
+          },
+          {
+            "id": "c377410f-4617-4a24-bd35-fa4e98de503c",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 239.91,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T16:57:00Z"
+          },
+          {
+            "id": "a74590a6-2efb-4a58-8d37-ae86b4f58443",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 239.91,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T17:11:00Z"
+          },
+          {
+            "id": "80ff7909-4b0a-445a-954e-d7c842aa290b",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 240.01,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T17:22:00Z"
+          },
+          {
+            "id": "ea97ac8f-7142-47d2-97c0-c7e24ac76875",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 239.84,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T17:28:00Z"
+          },
+          {
+            "id": "6323f9c8-fd0b-48ee-9e33-d2dfe5c88ebb",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 239.58,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T18:22:00Z"
+          },
+          {
+            "id": "0630e16b-cfa8-44d4-9edf-519d75bbea13",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 239.37,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T18:30:00Z"
+          },
+          {
+            "id": "7330c3d6-1c61-46c6-ae78-f6c053554abb",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 239.46,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T18:46:00Z"
+          },
+          {
+            "id": "966d6749-5765-43e1-85a4-baee4ce5d00d",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 239.39,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T18:47:00Z"
+          },
+          {
+            "id": "9b995ca9-218c-4096-a01e-7a059ca60371",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 239.42,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T18:48:00Z"
+          },
+          {
+            "id": "4b3d5cf6-49a7-4f75-a341-7d0550a73067",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 239.38,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T18:49:00Z"
+          },
+          {
+            "id": "e85caadb-3c7e-44ab-98c0-dd6ce3075e4e",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 239.31,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T19:04:00Z"
+          },
+          {
+            "id": "eb5669a0-8302-4a14-99d1-aad9d38afb18",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 239.17,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T19:13:00Z"
+          },
+          {
+            "id": "761883f7-9d73-439a-b3b0-e4b13fd34ab7",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 239.31,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T19:24:00Z"
+          },
+          {
+            "id": "a636402c-5c0f-4c74-bec1-ac01136964b0",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 239.14,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T19:26:00Z"
+          },
+          {
+            "id": "2ac0ad64-2ace-4c6b-9b22-73d477fd4f5b",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 239.3,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T19:28:00Z"
+          },
+          {
+            "id": "44255fcc-4920-4844-95d9-f78459ddeda3",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 239.38,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T20:08:00Z"
+          },
+          {
+            "id": "82b09494-4cb8-4bf9-b515-6800c2821170",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 239.57,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T20:15:00Z"
+          },
+          {
+            "id": "afa78469-8e08-4488-81d8-5095e9ed0e62",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 239.49,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T20:17:00Z"
+          },
+          {
+            "id": "99594c79-cc7c-4323-9230-443bf68b65fc",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 239.62,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T20:21:00Z"
+          },
+          {
+            "id": "cb052dfc-afec-4760-a302-88c5b0097b97",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 239.64,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T20:49:00Z"
+          },
+          {
+            "id": "3782dbd5-7f63-48b4-b620-583d0dbf5888",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 239.75,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T21:01:00Z"
+          },
+          {
+            "id": "01474b95-1a56-4862-8577-27cc43e4497c",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 239.72,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T21:49:00Z"
+          },
+          {
+            "id": "7dd16769-61bc-4cb3-aa37-72b02b44b051",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 239.8,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T21:54:00Z"
+          },
+          {
+            "id": "51516a9f-dc39-4e6e-a416-bce12a16cfdb",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 239.79,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-02T22:57:00Z"
+          },
+          {
+            "id": "9ace8963-3a9f-4d84-9458-66f138d024e8",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 240.09,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T12:00:00Z"
+          },
+          {
+            "id": "29b463dd-1d39-4644-acab-1b3c547d6f06",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 240.16,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T13:59:00Z"
+          },
+          {
+            "id": "0210cdcd-72d9-4e0f-96d2-423053afed2c",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 239.78,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T14:45:00Z"
+          },
+          {
+            "id": "cd086da6-2700-442c-acfd-0254171df533",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 240.63,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T15:21:00Z"
+          },
+          {
+            "id": "cfa011c5-a9ce-4fa7-9e89-3d97f3e96c08",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 240.9,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T15:33:00Z"
+          },
+          {
+            "id": "152471b2-b0b4-4098-b2bc-44adf77423ac",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 240.67,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T15:40:00Z"
+          },
+          {
+            "id": "165541fc-a67d-4f05-becc-3a461aed578b",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 240.82,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T15:41:00Z"
+          },
+          {
+            "id": "1fe75b92-c8e8-4279-b2d8-91f55b8d5fff",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 240.9,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T16:12:00Z"
+          },
+          {
+            "id": "9aff2bb0-4a85-4b1f-8630-ed99266e9890",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 241.1,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T16:17:00Z"
+          },
+          {
+            "id": "ef95355c-26de-4a76-ad0f-d10eed64b2c8",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 241.03,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T16:33:00Z"
+          },
+          {
+            "id": "4d1d0c66-d9f7-4285-92cc-b0ecc1a731e8",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 241.23,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T16:36:00Z"
+          },
+          {
+            "id": "71715ea7-63d0-4032-a851-2ece45621d84",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 241.08,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T16:39:00Z"
+          },
+          {
+            "id": "12ee8d67-735c-4f8b-addf-ad803e13e80a",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 241.19,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T16:41:00Z"
+          },
+          {
+            "id": "2a24271c-2362-4db0-a1ed-cae0f018602d",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 241.41,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T17:14:00Z"
+          },
+          {
+            "id": "fcb791d3-8251-426c-bca8-035f653ff643",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 241.54,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T17:17:00Z"
+          },
+          {
+            "id": "28b0b6eb-5748-48d5-bf86-91a953cfffce",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 241.38,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T17:20:00Z"
+          },
+          {
+            "id": "3e38d823-b685-43c2-b821-9ec71f75f14c",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 241.46,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T17:42:00Z"
+          },
+          {
+            "id": "d15a1b60-3b69-40ee-91d4-9f530f4f3733",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 241.5,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T18:06:00Z"
+          },
+          {
+            "id": "ace02abb-34cf-4b31-a53a-0505a2f21fae",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 241.51,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T18:23:00Z"
+          },
+          {
+            "id": "2362eb5a-5070-4c91-af70-40abcdfb1d62",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 241.44,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T18:30:00Z"
+          },
+          {
+            "id": "55282969-fed1-4759-8eed-de7aa80e3caa",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 241.73,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T18:34:00Z"
+          },
+          {
+            "id": "d511477c-623b-4a2a-9f88-647b40375f08",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.19,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T20:03:00Z"
+          },
+          {
+            "id": "5fbd70ae-9f39-4963-bd84-218d0057a0a3",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.13,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T20:30:00Z"
+          },
+          {
+            "id": "1186384c-8397-4991-be6f-53064d595b61",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.7,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T22:25:00Z"
+          },
+          {
+            "id": "fca2ded0-c670-43d2-a77e-2d0265bf7ccb",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.82,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T22:45:00Z"
+          },
+          {
+            "id": "c7855888-cfad-43f7-a807-aca987a03e71",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.67,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T23:04:00Z"
+          },
+          {
+            "id": "2e271725-ebf3-4529-bdc6-1e70a5ad92f9",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.76,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T23:26:00Z"
+          },
+          {
+            "id": "8e20f33e-07cb-41f5-a704-373090b76d1e",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.69,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T23:36:00Z"
+          },
+          {
+            "id": "a66280e0-4000-4e7c-8335-fd2b235788bf",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.0,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-03T23:44:00Z"
+          },
+          {
+            "id": "1f098cca-0552-4d44-b9ee-c0171442efb3",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.96,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T12:23:00Z"
+          },
+          {
+            "id": "a55464de-773d-4e42-a06e-173c700cb973",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.08,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T12:33:00Z"
+          },
+          {
+            "id": "12c63c6b-e3c1-41c2-b5ac-b8487cc23ef6",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.05,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T13:35:00Z"
+          },
+          {
+            "id": "c6ffc48b-b3bf-4b74-903b-2baf795bdebc",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.2,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T13:40:00Z"
+          },
+          {
+            "id": "f61bf71b-12f2-43de-8626-646c83b10fc1",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.8,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T14:00:00Z"
+          },
+          {
+            "id": "d75f7e55-3c05-49c4-9f3a-fd04b2bec390",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.29,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T14:04:00Z"
+          },
+          {
+            "id": "76d4fe65-1d52-443a-9221-1d67f39e95b6",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.92,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T14:27:00Z"
+          },
+          {
+            "id": "0c2281c1-4c89-45fe-9e4f-6726950f0149",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.18,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T14:46:00Z"
+          },
+          {
+            "id": "c880cedd-3443-488f-8b0e-5085cc30a886",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.17,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T15:03:00Z"
+          },
+          {
+            "id": "5c807713-1b2e-4a5b-8a0f-11614a2280f6",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.5,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T15:05:00Z"
+          },
+          {
+            "id": "a001b7bb-69a3-48e3-aff6-8c00e0aff510",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.27,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T15:16:00Z"
+          },
+          {
+            "id": "e70cd6cf-af7a-49cc-a10f-ff22286d6938",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.56,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T15:33:00Z"
+          },
+          {
+            "id": "7f232db8-00e2-415c-9420-3cc07e20a626",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.45,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T15:43:00Z"
+          },
+          {
+            "id": "9e4cbed3-2440-408b-bb0a-dd3a82ec1784",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.53,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T15:58:00Z"
+          },
+          {
+            "id": "896d9706-2ba2-4b4b-bc08-ed795d37d284",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.39,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T16:10:00Z"
+          },
+          {
+            "id": "a4c52b2d-406f-46bf-bba0-02781ec529cd",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.49,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T16:59:00Z"
+          },
+          {
+            "id": "ca9d671f-5e01-4124-a9cf-7e90273ee099",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.36,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T17:00:00Z"
+          },
+          {
+            "id": "0a49f406-6f63-430f-906e-bf1e369412af",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.12,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T17:27:00Z"
+          },
+          {
+            "id": "408078ff-fd1e-49ab-bc69-07a786fe7afe",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 241.91,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T17:34:00Z"
+          },
+          {
+            "id": "07cc6ac1-9a87-426c-99cf-f26005659a70",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.02,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T17:45:00Z"
+          },
+          {
+            "id": "096c3bb9-2e3c-4085-9718-3c189f38d7eb",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.28,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T18:26:00Z"
+          },
+          {
+            "id": "2c486641-9a8e-4336-b66f-3cbbd1cfd872",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.3,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T18:47:00Z"
+          },
+          {
+            "id": "11f6cb62-de44-4e8d-b6f1-fb7b8a2fb54e",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.92,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T19:38:00Z"
+          },
+          {
+            "id": "dbf1c1c7-34ec-4050-b377-d7208c97fd15",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.98,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T19:51:00Z"
+          },
+          {
+            "id": "0ab48362-2922-4a3a-8dcd-aa7108abacc5",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.9,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T20:00:00Z"
+          },
+          {
+            "id": "76c5e180-d52d-4f64-83de-a83e88a8c028",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.96,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T20:01:00Z"
+          },
+          {
+            "id": "f91d90d5-be57-4042-a511-8874357d2dda",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.85,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T20:05:00Z"
+          },
+          {
+            "id": "52ffda68-a520-415d-beff-19e4a8030ddd",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.98,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T20:10:00Z"
+          },
+          {
+            "id": "d50a2281-d5b6-4dba-be85-b809a94bcca3",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.91,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T20:11:00Z"
+          },
+          {
+            "id": "dfcee7dd-5098-445f-b5ad-31e2275bfb1a",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.96,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T20:13:00Z"
+          },
+          {
+            "id": "9a7f4141-2750-4a9b-8913-bfef80939243",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.92,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T20:30:00Z"
+          },
+          {
+            "id": "537485f7-666e-4a5f-860e-a8f22621704b",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.98,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T20:36:00Z"
+          },
+          {
+            "id": "45dc45f2-741d-4877-8117-f5abd9d9af62",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.83,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T20:53:00Z"
+          },
+          {
+            "id": "301e8d05-c5e0-4133-bbc3-c15b21aef1e6",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.95,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T21:43:00Z"
+          },
+          {
+            "id": "043cb11f-33ce-45d0-a0f9-aae8c7bcd072",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.92,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-04T23:42:00Z"
+          },
+          {
+            "id": "a3832355-3441-4ecc-8214-dfb26a97783a",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.07,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T12:00:00Z"
+          },
+          {
+            "id": "4df51c8c-f3b1-4af0-8b75-f27e684303f6",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.0,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T13:05:00Z"
+          },
+          {
+            "id": "132f8fe8-1f3a-44f8-8363-b9b364fc3472",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.1,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T13:34:00Z"
+          },
+          {
+            "id": "10612834-4236-441a-8f0c-3295e5a658e6",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.03,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T13:59:00Z"
+          },
+          {
+            "id": "a12c92d1-4490-482f-adc7-3b727e6a0fde",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.14,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T14:03:00Z"
+          },
+          {
+            "id": "1d423ad0-d85d-4a14-b850-7409422c9344",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.28,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T14:39:00Z"
+          },
+          {
+            "id": "7c74af50-078e-4f85-b919-d10b30a70345",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.51,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T14:59:00Z"
+          },
+          {
+            "id": "69be9fa9-1ec9-448f-97fa-c6c3cda40484",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.21,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T15:13:00Z"
+          },
+          {
+            "id": "cd86b492-d7ec-4342-8ff2-1db4b32f462a",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.98,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T15:42:00Z"
+          },
+          {
+            "id": "f5f9cfdb-0306-4386-8480-96a362fa623c",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.92,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T15:43:00Z"
+          },
+          {
+            "id": "7a866f71-6dfb-42bf-845b-cd61c4b3012d",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.66,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T16:06:00Z"
+          },
+          {
+            "id": "d07f52e3-8f37-4f53-ab04-101c6fe63150",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.57,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T16:11:00Z"
+          },
+          {
+            "id": "fbbf777d-3814-4719-aed8-7ce3f74cad83",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.69,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T16:19:00Z"
+          },
+          {
+            "id": "e4319a67-85b8-4994-a2b0-a2db8367f9f6",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.52,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T16:26:00Z"
+          },
+          {
+            "id": "9f7e5d77-4514-41f3-9726-a6d2854900dd",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.63,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T16:59:00Z"
+          },
+          {
+            "id": "3917980e-443c-4c8d-8692-951bda655a41",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.08,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T17:41:00Z"
+          },
+          {
+            "id": "58ea3f62-9507-4d58-b26d-2db3a8605bb2",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.23,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T17:46:00Z"
+          },
+          {
+            "id": "47978a7b-7acf-43b1-a75d-c0d4059d6574",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.07,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T17:49:00Z"
+          },
+          {
+            "id": "c36eabd9-1093-480b-9f93-45d991d5ed6f",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.06,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T18:11:00Z"
+          },
+          {
+            "id": "805c0894-8f67-435a-9b55-5c988f72cf50",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.96,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T18:21:00Z"
+          },
+          {
+            "id": "3d876e9c-4309-4a5b-818c-93d69dccdbef",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.08,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T18:33:00Z"
+          },
+          {
+            "id": "74208bbf-ed64-4a02-8e40-07d75fd50275",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.08,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T18:51:00Z"
+          },
+          {
+            "id": "0e0cf7ac-c1d5-433e-8efa-6471191d443d",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.22,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T18:59:00Z"
+          },
+          {
+            "id": "c0da9b71-d3ec-45f5-8eac-a0a095587130",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.01,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T19:03:00Z"
+          },
+          {
+            "id": "ca3b4390-76b7-4fb7-848f-a1f98b9589c2",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.22,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T19:05:00Z"
+          },
+          {
+            "id": "bfe8699c-0097-437e-94fb-ad9fb236491f",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.33,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T19:27:00Z"
+          },
+          {
+            "id": "ef2a80e6-5650-49f0-9055-8e213e00cf4e",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.12,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T20:00:00Z"
+          },
+          {
+            "id": "defb291b-d09c-454d-8c91-7c4d17052a34",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.04,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T20:09:00Z"
+          },
+          {
+            "id": "d37e5d2e-910b-4b88-9548-d0c88dad8925",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.98,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T20:36:00Z"
+          },
+          {
+            "id": "b541b30d-9027-4f9c-953e-ccd82cb79f61",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.87,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T20:37:00Z"
+          },
+          {
+            "id": "f6a8f889-e8c6-46ea-82be-ba9f92b32a5d",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.89,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T20:45:00Z"
+          },
+          {
+            "id": "393a4445-0a09-47f2-bde4-05e245fb1f1e",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.84,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T20:46:00Z"
+          },
+          {
+            "id": "20783f22-f463-425e-af4d-ba2611b534d7",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.95,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T20:57:00Z"
+          },
+          {
+            "id": "76940659-5c34-4b3e-b87f-9b17e2b89ad7",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.69,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T21:21:00Z"
+          },
+          {
+            "id": "2064a51e-e598-48c2-9ecd-565b91c4709e",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.89,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T21:34:00Z"
+          },
+          {
+            "id": "3328582c-c1f6-4c0d-ae0f-d308b42c07a6",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.75,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T22:30:00Z"
+          },
+          {
+            "id": "78808076-6152-4807-85f1-0f25e89c41f4",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.83,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T22:53:00Z"
+          },
+          {
+            "id": "bf2e529b-b88b-416b-8cc6-dff418074f5f",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.8,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T23:05:00Z"
+          },
+          {
+            "id": "4e70dc68-89c3-4acb-827a-a60853f3d058",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.85,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-05T23:45:00Z"
+          },
+          {
+            "id": "785ac929-bb15-44df-9c75-9fcb9145be64",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.75,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T12:31:00Z"
+          },
+          {
+            "id": "ec911829-fea3-4ffc-9cee-84018ffb2816",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.9,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T13:23:00Z"
+          },
+          {
+            "id": "e51f1103-1302-4948-a186-96f1620eb719",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.83,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T13:54:00Z"
+          },
+          {
+            "id": "00a36e7e-4f4c-4eee-9c1c-54c051deb039",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.03,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T14:05:00Z"
+          },
+          {
+            "id": "721a4eb2-b830-48ad-8e11-dc305a1111fd",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 242.73,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T14:25:00Z"
+          },
+          {
+            "id": "1c7d33a0-dd1d-4ee5-aad5-9847d0f54791",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 242.95,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T14:38:00Z"
+          },
+          {
+            "id": "d7b8f16c-a005-45c7-997a-07999c4536b9",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.88,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T15:20:00Z"
+          },
+          {
+            "id": "e1a1df13-e636-4175-97d7-62d2004021c4",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.59,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T15:59:00Z"
+          },
+          {
+            "id": "1e7fb75a-6077-403a-9958-ab291ac56dda",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.7,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T16:27:00Z"
+          },
+          {
+            "id": "614af2ba-2132-411a-89e1-5330ee34da6c",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.78,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T16:37:00Z"
+          },
+          {
+            "id": "8c92880f-28a3-4fc1-80b9-5daff10f0a92",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.67,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T16:42:00Z"
+          },
+          {
+            "id": "7ba18655-24cb-41ef-bf20-f8335211e214",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.71,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T17:02:00Z"
+          },
+          {
+            "id": "a767d8c2-b89f-4b6b-bf24-fafb69b7cc43",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.65,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T17:04:00Z"
+          },
+          {
+            "id": "be786827-530b-4794-b95b-1855784a7005",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.66,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T17:22:00Z"
+          },
+          {
+            "id": "9b6694b6-e30e-4f19-b239-02b1c34e7f4f",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.44,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T17:32:00Z"
+          },
+          {
+            "id": "900630dc-68c0-4a6e-8357-14c61b14c899",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.56,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T17:38:00Z"
+          },
+          {
+            "id": "7962f740-4490-4c4e-bdfd-98ec26b0d4e9",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.42,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T17:40:00Z"
+          },
+          {
+            "id": "6e983f43-da6f-40e2-a1ca-5f24443c35f5",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.14,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T18:10:00Z"
+          },
+          {
+            "id": "fa36e774-f730-419f-9d46-b13ece07701e",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.17,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T18:33:00Z"
+          },
+          {
+            "id": "8e2c1060-7550-4eb2-9fe4-cad679b6be37",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.29,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T18:38:00Z"
+          },
+          {
+            "id": "7e5561cc-70f0-4b5a-8323-1efaf34c48fb",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.39,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T19:06:00Z"
+          },
+          {
+            "id": "b752673f-4cbd-409f-a72a-95153fa9dcbb",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.41,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T19:18:00Z"
+          },
+          {
+            "id": "a1f0a444-25f5-4e0a-8727-8e6d56be449c",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.31,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T19:24:00Z"
+          },
+          {
+            "id": "5c00dd96-281f-4fb5-aa52-87ca61ce99b5",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.16,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T19:48:00Z"
+          },
+          {
+            "id": "2536103a-a606-4238-9e81-80d5599e4741",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.08,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T19:56:00Z"
+          },
+          {
+            "id": "01db1b4f-f0dd-44f7-9488-e9139969cadb",
+            "instrument": "AAPL.NASDAQ",
+            "side": "BUY",
+            "quantity": 1.0,
+            "price": 243.17,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T20:11:00Z"
+          },
+          {
+            "id": "a6d9be78-3cac-4f3c-9bcd-51027d032d60",
+            "instrument": "AAPL.NASDAQ",
+            "side": "SELL",
+            "quantity": 1.0,
+            "price": 243.14,
+            "pnl": 0.0,
+            "commission": 0.0,
+            "executed_at": "2024-12-06T20:24:00Z"
+          }
+        ],
+        "total": 166,
+        "page": 1,
+        "page_size": 500
+      }
+    },
+    "history_single": {
+      "http_status": 200,
+      "path": "/api/v1/backtests/history?type=single&page=1&page_size=20",
+      "body": {
+        "items": [
+          {
+            "id": "6d8e6878-55eb-4b42-8444-6d5a6abc7166",
+            "type": "single",
+            "strategy_id": "630f8d0a-3a02-4c39-a8ba-92a26181972f",
+            "portfolio_id": null,
+            "portfolio_name": null,
+            "status": "completed",
+            "start_date": "2024-12-02",
+            "end_date": "2024-12-07",
+            "created_at": "2026-10-03T17:48:46.279661",
+            "error_code": null,
+            "error_public_message": null,
+            "phase": null,
+            "progress_message": null,
+            "smoke": false
+          },
+          {
+            "id": "e343c6a8-558a-4814-bc32-a27a251f142a",
+            "type": "single",
+            "strategy_id": "4ece46fb-6569-4578-8015-a678265d81d4",
+            "portfolio_id": null,
+            "portfolio_name": null,
+            "status": "completed",
+            "start_date": "2025-11-03",
+            "end_date": "2025-11-15",
+            "created_at": "2026-05-13T04:15:32.314456",
+            "error_code": null,
+            "error_public_message": null,
+            "phase": null,
+            "progress_message": null,
+            "smoke": false
+          },
+          {
+            "id": "0d36ce6a-07e9-4de0-b933-e76e73cb7c0d",
+            "type": "single",
+            "strategy_id": "4ece46fb-6569-4578-8015-a678265d81d4",
+            "portfolio_id": null,
+            "portfolio_name": null,
+            "status": "completed",
+            "start_date": "2025-11-03",
+            "end_date": "2025-11-15",
+            "created_at": "2026-05-13T04:14:50.800613",
+            "error_code": null,
+            "error_public_message": null,
+            "phase": null,
+            "progress_message": null,
+            "smoke": false
+          },
+          {
+            "id": "e375475b-abe0-4600-8afb-d2a7897bccb8",
+            "type": "single",
+            "strategy_id": "4ece46fb-6569-4578-8015-a678265d81d4",
+            "portfolio_id": null,
+            "portfolio_name": null,
+            "status": "completed",
+            "start_date": "2025-11-03",
+            "end_date": "2025-11-15",
+            "created_at": "2026-05-13T04:13:39.165312",
+            "error_code": null,
+            "error_public_message": null,
+            "phase": null,
+            "progress_message": null,
+            "smoke": false
+          },
+          {
+            "id": "3661ed5e-be74-4b30-ab6a-bd3dbee77638",
+            "type": "single",
+            "strategy_id": "630f8d0a-3a02-4c39-a8ba-92a26181972f",
+            "portfolio_id": null,
+            "portfolio_name": null,
+            "status": "completed",
+            "start_date": "2025-11-03",
+            "end_date": "2026-04-29",
+            "created_at": "2026-05-12T14:05:27.002288",
+            "error_code": null,
+            "error_public_message": null,
+            "phase": null,
+            "progress_message": null,
+            "smoke": false
+          },
+          {
+            "id": "2ebe9b1e-ae20-4c43-9faf-4100b280e6fb",
+            "type": "single",
+            "strategy_id": "630f8d0a-3a02-4c39-a8ba-92a26181972f",
+            "portfolio_id": null,
+            "portfolio_name": null,
+            "status": "completed",
+            "start_date": "2025-11-03",
+            "end_date": "2026-04-29",
+            "created_at": "2026-05-12T14:04:59.387490",
+            "error_code": null,
+            "error_public_message": null,
+            "phase": null,
+            "progress_message": null,
+            "smoke": false
+          },
+          {
+            "id": "21ebdb73-7a32-4b77-b6cb-f3bedba35eaf",
+            "type": "single",
+            "strategy_id": "630f8d0a-3a02-4c39-a8ba-92a26181972f",
+            "portfolio_id": null,
+            "portfolio_name": null,
+            "status": "completed",
+            "start_date": "2025-11-03",
+            "end_date": "2026-04-29",
+            "created_at": "2026-05-12T13:50:49.180917",
+            "error_code": null,
+            "error_public_message": null,
+            "phase": null,
+            "progress_message": null,
+            "smoke": false
+          },
+          {
+            "id": "f2411f3b-fc1d-47b4-8f6a-28f6641bbffb",
+            "type": "single",
+            "strategy_id": "630f8d0a-3a02-4c39-a8ba-92a26181972f",
+            "portfolio_id": null,
+            "portfolio_name": null,
+            "status": "completed",
+            "start_date": "2025-11-03",
+            "end_date": "2026-04-29",
+            "created_at": "2026-05-12T13:50:08.912188",
+            "error_code": null,
+            "error_public_message": null,
+            "phase": null,
+            "progress_message": null,
+            "smoke": false
+          }
+        ],
+        "total": 8
+      }
+    },
+    "history": {
+      "http_status": 200,
+      "path": "/api/v1/backtests/history?page=1&page_size=20",
+      "body": {
+        "items": [
+          {
+            "id": "6d8e6878-55eb-4b42-8444-6d5a6abc7166",
+            "type": "single",
+            "strategy_id": "630f8d0a-3a02-4c39-a8ba-92a26181972f",
+            "portfolio_id": null,
+            "portfolio_name": null,
+            "status": "completed",
+            "start_date": "2024-12-02",
+            "end_date": "2024-12-07",
+            "created_at": "2026-10-03T17:48:46.279661",
+            "error_code": null,
+            "error_public_message": null,
+            "phase": null,
+            "progress_message": null,
+            "smoke": false
+          },
+          {
+            "id": "3715189d-7ce9-41ac-8a18-12c2555ec419",
+            "type": "portfolio",
+            "strategy_id": null,
+            "portfolio_id": "69b6a0f5-bcb2-4b4a-8c08-2bb1f9e1f9e8",
+            "portfolio_name": "AAPL EMA Cross 10/30 (H1 2024 minute bars)",
+            "status": "completed",
+            "start_date": "2024-01-02",
+            "end_date": "2024-06-28",
+            "created_at": "2026-05-21T01:39:45.068010",
+            "error_code": null,
+            "error_public_message": null,
+            "phase": null,
+            "progress_message": null,
+            "smoke": false
+          },
+          {
+            "id": "7688f694-8039-410d-8679-0e72f7a72271",
+            "type": "portfolio",
+            "strategy_id": null,
+            "portfolio_id": "69b6a0f5-bcb2-4b4a-8c08-2bb1f9e1f9e8",
+            "portfolio_name": "AAPL EMA Cross 10/30 (H1 2024 minute bars)",
+            "status": "completed",
+            "start_date": "2024-01-02",
+            "end_date": "2024-06-28",
+            "created_at": "2026-05-21T01:33:25.595725",
+            "error_code": null,
+            "error_public_message": null,
+            "phase": null,
+            "progress_message": null,
+            "smoke": false
+          },
+          {
+            "id": "57feb355-999c-474f-883a-524cb0fa3cc0",
+            "type": "portfolio",
+            "strategy_id": null,
+            "portfolio_id": "cd70fd7a-db52-4c54-9eac-977f0b70caa8",
+            "portfolio_name": "AAPL EMA Cross 10/30 (3y backtest)",
+            "status": "completed",
+            "start_date": "2024-01-02",
+            "end_date": "2024-06-28",
+            "created_at": "2026-05-21T01:29:03.621598",
+            "error_code": null,
+            "error_public_message": null,
+            "phase": null,
+            "progress_message": null,
+            "smoke": false
+          },
+          {
+            "id": "d75f6fc0-1fd2-40c8-92a0-84338ffa697c",
+            "type": "portfolio",
+            "strategy_id": null,
+            "portfolio_id": "cd70fd7a-db52-4c54-9eac-977f0b70caa8",
+            "portfolio_name": "AAPL EMA Cross 10/30 (3y backtest)",
+            "status": "completed",
+            "start_date": "2023-04-03",
+            "end_date": "2026-05-20",
+            "created_at": "2026-05-20T22:44:07.784757",
+            "error_code": null,
+            "error_public_message": null,
+            "phase": null,
+            "progress_message": null,
+            "smoke": false
+          },
+          {
+            "id": "e343c6a8-558a-4814-bc32-a27a251f142a",
+            "type": "single",
+            "strategy_id": "4ece46fb-6569-4578-8015-a678265d81d4",
+            "portfolio_id": null,
+            "portfolio_name": null,
+            "status": "completed",
+            "start_date": "2025-11-03",
+            "end_date": "2025-11-15",
+            "created_at": "2026-05-13T04:15:32.314456",
+            "error_code": null,
+            "error_public_message": null,
+            "phase": null,
+            "progress_message": null,
+            "smoke": false
+          },
+          {
+            "id": "0d36ce6a-07e9-4de0-b933-e76e73cb7c0d",
+            "type": "single",
+            "strategy_id": "4ece46fb-6569-4578-8015-a678265d81d4",
+            "portfolio_id": null,
+            "portfolio_name": null,
+            "status": "completed",
+            "start_date": "2025-11-03",
+            "end_date": "2025-11-15",
+            "created_at": "2026-05-13T04:14:50.800613",
+            "error_code": null,
+            "error_public_message": null,
+            "phase": null,
+            "progress_message": null,
+            "smoke": false
+          },
+          {
+            "id": "e375475b-abe0-4600-8afb-d2a7897bccb8",
+            "type": "single",
+            "strategy_id": "4ece46fb-6569-4578-8015-a678265d81d4",
+            "portfolio_id": null,
+            "portfolio_name": null,
+            "status": "completed",
+            "start_date": "2025-11-03",
+            "end_date": "2025-11-15",
+            "created_at": "2026-05-13T04:13:39.165312",
+            "error_code": null,
+            "error_public_message": null,
+            "phase": null,
+            "progress_message": null,
+            "smoke": false
+          },
+          {
+            "id": "3661ed5e-be74-4b30-ab6a-bd3dbee77638",
+            "type": "single",
+            "strategy_id": "630f8d0a-3a02-4c39-a8ba-92a26181972f",
+            "portfolio_id": null,
+            "portfolio_name": null,
+            "status": "completed",
+            "start_date": "2025-11-03",
+            "end_date": "2026-04-29",
+            "created_at": "2026-05-12T14:05:27.002288",
+            "error_code": null,
+            "error_public_message": null,
+            "phase": null,
+            "progress_message": null,
+            "smoke": false
+          },
+          {
+            "id": "2ebe9b1e-ae20-4c43-9faf-4100b280e6fb",
+            "type": "single",
+            "strategy_id": "630f8d0a-3a02-4c39-a8ba-92a26181972f",
+            "portfolio_id": null,
+            "portfolio_name": null,
+            "status": "completed",
+            "start_date": "2025-11-03",
+            "end_date": "2026-04-29",
+            "created_at": "2026-05-12T14:04:59.387490",
+            "error_code": null,
+            "error_public_message": null,
+            "phase": null,
+            "progress_message": null,
+            "smoke": false
+          },
+          {
+            "id": "21ebdb73-7a32-4b77-b6cb-f3bedba35eaf",
+            "type": "single",
+            "strategy_id": "630f8d0a-3a02-4c39-a8ba-92a26181972f",
+            "portfolio_id": null,
+            "portfolio_name": null,
+            "status": "completed",
+            "start_date": "2025-11-03",
+            "end_date": "2026-04-29",
+            "created_at": "2026-05-12T13:50:49.180917",
+            "error_code": null,
+            "error_public_message": null,
+            "phase": null,
+            "progress_message": null,
+            "smoke": false
+          },
+          {
+            "id": "f2411f3b-fc1d-47b4-8f6a-28f6641bbffb",
+            "type": "single",
+            "strategy_id": "630f8d0a-3a02-4c39-a8ba-92a26181972f",
+            "portfolio_id": null,
+            "portfolio_name": null,
+            "status": "completed",
+            "start_date": "2025-11-03",
+            "end_date": "2026-04-29",
+            "created_at": "2026-05-12T13:50:08.912188",
+            "error_code": null,
+            "error_public_message": null,
+            "phase": null,
+            "progress_message": null,
+            "smoke": false
+          }
+        ],
+        "total": 12
+      }
+    },
+    "report": {
+      "http_status": 200,
+      "path": "/api/v1/backtests/6d8e6878-55eb-4b42-8444-6d5a6abc7166/report",
+      "content_type": "text/html; charset=utf-8",
+      "bytes": 326660,
+      "sha256": "154fadb418821b0e804d0ac022ffe99ba4f3a9c2767049af62afa6a4aa090df6",
+      "contains_quantstats": true,
+      "empty_fallback": false,
+      "basic_fallback": false
+    }
+  }
+}

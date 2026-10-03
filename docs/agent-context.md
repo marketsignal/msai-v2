@@ -1,18 +1,45 @@
 # MSAI v2 (MarketSignal AI) — Project Context
 
+This is the shared, project-owned context for Claude Code and Codex. Read it completely before project action, as required by the root adapters. Keep the deployment procedures, API inventory, data-provider knowledge and E2E configuration here so every agent sees them. Canonical Forge workflow policy lives in [`.forge/instructions.md`](../.forge/instructions.md); this document supplies MSAI's goals, facts and operating constraints.
+
+**Last reconciled: 2026-10-03.** The goal below is the intended product. Implementation descriptions are not proof of acceptance. Dated runtime observations are snapshots; verify the relevant environment before operating it. [Master Map](../MASTER_MAP.md) records capability evidence and open findings; [Master Plan](../MASTER_PLAN.md) owns delivery milestones, the monthly roadmap, status and acceptance gates.
+
 ## Project Overview
 
 ### Goal
 
-First real backtest — ingest market data and run EMA Cross strategy on real AAPL/SPY data.
+Build a professional-grade hedge fund research and portfolio operations platform. The operator should be able to focus on researching strategies, assessing evidence and managing portfolios across brokerage accounts, with dependable infrastructure and clear financial records.
+
+The complete workflow is **research → strategy backtesting and validation → portfolio construction and validation → deployment to an account → live monitoring, reconciliation and controlled revision**. The platform must support multiple accounts, each with a deployed portfolio composed of strategies, and consistent account switching through the API, CLI and UI. Interactive Brokers is the first supported broker; other brokers are a future extension of the same account/portfolio model.
+
+Professional quality means reproducible experiments, controls against leakage and selection bias, explicit execution costs and market assumptions, correct portfolio/account accounting, verified account routing, effective risk controls, recoverable operation and traceable actions. The platform assesses evidence for alpha; neither a completed backtest nor the platform itself guarantees profitable strategies.
+
+The earlier goal of completing an AAPL/SPY EMA backtest was an initial milestone. It is not the product boundary.
+
+### Product model and scope
+
+- **Strategy:** versioned Python code, configuration and evidence. Author and evaluate strategies through real backtests, independent validation and forward observation before assigning capital. Track failed experiments as well as selected results.
+- **Portfolio:** a versioned combination of strategies with defined allocations, capital/risk assumptions and portfolio-level validation. Combining independently calculated return curves does not by itself prove shared-cash or margin behavior.
+- **Account deployment:** bind an approved portfolio revision to an explicit brokerage account. The intended operating model is one active portfolio per account, containing multiple strategies. Different accounts may use different portfolios, or the same revision with account-specific capital and limits. Enforcing replacement, allocation and account ownership is part of acceptance, not an assumption about current code.
+- **Account and fleet views:** show fresh positions, orders, fills, cash, exposure, performance and system health by account, portfolio and strategy. Observations follow the selected view scope. Account commands name and validate their execution target independently; fleet-wide controls retain explicit fleet scope. A UI filter alone is not an authorization boundary. Managing customer accounts does not automatically imply customer logins or a public multi-tenant SaaS product.
+- **Interfaces:** API first, CLI second, UI third is the implementation and verification order. All three are product interfaces and must express the same account/portfolio identities and financial meanings.
+- **Markets and cadence:** the target includes minute data for stocks, indexes, futures, selected options and some crypto, with strategies acting every 5–10 minutes or daily and a potential universe of about 100 underlyings. This is not high-frequency trading. Asset correctness, derived bar intervals and capacity must be demonstrated before those targets are advertised as supported.
+- **Broker and access scope:** prove the full account lifecycle with Interactive Brokers first. Preserve a clear broker boundary without building speculative adapters. Access for the operator and partners uses Microsoft Entra ID; permission and account-access policies require explicit enforcement.
+- **AI:** AI/LLM trading features remain deferred. AI-assisted strategy authoring and analysis must pass the same evidence and execution controls as human-authored work; generated explanations are not validation evidence.
 
 ### What Is This?
 
-MSAI v2 is a personal hedge fund platform for automated trading via Interactive Brokers. It enables defining trading strategies as Python files, backtesting them against historical minute-level data, deploying them to live/paper trading, and monitoring portfolio performance through a web dashboard. MSAI v2 is an API-first, CLI-second, UI-third product.
+MSAI v2 is the current implementation toward that goal: Python strategies, Nautilus backtests and trading nodes, research/portfolio workflows, account routing, and a custom operations dashboard. Much of the workflow exists, but professional readiness has not been established. Use the evidence below and in the Master Map to distinguish implemented, tested, runtime-observed and unverified behavior.
+
+### Current implementation focus
+
+Read the [Master Plan delivery milestones and monthly roadmap](../MASTER_PLAN.md#delivery-milestones) before selecting implementation work. The delivery sequence is **reliable strategy research → reliable portfolio operations → dependable daily operation**, with operational repairs and usable interfaces throughout. The immediate priority is trustworthy strategy iteration: reconcile backtest economics and data, protect independent validation, and prove the same research workflow through API, CLI and real-browser computer use.
+
+The Master Plan owns changing dates, progress, dependencies and next actions; do not duplicate its task tracker here. This context retains mandatory operating knowledge and the [UI/browser acceptance requirements](#ui-implementation-and-real-browser-acceptance). A research milestone does not confer portfolio-execution or live-capital readiness.
 
 ### History
 
-This project was originally built in parallel by two AI implementations from the same PRD, and compared side-by-side through 2026-02 to 2026-04. The comparison concluded 2026-04-19 (council verdict in [`docs/decisions/which-version-to-keep.md`](docs/decisions/which-version-to-keep.md)); the losing implementation was archived at tag `codex-final` and removed. The surviving implementation was then flattened from its subdirectory to the repo root. **This IS the shipping implementation; there is no "version" suffix anywhere.** A brief attempt to port the archived Playwright specs was abandoned when plan review found the UI drift too large — see the decision-doc postscript.
+This project was originally built in parallel by two AI implementations from the same PRD, and compared side-by-side through 2026-02 to 2026-04. The comparison concluded 2026-04-19 (council verdict in [the version decision](decisions/which-version-to-keep.md)); the older Codex implementation was archived at tag `codex-final` and removed. The surviving implementation was flattened to the repo root. **The root is the shipping implementation; there is no active "version" suffix.** Historical Codex NQ research and test results do not automatically describe this tree. The decision's postscript records why an attempted direct port of the archived browser tests was abandoned.
 
 ### Stack
 
@@ -20,9 +47,23 @@ This project was originally built in parallel by two AI implementations from the
 - **Frontend:** Next.js 15 + React + shadcn/ui + Tailwind CSS + TradingView Charts + Recharts
 - **Database:** PostgreSQL 16 + Parquet files + DuckDB + Redis 7
 - **Auth:** Azure Entra ID (MSAL frontend, PyJWT backend)
-- **Deploy:** Docker Compose on Azure VM (dev: single-host; prod: single-VM Standard_D4ds_v6, Phase 2 splits to 2-VM for real money)
-- **Data Sources:** Databento — equities **live real-time via `EQUS.MINI`** (the `DBEQ.BASIC` dataset was deprecated by Databento 2025-01-13; do NOT use it) + equities/futures/options historical; IB Gateway (execution only)
-- **Live test accounts:** local dev uses the **LVP** account (`U4705114` / test-lvp); the prod VM uses the **HVP** account (`U4715997` / test-hvp). IB allows only ONE live session per login (gotcha #3), so the same login cannot run on local and prod at the same time — bring one down before the other comes up. The real **fund** account is NOT touched until everything is proven, after PR-3.
+- **Deploy:** Docker Compose on Azure VM; the observed production VM is Standard_D4ds_v6. Splitting research and live compute across hosts is a future decision based on measured contention and recovery requirements, not an implemented or unconditional "Phase 2" promise.
+- **Data sources:** Databento defaults to `EQUS.MINI` for equities and `GLBX.MDP3` for futures. Databento is the intended live market-data source; IB Gateway supplies execution/account connectivity. Historical data availability is recorded in the dated vendor table below. Provider coverage does not certify MSAI's asset/catalog handling.
+- **Broker identity:** LVP `U4705114` and HVP `U4715997` are the named live test accounts from the historical operating plan. **Do not assume the old local-LVP / Azure-HVP mapping is currently active.** The October 3 inspection found an LVP production registry entry but null broker-reported account identity. Avoid competing sessions on the same IB login; establish the actual account/login/mode before starting another gateway. The real fund account remains outside the standing test authorization.
+
+### Verified baseline and current limits
+
+The [2026-10-03 runtime assessment](audits/2026-10-03/runtime-assessment.md) records actual execution rather than inferred readiness:
+
+- Local equity backtest, two research trials, discovery-candidate creation, a one-member quick portfolio simulation, CLI reads and QuantStats reports succeeded using existing data.
+- Azure owner Entra sign-in, browser backtest submission, 166 simulated fills, native results and a full report succeeded. Full research-to-live acceptance and current broker order execution were not tested.
+- Both running environments produced incorrect headline return units and omitted first-day PnL in return series. Research holdout/selection, multi-asset modeling, risk wiring and financial attribution also have open findings. Completed jobs are not investment approval.
+- Azure's latest two deployments were blocked by a stale temporary SSH rule; its older live supervisor could not resolve current strategy paths. Application/database volumes were on the 83%-used root disk; the attached data disk was unmounted. Backup artifacts existed, but restoration was not tested.
+- Seven local research services were left running with vendor ingestion and broker access disabled by the assessment override. Local browser history/trades fetch errors remain unresolved. CLI invocation from the repository root failed and exposed configuration values in diagnostics; run it from `backend/` and never publish raw sensitive diagnostics.
+
+These are dated observations, not permanent environment facts. Consult the linked evidence before repeating a completed investigation; refresh the relevant checks when the code, environment or intended operation changes.
+
+**Research-foundation candidate:** the first repair batch corrects return units, opening-capital/first-session math, individual fill persistence, legacy unknown economics and CLI diagnostics. [Candidate verification](audits/2026-10-03/research-foundation-verification.md) records the local API/CLI/browser proof and its remaining gates. These changes have not been released to Azure. New accounting metadata identifies realized USD account balances and engine-recorded costs; it does not certify marked-to-market NAV, realistic execution costs or investment validity. Never compare unversioned historical research studies with corrected runs as though their accounting basis were identical.
 
 ### Ports (dev)
 
@@ -35,55 +76,65 @@ This project was originally built in parallel by two AI implementations from the
 
 ### Running the stack
 
+Run from the repository root. To resume the existing-data research assessment with its broker/vendor guards and existing images:
+
 ```bash
-docker compose -f docker-compose.dev.yml up -d
+docker compose -f docker-compose.dev.yml \
+  -f docs/audits/2026-10-03/local-runtime.override.yml \
+  up -d --no-build postgres redis backend frontend backtest-worker research-worker portfolio-worker
 
 # Health checks
 curl http://localhost:8800/health
+curl http://localhost:8800/ready
 open http://localhost:3300
 
-# Logs + stop
+# Logs
 docker compose -f docker-compose.dev.yml logs -f
-docker compose -f docker-compose.dev.yml down
 ```
 
-IB Gateway is behind the `broker` Compose profile:
+The standard development startup remains `docker compose -f docker-compose.dev.yml up -d`; it does **not** preserve the audit override. Inventory existing services and select the intended mode first. The API starts account-connection tasks even when no broker container is launched, so omitting the broker profile alone is not a broker-disable switch. The override points those tasks at a closed loopback port, disables scheduled ingestion and automatic data healing, and clears the vendor key. Keep it for this bounded research mode; inspect any additional `IB_HOST` override because it has precedence over `IB_GATEWAY_HOST`.
+
+IB Gateway and the live supervisor are behind the `broker` Compose profile. The historical broker-start form is:
 
 ```bash
 COMPOSE_PROFILES=broker docker compose -f docker-compose.dev.yml --env-file .env up -d
 ```
 
+Use it only within an authorized broker task after verifying account/login/mode, routing and existing sessions. It can start/recover live processes; it is not a passive health check. `docker compose -f docker-compose.dev.yml down` stops the project; do not run it against active trading merely to reset development. Health/readiness do not certify worker progress or safe trading. `/ready` may also bootstrap the configured API-key user.
+
 ### Deploying to production
 
-**Push to main auto-deploys to the Azure VM** via a two-workflow chain:
+**Azure identity:** MSAI belongs to the **MarketSignal.ai LLC** Azure/Entra tenant. Use **`pablo@marketsignal.ai`** for the platform and tenant sign-in. This environment is separate from KSG; **`pablo@ksgai.com` is not the MSAI tenant account**. Verify the selected tenant and subscription before Azure operations rather than relying on the CLI's current default. Confirmed by the operator on 2026-10-03.
+
+**Push to main triggers automatic deployment toward the Azure VM** via a two-workflow chain. A trigger is not proof that the deployment succeeded; the current blockage is recorded above.
 
 1. `.github/workflows/build-and-push.yml` (Slice 2) — OIDC → ACR → docker build & push tagged `<sha7>`.
 2. `.github/workflows/deploy.yml` (Slice 3 + 4) — `workflow_run` on Slice 2 success → active-deployments gate → OIDC + transient NSG SSH rule → `scp` + `ssh sudo bash deploy-on-vm.sh` → `docker compose pull && up -d --wait` → VM-executed probes (any failure here auto-rolls back to the previous SHA) → runner-side public probes (TLS chain / public `/health` / frontend root — these fail the workflow but do NOT trigger auto-rollback; manual rollback needed if they fail).
 
 Manual rollback / re-deploy / rehearsal-RG dispatch use `gh workflow run deploy.yml -f git_sha=<sha>` (and full override matrix for rehearsal).
 
-**Read [`docs/how_to_deploy.md`](docs/how_to_deploy.md) first** for the deploy architecture diagram, the active-`live_deployments` safety gate, rehearsal procedure, repo-Variable matrix, and the pointer index to deep-dive runbooks (`vm-setup`, `slice-3-first-deploy`, `disaster-recovery`, `restore-from-backup`, `iac-parity-reapply`).
+**Read [how_to_deploy.md](how_to_deploy.md) before deployment** for the architecture, active-deployment gate, rehearsal procedure, repository-variable matrix and detailed runbooks (`vm-setup`, `slice-3-first-deploy`, `disaster-recovery`, `restore-from-backup`, `iac-parity-reapply`). Routine deployment excludes broker-profile services; their compatibility and maintenance must be checked separately. Existing findings include missing full-CI release gating and incomplete treatment of stopping deployments. Image rollback does not automatically reverse a schema migration. Deployment/rollback commands here are an operational reference, not an instruction to run them during an audit.
 
 ### File Structure
 
 ```
 msai-v2/
-├── backend/                 # FastAPI + Python (~32.5K LOC, 536 tests)
+├── backend/                 # FastAPI, CLI, workers, research and trading services
 │   ├── src/msai/
 │   │   ├── api/             # FastAPI routers (auth, strategies, backtests, live, portfolios, market-data, account, websocket, alerts)
 │   │   ├── core/            # Config, auth, database, logging, queue, secrets, audit, data_integrity, metrics
 │   │   ├── live_supervisor/ # Subprocess spawner for TradingNode — heartbeat monitor, process manager, command bus
-│   │   ├── models/          # SQLAlchemy 2.0 models (~30 tables)
+│   │   ├── models/          # SQLAlchemy application and audit models
 │   │   ├── schemas/         # Pydantic request/response
 │   │   ├── services/        # Business logic (risk_engine, alerting, parquet_store, nautilus/*, security_master/*, live/*, data_sources/*)
 │   │   ├── workers/         # arq background workers (backtest, research, portfolio, ingest, live_supervisor)
 │   │   ├── main.py          # FastAPI app entrypoint
-│   │   └── cli.py           # Typer CLI (8 sub-apps)
+│   │   └── cli.py           # Typer CLI and local operator commands
 │   ├── tests/{unit,integration,e2e}/
 │   ├── alembic/             # Database migrations
 │   ├── Dockerfile + Dockerfile.dev
 │   └── pyproject.toml
-├── frontend/                # Next.js 15 + shadcn/ui (15 primitives) + typed API client
+├── frontend/                # Next.js + shadcn/ui + typed API client
 │   ├── src/{app,components,lib}/
 │   ├── playwright.config.ts       # Playwright scaffold — baseURL http://localhost:3300
 │   └── tests/e2e/{specs,fixtures,.auth}/  # Graduated specs + auth fixture
@@ -105,18 +156,20 @@ msai-v2/
 │   └── reports/             # verify-e2e agent output
 ├── scripts/                 # Operator-invokable scripts (seed_market_data, parity_check, restart-workers, migrate_catalog_to_canonical, etc.)
 ├── .github/workflows/       # CI
-├── .claude/                 # Claude Code configuration (hooks, rules, commands, skills)
+├── .forge/                  # Canonical Forge policy, workflows and roles
+├── .claude/ + .codex/ + .agents/ # Host adapters and discovery surfaces
 ├── docker-compose.dev.yml   # Ports: 3300, 8800, 5433, 6380
 ├── docker-compose.prod.yml
-├── CLAUDE.md                # This file
+├── AGENTS.md + CLAUDE.md    # Thin pointers to this context and Forge policy
+├── MASTER_MAP.md + MASTER_PLAN.md # Evidence-based assessment and proposed work
 └── README.md
 ```
 
 ### Key Commands
 
 ```bash
-# Backend development
-cd backend && uv run pytest tests/ -v
+# Backend development (run each command from the repository root)
+cd backend && uv run pytest tests/unit/<owning_test_file>.py -v  # replace placeholder
 cd backend && uv run ruff check src/
 cd backend && uv run mypy src/ --strict
 cd backend && uv run uvicorn msai.main:app --reload   # Dev server on :8000 (Docker maps to :8800)
@@ -126,24 +179,17 @@ cd frontend && pnpm dev                               # Dev server on :3000 (Doc
 cd frontend && pnpm build
 cd frontend && pnpm lint
 
-# Docker dev (preferred — hot reload via volume mounts)
-docker compose -f docker-compose.dev.yml up -d
-docker compose -f docker-compose.dev.yml logs -f
-docker compose -f docker-compose.dev.yml down
+# Docker startup/mode selection: use "Running the stack" above.
+# Production changes: use the supported deployment procedure above.
 
-# Docker prod
-docker compose -f docker-compose.prod.yml up -d
-
-# CLI tools (msai is organized as sub-apps: live, strategy, backtest, research,
-# graduation, portfolio, account, system, instruments; plus top-level ingest,
-# ingest-daily, data-status, health)
+# CLI examples; groups and target configuration are listed below.
 cd backend && uv run msai ingest stocks AAPL,MSFT 2024-01-01 2025-01-01   # positional: asset symbols start end
 cd backend && uv run msai data-status
 cd backend && uv run msai live status
 cd backend && uv run msai live kill-all
 cd backend && uv run msai instruments refresh --symbols AAPL,ES --provider interactive_brokers
 
-# Database migrations
+# Database migrations (mutating operations, only when in task scope)
 cd backend && uv run alembic upgrade head
 cd backend && uv run alembic revision --autogenerate -m "description"
 
@@ -152,39 +198,37 @@ cd backend && uv run alembic revision --autogenerate -m "description"
 ./scripts/restart-workers.sh --with-broker   # also restart live-supervisor + ib-gateway
 ```
 
+Use focused owning checks during development; broad regression belongs in CI or an explicitly requested full run. Run each `cd ... && ...` example independently from the repository root. CLI groups are `strategy`, `backtest`, `research`, `live`, `graduation`, `portfolio`, `account`, `broker`, `system`, `instruments`, `alerts`, `auth`, `market-data` and `symbols`; top-level commands include `health`, `ingest`, `ingest-daily`, `data-status` and `whoami`.
+
+API-backed CLI commands read `MSAI_API_URL` (default `http://localhost:8000`; use `http://localhost:8800` for the Docker host API) and `MSAI_API_KEY`. Top-level ingestion/data-status and some operator commands execute locally, so setting a remote API URL does not relocate every command. When the `msai` executable is not installed, run `PYTHONPATH=backend/src backend/.venv/bin/python -m msai.cli ...` from a checkout with that environment, or `PYTHONPATH=src .venv/bin/python -m msai.cli ...` from `backend/`; an isolated worktree can use the explicitly selected existing interpreter and its own source path. Settings reads `.env` from the working directory. The research-foundation repair ignores unrelated Compose keys and hides validation input values while retaining known-field and production checks; older running source lacks that fix. Always select the intended API configuration and avoid publishing raw sensitive diagnostics. Restart commands affect running processes and require the same account/session awareness as startup.
+
 ### API Endpoints
 
-```
-/health                              # Liveness probe (unauthenticated)
-/ready                               # Readiness probe (unauthenticated)
-/api/v1/auth/me                      # GET  Current user from JWT
-/api/v1/auth/logout                  # POST Placeholder logout
-/api/v1/strategies/                  # GET/PATCH/DELETE  Strategy registry
-/api/v1/strategies/{id}/validate     # POST Validate strategy loads
-/api/v1/backtests/run                # POST Start backtest (arq job)
-/api/v1/backtests/{id}/status        # GET  Poll job status
-/api/v1/backtests/{id}/results       # GET  Metrics + trade log
-/api/v1/backtests/{id}/report        # GET  Download QuantStats HTML
-/api/v1/backtests/history            # GET  List past backtests
-/api/v1/live/start-portfolio         # POST Deploy portfolio revision (risk-validated)
-/api/v1/live/stop                    # POST Stop deployment
-/api/v1/live/kill-all                # POST Emergency halt all
-/api/v1/live/status                  # GET  All deployments
-/api/v1/live/positions               # GET  Open positions
-/api/v1/live/trades                  # GET  Recent executions
-/api/v1/live/stream/{deployment_id}  # WS   Real-time updates (JWT first-message auth)
-/api/v1/live-portfolios/             # GET/POST/PATCH Portfolio CRUD + revision lifecycle
-/api/v1/market-data/bars/{symbol}    # GET  OHLCV bars from Parquet via DuckDB
-/api/v1/market-data/symbols          # GET  Available symbols
-/api/v1/market-data/status           # GET  Storage stats
-/api/v1/market-data/ingest           # POST Trigger data download (arq job)
-/api/v1/account/summary              # GET  IB account data
-/api/v1/account/portfolio            # GET  IB positions
-/api/v1/account/health               # GET  IB Gateway status
-/api/v1/alerts/                      # GET  Recent alert history
-```
+Principal route inventory, checked against the mounted routers on 2026-10-03. Paths in the table have the `/api/v1` prefix. Exact schemas, query parameters and less common operations remain defined by the router/OpenAPI contract; this table does not imply every route has passed end-to-end acceptance.
 
-All endpoints except `/health` and `/ready` require Azure Entra ID JWT authentication.
+| Family | Methods and paths | Purpose |
+| --- | --- | --- |
+| Authentication | `GET /auth/me`; `POST /auth/logout` | Authenticated user; logout route is an unauthenticated placeholder. |
+| Strategies | `GET /strategies/`; `GET/PATCH/DELETE /strategies/{id}`; `POST /strategies/{id}/validate` | Registry, configuration and Python strategy validation. |
+| Backtests | `POST /backtests/run`; `GET /backtests/history`; `GET /backtests/{id}/status`; `GET /backtests/{id}/results`; `GET /backtests/{id}/trades`; `POST /backtests/{id}/report-token`; `GET /backtests/{id}/report` | Queued simulation, metrics/series, paginated fills and QuantStats report delivery. |
+| Research | `POST /research/sweeps`; `POST /research/walk-forward`; `GET /research/jobs`; `GET /research/jobs/{id}`; `POST /research/jobs/{id}/cancel`; `POST /research/promotions` | Experiment jobs and candidate promotion. |
+| Graduation | `GET/POST /graduation/candidates`; `GET /graduation/candidates/{id}`; `POST /graduation/candidates/{id}/stage`; `GET /graduation/candidates/{id}/transitions` | Candidate evidence and stage history; current evidence gates have open findings. |
+| Research portfolios | `GET/POST /portfolios`; `GET /portfolios/{id}`; `GET /portfolios/{id}/allocations`; `GET /portfolios/runs`; `POST /portfolios/{id}/runs`; `GET /portfolios/runs/{id}`; `GET /portfolios/runs/{id}/report`; `POST /portfolios/runs/{id}/cancel`; `POST /portfolios/runs/{id}/promote-to-live`; `POST /portfolios/smoke/runs` | Portfolio construction, simulation and promotion. |
+| Live portfolio definitions | `GET/POST /live-portfolios`; `GET /live-portfolios/{id}`; `POST /live-portfolios/{id}/strategies`; `POST /live-portfolios/{id}/snapshot`; `GET /live-portfolios/{id}/members`; `GET /live-portfolio-revisions/{revision_id}/members` | Live composition, immutable revisions and member inspection; there is no live-portfolio PATCH route. |
+| Live commands | `POST /live/start-portfolio`; `POST /live/stop`; `POST /live/kill-all`; `POST /live/drain/{account_id}`; `POST /live/resume`; `POST /live/resume/{account_id}` | Account-bound deployment and lifecycle controls. Old `POST /live/start` is an unauthenticated **410 deprecated** tombstone. |
+| Live observations | `GET /live/status`; `GET /live/status/{deployment_id}`; `GET /live/positions`; `GET /live/trades`; `GET /live/data-health`; `GET /live/audits/{deployment_id}`; `WS /live/stream/{deployment_id}` | Status, positions, fills, feed health, audit trail and stream. Verify account/deployment scope and freshness. |
+| Broker accounts | `GET/POST /broker-accounts`; `GET/PATCH /broker-accounts/{id}`; `POST /broker-accounts/{id}/rotate-credentials`; `POST /broker-accounts/{id}/archive` | Broker account registry and lifecycle. A registry row is not proof of the connected broker identity. |
+| Market data | `GET /market-data/bars/{symbol}`; `GET /market-data/symbols`; `GET /market-data/status`; `POST /market-data/ingest` | DuckDB queries and stored-data/ingestion controls. |
+| Symbol onboarding | `POST /symbols/onboard/dry-run`; `POST /symbols/onboard`; `GET /symbols/onboard/{run_id}/status`; `POST /symbols/onboard/{run_id}/repair`; `GET /symbols/readiness`; `GET /symbols/inventory`; `DELETE /symbols/{symbol}` | Data availability/onboarding and lifecycle; distinguish preview, download and deletion. |
+| Instruments | `POST /instruments/bootstrap` | Instrument registry preparation. |
+| Account snapshots | `GET /account/summary`; `GET /account/portfolio`; `GET /account/health` | Broker account data, positions and connection health; these are not a full historical performance ledger. |
+| Operations | `GET /alerts/`; `GET /system/health` | Alerts and operational visibility. |
+
+Unprefixed backend routes: `GET /health` (liveness), `GET /ready` (PostgreSQL readiness plus API-user bootstrap), `GET /metrics` (metrics). They are unauthenticated at the application layer; deployment/proxy exposure is a separate concern.
+
+Protected REST routes accept an Entra access token in `Authorization: Bearer …` or the configured `MSAI_API_KEY` in `X-API-Key`. Entra validation checks tenant issuer, client audience, token version 2.0 and delegated `access_as_user` scope. Backtest report downloads also accept a short-lived signed `?token=` capability; portfolio reports require normal authenticated headers. Never retain that capability in shared evidence. Stored viewer/operator roles do not currently enforce REST permissions (M09).
+
+WebSocket authentication sends the raw JWT or API key as the first text message within five seconds. API-key access covers all deployments; JWT access requires deployment ownership. REST/WS visibility therefore needs explicit reconciliation rather than assuming identical authorization.
 
 ---
 
@@ -194,75 +238,105 @@ All endpoints except `/health` and `/ready` require Azure Entra ID JWT authentic
 
 - **Historical data**: Databento → Python ingestion → atomic Parquet writes → `{DATA_ROOT}/parquet/{asset_class}/{symbol}/{YYYY}/{MM}.parquet`
 - **Backtesting**: FastAPI → arq queue → backtest worker → NautilusTrader BacktestRunner → QuantStats report → results in PostgreSQL
-- **Live trading**: FastAPI → risk engine validation → `live_supervisor` spawns TradingNode subprocess → NautilusTrader → IB Gateway. Supervisor owns heartbeat monitor + command bus (Redis Streams + consumer groups + PEL recovery + DLQ).
+- **Live trading**: FastAPI account/revision/start checks → `live_supervisor` spawns TradingNode subprocess → NautilusTrader → IB Gateway. Supervisor owns heartbeat monitor + command bus (Redis Streams + consumer groups + PEL recovery + DLQ). Quantitative risk validation is not fully wired into this active path; see M06.
 - **Dashboard queries**: Frontend → FastAPI → DuckDB (in-memory, reads Parquet) → JSON response
 
-### Databento Data Availability (SETTLED 2026-06-03 — do NOT re-investigate)
+### Databento data availability — recorded verification 2026-06-03
 
-Verified empirically on our **Standard** account via `metadata.list_datasets` + `get_dataset_range` + live fetches, cross-checked against Databento docs. This is the definitive history coverage — do not re-open it.
+The previous investigation reported empirical verification on our **Standard** account using `metadata.list_datasets`, `get_dataset_range` and sample fetches, cross-checked against vendor documentation. Preserve this knowledge to avoid repeating settled research. The table is that dated evidence, **not a fresh vendor/account entitlement check on every context revision**. Recheck the relevant dataset when a requested symbol/window, changed offering, entitlement issue or contradictory result warrants it; do not restart the entire investigation without a reason.
 
 | Asset class                             | Dataset(s)                                                                                                                   | History from   | Notes                                                                       |
 | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | -------------- | --------------------------------------------------------------------------- |
-| **Futures** (ES, NQ, YM, EMD)           | `GLBX.MDP3`                                                                                                                  | **2010-06-06** | ~16 yr; consolidated by nature. RTY (Russell 2000) only 2017.               |
-| **Equities — per-VENUE feeds**          | `ARCX.PILLAR` (NYSE Arca), `XNAS.ITCH` (Nasdaq), `XNYS.PILLAR`, `XASE.PILLAR`, `BATS/BATY/EDGA/EDGX.PITCH`, `XBOS/XPSX.ITCH` | **2018-05-01** | ~8 yr; 1-min + daily. SINGLE-VENUE only (Nasdaq ≈13% ADV, Arca a fraction). |
-| **Equities — CONSOLIDATED**             | `EQUS.MINI`, `DBEQ.BASIC` (deprecated 2025-01)                                                                               | **2023-03-28** | ~3 yr.                                                                      |
-| **Equities — consolidated EOD/summary** | `EQUS.SUMMARY`, `XNAS.BASIC`                                                                                                 | **2024-07-01** | ~2 yr.                                                                      |
+| **Futures** (ES, NQ, YM, EMD)           | `GLBX.MDP3`                                                                                                                  | **2010-06-06** | Consolidated exchange feed; RTY history was reported from 2017. |
+| **Equities — per-VENUE feeds**          | `ARCX.PILLAR` (NYSE Arca), `XNAS.ITCH` (Nasdaq), `XNYS.PILLAR`, `XASE.PILLAR`, `BATS/BATY/EDGA/EDGX.PITCH`, `XBOS/XPSX.ITCH` | **2018-05-01** | One-minute and daily; single-venue coverage, not total-market volume. |
+| **Equities — CONSOLIDATED**             | `EQUS.MINI`, `DBEQ.BASIC` (historically deprecated 2025-01)                                                                   | **2023-03-28** | Use the configured `EQUS.MINI` path; the former investigation recorded `DBEQ.BASIC` deprecation as 2025-01-13. |
+| **Equities — consolidated EOD/summary** | `EQUS.SUMMARY`, `XNAS.BASIC`                                                                                                 | **2024-07-01** | EOD/summary coverage does not substitute for minute history. |
 
-**The rules that follow from this (memorize — they keep biting):**
+**Operational implications of that evidence:**
 
-- **Consolidated equities exist ONLY from 2023** (`EQUS.MINI`). There is **NO single consolidated all-venue equities dataset before 2023** — for true total-market volume/OHLCV in 2018–2023 you must pull every venue feed and aggregate yourself. A volume-based equity signal pre-2023 therefore needs either venue-aggregation or must accept single-venue data.
-- **The "2023 wall" is a dataset-choice artifact, not a hard floor.** Querying `EQUS.MINI` (the consolidated feed, what the app wires for equities) returns only 2023+. The **per-venue feeds (`ARCX.PILLAR` for SPY/IWM/DIA/EEM/EFA/LQD, `XNAS.ITCH` for QQQ/AAPL/MSFT) go back to 2018** for both 1-min and daily bars.
-- **15 years of equities is NOT available from Databento — ever.** The entire equity archive begins 2018-05-01 (~8 yr max). For deeper history use **futures** (ES via `GLBX.MDP3`, 2010) or another provider.
-- **For deep S&P signal research, default to ES futures** (2010, consolidated, no venue-aggregation problem) rather than SPY cash.
-- **Plus is NOT needed for more history.** Depth is fixed by each dataset's inception date, not by subscription tier (Standard pulls 2018 venue data fine). Plus only deepens L1 tick history + licensing — see `MEMORY` note `reference_databento_plan_standard_sufficient`.
-- Always confirm a symbol/dataset's real range with `metadata.get_dataset_range(dataset=...)` + a tiny fetch before designing a backtest window — never assume.
+- **A 2023 equities cutoff can be a dataset-choice issue.** The recorded consolidated `EQUS.MINI` history begins in 2023, while selected single-venue feeds begin in 2018. The prior examples used `ARCX.PILLAR` for SPY/IWM/DIA/EEM/EFA/LQD and `XNAS.ITCH` for QQQ/AAPL/MSFT. Confirm the symbol/dataset pair rather than assuming every symbol has the dataset's full range.
+- Single-venue volume is not consolidated volume. Earlier volume-based equity studies need an explicitly limited single-venue interpretation or a validated aggregation approach covering the required venues. Do not label that input total-market data without evidence.
+- The recorded archive did not supply 15 years of equity history. ES futures via `GLBX.MDP3` offered deeper S&P-related history, but futures are a different instrument and MSAI's futures modeling has open defects. Do not silently substitute ES for SPY or treat vendor coverage as proof the backtest is economically correct.
+- The previous Standard-account check did not justify upgrading to Plus solely to obtain the listed older history. Do not assume a higher tier creates pre-inception data. Check current entitlements, licensing and the requested schema before a purchase or download; old pricing/size estimates are not purchasing evidence.
+- Before designing a new window, use recorded coverage plus `metadata.get_dataset_range(dataset=...)` and, when needed and within the authorized data-download scope, a small sample fetch. Distinguish vendor availability, data actually stored here, and completeness within the requested sessions.
 
 ### Key Design Decisions
 
 - `DATA_ROOT` env var controls all Parquet/report paths (Docker: `/app/data`, local: `./data`)
 - Strategies are Python files in `strategies/` dir (no UI uploads in Phase 1 — git-only)
-- `strategy_code_hash` (SHA256) stored on every backtest/deployment for reproducibility
-- Data lineage on Backtest (nautilus_version, python_version, data_snapshot)
-- arq (not multiprocessing) for job queue — handles retry, timeout, dead-letter
+- Strategy hashes and backtest lineage fields (`nautilus_version`, `python_version`, `data_snapshot`) support provenance. They do not yet bind every executed helper/config/data byte into an immutable experiment; see Master Map M16.
+- arq/Redis provide background job queues, with application retry/cancellation/recovery logic. Live command streams have separate consumer-group/PEL/DLQ handling; do not infer every queue has identical delivery guarantees.
 - PyJWT for backend JWT validation (NOT MSAL — MSAL is frontend only)
 - Backend accepts `X-API-Key` header as alternative to Bearer JWT (dev/CLI/testing via `MSAI_API_KEY` env)
-- Risk engine validates before every live deployment start; 4-layer kill-all (Redis halt latch [fleet + per-account] + supervisor re-check + push-stop + SIGTERM+flatten). On top of these supervisor-driven layers, every live strategy carries a **node-side live-halt order gate** (PR 2 / F6): `RiskAwareStrategy` overrides `submit_order`/`submit_order_list`/`modify_order` and blocks any new opening order while the fleet OR account halt latch is set — read directly from Redis by the node (bounded-staleness ≤2s; `None`/stale → fail-closed), so it is router-independent and survives a supervisor outage. Reduce-only / `MARKET_EXIT` flatten orders are ALWAYS allowed so kill-all/drain flatten still works under a halt. The gate is armed only in live (inert in backtests, where it is never wired).
+- Live safety mechanisms include fleet/account Redis halt latches, supervisor checks, push-stop and process-stop/flatten paths. `RiskAwareStrategy` gates opening submit/modify calls in live mode while allowing reduce-only/`MARKET_EXIT` exits. A failed or stale halt read is intended to fail closed; **a missing key after Redis state loss is a separate known gap** (M08). Position/exposure/daily-loss limits are not fully connected to live order execution (M06). Do not describe these mechanisms as complete risk enforcement or assume every strategy reaches the same gate.
 - Trade dedup via partial unique index on `(deployment_id, broker_trade_id) WHERE broker_trade_id IS NOT NULL` — idempotent reconciliation replay
-- WebSocket auth: first message must be JWT token within 5 seconds; reconnect hydrates orders/trades/status/risk_halt from DB
+- WebSocket reconnect hydrates orders/trades/status/risk_halt from persisted records; authentication and its current visibility differences are described in the API inventory above.
 
 ### Portfolio-per-account
 
-Live deployments sit under a `LivePortfolio → LivePortfolioRevision → LiveDeployment` chain. Revisions are immutable once frozen. Multi-strategy TradingNode via `TradingNodeConfig.strategies=[N ImportableStrategyConfigs]`. `FailureIsolatedStrategy` base class wraps event handlers via `__init_subclass__` so one strategy crashing doesn't kill the node.
+The implementation has a `LivePortfolio → LivePortfolioRevision → LiveDeployment` chain, revision members and a broker-account routing layer. Frozen revisions and `TradingNodeConfig.strategies=[N ImportableStrategyConfigs]` support multi-strategy composition. `FailureIsolatedStrategy` wraps strategy event handlers to contain member exceptions; this is not complete process or resource isolation.
+
+The target is explicit portfolio deployment per account, with account-specific capital, limits and reconciled performance. Stored revision weights do not currently guarantee live order sizing. The [goal-alignment assessment](audits/2026-10-03/goal-alignment.md) records these source-confirmed gaps:
+
+- A graduation candidate is linked to one deployment and becomes ineligible for general reuse; the same approved evidence is not cleanly reusable across account deployments (M25).
+- Active-process uniqueness is per deployment, not account; the inspected guards permit another portfolio after the first is running. The intended one-active-portfolio rule is not enforced (M26).
+- Account scope is partial across API/CLI/UI, and All positions can collapse to a single streamed deployment. Live daily PnL aggregation writes placeholders instead of a reconciled performance history (M27/M28).
+- Research-portfolio promotion requires a `DU` paper-format account, but stores that target only in the new composition's description. Actual account deployment is selected later; clarify this contract without assuming a provisioned paper account or bypassing the restriction (M29).
+
+These gaps remain open after this documentation revision. A real two-account, multi-strategy acceptance journey is required before claiming the product model works end to end. Other brokers remain future work: the present broker registry, credentials and execution factory are IB-specific.
 
 ### Instrument Registry (2026-04-17 / PR #32 + #35)
 
 Tables `instrument_definitions` + `instrument_aliases` hold control-plane metadata for instrument resolution. UUID-keyed with effective-date windowing on aliases for futures rolls. `SecurityMaster.resolve_for_backtest` honors `start` kwarg for historical alias windowing. `msai instruments refresh --provider interactive_brokers` CLI warms the registry via IB qualification.
 
-**Deferred follow-ups:**
+**Current boundary:**
 
-- Live-path wiring onto registry (currently `/live/start-portfolio` uses closed-universe `canonical_instrument_id()`)
-- `instrument_cache` → registry migration
-- Strategy config-schema extraction for UI form generation
+- Instrument/alias metadata exists, but the backtest catalog can reconstruct non-equities as Equity and hardcode one-minute bars (M03). Registry presence does not certify asset, multiplier, expiry or resampling correctness.
+- Strategy config-schema/default extraction is already implemented in the registry; it is not a future task. Schema availability depends on the discovered config class and supported field types.
+- Recheck old instrument-cache/live-resolution migration notes against current call sites before carrying them into a plan; the prior deferred list is not a current work inventory.
 
 ### Environment Variables
 
-```
+Backend settings reference (container-network examples and placeholders, **not a complete file to copy into every process**):
+
+```dotenv
 DATABASE_URL=postgresql+asyncpg://msai:password@postgres:5432/msai
 REDIS_URL=redis://redis:6379
 DATA_ROOT=/app/data
+STRATEGIES_ROOT=/app/strategies
 ENVIRONMENT=development|production
 MSAI_API_KEY=msai-dev-key               # Alternative to Bearer JWT for dev/CLI/testing
 AZURE_TENANT_ID=your-tenant-id
 AZURE_CLIENT_ID=your-client-id
-JWT_TENANT_ID=your-tenant-id
-JWT_CLIENT_ID=your-client-id
-CORS_ORIGINS=["http://localhost:3000"]
+CORS_ORIGINS=["http://localhost:3300"]
 DATABENTO_API_KEY=your-key
+DATABENTO_EQUITIES_DATASET=EQUS.MINI
+DATABENTO_FUTURES_DATASET=GLBX.MDP3
+DATABENTO_DEFAULT_SCHEMA=ohlcv-1m
 IB_GATEWAY_HOST=ib-gateway
 IB_GATEWAY_PORT_PAPER=4004              # client-side socat proxy port (gateway binds 4002 internally)
-IB_GATEWAY_PORT_LIVE=4003               # client-side socat proxy port (gateway binds 4001 internally); documentation-only — flip via IB_PORT=4003
-IB_ACCOUNT_ID=DU...                     # paper; real money starts with U
+IB_ACCOUNT_ID=verified-account-id
+REPORT_SIGNING_SECRET=replace-with-generated-secret
+REPORT_TOKEN_TTL_SECONDS=60
+BROKER_GATEWAY_SLOTS=ib-gateway
+AZURE_KEYVAULT_URI=https://your-vault.vault.azure.net/
+AZURE_KV_MI_CLIENT_ID=                  # optional managed-identity client id, distinct from JWT audience
 ```
+
+`IB_HOST` takes precedence over `IB_GATEWAY_HOST`; `IB_PORT` takes precedence over `IB_GATEWAY_PORT_PAPER`. Live mode uses explicit `IB_PORT=4003` and a matching gateway internal `IB_API_PORT=4001`; paper uses 4004/4002. `IB_GATEWAY_PORT_LIVE` is documentation-only for Settings. Account ID, trading mode, gateway routing and both port layers must agree.
+
+Keep these configuration domains separate:
+
+| Domain | Variables and meaning |
+| --- | --- |
+| Backend JWT validation | Actual Settings fields are `AZURE_TENANT_ID` and `AZURE_CLIENT_ID`. Production Compose also sets `JWT_TENANT_ID`/`JWT_CLIENT_ID`, but they are not aliases consumed by Settings. |
+| API/supervisor process environment | `GATEWAY_CONFIG` describes gateway/account routing. It is read from the process environment, not a Settings field. |
+| Gateway container | `TRADING_MODE`, `IB_API_PORT` and credential inputs configure the broker process. Obtain credentials through the authorized secret store; never put their values in this document or reports. |
+| CLI client | `MSAI_API_URL` and `MSAI_API_KEY` target API-backed commands; host Docker API is port 8800. |
+| Frontend build | `NEXT_PUBLIC_AZURE_CLIENT_ID`, `NEXT_PUBLIC_AZURE_TENANT_ID`, `NEXT_PUBLIC_API_URL`. These public values are embedded at build time. Local/E2E bypass configuration is not a production permission policy. |
+| Assessment guards | Empty `DATABENTO_API_KEY`, `DAILY_INGEST_ENABLED=false`, `AUTO_HEAL_MAX_SYMBOLS=0` and closed-loopback broker routing are in the retained override. `IB_ALLOW_MOCK_FALLBACK` has no found production-code consumer and must not be treated as a broker-disable control. |
+
+Production report signing requires a nondefault secret of at least 32 characters; token TTL defaults to 60 seconds and is bounded at 300. The Key Vault managed identity is distinct from the Entra API audience. Use the deployed secret-rendering flow and current Compose/settings definitions rather than pasting every listed variable into the root `.env`.
 
 ### Revival of archived implementation (if ever needed)
 
@@ -276,11 +350,14 @@ No active work relies on it.
 
 ---
 
-### E2E Configuration
+## E2E Configuration
 
-**interface_type:** `fullstack` — MSAI v2 exposes an HTTP API (primary) and a Next.js UI (secondary). Per the project ordering rule ("API-first, CLI-second, UI-third"), the `verify-e2e` agent MUST test the API surface first, then the UI. An API failure means the contract/state is broken — stop immediately and diagnose; do not proceed to UI checks.
+```yaml
+interface_type: fullstack
+surfaces: [API, CLI, UI]
+```
 
-**surfaces:** `[API, CLI, UI]` — MSAI v2 is API-first, CLI-second, UI-third. The `fullstack` default (UI + API) would silently omit the CLI; this explicit list makes the verify-e2e Step 2c multi-surface coverage check warn when use cases miss the `msai` CLI surface. (The CLI gap was surfaced empirically in the 2026-05-18 soak — design UCs for every surface a user can actually reach for the feature's capability area.)
+Preserve these explicit fields: Forge's verifier uses them to determine interface coverage; `fullstack` alone defaults to UI + API and can omit the CLI. Its surface-coverage warning applies in feature mode. Verify API first, CLI second, UI third for the capability under test. An unexpected API failure blocks dependent CLI/UI acceptance until diagnosed; a deliberately disabled broker returning unavailable during non-trading research is a recorded scope limitation.
 
 **Server URLs:**
 
@@ -295,9 +372,9 @@ All API routes are versioned under `/api/v1/`. Health: `GET /health`.
 
 **Pre-flight (before any E2E run):**
 
-1. `curl -sf http://localhost:8800/health` — if it fails, start the stack: `docker compose -f docker-compose.dev.yml up -d`.
+1. Check `http://localhost:8800/health` and the required application dependencies. If unavailable, use the intended startup mode in "Running the stack"; do not replace guarded research mode with unrestricted default startup automatically.
 2. Confirm the UI responds at `http://localhost:3300` (only if UI use cases are in scope).
-3. For live-trading use cases: confirm IB Gateway is reachable for the live test account (LVP locally — `lvp` gateway, port 4003, socat to internal 4001; `GET /api/v1/account/health` → `gateway_connected:true`). Paper `DU…`/4004 is unprovisioned and not used (operator decision 2026-06-05; see "Live-trading safety rails" below).
+3. For live-trading use cases: establish the exact authorized account, login, gateway route and mode before any start. Historically the live test routes used client port 4003 to internal 4001; paper used 4004 to 4002. A reachable gateway or `gateway_connected:true` is not account identity proof. The October 3 identity conflict must be resolved before relying on the historical environment mapping.
 
 **Auth.** The app uses Azure Entra ID (MSAL on the frontend, PyJWT on the backend). E2E runs should authenticate via the documented login flow OR use a dev-mode bypass token if one is configured — never by forging JWTs or reading secrets from disk.
 
@@ -316,7 +393,9 @@ All API routes are versioned under `/api/v1/`. Health: `GET /health`.
 
 **VERIFY (assertions) MUST go through the same interface the use case targets.** API use cases check response bodies and subsequent GETs; UI use cases check what Playwright sees on screen (`data-testid`, role selectors) and reload to confirm persistence. Never peek at Postgres, DuckDB, or Parquet to "confirm" — if it isn't visible through the API or UI, it doesn't count as verified.
 
-**Live-trading safety rails.** Paper accounts are NOT used (operator decision 2026-06-05 — none is provisioned). Live-trading E2E runs on the live TEST accounts in two legs: **LVP (`U4705114`) on the local stack pre-PR**, then **HVP (`U4715997`) on the prod VM post-merge**. This is a standing authorization for short deploy→verify→stop cycles ONLY — keep exposure minimal (prompt `/live/stop`, confirm `broker_flat:true`); it does NOT extend to the real fund account (untouched until post-PR-3). Live UCs must still name their account explicitly in the use-case file and are never triggered from an unattended regression cron. Stop-the-world when any API use case returns 5xx during a live flow — do not continue UI verification against a node in unknown state (gotcha #13: stopping Nautilus does not close positions).
+**Live-trading safety rails and standing authorization.** The June 5–8 operating plan designated **LVP (`U4705114`) locally pre-PR** and **HVP (`U4715997`) on Azure post-merge**, and chose live test accounts rather than paper for those drills. Retain the existing standing authorization for short deploy→verify→stop cycles on those named test accounts, with minimal exposure; it does **not** authorize the real fund account or unattended trading tests. This historical plan does not prove today's gateway binding or paper-account availability. Verify the actual identity/mode and resolve contradictory evidence before exercising the authorization; a null account ID is not confirmation.
+
+Live use cases must name the account explicitly and must not run from an unattended regression cron. Stop and diagnose unexpected 5xx responses during a live flow before dependent UI testing. Promptly stop the test deployment and reconcile its orders/positions with fresh broker state. `broker_flat:true` currently describes the deployment's local engine-cache scope, not fresh account-wide flatness (M18). Account-wide reconciliation must account for unrelated holdings; do not liquidate them to make a test appear flat. Stopping a Nautilus process alone does not establish that positions were closed.
 
 **Core use-case categories** (for inventory in `tests/e2e/use-cases/`):
 
@@ -326,14 +405,25 @@ All API routes are versioned under `/api/v1/`. Health: `GET /health`.
 - `data/` — instrument lookup, catalog browse, bar chart rendering
 - `auth/` — login, token refresh, logout, RBAC
 
-The use-case lifecycle is draft → execute → graduate, with failure classification PASS / FAIL_BUG / FAIL_STALE / FAIL_INFRA.
+The use-case lifecycle is draft → execute → graduate. Use the installed Forge verifier's result vocabulary, including PASS / FAIL_BUG / FAIL_STALE / FAIL_INFRA and invalid-use-case handling; do not create a separate MSAI result schema.
+
+### UI implementation and real-browser acceptance
+
+**Every UI implementation or change must be easy to understand, intuitive to operate, and tested through computer use in a real browser with an end-to-end user journey.** This is a completion requirement, not optional polish. Apply it to the affected workflow at the final candidate; it does not require an unrelated exhaustive regression suite for every small change.
+
+- Define the user's goal and successful outcome before implementation. Use plain labels, visible primary actions and understandable next steps. The operator should not need infrastructure knowledge to research a strategy, interpret results or manage a portfolio. Evaluate usability while performing the task, not just visual appearance.
+- Verify the capability API first, CLI second, UI third, preserving Forge's explicit surface configuration above. Then use computer-use browser tooling to perform the actual user actions against the running app and real backend/data. Playwright can automate the journey; API calls alone, static screenshots and rendered-component checks cannot replace browser interaction and observation.
+- Cover the affected path from entry and meaningful input/action through progress to its persisted result; reload or revisit where persistence is promised. Check a relevant failure/recovery path and applicable loading, empty, error and stale-data states. Scale the cases to the change while retaining the complete user outcome.
+- Keep account/environment identity, units, dates, costs and data freshness understandable. Verify observations follow the selected account view, while account commands independently name and validate their execution target; fleet controls must state fleet scope. Test account switching when the change affects account data or controls.
+- Use real API responses and real application state for final E2E acceptance. Mocked responses remain useful for isolated unit/component tests but do not establish that a journey works. A configured development auth bypass is not proof of Entra login or permission enforcement; test the real documented login for authentication acceptance.
+- Record the journey, revision, environment, relevant data/account scope, result and evidence. Screenshots support usability evidence; observable actions/results and persisted state establish functionality. Preserve existing arrange/verify rules and live-trading authorization above. If services, identity or authorization prevent the journey, record the blocker/unverified scope and leave UI acceptance incomplete rather than calling it done.
 
 ### Playwright Framework
 
-Scaffolded inside `frontend/` because msai-v2 is a backend+frontend split and the forge's `setup.sh --with-playwright` auto-detects the lone `package.json` subdirectory:
+The Playwright framework lives inside `frontend/`, where the application package is located:
 
 - `frontend/playwright.config.ts` — `baseURL` defaults to `http://localhost:3300` (host-exposed Docker port). Override per run with `PLAYWRIGHT_BASE_URL=<url>`.
-- `frontend/tests/e2e/specs/` — graduated spec files (currently empty; future feature work should author specs here using `getByTestId` / role-based selectors).
+- `frontend/tests/e2e/specs/` — existing browser specs; author additional cases with `getByTestId` / role-based selectors. Presence of specs or mocked/bypass-auth checks does not establish real Entra/broker acceptance.
 - `frontend/tests/e2e/fixtures/` — auth fixture + helpers.
 - `frontend/tests/e2e/.auth/` — gitignored storage state (credentials).
 
@@ -348,42 +438,34 @@ Run specs locally:
 cd frontend && pnpm exec playwright test
 ```
 
+The config uses `TEST_API_KEY` for backend test headers and `NEXT_PUBLIC_E2E_AUTH_BYPASS=1` for its managed development server; UI bypass alone does not authenticate browser-to-backend requests, which need the intended `NEXT_PUBLIC_MSAI_API_KEY` development setting or a real token. MSAL storage-state setup is commented out. The research-foundation harness uses `pnpm dev --port 3300` for its default local target. An explicit `PLAYWRIGHT_BASE_URL` selects an already-serving environment and skips local server management; that environment supplies its own authentication. Frontend CI currently runs lint/build, not these browser specs. See Master Map M14 and the candidate verification record for the current evidence boundary.
+
 API-only use cases don't need Playwright — the `verify-e2e` agent hits the REST endpoints directly with curl/httpx.
 
 ### Research Enforcement
 
-The `research-first` agent runs in Phase 2 of `/new-feature` (before design begins). It queries Context7, WebSearch, and WebFetch for every external library this feature touches and produces a brief at `docs/research/YYYY-MM-DD-<feature>.md`. The design phase reads this brief to avoid building on stale assumptions.
-
-For bug fixes, targeted research runs after root-cause isolation (Phase 2.5 of `/fix-bug`).
+Follow the installed canonical Forge workflows rather than copying their phase numbers or tool requirements into this file. [New-feature research](../.forge/workflows/new-feature.md) precedes design and addresses current dependencies, official sources and verification implications. [Bug-fix research](../.forge/workflows/fix-bug.md) follows root-cause investigation and reuses relevant repository knowledge; dispatch `research-first` when current external behavior matters. Preserve useful project research under `docs/research/` with dates, sources and explicit unknowns.
 
 ---
 
 ### Visual Design Preferences
 
-- Never generate plain static rectangles for hero sections, landing pages, or key visual moments
-- Always include at least one dynamic/animated element: SVG waves, Lottie, shader gradients, or canvas particles
-- Prefer organic shapes (blobs, curves, clip-paths) over straight edges and 90-degree corners
-- Animations must respect `prefers-reduced-motion` — provide static fallbacks
-- Premium, dark-mode-first aesthetic (Linear.app / Vercel.com style). Font: Geist. Color: shadcn/ui dark theme via CSS custom properties (oklch).
+- Optimize for intuitive task completion and clear financial decisions; apply the mandatory [UI/browser acceptance requirements](#ui-implementation-and-real-browser-acceptance) to every UI change.
+- Preserve the dark-mode-first Geist/shadcn visual system and accessible contrast.
+- Prioritize readable financial tables/charts, explicit account and environment identity, data freshness, consistent units and clear empty/error states.
+- Motion is optional and should help explain a state change; respect `prefers-reduced-motion`. Decorative animation or organic shapes are not required for financial controls or dashboards.
 
 ## No Bugs Left Behind Policy
 
-**NEVER defer known issues "for later."** When a review, test, or tool flags an issue — fix it in the same branch before moving on. This applies to:
-
-- Code bugs found during review
-- Deployment/infrastructure issues found during testing
-- Configuration mismatches across environments (Docker, K8s, Helm)
-- Security findings from any reviewer (Claude, Codex, PR toolkit)
-- Test coverage gaps for new code
-
-No "follow-up PRs" for known problems. No "v2" for things that should work in v1. If it's found, it's fixed — or the branch isn't ready.
+The canonical policy is [Forge's No Bugs Left Behind](../.forge/instructions.md#no-bugs-left-behind): fix known reachable defects in the active supported scope before shipping. During an explicitly requested assessment, record findings and evidence without pretending they are repaired or silently expanding into production changes. A finding closes with a verified repair at the final revision, not a new document or a passing unrelated test.
 
 ## Ground Your Claims Policy
 
-**State what you verified, not what you assume.** Before asserting anything about the code, read it — don't pattern-match from a name or from memory. Separate fact from inference, and say which:
+Apply [Forge's Ground Your Claims](../.forge/instructions.md#ground-your-claims) to MSAI's financial and operational assertions:
 
 - Claims about code → cite the file you actually read (`file.py:42`)
-- Claims about behavior → run it, or label the claim unverified
+- Claims about behavior → name the tested environment, revision and real workflow, or label the claim unverified
+- Claims about alpha/performance → reconcile inputs, costs, return units, account scope and selection/validation boundaries; a rendered tearsheet is not proof of economic correctness
 - Uncertain → say "I haven't checked X" instead of guessing fluently
 
-Confident guessing is a defect, the same caliber as a known bug left behind. When in doubt, check — or flag it.
+Keep intended capability, inspected code, offline test evidence, actual runtime observations and historical reports distinct. Preserve the operational details in this document while correcting drift; links supplement the mandatory-read context rather than replacing essential instructions.

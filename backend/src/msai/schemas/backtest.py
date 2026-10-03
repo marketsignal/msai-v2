@@ -62,10 +62,13 @@ class BacktestResultsResponse(BaseModel):
 
     id: UUID
     metrics: dict[str, Any] | None = None
+    # Number of persisted executions for accounting v1; unversioned results
+    # instead count legacy order-derived records, including possible unfilled orders.
     trade_count: int
     series: SeriesPayload | None = None
     series_status: SeriesStatus = "not_materialized"
     has_report: bool = False
+    accounting: BacktestAccounting | None = None
 
     model_config = {"from_attributes": True}
 
@@ -228,11 +231,26 @@ class SeriesMonthlyReturn(BaseModel):
         return v
 
 
+class BacktestAccounting(BaseModel):
+    """Verified interpretation of newly generated balance and fill records.
+
+    Absence identifies legacy results; it must never imply zero costs or a
+    known starting capital. This basis excludes unrealized open-position P&L.
+    """
+
+    version: Literal[1]
+    basis: Literal["realized_account_balance"]
+    initial_capital: float = Field(..., gt=0, allow_inf_nan=False)
+    currency: Literal["USD"]
+    costs: Literal["engine_recorded"]
+
+
 class SeriesPayload(BaseModel):
     """Canonical analytics payload written by worker, consumed by API + UI."""
 
     daily: list[SeriesDailyPoint]
     monthly_returns: list[SeriesMonthlyReturn]
+    accounting: BacktestAccounting | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +278,7 @@ class BacktestReportTokenResponse(BaseModel):
 
 
 class BacktestTradeItem(BaseModel):
-    """One individual Nautilus fill from a backtest."""
+    """One fill, or an unverified legacy order record (see response accounting)."""
 
     id: UUID
     instrument: str
@@ -268,15 +286,20 @@ class BacktestTradeItem(BaseModel):
     side: Literal["BUY", "SELL"]
     quantity: float = Field(..., ge=0.0)
     price: float
-    pnl: float
-    commission: float = Field(..., ge=0.0)
+    pnl: float | None
+    commission: float | None = Field(..., ge=0.0)
     executed_at: datetime  # tz-aware — frontend renders in user's locale
 
 
 class BacktestTradesResponse(BaseModel):
-    """Paginated response for ``GET /api/v1/backtests/{id}/trades``."""
+    """Paginated records; absent accounting identifies legacy order records.
+
+    Legacy P&L and commission are unknown, even if persisted as zero. In
+    versioned fill records, null means unavailable and zero is a known value.
+    """
 
     items: list[BacktestTradeItem]
+    accounting: BacktestAccounting | None = None
     total: int = Field(..., ge=0)
     page: int = Field(..., ge=1)
     page_size: int = Field(..., ge=1, le=500)

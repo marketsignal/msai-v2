@@ -1,0 +1,263 @@
+{
+  "audit_date": "2026-10-03",
+  "code_commit": "7f9eb2b5ad252bc3ba730f53a159ca04046278eb",
+  "method": "git-tracked files only; physical lines including blanks/comments; AST test functions are not collected parametrized cases",
+  "counts": {
+    "backend_source": {
+      "files": 224,
+      "physical_lines_including_comments_and_blanks": 70331,
+      "largest_files": [
+        {
+          "path": "backend/src/msai/live_supervisor/fleet_router.py",
+          "lines": 4906
+        },
+        {
+          "path": "backend/src/msai/api/live.py",
+          "lines": 4087
+        },
+        {
+          "path": "backend/src/msai/cli.py",
+          "lines": 3529
+        },
+        {
+          "path": "backend/src/msai/services/nautilus/trading_node_subprocess.py",
+          "lines": 2943
+        },
+        {
+          "path": "backend/src/msai/services/portfolio/orchestration.py",
+          "lines": 1894
+        },
+        {
+          "path": "backend/src/msai/services/nautilus/security_master/service.py",
+          "lines": 1471
+        },
+        {
+          "path": "backend/src/msai/services/research_engine.py",
+          "lines": 1396
+        },
+        {
+          "path": "backend/src/msai/services/nautilus/live_node_config.py",
+          "lines": 1149
+        },
+        {
+          "path": "backend/src/msai/api/backtests.py",
+          "lines": 1072
+        },
+        {
+          "path": "backend/src/msai/live_supervisor/__main__.py",
+          "lines": 1005
+        }
+      ]
+    },
+    "backend_tests": {
+      "files": 357,
+      "physical_lines_including_comments_and_blanks": 106073,
+      "largest_files": [
+        {
+          "path": "backend/tests/integration/api/test_live_start_broker_account.py",
+          "lines": 2834
+        },
+        {
+          "path": "backend/tests/integration/live_supervisor/test_pr2_lock_order_concurrency.py",
+          "lines": 2483
+        },
+        {
+          "path": "backend/tests/unit/test_data_freshness.py",
+          "lines": 2429
+        },
+        {
+          "path": "backend/tests/integration/live_supervisor/test_auto_restart_db.py",
+          "lines": 2242
+        },
+        {
+          "path": "backend/tests/integration/test_broker_account_service.py",
+          "lines": 1730
+        },
+        {
+          "path": "backend/tests/integration/test_trading_node_subprocess.py",
+          "lines": 1613
+        },
+        {
+          "path": "backend/tests/unit/live_supervisor/test_auto_restart.py",
+          "lines": 1597
+        },
+        {
+          "path": "backend/tests/integration/test_fleet_router.py",
+          "lines": 1581
+        },
+        {
+          "path": "backend/tests/integration/api/test_live_data_health.py",
+          "lines": 1548
+        },
+        {
+          "path": "backend/tests/integration/test_alembic_migrations.py",
+          "lines": 1332
+        }
+      ]
+    },
+    "frontend_source": {
+      "files": 137,
+      "physical_lines_including_comments_and_blanks": 24147,
+      "largest_files": [
+        {
+          "path": "frontend/src/lib/api.ts",
+          "lines": 1284
+        },
+        {
+          "path": "frontend/src/components/live/portfolio-start-dialog.tsx",
+          "lines": 792
+        },
+        {
+          "path": "frontend/src/app/portfolio/runs/[runId]/page.tsx",
+          "lines": 680
+        },
+        {
+          "path": "frontend/src/components/broker-accounts/broker-account-detail.tsx",
+          "lines": 631
+        },
+        {
+          "path": "frontend/src/app/graduation/page.tsx",
+          "lines": 623
+        },
+        {
+          "path": "frontend/src/components/backtests/results-charts.tsx",
+          "lines": 583
+        },
+        {
+          "path": "frontend/src/components/broker-accounts/broker-account-wizard.tsx",
+          "lines": 504
+        },
+        {
+          "path": "frontend/src/components/live/portfolio-compose.tsx",
+          "lines": 499
+        },
+        {
+          "path": "frontend/src/app/live-trading/page.tsx",
+          "lines": 491
+        },
+        {
+          "path": "frontend/src/app/portfolio/[id]/page.tsx",
+          "lines": 485
+        }
+      ]
+    },
+    "strategies": {
+      "files": 8,
+      "physical_lines_including_comments_and_blanks": 723,
+      "largest_files": [
+        {
+          "path": "strategies/example/ema_cross.py",
+          "lines": 291
+        },
+        {
+          "path": "strategies/example/smoke_market_order.py",
+          "lines": 131
+        },
+        {
+          "path": "strategies/example/cycle_buy_sell.py",
+          "lines": 112
+        },
+        {
+          "path": "strategies/intentionally_failing_strategy.py",
+          "lines": 89
+        },
+        {
+          "path": "strategies/example/cycle_buy_sell_b.py",
+          "lines": 84
+        },
+        {
+          "path": "strategies/example/config.py",
+          "lines": 15
+        },
+        {
+          "path": "strategies/__init__.py",
+          "lines": 1
+        },
+        {
+          "path": "strategies/example/__init__.py",
+          "lines": 0
+        }
+      ]
+    },
+    "docs": {
+      "files": 206,
+      "physical_lines_including_comments_and_blanks": 111018,
+      "largest_files": [
+        {
+          "path": "docs/plans/2026-04-24-symbol-onboarding.md",
+          "lines": 5234
+        },
+        {
+          "path": "docs/plans/2026-04-06-claude-nautilus-production-hardening.md",
+          "lines": 5198
+        },
+        {
+          "path": "docs/plans/portfolio-backtest.md",
+          "lines": 4348
+        },
+        {
+          "path": "docs/plans/2026-05-07-coverage-day-precise.md",
+          "lines": 3743
+        },
+        {
+          "path": "docs/plans/2026-04-21-backtest-results-charts-and-trades.md",
+          "lines": 3708
+        },
+        {
+          "path": "docs/plans/2026-05-01-universe-page.md",
+          "lines": 3676
+        },
+        {
+          "path": "docs/plans/2026-04-27-instrument-cache-registry-migration.md",
+          "lines": 3463
+        },
+        {
+          "path": "docs/plans/2026-04-21-backtest-auto-ingest-on-missing-data.md",
+          "lines": 3124
+        },
+        {
+          "path": "docs/plans/2026-04-20-live-path-wiring-registry.md",
+          "lines": 2907
+        },
+        {
+          "path": "docs/plans/2026-04-17-db-backed-strategy-registry.md",
+          "lines": 2753
+        }
+      ]
+    }
+  },
+  "backend_test_functions": {
+    "unit": 2582,
+    "integration": 836,
+    "e2e": 9
+  },
+  "frontend_pages": 24,
+  "frontend_spec_files": [
+    "frontend/tests/e2e/specs/broker-accounts.spec.ts",
+    "frontend/tests/e2e/specs/deeplink-auth-race.spec.ts",
+    "frontend/tests/e2e/specs/error-pages.spec.ts",
+    "frontend/tests/e2e/specs/metrics-block.spec.ts",
+    "frontend/tests/e2e/specs/morning-checklist.spec.ts",
+    "frontend/tests/e2e/specs/run-smoke-button.spec.ts",
+    "frontend/tests/e2e/specs/settings-honest.spec.ts"
+  ],
+  "migration_files": 48,
+  "locked_backend_versions": {
+    "arq": "0.27.0",
+    "databento": "0.71.0",
+    "duckdb": "1.4.4",
+    "fastapi": "0.133.1",
+    "nautilus-trader": "1.223.0",
+    "pandas": "2.3.3",
+    "pyarrow": "23.0.1",
+    "pyjwt": "2.11.0",
+    "quantstats": "0.0.81",
+    "redis": "5.3.1",
+    "sqlalchemy": "2.0.47"
+  },
+  "frontend_versions": {
+    "next": "15.5.12",
+    "react": "19.1.0",
+    "react-dom": "19.1.0"
+  }
+}

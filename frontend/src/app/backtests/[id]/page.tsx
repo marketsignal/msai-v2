@@ -222,7 +222,9 @@ export default function BacktestDetailPage({
       maxDrawdown: m.max_drawdown * 100,
       totalReturn: m.total_return * 100,
       winRate: m.win_rate * 100,
-      totalTrades: m.num_trades,
+      totalTrades: results.accounting
+        ? (m.num_fills ?? results.trade_count)
+        : results.trade_count,
     };
   }, [results]);
 
@@ -305,6 +307,34 @@ export default function BacktestDetailPage({
         </div>
       )}
 
+      {results && status.status === "completed" && (
+        <div
+          data-testid="backtest-accounting-scope"
+          className="rounded-md border border-border/50 p-3 text-sm text-muted-foreground"
+        >
+          {results.accounting ? (
+            <>
+              <p>
+                Opening capital: {results.accounting.initial_capital.toLocaleString("en-US")}{" "}
+                {results.accounting.currency}. Returns measure realized account
+                balance, excluding unrealized gains and losses on open positions.
+              </p>
+              <p className="mt-1">
+                Fees are those recorded by the simulation. Realistic broker fees
+                and slippage have not been validated. Fills count executions,
+                not completed trades.
+              </p>
+            </>
+          ) : (
+            <p>
+              Legacy result: accounting, opening capital and costs are unverified.
+              These order records may include unfilled requests. Rerun this
+              backtest before comparing performance.
+            </p>
+          )}
+        </div>
+      )}
+
       {status.status === "failed" && status.error ? (
         <FailureCard error={status.error} />
       ) : status.status !== "completed" ? (
@@ -337,6 +367,7 @@ export default function BacktestDetailPage({
               backtest={backtestForCharts}
               series={results?.series ?? null}
               seriesStatus={results?.series_status ?? "not_materialized"}
+              accounting={results?.accounting ?? null}
             />
             <TradeLog backtestId={id} />
           </TabsContent>

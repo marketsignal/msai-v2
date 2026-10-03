@@ -12,7 +12,7 @@
  *   - portfolio → /portfolio/runs/{run_id}
  */
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
 import {
   Card,
@@ -75,6 +75,15 @@ function statusColor(status: string): string {
 }
 
 type HistoryTypeFilter = "all" | "single" | "portfolio";
+type HistoryState = { filter: HistoryTypeFilter } & (
+  | { status: "loading" }
+  | { status: "error"; message: string }
+  | {
+      status: "success";
+      items: BacktestHistoryItem[];
+      strategiesById: Record<string, StrategyResponse>;
+    }
+);
 
 function typeBadgeClass(type: BacktestHistoryItem["type"]): string {
   return type === "portfolio"
@@ -101,19 +110,20 @@ function detailHref(item: BacktestHistoryItem): string {
 export default function BacktestsPage(): React.ReactElement {
   const { getToken } = useAuth();
   const [runDialogOpen, setRunDialogOpen] = useState<boolean>(false);
-  const [backtests, setBacktests] = useState<BacktestHistoryItem[]>([]);
-  const [strategiesById, setStrategiesById] = useState<
-    Record<string, StrategyResponse>
-  >({});
-  const [loading, setLoading] = useState<boolean>(true);
-  const [error, setError] = useState<string | null>(null);
+  const [historyState, setHistoryState] = useState<HistoryState>({
+    filter: "all",
+    status: "loading",
+  });
   const [typeFilter, setTypeFilter] = useState<HistoryTypeFilter>("all");
+  const loadGeneration = useRef(0);
+  const loading = historyState.filter !== typeFilter || historyState.status === "loading";
 
   const load = useCallback(async (): Promise<void> => {
-    setLoading(true);
-    setError(null);
+    const generation = ++loadGeneration.current;
+    setHistoryState({ filter: typeFilter, status: "loading" });
     try {
       const token = await getToken();
+      if (generation !== loadGeneration.current) return;
       const [history, strategies] = await Promise.all([
         apiGet<BacktestHistoryResponse>(
           `/api/v1/backtests/history?type=${encodeURIComponent(typeFilter)}`,
@@ -121,23 +131,29 @@ export default function BacktestsPage(): React.ReactElement {
         ),
         apiGet<StrategyListResponse>("/api/v1/strategies/", token),
       ]);
-      setBacktests(history.items);
+      if (generation !== loadGeneration.current) return;
       const map: Record<string, StrategyResponse> = {};
       for (const s of strategies.items) map[s.id] = s;
-      setStrategiesById(map);
+      setHistoryState({
+        filter: typeFilter,
+        status: "success",
+        items: history.items,
+        strategiesById: map,
+      });
     } catch (err) {
+      if (generation !== loadGeneration.current) return;
       const msg =
         err instanceof ApiError
           ? `Failed to load backtests (${err.status})`
           : "Failed to load backtests";
-      setError(msg);
-    } finally {
-      setLoading(false);
+      setHistoryState({ filter: typeFilter, status: "error", message: msg });
     }
   }, [getToken, typeFilter]);
 
   useEffect(() => {
     void load();
+    // Invalidate pending work when the filter changes or this page unmounts.
+    return () => { loadGeneration.current += 1; };
   }, [load]);
 
   return (
@@ -160,12 +176,6 @@ export default function BacktestsPage(): React.ReactElement {
         </div>
       </div>
 
-      {error && (
-        <div className="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-400">
-          {error}
-        </div>
-      )}
-
       {/* Backtests table */}
       <Card className="border-border/50">
         <CardHeader className="flex flex-row items-start justify-between gap-4">
@@ -176,6 +186,14 @@ export default function BacktestsPage(): React.ReactElement {
             </CardDescription>
           </div>
           <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={loading}
+              onClick={() => void load()}
+            >
+              Refresh history
+            </Button>
             <label
               htmlFor="backtest-type-filter"
               className="text-xs text-muted-foreground"
@@ -215,13 +233,23 @@ export default function BacktestsPage(): React.ReactElement {
             <div className="flex h-32 items-center justify-center text-sm text-muted-foreground">
               Loading backtests...
             </div>
-          ) : backtests.length === 0 ? (
+          ) : historyState.status === "error" ? (
+            <div
+              role="alert"
+              className="space-y-3 rounded-md border border-red-500/30 bg-red-500/10 p-4 text-sm"
+            >
+              <p>{historyState.message}. Retry to load the selected history.</p>
+              <Button variant="outline" size="sm" onClick={() => void load()}>
+                Retry
+              </Button>
+            </div>
+          ) : historyState.status === "success" && historyState.items.length === 0 ? (
             <div className="flex h-32 items-center justify-center text-sm text-muted-foreground">
               {typeFilter === "all"
                 ? 'No backtests yet. Click "Run Backtest" to start one.'
                 : `No ${typeFilter} backtests yet.`}
             </div>
-          ) : (
+          ) : historyState.status === "success" ? (
             <Table>
               <TableHeader>
                 <TableRow className="border-border/50 hover:bg-transparent">
@@ -234,14 +262,14 @@ export default function BacktestsPage(): React.ReactElement {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {backtests.map((bt) => {
+                {historyState.items.map((bt) => {
                   const isPortfolio = bt.type === "portfolio";
                   const name = isPortfolio
                     ? (bt.portfolio_name ??
                       bt.portfolio_id?.slice(0, 8) ??
                       bt.id.slice(0, 8))
                     : bt.strategy_id
-                      ? (strategiesById[bt.strategy_id]?.name ??
+                      ? (historyState.strategiesById[bt.strategy_id]?.name ??
                         bt.strategy_id.slice(0, 8))
                       : bt.id.slice(0, 8);
                   return (
@@ -339,7 +367,7 @@ export default function BacktestsPage(): React.ReactElement {
                 })}
               </TableBody>
             </Table>
-          )}
+          ) : null}
         </CardContent>
       </Card>
     </div>

@@ -421,6 +421,83 @@ class TestBacktestReport:
 
 
 class TestBacktestTrades:
+    @pytest.mark.parametrize("metadata", ["versioned", "legacy", "missing"])
+    @pytest.mark.parametrize("write_file", [False, True])
+    def test_all_pages_preserves_accounting_and_null_zero_economics(
+        self, runner: CliRunner, tmp_path: Path, metadata: str, write_file: bool
+    ) -> None:
+        accounting = {
+            "version": 1,
+            "basis": "realized_account_balance",
+            "initial_capital": 1_000_000,
+            "currency": "USD",
+            "costs": "engine_recorded",
+        } if metadata == "versioned" else None
+        items = [
+            {
+                "id": f"fill-{index}", "instrument": "AAPL.NASDAQ", "side": "BUY",
+                "quantity": 1, "price": 100, "pnl": None, "commission": fee,
+                "executed_at": "2025-01-22T15:30:00Z",
+            }
+            for index, fee in enumerate([None, 0, 1.2])
+        ]
+        pages = [
+            {"items": items[:2], "total": 3, "page": 1, "page_size": 2},
+            {"items": items[2:], "total": 3, "page": 2, "page_size": 2},
+        ]
+        if metadata != "missing":
+            for page in pages:
+                page["accounting"] = accounting
+        out = tmp_path / "fills.json"
+        args = ["backtest", "trades", "bt1", "--all", "--page-size", "1000"]
+        if write_file:
+            args += ["--out", str(out)]
+        with patch(
+            "msai.cli.httpx.request", side_effect=[_ok_response(page) for page in pages]
+        ) as mock:
+            result = runner.invoke(app, args)
+
+        assert result.exit_code == 0, result.output
+        merged = json.loads(out.read_text() if write_file else result.stdout)
+        assert merged["accounting"] == accounting
+        assert [item["pnl"] for item in merged["items"]] == [None, None, None]
+        assert [item["commission"] for item in merged["items"]] == [None, 0, 1.2]
+        assert merged["total"] == 3
+        assert merged["pages_fetched"] == 2
+        assert [call.kwargs["params"] for call in mock.call_args_list] == [
+            {"page": 1, "page_size": 1000}, {"page": 2, "page_size": 1000},
+        ]
+
+    def test_all_pages_rejects_changed_accounting_without_overwriting_export(
+        self, runner: CliRunner, tmp_path: Path
+    ) -> None:
+        accounting = {
+            "version": 1, "basis": "realized_account_balance",
+            "initial_capital": 1_000_000, "currency": "USD", "costs": "engine_recorded",
+        }
+        first = {
+            "items": [{"id": "first"}], "total": 1, "page": 1, "page_size": 1,
+            "accounting": accounting,
+        }
+        second = {
+            "items": [], "total": 1, "page": 2, "page_size": 1,
+            "accounting": None,
+        }
+        out = tmp_path / "fills.json"
+        out.write_text("existing export")
+        with patch(
+            "msai.cli.httpx.request", side_effect=[_ok_response(first), _ok_response(second)]
+        ):
+            result = runner.invoke(
+                app, ["backtest", "trades", "bt1", "--all", "--out", str(out)]
+            )
+
+        assert result.exit_code != 0
+        assert "accounting" in result.stderr.lower()
+        assert "retry" in result.stderr.lower()
+        assert result.stdout == ""
+        assert out.read_text() == "existing export"
+
     def test_single_page_default_params(self, runner: CliRunner) -> None:
         body = {"items": [{"id": "t1"}], "total": 1, "page": 1, "page_size": 100}
         with patch("msai.cli.httpx.request", return_value=_ok_response(body)) as mock:

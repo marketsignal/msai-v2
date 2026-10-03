@@ -15,12 +15,9 @@
  *
  * NOTE (local run): this UI flow was verified PASS end-to-end by the verify-e2e
  * agent (tests/e2e/reports/2026-06-02-09-30-broker-account-entity.md) with these
- * exact selectors. A `pnpm exec playwright test` run that has to START its own
- * webServer currently fails to launch it due to a PRE-EXISTING issue in
- * playwright.config.ts (`command: "pnpm dev -- --port 3300"` — Next misparses
- * `--port` as a project dir); this affects ALL specs, is unrelated to this
- * feature, and is flagged as a separate follow-up. Locally, run against the
- * already-serving dev frontend (reuseExistingServer) once it has the auth bypass.
+ * exact selectors. The default harness starts/reuses the dev frontend on :3300.
+ * PLAYWRIGHT_BASE_URL targets an already-running environment without managing
+ * a local server; ensure that target has the documented authentication setup.
  */
 import { test, expect } from "@playwright/test";
 

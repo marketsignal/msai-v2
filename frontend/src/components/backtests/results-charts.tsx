@@ -29,6 +29,8 @@ import {
 } from "lucide-react";
 import { SeriesStatusIndicator } from "@/components/backtests/series-status-indicator";
 import type {
+  BacktestAccounting,
+  SeriesDailyPoint,
   SeriesMonthlyReturn,
   SeriesPayload,
   SeriesStatus,
@@ -42,6 +44,13 @@ export interface ResultsChartsBacktest {
   totalReturn: number; // percent (e.g. 24.5 for 24.5%)
   winRate: number; // percent (e.g. 62.3 for 62.3%)
   totalTrades: number;
+}
+
+export function formatBacktestPercent(value: number): string {
+  if (value !== 0 && Math.abs(value) < 0.01) {
+    return `${value > 0 ? "+" : ""}${value.toPrecision(3)}%`;
+  }
+  return formatPercent(value);
 }
 
 function MetricCard({
@@ -185,7 +194,7 @@ function YearRow({
             style={{ backgroundColor: cellColor(pct) }}
             title={
               pct !== undefined
-                ? `${year}-${moKey}: ${(pct * 100).toFixed(2)}%`
+                ? `${year}-${moKey}: ${formatBacktestPercent(pct * 100)}`
                 : "No data"
             }
           >
@@ -283,7 +292,9 @@ function returnTickFormatter(cumReturnPct: number[]): (v: number) => string {
   } else if (step >= 1) {
     decimals = 1;
   }
-  return (v: number) => `${v >= 0 ? "+" : ""}${v.toFixed(decimals)}%`;
+  return (v: number) => v !== 0 && Math.abs(v) < 0.01
+    ? formatBacktestPercent(v)
+    : `${v >= 0 ? "+" : ""}${v.toFixed(decimals)}%`;
 }
 
 /**
@@ -312,7 +323,9 @@ function drawdownTickFormatter(
   if (magnitudePct > 0 && magnitudePct < 1) {
     decimals = Math.min(4, Math.max(2, Math.ceil(-Math.log10(magnitudePct))));
   }
-  return (v: number) => `${(v * 100).toFixed(decimals)}%`;
+  return (v: number) => v !== 0 && Math.abs(v * 100) < 0.01
+    ? formatBacktestPercent(v * 100)
+    : `${(v * 100).toFixed(decimals)}%`;
 }
 
 function returnYDomain(cumReturnPct: number[]): [number, number] {
@@ -336,38 +349,45 @@ interface ResultsChartsProps {
   backtest: ResultsChartsBacktest;
   series: SeriesPayload | null;
   seriesStatus: SeriesStatus;
+  accounting?: BacktestAccounting | null;
+}
+
+export function cumulativeReturnData(
+  daily: SeriesDailyPoint[],
+  initialCapital: number | null,
+): (SeriesDailyPoint & { cum_return_pct: number })[] {
+  if (daily.length === 0) return [];
+  // Legacy series have no certified opening balance: retain their relative
+  // curve only, with an explicit legacy label at the point of display.
+  const base = initialCapital ?? daily[0].equity;
+  if (base <= 0) return daily.map((point) => ({ ...point, cum_return_pct: 0 }));
+  return daily.map((point) => ({
+    ...point,
+    cum_return_pct: (point.equity / base - 1) * 100,
+  }));
 }
 
 export function ResultsCharts({
   backtest,
   series,
   seriesStatus,
+  accounting,
 }: ResultsChartsProps): React.ReactElement {
   const daily = series?.daily ?? [];
   const monthly = series?.monthly_returns ?? [];
   const hasSeries = seriesStatus === "ready" && daily.length > 0;
+  const curveAccounting = series ? series.accounting : accounting;
 
-  // Pablo 2026-05-17: equity curve is more useful as cumulative-return
-  // % over time. The raw $ equity makes small returns invisible (a 0.08%
-  // gain on $100k is $80 of variation in a ~$100k Y-axis); plotting
-  // ``(equity_t / equity_0 - 1) * 100`` shows growth proportionally
-  // regardless of starting balance. Use base = first day's equity so
-  // day-0 is exactly 0.00%.
-  const equityCurveData = (() => {
-    if (daily.length === 0) return [];
-    const base = daily[0].equity;
-    if (base <= 0) return daily.map((p) => ({ ...p, cum_return_pct: 0 }));
-    return daily.map((p) => ({
-      ...p,
-      cum_return_pct: (p.equity / base - 1) * 100,
-    }));
-  })();
+  const equityCurveData = cumulativeReturnData(
+    daily,
+    series?.accounting?.initial_capital ?? null,
+  );
   const cumReturnSeries = equityCurveData.map((p) => p.cum_return_pct);
 
   return (
     <>
       {/* Key metrics grid */}
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
+      <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,15rem),1fr))] gap-4">
         <MetricCard
           title="Sharpe Ratio"
           value={backtest.sharpeRatio.toFixed(2)}
@@ -380,13 +400,13 @@ export function ResultsCharts({
         />
         <MetricCard
           title="Max Drawdown"
-          value={formatPercent(backtest.maxDrawdown)}
+          value={formatBacktestPercent(backtest.maxDrawdown)}
           icon={TrendingDown}
           color="text-red-500"
         />
         <MetricCard
           title="Total Return"
-          value={formatPercent(backtest.totalReturn)}
+          value={formatBacktestPercent(backtest.totalReturn)}
           icon={TrendingUp}
           color={
             backtest.totalReturn >= 0 ? "text-emerald-500" : "text-red-500"
@@ -398,7 +418,7 @@ export function ResultsCharts({
           icon={Trophy}
         />
         <MetricCard
-          title="Total Trades"
+          title={accounting ? "Fills" : "Legacy records"}
           value={backtest.totalTrades.toString()}
           icon={Zap}
         />
@@ -407,9 +427,13 @@ export function ResultsCharts({
       {/* Equity curve — cumulative return % over time (Pablo 2026-05-17) */}
       <Card className="border-border/50">
         <CardHeader>
-          <CardTitle className="text-base">Equity Curve</CardTitle>
+          <CardTitle className="text-base">
+            {curveAccounting ? "Account Balance Return" : "Legacy Equity Curve"}
+          </CardTitle>
           <CardDescription>
-            Cumulative return % from the backtest start
+            {curveAccounting
+              ? "Cumulative return from opening capital, including the first session"
+              : "Rebased to the first stored day; opening capital is unknown"}
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -433,6 +457,7 @@ export function ResultsCharts({
                     interval={DAILY_CHART_TICK_INTERVAL}
                   />
                   <YAxis
+                    width={96}
                     tick={{ fontSize: 11, fill: "hsl(0 0% 63.9%)" }}
                     tickLine={false}
                     axisLine={false}
@@ -454,7 +479,7 @@ export function ResultsCharts({
                     }}
                     labelStyle={{ color: "hsl(0 0% 63.9%)" }}
                     formatter={(value: number | undefined) => [
-                      `${(value ?? 0) >= 0 ? "+" : ""}${(value ?? 0).toFixed(3)}%`,
+                      formatBacktestPercent(value ?? 0),
                       "Cum. return",
                     ]}
                   />
@@ -480,7 +505,11 @@ export function ResultsCharts({
       <Card className="border-border/50">
         <CardHeader>
           <CardTitle className="text-base">Drawdown</CardTitle>
-          <CardDescription>Portfolio drawdown from peak equity</CardDescription>
+          <CardDescription>
+            {curveAccounting
+              ? "Account balance decline from its peak, including opening capital"
+              : "Stored legacy drawdown; accounting is unverified"}
+          </CardDescription>
         </CardHeader>
         <CardContent>
           {hasSeries ? (
@@ -523,6 +552,7 @@ export function ResultsCharts({
                     interval={DAILY_CHART_TICK_INTERVAL}
                   />
                   <YAxis
+                    width={96}
                     tick={{ fontSize: 11, fill: "hsl(0 0% 63.9%)" }}
                     tickLine={false}
                     axisLine={false}
@@ -541,7 +571,7 @@ export function ResultsCharts({
                     }}
                     labelStyle={{ color: "hsl(0 0% 63.9%)" }}
                     formatter={(value: number | undefined) => [
-                      `${((value ?? 0) * 100).toFixed(2)}%`,
+                      formatBacktestPercent((value ?? 0) * 100),
                       "Drawdown",
                     ]}
                   />
@@ -567,7 +597,9 @@ export function ResultsCharts({
       <Card className="border-border/50">
         <CardHeader>
           <CardTitle className="text-base">Monthly Returns</CardTitle>
-          <CardDescription>Return breakdown by month and year</CardDescription>
+          <CardDescription>
+            Returns (%), rounded to one decimal. Hover over a month for more precision.
+          </CardDescription>
         </CardHeader>
         <CardContent>
           {seriesStatus === "ready" ? (
