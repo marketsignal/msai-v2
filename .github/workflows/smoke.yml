@@ -4,7 +4,7 @@ name: Smoke
 # Mirrors deploy.yml's OIDC + transient-NSG-SSH-rule pattern.
 #
 # Flow:
-#   1. azure/login@v2 (OIDC, no client secret; SHA-pinned action)
+#   1. azure/login@v3 (OIDC, no client secret; SHA-pinned action)
 #   2. Open transient NSG rule for SSH from the runner IP (priority 202 —
 #      distinct from deploy.yml's 200 [main deploy] + 201 [preflight] so a
 #      concurrent nightly-smoke + on-push-deploy don't collide on the same
@@ -45,6 +45,7 @@ on:
 permissions:
   id-token: write
   contents: read
+  actions: read
 
 # Serialize smoke runs; queue rather than cancel so an in-flight smoke isn't
 # severed (cancellation mid-run = orphaned NSG rule + half-written alert).
@@ -64,6 +65,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: control
+          persist-credentials: false
 
       - name: Resolve config + rule name
         id: resolve
@@ -103,19 +108,16 @@ jobs:
           echo "ip=$ip" >> "$GITHUB_OUTPUT"
 
       - name: Open transient SSH allow rule
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          az network nsg rule create \
+          python3 control/scripts/nsg_rule_lifecycle.py create \
+            --subscription "${{ vars.AZURE_SUBSCRIPTION_ID }}" \
             --resource-group "${{ steps.resolve.outputs.resource_group }}" \
             --nsg-name "${{ steps.resolve.outputs.nsg_name }}" \
-            --name "${{ steps.resolve.outputs.rule_name }}" \
-            --priority 202 \
-            --direction Inbound \
-            --access Allow \
-            --protocol Tcp \
-            --source-address-prefixes "${{ steps.runner-ip.outputs.ip }}/32" \
-            --destination-port-ranges 22 \
-            --description "Transient SSH from GHA smoke.yml. run_id=${{ github.run_id }} attempt=${{ github.run_attempt }}. See docs/decisions/deploy-ssh-jit.md" \
-            --output none
+            --repository "${{ github.repository }}" --phase smoke \
+            --run-id "${{ github.run_id }}" --attempt "${{ github.run_attempt }}" \
+            --runner-ip "${{ steps.runner-ip.outputs.ip }}"
 
       - name: Wait briefly for NSG rule propagation
         run: sleep 15
@@ -246,13 +248,20 @@ jobs:
     # Separate job to survive runner-VM kill on the smoke job. needs+always()
     # ensures this runs even if smoke was cancelled or failed mid-step.
     needs: [smoke]
-    if: always()
+    if: always() && needs.smoke.outputs.rule_name != ''
     runs-on: ubuntu-24.04
     permissions:
       id-token: write
       contents: read
+      actions: read
 
     steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: control
+          persist-credentials: false
+
       - name: Azure login (OIDC)
         uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
         with:
@@ -261,14 +270,14 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Delete transient SSH rule
-        # Tolerant to upstream failures — the rule may not exist if the smoke
-        # job died before creating it. `--output none` + `|| true` ensures
-        # cleanup never fails the workflow. If the delete legitimately fails
-        # (RBAC, network blip), reap-orphan-nsg-rules.yml cron picks it up.
-        if: needs.smoke.outputs.rule_name != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          az network nsg rule delete \
+          python3 control/scripts/nsg_rule_lifecycle.py cleanup \
+            --subscription "${{ vars.AZURE_SUBSCRIPTION_ID }}" \
             --resource-group "${{ needs.smoke.outputs.resource_group }}" \
             --nsg-name "${{ needs.smoke.outputs.nsg_name }}" \
-            --name "${{ needs.smoke.outputs.rule_name }}" \
-            --output none 2>/dev/null || true
+            --repository "${{ github.repository }}" --phase smoke \
+            --run-id "${{ github.run_id }}" --attempt "${{ github.run_attempt }}" \
+            --producer-rule-name "${{ needs.smoke.outputs.rule_name }}" \
+            --producer-result "${{ needs.smoke.result }}"

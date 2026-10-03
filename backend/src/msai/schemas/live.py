@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime  # noqa: TC003 — Pydantic resolves annotations at runtime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID  # noqa: TC003 — Pydantic resolves annotations at runtime
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -215,6 +215,18 @@ class LiveStatusResponse(BaseModel):
     # expired (supervisor down or never started — fail-closed). A small age
     # confirms the single-supervisor SPOF is alive.
     router_heartbeat_age_s: float | None = None
+
+
+class LiveReleaseReadinessResponse(BaseModel):
+    """Complete fleet lifecycle counts from one database statement snapshot."""
+
+    contract_version: Literal[1] = 1
+    scope: Literal["fleet"] = "fleet"
+    complete: Literal[True] = True
+    ready: bool
+    blocking_deployments: int = Field(ge=0, strict=True)
+    blocking_processes: int = Field(ge=0, strict=True)
+    restart_blockers: int = Field(ge=0, strict=True)
 
 
 class LiveDeploymentStatusResponse(BaseModel):

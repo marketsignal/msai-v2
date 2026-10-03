@@ -17,8 +17,9 @@ from uuid import UUID  # noqa: TC003 — FastAPI resolves the type at runtime fo
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
-from sqlalchemy import case, delete, func, or_, select
+from sqlalchemy import and_, case, delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.orm import aliased
 
 from msai.api._broker_account_deps import build_broker_account_service
 from msai.api.live_deps import get_command_bus, get_idempotency_store
@@ -53,6 +54,7 @@ from msai.schemas.live import (
     LiveDeploymentStatusResponse,
     LiveKillAllResponse,
     LivePositionsResponse,
+    LiveReleaseReadinessResponse,
     LiveResumeResponse,
     LiveStartRequest,
     LiveStatusResponse,
@@ -3672,6 +3674,77 @@ async def live_data_health(
     return DataHealthResponse(**snapshot.as_dict())
 
 
+@router.get("/release-readiness", response_model=LiveReleaseReadinessResponse)
+async def release_readiness(
+    claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008, ARG001
+    db: AsyncSession = Depends(get_db),  # noqa: B008
+) -> LiveReleaseReadinessResponse:
+    """Read the entire fleet's release precondition, without list limits.
+
+    This snapshot does not lock out new starts or certify broker flatness.
+    Unknown statuses block; a successful DB read is required for completeness.
+    """
+    terminal = ("stopped", "failed")
+    later_process = aliased(LiveNodeProcess)
+    has_later_process = (
+        select(later_process.id)
+        .where(
+            later_process.deployment_id == LiveNodeProcess.deployment_id,
+            later_process.started_at > LiveNodeProcess.started_at,
+        )
+        .correlate(LiveNodeProcess)
+        .exists()
+    )
+    # Tied latest rows all remain eligible. EXISTS counts the parent once.
+    # Durable stop suppresses ordinary recovery, but current-attempt transient
+    # START redelivery can still spawn and must remain a release blocker.
+    has_restart_candidate = (
+        select(LiveNodeProcess.id)
+        .where(
+            LiveNodeProcess.deployment_id == LiveDeployment.id,
+            LiveNodeProcess.status == "failed",
+            ~has_later_process,
+            or_(
+                LiveNodeProcess.stop_requested_at.is_(None),
+                and_(
+                    LiveNodeProcess.failure_kind == FailureKind.SPAWN_FAILED_TRANSIENT.value,
+                    or_(
+                        LiveDeployment.last_started_at.is_(None),
+                        LiveNodeProcess.started_at >= LiveDeployment.last_started_at,
+                    ),
+                ),
+            ),
+        )
+        .correlate(LiveDeployment)
+        .exists()
+    )
+    # Scalar subqueries in ONE statement share a PostgreSQL statement snapshot.
+    # Process blockers deliberately include all rows, even under terminal parents.
+    result = await db.execute(
+        select(
+            select(func.count())
+            .select_from(LiveDeployment)
+            .where(or_(LiveDeployment.status.is_(None), LiveDeployment.status.not_in(terminal)))
+            .scalar_subquery(),
+            select(func.count())
+            .select_from(LiveNodeProcess)
+            .where(or_(LiveNodeProcess.status.is_(None), LiveNodeProcess.status.not_in(terminal)))
+            .scalar_subquery(),
+            select(func.count())
+            .select_from(LiveDeployment)
+            .where(LiveDeployment.status == "failed", has_restart_candidate)
+            .scalar_subquery(),
+        )
+    )
+    blocking_deployments, blocking_processes, restart_blockers = result.one()
+    return LiveReleaseReadinessResponse(
+        ready=blocking_deployments == blocking_processes == restart_blockers == 0,
+        blocking_deployments=blocking_deployments,
+        blocking_processes=blocking_processes,
+        restart_blockers=restart_blockers,
+    )
+
+
 @router.get("/status")
 async def live_status(
     active_only: bool = False,
@@ -3686,13 +3759,10 @@ async def live_status(
 
     Query params:
         active_only: if True, filter to deployments with status in
-            {starting, running} and return ALL matches (no 50-row cap).
+            {starting, building, ready, running, stopping}, capped at 1000.
             Default False preserves the existing dashboard contract
             (50 most-recently-active deployments regardless of status).
-            Added 2026-05-11 for the Slice 4 deploy.yml active-deployments
-            gate — Codex PR #58 review caught that the 50-row default cap
-            could push a long-running broker deployment off the response
-            after 50+ subsequent stop events accumulate.
+            Release checks use /release-readiness for complete fleet counts.
     """
     # Order by most recent activity, not by immutable ``created_at``:
     # since v9 a deployment row is a stable logical record that survives
@@ -3709,15 +3779,8 @@ async def live_status(
     )
     query = select(LiveDeployment).order_by(last_activity.desc())
     if active_only:
-        # Active set must match the one main.py:158 uses on startup re-hydration —
-        # PR #58 Codex round-4 P1: `building` and `ready` are written by paths
-        # other than api/live.py (NautilusTrader subprocess + supervisor lifecycle
-        # callbacks) and DO count as "live" for the deploy-gate's purposes. A
-        # mismatch here causes the gate to fail open during the building/ready
-        # window of a starting deployment.
-        query = query.where(
-            LiveDeployment.status.in_(["starting", "building", "ready", "running"])
-        ).limit(1000)
+        # A stopping deployment is still active until teardown is complete.
+        query = query.where(LiveDeployment.status.in_(ACTIVE_DEPLOYMENT_STATUSES)).limit(1000)
     else:
         query = query.limit(50)
     result = await db.execute(query)

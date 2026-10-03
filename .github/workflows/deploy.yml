@@ -5,6 +5,7 @@ name: Deploy
 # main, OR on manual workflow_dispatch (with optional git_sha for rollback).
 #
 # Flow:
+#   0. Exact main-push CI/auth evidence and complete quiet fleet before any Azure job.
 #   1. azure/login@v3 (SHA-pinned in `uses:` blocks for supply-chain hardening — OIDC, no client secret)
 #   2. Resolve runner public IP, open transient NSG rule for SSH (council-mandated:
 #      docs/decisions/deploy-ssh-jit.md)
@@ -72,7 +73,7 @@ on:
         required: false
         type: boolean
         default: false
-        description: "Explicit fresh-target / DR-rebuild flag. Allows the active-live_deployments gate to bypass on curl 6/7 (no DNS / connect-refused). MUST be false for prod re-deploys — Caddy being down doesn't mean broker (separate compose profile) is also down."
+        description: "Explicit fresh-target / DR-rebuild flag. Allows the readiness gate to bypass on curl 6/7 (no DNS / connect-refused). MUST be false for prod re-deploys — Caddy being down doesn't mean broker (separate compose profile) is also down."
       run_smoke:
         required: false
         type: boolean
@@ -80,7 +81,6 @@ on:
         description: "Opt-in pre-deploy smoke preflight. Runs `msai backtest smoke --config fast --json` on the VM BEFORE the deploy job. IMPORTANT: this validates the CURRENTLY-DEPLOYED image (env + data + Databento reachability), NOT the candidate SHA. Candidate-image staging gate is a deferred follow-up. Default false → push-to-main behavior is unchanged."
 
 permissions:
-  id-token: write
   contents: read
 
 # Serialize deploys; queue rather than cancel so an in-flight deploy isn't severed
@@ -90,6 +90,50 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  release-check:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      full_sha: ${{ steps.target.outputs.full_sha }}
+      short_sha: ${{ steps.target.outputs.short_sha }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: control
+          persist-credentials: false
+
+      - name: Resolve exact release target
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MANUAL_SHA: ${{ inputs.git_sha }}
+          UPSTREAM_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          python3 control/scripts/release_safety.py resolve \
+            --repository "${{ github.repository }}" --event "${{ github.event_name }}" \
+            --manual-sha "$MANUAL_SHA" --upstream-sha "$UPSTREAM_SHA" \
+            --default-sha "${{ github.sha }}"
+
+      - name: Require exact revision CI and auth evidence
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 control/scripts/release_safety.py check \
+            --repository "${{ github.repository }}" --sha "${{ steps.target.outputs.full_sha }}"
+
+      - name: Require complete quiet fleet before any Azure access
+        env:
+          MSAI_API_KEY: ${{ secrets.MSAI_API_KEY }}
+        run: |
+          python3 control/scripts/release_safety.py readiness \
+            --host "${{ inputs.msai_hostname != '' && inputs.msai_hostname || vars.MSAI_HOSTNAME }}" \
+            --bootstrap "${{ inputs.bootstrap || false }}"
+
   preflight:
     # Opt-in pre-deploy smoke. Mirrors smoke.yml's SSH-to-VM pattern (OIDC +
     # transient NSG SSH rule + docker exec inside the running backend
@@ -104,9 +148,14 @@ jobs:
     # `github.event.inputs.run_smoke` arrives as a STRING ('true' / 'false')
     # — GitHub serializes workflow_dispatch boolean inputs to strings (Codex
     # plan-review iter-1). Compare against the literal string 'true'.
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_smoke == 'true' }}
+    needs: [release-check]
+    if: ${{ needs.release-check.result == 'success' && github.event_name == 'workflow_dispatch' && github.event.inputs.run_smoke == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     outputs:
       runner_ip: ${{ steps.preflight-runner-ip.outputs.ip }}
       rule_name: ${{ steps.preflight-resolve.outputs.rule_name }}
@@ -115,6 +164,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: control
+          persist-credentials: false
 
       - name: Resolve preflight rule name + RG
         id: preflight-resolve
@@ -149,19 +202,16 @@ jobs:
           echo "ip=$ip" >> "$GITHUB_OUTPUT"
 
       - name: Open transient SSH allow rule
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          az network nsg rule create \
+          python3 control/scripts/nsg_rule_lifecycle.py create \
+            --subscription "${{ vars.AZURE_SUBSCRIPTION_ID }}" \
             --resource-group "${{ steps.preflight-resolve.outputs.resource_group }}" \
             --nsg-name "${{ steps.preflight-resolve.outputs.nsg_name }}" \
-            --name "${{ steps.preflight-resolve.outputs.rule_name }}" \
-            --priority 201 \
-            --direction Inbound \
-            --access Allow \
-            --protocol Tcp \
-            --source-address-prefixes "${{ steps.preflight-runner-ip.outputs.ip }}/32" \
-            --destination-port-ranges 22 \
-            --description "Transient SSH from GHA deploy.yml preflight. run_id=${{ github.run_id }} attempt=${{ github.run_attempt }}. See docs/decisions/deploy-ssh-jit.md" \
-            --output none
+            --repository "${{ github.repository }}" --phase preflight \
+            --run-id "${{ github.run_id }}" --attempt "${{ github.run_attempt }}" \
+            --runner-ip "${{ steps.preflight-runner-ip.outputs.ip }}"
 
       - name: Wait briefly for NSG rule propagation
         run: sleep 15
@@ -250,13 +300,20 @@ jobs:
     # Separate cleanup job for the preflight NSG rule. Mirrors the
     # deploy/cleanup pattern (survives runner-VM kill on the preflight job).
     needs: [preflight]
-    if: always() && needs.preflight.result != 'skipped'
+    if: always() && needs.preflight.outputs.rule_name != ''
     runs-on: ubuntu-24.04
     permissions:
       id-token: write
       contents: read
+      actions: read
 
     steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: control
+          persist-credentials: false
+
       - name: Azure login (OIDC)
         uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
         with:
@@ -265,30 +322,40 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Delete transient SSH rule
-        if: needs.preflight.outputs.rule_name != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          az network nsg rule delete \
+          python3 control/scripts/nsg_rule_lifecycle.py cleanup \
+            --subscription "${{ vars.AZURE_SUBSCRIPTION_ID }}" \
             --resource-group "${{ needs.preflight.outputs.resource_group }}" \
             --nsg-name "${{ needs.preflight.outputs.nsg_name }}" \
-            --name "${{ needs.preflight.outputs.rule_name }}" \
-            --output none 2>/dev/null || true
+            --repository "${{ github.repository }}" --phase preflight \
+            --run-id "${{ github.run_id }}" --attempt "${{ github.run_attempt }}" \
+            --producer-rule-name "${{ needs.preflight.outputs.rule_name }}" \
+            --producer-result "${{ needs.preflight.result }}"
 
   deploy:
     # workflow_run fires on ALL conclusions; gate on success explicitly. workflow_dispatch
     # always runs (no conclusion field on dispatch events).
     #
-    # `needs: [preflight]` with `if: always() && (preflight.result == 'success'
+    # The required release-check precedes Azure access. Optional preflight with
+    # `if: always() && (preflight.result == 'success'
     # || preflight.result == 'skipped')` lets the deploy job run when the
     # preflight job was skipped (the default, opt-in flag absent — push-to-main
     # behavior is unchanged) AND when the preflight job ran successfully.
     # A failed preflight blocks the deploy; a successful one (or a skipped one)
     # proceeds.
-    needs: [preflight]
+    needs: [release-check, preflight]
     if: |
       always()
+      && needs.release-check.result == 'success'
       && (needs.preflight.result == 'success' || needs.preflight.result == 'skipped')
       && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
     outputs:
       short_sha: ${{ steps.resolve.outputs.short_sha }}
       runner_ip: ${{ steps.runner-ip.outputs.ip }}
@@ -297,75 +364,22 @@ jobs:
       nsg_name: ${{ steps.resolve.outputs.nsg_name }}
 
     steps:
-      - name: Resolve checkout ref (rollback-aware + workflow_run-aware)
-        id: ckref
-        # The staged docker-compose.prod.yml / Caddyfile / scripts MUST come
-        # from the same SHA as the deployed image, otherwise rollback pairs
-        # old images with new config (or vice versa). Resolution priority,
-        # matching the image-SHA resolver in step `resolve` below:
-        #   1. workflow_dispatch inputs.git_sha   — explicit rollback/re-deploy
-        #      target. inputs.git_sha is documented as a 7-char short SHA
-        #      (for matching the ACR image tag); actions/checkout v4 only
-        #      accepts a full 40-char SHA, branch, or tag for `ref:` and
-        #      would otherwise interpret 7-char input as a branch name +
-        #      fail "ref not found". Resolve to a full SHA via gh api before
-        #      checkout (Codex GitHub-bot PR #69 P1 on commit e51cc19,
-        #      2026-05-16).
-        #   2. workflow_run.head_sha              — already a full 40-char SHA
-        #      from the GitHub event payload; no resolution needed.
-        #   3. github.sha                         — full SHA from the runner
-        #      env; no resolution needed.
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if [[ -n "${{ inputs.git_sha }}" ]]; then
-            # Expand the short SHA via gh api. Validates that the SHA exists
-            # on the repo and gives us the full 40-char form actions/checkout
-            # requires. Errors if the input doesn't resolve (e.g., typo or a
-            # commit that was force-pushed away).
-            full_sha=$(gh api "/repos/${{ github.repository }}/commits/${{ inputs.git_sha }}" --jq .sha 2>/dev/null || echo "")
-            if ! [[ "$full_sha" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "FAIL_GIT_SHA_RESOLVE: inputs.git_sha='${{ inputs.git_sha }}' did not resolve to a full commit SHA on ${{ github.repository }}. Verify the 7-char SHA is correct and the commit is still reachable." >&2
-              exit 1
-            fi
-            echo "ref=$full_sha" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ github.event_name }}" == "workflow_run" ]]; then
-            echo "ref=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "ref=${{ github.sha }}" >> "$GITHUB_OUTPUT"
-          fi
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: control
+          persist-credentials: false
 
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
-          ref: ${{ steps.ckref.outputs.ref }}
+          ref: ${{ needs.release-check.outputs.full_sha }}
+          path: payload
+          persist-credentials: false
 
       - name: Resolve inputs vs vars (rehearsal-aware)
         id: resolve
         run: |
-          # SHA resolution, in priority order:
-          #   1. workflow_dispatch explicit `git_sha` input (rollback / re-deploy).
-          #   2. workflow_run trigger — pin to the upstream build-and-push run's
-          #      head_sha. GITHUB_SHA on workflow_run is the LATEST default-branch
-          #      commit at the time deploy fires, NOT the SHA whose images just
-          #      got built. If a second push lands between build-and-push start
-          #      and deploy fire, fallback to GITHUB_SHA deploys a SHA whose
-          #      images may not exist yet. Use `workflow_run.head_sha` so deploy
-          #      always pulls images that Slice 2 confirmed it pushed.
-          #      See: https://docs.github.com/actions/learn-github-actions/events-that-trigger-workflows#workflow_run
-          #   3. Last-resort fallback to GITHUB_SHA — covers manual `gh workflow
-          #      run deploy.yml` (no inputs) for non-rehearsal re-deploys.
-          if [[ -n "${{ inputs.git_sha }}" ]]; then
-            sha="${{ inputs.git_sha }}"
-          elif [[ "${{ github.event_name }}" == "workflow_run" ]]; then
-            sha="${{ github.event.workflow_run.head_sha }}"
-            sha="${sha:0:7}"
-          else
-            sha="${GITHUB_SHA::7}"
-          fi
-          if ! [[ "$sha" =~ ^[0-9a-f]{7}$ ]]; then
-            echo "git_sha must be 7 hex chars, got: $sha" >&2
-            exit 1
-          fi
+          sha="${{ needs.release-check.outputs.short_sha }}"
           rg="${{ inputs.resource_group }}"
           [[ -z "$rg" ]] && rg="${{ vars.RESOURCE_GROUP }}"
 
@@ -396,82 +410,6 @@ jobs:
             echo "rule_name=gha-transient-${{ github.run_id }}-${{ github.run_attempt }}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Refuse if active live_deployments
-        # Slice 4: refuse the deploy if backend reports any active deployment. Fail
-        # fast BEFORE Azure login (no OIDC mint, no NSG rule churn) so the gate is
-        # the cheapest possible pre-flight. Uses public endpoint via Caddy + X-API-Key
-        # (which Caddy passes through unchanged per Slice 4 research §7). No force
-        # flag — operator clears state with `msai live stop <id>` per active
-        # deployment (or `msai live kill-all --yes` for emergency) first.
-        env:
-          MSAI_HOST: ${{ steps.resolve.outputs.msai_hostname }}
-          MSAI_API_KEY: ${{ secrets.MSAI_API_KEY }}
-        run: |
-          set -euo pipefail
-          # SOURCE OF TRUTH: persisted .deployments[].status (DB column, populated
-          # from backend/src/msai/api/live.py:935 via SELECT on live_deployments).
-          # Codex-bot review on PR #58 caught that `.active_count` reads
-          # `_node_manager.active_count` — backend-local state that does NOT track
-          # live-supervisor-owned subprocesses (supervisor is a separate broker-profile
-          # container, started via /api/v1/live/start-portfolio → Redis Streams →
-          # supervisor.spawn). So active_count stays 0 during real broker trading
-          # and the gate fails OPEN. Querying the DB-persisted status is correct;
-          # status enum includes {starting, building, ready, running, stopped,
-          # failed} per backend/src/msai/api/live.py; the active set for this
-          # gate is {starting, building, ready, running} (see ?active_only=true
-          # comment below).
-          # Bound the request — Codex P2 review on PR #58: if backend accepts the
-          # connection but stalls (e.g., DB query hanging), curl without --max-time
-          # would block the gate for the runner timeout while holding the
-          # `deploy-msai` concurrency lock, queueing subsequent prod deploys instead
-          # of failing closed quickly. 10s is generous (existing probes use 5-10s).
-          # ?active_only=true filters status IN (starting,building,ready,running) AND drops the
-          # 50-row cap (raised to a 1000-row safety cap) so a long-running broker
-          # deployment can't be pushed out of the response by 50+ subsequent stop
-          # events. Codex P1 review on PR #58 caught that limit-50 bug. Backwards
-          # compat: old backend (pre-Slice-4) ignores unknown query params and
-          # returns the limited 50-row response, so the gate degrades to the
-          # original behavior on a backend that hasn't deployed Slice 4 yet.
-          # Distinguish "fresh target" (curl can't connect — no DNS, connection
-          # refused) from "stalled server" (curl timed out). PR #58 Codex round-8
-          # P1: round-7's blanket bypass on curl 6/7 was unsafe — Caddy being
-          # down doesn't mean broker is also down (broker is a SEPARATE compose
-          # profile with `live-supervisor` + ib-gateway; they can keep trading
-          # even if the API listener is dead). So the bypass MUST be opt-in via
-          # the `bootstrap` workflow_dispatch input. For an established prod
-          # deploy, any curl failure fails closed.
-          set +e
-          resp=$(curl -sf --max-time 10 -H "X-API-Key: $MSAI_API_KEY" "https://${MSAI_HOST}/api/v1/live/status?active_only=true")
-          curl_exit=$?
-          set -e
-          case "$curl_exit" in
-            0)
-              ;;  # got a response — proceed to active-deployments check below
-            6|7)
-              if [[ "${{ inputs.bootstrap }}" == "true" ]]; then
-                echo "Gate: fresh-target bootstrap explicit (curl exit $curl_exit — DNS or connect-refused). Allowing." >&2
-                resp='{"deployments":[]}'
-              else
-                echo "FAIL_CANNOT_DETERMINE_LIVE_STATE: /api/v1/live/status not reachable (curl exit $curl_exit). For prod re-deploys this fails closed (Caddy down does NOT mean broker is down — separate compose profile). Re-dispatch with -f bootstrap=true IFF this is a fresh-VM bootstrap / DR rebuild and you've confirmed no broker subprocesses are running." >&2
-                exit 1
-              fi
-              ;;
-            *)
-              echo "FAIL_CANNOT_DETERMINE_LIVE_STATE: /api/v1/live/status reachable but unhealthy (curl exit $curl_exit — timeout or 5xx). Fail-closed: refusing deploy." >&2
-              exit 1
-              ;;
-          esac
-          # Active status set must match backend/src/msai/main.py:158 startup
-          # re-hydration filter — Codex round-4 P1 on PR #58. `building` and
-          # `ready` are intermediate states between starting → running; treating
-          # them as inactive lets the gate fail open during the spawn window.
-          active_ids=$(echo "$resp" | jq -r '[.deployments[] | select(.status == "starting" or .status == "building" or .status == "ready" or .status == "running") | .id] | join(",")')
-          if [[ -n "$active_ids" ]]; then
-            echo "FAIL_ACTIVE_DEPLOYMENTS_REFUSAL: active deployments [$active_ids]. Run 'msai live status' to inspect, then 'msai live stop <id>' for each (or 'msai live kill-all --yes' if backend is wedged) first, then re-dispatch." >&2
-            exit 1
-          fi
-          echo "deployments[].status check: 0 active — gate clear"
-
       - name: Azure login (OIDC)
         uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
         with:
@@ -492,23 +430,16 @@ jobs:
           echo "ip=$ip" >> "$GITHUB_OUTPUT"
 
       - name: Open transient SSH allow rule
-        # Council-mandated (docs/decisions/deploy-ssh-jit.md). Priority 200 — operator
-        # rule at priority 100 always wins. Description includes run_id for orphan
-        # diagnosis. NSG child-resource refactor (Slice 3 T13) ensures this transient
-        # rule survives any concurrent Bicep reapply.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          az network nsg rule create \
+          python3 control/scripts/nsg_rule_lifecycle.py create \
+            --subscription "${{ vars.AZURE_SUBSCRIPTION_ID }}" \
             --resource-group "${{ steps.resolve.outputs.resource_group }}" \
             --nsg-name "${{ steps.resolve.outputs.nsg_name }}" \
-            --name "${{ steps.resolve.outputs.rule_name }}" \
-            --priority 200 \
-            --direction Inbound \
-            --access Allow \
-            --protocol Tcp \
-            --source-address-prefixes "${{ steps.runner-ip.outputs.ip }}/32" \
-            --destination-port-ranges 22 \
-            --description "Transient SSH from GHA. run_id=${{ github.run_id }} attempt=${{ github.run_attempt }}. See docs/decisions/deploy-ssh-jit.md" \
-            --output none
+            --repository "${{ github.repository }}" --phase deploy \
+            --run-id "${{ github.run_id }}" --attempt "${{ github.run_attempt }}" \
+            --runner-ip "${{ steps.runner-ip.outputs.ip }}"
 
       - name: Wait briefly for NSG rule propagation
         run: sleep 15
@@ -559,6 +490,7 @@ jobs:
           EOF
 
       - name: Stage compose file + Caddyfile + scripts on VM
+        working-directory: payload
         # docker-compose.prod.yml + Caddyfile must live at /opt/msai/ on the VM. Slice 1
         # cloud-init doesn't plant them (cloud-init was committed before Slice 3 added
         # Caddy). Slice 3 deploy.yml is the single source of truth for these files —
@@ -586,6 +518,14 @@ jobs:
           # Also stage the per-run script at /tmp for the next step (kept in /tmp so the
           # `sudo bash /tmp/...` below is unambiguous about which run is firing)
           scp scripts/deploy-on-vm.sh "${VM_USER}@${VM_IP}:/tmp/deploy-on-vm-${{ github.run_id }}.sh"
+
+      - name: Recheck complete quiet fleet immediately before VM execution
+        env:
+          MSAI_API_KEY: ${{ secrets.MSAI_API_KEY }}
+        run: |
+          python3 control/scripts/release_safety.py readiness \
+            --host "${{ steps.resolve.outputs.msai_hostname }}" \
+            --bootstrap "${{ inputs.bootstrap || false }}"
 
       - name: Execute deploy
         env:
@@ -649,13 +589,20 @@ jobs:
     # Separate job to survive runner-VM kill on the deploy job. needs+always() ensures
     # this runs even if deploy was cancelled or failed mid-step.
     needs: [deploy]
-    if: always()
+    if: always() && needs.deploy.outputs.rule_name != ''
     runs-on: ubuntu-24.04
     permissions:
       id-token: write
       contents: read
+      actions: read
 
     steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: control
+          persist-credentials: false
+
       - name: Azure login (OIDC)
         uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 # v3.0.0
         with:
@@ -664,25 +611,14 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
       - name: Delete transient SSH rule
-        # Tolerant to upstream failures — the rule may not exist if the deploy job died
-        # before creating it. `--output none` + `|| true` ensures cleanup never fails
-        # the workflow. If the delete legitimately fails (RBAC, network blip), the
-        # reap-orphan-nsg-rules.yml cron picks it up. Reaper runs every 15
-        # min and deletes rules older than 30 min — actual cleanup lands
-        # 30-45 min after the orphan was created.
-        if: needs.deploy.outputs.rule_name != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          az network nsg rule delete \
+          python3 control/scripts/nsg_rule_lifecycle.py cleanup \
+            --subscription "${{ vars.AZURE_SUBSCRIPTION_ID }}" \
             --resource-group "${{ needs.deploy.outputs.resource_group }}" \
             --nsg-name "${{ needs.deploy.outputs.nsg_name }}" \
-            --name "${{ needs.deploy.outputs.rule_name }}" \
-            --output none 2>/dev/null || true
-
-      # NB: /tmp cleanup is intentionally NOT done here. The transient SSH rule is
-      # deleted ABOVE, so subsequent SSH from the runner would fail. Leftover
-      # /tmp/deploy-{env,on-vm}-${run_id}.{env,sh} files are VM_USER-owned (mode
-      # 600 for the env file via umask 077; the sh script is the public deploy
-      # helper), small (few KB each), and uniquely run_id-suffixed — so they
-      # ACCUMULATE across deploys rather than being overwritten. If accumulation
-      # becomes an issue, a systemd-tmpfiles rule on the VM could reap them —
-      # out of scope for Slice 3.
+            --repository "${{ github.repository }}" --phase deploy \
+            --run-id "${{ github.run_id }}" --attempt "${{ github.run_attempt }}" \
+            --producer-rule-name "${{ needs.deploy.outputs.rule_name }}" \
+            --producer-result "${{ needs.deploy.result }}"

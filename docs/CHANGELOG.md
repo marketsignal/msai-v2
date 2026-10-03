@@ -4,6 +4,15 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-10-03 — Release checks and temporary SSH access
+
+Candidate implementation in `fix/release-safety`, stacked on the research foundation. Azure rehearsal, first installation and full deployment acceptance remain pending.
+
+- Deployment now checks the exact application revision's main-push CI and authentication jobs before Azure access, including optional preflight. Rollbacks retain current workflow controls while selecting the target revision's application files and images. Missing, unsuccessful or unreadable evidence refuses the release.
+- Authenticated fleet release readiness counts every deployment and process in one database snapshot, including stopping, unknown state and failed processes eligible for restart. The operator status filter now includes stopping. Readiness is checked again before VM execution; it does not provide a concurrent-start lock or prove broker-account flatness.
+- Deploy, preflight, smoke and reaping share a narrowly owned temporary SSH-rule helper. Creation can recover a proved completed owner's conflict without relying on cron. Cleanup retries retain the producer's original rule identity even when GitHub advances the retry attempt; earlier attempts require completed-owner proof. Active, unrelated and unproved owners are preserved. Cleanup failures are visible and successful deletion requires an absence check.
+- The [operator runbook](operations/release-safety.md) records explicit MarketSignal subscription selection, refusal/recovery procedures and the supervised first-upgrade boundary. The old API cannot satisfy the new contract; no readiness bypass is introduced. No migration, frontend change or broker operation is included.
+
 ### 2026-10-03 — Research foundation: balance accounting and interface reliability
 
 Candidate implementation in `fix/research-foundation`; release and complete research-validity acceptance remain pending.
