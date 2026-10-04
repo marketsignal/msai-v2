@@ -4,6 +4,11 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-10-04 — Azure deployment failure diagnostics
+
+- Temporary SSH-rule failures expose a bounded symbolic Azure error code or a fixed CLI failure category while withholding free-form diagnostics. Nonzero exit refusal and ownership/mutation checks remain unchanged.
+- Subprocess-boundary regressions cover diagnostic loss and sensitive-message suppression. The operator runbook distinguishes this diagnostic repair from the unresolved runner create/delete failure and normal deployment acceptance.
+
 ### 2026-10-03 — Release checks and temporary SSH access
 
 Candidate implementation in `fix/release-safety`, stacked on the research foundation. Azure rehearsal, first installation and full deployment acceptance remain pending.

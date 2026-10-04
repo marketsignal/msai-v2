@@ -62,6 +62,27 @@ Separate cleanup jobs use the producing job's recorded rule identity, including 
 
 The helper's `reap --dry-run` is the preview path. Review its target and decisions before an authorized cleanup. There is no blanket delete fallback for missing GitHub/activity evidence.
 
+### Diagnose an Azure refusal
+
+An `NSG_REFUSED` message retains the failed operation and Azure CLI exit status.
+It now adds a bounded symbolic Azure code when available, otherwise a fixed CLI
+argument, login, subscription, connection/TLS or runtime-error category. Unknown
+formats explicitly remain unclassified. Free-form Azure messages, command
+arguments and traceback bodies are withheld; do not turn on raw debug logging
+or publish credentials to diagnose a failure.
+
+Use the code/category to choose the next investigation. It is not proof of a
+specific permission or connectivity defect, and does not authorize a retry or
+IAM expansion. Inspect the exact target and identity before changing anything.
+`reap --dry-run` remains the read-only path for checking preservation decisions.
+
+Two normal runs at application revision `23db3b8` on October 4 failed before VM
+staging: [37164968762](https://github.com/marketsignal/msai-v2/actions/runs/37164968762)
+on Azure delete, then [37165202036](https://github.com/marketsignal/msai-v2/actions/runs/37165202036)
+on Azure create. Operator recovery separately removed the old completed-owner
+orphan. The diagnostic repair does not establish the runner's underlying cause
+or certify its write permissions, normal installation or cleanup recovery.
+
 ## First upgrade from the old API
 
 The current installation does not have the new readiness contract. The corrected workflow deliberately refuses an old/404 response. There is no compatibility shortcut and `bootstrap=true` is not a workaround for production.

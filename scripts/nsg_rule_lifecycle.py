@@ -14,6 +14,26 @@ PHASES = {"deploy": (200, "", "deploy.yml"), "preflight": (201, "preflight-", "d
           "smoke": (202, "smoke-", "smoke.yml")}
 
 
+def azure_failure_detail(stderr: str) -> str:
+    """Expose only bounded symbolic codes or fixed categories, never message text."""
+    for line in stderr.splitlines():
+        code = re.match(r"^ERROR: \(([A-Za-z][A-Za-z0-9]{0,63})\)(?:[ \t]|$)", line)
+        code = code or re.fullmatch(r"Code: ([A-Za-z][A-Za-z0-9]{0,63})[ \t]*", line)
+        if code:
+            return f"code={code[1]}"
+    lowered = stderr.lower()
+    for category, markers in (
+        ("CLI_ARGUMENT_ERROR", ("unrecognized arguments:", "the following arguments are required:", "invalid choice:")),
+        ("AUTHENTICATION_REQUIRED", ("please run 'az login'",)),
+        ("SUBSCRIPTION_SELECTION", ("doesn't exist in cloud", "no subscriptions found")),
+        ("CONNECTION_OR_TLS", ("connectionerror", "sslerror", "certificate verify failed")),
+        ("CLI_RUNTIME_ERROR", ("traceback (most recent call last):",)),
+    ):
+        if any(marker in lowered for marker in markers):
+            return f"category={category}"
+    return "category=UNCLASSIFIED (details withheld)"
+
+
 def az_json(args):
     try:
         response = subprocess.run(["az", "network", "nsg", "rule", *args, "--output", "json"],
@@ -21,7 +41,8 @@ def az_json(args):
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise Refusal(f"Azure {args[0]} unavailable/timed out; rule state is unproved") from exc
     if response.returncode:
-        raise Refusal(f"Azure {args[0]} failed (exit {response.returncode}); check subscription, RBAC and connectivity")
+        raise Refusal(f"Azure {args[0]} failed (exit {response.returncode}); check subscription, RBAC and connectivity; "
+                      f"{azure_failure_detail(response.stderr)}")
     try:
         return json.loads(response.stdout) if response.stdout.strip() else None
     except ValueError as exc:

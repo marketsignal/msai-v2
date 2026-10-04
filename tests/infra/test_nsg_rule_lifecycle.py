@@ -1,8 +1,10 @@
 """NSG side effects are exercised against a stateful Azure CLI boundary."""
 import copy
 import importlib
+import io
 import os
 from pathlib import Path
+import subprocess
 import sys
 import unittest
 from unittest.mock import patch
@@ -24,6 +26,105 @@ def rule(phase="deploy", run=10, attempt=1, legacy=False, **overrides):
                  sourcePortRange="*", destinationAddressPrefix="*", destinationPortRange="22")
     value.update(overrides)
     return value
+
+
+class AzureBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        self.m = importlib.import_module("nsg_rule_lifecycle")
+
+    def refused(self, stderr, verb="list", returncode=1):
+        args = [verb, "--resource-group", "rg", "--nsg-name", "nsg", "--subscription", "subscription-id"]
+        response = subprocess.CompletedProcess([], returncode, "secret-stdout", stderr)
+        with patch.object(self.m.subprocess, "run", return_value=response) as run:
+            with self.assertRaises(self.m.Refusal) as caught:
+                self.m.az_json(args)
+        # Diagnostics must not alter the command, retry it, or expose stdout.
+        run.assert_called_once_with(["az", "network", "nsg", "rule", *args, "--output", "json"],
+                                    text=True, capture_output=True, timeout=120, check=False)
+        message = str(caught.exception)
+        self.assertIn(f"Azure {verb} failed (exit {returncode})", message)
+        self.assertNotIn("secret-stdout", message)
+        self.assertNotIn("sensitive-payload", message)
+        return message
+
+    def test_standard_azure_codes_are_visible_without_message_bodies(self):
+        for verb, code, stderr in (
+            ("create", "AuthorizationFailed", "ERROR: (AuthorizationFailed) sensitive-payload\n"),
+            ("delete", "ScopeLocked", "WARNING: sensitive-payload\nERROR: (ScopeLocked) sensitive-payload\n"),
+            ("list", "ResourceNotFound", "ERROR: sensitive-payload\nCode: ResourceNotFound\nMessage: sensitive-payload\n"),
+        ):
+            with self.subTest(verb=verb):
+                self.assertIn(f"code={code}", self.refused(stderr, verb))
+
+    def test_cli_categories_withhold_sensitive_diagnostics(self):
+        for stderr, category in (
+            ("ERROR: unrecognized arguments: sensitive-payload", "CLI_ARGUMENT_ERROR"),
+            ("ERROR: the following arguments are required: sensitive-payload", "CLI_ARGUMENT_ERROR"),
+            ("ERROR: argument --access: invalid choice: sensitive-payload", "CLI_ARGUMENT_ERROR"),
+            ("ERROR: Please run 'az login' to setup account. sensitive-payload", "AUTHENTICATION_REQUIRED"),
+            ("ERROR: The subscription of 'sensitive-payload' doesn't exist in cloud 'AzureCloud'.", "SUBSCRIPTION_SELECTION"),
+            ("ERROR: No subscriptions found for sensitive-payload", "SUBSCRIPTION_SELECTION"),
+            ("ERROR: requests.exceptions.ConnectionError: sensitive-payload", "CONNECTION_OR_TLS"),
+            ("ERROR: SSLError: certificate verify failed: sensitive-payload", "CONNECTION_OR_TLS"),
+            ("Traceback (most recent call last):\n  sensitive-payload\nAttributeError: sensitive-payload", "CLI_RUNTIME_ERROR"),
+        ):
+            with self.subTest(category=category, stderr=stderr):
+                self.assertIn(f"category={category}", self.refused(stderr, returncode=2))
+
+    def test_unknown_and_empty_errors_are_explicitly_unclassified(self):
+        for stderr in ("", "ERROR: sensitive-payload", "token=sensitive-payload\nBearer sensitive-payload\n"):
+            with self.subTest(stderr=stderr):
+                self.assertIn("category=UNCLASSIFIED (details withheld)", self.refused(stderr))
+
+    def test_code_extraction_is_anchored_bounded_and_symbolic(self):
+        for stderr in (
+            "message ERROR: (AuthorizationFailed) sensitive-payload",
+            "Code: ResourceNotFound sensitive-payload",
+            "ERROR: (sensitive-payload) hidden",
+            "ERROR: (A" + "B" * 64 + ") hidden",
+            "Code: A" + "B" * 64,
+            "ERROR: (1Invalid) hidden",
+            "ERROR: (Überraschung) hidden",
+            "ERROR: (ResourceNotFound\nsensitive-payload) hidden",
+        ):
+            with self.subTest(stderr=stderr):
+                self.assertIn("category=UNCLASSIFIED (details withheld)", self.refused(stderr))
+        self.assertIn("code=" + "A" * 64, self.refused("Code: " + "A" * 64 + "\n"))
+
+    def test_success_retains_json_and_empty_delete_results(self):
+        for verb, stdout, wanted in (("list", '[{"name": "operator"}]', [{"name": "operator"}]),
+                                    ("create", '{"name": "temporary"}', {"name": "temporary"}),
+                                    ("delete", " \n", None)):
+            with self.subTest(verb=verb), patch.object(self.m.subprocess, "run", return_value=
+                    subprocess.CompletedProcess([], 0, stdout, "ERROR: (IgnoredWarning) sensitive-payload")):
+                self.assertEqual(self.m.az_json([verb]), wanted)
+
+    def test_malformed_json_still_refuses_without_echoing_it(self):
+        with patch.object(self.m.subprocess, "run", return_value=
+                subprocess.CompletedProcess([], 0, "sensitive-payload", "")):
+            with self.assertRaisesRegex(self.m.Refusal, "^Azure list returned malformed JSON$"):
+                self.m.az_json(["list"])
+
+    def test_timeouts_and_missing_cli_still_refuse_without_diagnostics(self):
+        for error in (subprocess.TimeoutExpired("sensitive-payload", 120, stderr="sensitive-payload"),
+                      OSError("sensitive-payload")):
+            with self.subTest(error=type(error).__name__), patch.object(self.m.subprocess, "run", side_effect=error):
+                with self.assertRaisesRegex(self.m.Refusal, "^Azure list unavailable/timed out; rule state is unproved$"):
+                    self.m.az_json(["list"])
+
+    def test_failed_preview_exits_one_without_success_or_followup_calls(self):
+        argv = ["nsg_rule_lifecycle.py", "reap", "--dry-run", "--resource-group", "rg", "--nsg-name", "nsg",
+                "--subscription", "subscription-id", "--repository", REPO]
+        with patch.object(sys, "argv", argv), patch.object(sys, "stderr", new_callable=io.StringIO) as stderr, \
+                patch.object(sys, "stdout", new_callable=io.StringIO) as stdout, \
+                patch.object(self.m.subprocess, "run", return_value=
+                    subprocess.CompletedProcess([], 1, "", "ERROR: (ResourceNotFound) sensitive-payload")) as run:
+            self.assertEqual(self.m.main(), 1)
+        self.assertIn("NSG_REFUSED:", stderr.getvalue())
+        self.assertIn("code=ResourceNotFound", stderr.getvalue())
+        self.assertNotIn("sensitive-payload", stderr.getvalue())
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(run.call_count, 1)
 
 
 class NSGTests(unittest.TestCase):
