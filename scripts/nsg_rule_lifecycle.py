@@ -30,8 +30,42 @@ def azure_failure_detail(stderr: str) -> str:
         ("CLI_RUNTIME_ERROR", ("traceback (most recent call last):",)),
     ):
         if any(marker in lowered for marker in markers):
+            # Azure CLI prints this fixed recommendation after unexpected-error traces.
+            # Remove only that final line, never arbitrary text or a later exception.
+            trace = stderr.rstrip().removesuffix(
+                "\nTo check existing issues, please visit: https://github.com/Azure/azure-cli/issues"
+            )
+            if (category == "CLI_RUNTIME_ERROR"
+                    and re.search(r"(?m)^Traceback \(most recent call last\):[ \t]*$", stderr)
+                    and re.search(
+                r"(?:^|\n)(?:_frozen_importlib\.)?_DeadlockError: deadlock detected by "
+                r"_ModuleLock\('requests\.structures'\) at [0-9]+\s*\Z", trace
+            )):
+                return "category=CLI_RUNTIME_ERROR signature=REQUESTS_STRUCTURES_IMPORT_DEADLOCK"
             return f"category={category}"
     return "category=UNCLASSIFIED (details withheld)"
+
+
+def azure_runtime_versions() -> str:
+    """Capture CLI-owned runtime versions privately; failure never changes the refusal."""
+    versions = {"cli": "unknown", "core": "unknown", "python": "unknown"}
+    try:
+        response = subprocess.run(["az", "--version"], text=True, capture_output=True,
+                                  timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
+        response = None
+    if response is not None and response.returncode == 0:
+        numeric = r"([0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4})"
+        for field, label, pattern in (
+            ("cli", r"azure-cli(?:[ \t]|$)", rf"azure-cli[ \t]+{numeric}(?:[ \t]+\*)?[ \t]*"),
+            ("core", r"core(?:[ \t]|$)", rf"core[ \t]+{numeric}(?:[ \t]+\*)?[ \t]*"),
+            ("python", r"Python \(", rf"Python \([A-Za-z]+\)[ \t]+{numeric}(?:[ \t].*)?"),
+        ):
+            lines = [line for line in response.stdout.splitlines() if re.match(label, line)]
+            match = re.fullmatch(pattern, lines[0]) if len(lines) == 1 else None
+            if match:
+                versions[field] = match[1]
+    return " ".join(f"runtime_{field}={value}" for field, value in versions.items())
 
 
 def az_json(args):
@@ -41,8 +75,11 @@ def az_json(args):
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise Refusal(f"Azure {args[0]} unavailable/timed out; rule state is unproved") from exc
     if response.returncode:
+        detail = azure_failure_detail(response.stderr)
+        if detail.startswith("category=CLI_RUNTIME_ERROR"):
+            detail += " " + azure_runtime_versions()
         raise Refusal(f"Azure {args[0]} failed (exit {response.returncode}); check subscription, RBAC and connectivity; "
-                      f"{azure_failure_detail(response.stderr)}")
+                      f"{detail}")
     try:
         return json.loads(response.stdout) if response.stdout.strip() else None
     except ValueError as exc:

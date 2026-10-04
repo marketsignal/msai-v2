@@ -4,6 +4,12 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-10-03 — Release cancellation and bounded runtime diagnostics
+
+- Deployment stops being eligible after cancellation while its separate ownership-checked cleanup remains eligible. Explicit release/preflight checks are preserved. Deploy has a 30-minute ceiling; every deploy/preflight SSH and SCP call uses strict, noninteractive host checking with bounded connection attempts and keepalives.
+- Runtime-error refusals recognize only the known `requests.structures` import-deadlock signature, optionally followed by Azure CLI's exact fixed help footer, and privately capture bounded numeric Azure CLI/core/bundled Python versions, or `unknown`, once with a five-second timeout. The original operation remains failed; no raw diagnostics, mutation retries or speculative CLI workaround are added.
+- Offline regressions execute actual workflow command blocks and cover cancellation predicates, transport failure propagation, runtime parsing and secret suppression. The runbook records the successful `fa4c8f8` normal deployment and failed cancellation baseline (October 4 UTC), and distinguishes pending GitHub acceptance from local proof and remote installer recovery.
+
 ### 2026-10-04 — Azure deployment failure diagnostics
 
 - Temporary SSH-rule failures expose a bounded symbolic Azure error code or a fixed CLI failure category while withholding free-form diagnostics. Nonzero exit refusal and ownership/mutation checks remain unchanged.

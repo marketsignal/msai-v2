@@ -1,6 +1,6 @@
 # Releasing MSAI safely
 
-This is the operating contract for the release-safety candidate. The existing VM/Compose deployment procedure remains in [how_to_deploy.md](../how_to_deploy.md). Local tests, actual read-only provider checks, an Azure rehearsal and the production rollout are separate evidence gates. This document does not authorize cloud changes or trading.
+This is the release operating contract. The existing VM/Compose deployment procedure remains in [how_to_deploy.md](../how_to_deploy.md). Local tests, actual provider checks and a production rollout are separate evidence gates. Normal deployment of `fa4c8f8` succeeded on October 4 UTC; the cancellation repair described below still requires acceptance on GitHub after integration. This document does not authorize cloud changes or trading.
 
 ## Choose the environment explicitly
 
@@ -38,7 +38,7 @@ python -m msai.cli live status
 python -m msai.cli live stop <authorized-deployment-uuid>
 ```
 
-The status list remains an operator view; its cap and process-local `active_count` are not complete release evidence. The candidate adds authenticated `GET /api/v1/live/release-readiness`:
+The status list remains an operator view; its cap and process-local `active_count` are not complete release evidence. The installed release contract exposes authenticated `GET /api/v1/live/release-readiness`:
 
 ```json
 {"contract_version":1,"scope":"fleet","complete":true,"ready":true,"blocking_deployments":0,"blocking_processes":0,"restart_blockers":0}
@@ -62,6 +62,39 @@ Separate cleanup jobs use the producing job's recorded rule identity, including 
 
 The helper's `reap --dry-run` is the preview path. Review its target and decisions before an authorized cleanup. There is no blanket delete fallback for missing GitHub/activity evidence.
 
+### Cancel pending deployment work
+
+The deploy producer uses `!cancelled()` while retaining the exact-revision and
+optional-preflight gates. Ordinary cancellation should stop that job; the
+separate cleanup jobs retain `always()` and the producer's original rule identity.
+Deploy and preflight each have a 30-minute job ceiling. Every SSH/SCP connection
+uses strict host-key checking, noninteractive authentication, one connection
+attempt and a 20-second connection/handshake timeout. Keepalives every 15 seconds
+with three unanswered probes detect an unresponsive peer; they do not limit a
+healthy remote command's runtime.
+
+Record the run and attempt before requesting cancellation:
+
+```bash
+gh run cancel <run-id> --repo marketsignal/msai-v2
+gh run view <run-id> --repo marketsignal/msai-v2 --json status,conclusion,jobs
+```
+
+Inspect the **producer job** and its staging/execution steps, then the independent
+cleanup job and its `NSG_ABSENT` marker. Run-level `cancelled` alone is insufficient:
+the baseline drill [37172097520 attempt 2](https://github.com/marketsignal/msai-v2/actions/runs/37172097520/attempts/2)
+accepted cancellation around 02:55:16 UTC on October 4, but still started staging
+at 02:55:27 and failed on SSH timeout at 02:57:43. Cleanup removed the owned rule
+at 02:58:09. Its producer interruption failed acceptance despite successful cleanup.
+The repaired condition and transport bounds have offline regression coverage;
+repeat the bounded GitHub drill after integration before claiming runtime acceptance.
+
+Cancellation or SSH disconnect is **not rollback** and does not prove an installer,
+migration or container command already started on the VM has stopped. Reconcile
+the actual VM/process, image, migration and health state before another install or
+recovery decision. NSG deletion stops new connections, not established sessions.
+A cancellation test stopped before VM execution proves only that narrower boundary.
+
 ### Diagnose an Azure refusal
 
 An `NSG_REFUSED` message retains the failed operation and Azure CLI exit status.
@@ -70,6 +103,21 @@ argument, login, subscription, connection/TLS or runtime-error category. Unknown
 formats explicitly remain unclassified. Free-form Azure messages, command
 arguments and traceback bodies are withheld; do not turn on raw debug logging
 or publish credentials to diagnose a failure.
+
+Only a runtime-error refusal performs one private `az --version` capture with a
+five-second timeout. It reports `runtime_cli`, `runtime_core` and `runtime_python`
+as bounded numeric versions or `unknown`; Python is the CLI's bundled runtime,
+not the runner's system Python. Raw version output, which can contain local paths
+and extension details, is withheld. Failed, malformed or ambiguous diagnostics
+leave the original operation failed and never trigger a mutation retry.
+
+The fixed `signature=REQUESTS_STRUCTURES_IMPORT_DEADLOCK` token requires a traceback
+ending in the known `_DeadlockError` module-lock signature for `requests.structures`.
+The exact Azure CLI help footer may follow that terminal exception; arbitrary
+trailing text or a later exception does not qualify.
+Other tracebacks retain the generic category. This is evidence collection for the
+next occurrence, not proof that the earlier generic failures had that cause or
+that the upstream CLI issue has been repaired. No CLI pin or workaround is added.
 
 Use the code/category to choose the next investigation. It is not proof of a
 specific permission or connectivity defect, and does not authorize a retry or
@@ -80,12 +128,14 @@ Two normal runs at application revision `23db3b8` on October 4 failed before VM
 staging: [37164968762](https://github.com/marketsignal/msai-v2/actions/runs/37164968762)
 on Azure delete, then [37165202036](https://github.com/marketsignal/msai-v2/actions/runs/37165202036)
 on Azure create. Operator recovery separately removed the old completed-owner
-orphan. The diagnostic repair does not establish the runner's underlying cause
-or certify its write permissions, normal installation or cleanup recovery.
+orphan. The diagnostic repair does not establish those failures' underlying cause.
+Subsequently, [normal run 37171071535](https://github.com/marketsignal/msai-v2/actions/runs/37171071535)
+at `fa4c8f8` passed its revision gate, installation, public checks and rule cleanup
+at 02:40 UTC on October 4. These observations do not establish unattended reliability.
 
 ## First upgrade from the old API
 
-The current installation does not have the new readiness contract. The corrected workflow deliberately refuses an old/404 response. There is no compatibility shortcut and `bootstrap=true` is not a workaround for production.
+This procedure applies to an old installation or rollback image lacking the readiness contract. The `fa4c8f8` installation passed the contract during the normal October 4 deployment. An old/404 response still deliberately refuses; there is no compatibility shortcut and `bootstrap=true` is not a workaround for production.
 
 Prepare a supervised maintenance installation through the existing [first-deploy/rollback runbook](../how_to_deploy.md), with a concrete approved target and revision:
 
@@ -97,10 +147,24 @@ Prepare a supervised maintenance installation through the existing [first-deploy
 
 A rollback to an old application image may remove the readiness endpoint. Subsequent automated releases then refuse and require this supervised restoration path.
 
-## Operational rehearsal proposal
+## Bounded recovery acceptance
 
-The October 3 read-only inventory found only the production NSG; no disposable rehearsal NSG was present. Proposed isolated target: a new **unattached** NSG `msai-release-safety-rehearsal-20261003` in `msaiv2_rg`, eastus2, under MarketSignal2. Do not attach it to a NIC/subnet or alter `msai-nsg` as part of the rehearsal.
+The operator selected the existing `msaiv2_rg/msai-nsg` for explicitly bounded
+recovery checks; no new resource group or rehearsal NSG is required. Preserve all
+unrelated rules and record exact workflow-control and application revisions,
+run/attempt identities, timings and before/after rule inventories.
 
-After the exact candidate and commands are reviewed, request authorization to create this one NSG, add only the bounded test rules, exercise recovery/cleanup, inspect persistence and remove that same disposable resource. Use genuine recorded workflow-attempt identities for ownership fixtures. Keep active-owner preservation and unknown-owner cases distinct; offline command fixtures alone do not certify the Azure behavior. The full GitHub deployment journey remains a further gate because it also affects an application VM/data environment.
+October 4 checks removed the old completed-owner orphan and proved cleanup-only
+rerun and unreachable-target failure cleanup. The cancellation attempt described
+above left its producer running until SSH failed, although its cleanup succeeded.
+The final inventory preserved the four unrelated rules. No fresh scheduled-reaper
+execution was verified; that remains a separate operational acceptance gate.
 
-Production orphan `gha-transient-37092738955-1` was still present at priority 200 at 21:37 UTC on October 3; its recorded GitHub attempt was completed/success. That refresh did not inspect every ownership-shape field or delete the rule. Production cleanup and enabling the scheduled reaper are separate named changes with a fresh preview, not side effects of this rehearsal.
+After reviewed integration, repeat cancellation with the explicitly authorized
+unreachable TEST-NET target, while propagation waits after owned-rule creation
+and before staging. Require producer conclusion `cancelled`, skipped staging and
+execution, successful independent cleanup, repeated absence of the exact owned
+rule and unchanged unrelated policies. Setup failure or a missed cancellation
+window is not a passing cancellation test. The ownership guard requires a genuine
+`main` run; do not weaken it to test a feature branch. Offline contracts and a
+read-only helper preview cannot replace this GitHub/Azure acceptance.
