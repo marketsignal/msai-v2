@@ -8,7 +8,7 @@
 | Reproduce and fix a defect | `/fix-bug <name>` |
 | Trivial, low-risk change under the quick-fix limits | `/quick-fix <name>` |
 | Fresh second opinion or code review | Claude: `/opinion <request>`; Codex: `$opinion <request>` |
-| Investigation with disposable write/network capability | Claude: `/opinion investigate <request>`; Codex: `$opinion investigate <request>` |
+| Investigation requiring live project tools, network, or real-worktree writes | Claude: `/opinion investigate <request>`; Codex: `$opinion investigate <request>` |
 | Resolve an explicitly requested or still-unresolved high-impact architectural fork | `/council <question>` |
 | Process PR feedback | `/review-pr-comments` |
 | Merge and clean up after approval | `/finish-branch` |
@@ -17,6 +17,13 @@ The current host is the main agent for the session. Resolve it through the insta
 never persist a permanent main-engine preference. Reviewer `auto` selects the other installed
 engine and automatically falls back to a fresh same-engine reviewer when launch/capability failure
 occurs. A finding is a review result, not a fallback reason.
+
+Ordinary reviews use an immutable disposable candidate. Select full-agent investigation from the
+task's actual need for live project capabilities, under the standing Human-Approved Reviews policy;
+explain the mode without another Forge consent question. Investigation runs in the real worktree
+with normal host/project capabilities. A permission denial or timeout alone must never switch an
+ordinary review or its fallback to investigation. Native host security and the existing destructive
+and external-mutation boundaries remain in force.
 
 ## Reviewer authentication recovery
 
@@ -260,7 +267,7 @@ for:
 - a security-sensitive or irreversible action;
 - a broken invariant, exhausted persistent budget, or unresolved convergence blocker.
 
-PR creation requires a human-created authorization record bound to the active nonce and candidate.
+PR creation requires explicit human approval bound to the active nonce and candidate. The agent records the decision and executes the approved action; the human need not edit state or run a command.
 Ordinary reviewer/council engine failure uses automatic same-engine fallback and does not stop the
 workflow. If the active host cannot compose every Must goal behavior, mark runtime readiness
 `BLOCKED` rather than silently reducing the contract.
@@ -281,7 +288,7 @@ an engine failure, or a convergence limit is not a council trigger by itself. Re
 failure uses automatic fallback; unresolved convergence and every action requiring human authority
 still pause for the developer.
 PR creation authorization remains human-only. Ask-tier commands stall autonomous runs, so surface the
-deterministic action and pause instead of hiding a prompt.
+deterministic action for the human decision, then record and execute it through normal host controls. Do not ask again for a still-valid approval.
 
 ### Severity and Convergence Compatibility
 
@@ -291,7 +298,7 @@ surface any remaining blocker to the developer. In a Developer Demo, an unsuppor
 diagram edge without `file:line` evidence is P1.
 
 The v5 compatibility reader retains `POST_CERT_REVIEW_ROUND_LIMIT` and the convergence-breaker.
-Only a human may record `Post-certification tail adjudicated by human`. A compatibility N/A after a
+Only a human may decide the breaker adjudication. After their explicit decision, the agent records `Post-certification tail adjudicated by human` with the current HEAD and timestamp; it never self-adjudicates. A compatibility N/A after a
 counted loop preserves its count as `Code review loop (<N> iterations) — N/A:`; migrated workflows
 use candidate-bound structured receipts instead.
 

@@ -4,6 +4,15 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-10-04 — Forge 6.4.3, assessments and merged-worktree consolidation
+
+- Includes the operator's installed Forge 6.4.3 harness and generated Claude/Codex adapters, together with the latest Master Map, Master Plan, agent context and audit records. Project context remains project-owned, with deployment procedures, endpoint inventory, vendor knowledge and real-browser acceptance requirements retained.
+- PR102–105 are merged in order. Primary `main` was fast-forwarded to `f4ede895`, with the operator's Forge, context and assessment edits restored and hash-verified before publication.
+- All four merged feature worktrees are archived recoverably; their ignored review/audit evidence is preserved outside worktrees. Merged local branches were safely deleted; the operator subsequently authorized and verified deletion of their four GitHub branches. Divergent continuity folds did not overwrite primary state, and archived receipts were not imported as active gates.
+- Five local application/worker source mounts now use primary. Seven guarded research services are healthy; existing data/database and disabled broker/vendor access were preserved. A real-browser reload retained the completed 100-fill local reference.
+- Updated the Master Map, Master Plan and mandatory-read agent context with the consolidated source/runtime and startup configuration. See [preservation and handoff evidence](audits/2026-10-03/worktree-consolidation.md).
+- PR checks, exact-main CI, image build/auth and automatic Azure deployment at `f4ede895` passed, with public probes and temporary SSH cleanup completed at 05:42 UTC. Repaired-runner cancellation and scheduled recovery remain unverified. Operational acceptance stays PARTIAL and M20 remains open.
+
 ### 2026-10-03 — Release cancellation and bounded runtime diagnostics
 
 - Deployment stops being eligible after cancellation while its separate ownership-checked cleanup remains eligible. Explicit release/preflight checks are preserved. Deploy has a 30-minute ceiling; every deploy/preflight SSH and SCP call uses strict, noninteractive host checking with bounded connection attempts and keepalives.

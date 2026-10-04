@@ -1,9 +1,9 @@
 ---
 name: "new-feature"
-description: "Forge adapter for new-feature. Invoking it authorizes only ordinary-review transport of the bounded immutable candidate, prompt, and evidence, including sensitive tracked or in-scope non-ignored files, to the configured Claude Code/Codex reviewer services. Investigation is excluded; investigate launches a separate full agent in the real worktree with normal config, tools, network, and write access under host approvals."
+description: "Forge adapter for new-feature. Standing human approval covers ordinary-review transport of the bounded immutable candidate, prompt, and evidence, including sensitive tracked or in-scope non-ignored files, to the configured Claude Code/Codex reviewer services, and full-agent investigation selected from task needs. No extra Forge consent question. Ordinary review stays hermetic; investigate uses normal config, tools, network, and real-worktree write access. Host security and external/destructive mutation boundaries still apply."
 forge-generated: true
 canonical-path: ".forge/workflows/new-feature.md"
-canonical-revision: "99fde645fe4eda4bdd0d5c59241753e9f6091c62e9bc0693b46f5ff621c61d29"
+canonical-revision: "e2fe8ba1515d4f5cddd9a2caa24b29a324c1a9bcc96771f198bcb3e587ead0e0"
 ---
 
 Read the canonical workflow or skill at `.forge/workflows/new-feature.md` completely before taking any action.

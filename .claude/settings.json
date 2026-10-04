@@ -45,7 +45,15 @@
       "Bash(gh pr merge:*)",
       "Bash(npm publish:*)",
       "Bash(rm -rf:*)",
-      "Bash(rm -r:*)"
+      "Bash(rm -r:*)",
+      "Bash(gh issue close:*)",
+      "Bash(kubectl apply:*)",
+      "Bash(kubectl delete:*)",
+      "Bash(kubectl patch:*)",
+      "Bash(curl -X POST:*)",
+      "Bash(curl -X PUT:*)",
+      "Bash(curl -X PATCH:*)",
+      "Bash(curl -X DELETE:*)"
     ]
   },
   "hooks": {
@@ -60,12 +68,8 @@
           },
           {
             "type": "command",
-            "forgeManagedId": "session-start",
-            "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/session-start.sh"
-          },
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/session-start.sh"
+            "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/session-start.sh",
+            "forgeManagedId": "session-start"
           }
         ]
       }
@@ -76,21 +80,13 @@
         "hooks": [
           {
             "type": "command",
-            "forgeManagedId": "build-evidence",
-            "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/build-evidence.sh"
+            "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/build-evidence.sh",
+            "forgeManagedId": "build-evidence"
           },
           {
             "type": "command",
-            "forgeManagedId": "state-updated",
-            "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/check-state-updated.sh"
-          },
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/build-evidence.sh"
-          },
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/check-state-updated.sh"
+            "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/check-state-updated.sh",
+            "forgeManagedId": "state-updated"
           }
         ]
       }
@@ -123,17 +119,13 @@
         "hooks": [
           {
             "type": "command",
-            "forgeManagedId": "precompact-memory",
-            "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/pre-compact-memory.sh"
-          },
-          {
-            "type": "command",
             "command": "echo 'COMPACTION IMMINENT. Save learnings to auto memory: bug root causes, patterns, architecture insights, user preferences. NOT session state (that goes in .claude/local/state.md).' >&2; exit 0",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/pre-compact-memory.sh"
+            "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/pre-compact-memory.sh",
+            "forgeManagedId": "precompact-memory"
           }
         ]
       }
@@ -144,12 +136,8 @@
         "hooks": [
           {
             "type": "command",
-            "forgeManagedId": "config-change",
-            "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/check-config-change.sh"
-          },
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/check-config-change.sh"
+            "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/check-config-change.sh",
+            "forgeManagedId": "config-change"
           }
         ]
       }
@@ -160,26 +148,18 @@
         "hooks": [
           {
             "type": "command",
-            "forgeManagedId": "bash-safety",
-            "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/check-bash-safety.sh"
-          },
-          {
-            "type": "command",
-            "forgeManagedId": "workflow-gates",
-            "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/check-workflow-gates.sh"
-          },
-          {
-            "type": "command",
             "forgeManagedId": "external-mutation-auth",
             "command": "bash \"$CLAUDE_PROJECT_DIR/.forge/hooks/check-external-mutation-auth.sh\""
           },
           {
             "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/check-bash-safety.sh"
+            "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/check-bash-safety.sh",
+            "forgeManagedId": "bash-safety"
           },
           {
             "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/check-workflow-gates.sh"
+            "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/check-workflow-gates.sh",
+            "forgeManagedId": "workflow-gates"
           }
         ]
       }
@@ -190,12 +170,8 @@
         "hooks": [
           {
             "type": "command",
-            "forgeManagedId": "auto-approve-local",
-            "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/auto-approve-local-writes.sh"
-          },
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/auto-approve-local-writes.sh"
+            "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/auto-approve-local-writes.sh",
+            "forgeManagedId": "auto-approve-local"
           }
         ]
       }
@@ -206,12 +182,8 @@
         "hooks": [
           {
             "type": "command",
-            "forgeManagedId": "post-format",
-            "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/post-tool-format.sh"
-          },
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/post-tool-format.sh"
+            "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/post-tool-format.sh",
+            "forgeManagedId": "post-format"
           }
         ]
       }
