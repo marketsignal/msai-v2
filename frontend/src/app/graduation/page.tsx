@@ -170,6 +170,9 @@ function DetailPanel({
   const [targetStage, setTargetStage] = useState<string>("");
   const [reason, setReason] = useState<string>("");
   const validTargets = VALID_TRANSITIONS[candidate.stage] ?? [];
+  const rawSelection = candidate.metrics.selection;
+  const selection = rawSelection !== null && typeof rawSelection === "object" && !Array.isArray(rawSelection)
+    ? rawSelection as Record<string, unknown> : null;
 
   const handleAdvance = async (): Promise<void> => {
     if (!targetStage) return;
@@ -204,9 +207,9 @@ function DetailPanel({
       <CardContent className="space-y-5">
         {/* Metrics */}
         <div>
-          <h4 className="mb-2 text-sm font-medium">Metrics</h4>
+          <h4 className="mb-2 text-sm font-medium">{selection ? "Training Metrics" : "Metrics"}</h4>
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-            {Object.entries(candidate.metrics).map(([k, v]) => (
+            {Object.entries(candidate.metrics).filter(([key]) => key !== "selection").map(([k, v]) => (
               <div
                 key={k}
                 className="rounded-md border border-border/50 bg-muted/30 px-3 py-2"
@@ -219,6 +222,22 @@ function DetailPanel({
             ))}
           </div>
         </div>
+
+        {selection && (
+          <section className="space-y-2 rounded-md border border-border/50 bg-muted/30 p-3" data-testid="candidate-selection-provenance">
+            <h4 className="text-sm font-medium">Research Selection Provenance</h4>
+            <p className="text-sm font-medium">
+              {selection.policy === "explicit_trial" ? "Explicit trial choice"
+                : selection.policy === "latest_window_training" ? "Automatic latest window training choice"
+                : "Automatic best training choice"} · Exploratory
+            </p>
+            <p className="text-sm text-muted-foreground">
+              Training evidence from {String(selection.train_start ?? "unavailable")} to {String(selection.train_end ?? "unavailable")}.<br />
+              {selection.trial_index_kind === "walk_forward_window" ? "Chronological window" : "Sweep result"} index {String(selection.selected_trial_index ?? "unavailable")} (zero-based).
+            </p>
+            <p className="text-xs text-muted-foreground">Discovery retains a configuration for further research. This selection is not validated alpha.</p>
+          </section>
+        )}
 
         {/* Config */}
         <div>

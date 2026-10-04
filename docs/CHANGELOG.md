@@ -4,9 +4,25 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-10-04 — Research training selection and exploratory discovery
+
+Candidate repair based on `c1dd1c1`; preliminary real API/CLI/browser acceptance passed. Final fingerprint-bound reviews/verification and publication remain pending.
+
+- Sweeps select and feed optimizers using eligible training evidence. Reserved-period diagnostics cannot change the chosen configuration. Walk-forward onward discovery uses the latest training window, with no silent earlier-window fallback.
+- New reports expose selection provenance and discovery eligibility. Legacy, failed, pruned and incomplete training evidence is refused with rerun guidance. Explicit eligible choices remain possible and are labeled manual; saved numerical metrics remain flat, with separate provenance outside strategy configuration.
+- Dashboard actions and result views distinguish exploratory discovery, training selection and diagnostic outcomes/dates. Graduation renders provenance readably, separately from numerical metrics; the research form exposes holdout/purge controls, plain validation without raw request echo and a constrained dialog column that fits populated JSON. Actual failure/correction and result/candidate reloads passed; graduated real journeys retain that coverage.
+- Only the research portion of M01 and the named research eligibility defects are addressed. Portfolio allocation and broader validation/production gates remain open. See the [repair explanation](solutions/research/training-selection-and-discovery.md).
+
+### 2026-10-04 — Verified rollout and actual cancellation at c1dd1c1
+
+- PR107 integrated the exact certified startup-repair tree as `c1dd1c11301b55f6edc20d8751760cc5aa386fe5`. Exact-main CI/auth/build passed; backend CI reported 3,748 passed, 11 skipped and 17 expected failures.
+- Genuine normal Deploy `37213065932` succeeded. Six app services were directly verified at c1dd1c1; broker identities were preserved. Installed CLI, separate API/FIFO checks and real-browser reload/native results/fill pagination/full report preserved the 166-fill, −$1.21 reference with first-day activity included.
+- Separately approved actual RC-1 `37215116906`, attempt 1, passed ordinary cancellation during propagation: producer cancelled, staging/installation skipped and independent cleanup succeeded. Two Azure absence reads preserve all four unrelated policies across 14 fields; all eight application/broker container identities are unchanged.
+- Genuine scheduled run37218539817 at c1dd1c1 completed successfully at16:55:34UTC. Actual logs and independent Azure inventory confirm four unrelated policies unchanged across fourteen fields; no owned orphan was present. Bounded release recovery/M20 is PASS. Updated the factual assessment/context/plan without closing research, account, supervisor, storage, risk, cost or alpha findings. [Evidence and limits](audits/2026-10-04/release-acceptance.md).
+
 ### 2026-10-04 — Azure CLI import-lock startup repair
 
-Candidate implementation in `fix/release-cli-deadlock`, based on merged main `e3ad095`. Publication, Linux runner deployment and complete release-recovery acceptance remain pending.
+Original candidate-stage entry for `fix/release-cli-deadlock`, based on `e3ad095`. Its pending statements describe that earlier stage; the dated acceptance entry above records PR107 integration and actual normal/cancellation results. The completed bounded release acceptance, including genuine scheduled inventory/preservation, is recorded above; earlier pending statements retain historical scope.
 
 - Exact-main CI passed with 3,748 backend tests, 11 skipped and 17 expected failures; auth and image build also passed. Automatic Deploy `37182097303` identified a Requests import-lock exception in CLI 2.90.0/Python 3.14.6 before VM staging. Separate cleanup and independent preservation of four unrelated rules passed. Earlier generic CLI failures remain unattributed.
 - The NSG helper can use an explicitly selected CLI-owned interpreter in isolated mode. A small same-process entry point completes Requests import before running the real Azure CLI module. Deploy, smoke and reaper workflows select the Debian interpreter and installer mode for all seven NSG paths. Operation and private diagnostic share the launch prefix; timeout, ownership, redaction and original failure behavior remain. Invalid explicit configuration fails closed without retrying the mutation or falling back to native `az`.

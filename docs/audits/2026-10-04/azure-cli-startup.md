@@ -1,9 +1,11 @@
 # Azure CLI startup failure and bounded repair
 
 Assessment date: October 4, 2026. Source baseline:
-`e3ad0951fbeb9c9d3e85228eafc71bc4c8e56909`. Repair status: candidate implemented;
-final review and verification pending. No replacement deployment or complete
-recovery acceptance is claimed.
+`e3ad0951fbeb9c9d3e85228eafc71bc4c8e56909`. Repair integrated through PR107 as `c1dd1c1`; final candidate certification,
+normal Linux rollout and actual pre-staging ordinary cancellation/cleanup passed.
+Bounded release recovery is now PASS after genuine scheduled run37218539817 at c1dd1c1; see the current acceptance record. Earlier PARTIAL observations below remain historical.
+[Current acceptance and limits](release-acceptance.md). Earlier failure and
+prepublication observations below retain their original scope.
 
 ## Observed failure
 
@@ -94,15 +96,20 @@ bundle merely by matching its CLI version. Record each tested runtime and
 instrumentation explicitly; do not infer that an intermittent cloud failure is
 fixed from a module-presence check or successful Mac command alone.
 
-## Recovery acceptance still open
+## Recovery acceptance history and subsequent closure
 
-The scheduled reaper is enabled, but the newest observed genuine schedule-event
-run was August 10 at an older revision. No current scheduled execution was found
-in the October 4 assessment. Its absence is observed; its cause is not established.
-A manual dispatch does not prove the scheduler works.
+The early October 4 assessment found only older August 10 schedule evidence.
+Later fresh observation found genuine successful October 4 schedules at `e3ad095`,
+latest run `37212662434` created at 15:21 UTC. As of 16:15 UTC, an exact-workflow,
+schedule-only query at integrated `c1dd1c1` returns no run. The workflow is active,
+its integrated file exists and main is default, but these facts are not runtime
+proof. Cause of the delay is unproven. A manual dispatch or older revision does
+not prove scheduled execution at the repair revision.
 
-M20 and operational release acceptance remain **PARTIAL** until the repaired
+At that pre-scheduled observation, M20 and operational release acceptance remained **PARTIAL** until the repaired
 revision passes normal deployment, actual producer interruption with cleanup,
 repeated owned-rule absence/unrelated-policy preservation, and fresh genuine
 scheduled recovery. These cloud checks require their concrete authorized scope
 after the repair is reviewable. No broker action is part of this repair.
+
+Normal Deploy `37213065932` and actual RC-1 `37215116906` at `c1dd1c1` now satisfy the normal Linux and pre-staging cancellation/cleanup criteria, with repeated rule absence and protected-policy preservation. Genuine scheduled run37218539817 subsequently satisfied scheduled execution/preservation at this integrated revision: exact checkout, successful actual step, four preservation markers and independently unchanged fourteen-field policy inventory. Bounded release recovery/M20 is PASS; no new orphan-deletion fixture was present. Current successful logs prove the configured Debian runtime performed actual network operations; they do not freshly emit exact CLI/Python versions. The older failing runtime versions must not be relabeled as current measurements.

@@ -21,6 +21,7 @@ A background heartbeat task renews the compute lease and updates the
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import socket
 from contextlib import suppress
@@ -40,17 +41,9 @@ from msai.services.compute_slots import (
     renew_compute_slots,
 )
 from msai.services.nautilus.catalog_builder import ensure_catalog_data
-from msai.services.research_engine import ResearchEngine, extract_objective_value
+from msai.services.research_engine import ResearchEngine, extract_usable_objective_value
 
 log = get_logger("workers.research")
-
-# Maps user-facing objective names to their canonical metric key.
-_OBJECTIVE_METRIC_MAP: dict[str, str] = {
-    "sharpe": "sharpe_ratio",
-    "sortino": "sortino_ratio",
-    "total_return": "total_return",
-    "max_drawdown": "max_drawdown",
-}
 
 
 async def run_research_job(
@@ -366,28 +359,7 @@ async def _finalize_job(job_id: str, report: dict[str, Any]) -> None:
         job.results = report
 
         objective = str(report.get("objective", "sharpe"))
-        objective_metric_key = _OBJECTIVE_METRIC_MAP.get(objective, "sharpe_ratio")
         best = report.get("summary", {}).get("best_result")
-        if best is None:
-            # Walk-forward: derive best from window with best test objective
-            windows = report.get("windows", [])
-            if windows:
-                best_window = max(
-                    (w for w in windows if w.get("test_result")),
-                    key=lambda w: (
-                        (w.get("test_result") or {}).get("metrics", {}).get(objective_metric_key, 0)
-                    ),
-                    default=None,
-                )
-                if best_window:
-                    # Use test metrics (out-of-sample) for best_metrics,
-                    # but train config for best_config
-                    train = best_window.get("best_train_result") or {}
-                    test = best_window.get("test_result") or {}
-                    best = {
-                        "config": train.get("config", {}),
-                        "metrics": test.get("metrics", train.get("metrics", {})),
-                    }
 
         job.best_config = best.get("config") if best else None
         job.best_metrics = best.get("metrics") if best else None
@@ -398,35 +370,52 @@ async def _finalize_job(job_id: str, report: dict[str, Any]) -> None:
             # Walk-forward: create trials from windows
             for i, window in enumerate(report.get("windows", [])):
                 train = window.get("best_train_result") or {}
-                test = window.get("test_result") or {}
+                # A window is one canonical trial. Diagnostics remain in job.results.
+                rejected_training = window.get("train_results") or []
+                status = (
+                    _training_trial_status(train, objective)
+                    if train
+                    else (
+                        "pruned"
+                        if rejected_training and all(r.get("pruned") for r in rejected_training)
+                        else "failed"
+                    )
+                )
                 trial = ResearchTrial(
                     research_job_id=job_id,
                     trial_number=i,
                     config=train.get("config", {}),
-                    metrics=test.get("metrics"),
-                    status="completed",
-                    objective_value=_safe_float(
-                        extract_objective_value(test.get("metrics", {}), objective)
-                    ),
+                    metrics=train.get("metrics"),
+                    status=status,
+                    objective_value=extract_usable_objective_value(train.get("metrics"), objective),
                 )
                 session.add(trial)
         for index, result in enumerate(results_list):
-            # Derive objective_value from metrics if not set directly
             raw_obj = result.get("objective_value")
-            if raw_obj is None:
-                metrics = result.get("metrics") or {}
-                raw_obj = extract_objective_value(metrics, objective)
             trial = ResearchTrial(
                 research_job_id=job_id,
                 trial_number=index,
                 config=result.get("config", {}),
                 metrics=result.get("metrics"),
-                status="completed" if result.get("error") is None else "failed",
+                status=_training_trial_status(result, objective),
                 objective_value=_safe_float(raw_obj),
             )
             session.add(trial)
 
         await session.commit()
+
+
+def _training_trial_status(result: dict[str, Any], objective: str) -> str:
+    """Persist training state independently of diagnostic success or failure."""
+    if result.get("error") is not None:
+        return "failed"
+    if result.get("pruned"):
+        return "pruned"
+    if extract_usable_objective_value(result.get("metrics"), objective) is None:
+        return "failed"
+    if not result.get("completed_full_run"):
+        return "incomplete"
+    return "completed" if result.get("selection_eligible") is True else "failed"
 
 
 async def _mark_cancelled(job_id: str) -> None:
@@ -464,6 +453,7 @@ def _safe_float(value: Any) -> float | None:
     if value is None:
         return None
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError, OverflowError):
         return None

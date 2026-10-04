@@ -29,7 +29,7 @@ import {
 import { LaunchResearchForm } from "@/components/research/launch-form";
 import {
   apiGet,
-  ApiError,
+  describeApiError,
   type ResearchJobResponse,
   type ResearchJobListResponse,
   type StrategyListResponse,
@@ -61,11 +61,7 @@ export default function ResearchPage(): React.ReactElement {
       setJobs(jobsData.items);
       setError(null);
     } catch (err) {
-      const msg =
-        err instanceof ApiError
-          ? `Failed to load research jobs (${err.status})`
-          : "Failed to load research jobs";
-      setError(msg);
+      setError(describeApiError(err, "Failed to load research jobs"));
     }
   }, [getToken]);
 
@@ -82,11 +78,7 @@ export default function ResearchPage(): React.ReactElement {
       setStrategiesById(map);
       setError(null);
     } catch (err) {
-      const msg =
-        err instanceof ApiError
-          ? `Failed to load research jobs (${err.status})`
-          : "Failed to load research jobs";
-      setError(msg);
+      setError(describeApiError(err, "Failed to load research jobs"));
     } finally {
       setLoading(false);
     }
@@ -128,6 +120,7 @@ export default function ResearchPage(): React.ReactElement {
           <p className="text-sm text-muted-foreground">
             Parameter sweeps and walk-forward optimisation
           </p>
+          <p className="text-xs text-muted-foreground">Exploratory research. Completed execution does not establish validated alpha.</p>
         </div>
         <LaunchResearchForm
           open={launchDialogOpen}
@@ -137,8 +130,9 @@ export default function ResearchPage(): React.ReactElement {
       </div>
 
       {error && (
-        <div className="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-400">
+        <div role="alert" className="flex items-center justify-between gap-3 rounded-md border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-400">
           {error}
+          <Button variant="outline" size="sm" onClick={() => void load()}>Retry</Button>
         </div>
       )}
 
@@ -179,6 +173,8 @@ export default function ResearchPage(): React.ReactElement {
             <div className="flex h-32 items-center justify-center text-sm text-muted-foreground">
               Loading research jobs...
             </div>
+          ) : error && jobs.length === 0 ? (
+            <p className="py-8 text-sm text-muted-foreground">Job history is unavailable. Retry to load your research.</p>
           ) : jobs.length === 0 ? (
             <div className="flex h-32 items-center justify-center text-sm text-muted-foreground">
               No research jobs yet. Click &quot;Launch Research&quot; to start
@@ -190,6 +186,7 @@ export default function ResearchPage(): React.ReactElement {
                 <TableRow className="border-border/50 hover:bg-transparent">
                   <TableHead>Job Type</TableHead>
                   <TableHead>Strategy</TableHead>
+                  <TableHead>Selection</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead>Progress</TableHead>
                   <TableHead className="text-right">Created</TableHead>
@@ -206,6 +203,9 @@ export default function ResearchPage(): React.ReactElement {
                       </TableCell>
                       <TableCell className="text-muted-foreground">
                         {strategy?.name ?? job.strategy_id.slice(0, 8)}
+                      </TableCell>
+                      <TableCell className="text-xs text-muted-foreground">
+                        {job.selection ? (job.selection.policy === "latest_window_training" ? "Latest window training · Exploratory" : "Best training · Exploratory") : "Unknown / legacy"}
                       </TableCell>
                       <TableCell>
                         <Badge

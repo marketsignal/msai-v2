@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
@@ -15,12 +15,50 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from msai.core.database import get_db
 from msai.main import app
 
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 _STRATEGY_ID = uuid4()
 _JOB_ID = uuid4()
+
+
+def _training_result(period: int = 20, score: float = 1.5) -> dict[str, Any]:
+    metrics = {"sharpe_ratio": score, "total_trades": 10}
+    return {
+        "config": {"period": period},
+        "metrics": metrics,
+        "train_metrics": metrics,
+        "objective_value": score,
+        "selection_eligible": True,
+        "selection_reason": None,
+        "completed_full_run": True,
+        "pruned": False,
+        "error": None,
+        "start_date": "2025-01-22",
+        "end_date": "2025-01-23",
+    }
+
+
+def _report() -> dict[str, Any]:
+    return {
+        "selection": {
+            "version": 1,
+            "basis": "train",
+            "scope": "exploratory",
+            "policy": "best_training",
+            "trial_index_kind": "sweep_result",
+            "selected_trial_index": 0,
+        },
+        "objective": "sharpe",
+        "results": [_training_result()],
+        "start_date": "2025-01-22",
+        "end_date": "2025-01-25",
+        "search": {"holdout": {"train_start": "2025-01-22", "train_end": "2025-01-23"}},
+    }
 
 
 def _make_strategy_row() -> MagicMock:
@@ -53,7 +91,10 @@ def _make_job_row(
     row.completed_at = None
     row.created_at = datetime.now(UTC)
     row.config = {"strategy_path": "/app/strategies/ema_cross.py"}
-    row.results = None
+    row.results = _report() if status == "completed" else None
+    row.selection = None
+    row.discovery_eligible = False
+    row.discovery_refusal_reason = None
     row.queue_name = "msai:research"
     row.queue_job_id = "arq-123"
     return row
@@ -103,7 +144,12 @@ def mock_db() -> AsyncMock:
     session.get.return_value = None
     session.flush = AsyncMock()
     session.commit = AsyncMock()
-    session.refresh = AsyncMock()
+
+    async def _refresh_identity(obj: Any) -> None:
+        if obj.id is None:
+            obj.id = uuid4()
+
+    session.refresh = AsyncMock(side_effect=_refresh_identity)
     session.rollback = AsyncMock()
     return session
 
@@ -388,13 +434,15 @@ class TestPromoteResearchResult:
 
         assert response.status_code == 404
 
+    @pytest.mark.parametrize("job_status", ["pending", "running", "failed", "cancelled"])
     async def test_promote_non_completed_returns_409(
         self,
         mock_db: AsyncMock,
         client_with_mock_db: httpx.AsyncClient,
+        job_status: str,
     ) -> None:
         """POST /promotions on a running job returns 409."""
-        job = _make_job_row(status="running")
+        job = _make_job_row(status=job_status)
         mock_db.get.return_value = job
 
         response = await client_with_mock_db.post(
@@ -505,6 +553,8 @@ class TestPromoteResearchResult:
         trial = _make_trial_row(trial_number=3)
         trial.config = {"period": 50}
         trial.metrics = {"sharpe_ratio": 2.0}
+        job.results["results"] = [_training_result() for _ in range(4)]
+        job.results["results"][3] = _training_result(period=50, score=2.0)
 
         # mock_db.get returns job; mock_db.execute returns trial.
         mock_db.get.return_value = job
@@ -542,3 +592,249 @@ class TestPromoteResearchResult:
         # Trial's config (period=50) + stamped instruments from the
         # parent job.
         assert captured["config"] == {"period": 50, "instruments": ["MSFT.NASDAQ"]}
+
+
+class TestTrainingDiscovery:
+    async def test_automatic_training_choice_survives_failed_holdout_diagnostic(
+        self,
+        mock_db: AsyncMock,
+        client_with_mock_db: httpx.AsyncClient,
+    ) -> None:
+        job = _make_job_row(status="completed")
+        job.results["results"][0]["holdout_error"] = "No reserved-period bars"
+        job.best_metrics = {"sharpe_ratio": -99.0}
+        mock_db.get.return_value = job
+        with patch(
+            "msai.api.research._graduation_service.create_candidate",
+            new_callable=AsyncMock,
+            return_value=_make_candidate_row(),
+        ) as create:
+            response = await client_with_mock_db.post(
+                "/api/v1/research/promotions",
+                json={
+                    "research_job_id": str(_JOB_ID),
+                },
+            )
+        assert response.status_code == 201
+        assert create.call_args.kwargs["metrics"]["sharpe_ratio"] == 1.5
+        assert create.call_args.kwargs["metrics"]["selection"]["policy"] == "best_training"
+
+    @pytest.mark.parametrize("trial_index", [None, 0])
+    async def test_legacy_selection_refuses_with_rerun_guidance(
+        self,
+        mock_db: AsyncMock,
+        client_with_mock_db: httpx.AsyncClient,
+        trial_index: int | None,
+    ) -> None:
+        job = _make_job_row(status="completed")
+        job.results = None
+        mock_db.get.return_value = job
+        response = await client_with_mock_db.post(
+            "/api/v1/research/promotions",
+            json={
+                "research_job_id": str(_JOB_ID),
+                "trial_index": trial_index,
+            },
+        )
+        assert response.status_code == 409
+        assert "rerun" in response.json()["detail"].lower()
+
+    @pytest.mark.parametrize(
+        "changes",
+        [
+            {"error": "training failed"},
+            {"pruned": True},
+            {"completed_full_run": False},
+            {"selection_eligible": False, "selection_reason": "Too few training trades"},
+            {"train_metrics": None},
+            {"train_metrics": {}},
+            {"objective_value": None},
+            {"objective_value": float("inf")},
+            {"train_metrics": {"sharpe_ratio": float("nan")}},
+            {"train_metrics": {"total_trades": 10}},
+        ],
+    )
+    async def test_canonical_invalid_training_refuses_even_if_trial_completed(
+        self,
+        mock_db: AsyncMock,
+        client_with_mock_db: httpx.AsyncClient,
+        changes: dict[str, Any],
+    ) -> None:
+        job = _make_job_row(status="completed")
+        job.results["results"][0].update(changes)
+        mock_db.get.return_value = job
+        trial_result = MagicMock()
+        trial_result.scalar_one_or_none.return_value = _make_trial_row()
+        mock_db.execute.return_value = trial_result
+        response = await client_with_mock_db.post(
+            "/api/v1/research/promotions",
+            json={
+                "research_job_id": str(_JOB_ID),
+                "trial_index": 0,
+            },
+        )
+        assert response.status_code == 409
+        assert "rerun" in response.json()["detail"].lower()
+
+    async def test_nonwinning_explicit_training_preserves_flat_metrics_and_provenance(
+        self,
+        mock_db: AsyncMock,
+        client_with_mock_db: httpx.AsyncClient,
+    ) -> None:
+        job = _make_job_row(status="completed")
+        job.config["instruments"] = ["AAPL.XNAS"]
+        result = _training_result(period=50, score=0.5)
+        result["holdout_error"] = "reserved diagnostic failed"
+        job.results["results"].append(result)
+        mock_db.get.return_value = job
+        with patch(
+            "msai.api.research._graduation_service.create_candidate",
+            new_callable=AsyncMock,
+            return_value=_make_candidate_row(),
+        ) as create:
+            response = await client_with_mock_db.post(
+                "/api/v1/research/promotions",
+                json={
+                    "research_job_id": str(_JOB_ID),
+                    "trial_index": 1,
+                },
+            )
+        assert response.status_code == 201
+        assert create.call_args.kwargs["config"] == {"period": 50, "instruments": ["AAPL.XNAS"]}
+        metrics = create.call_args.kwargs["metrics"]
+        assert metrics["sharpe_ratio"] == 0.5
+        assert metrics["selection"] == {
+            "version": 1,
+            "research_job_id": str(_JOB_ID),
+            "basis": "train",
+            "scope": "exploratory",
+            "policy": "explicit_trial",
+            "trial_index_kind": "sweep_result",
+            "selected_trial_index": 1,
+            "train_start": "2025-01-22",
+            "train_end": "2025-01-23",
+        }
+        assert "selection" not in create.call_args.kwargs["config"]
+
+    async def test_earlier_walk_forward_explicit_choice_when_latest_has_no_winner(
+        self,
+        mock_db: AsyncMock,
+        client_with_mock_db: httpx.AsyncClient,
+    ) -> None:
+        job = _make_job_row(status="completed", job_type="walk_forward")
+        job.best_config = job.best_metrics = None
+        job.results = {
+            "objective": "sharpe",
+            "selection": {
+                "version": 1,
+                "basis": "train",
+                "scope": "exploratory",
+                "policy": "latest_window_training",
+                "trial_index_kind": "walk_forward_window",
+                "selected_trial_index": None,
+            },
+            "windows": [
+                {
+                    "train_start": "2025-01-22",
+                    "train_end": "2025-01-23",
+                    "best_train_result": _training_result(),
+                    "test_result": {"error": "no bars"},
+                },
+                {"best_train_result": None},
+            ],
+        }
+        mock_db.get.return_value = job
+        automatic = await client_with_mock_db.post(
+            "/api/v1/research/promotions",
+            json={
+                "research_job_id": str(_JOB_ID),
+            },
+        )
+        assert automatic.status_code == 409
+        with patch(
+            "msai.api.research._graduation_service.create_candidate",
+            new_callable=AsyncMock,
+            return_value=_make_candidate_row(),
+        ) as create:
+            explicit = await client_with_mock_db.post(
+                "/api/v1/research/promotions",
+                json={
+                    "research_job_id": str(_JOB_ID),
+                    "trial_index": 0,
+                },
+            )
+        assert explicit.status_code == 201
+        assert (
+            create.call_args.kwargs["metrics"]["selection"]["trial_index_kind"]
+            == "walk_forward_window"
+        )
+        assert create.call_args.kwargs["metrics"]["selection"]["policy"] == "explicit_trial"
+
+    async def test_detail_exposes_selection_and_derived_eligibility(
+        self,
+        mock_db: AsyncMock,
+        client_with_mock_db: httpx.AsyncClient,
+    ) -> None:
+        job = _make_job_row(status="completed")
+        mock_db.get.return_value = job
+        response = await client_with_mock_db.get(f"/api/v1/research/jobs/{_JOB_ID}")
+        assert response.status_code == 200
+        assert response.json()["selection"] == job.results["selection"]
+        assert response.json()["discovery_eligible"] is True
+        assert response.json()["discovery_refusal_reason"] is None
+
+    async def test_list_legacy_job_remains_readable_with_unknown_selection(
+        self,
+        mock_db: AsyncMock,
+        client_with_mock_db: httpx.AsyncClient,
+    ) -> None:
+        job = _make_job_row(status="completed")
+        job.results = None
+        count_result = MagicMock()
+        count_result.scalar_one.return_value = 1
+        jobs_result = MagicMock()
+        jobs_result.scalars.return_value.all.return_value = [job]
+        mock_db.execute.side_effect = [count_result, jobs_result]
+        response = await client_with_mock_db.get("/api/v1/research/jobs")
+        assert response.status_code == 200
+        item = response.json()["items"][0]
+        assert item["best_metrics"] == job.best_metrics
+        assert item["selection"] is None
+        assert item["discovery_eligible"] is False
+        assert "rerun" in item["discovery_refusal_reason"].lower()
+
+    @pytest.mark.parametrize("marker", [None, 2, True])
+    async def test_unknown_contract_version_refuses(
+        self,
+        mock_db: AsyncMock,
+        client_with_mock_db: httpx.AsyncClient,
+        marker: Any,
+    ) -> None:
+        job = _make_job_row(status="completed")
+        job.results["selection"]["version"] = marker
+        mock_db.get.return_value = job
+        response = await client_with_mock_db.post(
+            "/api/v1/research/promotions",
+            json={
+                "research_job_id": str(_JOB_ID),
+            },
+        )
+        assert response.status_code == 409
+
+    async def test_missing_canonical_result_refuses(
+        self,
+        mock_db: AsyncMock,
+        client_with_mock_db: httpx.AsyncClient,
+    ) -> None:
+        job = _make_job_row(status="completed")
+        job.results["results"] = []
+        mock_db.get.return_value = job
+        response = await client_with_mock_db.post(
+            "/api/v1/research/promotions",
+            json={
+                "research_job_id": str(_JOB_ID),
+                "trial_index": 0,
+            },
+        )
+        assert response.status_code == 409
+        assert "canonical training result" in response.json()["detail"]

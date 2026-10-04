@@ -561,6 +561,15 @@ export async function getMarketDataSymbols(
 // Research types — mirror of backend schemas/research.py
 // =====================================================================
 
+export interface ResearchSelection {
+  version: 1;
+  basis: "train";
+  scope: "exploratory";
+  policy: "best_training" | "latest_window_training";
+  trial_index_kind: "sweep_result" | "walk_forward_window";
+  selected_trial_index: number | null;
+}
+
 export interface ResearchJobResponse {
   id: string;
   strategy_id: string;
@@ -570,6 +579,9 @@ export interface ResearchJobResponse {
   progress_message: string | null;
   best_config: Record<string, unknown> | null;
   best_metrics: Record<string, unknown> | null;
+  selection: ResearchSelection | null;
+  discovery_eligible: boolean;
+  discovery_refusal_reason: string | null;
   error_message: string | null;
   started_at: string | null;
   completed_at: string | null;

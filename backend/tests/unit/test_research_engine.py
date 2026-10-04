@@ -17,7 +17,6 @@ from msai.services.research_engine import (
     rank_results,
 )
 
-
 # ---------------------------------------------------------------------------
 # expand_parameter_grid
 # ---------------------------------------------------------------------------
@@ -88,14 +87,13 @@ class TestRankResults:
     def test_empty_results_returns_empty(self) -> None:
         assert rank_results([], objective="sharpe") == []
 
-    def test_holdout_validated_preferred_over_train_only(self) -> None:
+    def test_holdout_label_does_not_override_training_rank(self) -> None:
         results = [
             _result(sharpe_ratio=3.0, completed=True, selection_basis="train"),
             _result(sharpe_ratio=2.0, completed=True, selection_basis="holdout"),
         ]
         ranked = rank_results(results, objective="sharpe")
-        # Holdout-validated comes first even with lower sharpe
-        assert ranked[0]["selection_basis"] == "holdout"
+        assert ranked[0]["metrics"]["sharpe_ratio"] == 3.0
 
 
 # ---------------------------------------------------------------------------
@@ -235,9 +233,7 @@ class TestResearchEngineInit:
 class TestParameterSweepWithMockRunner:
     def test_simple_grid_sweep_returns_results(self) -> None:
         mock_runner = MagicMock()
-        mock_runner.run.return_value = _mock_backtest_result(
-            sharpe_ratio=1.5, total_return=0.1
-        )
+        mock_runner.run.return_value = _mock_backtest_result(sharpe_ratio=1.5, total_return=0.1)
 
         engine = ResearchEngine(runner=mock_runner)
         result = engine.run_parameter_sweep(

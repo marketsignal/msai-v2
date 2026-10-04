@@ -1,6 +1,6 @@
 # Releasing MSAI safely
 
-This is the release operating contract. The existing VM/Compose deployment procedure remains in [how_to_deploy.md](../how_to_deploy.md). Local tests, actual provider checks and a production rollout are separate evidence gates. Earlier normal deployments at `fa4c8f8` and `f4ede895` succeeded on October 4 UTC. The later `e3ad095` deployment failed during Azure CLI startup; its focused repair, actual cancellation and scheduled recovery still require acceptance. This document does not authorize cloud changes or trading.
+This is the release operating contract. The existing VM/Compose procedure remains in [how_to_deploy.md](../how_to_deploy.md). Local checks, actual provider journeys and installation are separate evidence gates. Normal rollout and real ordinary pre-staging cancellation/cleanup passed at integrated `c1dd1c1` on October 4 UTC; bounded release recovery is PASS after genuine scheduled run37218539817 at that revision succeeded and independent Azure inventory preserved all four unrelated rules across fourteen fields. [Dated acceptance evidence](../audits/2026-10-04/release-acceptance.md). Earlier failed/PARTIAL records remain preserved. This document does not authorize cloud changes or trading.
 
 ## Choose the environment explicitly
 
@@ -204,3 +204,7 @@ rule and unchanged unrelated policies. Setup failure or a missed cancellation
 window is not a passing cancellation test. The ownership guard requires a genuine
 `main` run; do not weaken it to test a feature branch. Offline contracts and a
 read-only helper preview cannot replace this GitHub/Azure acceptance.
+
+### October 4 integrated-revision update
+
+At `c1dd1c1`, automatic Deploy `37213065932` passed normal installation and separate cleanup. The independently authorized RC-1 `37215116906`, attempt 1, genuinely cancelled its producer during propagation before staging. Staging/installation/public probes skipped; separate cleanup succeeded at 16:01:35 UTC. Two successful Azure reads prove exact owned-rule absence and unchanged four protected policies across all 14 fields. All eight application/broker container identities were preserved. This supersedes the cancellation-pending result for the repaired revision; it does not erase the failed historical test above or establish rollback of an already-running installer. Genuine scheduled run37218539817 at this revision also passed, with actual exact checkout/inventory/preservation markers and independent unchanged four-policy inventory. No owned orphan was present, so this is scheduled inventory/preservation proof. Use the linked current acceptance record.
