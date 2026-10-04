@@ -21,6 +21,7 @@ from math import ceil
 from os import cpu_count
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import structlog
 
@@ -89,29 +90,22 @@ def rank_results(
     *,
     objective: str = "sharpe",
 ) -> list[dict[str, Any]]:
-    """Sort results by objective metric descending.  Handle missing/error results.
+    """Rank usable training results, retaining input order for equal scores.
 
-    Ranking tiers (lower tier number = better):
-    0 — holdout-validated, completed, no error
-    1 — train-only, completed, no error
-    2 — pruned or incomplete
-    3 — errored
+    Reserved-period diagnostics never affect ranking, including their errors.
     """
 
     def sort_key(result: dict[str, Any]) -> tuple[int, float]:
-        if result.get("error") is not None or result.get("holdout_error") is not None:
+        metrics = result.get("train_metrics", result.get("metrics"))
+        value = extract_usable_objective_value(metrics, objective)
+        if result.get("error") is not None or value is None:
             return (3, float("-inf"))
 
         if bool(result.get("pruned")) or not bool(result.get("completed_full_run", True)):
-            metrics = result.get("metrics") or {}
-            value = extract_objective_value(metrics, objective)
             return (2, value)
-
-        metrics = result.get("metrics") or {}
-        value = extract_objective_value(metrics, objective)
-        selection_basis = str(result.get("selection_basis") or "train")
-        priority = 0 if selection_basis == "holdout" else 1
-        return (priority, value)
+        if result.get("selection_eligible") is False:
+            return (2, value)
+        return (0, value)
 
     return sorted(results, key=lambda r: (sort_key(r)[0], -sort_key(r)[1]))
 
@@ -186,6 +180,77 @@ def extract_objective_value(metrics: dict[str, Any], objective: str) -> float:
     return value
 
 
+def extract_usable_objective_value(metrics: dict[str, Any] | None, objective: str) -> float | None:
+    """Extract a finite objective without inventing evidence for missing metrics."""
+    if not metrics:
+        return None
+    canonical = _METRIC_KEY_MAP.get(objective, objective)
+    raw = metrics.get(canonical, metrics.get(objective))
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return -abs(value) if objective == "max_drawdown" else value
+
+
+def mark_training_selection(
+    result: dict[str, Any],
+    *,
+    objective: str,
+    min_trades: int | None,
+    require_positive_return: bool,
+) -> None:
+    """Record canonical full-training eligibility for selection and discovery."""
+    result["selection_basis"] = "train"
+    result.setdefault("train_metrics", result.get("metrics"))
+    value = extract_usable_objective_value(result.get("train_metrics"), objective)
+    result["objective_value"] = value if result.get("completed_full_run") else None
+    reason = None
+    if result.get("error") is not None:
+        reason = str(result["error"])
+        result["objective_value"] = None
+    elif result.get("pruned"):
+        reason = str(result.get("prune_reason") or "Pruned during training search")
+    elif value is None:
+        reason = f"Training objective {objective} is missing or nonfinite"
+    elif not result.get("completed_full_run"):
+        reason = "Full training evaluation did not complete"
+    elif not is_stage_eligible(
+        result=result,
+        stage_fraction=1.0,
+        min_trades=min_trades,
+        require_positive_return=require_positive_return,
+    ):
+        reason = build_prune_reason(
+            result=result,
+            stage_fraction=1.0,
+            min_trades=min_trades,
+            require_positive_return=require_positive_return,
+        )
+        result["pruned"] = True
+        result["prune_reason"] = reason
+    result["selection_eligible"] = reason is None
+    result["selection_reason"] = reason
+
+
+def selection_contract(
+    *, policy: str, trial_index_kind: str, selected_trial_index: int | None
+) -> dict[str, Any]:
+    """Describe the exploratory, training-only automatic selection."""
+    return {
+        "version": 1,
+        "basis": "train",
+        "scope": "exploratory",
+        "policy": policy,
+        "trial_index_kind": trial_index_kind,
+        "selected_trial_index": selected_trial_index,
+    }
+
+
 def resolve_search_strategy(
     *,
     requested_strategy: str,
@@ -223,6 +288,7 @@ def resolve_train_holdout_split(
     total_days = max(1, (end - start).days + 1)
 
     resolved_holdout_days = holdout_days
+    explicit = holdout_days is not None or holdout_fraction is not None
     if resolved_holdout_days is None and holdout_fraction is None and total_days >= 252:
         holdout_fraction = 0.2
     if resolved_holdout_days is None and holdout_fraction is not None:
@@ -230,16 +296,24 @@ def resolve_train_holdout_split(
     if resolved_holdout_days is None:
         return None
     if resolved_holdout_days + purge_days >= total_days:
+        if explicit:
+            raise ValueError(
+                "Requested holdout plus purge leaves no training range; reduce holdout/purge "
+                "or extend the date range"
+            )
         return None
 
     holdout_end = end
     holdout_start = end - timedelta(days=resolved_holdout_days - 1)
     train_end = holdout_start - timedelta(days=purge_days + 1)
-    if train_end <= start:
+    if train_end < start:
+        if explicit:
+            raise ValueError("Requested holdout plus purge leaves no training range")
         return None
     effective_fraction = resolved_holdout_days / total_days
     return {
         "enabled": True,
+        "origin": "explicit" if explicit else "automatic",
         "train_start": start_date,
         "train_end": train_end.isoformat(),
         "holdout_start": holdout_start.isoformat(),
@@ -321,11 +395,11 @@ def is_stage_eligible(
         return False
     metrics = result.get("metrics") or {}
     min_trade_threshold = scaled_min_trades(min_trades, stage_fraction)
-    num_trades = float(metrics.get("num_trades", 0.0))
-    total_return = float(metrics.get("total_return", 0.0))
-    if min_trade_threshold is not None and num_trades < min_trade_threshold:
+    num_trades = extract_usable_objective_value(metrics, "num_trades")
+    total_return = extract_usable_objective_value(metrics, "total_return")
+    if min_trade_threshold is not None and (num_trades is None or num_trades < min_trade_threshold):
         return False
-    return not (require_positive_return and total_return <= 0.0)
+    return not (require_positive_return and (total_return is None or total_return <= 0.0))
 
 
 def build_prune_reason(
@@ -340,15 +414,14 @@ def build_prune_reason(
         return str(result.get("error"))
     metrics = result.get("metrics") or {}
     min_trade_threshold = scaled_min_trades(min_trades, stage_fraction)
-    if (
-        min_trade_threshold is not None
-        and float(metrics.get("num_trades", 0.0)) < min_trade_threshold
-    ):
+    num_trades = extract_usable_objective_value(metrics, "num_trades")
+    total_return = extract_usable_objective_value(metrics, "total_return")
+    if min_trade_threshold is not None and (num_trades is None or num_trades < min_trade_threshold):
         return (
             f"Insufficient trades for stage budget "
             f"({metrics.get('num_trades', 0)} < {min_trade_threshold})"
         )
-    if require_positive_return and float(metrics.get("total_return", 0.0)) <= 0.0:
+    if require_positive_return and (total_return is None or total_return <= 0.0):
         return "Non-positive return during stage screening"
     return "Pruned during stage screening"
 
@@ -386,6 +459,8 @@ def to_jsonable(value: Any) -> Any:
         return {str(k): to_jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [to_jsonable(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     if isinstance(value, Decimal):
         return str(value)
     if isinstance(value, (datetime, date)):
@@ -439,21 +514,21 @@ def average_metric(results: list[dict[str, Any]], metric: str) -> float:
     count = 0
     for result in results:
         metrics = result.get("metrics") or {}
-        canonical = _METRIC_KEY_MAP.get(metric, metric)
-        if canonical not in metrics and metric not in metrics:
+        value = extract_usable_objective_value(metrics, metric)
+        if value is None:
             continue
-        total += float(metrics.get(canonical, metrics.get(metric, 0.0)))
+        total += value
         count += 1
     return total / count if count else 0.0
 
 
 def min_metric(results: list[dict[str, Any]], metric: str) -> float:
     """Find the minimum value of a metric across results."""
-    canonical = _METRIC_KEY_MAP.get(metric, metric)
     values = [
-        float((r.get("metrics") or {}).get(canonical, (r.get("metrics") or {}).get(metric, 0.0)))
+        value
         for r in results
         if r.get("error") is None
+        and (value := extract_usable_objective_value(r.get("metrics"), metric)) is not None
     ]
     return min(values) if values else 0.0
 
@@ -665,45 +740,26 @@ class ResearchEngine:
                 results[candidate_index]["completed_full_run"] = full_result.get("error") is None
                 results[candidate_index]["selection_basis"] = "train"
 
-        # Holdout evaluation
-        holdout_evaluated = 0
-        if split is not None:
-            holdout_candidates = [
-                i
-                for i in survivors
-                if results[i].get("error") is None and bool(results[i].get("completed_full_run"))
-            ]
-            if holdout_candidates:
-                if progress_callback is not None:
-                    progress_callback(
-                        {
-                            "progress": 90,
-                            "message": (
-                                f"Evaluating {len(holdout_candidates)} candidates on purged holdout"
-                            ),
-                            "completed_trials": len(holdout_candidates),
-                            "total_trials": len(results),
-                        }
-                    )
-                holdout_results = self._run_candidates(
-                    candidate_indexes=holdout_candidates,
-                    candidates=results,
-                    strategy_path=strategy_path,
-                    instruments=instruments,
-                    start_date=split["holdout_start"],
-                    end_date=split["holdout_end"],
-                    data_path=data_path,
-                )
-                holdout_evaluated = len(holdout_results)
-                for candidate_index, holdout_result in holdout_results:
-                    results[candidate_index]["holdout_metrics"] = holdout_result.get("metrics")
-                    results[candidate_index]["holdout_error"] = holdout_result.get("error")
-                    results[candidate_index]["selection_basis"] = "holdout"
-                    if holdout_result.get("error") is None:
-                        results[candidate_index]["metrics"] = holdout_result.get("metrics")
+        for result in results:
+            mark_training_selection(
+                result,
+                objective=objective,
+                min_trades=resolved_min_trades,
+                require_positive_return=require_positive_return,
+            )
 
-        # Rank and select best
+        # Freeze training ranking and winner before any diagnostic execution.
         ranked_results = rank_results(results, objective=objective)
+        best_result = self._select_best_result(ranked_results)
+        full_period_result = self._evaluate_selected_diagnostics(
+            best_result=best_result,
+            split=split,
+            strategy_path=strategy_path,
+            instruments=instruments,
+            start_date=start_date,
+            end_date=end_date,
+            data_path=data_path,
+        )
         if progress_callback is not None:
             progress_callback(
                 {
@@ -714,22 +770,13 @@ class ResearchEngine:
                 }
             )
 
-        best_result = self._select_best_result(ranked_results)
-
-        # Full-period run for the best result (when holdout was used)
-        full_period_result = None
-        if split is not None and best_result is not None:
-            full_period_result = self._run_one(
-                strategy_path=strategy_path,
-                config=dict(best_result["config"]),
-                instruments=instruments,
-                start_date=start_date,
-                end_date=end_date,
-                data_path=data_path,
-            )
-
         return {
             "mode": "parameter_sweep",
+            "selection": selection_contract(
+                policy="best_training",
+                trial_index_kind="sweep_result",
+                selected_trial_index=0 if best_result is not None else None,
+            ),
             "generated_at": datetime.now(UTC).isoformat(),
             "objective": objective,
             "strategy_path": strategy_path,
@@ -753,7 +800,7 @@ class ResearchEngine:
                     1 for r in ranked_results if bool(r.get("completed_full_run"))
                 ),
                 "pruned_runs": sum(1 for r in ranked_results if bool(r.get("pruned"))),
-                "holdout_evaluated_runs": holdout_evaluated,
+                "holdout_evaluated_runs": int(split is not None and best_result is not None),
                 "best_result": best_result,
                 "full_period_result": full_period_result,
             },
@@ -843,6 +890,8 @@ class ResearchEngine:
                 "test_start": window["test_start"].isoformat(),
                 "test_end": window["test_end"].isoformat(),
                 "train_results": train_report["results"],
+                "train_search": train_report["search"],
+                "train_full_period_result": train_report["summary"]["full_period_result"],
                 "best_train_result": best_train_result,
                 "test_result": None,
             }
@@ -878,6 +927,7 @@ class ResearchEngine:
 
         summary = {
             "mode": mode,
+            "best_result": payload_windows[-1]["best_train_result"] if payload_windows else None,
             "window_count": len(payload_windows),
             "successful_test_windows": len(out_of_sample_results),
             "avg_train_sharpe": average_metric(in_sample_results, "sharpe"),
@@ -900,6 +950,13 @@ class ResearchEngine:
 
         return {
             "mode": "walk_forward",
+            "selection": selection_contract(
+                policy="latest_window_training",
+                trial_index_kind="walk_forward_window",
+                selected_trial_index=(
+                    len(payload_windows) - 1 if summary["best_result"] is not None else None
+                ),
+            ),
             "generated_at": datetime.now(UTC).isoformat(),
             "objective": objective,
             "strategy_path": strategy_path,
@@ -932,6 +989,39 @@ class ResearchEngine:
         }
 
     # ----- private helpers -----
+
+    def _evaluate_selected_diagnostics(
+        self,
+        *,
+        best_result: dict[str, Any] | None,
+        split: dict[str, Any] | None,
+        strategy_path: str,
+        instruments: list[str],
+        start_date: str,
+        end_date: str,
+        data_path: Path,
+    ) -> dict[str, Any] | None:
+        """Evaluate only the frozen training choice; keep diagnostics separate."""
+        if split is None or best_result is None:
+            return None
+        holdout = self._run_one(
+            strategy_path=strategy_path,
+            config=dict(best_result["config"]),
+            instruments=instruments,
+            start_date=split["holdout_start"],
+            end_date=split["holdout_end"],
+            data_path=data_path,
+        )
+        best_result["holdout_metrics"] = holdout.get("metrics")
+        best_result["holdout_error"] = holdout.get("error")
+        return self._run_one(
+            strategy_path=strategy_path,
+            config=dict(best_result["config"]),
+            instruments=instruments,
+            start_date=start_date,
+            end_date=end_date,
+            data_path=data_path,
+        )
 
     def _run_one(
         self,
@@ -1104,6 +1194,8 @@ class ResearchEngine:
                 candidates[candidate_index]["metrics"] = result.get("metrics")
                 candidates[candidate_index]["error"] = result.get("error")
 
+                if extract_usable_objective_value(result.get("metrics"), objective) is None:
+                    continue
                 if is_stage_eligible(
                     result=result,
                     stage_fraction=stage_def["fraction"],
@@ -1197,7 +1289,7 @@ class ResearchEngine:
         from optuna.storages.journal import JournalFileBackend
         from optuna.trial import TrialState
 
-        study_name = resolve_optuna_study_name(
+        study_prefix = resolve_optuna_study_name(
             study_key=None,
             strategy_path=strategy_path,
             instruments=instruments,
@@ -1205,6 +1297,8 @@ class ResearchEngine:
             end_date=end_date,
             objective=objective,
         )
+        # Until immutable experiment identity exists, every invocation has isolated feedback.
+        study_name = f"{study_prefix}-train-v1-{uuid4().hex}"
         settings.optuna_root.mkdir(parents=True, exist_ok=True)
         storage_path = settings.optuna_root / f"{sanitize_study_name(study_name)}.journal"
 
@@ -1213,7 +1307,7 @@ class ResearchEngine:
             direction="maximize",
             sampler=TPESampler(),
             storage=JournalStorage(JournalFileBackend(str(storage_path))),
-            load_if_exists=True,
+            load_if_exists=False,
         )
 
         grid_limit = count_parameter_grid(parameter_grid)
@@ -1280,28 +1374,22 @@ class ResearchEngine:
                 "stage_results": [],
             }
 
-            # Holdout if applicable
-            if split is not None and train_result.get("error") is None:
-                holdout_result = self._run_one(
-                    strategy_path=strategy_path,
-                    config=candidate_config,
-                    instruments=instruments,
-                    start_date=split["holdout_start"],
-                    end_date=split["holdout_end"],
-                    data_path=data_path,
-                )
-                candidate["holdout_metrics"] = holdout_result.get("metrics")
-                candidate["holdout_error"] = holdout_result.get("error")
-                candidate["selection_basis"] = "holdout"
-                if holdout_result.get("error") is None:
-                    candidate["metrics"] = holdout_result.get("metrics")
+            mark_training_selection(
+                candidate,
+                objective=objective,
+                min_trades=min_trades,
+                require_positive_return=require_positive_return,
+            )
 
             # Report to Optuna
-            if candidate.get("error") is not None:
+            if candidate.get("pruned"):
+                study.tell(trial, state=TrialState.PRUNED)
+                history[cache_key] = {"state": "pruned", "value": None}
+            elif not candidate["selection_eligible"]:
                 study.tell(trial, state=TrialState.FAIL)
                 history[cache_key] = {"state": "fail", "value": None}
             else:
-                obj_val = extract_objective_value(candidate.get("metrics") or {}, objective)
+                obj_val = candidate["objective_value"]
                 study.tell(trial, obj_val)
                 history[cache_key] = {"state": "complete", "value": obj_val}
 
@@ -1311,16 +1399,15 @@ class ResearchEngine:
         ranked_results = rank_results(results, objective=objective)
         best_result = self._select_best_result(ranked_results)
 
-        full_period_result = None
-        if split is not None and best_result is not None:
-            full_period_result = self._run_one(
-                strategy_path=strategy_path,
-                config=dict(best_result["config"]),
-                instruments=instruments,
-                start_date=start_date,
-                end_date=end_date,
-                data_path=data_path,
-            )
+        full_period_result = self._evaluate_selected_diagnostics(
+            best_result=best_result,
+            split=split,
+            strategy_path=strategy_path,
+            instruments=instruments,
+            start_date=start_date,
+            end_date=end_date,
+            data_path=data_path,
+        )
 
         if progress_callback is not None:
             progress_callback(
@@ -1334,6 +1421,11 @@ class ResearchEngine:
 
         return {
             "mode": "parameter_sweep",
+            "selection": selection_contract(
+                policy="best_training",
+                trial_index_kind="sweep_result",
+                selected_trial_index=0 if best_result is not None else None,
+            ),
             "generated_at": datetime.now(UTC).isoformat(),
             "objective": objective,
             "strategy_path": strategy_path,
@@ -1359,9 +1451,7 @@ class ResearchEngine:
                     1 for r in ranked_results if bool(r.get("completed_full_run"))
                 ),
                 "pruned_runs": sum(1 for r in ranked_results if bool(r.get("pruned"))),
-                "holdout_evaluated_runs": sum(
-                    1 for r in ranked_results if r.get("holdout_metrics") is not None
-                ),
+                "holdout_evaluated_runs": int(split is not None and best_result is not None),
                 "best_result": best_result,
                 "full_period_result": full_period_result,
             },
@@ -1372,25 +1462,8 @@ class ResearchEngine:
     def _select_best_result(
         ranked_results: list[dict[str, Any]],
     ) -> dict[str, Any] | None:
-        """Pick the best result: prefer holdout-validated, then train-only."""
+        """Pick the first canonically eligible full-training result."""
         return next(
-            (
-                r
-                for r in ranked_results
-                if r.get("error") is None
-                and r.get("holdout_error") is None
-                and not bool(r.get("pruned"))
-                and bool(r.get("completed_full_run"))
-                and r.get("selection_basis") == "holdout"
-            ),
-            next(
-                (
-                    r
-                    for r in ranked_results
-                    if r.get("error") is None
-                    and not bool(r.get("pruned"))
-                    and bool(r.get("completed_full_run"))
-                ),
-                None,
-            ),
+            (r for r in ranked_results if r.get("selection_eligible") is True),
+            None,
         )

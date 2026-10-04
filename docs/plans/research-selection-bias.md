@@ -1,0 +1,77 @@
+# Repair research selection bias
+
+## Intent and immutable base
+
+The operator needs trustworthy research through API, CLI and an intuitive browser workflow, as the first milestone toward validated multi-account portfolios. This bounded repair removes held-out/test-driven automatic selection. It does not claim profitable alpha or complete independent validation. Base ref/SHA is `c1dd1c11301b55f6edc20d8751760cc5aa386fe5`, branch `fix/research-selection-bias`, isolated worktree `.worktrees/research-selection-bias`.
+
+## Reproduction and root cause
+
+The existing ownership map is `docs/audits/2026-10-03/next-research-scope.md`. Actual engine code preserves training metrics then overwrites `metrics` and `selection_basis` with holdout results before ranking (`services/research_engine.py:662–717`). Optuna sends this overwritten score to its sampler (`:1283–1305`). Worker finalization selects the walk-forward window with maximum test performance (`workers/research_job.py:375–390`). Changing only reserved-period values can therefore change the chosen configuration. The fallback may select a holdout-error row. Grid/Optuna also omit their declared minimum-trades/positive-return eligibility check. These are reachable selection defects, not claims about market performance.
+
+Reproduction must exercise actual ranking/sweep/finalization, while substituting only external backtest execution and database storage as necessary. Store exact commands and input/output counterexamples under `.forge/local/evidence/research-selection-bias/repro/`. Add owning regressions and observe RED before production edits.
+
+## Smallest coherent behavior
+
+1. All sweep modes rank/select on usable full-training metrics only. Apply declared minimum-trades and positive-return filters there. Failed, pruned, incomplete, missing/nonfinite-objective rows cannot win. Stable ties keep existing candidate order. Successive-halving stage pruning remains training-only.
+2. Freeze the eligible training winner before the optional holdout run. Evaluate that one configuration once on the reserved window. Store `holdout_metrics`/`holdout_error` separately, keep `metrics`/`train_metrics` training-based, and never reselect on diagnostic values or failure. Existing full-period replay is also diagnostic, not independent validation. No eligible winner means no holdout/full-period run.
+3. Optuna receives finite training objective values only. Mark training-filter rejections PRUNED and execution errors or missing/nonfinite objectives FAIL; never replace these with zero feedback. Use a fresh per-invocation study namespace, preserving the study name in the report, so old holdout-driven history and mutable-input cross-job reuse cannot influence new selection. This deliberately suspends automatic cross-job reuse until immutable experiment identity is implemented (M16), while keeping existing Optuna storage and worker queues. No new scheduler/storage framework.
+4. Walk-forward windows continue to choose their configurations using each training slice, then run their test slices. The report explicitly selects the latest chronological window's eligible training winner for onward discovery, even when its diagnostic test failed. No fallback to an earlier window when the latest training has no eligible result. Persist training metrics in job/trial selection records; retain test metrics/errors in the window report. Summary test aggregates remain diagnostic.
+5. New reports carry a small versioned server-produced selection contract (version 1, policy/basis, exploratory scope). API summary/detail expose the selection method, discovery eligibility and refusal reason derived from canonical persisted reports. Legacy jobs remain readable with unknown selection semantics; do not rewrite their records or infer the new contract.
+6. Research promotion creates a discovery candidate only. Require the new contract and a successful, complete, eligible training result with usable metrics. Explicit trial selection must resolve its canonical result, not rely on a trial status that can hide pruning or failure. For walk-forward, trial_index identifies a chronological window, not an optimizer trial within it. Earlier eligible windows may be explicitly chosen for exploratory discovery even if the latest window has no winner; identify this as manual selection and never label it the automatic latest-window choice. Reject legacy/failed/pruned/incomplete/null-metric choices with an actionable 409 rerun message. Holdout/test failure alone does not disqualify otherwise valid training discovery. Keep existing training metrics as flat top-level candidate.metrics keys for their current consumers; add only the provenance object under candidate.metrics.selection, never candidate.config. Render that provenance readably in the graduation detail view, separately from numerical metrics, and identify explicit-trial selection distinctly. This repairs only the research sweep/walk-forward portion of M01 and the named M02 eligibility defects. M01's portfolio out-of-sample allocation selection and broader M02 graduation-stage evidence gates remain open. It does not create a validation certificate or new post-discovery permission.
+7. UI calls the action “Create Discovery Candidate,” labels the selected training configuration/metrics, shows exploratory/legacy status and the server refusal reason, and displays diagnostic state and resolved dates separately (not requested, succeeded, failed, unavailable). Explicitly requested holdout plus purge that leaves no training range must fail with actionable validation rather than silently run without the requested split. Preserve the existing automatic 20% split for ranges of at least 252 days, disclose that it was automatically resolved, and expose its actual training/holdout dates, including within walk-forward training slices. Add minimal holdout-days/purge controls and an explanatory sentence to the existing form; preserve its layout. CLI commands already return API JSON; update help wording. Never present missing diagnostics as zero or execution completion as validation.
+
+## Changed paths / ownership
+
+Engine producer: `backend/src/msai/services/research_engine.py`, `backend/src/msai/workers/research_job.py`, owning unit tests for engine/worker. Interface producer: `backend/src/msai/schemas/research.py`, `backend/src/msai/api/research.py`, `backend/src/msai/cli.py`, owning research API/CLI tests, `frontend/src/lib/api.ts`, `frontend/src/components/research/launch-form.tsx`, `frontend/src/app/research/page.tsx`, `frontend/src/app/research/[id]/page.tsx`, `frontend/src/app/graduation/page.tsx`, focused existing browser specs if applicable. Coordinate the shared report contract before edits; do not revert other producers.
+
+Coordinator owns this plan, dated research/solution material, use cases, changelog, and factual reconciliation of Master Map/Plan/context/release runbook/startup assessment. That reconciliation records actual c1dd1c1 rollout, cancellation and genuine scheduled run37218539817 with independently unchanged four Azure policies; it does not borrow exact-c1 CI/deployment proof for this future revision. Preserve product goal, Azure identity, endpoints, vendor coverage and full real-browser rules. Keep other findings open.
+
+## Acceptance / focused checks
+
+- Counterfactual controls across grid, successive halving and Optuna: changing reserved metrics or producing reserved errors cannot change training ranking, winner or optimizer feedback. Only the frozen winner is evaluated. Include tied scores, training failure, missing/nonfinite metrics, eligibility rejection and all-ineligible inputs.
+- Actual Optuna isolated temporary storage proves training feedback and fresh study separation; no fabricated sampler proof from only a mock tell assertion. Old study identity/history cannot be loaded into a new run.
+- Real worker finalization proves two windows with opposing train/test scores retain the latest training config; test perturbation/failure cannot change it; missing latest training produces no automatic winner while explicit earlier eligible-window discovery remains possible. Persisted trial status describes training eligibility; diagnostic test failure is separately reported and cannot turn a valid training trial into a failed selection record.
+- Research API checks new-contract discovery, explicit valid/nonwinning trial choice, legacy refusal and failed/pruned/incomplete/missing evidence refusal. Job read responses and CLI JSON agree. No migration required.
+- Run owning engine/worker/API suites, focused lint/types and frontend checks; broad unrelated regression belongs to CI. Record environmental limits without upgrading them to passing evidence.
+- Preliminary and final real API→CLI→computer-use browser journeys below, against final candidate sources, real existing data and PostgreSQL. No mocked API response qualifies.
+
+## Surface coverage decision and user journeys
+
+All three exposed capability surfaces are covered. API, CLI and UI are each required; no exclusion based on unchanged implementation paths. Scope: guarded local equity/minute research, existing licensed AAPL data and `example.ema_cross`; no downloads or broker calls/orders. Check actual source mounts and named disabled broker/vendor guards before restarting only quiet application services. The stable source override currently targets primary and must not be reused unchanged to claim candidate testing.
+
+### UC-RSB-API — exploratory sweep and honest discovery
+
+- Actor: Research operator submitting a small strategy experiment through the public API.
+- Scenario: Existing AAPL data and a registered EMA strategy are available; the operator wants a training-selected configuration and a separately visible reserved-period diagnostic before storing it for further research.
+- Intent: Run an experiment, understand how its choice was made, and retain a discovery candidate without mistaking it for validated alpha.
+- Interface: API.
+- Setup: Authenticate using the configured supported development key; refresh available strategy, canonical instrument/config and bar-window via public GETs. Reuse the previously working research job4f39f4ff-3c54-44e1-a190-b0123feba503 as an input reference, not proof for the new run. No raw DB/queue/Parquet arrange.
+- Steps: POST a two-choice grid (fast EMA5/10, slow20, one-share size) over existing January22–25,2025 data with holdout_days2/purge0; poll job progress; inspect detail and trials; create a discovery candidate. Explicitly promote a different eligible trial using trial_index and inspect its manual-selection provenance. POST one bounded walk-forward experiment over the same available data with small training/test windows and purge0; inspect the latest training choice and separate test results, then create discovery or inspect its concrete refusal. Request legacy-job promotion and a failed/ineligible result through the supported route to observe refusal.
+- Verification: Responses include training selection and distinct diagnostic metrics/state/dates; candidates are discovery with training metrics and automatic/manual provenance. Walk-forward retains the latest training winner and reports test failure independently. If a real empty/failing latest test cannot be induced through supported inputs, retain an explicit limitation and prove that failure control in the owning finalizer regression; the successful real walk-forward journey is still mandatory. Refusal explains rerun/eligibility. Counterfactual numerical invariants are proved separately by owning tests, not inferred from this market example.
+- Persistence: Re-request job/candidate and list history; identity/config/selection/diagnostic/refusal remain consistent.
+
+### UC-RSB-CLI — research and rerun guidance
+
+- Actor: Research operator driving the same small experiment from the CLI.
+- Scenario: The operator needs to submit and revisit a research run from a shell with the same meanings as the dashboard.
+- Intent: Complete a research-to-discovery workflow and understand a legacy refusal without infrastructure knowledge.
+- Interface: CLI.
+- Setup: Intended local API URL and configured supported API key; same refreshed public input reference, no secret output.
+- Steps: Submit via `research sweep --config @payload.json`; use list/show until terminal; create discovery using research promote; explicitly choose a different eligible trial using --trial-index. Submit a bounded walk-forward run via the existing walk-forward command, inspect its latest training selection and diagnostic tests, and create discovery or observe an evidence-based refusal. Invoke legacy promotion.
+- Verification: stdout includes training selection contract and separately labeled diagnostic evidence for both sweep and walk-forward; discovery identities and explicit-trial provenance agree with API detail; refusal explains why a rerun is needed rather than exposing a stack trace or secret. A real failing latest test is desirable but not inferred if only the owning regression exercised it.
+- Persistence: A separate show/list invocation retains the same experiment/config and candidate observations.
+
+### UC-RSB-UI — understandable research outcome and recovery
+
+- Actor: Research operator using the real local browser dashboard.
+- Scenario: The operator wants to launch the small experiment, follow progress and retain an exploratory choice, then revisit it later.
+- Intent: Complete research and see clearly what is selected, tested and still unvalidated.
+- Interface: UI.
+- Setup: Running candidate-mounted guarded app with supported development authentication; refresh real inputs via public interfaces. No response interception/mocks.
+- Steps: Launch a grid through the form with bounded parameters, holdout_days2 and purge0; follow progress; open result; inspect separate training/diagnostic sections; create Discovery Candidate; navigate to its graduation view. Switch the form to walk-forward, launch a bounded run, inspect the latest training choice and separate test diagnostics, then create discovery or inspect its refusal. Open a legacy job and inspect rerun explanation. Submit a deliberately invalid strategy configuration, observe persisted failure/no eligible winner, correct it and launch a successful run. Confirm an invalid explicit holdout/purge combination is refused clearly.
+- Verification: Plain wording, resolved dates and diagnostic status are readable; discovery creation and refusal reflect API eligibility; operator can identify the next action. Capture real computer-use evidence and appropriate loading/error/legacy states.
+- Persistence: Reload research/candidate views; selection/evidence/candidate stage and failure state persist against real backend responses.
+
+## Limits and next milestone slice
+
+This closes the named research sweep/walk-forward automatic selection leaks only when final-revision evidence passes. Portfolio out-of-sample allocation selection remains open under M01, alongside data completeness/session semantics, asset/interval/cost correctness, immutable strategy/data bundles, final-test one-time/reuse controls, portfolio weighting and central graduation gates in the Master Map. The short real-data journey establishes plumbing/interpretation, not market validity, generalization or alpha. No new commit/push/PR/merge/deployment/trading action is authorized by this plan alone.

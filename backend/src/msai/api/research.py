@@ -7,6 +7,7 @@ listing / polling job status, and promoting the best result to a
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Any
 from uuid import UUID  # noqa: TC003 — FastAPI resolves path param types at runtime
 
@@ -83,7 +84,7 @@ async def submit_parameter_sweep(
         job_id=str(job.id),
         strategy_id=str(body.strategy_id),
     )
-    return ResearchJobResponse.model_validate(job)
+    return _job_response(job)
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +134,7 @@ async def submit_walk_forward(
         job_id=str(job.id),
         strategy_id=str(body.strategy_id),
     )
-    return ResearchJobResponse.model_validate(job)
+    return _job_response(job)
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +160,7 @@ async def list_research_jobs(
     jobs = result.scalars().all()
 
     return ResearchJobListResponse(
-        items=[ResearchJobResponse.model_validate(j) for j in jobs],
+        items=[_job_response(j) for j in jobs],
         total=total,
     )
 
@@ -191,7 +192,7 @@ async def get_research_job(
     trials = trials_result.scalars().all()
 
     return ResearchJobDetailResponse(
-        **ResearchJobResponse.model_validate(job).model_dump(),
+        **_job_response(job).model_dump(),
         config=job.config,
         results=job.results,
         trials=[ResearchTrialResponse.model_validate(t) for t in trials],
@@ -223,7 +224,7 @@ async def cancel_research_job(
         )
 
     if job.status in {"completed", "failed", "cancelled"}:
-        return ResearchJobResponse.model_validate(job)
+        return _job_response(job)
 
     if job.status == "pending":
         job.status = "cancelled"
@@ -235,7 +236,7 @@ async def cancel_research_job(
 
     await db.commit()
     await db.refresh(job)
-    return ResearchJobResponse.model_validate(job)
+    return _job_response(job)
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +254,7 @@ async def promote_research_result(
     claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> ResearchPromotionResponse:
-    """Promote the best result from a completed research job to a graduation candidate."""
+    """Create an exploratory discovery candidate from eligible training evidence."""
     job = await db.get(ResearchJob, body.research_job_id)
     if job is None:
         raise HTTPException(
@@ -261,36 +262,15 @@ async def promote_research_result(
             detail=f"Research job {body.research_job_id} not found",
         )
 
-    if job.status != "completed":
+    try:
+        result, provenance = _resolve_training_selection(job, body.trial_index)
+    except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Research job is {job.status}, not completed — cannot promote",
-        )
-
-    if job.best_config is None or job.best_metrics is None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Research job has no best result to promote",
-        )
-
-    # Select specific trial if requested
-    config = dict(job.best_config)
-    metrics = dict(job.best_metrics)
-    if body.trial_index is not None:
-        trial_result = await db.execute(
-            select(ResearchTrial).where(
-                ResearchTrial.research_job_id == body.research_job_id,
-                ResearchTrial.trial_number == body.trial_index,
-            )
-        )
-        trial = trial_result.scalar_one_or_none()
-        if trial is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Trial {body.trial_index} not found in job {body.research_job_id}",
-            )
-        config = dict(trial.config)
-        metrics = dict(trial.metrics) if trial.metrics else {}
+            detail=str(exc),
+        ) from exc
+    config = dict(result["config"])
+    metrics = {**result["train_metrics"], "selection": provenance}
 
     # Bug #3 (live-deploy-safety-trio): stamp instruments into the
     # candidate's config so the snapshot-binding verifier at
@@ -327,13 +307,135 @@ async def promote_research_result(
     return ResearchPromotionResponse(
         candidate_id=candidate.id,
         stage=candidate.stage,
-        message=f"Promoted to graduation candidate (stage: {candidate.stage})",
+        message=(
+            "Created exploratory discovery candidate from training evidence; not validated alpha"
+        ),
     )
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _selection_contract(job: ResearchJob) -> dict[str, Any] | None:
+    """Read only the exact new contract; legacy semantics remain unknown."""
+    report = job.results if isinstance(job.results, dict) else {}
+    selection = report.get("selection")
+    if not isinstance(selection, dict):
+        return None
+    policy, index_kind = (
+        ("latest_window_training", "walk_forward_window")
+        if job.job_type == "walk_forward"
+        else ("best_training", "sweep_result")
+    )
+    if (
+        type(selection.get("version")) is not int
+        or selection["version"] != 1
+        or selection.get("basis") != "train"
+        or selection.get("scope") != "exploratory"
+        or selection.get("policy") != policy
+        or selection.get("trial_index_kind") != index_kind
+        or "selected_trial_index" not in selection
+    ):
+        return None
+    index = selection["selected_trial_index"]
+    if index is not None and (type(index) is not int or index < 0):
+        return None
+    return dict(selection)
+
+
+def _finite_number(value: Any) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _resolve_training_selection(
+    job: ResearchJob,
+    trial_index: int | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Resolve canonical report evidence before automatic or explicit discovery."""
+    rerun = " Rerun research with valid training inputs to create a discovery candidate."
+    if job.status != "completed":
+        raise ValueError(f"Research job is {job.status}; execution must complete." + rerun)
+    selection = _selection_contract(job)
+    if selection is None:
+        raise ValueError(
+            "Legacy or unknown selection evidence cannot establish training eligibility." + rerun
+        )
+    report = job.results if isinstance(job.results, dict) else {}
+    index = trial_index if trial_index is not None else selection["selected_trial_index"]
+    if index is None:
+        raise ValueError("No eligible automatic training result is available." + rerun)
+    windows = report.get("windows", []) if job.job_type == "walk_forward" else []
+    rows = windows if job.job_type == "walk_forward" else report.get("results", [])
+    if not isinstance(rows, list) or index >= len(rows) or not isinstance(rows[index], dict):
+        raise ValueError(f"Trial index {index} has no canonical training result." + rerun)
+    if job.job_type == "walk_forward" and trial_index is None and index != len(rows) - 1:
+        raise ValueError(
+            "Automatic discovery requires the latest chronological training window." + rerun
+        )
+    window = rows[index] if job.job_type == "walk_forward" else None
+    result = window.get("best_train_result") if window is not None else rows[index]
+    if not isinstance(result, dict):
+        raise ValueError(f"Trial index {index} has no eligible training winner." + rerun)
+    metrics = result.get("train_metrics")
+    objective = report.get("objective", job.config.get("objective", "sharpe"))
+    metric_key = {"sharpe": "sharpe_ratio", "sortino": "sortino_ratio"}.get(objective, objective)
+    if (
+        result.get("selection_eligible") is not True
+        or result.get("error") is not None
+        or result.get("pruned")
+        or result.get("completed_full_run") is not True
+        or not isinstance(result.get("config"), dict)
+        or not isinstance(metrics, dict)
+        or not metrics
+        or not _finite_number(result.get("objective_value"))
+        or not _finite_number(metrics.get(metric_key, metrics.get(objective)))
+    ):
+        reason = result.get("selection_reason") or (
+            "Training result is failed, pruned, incomplete or has unusable metrics."
+        )
+        raise ValueError(str(reason) + rerun)
+    split = report.get("search", {}).get("holdout") or {}
+    if window is not None:
+        split = window.get("train_search", {}).get("holdout") or {}
+    provenance = {
+        **selection,
+        "research_job_id": str(job.id),
+        "policy": selection["policy"] if trial_index is None else "explicit_trial",
+        "selected_trial_index": index,
+        "train_start": split.get("train_start")
+        or result.get("start_date")
+        or (window or {}).get("train_start")
+        or report.get("start_date"),
+        "train_end": split.get("train_end")
+        or result.get("end_date")
+        or (window or {}).get("train_end")
+        or report.get("end_date"),
+    }
+    return result, provenance
+
+
+def _job_response(job: ResearchJob) -> ResearchJobResponse:
+    """Expose canonical selection and the automatic discovery decision on all reads."""
+    response = ResearchJobResponse.model_validate(job)
+    reason = None
+    try:
+        _resolve_training_selection(job)
+    except ValueError as exc:
+        reason = str(exc)
+    return response.model_copy(
+        update={
+            "selection": _selection_contract(job),
+            "discovery_eligible": reason is None,
+            "discovery_refusal_reason": reason,
+        }
+    )
 
 
 async def _resolve_strategy(db: AsyncSession, strategy_id: UUID) -> Strategy:

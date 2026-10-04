@@ -26,12 +26,43 @@ import { useAuth } from "@/lib/auth";
 import {
   apiGet,
   apiPost,
+  ApiError,
   describeApiError,
   type StrategyListResponse,
   type StrategyResponse,
 } from "@/lib/api";
 
 type ResearchMode = "parameter_sweep" | "walk_forward";
+
+function describeResearchSubmissionError(error: unknown): string {
+  if (!(error instanceof ApiError) || error.status !== 422) {
+    return describeApiError(error, "Failed to launch research");
+  }
+  const fallback = "Research inputs are invalid. Check the dates, holdout and purge settings, and try again.";
+  const detail = error.body !== null && typeof error.body === "object" && "detail" in error.body
+    ? error.body.detail : null;
+  if (typeof detail === "string" && detail.trim()) return detail;
+  if (!Array.isArray(detail)) return fallback;
+
+  const fieldLabels: Record<string, string> = {
+    strategy_id: "Strategy", instruments: "Instruments", asset_class: "Asset Class",
+    start_date: "Start Date", end_date: "End Date", objective: "Objective",
+    base_config: "Base Config", parameter_grid: "Parameter Grid",
+    holdout_days: "Holdout Days", holdout_fraction: "Holdout Fraction", purge_days: "Purge Days",
+    train_days: "Train Days", test_days: "Test Days", step_days: "Step Days",
+  };
+  const messages = detail.flatMap((entry: unknown): string[] => {
+    if (entry === null || typeof entry !== "object" || !("msg" in entry) || typeof entry.msg !== "string") {
+      return [];
+    }
+    const message = entry.msg.trim().replace(/^Value error,\s*/u, "");
+    if (!message) return [];
+    const field = "loc" in entry && Array.isArray(entry.loc) ? entry.loc[1] : null;
+    const label = typeof field === "string" ? fieldLabels[field] : undefined;
+    return [label ? `${label}: ${message}` : message];
+  });
+  return messages.length > 0 ? messages.join(" ") : fallback;
+}
 
 interface LaunchResearchFormProps {
   open: boolean;
@@ -56,6 +87,8 @@ export function LaunchResearchForm({
   const [objective, setObjective] = useState<string>("sharpe");
   const [baseConfig, setBaseConfig] = useState<string>("{}");
   const [paramGrid, setParamGrid] = useState<string>("{}");
+  const [holdoutDays, setHoldoutDays] = useState<string>("");
+  const [purgeDays, setPurgeDays] = useState<string>("5");
   // Walk-forward fields
   const [trainDays, setTrainDays] = useState<string>("252");
   const [testDays, setTestDays] = useState<string>("63");
@@ -121,6 +154,8 @@ export function LaunchResearchForm({
         objective,
         base_config: parsedBaseConfig,
         parameter_grid: parsedParamGrid,
+        holdout_days: holdoutDays.trim() ? Number(holdoutDays) : null,
+        purge_days: Number(purgeDays),
       };
 
       if (mode === "walk_forward") {
@@ -135,13 +170,10 @@ export function LaunchResearchForm({
       onSubmitted?.();
       onOpenChange(false);
     } catch (err) {
-      // iter-3 describeApiError sweep. SyntaxError is local JSON.parse —
-      // keep its specific message; ApiError flows through describeApiError
-      // to surface the backend's HTTPException detail.
       if (err instanceof SyntaxError) {
         setError("Configuration or parameter grid JSON is invalid");
       } else {
-        setError(describeApiError(err, "Failed to launch research"));
+        setError(describeResearchSubmissionError(err));
       }
     } finally {
       setSubmitting(false);
@@ -156,7 +188,7 @@ export function LaunchResearchForm({
           Launch Research
         </Button>
       </DialogTrigger>
-      <DialogContent className="max-w-lg max-h-[85vh] overflow-y-auto">
+      <DialogContent className="grid-cols-1 max-w-lg max-h-[85vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Launch Research Job</DialogTitle>
           <DialogDescription>
@@ -166,13 +198,13 @@ export function LaunchResearchForm({
         <div className="space-y-4 py-2">
           {/* Strategy */}
           <div className="space-y-2">
-            <Label>Strategy</Label>
+            <Label htmlFor="research-strategy">Strategy</Label>
             <Select
               value={selectedStrategy}
               onValueChange={setSelectedStrategy}
               disabled={strategiesLoading || strategies.length === 0}
             >
-              <SelectTrigger>
+              <SelectTrigger id="research-strategy">
                 <SelectValue
                   placeholder={
                     strategiesLoading
@@ -220,8 +252,9 @@ export function LaunchResearchForm({
 
           {/* Instruments */}
           <div className="space-y-2">
-            <Label>Instruments</Label>
+            <Label htmlFor="research-instruments">Instruments</Label>
             <Input
+              id="research-instruments"
               value={instruments}
               onChange={(e) => setInstruments(e.target.value)}
               placeholder="AAPL, MSFT, SPY"
@@ -230,9 +263,9 @@ export function LaunchResearchForm({
 
           {/* Asset Class */}
           <div className="space-y-2">
-            <Label>Asset Class</Label>
+            <Label htmlFor="research-asset-class">Asset Class</Label>
             <Select value={assetClass} onValueChange={setAssetClass}>
-              <SelectTrigger>
+              <SelectTrigger id="research-asset-class">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -246,16 +279,18 @@ export function LaunchResearchForm({
           {/* Date range */}
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-2">
-              <Label>Start Date</Label>
+              <Label htmlFor="research-start">Start Date</Label>
               <Input
+                id="research-start"
                 type="date"
                 value={startDate}
                 onChange={(e) => setStartDate(e.target.value)}
               />
             </div>
             <div className="space-y-2">
-              <Label>End Date</Label>
+              <Label htmlFor="research-end">End Date</Label>
               <Input
+                id="research-end"
                 type="date"
                 value={endDate}
                 onChange={(e) => setEndDate(e.target.value)}
@@ -263,11 +298,32 @@ export function LaunchResearchForm({
             </div>
           </div>
 
+          <div className="space-y-2">
+            <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-2">
+                <Label htmlFor="research-holdout">Holdout Days (optional)</Label>
+                <Input id="research-holdout" type="number" min="1" value={holdoutDays}
+                  onChange={(e) => setHoldoutDays(e.target.value)} placeholder="Automatic" />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="research-purge">Purge Days</Label>
+                <Input id="research-purge" type="number" min="0" value={purgeDays}
+                  onChange={(e) => setPurgeDays(e.target.value)} />
+              </div>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Selection uses training only. Holdout is a separate diagnostic, with purge days
+              between periods. Blank uses an automatic 20% holdout for training ranges of at
+              least 252 days; shorter ranges have none. Walk-forward applies this within each
+              training slice. For a four-day sweep, use holdout 2 and purge 0.
+            </p>
+          </div>
+
           {/* Objective */}
           <div className="space-y-2">
-            <Label>Objective</Label>
+            <Label htmlFor="research-objective">Objective</Label>
             <Select value={objective} onValueChange={setObjective}>
-              <SelectTrigger>
+              <SelectTrigger id="research-objective">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -280,8 +336,9 @@ export function LaunchResearchForm({
 
           {/* Base Config */}
           <div className="space-y-2">
-            <Label>Base Config (JSON)</Label>
+            <Label htmlFor="research-base-config">Base Config (JSON)</Label>
             <Textarea
+              id="research-base-config"
               value={baseConfig}
               onChange={(e) => setBaseConfig(e.target.value)}
               className="h-20 font-mono text-sm"
@@ -291,8 +348,9 @@ export function LaunchResearchForm({
 
           {/* Parameter Grid */}
           <div className="space-y-2">
-            <Label>Parameter Grid (JSON)</Label>
+            <Label htmlFor="research-parameter-grid">Parameter Grid (JSON)</Label>
             <Textarea
+              id="research-parameter-grid"
               value={paramGrid}
               onChange={(e) => setParamGrid(e.target.value)}
               className="h-20 font-mono text-sm"
@@ -308,8 +366,9 @@ export function LaunchResearchForm({
               </p>
               <div className="grid grid-cols-3 gap-3">
                 <div className="space-y-2">
-                  <Label>Train Days</Label>
+                  <Label htmlFor="research-train-days">Train Days</Label>
                   <Input
+                    id="research-train-days"
                     type="number"
                     value={trainDays}
                     onChange={(e) => setTrainDays(e.target.value)}
@@ -317,8 +376,9 @@ export function LaunchResearchForm({
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label>Test Days</Label>
+                  <Label htmlFor="research-test-days">Test Days</Label>
                   <Input
+                    id="research-test-days"
                     type="number"
                     value={testDays}
                     onChange={(e) => setTestDays(e.target.value)}
@@ -326,8 +386,9 @@ export function LaunchResearchForm({
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label>Step Days</Label>
+                  <Label htmlFor="research-step-days">Step Days</Label>
                   <Input
+                    id="research-step-days"
                     type="number"
                     value={stepDays}
                     onChange={(e) => setStepDays(e.target.value)}
@@ -339,7 +400,7 @@ export function LaunchResearchForm({
           )}
 
           {error && (
-            <div className="rounded-md border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-400">
+            <div role="alert" className="min-w-0 break-words rounded-md border border-red-500/30 bg-red-500/10 p-2 text-sm text-red-400">
               {error}
             </div>
           )}

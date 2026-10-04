@@ -56,7 +56,7 @@ function truncateJson(obj: Record<string, unknown>, maxLen: number): string {
 
 function metricsSnippet(metrics: Record<string, unknown> | null): string {
   if (!metrics) return "--";
-  const keys = Object.keys(metrics).slice(0, 3);
+  const keys = Object.keys(metrics).filter((key) => typeof metrics[key] === "number").slice(0, 3);
   return keys
     .map((k) => {
       const v = metrics[k];
@@ -64,6 +64,84 @@ function metricsSnippet(metrics: Record<string, unknown> | null): string {
       return `${k}: ${formatted}`;
     })
     .join(", ");
+}
+
+function record(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown> : {};
+}
+
+function dateLabel(value: unknown): string {
+  return typeof value === "string" ? value : "Unavailable";
+}
+
+function Diagnostic({ title, metrics, error, requested, start, end }: {
+  title: string; metrics: unknown; error: unknown; requested: boolean;
+  start: unknown; end: unknown;
+}): React.ReactElement {
+  const data = record(metrics);
+  const state = !requested ? "Not requested" : error ? "Failed"
+    : Object.keys(data).length > 0 ? "Succeeded" : "Unavailable";
+  return (
+    <div className="space-y-2 rounded-md border border-border/50 bg-muted/30 p-3">
+      <p className="text-sm font-medium">{title} · {state}</p>
+      {requested && <p className="text-xs text-muted-foreground">{dateLabel(start)} to {dateLabel(end)}</p>}
+      {state === "Failed" && <p className="text-sm text-red-400">{String(error)}</p>}
+      {state === "Succeeded" && <pre className="overflow-auto text-xs text-muted-foreground">{JSON.stringify(data, null, 2)}</pre>}
+    </div>
+  );
+}
+
+function ResearchDiagnostics({ job }: { job: ResearchJobDetailResponse }): React.ReactElement {
+  const report = record(job.results);
+  if (Object.keys(report).length === 0) {
+    return <Card className="border-border/50">
+      <CardHeader><CardTitle className="text-base">Separate Diagnostics</CardTitle></CardHeader>
+      <CardContent><p className="text-sm text-muted-foreground">Diagnostics unavailable until a report is persisted.</p></CardContent>
+    </Card>;
+  }
+  const summary = record(report.summary);
+  const windows = Array.isArray(report.windows) ? report.windows : [];
+  const sweep = (searchValue: unknown, resultValue: unknown, replayValue: unknown,
+    start: unknown, end: unknown): React.ReactElement => {
+    const search = record(searchValue);
+    const split = record(search.holdout);
+    const result = record(resultValue);
+    const replay = record(replayValue);
+    const hasSplit = Object.keys(split).length > 0;
+    return <div className="space-y-3">
+      <p className="text-xs text-muted-foreground">
+        Training: {dateLabel(split.train_start ?? start)} to {dateLabel(split.train_end ?? end)}.
+        {hasSplit ? ` Holdout split ${split.origin === "automatic" ? "automatically resolved" : "explicitly requested"}; purge ${String(split.purge_days ?? "unavailable")} days.` : " No holdout split requested or automatically resolved."}
+      </p>
+      <div className="grid gap-3 md:grid-cols-2">
+        <Diagnostic title="Holdout diagnostic" metrics={result.holdout_metrics} error={result.holdout_error}
+          requested={hasSplit} start={split.holdout_start} end={split.holdout_end} />
+        <Diagnostic title="Full-period replay diagnostic" metrics={replay.metrics} error={replay.error}
+          requested={hasSplit} start={start} end={end} />
+      </div>
+    </div>;
+  };
+  return <Card className="border-border/50">
+    <CardHeader>
+      <CardTitle className="text-base">Separate Diagnostics</CardTitle>
+      <CardDescription>Holdout, test and full-period replay do not select the training configuration or certify alpha.</CardDescription>
+    </CardHeader>
+    <CardContent className="space-y-4">
+      {job.job_type === "walk_forward" ? windows.length === 0
+        ? <p className="text-sm text-muted-foreground">Window diagnostics unavailable.</p>
+        : windows.map((value, index) => {
+          const window = record(value);
+          const test = record(window.test_result);
+          return <div key={index} className="space-y-3 rounded-md border border-border/50 p-3">
+            <p className="text-sm font-medium">Window {index} {index === windows.length - 1 ? "· Latest training window" : ""}</p>
+            {sweep(window.train_search, window.best_train_result, window.train_full_period_result, window.train_start, window.train_end)}
+            <Diagnostic title="Test diagnostic" metrics={test.metrics} error={test.error}
+              requested start={window.test_start} end={window.test_end} />
+          </div>;
+        }) : sweep(report.search, summary.best_result, summary.full_period_result, report.start_date ?? job.config.start_date, report.end_date ?? job.config.end_date)}
+    </CardContent>
+  </Card>;
 }
 
 export default function ResearchDetailPage({
@@ -132,7 +210,7 @@ export default function ResearchDetailPage({
     };
   }, [job?.status, load]);
 
-  const handlePromote = async (): Promise<void> => {
+  const handlePromote = async (trialIndex?: number): Promise<void> => {
     if (!job) return;
     setPromoting(true);
     setError(null);
@@ -140,7 +218,7 @@ export default function ResearchDetailPage({
       const token = await getToken();
       const result = await apiPost<ResearchPromotionResponse>(
         "/api/v1/research/promotions",
-        { research_job_id: job.id },
+        { research_job_id: job.id, ...(trialIndex !== undefined ? { trial_index: trialIndex } : {}) },
         token,
       );
       setPromotionResult(result);
@@ -148,7 +226,7 @@ export default function ResearchDetailPage({
       // iter-3 describeApiError sweep: 409/422 from /api/v1/research/
       // promotions carries the reason ("candidate not optimisation-
       // eligible") in detail; raw status code throws that away.
-      setError(describeApiError(err, "Promotion failed"));
+      setError(describeApiError(err, "Discovery candidate creation failed"));
     } finally {
       setPromoting(false);
     }
@@ -225,14 +303,33 @@ export default function ResearchDetailPage({
             <Button
               className="gap-1.5"
               onClick={() => void handlePromote()}
-              disabled={promoting}
+              disabled={promoting || !job.discovery_eligible}
+              data-testid="research-create-discovery"
             >
               <Trophy className="size-3.5" />
-              {promoting ? "Promoting..." : "Promote Best Config"}
+              {promoting ? "Creating..." : "Create Discovery Candidate"}
             </Button>
           )}
         </div>
       </div>
+
+      <Card className="border-border/50" data-testid="research-selection">
+        <CardHeader>
+          <CardTitle className="text-base">{job.selection ? "Training Selection · Exploratory" : job.status === "pending" || job.status === "running" ? "Training Selection Pending" : "Unknown Selection · Legacy"}</CardTitle>
+          <CardDescription>
+            {job.selection ? (job.selection.policy === "latest_window_training"
+              ? "Automatic choice uses the latest chronological window's eligible training result."
+              : "Automatic choice uses the best eligible training result.")
+              : job.status === "pending" || job.status === "running" ? "Training selection will be available after execution."
+              : "This job has no versioned training-selection evidence. Rerun research before creating a discovery candidate."}
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-2 text-sm text-muted-foreground">
+          <p>Completed execution does not establish validated alpha. Discovery retains a configuration for further research.</p>
+          {job.selection?.selected_trial_index != null && <p>Selected {job.selection.trial_index_kind === "walk_forward_window" ? "window" : "trial"} index: {job.selection.selected_trial_index} (zero-based).</p>}
+          {job.discovery_refusal_reason && <p data-testid="research-discovery-refusal">{job.discovery_refusal_reason}</p>}
+        </CardContent>
+      </Card>
 
       {/* Progress bar for running jobs */}
       {job.status === "running" && (
@@ -299,15 +396,15 @@ export default function ResearchDetailPage({
       {job.best_config && (
         <Card className="border-border/50">
           <CardHeader>
-            <CardTitle className="text-base">Best Result</CardTitle>
+              <CardTitle className="text-base">{job.selection ? "Selected Training Result" : "Legacy Result · Selection Unknown"}</CardTitle>
             <CardDescription>
-              Optimal configuration found by the optimiser
+              {job.selection ? "Configuration selected using training evidence for exploratory discovery" : "Historical configuration; selection evidence is unknown"}
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <div>
               <p className="mb-1 text-xs font-medium text-muted-foreground">
-                Best Config
+                {job.selection ? "Selected Training Config" : "Legacy Config"}
               </p>
               <pre className="overflow-x-auto rounded-md bg-muted/50 p-3 text-xs font-mono text-muted-foreground">
                 {JSON.stringify(job.best_config, null, 2)}
@@ -316,7 +413,7 @@ export default function ResearchDetailPage({
             {job.best_metrics && (
               <div>
                 <p className="mb-1 text-xs font-medium text-muted-foreground">
-                  Best Metrics
+                  {job.selection ? "Training Metrics" : "Legacy Metrics · Basis Unknown"}
                 </p>
                 <pre className="overflow-x-auto rounded-md bg-muted/50 p-3 text-xs font-mono text-muted-foreground">
                   {JSON.stringify(job.best_metrics, null, 2)}
@@ -327,6 +424,8 @@ export default function ResearchDetailPage({
         </Card>
       )}
 
+      <ResearchDiagnostics job={job} />
+
       {/* Trials table */}
       {job.trials.length > 0 && (
         <Card className="border-border/50">
@@ -334,7 +433,7 @@ export default function ResearchDetailPage({
             <CardTitle className="text-base">Trials</CardTitle>
             <CardDescription>
               {job.trials.length} trial{job.trials.length !== 1 ? "s" : ""}{" "}
-              evaluated
+              evaluated. Explicit choices use the selected trial&apos;s training evidence; walk-forward indices identify chronological windows.
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -347,6 +446,7 @@ export default function ResearchDetailPage({
                   <TableHead>Status</TableHead>
                   <TableHead>Metrics</TableHead>
                   <TableHead className="text-right">Created</TableHead>
+                  <TableHead>Discovery</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -376,6 +476,13 @@ export default function ResearchDetailPage({
                     </TableCell>
                     <TableCell className="text-right text-muted-foreground">
                       {formatDateTime(trial.created_at)}
+                    </TableCell>
+                    <TableCell>
+                      <Button variant="outline" size="sm"
+                        disabled={promoting || job.status !== "completed" || !job.selection || trial.status !== "completed"}
+                        onClick={() => void handlePromote(trial.trial_number)}>
+                        Create Discovery from {job.job_type === "walk_forward" ? "window" : "trial"} {trial.trial_number}
+                      </Button>
                     </TableCell>
                   </TableRow>
                 ))}

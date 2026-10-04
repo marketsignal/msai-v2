@@ -544,7 +544,7 @@ def research_list(
 def research_show(
     job_id: str = typer.Argument(..., help="Research job UUID"),
 ) -> None:
-    """Show one research job's progress + leaderboard."""
+    """Show research progress, training selection and separate diagnostic evidence."""
     response = _api_call("GET", f"/api/v1/research/jobs/{_url_id(job_id)}")
     _emit_json(response.json())
 
@@ -2783,7 +2783,7 @@ def research_sweep(
         ),
     ),
 ) -> None:
-    """Launch a parameter sweep research job."""
+    """Launch exploratory research selected on training metrics."""
     payload = _load_config_arg(config)
     response = _api_call("POST", "/api/v1/research/sweeps", json_body=payload)
     _emit_json(response.json())
@@ -2800,7 +2800,7 @@ def research_walk_forward(
         ),
     ),
 ) -> None:
-    """Launch a walk-forward optimisation research job."""
+    """Launch walk-forward research; the latest training window selects discovery."""
     payload = _load_config_arg(config)
     response = _api_call("POST", "/api/v1/research/walk-forward", json_body=payload)
     _emit_json(response.json())
@@ -2812,11 +2812,17 @@ def research_promote(
     trial_index: int = typer.Option(
         -1,
         "--trial-index",
-        help="Specific trial index to promote (default: server picks best)",
+        help=(
+            "Explicit eligible training choice: zero-based sweep result or chronological "
+            "walk-forward window index. Default: automatic training selection."
+        ),
     ),
     notes: str = typer.Option("", "--notes", help="Optional notes"),
 ) -> None:
-    """Promote a completed research job's result to a graduation candidate."""
+    """Create an exploratory discovery candidate from eligible training.
+
+    Legacy jobs require a rerun.
+    """
     payload: dict[str, Any] = {"research_job_id": job_id}
     if trial_index >= 0:
         payload["trial_index"] = trial_index
