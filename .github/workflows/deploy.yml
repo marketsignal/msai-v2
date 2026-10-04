@@ -244,7 +244,9 @@ jobs:
           VM_IP: ${{ inputs.vm_public_ip != '' && inputs.vm_public_ip || vars.VM_PUBLIC_IP }}
         run: |
           # shellcheck disable=SC2029  # remote bash -s heredoc by design
-          ssh "${VM_USER}@${VM_IP}" "bash -s" <<'EOF'
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+            -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "${VM_USER}@${VM_IP}" "bash -s" <<'EOF'
           set -uo pipefail  # NOTE: no -e — we want to capture nonzero exits
           # Locate the prod backend container by its compose-assigned labels.
           # `docker compose ... ps/exec` would parse docker-compose.prod.yml and
@@ -339,19 +341,20 @@ jobs:
     # always runs (no conclusion field on dispatch events).
     #
     # The required release-check precedes Azure access. Optional preflight with
-    # `if: always() && (preflight.result == 'success'
+    # `if: !cancelled() && (preflight.result == 'success'
     # || preflight.result == 'skipped')` lets the deploy job run when the
     # preflight job was skipped (the default, opt-in flag absent — push-to-main
     # behavior is unchanged) AND when the preflight job ran successfully.
     # A failed preflight blocks the deploy; a successful one (or a skipped one)
-    # proceeds.
+    # proceeds. Cancellation stops this producer; the separate cleanup stays eligible.
     needs: [release-check, preflight]
     if: |
-      always()
+      !cancelled()
       && needs.release-check.result == 'success'
       && (needs.preflight.result == 'success' || needs.preflight.result == 'skipped')
       && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: read
       actions: read
@@ -477,7 +480,9 @@ jobs:
           VM_USER: ${{ vars.VM_SSH_USER }}
           VM_IP: ${{ steps.resolve.outputs.vm_public_ip }}
         run: |
-          ssh "${VM_USER}@${VM_IP}" "umask 077 && cat > /tmp/deploy-env-${{ github.run_id }}.env" <<EOF
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+            -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "${VM_USER}@${VM_IP}" "umask 077 && cat > /tmp/deploy-env-${{ github.run_id }}.env" <<EOF
           MSAI_ACR_NAME=${{ steps.resolve.outputs.acr_name }}
           MSAI_ACR_LOGIN_SERVER=${{ steps.resolve.outputs.acr_login_server }}
           MSAI_REGISTRY=${{ steps.resolve.outputs.acr_login_server }}
@@ -501,23 +506,33 @@ jobs:
           VM_IP: ${{ steps.resolve.outputs.vm_public_ip }}
         run: |
           # shellcheck disable=SC2029  # VM_USER expansion is intentional client-side
-          ssh "${VM_USER}@${VM_IP}" "sudo mkdir -p /opt/msai/scripts && sudo chown -R ${VM_USER}:${VM_USER} /opt/msai"
-          scp docker-compose.prod.yml Caddyfile "${VM_USER}@${VM_IP}:/opt/msai/"
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+            -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "${VM_USER}@${VM_IP}" "sudo mkdir -p /opt/msai/scripts && sudo chown -R ${VM_USER}:${VM_USER} /opt/msai"
+          scp -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+            -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            docker-compose.prod.yml Caddyfile "${VM_USER}@${VM_IP}:/opt/msai/"
           # msai-render-env.service + render-env-from-kv.sh are staged so deploy-on-vm.sh
           # Phase 5 can re-sync them to /etc/systemd + /usr/local/bin. cloud-init only
           # bakes them at provision time, so without re-staging, a render-logic/secret-list
           # change (e.g. PR 3's derived AZURE_KEYVAULT_URI) would never reach an existing VM.
-          scp scripts/backup-to-blob.sh scripts/deploy-on-vm.sh scripts/install-azcopy.sh \
+          scp -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+              -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+              scripts/backup-to-blob.sh scripts/deploy-on-vm.sh scripts/install-azcopy.sh \
               scripts/deploy-smoke.sh \
               scripts/backup-to-blob.service scripts/backup-to-blob.timer \
               scripts/msai-render-env.service scripts/render-env-from-kv.sh \
               scripts/gateway-watchdog.sh \
               scripts/msai-gateway-watchdog.service scripts/msai-gateway-watchdog.timer \
               "${VM_USER}@${VM_IP}:/opt/msai/scripts/"
-          ssh "${VM_USER}@${VM_IP}" "sudo chmod +x /opt/msai/scripts/backup-to-blob.sh /opt/msai/scripts/deploy-on-vm.sh /opt/msai/scripts/install-azcopy.sh /opt/msai/scripts/deploy-smoke.sh /opt/msai/scripts/render-env-from-kv.sh /opt/msai/scripts/gateway-watchdog.sh"
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+            -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "${VM_USER}@${VM_IP}" "sudo chmod +x /opt/msai/scripts/backup-to-blob.sh /opt/msai/scripts/deploy-on-vm.sh /opt/msai/scripts/install-azcopy.sh /opt/msai/scripts/deploy-smoke.sh /opt/msai/scripts/render-env-from-kv.sh /opt/msai/scripts/gateway-watchdog.sh"
           # Also stage the per-run script at /tmp for the next step (kept in /tmp so the
           # `sudo bash /tmp/...` below is unambiguous about which run is firing)
-          scp scripts/deploy-on-vm.sh "${VM_USER}@${VM_IP}:/tmp/deploy-on-vm-${{ github.run_id }}.sh"
+          scp -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+            -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            scripts/deploy-on-vm.sh "${VM_USER}@${VM_IP}:/tmp/deploy-on-vm-${{ github.run_id }}.sh"
 
       - name: Recheck complete quiet fleet immediately before VM execution
         env:
@@ -532,7 +547,9 @@ jobs:
           VM_USER: ${{ vars.VM_SSH_USER }}
           VM_IP: ${{ steps.resolve.outputs.vm_public_ip }}
         run: |
-          ssh "${VM_USER}@${VM_IP}" \
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+            -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "${VM_USER}@${VM_IP}" \
             "sudo bash /tmp/deploy-on-vm-${{ github.run_id }}.sh ${{ steps.resolve.outputs.short_sha }} /tmp/deploy-env-${{ github.run_id }}.env"
 
       - name: Probe — public TLS endpoint

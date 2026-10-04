@@ -32,15 +32,23 @@ class AzureBoundaryTests(unittest.TestCase):
     def setUp(self):
         self.m = importlib.import_module("nsg_rule_lifecycle")
 
-    def refused(self, stderr, verb="list", returncode=1):
+    def refused(self, stderr, verb="list", returncode=1, runtime=False, version=None):
         args = [verb, "--resource-group", "rg", "--nsg-name", "nsg", "--subscription", "subscription-id"]
         response = subprocess.CompletedProcess([], returncode, "secret-stdout", stderr)
-        with patch.object(self.m.subprocess, "run", return_value=response) as run:
+        version = version if version is not None else subprocess.CompletedProcess([], 0, "", "")
+        with patch.object(self.m.subprocess, "run", side_effect=[response, version]) as run:
             with self.assertRaises(self.m.Refusal) as caught:
                 self.m.az_json(args)
         # Diagnostics must not alter the command, retry it, or expose stdout.
-        run.assert_called_once_with(["az", "network", "nsg", "rule", *args, "--output", "json"],
-                                    text=True, capture_output=True, timeout=120, check=False)
+        self.assertEqual(run.call_count, 2 if runtime else 1)
+        self.assertEqual(run.call_args_list[0].args[0],
+                         ["az", "network", "nsg", "rule", *args, "--output", "json"])
+        self.assertEqual(run.call_args_list[0].kwargs,
+                         dict(text=True, capture_output=True, timeout=120, check=False))
+        if runtime:
+            self.assertEqual(run.call_args_list[1].args[0], ["az", "--version"])
+            self.assertEqual(run.call_args_list[1].kwargs,
+                             dict(text=True, capture_output=True, timeout=5, check=False))
         message = str(caught.exception)
         self.assertIn(f"Azure {verb} failed (exit {returncode})", message)
         self.assertNotIn("secret-stdout", message)
@@ -69,7 +77,104 @@ class AzureBoundaryTests(unittest.TestCase):
             ("Traceback (most recent call last):\n  sensitive-payload\nAttributeError: sensitive-payload", "CLI_RUNTIME_ERROR"),
         ):
             with self.subTest(category=category, stderr=stderr):
-                self.assertIn(f"category={category}", self.refused(stderr, returncode=2))
+                self.assertIn(f"category={category}", self.refused(
+                    stderr, returncode=2, runtime=category == "CLI_RUNTIME_ERROR"))
+
+    def test_runtime_signature_requires_traceback_and_exact_terminal_exception(self) -> None:
+        terminal = ("_frozen_importlib._DeadlockError: deadlock detected by "
+                    "_ModuleLock('requests.structures') at 123456")
+        trace = "Traceback (most recent call last):\n  sensitive-payload\n" + terminal
+        message = self.refused(trace, "create", runtime=True)
+        self.assertIn("category=CLI_RUNTIME_ERROR signature=REQUESTS_STRUCTURES_IMPORT_DEADLOCK", message)
+        for changed in (trace.replace("requests.structures", "requests.sessions"),
+                        trace.replace("_DeadlockError", "RuntimeError"),
+                        trace.replace("Traceback (", "quoted Traceback ("),
+                        trace + "\nValueError: sensitive-payload",
+                        trace.replace(terminal, "  " + terminal),
+                        trace.replace("at 123456", "at sensitive-payload")):
+            with self.subTest(trace=changed):
+                self.assertNotIn("signature=", self.refused(changed, runtime=True))
+        self.assertNotIn("signature=", self.refused(terminal))
+        # ARM codes retain precedence, even if surrounded by a runtime trace.
+        self.assertIn("code=AuthorizationFailed", self.refused(trace + "\nCode: AuthorizationFailed"))
+
+    def test_runtime_versions_expose_only_anchored_numeric_fields(self) -> None:
+        trace = "Traceback (most recent call last):\nValueError: sensitive-payload"
+        output = ("azure-cli                         2.90.0 *\ncore                              2.90.0\n"
+                  "telemetry                          1.1.0\nExtensions directory 'sensitive-payload'\n"
+                  "Python location 'sensitive-payload'\n"
+                  "Python (Linux) 3.14.6 (main, sensitive-payload) [GCC sensitive-payload]\n")
+        message = self.refused(trace, "delete", runtime=True,
+                               version=subprocess.CompletedProcess([], 0, output, "sensitive-payload"))
+        self.assertTrue(message.endswith("runtime_cli=2.90.0 runtime_core=2.90.0 runtime_python=3.14.6"))
+        for bad, expected in (
+            (output.replace("2.90.0 *", "2.90.0-sensitive-payload"), "runtime_cli=unknown"),
+            (output.replace("2.90.0 *", "12345.90.0"), "runtime_cli=unknown"),
+            (output.replace("3.14.6 (", "3.14.6.1 ("), "runtime_python=unknown"),
+            (output.replace("3.14.6 (", "3.14.6sensitive-payload ("), "runtime_python=unknown"),
+            (output + "azure-cli 2.90.0\n", "runtime_cli=unknown"),
+            (output + "core sensitive-payload\n", "runtime_core=unknown"),
+            (output + "Python (Linux) 3.14.6\n", "runtime_python=unknown"),
+            ("secret-stdout\nsensitive-payload\n", "runtime_cli=unknown runtime_core=unknown runtime_python=unknown"),
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, self.refused(trace, runtime=True,
+                              version=subprocess.CompletedProcess([], 0, bad, "sensitive-payload")))
+
+    def test_runtime_signature_accepts_only_the_exact_azure_cli_help_footer(self) -> None:
+        # Azure CLI 2.90.0 logs the unexpected-error traceback, then prints this
+        # fixed recommendation separately to stderr (azclierror.print_error).
+        trace = (
+            "ERROR: The command failed with an unexpected error. Here is the traceback:\n"
+            "ERROR: deadlock detected by _ModuleLock('requests.structures') at 123456\n"
+            "Traceback (most recent call last):\n"
+            '  File "/sensitive-payload/azure/cli/core/util.py", line 145, in handle_exception\n'
+            "    sensitive-payload\n"
+            "_frozen_importlib._DeadlockError: deadlock detected by "
+            "_ModuleLock('requests.structures') at 123456\n"
+        )
+        footer = "To check existing issues, please visit: https://github.com/Azure/azure-cli/issues\n"
+        for stderr in (trace, trace + footer, trace + "\n" + footer):
+            with self.subTest(stderr=stderr):
+                message = self.refused(stderr, "create", runtime=True)
+                self.assertIn("signature=REQUESTS_STRUCTURES_IMPORT_DEADLOCK", message)
+                self.assertNotIn("To check existing issues", message)
+                self.assertNotIn("Traceback", message)
+        for suffix in (
+            "sensitive-payload\n", "ValueError: sensitive-payload\n" + footer,
+            footer + "sensitive-payload\n", footer + "ValueError: sensitive-payload\n",
+            footer.replace("azure-cli/issues", "sensitive-payload"),
+            footer.rstrip() + " sensitive-payload\n", footer + footer,
+        ):
+            with self.subTest(suffix=suffix):
+                self.assertNotIn("signature=", self.refused(trace + suffix, "create", runtime=True))
+
+    def test_runtime_version_failure_preserves_original_refusal_without_retry(self) -> None:
+        trace = "Traceback (most recent call last):\nValueError: sensitive-payload"
+        for version in (subprocess.CompletedProcess([], 8, "azure-cli 2.90.0\n", "sensitive-payload"),
+                        subprocess.TimeoutExpired("sensitive-payload", 5, stderr="sensitive-payload"),
+                        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "sensitive-payload"),
+                        OSError("sensitive-payload")):
+            with self.subTest(failure=type(version).__name__):
+                message = self.refused(trace, "create", returncode=2, runtime=True, version=version)
+                self.assertTrue(message.endswith("runtime_cli=unknown runtime_core=unknown runtime_python=unknown"))
+
+    def test_runtime_refusal_main_exits_one_without_success_output(self) -> None:
+        argv = ["nsg_rule_lifecycle.py", "reap", "--dry-run", "--resource-group", "rg", "--nsg-name", "nsg",
+                "--subscription", "subscription-id", "--repository", REPO]
+        responses = [subprocess.CompletedProcess([], 2, "sensitive-payload",
+                     "Traceback (most recent call last):\nValueError: sensitive-payload"),
+                     subprocess.CompletedProcess([], 0, "azure-cli 2.90.0\ncore 2.90.0 *\nPython (Linux) 3.14.6\n",
+                                                 "sensitive-payload")]
+        with patch.object(sys, "argv", argv), patch.object(sys, "stderr", new_callable=io.StringIO) as stderr, \
+                patch.object(sys, "stdout", new_callable=io.StringIO) as stdout, \
+                patch.object(self.m.subprocess, "run", side_effect=responses) as run:
+            self.assertEqual(self.m.main(), 1)
+        self.assertIn("NSG_REFUSED: Azure list failed (exit 2)", stderr.getvalue())
+        self.assertIn("runtime_cli=2.90.0 runtime_core=2.90.0 runtime_python=3.14.6", stderr.getvalue())
+        self.assertNotIn("sensitive-payload", stderr.getvalue())
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(run.call_count, 2)
 
     def test_unknown_and_empty_errors_are_explicitly_unclassified(self):
         for stderr in ("", "ERROR: sensitive-payload", "token=sensitive-payload\nBearer sensitive-payload\n"):
@@ -96,8 +201,9 @@ class AzureBoundaryTests(unittest.TestCase):
                                     ("create", '{"name": "temporary"}', {"name": "temporary"}),
                                     ("delete", " \n", None)):
             with self.subTest(verb=verb), patch.object(self.m.subprocess, "run", return_value=
-                    subprocess.CompletedProcess([], 0, stdout, "ERROR: (IgnoredWarning) sensitive-payload")):
+                    subprocess.CompletedProcess([], 0, stdout, "ERROR: (IgnoredWarning) sensitive-payload")) as run:
                 self.assertEqual(self.m.az_json([verb]), wanted)
+                self.assertEqual(run.call_count, 1)
 
     def test_malformed_json_still_refuses_without_echoing_it(self):
         with patch.object(self.m.subprocess, "run", return_value=

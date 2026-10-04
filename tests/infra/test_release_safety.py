@@ -259,6 +259,12 @@ elif name == "curl":
     if data.get("curl_exit", 0): sys.exit(data["curl_exit"])
     print(json.dumps(data["ready"]))
     if "--write-out" in args: print("200", end="")
+elif name in ("ssh", "scp"):
+    if name == "ssh":
+        pathlib.Path(os.environ["SSH_INPUT"]).write_text(sys.stdin.read())
+    calls = [json.loads(line) for line in pathlib.Path(os.environ["LOG"]).read_text().splitlines()]
+    count = sum(name in ("ssh", "scp") for name, _ in calls)
+    if count == data.get("transport_fail_at"): sys.exit(255)
 elif name == "az":
     verb = args[3]
     if data.get("az_fail") == verb: sys.exit(8)
@@ -272,7 +278,7 @@ elif name == "az":
         path.write_text(json.dumps(data))
 ''')
         provider.chmod(0o755)
-        for name in ("gh", "curl", "az"):
+        for name in ("gh", "curl", "az", "ssh", "scp"):
             (self.folder / name).symlink_to(provider)
         self.data = {"gh": {}, "rules": [], "ready": dict(contract_version=1, scope="fleet", complete=True,
                        ready=True, blocking_deployments=0, blocking_processes=0, restart_blockers=0)}
@@ -295,6 +301,7 @@ elif name == "az":
                         "needs.release-check.outputs.short_sha": SHA[:7], "steps.resolve.outputs.msai_hostname": "example.test"}
         self.env = {**os.environ, "PATH": f"{self.folder}:{os.environ['PATH']}", "FIXTURE": str(self.fixture),
                     "LOG": str(self.log), "GITHUB_OUTPUT": str(self.output), "GITHUB_REPOSITORY": REPO,
+                    "SSH_INPUT": str(self.folder / "ssh-input"),
                     "GITHUB_RUN_ID": "10", "GITHUB_RUN_ATTEMPT": "1", "MSAI_API_KEY": "not-logged"}
 
     def expand(self, value):
@@ -333,11 +340,13 @@ elif name == "az":
     def test_workflow_job_conditions_refuse_failed_gate_and_failed_optional_preflight(self):
         import re
         jobs = self.workflows["deploy"]["jobs"]
-        def allowed(job, values):
+        def allowed(job, values, cancelled=False):
             expression = jobs[job]["if"].strip().removeprefix("${{").removesuffix("}}").strip()
             expression = expression.replace("always()", "True")
+            expression = expression.replace("cancelled()", repr(cancelled))
             expression = re.sub(r"\b(?:github|needs)\.[A-Za-z0-9_.-]+", lambda m: repr(values[m[0]]), expression)
             expression = expression.replace("&&", " and ").replace("||", " or ")
+            expression = re.sub(r"!(?!=)", " not ", expression)
             return eval(" ".join(expression.split()), {"__builtins__": {}}, {})
         values = {"github.event_name": "workflow_dispatch", "github.event.inputs.run_smoke": "true",
                   "github.event.workflow_run.conclusion": "success", "needs.release-check.result": "failure",
@@ -349,15 +358,84 @@ elif name == "az":
         values["needs.release-check.result"] = "success"
         self.assertTrue(allowed("preflight", values))
         self.assertTrue(allowed("deploy", values))
-        values["needs.preflight.result"] = "failure"
-        self.assertFalse(allowed("deploy", values))
+        for result in ("success", "skipped"):
+            values["needs.preflight.result"] = result
+            self.assertTrue(allowed("deploy", values))
+            self.assertFalse(allowed("deploy", values, cancelled=True))
+        for result in ("failure", "cancelled"):
+            values["needs.preflight.result"] = result
+            self.assertFalse(allowed("deploy", values))
         values.update({"github.event_name": "workflow_run", "needs.preflight.result": "skipped"})
         self.assertTrue(allowed("release-check", values))
         self.assertTrue(allowed("deploy", values))
+        self.assertFalse(allowed("deploy", values, cancelled=True))
         self.assertFalse(allowed("preflight", values))
         values["github.event.workflow_run.conclusion"] = "failure"
         self.assertFalse(allowed("release-check", values))
         self.assertFalse(allowed("deploy", values))
+        for job, producer in (("cleanup", "deploy"), ("preflight-cleanup", "preflight")):
+            values[f"needs.{producer}.outputs.rule_name"] = "gha-transient-10-1"
+            values[f"needs.{producer}.result"] = "cancelled"
+            self.assertTrue(allowed(job, values, cancelled=True))
+            values[f"needs.{producer}.outputs.rule_name"] = ""
+            self.assertFalse(allowed(job, values, cancelled=True))
+
+    def transport_steps(self) -> list[dict]:
+        import re
+        self.context.update({"vars.VM_SSH_USER": "operator", "steps.resolve.outputs.vm_public_ip": "192.0.2.1",
+                             "inputs.vm_public_ip != '' && inputs.vm_public_ip || vars.VM_PUBLIC_IP": "192.0.2.1",
+                             "steps.resolve.outputs.short_sha": SHA[:7], "steps.resolve.outputs.acr_name": "registry",
+                             "steps.resolve.outputs.acr_login_server": "registry.example.test",
+                             "vars.MSAI_BACKEND_IMAGE": "backend", "vars.MSAI_FRONTEND_IMAGE": "frontend",
+                             "steps.resolve.outputs.kv_name": "vault", "steps.resolve.outputs.resource_group": "rg",
+                             "vars.DEPLOYMENT_NAME": "deployment"})
+        return [step for job in ("preflight", "deploy") for step in self.workflows["deploy"]["jobs"][job]["steps"]
+                if re.search(r"(?m)^\s*(?:ssh|scp)\s", step.get("run", ""))]
+
+    def test_preflight_and_deploy_jobs_have_finite_runtime_limits(self) -> None:
+        for job in ("preflight", "deploy"):
+            self.assertEqual(self.workflows["deploy"]["jobs"][job].get("timeout-minutes"), 30)
+
+    def test_preflight_and_deploy_bound_every_transport_and_preserve_payload(self) -> None:
+        steps = self.transport_steps()
+        self.assertEqual(len(steps), 4)
+        for step in steps:
+            with self.subTest(step=step["name"]):
+                result = self.execute(step)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if step["name"] == "Run smoke preflight on VM":
+                    self.assertIn("python -m msai.cli backtest smoke --config fast --json",
+                                  (self.folder / "ssh-input").read_text())
+                if step["name"] == "Stage deploy env on VM":
+                    self.assertIn("MSAI_ACR_NAME=registry\n", (self.folder / "ssh-input").read_text())
+                if step["name"] == "Stage compose file + Caddyfile + scripts on VM":
+                    self.assertEqual(step["working-directory"], "payload")
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertEqual(len(calls), 8)
+        for name, args in calls:
+            self.assertIn(name, ("ssh", "scp"))
+            options = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "-o"]
+            self.assertCountEqual(options, ["BatchMode=yes", "StrictHostKeyChecking=yes", "ConnectTimeout=20",
+                                           "ConnectionAttempts=1", "ServerAliveInterval=15", "ServerAliveCountMax=3"])
+            self.assertTrue(any(arg.startswith("operator@192.0.2.1") for arg in args))
+        copies = [args for name, args in calls if name == "scp"]
+        self.assertEqual(copies[0][-3:], ["docker-compose.prod.yml", "Caddyfile", "operator@192.0.2.1:/opt/msai/"])
+        self.assertEqual(copies[1][-1], "operator@192.0.2.1:/opt/msai/scripts/")
+        self.assertEqual(copies[2][-2:], ["scripts/deploy-on-vm.sh", "operator@192.0.2.1:/tmp/deploy-on-vm-10.sh"])
+        self.assertEqual(calls[-1][1][-1], f"sudo bash /tmp/deploy-on-vm-10.sh {SHA[:7]} /tmp/deploy-env-10.env")
+
+    def test_transport_failure_stops_actual_staging_block_before_followup_calls(self) -> None:
+        steps = self.transport_steps()
+        for step in steps:
+            # Exercise both first SSH and subsequent SCP failure in the multi-command block.
+            failures = (1, 2) if step["name"] == "Stage compose file + Caddyfile + scripts on VM" else (1,)
+            for failure in failures:
+                with self.subTest(step=step["name"], failing_call=failure):
+                    self.log.write_text("")
+                    self.data["transport_fail_at"] = failure
+                    result = self.execute(step)
+                    self.assertEqual(result.returncode, 255)
+                    self.assertEqual(len(self.log.read_text().splitlines()), failure)
 
     def test_deploy_uses_current_controls_exact_payload_and_fresh_readiness_before_execute(self):
         jobs = self.workflows["deploy"]["jobs"]
