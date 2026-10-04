@@ -53,6 +53,11 @@ concurrency:
   group: smoke-msai
   cancel-in-progress: false
 
+# Match the Ubuntu Debian az launcher while preloading in its own process.
+env:
+  MSAI_AZURE_CLI_PYTHON: /opt/az/bin/python3
+  AZ_INSTALLER: DEB
+
 jobs:
   smoke:
     runs-on: ubuntu-24.04

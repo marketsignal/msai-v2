@@ -4,6 +4,7 @@ import argparse
 import ipaddress
 import json
 import os
+from pathlib import Path
 import re
 import subprocess
 import sys
@@ -46,11 +47,21 @@ def azure_failure_detail(stderr: str) -> str:
     return "category=UNCLASSIFIED (details withheld)"
 
 
-def azure_runtime_versions() -> str:
+def azure_cli_prefix() -> list[str]:
+    """Use the explicitly selected CLI runtime; only unset retains native az."""
+    interpreter = os.environ.get("MSAI_AZURE_CLI_PYTHON")
+    if interpreter is None:
+        return ["az"]
+    if not os.path.isabs(interpreter):
+        raise OSError("configured Azure CLI interpreter must be an absolute path")
+    return [interpreter, "-I", str(Path(__file__).resolve().with_name("azure_cli_startup.py"))]
+
+
+def azure_runtime_versions(prefix: list[str]) -> str:
     """Capture CLI-owned runtime versions privately; failure never changes the refusal."""
     versions = {"cli": "unknown", "core": "unknown", "python": "unknown"}
     try:
-        response = subprocess.run(["az", "--version"], text=True, capture_output=True,
+        response = subprocess.run([*prefix, "--version"], text=True, capture_output=True,
                                   timeout=5, check=False)
     except (OSError, subprocess.TimeoutExpired, UnicodeError):
         response = None
@@ -70,14 +81,15 @@ def azure_runtime_versions() -> str:
 
 def az_json(args):
     try:
-        response = subprocess.run(["az", "network", "nsg", "rule", *args, "--output", "json"],
+        prefix = azure_cli_prefix()
+        response = subprocess.run([*prefix, "network", "nsg", "rule", *args, "--output", "json"],
                                   text=True, capture_output=True, timeout=120, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise Refusal(f"Azure {args[0]} unavailable/timed out; rule state is unproved") from exc
     if response.returncode:
         detail = azure_failure_detail(response.stderr)
         if detail.startswith("category=CLI_RUNTIME_ERROR"):
-            detail += " " + azure_runtime_versions()
+            detail += " " + azure_runtime_versions(prefix)
         raise Refusal(f"Azure {args[0]} failed (exit {response.returncode}); check subscription, RBAC and connectivity; "
                       f"{detail}")
     try:

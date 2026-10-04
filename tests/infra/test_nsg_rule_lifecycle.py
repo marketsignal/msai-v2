@@ -2,17 +2,199 @@
 import copy
 import importlib
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
+import venv
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 REPO = "marketsignal/msai-v2"
 PHASES = {"deploy": (200, "", "deploy.yml"), "preflight": (201, "preflight-", "deploy.yml"), "smoke": (202, "smoke-", "smoke.yml")}
+
+
+def azure_cli_fixture(folder, cli_code):
+    """Install only disposable external packages; -I cannot use PYTHONPATH."""
+    root = folder / "cli-venv"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(root)
+    python = root / "bin/python"
+    site = Path(subprocess.check_output(
+        [str(python), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"], text=True).strip())
+    requests = site / "requests"
+    requests.mkdir()
+    (requests / "structures.py").write_text('''import threading
+assert threading.current_thread() is threading.main_thread()
+MAIN_COMPLETE = True
+''')
+    (requests / "__init__.py").write_text('''from . import structures
+import json, os
+if os.environ.get("STARTUP_AUDIT"):
+    with open(os.environ["STARTUP_AUDIT"], "a") as stream:
+        stream.write(json.dumps({"event": "requests", "pid": os.getpid()}) + "\\n")
+''')
+    cli = site / "azure/cli"
+    cli.mkdir(parents=True)
+    (cli / "__init__.py").write_text("")
+    (cli / "__main__.py").write_text('''import json, os, sys, threading
+assert "requests.structures" in sys.modules, "requests preload missing before CLI entrypoint"
+assert sys.modules["requests.structures"].MAIN_COMPLETE
+assert threading.current_thread() is threading.main_thread()
+if os.environ.get("STARTUP_AUDIT"):
+    with open(os.environ["STARTUP_AUDIT"], "a") as stream:
+        stream.write(json.dumps({"event": "cli", "pid": os.getpid(), "argv": sys.argv[1:],
+                                 "installer": os.environ.get("AZ_INSTALLER"),
+                                 "marker": os.environ.get("FIXTURE_MARKER"),
+                                 "isolated": sys.flags.isolated}) + "\\n")
+''' + cli_code)
+    return python, requests
+
+
+class AzureStartupTests(unittest.TestCase):
+    """The real startup/helper run; only installed Azure/Requests are fixtures."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir="/tmp")
+        self.addCleanup(self.temp.cleanup)
+        self.folder = Path(self.temp.name)
+        self.audit = self.folder / "audit.jsonl"
+        self.native = self.folder / "native.jsonl"
+        self.python, self.requests = azure_cli_fixture(self.folder, '''
+if sys.argv[1:] == ["--version"]:
+    print("azure-cli 2.90.0\\ncore 2.90.0\\nPython (Linux) 3.14.6 (sensitive-payload)")
+elif os.environ.get("FIXTURE_MODE") == "runtime-fail":
+    print("sensitive-payload")
+    print("Traceback (most recent call last):\\nValueError: sensitive-payload", file=sys.stderr)
+    sys.exit(7)
+elif os.environ.get("FIXTURE_MODE") == "exit":
+    print("unchanged stdout")
+    print("unchanged stderr", file=sys.stderr)
+    sys.exit(23)
+else:
+    print(json.dumps({"args": sys.argv[1:], "installer": os.environ.get("AZ_INSTALLER"),
+                      "marker": os.environ.get("FIXTURE_MARKER")}))
+''')
+        launcher = self.folder / "az"
+        launcher.write_text(f"#!{sys.executable}\n" + '''import os, pathlib, sys
+with pathlib.Path(os.environ["NATIVE_AUDIT"]).open("a") as stream:
+    stream.write("called\\n")
+print('{"native": true}')
+sys.exit(int(os.environ.get("NATIVE_EXIT", "0")))
+''')
+        launcher.chmod(0o755)
+        self.env = {**os.environ, "PATH": f"{self.folder}:{os.environ['PATH']}",
+                    "MSAI_AZURE_CLI_PYTHON": str(self.python), "AZ_INSTALLER": "DEB",
+                    "FIXTURE_MARKER": "config-and-auth-preserved", "STARTUP_AUDIT": str(self.audit),
+                    "NATIVE_AUDIT": str(self.native), "PYTHONDONTWRITEBYTECODE": "1"}
+        self.startup = ROOT / "scripts/azure_cli_startup.py"
+        self.args = ["create", "--resource-group", "fixture-rg", "--description", "two words"]
+
+    def helper(self, **environment):
+        # Call the real helper from a subprocess so launch/import errors cannot
+        # be hidden by an in-process patch of its command selection.
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); import nsg_rule_lifecycle as n; "
+                "print(n.az_json(sys.argv[2:]))")
+        return subprocess.run([sys.executable, "-B", "-c", code, str(ROOT / "scripts"), *self.args],
+                              env={**self.env, **environment}, text=True, capture_output=True, timeout=10)
+
+    def events(self):
+        return [json.loads(line) for line in self.audit.read_text().splitlines()] if self.audit.exists() else []
+
+    def test_configured_operation_preloads_on_main_thread_in_same_child(self):
+        result = self.helper()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("config-and-auth-preserved", result.stdout)
+        events = self.events()
+        self.assertEqual([e["event"] for e in events], ["requests", "cli"])
+        self.assertEqual(events[0]["pid"], events[1]["pid"])
+        self.assertEqual(events[1]["argv"], ["network", "nsg", "rule", *self.args, "--output", "json"])
+        self.assertEqual(events[1]["installer"], "DEB")
+        self.assertEqual(events[1]["isolated"], 1)
+        self.assertFalse(self.native.exists(), "configured runtime fell back to native az")
+
+    def test_startup_preserves_arguments_environment_output_and_system_exit(self):
+        args = ["--literal", "two words", "--", "$"]
+        result = subprocess.run([str(self.python), "-I", str(self.startup), *args],
+                                env={**self.env, "FIXTURE_MODE": "exit"}, text=True,
+                                capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 23, result.stderr)
+        self.assertEqual(result.stdout, "unchanged stdout\n")
+        self.assertEqual(result.stderr, "unchanged stderr\n")
+        self.assertEqual(self.events()[1]["argv"], args)
+        self.assertEqual(self.events()[1]["marker"], "config-and-auth-preserved")
+
+    def test_isolation_ignores_cwd_and_pythonpath_package_shadowing(self):
+        poison = self.folder / "poison"
+        poison.mkdir()
+        (poison / "requests.py").write_text("raise RuntimeError('cwd/PYTHONPATH shadow imported')")
+        (poison / "azure.py").write_text("raise RuntimeError('cwd/PYTHONPATH shadow imported')")
+        result = subprocess.run([str(self.python), "-I", str(self.startup), "--version"],
+                                cwd=poison, env={**self.env, "PYTHONPATH": str(poison)},
+                                text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("azure-cli 2.90.0", result.stdout)
+        self.assertEqual([e["event"] for e in self.events()], ["requests", "cli"])
+
+    def test_configured_runtime_failure_keeps_original_exit_and_redacted_same_runtime_versions(self):
+        result = self.helper(FIXTURE_MODE="runtime-fail")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Azure create failed (exit 7)", result.stderr)
+        self.assertIn("runtime_cli=2.90.0 runtime_core=2.90.0 runtime_python=3.14.6", result.stderr)
+        self.assertNotIn("sensitive-payload", result.stdout + result.stderr)
+        entries = [e for e in self.events() if e["event"] == "cli"]
+        self.assertEqual([e["argv"] for e in entries],
+                         [["network", "nsg", "rule", *self.args, "--output", "json"], ["--version"]])
+        self.assertTrue(all(e["installer"] == "DEB" and e["isolated"] == 1 for e in entries))
+        self.assertFalse(self.native.exists())
+
+    def test_explicit_invalid_runtime_never_falls_back(self):
+        for value in ("", "relative/python", str(self.folder / "missing-python")):
+            with self.subTest(value=value):
+                result = self.helper(MSAI_AZURE_CLI_PYTHON=value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("rule state is unproved", result.stderr)
+                self.assertFalse(self.native.exists())
+                self.assertEqual(self.events(), [])
+
+    def test_preload_import_failure_never_enters_cli_or_native_launcher(self):
+        (self.requests / "__init__.py").write_text("raise ImportError('sensitive-payload')")
+        result = self.helper()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Azure create failed (exit 1)", result.stderr)
+        self.assertNotIn("sensitive-payload", result.stdout + result.stderr)
+        self.assertIn("runtime_cli=unknown runtime_core=unknown runtime_python=unknown", result.stderr)
+        self.assertEqual(self.events(), [])
+        self.assertFalse(self.native.exists())
+
+    def test_truly_unset_runtime_retains_native_launcher(self):
+        del self.env["MSAI_AZURE_CLI_PYTHON"]
+        result = self.helper()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("'native': True", result.stdout)
+        self.assertEqual(self.native.read_text(), "called\n")
+        self.assertEqual(self.events(), [])
+
+    def test_configured_operation_and_private_versions_keep_distinct_time_bounds(self):
+        m = importlib.import_module("nsg_rule_lifecycle")
+        failed = subprocess.CompletedProcess([], 7, "sensitive-payload",
+                                             "Traceback (most recent call last):\nValueError: sensitive-payload")
+        with patch.dict(os.environ, self.env), patch.object(m.subprocess, "run", side_effect=[
+                failed, subprocess.TimeoutExpired("fixture", 5)]) as run:
+            with self.assertRaises(m.Refusal) as caught:
+                m.az_json(self.args)
+        self.assertIn("Azure create failed (exit 7)", str(caught.exception))
+        self.assertNotIn("sensitive-payload", str(caught.exception))
+        self.assertEqual(run.call_count, 2)
+        prefix = [str(self.python), "-I", str(self.startup)]
+        self.assertEqual(run.call_args_list[0].args[0],
+                         [*prefix, "network", "nsg", "rule", *self.args, "--output", "json"])
+        self.assertEqual(run.call_args_list[1].args[0], [*prefix, "--version"])
+        self.assertEqual([call.kwargs for call in run.call_args_list],
+                         [dict(text=True, capture_output=True, timeout=120, check=False),
+                          dict(text=True, capture_output=True, timeout=5, check=False)])
 
 
 def rule(phase="deploy", run=10, attempt=1, legacy=False, **overrides):

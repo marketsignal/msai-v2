@@ -236,7 +236,7 @@ class WorkflowTests(unittest.TestCase):
         import yaml
         self.workflows = {name: yaml.safe_load((ROOT / f".github/workflows/{name}.yml").read_text())
                           for name in ("deploy", "smoke", "reap-orphan-nsg-rules", "ci")}
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = tempfile.TemporaryDirectory(dir="/tmp")
         self.addCleanup(self.temp.cleanup)
         self.folder = Path(self.temp.name)
         self.fixture = self.folder / "fixture.json"
@@ -278,6 +278,10 @@ elif name == "az":
         path.write_text(json.dumps(data))
 ''')
         provider.chmod(0o755)
+        from test_nsg_rule_lifecycle import azure_cli_fixture
+        self.cli_python, _ = azure_cli_fixture(
+            self.folder, provider.read_text().replace('name = pathlib.Path(sys.argv[0]).name', 'name = "az"'))
+        self.startup_audit = self.folder / "startup.jsonl"
         for name in ("gh", "curl", "az", "ssh", "scp"):
             (self.folder / name).symlink_to(provider)
         self.data = {"gh": {}, "rules": [], "ready": dict(contract_version=1, scope="fleet", complete=True,
@@ -301,6 +305,7 @@ elif name == "az":
                         "needs.release-check.outputs.short_sha": SHA[:7], "steps.resolve.outputs.msai_hostname": "example.test"}
         self.env = {**os.environ, "PATH": f"{self.folder}:{os.environ['PATH']}", "FIXTURE": str(self.fixture),
                     "LOG": str(self.log), "GITHUB_OUTPUT": str(self.output), "GITHUB_REPOSITORY": REPO,
+                    "STARTUP_AUDIT": str(self.startup_audit), "PYTHONDONTWRITEBYTECODE": "1",
                     "SSH_INPUT": str(self.folder / "ssh-input"),
                     "GITHUB_RUN_ID": "10", "GITHUB_RUN_ATTEMPT": "1", "MSAI_API_KEY": "not-logged"}
 
@@ -308,14 +313,52 @@ elif name == "az":
         import re
         return re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda m: self.context[m[1]], str(value))
 
+    def declared_env(self, step):
+        for workflow in self.workflows.values():
+            for job in workflow["jobs"].values():
+                if any(s is step for s in job["steps"]):
+                    return {**workflow.get("env", {}), **job.get("env", {}), **step.get("env", {})}
+        raise AssertionError("step does not belong to a parsed workflow")
+
     def execute(self, step):
         self.fixture.write_text(json.dumps(self.data))
-        env = {**self.env, **{k: self.expand(v) for k, v in step.get("env", {}).items()}}
+        audit_before = len(self.startup_audit.read_text().splitlines()) if self.startup_audit.exists() else 0
+        log_before = len(self.log.read_text().splitlines()) if self.log.exists() else 0
+        env = {**self.env, **{k: self.expand(v) for k, v in self.declared_env(step).items()}}
+        if "nsg_rule_lifecycle.py" in step["run"]:
+            # Check shipped configuration before substituting only the external
+            # runtime boundary. Never invoke an installed /opt/az in offline CI.
+            self.assertEqual(env.get("MSAI_AZURE_CLI_PYTHON"), "/opt/az/bin/python3")
+            self.assertEqual(env.get("AZ_INSTALLER"), "DEB")
+            env["MSAI_AZURE_CLI_PYTHON"] = str(self.cli_python)
         script = self.expand(step["run"]).replace("control/scripts/", str(ROOT / "scripts") + "/")
         result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=ROOT, env=env,
                                 capture_output=True, text=True, timeout=10)
         self.data = json.loads(self.fixture.read_text())
+        if "nsg_rule_lifecycle.py" in step["run"]:
+            calls = [json.loads(line) for line in self.log.read_text().splitlines()[log_before:]] if self.log.exists() else []
+            entries = [json.loads(line) for line in self.startup_audit.read_text().splitlines()[audit_before:]] if self.startup_audit.exists() else []
+            azure_calls = [args for name, args in calls if name == "az"]
+            self.assertEqual([e["event"] for e in entries], ["requests", "cli"] * len(azure_calls))
+            self.assertEqual([e["argv"] for e in entries if e["event"] == "cli"], azure_calls)
+            self.assertTrue(all(e["installer"] == "DEB" and e["isolated"] == 1 for e in entries if e["event"] == "cli"))
+            for preload, cli in zip(entries[::2], entries[1::2]):
+                self.assertEqual(preload["pid"], cli["pid"])
         return result
+
+    def test_all_seven_nsg_paths_declare_cli_owned_debian_runtime(self):
+        callers = [(name, job, step) for name in ("deploy", "smoke", "reap-orphan-nsg-rules")
+                   for job, value in self.workflows[name]["jobs"].items()
+                   for step in value["steps"] if "nsg_rule_lifecycle.py" in step.get("run", "")]
+        self.assertCountEqual([(name, job) for name, job, _ in callers],
+                              [("deploy", "deploy"), ("deploy", "preflight"),
+                               ("deploy", "cleanup"), ("deploy", "preflight-cleanup"),
+                               ("smoke", "smoke"), ("smoke", "cleanup"), ("reap-orphan-nsg-rules", "reap")])
+        for name, job, step in callers:
+            with self.subTest(workflow=name, job=job):
+                declared = self.declared_env(step)
+                self.assertEqual(declared.get("MSAI_AZURE_CLI_PYTHON"), "/opt/az/bin/python3")
+                self.assertEqual(declared.get("AZ_INSTALLER"), "DEB")
 
     def test_release_job_executes_resolve_check_readiness_before_azure_dependencies(self):
         jobs = self.workflows["deploy"]["jobs"]

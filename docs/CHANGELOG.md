@@ -4,6 +4,16 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-10-04 — Azure CLI import-lock startup repair
+
+Candidate implementation in `fix/release-cli-deadlock`, based on merged main `e3ad095`. Publication, Linux runner deployment and complete release-recovery acceptance remain pending.
+
+- Exact-main CI passed with 3,748 backend tests, 11 skipped and 17 expected failures; auth and image build also passed. Automatic Deploy `37182097303` identified a Requests import-lock exception in CLI 2.90.0/Python 3.14.6 before VM staging. Separate cleanup and independent preservation of four unrelated rules passed. Earlier generic CLI failures remain unattributed.
+- The NSG helper can use an explicitly selected CLI-owned interpreter in isolated mode. A small same-process entry point completes Requests import before running the real Azure CLI module. Deploy, smoke and reaper workflows select the Debian interpreter and installer mode for all seven NSG paths. Operation and private diagnostic share the launch prefix; timeout, ownership, redaction and original failure behavior remain. Invalid explicit configuration fails closed without retrying the mutation or falling back to native `az`.
+- Test-first verification observed failures before the repair, then passed 61 focused startup/NSG/release-workflow tests and actual Actionlint/ShellCheck, shell syntax, Ruff and whitespace checks. Scoped typing passed with the unavailable external Requests-stub boundary excluded. Installed-package test fixtures are disposable offline doubles, not Linux 3.14 evidence.
+- The actual authenticated Mac CLI preview passed missing-target refusal, corrected/repeated preview and independently matched 14-field before/after inventories for four unrelated policies. The graduated CLI journey retains the distinction between this read-only compatibility proof and pending Linux runner deployment/recovery acceptance.
+- Updated the Master Map, Master Plan, mandatory-read context and [release runbook](operations/release-safety.md). The [startup assessment](audits/2026-10-04/azure-cli-startup.md) separates actual failure, controlled local reproduction and the still-pending runner/recovery gates; M20 remains PARTIAL. No application, broker, credential, IAM or dependency version change is included.
+
 ### 2026-10-04 — Forge 6.4.3, assessments and merged-worktree consolidation
 
 - Includes the operator's installed Forge 6.4.3 harness and generated Claude/Codex adapters, together with the latest Master Map, Master Plan, agent context and audit records. Project context remains project-owned, with deployment procedures, endpoint inventory, vendor knowledge and real-browser acceptance requirements retained.
