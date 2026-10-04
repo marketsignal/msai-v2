@@ -1,0 +1,33 @@
+# Stable source mounts after retiring the merged research-foundation worktree.
+# Use together with local-runtime.override.yml and --env-file /dev/null.
+services:
+  backend:
+    volumes:
+      - /Users/pablomarin/Code/msai-v2/backend/src:/app/src:ro
+      - /Users/pablomarin/Code/msai-v2/backend/alembic:/app/alembic:ro
+      - /Users/pablomarin/Code/msai-v2/backend/alembic.ini:/app/alembic.ini:ro
+      - /Users/pablomarin/Code/msai-v2/strategies:/app/strategies:ro
+      - /Users/pablomarin/Code/msai-v2/data:/app/data
+  backtest-worker:
+    volumes:
+      - /Users/pablomarin/Code/msai-v2/backend/src:/app/src:ro
+      - /Users/pablomarin/Code/msai-v2/strategies:/app/strategies:ro
+      - /Users/pablomarin/Code/msai-v2/data:/app/data
+  research-worker:
+    volumes:
+      - /Users/pablomarin/Code/msai-v2/backend/src:/app/src:ro
+      - /Users/pablomarin/Code/msai-v2/strategies:/app/strategies:ro
+      - /Users/pablomarin/Code/msai-v2/data:/app/data
+  portfolio-worker:
+    volumes:
+      - /Users/pablomarin/Code/msai-v2/backend/src:/app/src:ro
+      - /Users/pablomarin/Code/msai-v2/strategies:/app/strategies:ro
+      - /Users/pablomarin/Code/msai-v2/data:/app/data
+  frontend:
+    volumes:
+      - /Users/pablomarin/Code/msai-v2/frontend/src:/app/src:ro
+      - /Users/pablomarin/Code/msai-v2/frontend/public:/app/public:ro
+      - /Users/pablomarin/Code/msai-v2/frontend/tsconfig.json:/app/tsconfig.json:ro
+      - /Users/pablomarin/Code/msai-v2/frontend/package.json:/app/package.json:ro
+      - /Users/pablomarin/Code/msai-v2/frontend/postcss.config.mjs:/app/postcss.config.mjs:ro
+      - /Users/pablomarin/Code/msai-v2/frontend/next.config.ts:/app/next.config.ts:ro
