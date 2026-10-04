@@ -1,6 +1,6 @@
 # Releasing MSAI safely
 
-This is the release operating contract. The existing VM/Compose deployment procedure remains in [how_to_deploy.md](../how_to_deploy.md). Local tests, actual provider checks and a production rollout are separate evidence gates. Normal deployment of `fa4c8f8` succeeded on October 4 UTC; the cancellation repair described below still requires acceptance on GitHub after integration. This document does not authorize cloud changes or trading.
+This is the release operating contract. The existing VM/Compose deployment procedure remains in [how_to_deploy.md](../how_to_deploy.md). Local tests, actual provider checks and a production rollout are separate evidence gates. Earlier normal deployments at `fa4c8f8` and `f4ede895` succeeded on October 4 UTC. The later `e3ad095` deployment failed during Azure CLI startup; its focused repair, actual cancellation and scheduled recovery still require acceptance. This document does not authorize cloud changes or trading.
 
 ## Choose the environment explicitly
 
@@ -117,12 +117,48 @@ The exact Azure CLI help footer may follow that terminal exception; arbitrary
 trailing text or a later exception does not qualify.
 Other tracebacks retain the generic category. This is evidence collection for the
 next occurrence, not proof that the earlier generic failures had that cause or
-that the upstream CLI issue has been repaired. No CLI pin or workaround is added.
+that the upstream CLI issue has been repaired. That diagnostic-only change added
+no CLI pin or startup workaround; the subsequently identified failure and focused
+startup repair are described below.
 
 Use the code/category to choose the next investigation. It is not proof of a
 specific permission or connectivity defect, and does not authorize a retry or
 IAM expansion. Inspect the exact target and identity before changing anything.
 `reap --dry-run` remains the read-only path for checking preservation decisions.
+
+### Azure CLI startup and its proof boundary
+
+Deploy [37182097303](https://github.com/marketsignal/msai-v2/actions/runs/37182097303)
+at `e3ad095` failed on October 4 at 06:29:04 UTC with the exact
+`REQUESTS_STRUCTURES_IMPORT_DEADLOCK` signature. A separate bounded version
+capture reported CLI/core 2.90.0 and bundled Python 3.14.6. Staging and installer
+execution were skipped. Cleanup reported the exact owned rule absent at
+06:29:24 UTC and completed at 06:29:26 UTC; independent inventories preserved
+all 14 policy fields of four unrelated rules. The failed write response alone
+does not prove Azure performed no write. Earlier generic failures remain
+unattributed. See the [startup assessment](../audits/2026-10-04/azure-cli-startup.md).
+
+The focused repair configures `MSAI_AZURE_CLI_PYTHON` for the NSG helper. It must
+name an absolute path to the CLI-owned interpreter. The three NSG workflows
+select `/opt/az/bin/python3` with `AZ_INSTALLER=DEB`; the helper runs it in isolated
+mode (`-I`) through the sibling `azure_cli_startup.py`. That entry point completes
+Requests import in the same process before Azure CLI can launch command/poller
+threads, then runs the real `azure.cli` module with the original arguments.
+Both the actual operation and its bounded version diagnostic use this prefix.
+Configured empty/relative/unusable runtimes fail closed; only an unset variable
+uses the existing native `az` launch. There is no automatic mutation retry or
+fallback from a failed configured launch to a second network operation.
+
+For read-only local compatibility checks, select the installed CLI's own
+interpreter and its installer mode (`HOMEBREW` for this Mac). Preserve existing
+authentication and explicitly select the MarketSignal subscription, resource
+group and NSG. Do not substitute the runner's system Python: it may lack the
+CLI and its dependencies. The official Docker image uses different RPM/system
+packaging and does not certify the affected Debian runtime merely by matching
+CLI version. Controlled import reproduction, Mac behavior and actual Linux
+runner deployment remain distinct evidence gates. Normal deployment must pass
+at the integrated repair revision before the separate cancellation/recovery
+drill; operational acceptance stays PARTIAL until all real criteria pass.
 
 Two normal runs at application revision `23db3b8` on October 4 failed before VM
 staging: [37164968762](https://github.com/marketsignal/msai-v2/actions/runs/37164968762)

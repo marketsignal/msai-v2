@@ -17,6 +17,11 @@ concurrency:
   group: nsg-reaper
   cancel-in-progress: true
 
+# Match the Ubuntu Debian az launcher while preloading in its own process.
+env:
+  MSAI_AZURE_CLI_PYTHON: /opt/az/bin/python3
+  AZ_INSTALLER: DEB
+
 jobs:
   reap:
     runs-on: ubuntu-24.04

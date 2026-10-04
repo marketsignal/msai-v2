@@ -89,6 +89,11 @@ concurrency:
   group: deploy-msai
   cancel-in-progress: false
 
+# Match the Ubuntu Debian az launcher while preloading in its own process.
+env:
+  MSAI_AZURE_CLI_PYTHON: /opt/az/bin/python3
+  AZ_INSTALLER: DEB
+
 jobs:
   release-check:
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
