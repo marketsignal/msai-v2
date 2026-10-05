@@ -119,13 +119,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'COMPACTION IMMINENT. Save learnings to auto memory: bug root causes, patterns, architecture insights, user preferences. NOT session state (that goes in .claude/local/state.md).' >&2; exit 0",
-            "timeout": 10
+            "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/pre-compact-memory.sh",
+            "forgeManagedId": "precompact-memory"
           },
           {
             "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/pre-compact-memory.sh",
-            "forgeManagedId": "precompact-memory"
+            "command": "echo 'COMPACTION IMMINENT. Save learnings to auto memory: bug root causes, patterns, architecture insights, user preferences. NOT session state (that goes in .claude/local/state.md).' >&2; exit 0",
+            "timeout": 10
           }
         ]
       }
@@ -148,11 +148,6 @@
         "hooks": [
           {
             "type": "command",
-            "forgeManagedId": "external-mutation-auth",
-            "command": "bash \"$CLAUDE_PROJECT_DIR/.forge/hooks/check-external-mutation-auth.sh\""
-          },
-          {
-            "type": "command",
             "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/check-bash-safety.sh",
             "forgeManagedId": "bash-safety"
           },
@@ -160,6 +155,11 @@
             "type": "command",
             "command": "$CLAUDE_PROJECT_DIR/.forge/hooks/check-workflow-gates.sh",
             "forgeManagedId": "workflow-gates"
+          },
+          {
+            "type": "command",
+            "forgeManagedId": "external-mutation-auth",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.forge/hooks/check-external-mutation-auth.sh\""
           }
         ]
       }
