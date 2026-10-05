@@ -25,6 +25,7 @@ from __future__ import annotations
 import math
 import multiprocessing as mp
 import pickle
+import re
 import tempfile
 import traceback
 from dataclasses import dataclass, field
@@ -63,6 +64,8 @@ except Exception as exc:  # pragma: no cover - environment-specific
 # ``BacktestVenueConfig`` per unique venue, which matches how
 # Nautilus's ``BacktestNode`` wires the engine.
 _DEFAULT_STARTING_BALANCE = "1000000 USD"
+_CALENDAR_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_DAY_NANOSECONDS = 86_400_000_000_000
 
 
 def _extract_venues_from_instrument_ids(instrument_ids: list[str]) -> list[str]:
@@ -136,8 +139,8 @@ class _RunPayload:
             the Nautilus ``StrategyConfig`` constructor.
         instrument_ids: List of canonical Nautilus instrument IDs the
             backtest should load from the catalog.
-        start_date: ISO-8601 start of the backtest window (inclusive).
-        end_date: ISO-8601 end of the backtest window (inclusive).
+        start_date: Inclusive UTC calendar date, or an exact ISO-8601 instant.
+        end_date: Inclusive UTC calendar date, or an exact ISO-8601 instant.
         catalog_path: Filesystem path to the Nautilus ``ParquetDataCatalog``.
         result_path: Tempfile path where the subprocess writes its pickle
             result.  Set by the parent before spawning.
@@ -185,8 +188,8 @@ class BacktestRunner:
                 user-editable knobs (EMA periods, trade size, ...).
             instrument_ids: Canonical Nautilus instrument IDs the data
                 config should load from the catalog.
-            start_date: ISO-8601 start of the backtest window.
-            end_date: ISO-8601 end of the backtest window.
+            start_date: Inclusive UTC calendar date, or an exact ISO timestamp.
+            end_date: Inclusive UTC calendar date, or an exact ISO timestamp.
             catalog_path: Path to the Nautilus ``ParquetDataCatalog`` to
                 read bar data from.
             timeout_seconds: Maximum wall-clock time before the subprocess
@@ -410,6 +413,44 @@ def _write_subprocess_result(result_path: str, payload: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _normalize_backtest_window(start: str, end: str) -> tuple[int, int]:
+    """Inclusive UTC calendar dates, or exact timestamp instants, as nanoseconds.
+
+    Both Nautilus's catalog query and engine cutoff are inclusive on ts_init.
+    The end of a calendar day is therefore next midnight minus one nanosecond.
+    """
+    start_is_date = _CALENDAR_DATE.fullmatch(start) is not None
+    end_is_date = _CALENDAR_DATE.fullmatch(end) is not None
+    if start_is_date and end_is_date and end < start:
+        raise ValueError("End date must be on or after start date")
+
+    bounds: list[int] = []
+    for value, label, is_date in (
+        (start, "start", start_is_date),
+        (end, "end", end_is_date),
+    ):
+        if not is_date and re.match(r"[0-9]{4}-[0-9]{2}-[0-9]{2}[T ]", value) is None:
+            raise ValueError(f"Invalid backtest {label}: use YYYY-MM-DD or an ISO timestamp")
+        try:
+            stamp = pd.Timestamp(value)
+        except (ValueError, OverflowError) as exc:
+            raise ValueError(f"Invalid backtest {label}: {value!r}") from exc
+        try:
+            stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+            nanos = int(stamp.value)
+        except (ValueError, OverflowError) as exc:
+            raise ValueError(f"Backtest {label} is outside the supported nanosecond range") from exc
+        if is_date and label == "end":
+            nanos += _DAY_NANOSECONDS - 1
+        if not 0 <= nanos <= pd.Timestamp.max.value:
+            raise ValueError(f"Backtest {label} is outside the supported nanosecond range")
+        bounds.append(nanos)
+
+    if bounds[1] < bounds[0]:
+        raise ValueError("End date must be on or after start date")
+    return bounds[0], bounds[1]
+
+
 def _build_backtest_run_config(payload: _RunPayload) -> BacktestRunConfig:
     """Translate a :class:`_RunPayload` into a Nautilus ``BacktestRunConfig``.
 
@@ -417,6 +458,7 @@ def _build_backtest_run_config(payload: _RunPayload) -> BacktestRunConfig:
     :class:`BacktestRunner`) so unit tests can call it directly without
     needing to spin up a subprocess.
     """
+    start_ns, end_ns = _normalize_backtest_window(payload.start_date, payload.end_date)
     paths = resolve_importable_strategy_paths(payload.strategy_file)
 
     strategy_config = ImportableStrategyConfig(
@@ -449,16 +491,16 @@ def _build_backtest_run_config(payload: _RunPayload) -> BacktestRunConfig:
         catalog_path=payload.catalog_path,
         data_cls="nautilus_trader.model.data:Bar",
         instrument_ids=payload.instrument_ids,
-        start_time=payload.start_date,
-        end_time=payload.end_date,
+        start_time=start_ns,
+        end_time=end_ns,
     )
 
     return BacktestRunConfig(
         venues=venue_configs,
         data=[data_config],
         engine=engine_config,
-        start=payload.start_date,
-        end=payload.end_date,
+        start=start_ns,
+        end=end_ns,
         raise_exception=True,
         dispose_on_completion=False,
     )
@@ -553,6 +595,7 @@ def _extract_metrics(
     for daily account metrics. Undefined risk statistics retain the existing
     numeric zero sentinel. ``num_trades`` remains the eligibility input but
     now counts actual fills, also exposed explicitly as ``num_fills``.
+    ``num_bars`` is present only when the native consumed-data counter exists.
     """
     stats_pnls = getattr(primary_result, "stats_pnls", None) or {}
     currency_stats: dict[str, object] = {}
@@ -579,7 +622,7 @@ def _extract_metrics(
         if positions_derived is not None:
             win_rate = positions_derived["win_rate"]
 
-    return {
+    metrics: dict[str, float | int] = {
         "sharpe_ratio": _nan_safe(sharpe),
         "sortino_ratio": _nan_safe(sortino),
         "max_drawdown": _nan_safe(max_drawdown),
@@ -588,6 +631,12 @@ def _extract_metrics(
         "num_trades": int(len(fills_df)),
         "num_fills": int(len(fills_df)),
     }
+    iterations = getattr(primary_result, "iterations", None)
+    if iterations is not None:
+        # This runner loads Bar data only; iterations counts consumed data items
+        # across all instruments, rather than unique minutes or generated fills.
+        metrics["num_bars"] = int(iterations)
+    return metrics
 
 
 def _derive_metrics_from_positions(positions_df: pd.DataFrame) -> dict[str, float] | None:

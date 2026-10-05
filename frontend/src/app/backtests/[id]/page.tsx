@@ -225,6 +225,7 @@ export default function BacktestDetailPage({
       totalTrades: results.accounting
         ? (m.num_fills ?? results.trade_count)
         : results.trade_count,
+      numBars: m.num_bars,
     };
   }, [results]);
 

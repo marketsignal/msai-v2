@@ -19,8 +19,8 @@ class BacktestRunRequest(BaseModel):
     strategy_id: UUID
     config: dict[str, Any]
     instruments: list[str]
-    start_date: date
-    end_date: date
+    start_date: date = Field(description="Inclusive start calendar date in UTC")
+    end_date: date = Field(description="Inclusive end calendar date in UTC")
     smoke: bool = False
     """Tag this row as a deploy-time data-path smoke (Phase 12 of
     ``deploy-on-vm.sh``). Smoke rows are filtered out of
@@ -28,6 +28,12 @@ class BacktestRunRequest(BaseModel):
     cleanup by the deploy rollback path. Defaults to ``False`` so normal
     user-initiated backtests never accidentally enter the smoke namespace.
     """
+
+    @model_validator(mode="after")
+    def validate_date_window(self) -> BacktestRunRequest:
+        if self.end_date < self.start_date:
+            raise ValueError("End date must be on or after start date")
+        return self
 
 
 class BacktestStatusResponse(BaseModel):

@@ -44,6 +44,7 @@ export interface ResultsChartsBacktest {
   totalReturn: number; // percent (e.g. 24.5 for 24.5%)
   winRate: number; // percent (e.g. 62.3 for 62.3%)
   totalTrades: number;
+  numBars?: number;
 }
 
 export function formatBacktestPercent(value: number): string {
@@ -421,6 +422,11 @@ export function ResultsCharts({
           title={accounting ? "Fills" : "Legacy records"}
           value={backtest.totalTrades.toString()}
           icon={Zap}
+        />
+        <MetricCard
+          title="Bars processed"
+          value={backtest.numBars == null ? "Not recorded" : backtest.numBars.toLocaleString("en-US")}
+          icon={BarChart3}
         />
       </div>
 

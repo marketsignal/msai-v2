@@ -15,8 +15,8 @@ class ResearchSweepRequest(BaseModel):
 
     strategy_id: UUID
     instruments: list[str]
-    start_date: date
-    end_date: date
+    start_date: date = Field(description="Inclusive start calendar date in UTC")
+    end_date: date = Field(description="Inclusive end calendar date in UTC")
     asset_class: str = "stocks"
     base_config: dict[str, Any] = Field(default_factory=dict)
     parameter_grid: dict[str, list[Any]]

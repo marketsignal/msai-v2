@@ -452,8 +452,8 @@ def strategy_validate(
 def backtest_run(
     strategy_id: str = typer.Argument(..., help="Strategy UUID"),
     instruments: str = typer.Argument(..., help="Comma-separated instrument IDs"),
-    start: str = typer.Argument(..., help="Start date YYYY-MM-DD"),
-    end: str = typer.Argument(..., help="End date YYYY-MM-DD"),
+    start: str = typer.Argument(..., help="Start date YYYY-MM-DD (included, UTC)"),
+    end: str = typer.Argument(..., help="End date YYYY-MM-DD (full day included, UTC)"),
     config_json: str = typer.Option("{}", help="Strategy config as a JSON string"),
 ) -> None:
     """Enqueue a backtest and print its job id.
