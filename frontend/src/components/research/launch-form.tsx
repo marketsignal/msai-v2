@@ -283,6 +283,7 @@ export function LaunchResearchForm({
               <Input
                 id="research-start"
                 type="date"
+                aria-describedby="research-date-window"
                 value={startDate}
                 onChange={(e) => setStartDate(e.target.value)}
               />
@@ -292,11 +293,15 @@ export function LaunchResearchForm({
               <Input
                 id="research-end"
                 type="date"
+                aria-describedby="research-date-window"
                 value={endDate}
                 onChange={(e) => setEndDate(e.target.value)}
               />
             </div>
           </div>
+          <p id="research-date-window" className="text-xs text-muted-foreground">
+            Includes both the start and end days in UTC.
+          </p>
 
           <div className="space-y-2">
             <div className="grid grid-cols-2 gap-4">

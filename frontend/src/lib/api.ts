@@ -245,6 +245,8 @@ export interface BacktestMetrics {
   num_trades: number;
   /** Execution count; num_trades is the backward-compatible alias. */
   num_fills?: number;
+  /** Native count of consumed bars across instruments; absent on legacy results. */
+  num_bars?: number;
   final_equity?: number;
   initial_cash?: number;
 }

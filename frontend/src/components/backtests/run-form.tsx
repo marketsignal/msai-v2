@@ -199,7 +199,7 @@ export function RunBacktestForm({
           setFieldErrors(fieldMap);
           setError(envelope.message);
         } else {
-          setError(`Backtest failed to start (422)`);
+          setError("Backtest inputs are invalid. Check the dates and configuration, and try again.");
         }
       } else {
         const msg =
@@ -268,22 +268,29 @@ export function RunBacktestForm({
           </div>
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-2">
-              <Label>Start Date</Label>
+              <Label htmlFor="backtest-start">Start Date</Label>
               <Input
+                id="backtest-start"
                 type="date"
+                aria-describedby="backtest-date-window"
                 value={startDate}
                 onChange={(e) => setStartDate(e.target.value)}
               />
             </div>
             <div className="space-y-2">
-              <Label>End Date</Label>
+              <Label htmlFor="backtest-end">End Date</Label>
               <Input
+                id="backtest-end"
                 type="date"
+                aria-describedby="backtest-date-window"
                 value={endDate}
                 onChange={(e) => setEndDate(e.target.value)}
               />
             </div>
           </div>
+          <p id="backtest-date-window" className="text-xs text-muted-foreground">
+            Includes both the start and end days in UTC.
+          </p>
           <div className="space-y-2">
             <Label>Configuration</Label>
             {schemaDetail?.config_schema_status === "ready" &&
@@ -356,18 +363,40 @@ interface ValidationErrorEnvelope {
  * 422 from ``POST /api/v1/backtests/run``. The backend produces:
  *   ``{ "detail": { "error": { code, message, details: [{field, message}] } } }``
  * via ``_prepare_and_validate_backtest_config`` in ``api/backtests.py``.
- * Returns ``null`` when the body doesn't match that shape (e.g. a
- * Pydantic-request-validation 422 from the BacktestRunRequest model,
- * which uses FastAPI's default ``{"detail": [...]}`` layout).
+ * Also accepts FastAPI's Pydantic ``{"detail": [...]}`` request-validation
+ * layout. Only messages and field labels are shown; raw input and context
+ * are never included. Returns ``null`` for an unrecognized body.
  */
 function extract422Envelope(body: unknown): ValidationErrorEnvelope | null {
   if (!body || typeof body !== "object") return null;
-  // Two shapes accepted (api-design.md transition 2026-04-21):
+  // Structured error shapes (api-design.md transition 2026-04-21):
   //   * Preferred (top-level): { "error": { code, message, details: [...] } }
   //     — produced by main.py::_strategy_config_validation_handler.
   //   * Legacy (FastAPI HTTPException wrapper): { "detail": { "error": {...} } }
   //     — produced anywhere else that still raises `HTTPException(detail=dict)`.
   const bag = body as { error?: unknown; detail?: unknown };
+  if (Array.isArray(bag.detail)) {
+    const fieldLabels: Record<string, string> = {
+      strategy_id: "Strategy", instruments: "Instruments", config: "Configuration",
+      start_date: "Start Date", end_date: "End Date",
+    };
+    const details = bag.detail.flatMap((entry: unknown): { field: string; message: string }[] => {
+      if (entry === null || typeof entry !== "object" || !("msg" in entry) || typeof entry.msg !== "string") {
+        return [];
+      }
+      const message = entry.msg.trim().replace(/^Value error,\s*/u, "");
+      if (!message) return [];
+      const field = "loc" in entry && Array.isArray(entry.loc) ? entry.loc[1] : null;
+      return [{ field: typeof field === "string" ? field : "(unknown)", message }];
+    });
+    if (details.length === 0) return null;
+    return {
+      code: "REQUEST_VALIDATION_ERROR",
+      message: details.map(({ field, message }) => fieldLabels[field]
+        ? `${fieldLabels[field]}: ${message}` : message).join(" "),
+      details,
+    };
+  }
   let error: unknown = bag.error;
   if (!error || typeof error !== "object") {
     const detail = bag.detail;

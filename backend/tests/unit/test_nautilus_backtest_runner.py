@@ -10,15 +10,22 @@ integration smoke test in Docker.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
+import pandas as pd
 import pytest
 
 from msai.services.nautilus.backtest_runner import (
-    _RunPayload,
     _build_backtest_run_config,
+    _extract_metrics,
     _extract_venues_from_instrument_ids,
+    _RunPayload,
     _zero_metrics,
 )
+
+if TYPE_CHECKING:
+    from nautilus_trader.backtest.config import BacktestRunConfig
 
 _STRATEGY_FILE = Path(__file__).resolve().parents[3] / "strategies" / "example" / "ema_cross.py"
 
@@ -55,8 +62,8 @@ class TestBuildBacktestRunConfig:
         assert strategy.config_path.endswith(":EMACrossConfig")
         assert data.instrument_ids == payload.instrument_ids
         assert data.catalog_path == payload.catalog_path
-        assert run_config.start == payload.start_date
-        assert run_config.end == payload.end_date
+        assert run_config.start == data.start_time == 1704067200000000000
+        assert run_config.end == data.end_time == 1706831999999999999
 
     def test_venue_is_sim(self) -> None:
         """The backtest config declares the SIM venue with a starting balance."""
@@ -155,3 +162,86 @@ class TestZeroMetrics:
         assert metrics["max_drawdown"] == 0.0
         assert metrics["total_return"] == 0.0
         assert metrics["win_rate"] == 0.0
+        assert "num_bars" not in metrics
+
+
+def _window_config(start: str, end: str) -> BacktestRunConfig:
+    return _build_backtest_run_config(
+        _RunPayload(
+            strategy_file=str(_STRATEGY_FILE),
+            strategy_config={
+                "instrument_id": "AAPL.NASDAQ",
+                "bar_type": "AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL",
+            },
+            instrument_ids=["AAPL.NASDAQ"],
+            start_date=start,
+            end_date=end,
+            catalog_path="./data/nautilus",
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "expected_start", "expected_end"),
+    [
+        ("2024-02-29", "2024-02-29", 1709164800000000000, 1709251199999999999),
+        ("2024-12-31", "2025-01-01", 1735603200000000000, 1735775999999999999),
+        ("1970-01-01", "1970-01-01", 0, 86399999999999),
+        (
+            "2024-12-03T12:00:00.000000001Z",
+            "2024-12-03T15:00:00.000000002Z",
+            1733227200000000001,
+            1733238000000000002,
+        ),
+        (
+            "2024-12-03T07:00:00-05:00",
+            "2024-12-03",
+            1733227200000000000,
+            1733270399999999999,
+        ),
+        (
+            "2024-12-03",
+            "2024-12-03T07:00:00-05:00",
+            1733184000000000000,
+            1733227200000000000,
+        ),
+    ],
+)
+def test_execution_bounds_preserve_utc_dates_and_exact_instants(
+    start: str, end: str, expected_start: int, expected_end: int
+) -> None:
+    config = _window_config(start, end)
+    assert config.start == config.data[0].start_time == expected_start
+    assert config.end == config.data[0].end_time == expected_end
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "message"),
+    [
+        ("2024-12-03", "2024-12-02", "End date must be on or after start date"),
+        ("2024-12-03T13:00:00Z", "2024-12-03T12:00:00Z", "End date must be"),
+        ("2024-02-30", "2024-03-01", "Invalid backtest start"),
+        ("20241203", "2024-12-04", "Invalid backtest start"),
+        ("2024-W49-2", "2024-12-04", "Invalid backtest start"),
+        ("2024-12-03", "not-a-date", "Invalid backtest end"),
+        ("1969-12-31", "1970-01-01", "supported nanosecond range"),
+        ("2262-04-11", "2262-04-11", "supported nanosecond range"),
+        ("9999-12-31", "9999-12-31", "supported nanosecond range"),
+    ],
+)
+def test_invalid_or_unrepresentable_window_fails_before_engine(
+    start: str, end: str, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _window_config(start, end)
+
+
+@pytest.mark.parametrize("count", [0, 3])
+def test_metrics_expose_actual_native_bar_count_including_zero(count: int) -> None:
+    metrics = _extract_metrics(SimpleNamespace(iterations=count), pd.DataFrame())
+    assert metrics["num_bars"] == count
+    assert isinstance(metrics["num_bars"], int)
+
+
+def test_metrics_without_native_count_do_not_fabricate_zero() -> None:
+    assert "num_bars" not in _extract_metrics(SimpleNamespace(), pd.DataFrame())

@@ -13,11 +13,34 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
-from msai.schemas.backtest import BacktestListItem, BacktestStatusResponse
+from msai.schemas.backtest import BacktestListItem, BacktestRunRequest, BacktestStatusResponse
 
 _STATUS_ID = UUID("00000000-0000-0000-0000-000000000001")
 _LIST_ID = UUID("00000000-0000-0000-0000-000000000002")
 _STRATEGY_ID = UUID("00000000-0000-0000-0000-00000000aaaa")
+
+
+def test_backtest_request_rejects_reversed_dates() -> None:
+    with pytest.raises(ValidationError, match="End date must be on or after start date"):
+        BacktestRunRequest(
+            strategy_id=_STRATEGY_ID,
+            config={},
+            instruments=["AAPL.NASDAQ"],
+            start_date=date(2024, 12, 3),
+            end_date=date(2024, 12, 2),
+        )
+
+
+def test_same_day_backtest_preserves_logical_requested_dates() -> None:
+    request = BacktestRunRequest(
+        strategy_id=_STRATEGY_ID,
+        config={},
+        instruments=["AAPL.NASDAQ"],
+        start_date=date(2024, 12, 3),
+        end_date=date(2024, 12, 3),
+    )
+    assert request.start_date == request.end_date == date(2024, 12, 3)
+    assert request.model_dump(mode="json")["end_date"] == "2024-12-03"
 
 
 # ---------------------------------------------------------------------------

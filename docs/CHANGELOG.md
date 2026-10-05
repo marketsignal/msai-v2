@@ -4,9 +4,23 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-10-04 — Inclusive backtest calendar dates (local candidate)
+
+- Normalize date-only backtest bounds to the first/last nanosecond of the requested UTC days at both Nautilus cutoffs; preserve explicit timestamp instants and reject invalid/reversed ranges. Equal public dates are valid. The prior midnight end silently omitted the final day's intraday bars.
+- Forms and CLI explain the inclusive UTC contract; form validation now renders Pydantic date errors readably while retaining existing structured errors. New native results expose optional total `num_bars`; historical missing counts display **Not recorded**. Saved results and research split/purge/portfolio slicing arithmetic remain unchanged; new shared-runner simulations consume their full requested days.
+- Passed 44 owning checks, 72 research controls, one portfolio boundary control, scoped lint/typing and frontend lint/build. Actual local API/CLI December 3–3 runs match the independent 502-bar, 32-fill, +$1.13 recorded-cost reference; real sweep/walk-forward/Discovery and saved-history checks passed. The unchanged build retry passed after an initial font-download failure, which is retained.
+- Preliminary native computer-use acceptance passed the actual form failure/correction, 502-bar/32-fill result, full report, reload/history reopening and legacy **Not recorded** journey; the initial locked-Mac PARTIAL report is retained. [Graduated journeys](../tests/e2e/use-cases/backtests/inclusive-date-window.md) retain the acceptance scope. Exact-candidate final reviews/verifiers, publication and Azure acceptance are separate gates; this entry is the candidate-stage snapshot. The repair does not certify session completeness, realistic costs, alpha or live readiness. [Repair explanation and scope](solutions/backtesting/inclusive-calendar-date-window.md).
+
+### 2026-10-04 — Research release evidence and completed checkout cleanup
+
+- PR108 merged the certified research-selection tree as `b48d0ad88c4ebcff498d2c14dc6fb834bea9c32a`. Exact-main CI reported 3,841 passed, 11 skipped and 17 expected failures; auth/build and normal Deploy 37238509145/independent cleanup passed. Six installed application images were independently verified, with broker identities and unrelated network policies preserved.
+- Actual Azure API→CLI→real-browser research/Discovery, failure/correction and reload journeys passed for existing AAPL minute data. Genuine legacy Azure acceptance was NOT_EXECUTED; multi-window runtime, independent final validation, immutable inputs, data/session correctness, realistic costs and portfolio/live gates remain open. Earlier cancellation/scheduled-recovery acceptance remains separately bound to c1dd1c1. [Scope and retained evidence](../MASTER_MAP.md#released-research-selection-and-discovery).
+- Removed the three clean merged extra local checkouts/branches and both specifically approved remaining GitHub feature branches after privately archiving and hash-verifying ignored evidence/settings. The seven guarded local services now use primary sources with preserved images, PostgreSQL/Redis/data and the identical 100-fill API/CLI/browser reference. No Azure or broker mutation was part of cleanup.
+- Reconciled Master Map, Master Plan and mandatory agent context with those completed results, preserving operational inventories and browser acceptance requirements. The next existing Milestone 1 dependency is the independently reconciled equity data/window/cost case. The candidate-stage entry below remains historical.
+
 ### 2026-10-04 — Research training selection and exploratory discovery
 
-Candidate repair based on `c1dd1c1`; preliminary real API/CLI/browser acceptance passed. Final fingerprint-bound reviews/verification and publication remain pending.
+Historical candidate-stage record based on `c1dd1c1`; the release entry above supersedes its pending status. Preliminary real API/CLI/browser acceptance passed at that stage.
 
 - Sweeps select and feed optimizers using eligible training evidence. Reserved-period diagnostics cannot change the chosen configuration. Walk-forward onward discovery uses the latest training window, with no silent earlier-window fallback.
 - New reports expose selection provenance and discovery eligibility. Legacy, failed, pruned and incomplete training evidence is refused with rerun guidance. Explicit eligible choices remain possible and are labeled manual; saved numerical metrics remain flat, with separate provenance outside strategy configuration.
