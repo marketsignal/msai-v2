@@ -41,7 +41,8 @@ jobs:
           uv run python -m unittest discover -s ../tests/infra -p 'test_nsg_rule_lifecycle.py' -v
       - run: cd backend && uv run ruff check src/
       - run: cd backend && uv run mypy src/ --strict
-      - run: cd backend && uv run pytest tests/ -v --cov=msai
+      - name: Backend suite for installed Nautilus runtime
+        run: cd backend && uv run python ../scripts/run_backend_ci.py -v --cov=msai
         env:
           DATABASE_URL: postgresql+asyncpg://msai:test@localhost:5432/msai_test
           REDIS_URL: redis://localhost:6379

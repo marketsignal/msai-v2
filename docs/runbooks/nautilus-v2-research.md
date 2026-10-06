@@ -161,6 +161,27 @@ Keep the archives and baseline image until accepted recovery and separately auth
 
 ## Current acceptance record
 
+### Backend CI scope
+
+Full-source Ruff and `mypy src/ --strict`, release-control behavior, frontend and image-data-path
+gates remain required. Exact Nautilus `2.0.0rc6` uses the committed positive research manifest
+[nautilus_v2_research_tests.txt](../../scripts/nautilus_v2_research_tests.txt): 22 research owning
+files plus two CI/refusal regression files. Run the same bounded gate from `backend/`:
+
+```bash
+uv run python ../scripts/run_backend_ci.py -v --cov=msai
+```
+
+The launcher validates the actual installed version and nonempty, unique, existing test paths
+before replacing itself with pytest; both selection refusal and pytest failures propagate to CI.
+Unknown V2 releases fail closed. This replaces the previous full-backend pytest gate on RC6,
+including after merge to main. Legacy live and broader backend suite acceptance remain unverified;
+expand the measured positive manifest or complete live migration before claiming that coverage.
+The retained `1.x` full-suite route is unverified for the current V2 application source. Isolated
+actual 1.223 controls on repaired legacy modules certify only those module contracts, not a full
+V1 application or live acceptance. Native-independent helpers remain importable; legacy actors
+and config builders refuse V2 before unavailable V1 imports or construction.
+
 The baseline API, installed CLI and real-browser result/report/reload/history journey passed.
 RC6 isolated Linux startup and focused native configuration/catalog/runner checks have executed.
 The first candidate EMA job exposed a removed `Portfolio.is_flat` callback and is retained as

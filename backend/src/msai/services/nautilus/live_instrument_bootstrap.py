@@ -301,7 +301,7 @@ def _ibcontract_from_spec(spec: dict[str, object]) -> IBContract:
     from nautilus_trader.adapters.interactive_brokers.common import IBContract
 
     filtered = {k: v for k, v in spec.items() if k in _IB_CONTRACT_KWARGS}
-    return IBContract(**filtered)  # type: ignore[arg-type]
+    return IBContract(**filtered)
 
 
 def build_ib_instrument_provider_config_from_resolved(

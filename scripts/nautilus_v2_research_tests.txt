@@ -1,0 +1,26 @@
+# Exact Nautilus 2.0.0rc6 research acceptance. Paths are relative to backend/.
+# Legacy live and the broader backend suite are not certified by this manifest.
+tests/unit/test_nautilus_runtime_capabilities.py
+tests/unit/test_databento_client.py
+tests/unit/api/test_live_drain_partial_failure.py
+tests/unit/api/test_live_account_halt_check.py
+tests/unit/test_seed_research_fixture.py
+tests/unit/test_v2_strategy_config.py
+tests/unit/test_schema_hooks.py
+tests/unit/test_strategy_registry.py
+tests/unit/test_backtests_api.py
+tests/unit/services/nautilus/test_catalog_builder.py
+tests/unit/test_catalog_builder_streaming.py
+tests/unit/test_nautilus_backtest_runner.py
+tests/integration/test_nautilus_v2_research.py
+tests/integration/test_parity_config_roundtrip.py
+tests/unit/test_backtest_date_window.py
+tests/unit/test_backtest_job.py
+tests/unit/test_backtest_schemas.py
+tests/unit/test_report_generator.py
+tests/unit/test_research_accounting.py
+tests/unit/test_research_engine.py
+tests/unit/test_research_selection.py
+tests/unit/test_cli_research_selection.py
+tests/unit/test_v2_legacy_live_boundary.py
+tests/unit/test_backend_ci_suite.py

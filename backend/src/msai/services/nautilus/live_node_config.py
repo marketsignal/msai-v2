@@ -46,28 +46,9 @@ if TYPE_CHECKING:
     )
     from msai.services.nautilus.trading_node_subprocess import StrategyMemberPayload
 
-from nautilus_trader.adapters.interactive_brokers.common import IB_VENUE
-from nautilus_trader.adapters.interactive_brokers.config import (
-    InteractiveBrokersDataClientConfig,
-    InteractiveBrokersExecClientConfig,
-)
-from nautilus_trader.cache.config import CacheConfig
-from nautilus_trader.common.config import DatabaseConfig, MessageBusConfig
-from nautilus_trader.config import ImportableStrategyConfig
-from nautilus_trader.live.config import (
-    LiveDataEngineConfig,
-    LiveExecEngineConfig,
-    LiveRiskEngineConfig,
-    TradingNodeConfig,
-)
-from nautilus_trader.model.enums import TimeInForce
-from nautilus_trader.model.identifiers import TraderId
 from pydantic import BaseModel, Field
 
 from msai.core.config import settings
-from msai.services.nautilus.databento_live_config import (
-    build_databento_data_client_config,
-)
 from msai.services.nautilus.ib_port_validator import (
     validate_port_account_consistency,
 )
@@ -80,6 +61,34 @@ from msai.services.nautilus.live_instrument_bootstrap import (
     build_ib_instrument_provider_config,
     build_ib_instrument_provider_config_from_resolved,
 )
+from msai.services.nautilus.runtime_capabilities import (
+    is_v2_research_runtime,
+    require_live_runtime,
+)
+
+# Keep native-independent helpers importable, including the cold-reader import.
+# These are the actual V1 configs; RC6 cannot construct this live topology.
+if TYPE_CHECKING or not is_v2_research_runtime():
+    from nautilus_trader.adapters.interactive_brokers.common import IB_VENUE
+    from nautilus_trader.adapters.interactive_brokers.config import (
+        InteractiveBrokersDataClientConfig,
+        InteractiveBrokersExecClientConfig,
+    )
+    from nautilus_trader.cache.config import CacheConfig
+    from nautilus_trader.common.config import DatabaseConfig, MessageBusConfig
+    from nautilus_trader.config import ImportableStrategyConfig
+    from nautilus_trader.live.config import (  # type: ignore[attr-defined]  # Four V1-only exports; RC6 refuses construction.
+        LiveDataEngineConfig,
+        LiveExecEngineConfig,
+        LiveRiskEngineConfig,
+        TradingNodeConfig,
+    )
+    from nautilus_trader.model.enums import TimeInForce
+    from nautilus_trader.model.identifiers import TraderId
+
+    from msai.services.nautilus.databento_live_config import (
+        build_databento_data_client_config,
+    )
 
 # Re-export the role salt constants so legacy callers that imported them
 # from this module (or grepped for them here when wiring the live status
@@ -147,6 +156,7 @@ def _strategy_us_equity_tif_overrides(
       contains a US-equity member would otherwise miss the TIF=DAY
       override and re-trigger the IB error-10349 cancel-fill race.
     """
+    require_live_runtime("Legacy _strategy_us_equity_tif_overrides")
     ids: list[str] = []
     if isinstance(strategy_config.get("instruments"), list):
         ids.extend(str(x) for x in strategy_config["instruments"])
@@ -253,6 +263,7 @@ def build_per_account_strategy_configs(
     state-reload and the audit trail behave identically across the
     two topologies.
     """
+    require_live_runtime("Legacy build_per_account_strategy_configs")
     strategy_configs: list[ImportableStrategyConfig] = []
     for member in strategy_members:
         _parts = member.strategy_id_full.split("-", 1)
@@ -312,6 +323,7 @@ def build_redis_database_config() -> DatabaseConfig:
     ``settings.redis_url``. The URL form ``rediss://`` indicates
     TLS; ``redis://user:pass@host:port`` carries credentials.
     """
+    require_live_runtime("Legacy build_redis_database_config")
     parsed = urlparse(settings.redis_url)
     return DatabaseConfig(
         type="redis",
@@ -370,6 +382,7 @@ def _derive_trader_id(deployment_slug: str) -> TraderId:
     reload and the projection consumer's stream lookup (Codex Task 1.5
     iter2 P2 fix).
     """
+    require_live_runtime("Legacy _derive_trader_id")
     return TraderId(f"MSAI-{deployment_slug}")
 
 
@@ -450,6 +463,7 @@ def build_live_trading_node_config(
         ValueError: For empty ``paper_symbols``, unknown port,
             paper-port-with-live-account, or live-port-with-paper-account.
     """
+    require_live_runtime("Legacy build_live_trading_node_config")
     if not paper_symbols:
         raise ValueError(
             "paper_symbols must contain at least one symbol — a TradingNode "
@@ -473,7 +487,7 @@ def build_live_trading_node_config(
     exec_client_id = _derive_exec_client_id(deployment_slug)
 
     # Map the string config value to the Nautilus enum.
-    from nautilus_trader.adapters.interactive_brokers.config import (  # type: ignore[attr-defined]  # Nautilus 1.223 re-exports it but without __all__ entry
+    from nautilus_trader.adapters.interactive_brokers.config import (
         IBMarketDataTypeEnum,
     )
 
@@ -671,6 +685,7 @@ def build_portfolio_trading_node_config(
         ValueError: For empty ``strategy_members``, no instruments across
             all members, unknown port, or port/account mismatch.
     """
+    require_live_runtime("Legacy build_portfolio_trading_node_config")
     if not strategy_members:
         raise ValueError(
             "strategy_members must contain at least one member — a portfolio "
@@ -723,7 +738,7 @@ def build_portfolio_trading_node_config(
     exec_client_id = _derive_exec_client_id(deployment_slug)
 
     # Map the string config value to the Nautilus enum.
-    from nautilus_trader.adapters.interactive_brokers.config import (  # type: ignore[attr-defined]  # Nautilus 1.223 re-exports it but without __all__ entry
+    from nautilus_trader.adapters.interactive_brokers.config import (
         IBMarketDataTypeEnum,
     )
 
@@ -935,6 +950,7 @@ def build_per_account_trading_node_config(
             (gotcha #6), or the IB venue key would collide with the
             Databento client key.
     """
+    require_live_runtime("Legacy build_per_account_trading_node_config")
     # Defer-import locally so this module's import cost stays low and
     # so the new builder doesn't accidentally couple the legacy paths
     # to the Databento adapter at import time.
