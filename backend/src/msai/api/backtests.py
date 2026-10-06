@@ -67,7 +67,7 @@ router = APIRouter(prefix="/api/v1/backtests", tags=["backtests"])
 
 class StrategyConfigValidationError(Exception):
     """Raised by :func:`_prepare_and_validate_backtest_config` when the
-    user-submitted config fails ``StrategyConfig.parse()``.
+    user-submitted config fails the declared native user-field contract.
 
     Carries the structured 422 envelope that ``main.py``'s exception
     handler renders as a top-level ``{"error": {...}}`` JSON response
@@ -138,20 +138,16 @@ def _prepare_and_validate_backtest_config(
     Prep: inject the first canonical instrument into ``instrument_id`` /
     ``bar_type`` if missing — mirrors the worker's ``_prepare_strategy_config``.
 
-    Validation: load the strategy's ``*Config`` class via the name that
-    discovery persisted (``Strategy.config_class``), run
-    ``StrategyConfig.parse()`` on the prepared dict, and re-raise as
-    :class:`StrategyConfigValidationError` with the ``$.<field>`` path
-    extracted from msgspec so the frontend can highlight the bad field.
+    Validation: load the config class recorded by discovery, validate its
+    declared constructor fields with the shared user-field helper and construct
+    the native config. Field-specific errors let all clients correct the input.
 
-    Returns the prepared config dict on success. Validation is skipped when
-    ``config_class_name`` is ``None`` (strategy has no matching ``*Config``
-    class); the worker's auto-discovery still catches malformed payloads
-    at backtest-runner time.
+    Returns the prepared config dict on success. Missing config/source classes
+    refuse explicitly rather than enqueueing unvalidated configuration.
     """
-    import json
+    from pydantic import ValidationError
 
-    import msgspec
+    from msai.services.nautilus.schema_hooks import validate_strategy_config
 
     # --- Prep: inject canonical instruments to match worker behavior ---
     prepared = dict(config)
@@ -178,7 +174,11 @@ def _prepare_and_validate_backtest_config(
         # those choices. Surgical rewrite: replace just the instrument
         # prefix (everything before ``-<digit>``), preserving the rest.
         user_bar_type = prepared.get("bar_type")
-        if isinstance(user_bar_type, str) and "-" in user_bar_type:
+        if user_bar_type is not None:
+            if not isinstance(user_bar_type, str):
+                raise StrategyConfigValidationError(
+                    field="bar_type", message="bar_type must be a string"
+                )
             # The ``<step>`` segment is always numeric — split on the
             # first ``-<digit>`` boundary to find the instrument prefix.
             import re
@@ -188,8 +188,10 @@ def _prepare_and_validate_backtest_config(
                 _old_prefix, rest = m.group(1), m.group(2)
                 prepared["bar_type"] = f"{canonical_id}-{rest}"
             else:
-                # Unparseable — fall back to the canonical default.
-                prepared["bar_type"] = f"{canonical_id}-1-MINUTE-LAST-EXTERNAL"
+                raise StrategyConfigValidationError(
+                    field="bar_type",
+                    message="Invalid bar_type; use INSTRUMENT-STEP-AGGREGATION-PRICE-SOURCE",
+                )
         else:
             prepared["bar_type"] = f"{canonical_id}-1-MINUTE-LAST-EXTERNAL"
 
@@ -208,46 +210,32 @@ def _prepare_and_validate_backtest_config(
 
     # --- Locate config class ---
     if not config_class_name:
-        log.info(
-            "backtest_config_validation_skipped",
-            reason="no_config_class",
-            strategy_file=strategy_file_path,
+        raise StrategyConfigValidationError(
+            field=None, message="Strategy has no supported config class; refresh strategy discovery"
         )
-        return prepared
 
     strategy_path = resolve_strategy_file(strategy_file_path)
     if not strategy_path.exists():
-        log.warning(
-            "backtest_config_validation_skipped",
-            reason="strategy_file_missing",
-            file_path=strategy_file_path,
+        raise StrategyConfigValidationError(
+            field=None, message="Strategy source is unavailable; refresh strategy discovery"
         )
-        return prepared
 
     try:
         config_cls = load_strategy_class(strategy_path, config_class_name)
-    except ImportError:
-        log.info(
-            "backtest_config_validation_skipped",
-            reason="config_class_not_importable",
-            strategy_file=strategy_file_path,
-            config_class=config_class_name,
-        )
-        return prepared
+    except ImportError as exc:
+        raise StrategyConfigValidationError(
+            field=None, message="Strategy config cannot be imported; refresh strategy discovery"
+        ) from exc
 
-    # --- Parse ---
+    # --- Validate declared user fields, then construct the native config ---
     try:
-        config_cls.parse(json.dumps(prepared))
-    except msgspec.ValidationError as exc:
-        # msgspec format: "<reason> - at `$.<field>`". Strip backticks +
-        # leading "$." so the client receives a plain key (e.g.
-        # ``instrument_id``) matching ``schema.properties`` for inline rendering.
-        raw = str(exc)
-        field = None
-        if " - at " in raw:
-            _, _, path = raw.partition(" - at ")
-            field = path.strip().strip("`").removeprefix("$.").strip()
-        raise StrategyConfigValidationError(field=field, message=raw) from exc
+        validate_strategy_config(config_cls, prepared)
+    except ValidationError as exc:
+        error = exc.errors(include_input=False)[0]
+        field = str(error["loc"][0]) if error["loc"] else None
+        raise StrategyConfigValidationError(field=field, message=error["msg"]) from exc
+    except (ValueError, TypeError, NotImplementedError) as exc:
+        raise StrategyConfigValidationError(field=None, message=str(exc)) from exc
 
     return prepared
 
@@ -376,7 +364,7 @@ async def run_backtest(
         ) from exc
 
     # Validation happens AFTER instrument resolve so canonical IDs are
-    # injected before msgspec.parse — matches the worker's
+    # injected before user-field validation — matches the worker's
     # _prepare_strategy_config behavior.
     worker_config = _prepare_and_validate_backtest_config(
         worker_config,

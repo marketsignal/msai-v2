@@ -275,199 +275,28 @@ class TestLoadStrategyClass:
 # extraction must rely on:
 #
 #   (a) msgspec.json.schema(..., schema_hook=...) produces usable schema
-#       for an EMACrossConfig — integers/decimals/defaults/nullable fields
-#       render as expected; Nautilus ID types map to typed strings.
-#   (b) StrategyConfig.parse(json_str) is the canonical round-trip:
-#       string-shaped payloads decode into typed instances, unknown-format
-#       values raise msgspec.ValidationError with field-level paths
-#       suitable for 422 surfaces.
-#   (c) User-defined fields can be distinguished from 17 inherited
-#       StrategyConfig base-class fields via `__annotations__` so the
-#       renderer doesn't expose `manage_stop`, `order_id_tag`, etc.
-# ---------------------------------------------------------------------------
+# The native V2 constructor helper is now the authoritative user contract.
 
 
-# Mirror strategies/example/config.py at module scope so msgspec can
-# resolve the lazy `from __future__ import annotations` forward refs
-# against real class objects in the module's globals. Re-declaring
-# (rather than importing from the strategies package) avoids sys.path
-# coupling to the runtime registry's _ensure_strategies_importable hack.
-from decimal import Decimal as _SpikeDecimal  # noqa: E402
+class TestNativeUserSchemaFidelity:
+    """The user field boundary replaces the historical V1 Msgspec spike."""
 
-from nautilus_trader.model.data import BarType as _SpikeBarType  # noqa: E402
-from nautilus_trader.model.identifiers import InstrumentId as _SpikeInstrumentId  # noqa: E402
-from nautilus_trader.trading.config import StrategyConfig as _SpikeStrategyConfig  # noqa: E402
+    def test_user_schema_excludes_native_base_fields(self):
+        from strategies.example.config import EMACrossConfig
 
-InstrumentId = _SpikeInstrumentId
-BarType = _SpikeBarType
-Decimal = _SpikeDecimal
+        from msai.services.nautilus.schema_hooks import build_user_schema
 
-
-class _SpikeEMACrossConfig(_SpikeStrategyConfig, frozen=True):
-    instrument_id: InstrumentId
-    bar_type: BarType
-    fast_ema_period: int = 10
-    slow_ema_period: int = 30
-    trade_size: Decimal = Decimal("1")
-
-
-class TestMsgspecSchemaFidelitySpike:
-    """Council pre-gate — pin msgspec schema/parse behavior before building the renderer."""
-
-    @staticmethod
-    def _ema_cross_config() -> type:
-        return _SpikeEMACrossConfig
-
-    @staticmethod
-    def _nautilus_schema_hook(t: type) -> dict:
-        """Map Nautilus ID types to typed strings with format hints.
-
-        `msgspec.json.schema()` raises TypeError on any custom class unless
-        a schema_hook covers it. We map all Nautilus identifier classes to
-        `type: string` so the renderer can pick a text input; `InstrumentId`
-        and `BarType` get ``x-format`` + examples for nicer widgets later.
-        """
-        from nautilus_trader.model.data import BarType
-        from nautilus_trader.model.identifiers import (
-            AccountId,
-            ClientId,
-            ComponentId,
-            InstrumentId,
-            OrderListId,
-            PositionId,
-            StrategyId,
-            Symbol,
-            TraderId,
-            Venue,
-        )
-
-        if t is InstrumentId:
-            return {
-                "type": "string",
-                "title": "Instrument ID",
-                "x-format": "instrument-id",
-                "description": "SYMBOL.VENUE",
-                "examples": ["AAPL.NASDAQ", "EUR/USD.IDEALPRO"],
-            }
-        if t is BarType:
-            return {
-                "type": "string",
-                "title": "Bar Type",
-                "x-format": "bar-type",
-                "description": "INSTRUMENT_ID-STEP-AGGREGATION-PRICE_TYPE-SOURCE",
-                "examples": ["AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL"],
-            }
-        nautilus_id_types = (
-            StrategyId,
-            ComponentId,
-            Venue,
-            Symbol,
-            AccountId,
-            ClientId,
-            OrderListId,
-            PositionId,
-            TraderId,
-        )
-        if t in nautilus_id_types:
-            return {"type": "string", "title": t.__name__}
-        raise NotImplementedError(f"no schema hook for {t!r}")
-
-    def test_json_schema_extracts_with_nautilus_hook(self) -> None:
-        """schema_hook maps Nautilus IDs → typed strings; primitives render natively."""
-        import msgspec
-
-        config_cls = self._ema_cross_config()
-        schema = msgspec.json.schema(config_cls, schema_hook=self._nautilus_schema_hook)
-
-        ema_def = schema["$defs"][config_cls.__name__]
-        props = ema_def["properties"]
-
-        # Nautilus ID types → typed string with format hint
-        assert props["instrument_id"]["type"] == "string"
-        assert props["instrument_id"]["x-format"] == "instrument-id"
-        assert "AAPL.NASDAQ" in props["instrument_id"]["examples"]
-
-        assert props["bar_type"]["type"] == "string"
-        assert props["bar_type"]["x-format"] == "bar-type"
-
-        # Primitives with defaults
-        assert props["fast_ema_period"] == {"type": "integer", "default": 10}
-        assert props["slow_ema_period"] == {"type": "integer", "default": 30}
-        assert props["trade_size"] == {"type": "string", "format": "decimal", "default": "1"}
-
-    def test_json_schema_includes_inherited_base_fields(self) -> None:
-        """msgspec emits the whole struct including StrategyConfig base plumbing.
-
-        Pinning this behavior so the extractor knows to trim via
-        ``__annotations__`` — we do NOT want the form to expose
-        ``manage_stop``, ``order_id_tag``, etc. by default.
-        """
-        import msgspec
-
-        config_cls = self._ema_cross_config()
-        schema = msgspec.json.schema(config_cls, schema_hook=self._nautilus_schema_hook)
-        props = schema["$defs"][config_cls.__name__]["properties"]
-
-        inherited = {
-            "strategy_id",
-            "order_id_tag",
-            "use_uuid_client_order_ids",
-            "manage_stop",
-            "log_events",
-        }
-        assert inherited.issubset(props.keys()), (
-            "msgspec.json.schema emits all fields incl. inherited — trim via __annotations__"
-        )
-
-    def test_user_defined_fields_via_annotations(self) -> None:
-        """``EMACrossConfig.__annotations__`` lists only the 5 user-defined fields."""
-        config_cls = self._ema_cross_config()
-        own_fields = set(config_cls.__annotations__.keys())
-        assert own_fields == {
+        schema, defaults, status = build_user_schema(EMACrossConfig)
+        assert status == "ready"
+        assert set(schema["properties"]) == {
             "instrument_id",
             "bar_type",
             "fast_ema_period",
             "slow_ema_period",
             "trade_size",
         }
-
-    def test_strategy_config_parse_round_trip(self) -> None:
-        """StrategyConfig.parse(json_string) accepts string payloads → typed instances."""
-        from decimal import Decimal
-
-        from nautilus_trader.model.data import BarType
-        from nautilus_trader.model.identifiers import InstrumentId
-
-        config_cls = self._ema_cross_config()
-        payload = (
-            '{"instrument_id":"AAPL.NASDAQ",'
-            '"bar_type":"AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL",'
-            '"fast_ema_period":5,'
-            '"trade_size":"2.5"}'
-        )
-
-        instance = config_cls.parse(payload)
-
-        assert isinstance(instance.instrument_id, InstrumentId)
-        assert str(instance.instrument_id) == "AAPL.NASDAQ"
-        assert isinstance(instance.bar_type, BarType)
-        assert instance.fast_ema_period == 5
-        assert instance.slow_ema_period == 30  # default honored
-        assert isinstance(instance.trade_size, Decimal)
-        assert instance.trade_size == Decimal("2.5")
-
-    def test_strategy_config_parse_malformed_raises_field_level_error(self) -> None:
-        """Bad InstrumentId → msgspec.ValidationError with field path — usable for 422."""
-        import msgspec
-
-        config_cls = self._ema_cross_config()
-        bad_payload = '{"instrument_id":"garbage","bar_type":"AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL"}'
-
-        with pytest.raises(msgspec.ValidationError) as excinfo:
-            config_cls.parse(bad_payload)
-
-        # Field-level path is present in the message — renderable inline
-        assert "$.instrument_id" in str(excinfo.value)
+        assert defaults == {"fast_ema_period": 10, "slow_ema_period": 30, "trade_size": "1"}
+        assert schema["properties"]["trade_size"]["format"] == "decimal"
 
 
 # ---------------------------------------------------------------------------
@@ -744,9 +573,7 @@ class TestSyncStrategiesToDb:
         assert result == []
         assert row.deleted_at is None
 
-    async def test_sync_excludes_smoke_rows_from_file_discovery_prune(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_sync_excludes_smoke_rows_from_file_discovery_prune(self, tmp_path: Path) -> None:
         """Migration-seeded smoke rows are outside the filesystem registry lifecycle."""
         from msai.models.strategy import Strategy
         from msai.services.strategy_registry import sync_strategies_to_db

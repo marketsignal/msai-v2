@@ -29,20 +29,25 @@ node-side halt-gated in live (inert in backtests), and relies on
 
 from __future__ import annotations
 
-# Nautilus msgspec configs resolve field annotations at runtime via inspect,
-# so ``InstrumentId``/``BarType`` must be importable at module load.
-from nautilus_trader.model.data import Bar, BarType  # noqa: TC002
-from nautilus_trader.model.enums import OrderSide
-from nautilus_trader.model.events import OrderFilled  # noqa: TC002
-from nautilus_trader.model.identifiers import InstrumentId  # noqa: TC002
-from nautilus_trader.model.objects import Quantity
-from nautilus_trader.trading.config import StrategyConfig
-from nautilus_trader.trading.strategy import Strategy
+# The V2 candidate supports this strategy in research only; live is refused.
+from typing import Annotated, Any, Self
+
+# The user schema helper resolves constructor annotations at runtime.
+from nautilus_trader.model import (  # noqa: TC002
+    Bar,
+    BarType,
+    InstrumentId,
+    OrderFilled,
+    OrderSide,
+    Quantity,
+)
+from nautilus_trader.trading import Strategy, StrategyConfig
+from pydantic import Field
 
 from msai.services.nautilus.risk import RiskAwareStrategy
 
 
-class CycleBuySellConfig(StrategyConfig, frozen=True, kw_only=True):
+class CycleBuySellConfig(StrategyConfig):
     """Config for :class:`CycleBuySellStrategy`.
 
     ``cycle_bars`` is the number of bars between each BUY/SELL toggle (2 bars
@@ -52,14 +57,37 @@ class CycleBuySellConfig(StrategyConfig, frozen=True, kw_only=True):
     don't redeclare it).
     """
 
-    instrument_id: InstrumentId
-    bar_type: BarType
-    cycle_bars: int = 2
-    quantity: int = 1
-    manage_stop: bool = True
+    def __new__(cls, **kwargs: Any) -> Self:
+        # Native base fields are initialized before Python __init__ runs.
+        kwargs.setdefault("manage_stop", True)
+        return super().__new__(cls, **kwargs)
+
+    def __init__(
+        self,
+        *,
+        instrument_id: InstrumentId,
+        bar_type: BarType,
+        cycle_bars: Annotated[int, Field(gt=0, strict=True)] = 2,
+        quantity: Annotated[int, Field(gt=0, strict=True)] = 1,
+        manage_stop: bool = True,
+        order_id_tag: str | None = None,
+    ) -> None:
+        super().__init__()
+        self.instrument_id = (
+            InstrumentId.from_str(instrument_id)
+            if isinstance(instrument_id, str)
+            else instrument_id
+        )
+        self.bar_type = (
+            BarType.from_str(bar_type) if isinstance(bar_type, str) else bar_type
+        )
+        self.cycle_bars = cycle_bars
+        self.quantity = quantity
 
 
-class CycleBuySellStrategy(RiskAwareStrategy, Strategy):
+# RC6 modify_order uses ClientOrderId; the retained V1 live mixin uses order.
+# This mixin is unarmed in research; RC6 live is refused and we do not modify orders.
+class CycleBuySellStrategy(RiskAwareStrategy, Strategy):  # type: ignore[misc]
     """BUY then SELL ``quantity`` every ``cycle_bars`` bars, forever."""
 
     def __init__(self, config: CycleBuySellConfig) -> None:

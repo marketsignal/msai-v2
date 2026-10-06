@@ -24,53 +24,51 @@ Design (plan v9 decision #11):
 
 from __future__ import annotations
 
-# Nautilus msgspec configs resolve field annotations at runtime via
-# inspect, so ``InstrumentId``/``BarType`` must be importable at
-# module load, not only under ``TYPE_CHECKING``.
-from nautilus_trader.model.data import Bar, BarType  # noqa: TC002
-from nautilus_trader.model.enums import OrderSide
-from nautilus_trader.model.identifiers import InstrumentId  # noqa: TC002
-from nautilus_trader.model.objects import Quantity
-from nautilus_trader.trading.config import StrategyConfig
-from nautilus_trader.trading.strategy import Strategy
+# The V2 candidate supports this strategy in research only; live is refused.
+from typing import Any, Self
+
+# The user schema helper resolves constructor annotations at runtime.
+from nautilus_trader.model import Bar, BarType, InstrumentId, OrderSide, Quantity  # noqa: TC002
+from nautilus_trader.trading import Strategy, StrategyConfig
 
 from msai.services.nautilus.risk import RiskAwareStrategy
 
 
-class SmokeMarketOrderConfig(StrategyConfig, frozen=True, kw_only=True):
-    """Config for :class:`SmokeMarketOrderStrategy`.
+class SmokeMarketOrderConfig(StrategyConfig):
+    """Native config with required instrument/bar identity and stop cleanup.
 
-    ``instrument_id`` + ``bar_type`` are required. ``manage_stop`` and
-    ``order_id_tag`` are inherited from the base
-    :class:`nautilus_trader.trading.config.StrategyConfig` and injected at
-    runtime by ``build_live_trading_node_config`` (Task 1.10) with real
-    values; backtests rely on the base class default ``order_id_tag=None``.
-
-    Why we DON'T redeclare ``order_id_tag`` with a default of ``""``:
-    Nautilus's strategy constructor builds ``StrategyId`` as
-    ``f"{component_id}-{config.order_id_tag}"`` (``trading/strategy.pyx:149``).
-    An empty-string ``order_id_tag`` produces ``"SmokeMarketOrderStrategy-"``
-    which the Rust ``StrategyId`` validator rejects with
-    ``Condition failed: 'value' tag part (after '-') cannot be empty`` —
-    the subprocess panics before it can write a result pickle, so the
-    parent BacktestRunner sees an empty file and raises ``EOFError: Ran
-    out of input``. Leaving ``order_id_tag`` inherited (default ``None``)
-    produces ``"SmokeMarketOrderStrategy-None"`` which the validator
-    accepts, and production live deployments always inject a real value
-    via the live config builder.
-
-    ``kw_only=True`` is required because ``StrategyConfig`` (the base)
-    has fields with defaults, and msgspec refuses required positional
-    fields following optional ones. ``kw_only`` sidesteps the
-    ordering constraint entirely.
+    Native base fields are initialized by __new__. Keep manage_stop=True there
+    as well as in the declared user defaults; order_id_tag remains native
+    plumbing and uses None unless explicitly supplied by an owning runtime.
     """
 
-    instrument_id: InstrumentId
-    bar_type: BarType
-    manage_stop: bool = True
+    def __new__(cls, **kwargs: Any) -> Self:
+        # Native base fields are initialized before Python __init__ runs.
+        kwargs.setdefault("manage_stop", True)
+        return super().__new__(cls, **kwargs)
+
+    def __init__(
+        self,
+        *,
+        instrument_id: InstrumentId,
+        bar_type: BarType,
+        manage_stop: bool = True,
+        order_id_tag: str | None = None,
+    ) -> None:
+        super().__init__()
+        self.instrument_id = (
+            InstrumentId.from_str(instrument_id)
+            if isinstance(instrument_id, str)
+            else instrument_id
+        )
+        self.bar_type = (
+            BarType.from_str(bar_type) if isinstance(bar_type, str) else bar_type
+        )
 
 
-class SmokeMarketOrderStrategy(RiskAwareStrategy, Strategy):
+# RC6 modify_order uses ClientOrderId; the retained V1 live mixin uses order.
+# This mixin is unarmed in research; RC6 live is refused and we do not modify orders.
+class SmokeMarketOrderStrategy(RiskAwareStrategy, Strategy):  # type: ignore[misc]
     """Submits exactly ONE market-order buy on the first bar received.
 
     After the single order is submitted the strategy sits idle forever
@@ -123,7 +121,7 @@ class SmokeMarketOrderStrategy(RiskAwareStrategy, Strategy):
     # ``on_bar``) so unit tests can subclass and override it without
     # touching Nautilus's Cython slot attributes. Production always
     # uses the real ``order_factory.market`` path.
-    def _build_market_order(self):  # type: ignore[no-untyped-def]
+    def _build_market_order(self) -> Any:
         return self.order_factory.market(
             instrument_id=self.instrument_id,
             order_side=OrderSide.BUY,

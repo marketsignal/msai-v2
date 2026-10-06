@@ -62,6 +62,7 @@ from msai.services.nautilus.projection.reconnect_reader import (
     load_open_orders_for_deployment,
     load_recent_trades_for_deployment,
 )
+from msai.services.nautilus.runtime_capabilities import is_v2_research_runtime
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -325,6 +326,10 @@ async def live_stream(
 
     claims = await _authenticate(websocket)
     if claims is None:
+        return
+
+    if is_v2_research_runtime():
+        await websocket.close(code=4503, reason="Research-only runtime: live stream unsupported")
         return
 
     deployment = await _load_deployment(deployment_id)

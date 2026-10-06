@@ -320,26 +320,25 @@ class TestPrepareAndValidateBacktestConfig:
         assert prepared["instrument_id"] == "AAPL.NASDAQ"
         assert prepared["bar_type"] == "AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL"
 
-    def test_skips_validation_gracefully_when_no_config_class(self, tmp_path: Path) -> None:
-        """Legacy strategies without a matching ``*Config`` class don't
-        block the run path — worker still catches bad payloads downstream.
-        The API passes ``config_class_name=None`` for those strategies."""
+    def test_refuses_unvalidated_config_when_no_config_class(self, tmp_path: Path) -> None:
+        """An absent config class must never enqueue unvalidated configuration."""
 
-        from msai.api.backtests import _prepare_and_validate_backtest_config
+        from msai.api.backtests import (
+            StrategyConfigValidationError,
+            _prepare_and_validate_backtest_config,
+        )
 
         # Path doesn't matter — the None path short-circuits before load.
         bogus = tmp_path / "no_such_strategy.py"
         bogus.write_text("# empty\n", encoding="utf-8")
 
-        prepared = _prepare_and_validate_backtest_config(
-            {"anything": 1},
-            strategy_file_path=str(bogus),
-            config_class_name=None,
-            canonical_instruments=[],
-        )
-
-        # Returns the config unchanged (no canonical_instruments → no inject)
-        assert prepared == {"anything": 1}
+        with pytest.raises(StrategyConfigValidationError, match="no supported config class"):
+            _prepare_and_validate_backtest_config(
+                {"anything": 1},
+                strategy_file_path=str(bogus),
+                config_class_name=None,
+                canonical_instruments=[],
+            )
 
     def test_rejects_config_class_that_uses_nonstandard_naming(self) -> None:
         """Regression for Codex code-review P1 2026-04-21: the helper

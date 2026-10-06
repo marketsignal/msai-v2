@@ -40,10 +40,12 @@ import socket
 import sys
 from datetime import UTC, datetime
 from decimal import Decimal
+from hashlib import sha256
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from datetime import date
+    from pathlib import Path
 
 import pandas as pd
 
@@ -356,6 +358,8 @@ async def _execute_backtest(
         instruments=instrument_ids,
         data_path=str(settings.parquet_root),
     )
+    fixture_provenance = _fixture_provenance(settings.data_root, lineage_snapshot)
+    lineage_snapshot.update(fixture_provenance)
     python_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     try:
         import nautilus_trader  # noqa: WPS433
@@ -387,6 +391,9 @@ async def _execute_backtest(
         catalog_path=settings.nautilus_catalog_root,
         timeout_seconds=settings.backtest_timeout_seconds,
     )
+
+    if result.accounting is not None:
+        result.accounting.update(fixture_provenance)
 
     # --- Generate QuantStats report -----------------------------------------
     returns_series = _extract_returns_series(result.account_df)
@@ -723,14 +730,14 @@ def _prepare_strategy_config(
         # backtests.py::_prepare_and_validate_backtest_config`` for the
         # rationale (Codex P1 catch, PR #61 round 4).
         user_bar_type = prepared.get("bar_type")
-        if isinstance(user_bar_type, str) and "-" in user_bar_type:
-            import re
-
+        if user_bar_type is not None:
+            if not isinstance(user_bar_type, str):
+                raise ValueError("bar_type must be a string")
             m = re.match(r"^(.+?)-(\d.*)$", user_bar_type)
             if m is not None:
                 prepared["bar_type"] = f"{canonical_id}-{m.group(2)}"
             else:
-                prepared["bar_type"] = f"{canonical_id}-1-MINUTE-LAST-EXTERNAL"
+                raise ValueError("Invalid bar_type; use INSTRUMENT-STEP-AGGREGATION-PRICE-SOURCE")
         else:
             prepared["bar_type"] = f"{canonical_id}-1-MINUTE-LAST-EXTERNAL"
 
@@ -858,6 +865,35 @@ def _fill_money(value: object, field: str) -> Decimal | None:
     return _fill_decimal(parts[0], field)
 
 
+def _fixture_provenance(data_root: Path, snapshot: dict[str, Any]) -> dict[str, str]:
+    """Label only data covered by the documented, content-verified fixture manifest."""
+    manifest_path = data_root / "research-fixture-manifest.json"
+    if not manifest_path.exists():
+        return {}  # Unmarked data has unknown origin, including legacy results.
+    content = manifest_path.read_bytes()
+    manifest = json.loads(content)
+    if manifest.get("origin") != "synthetic" or not manifest.get("fixture_id"):
+        raise ValueError("Invalid research fixture manifest")
+    files = snapshot.get("files", [])
+    if not files or snapshot.get("file_count", len(files)) != len(files):
+        return {}
+    records = {record["path"]: record["sha256"] for record in manifest["files"]}
+    for file in files:
+        relative = "parquet/" + file["path"]
+        if relative not in records:
+            return {}
+        source = (data_root / relative).resolve()
+        if not source.is_relative_to(data_root.resolve()):
+            raise ValueError("Invalid fixture source path")
+        if sha256(source.read_bytes()).hexdigest() != records[relative]:
+            raise ValueError("Research fixture data hash mismatch")
+    return {
+        "data_origin": "synthetic",
+        "fixture_id": manifest["fixture_id"],
+        "fixture_manifest_sha256": sha256(content).hexdigest(),
+    }
+
+
 def _add_accounting_notice(
     html: str,
     accounting: dict[str, Any] | None,
@@ -875,6 +911,33 @@ def _add_accounting_notice(
         "Daily statistics use observed UTC balance dates, not a verified exchange calendar. "
         "Zero risk statistics can mean insufficient observations or zero variation.</p></section>"
     )
+    recorded = {
+        "Engine": "engine_version",
+        "Leverage": "leverage",
+        "Fee model": "fee_model",
+        "Commission per fill (USD)": "commission_per_fill",
+        "Fill model": "fill_model",
+        "Fill seed": "fill_seed",
+        "Random slippage probability": "slippage_probability",
+        "Execution assumptions": "execution_assumptions",
+        "Data origin": "data_origin",
+        "Fixture": "fixture_id",
+        "Fixture manifest SHA256": "fixture_manifest_sha256",
+    }
+    details = [
+        f"{label}: {html_lib.escape(str(accounting[key]))}"
+        for label, key in recorded.items()
+        if accounting.get(key) is not None
+    ]
+    if details:
+        notice += "<section><h2>Recorded run assumptions</h2><p>" + "; ".join(details) + ".</p>"
+        if accounting.get("data_origin") == "synthetic":
+            notice += (
+                "<p>Synthetic minute-equity fixture using UTC weekdays, not exchange sessions. "
+                "This verifies research plumbing; it does not validate alpha, realistic costs, "
+                "portfolio funding or live-capital readiness.</p>"
+            )
+        notice += "</section>"
     if metrics is not None:
         headlines = {
             "Cumulative Return": _report_percent(metrics["total_return"]),

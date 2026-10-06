@@ -58,6 +58,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from msai.services.nautilus.runtime_capabilities import require_live_runtime
+
+if not TYPE_CHECKING:
+    require_live_runtime("Legacy symbology actor")
+
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.common.config import ActorConfig
 from nautilus_trader.model.data import Bar, BarType
@@ -68,7 +73,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
-class SymbologyShimActorConfig(ActorConfig, frozen=True):
+class SymbologyShimActorConfig(ActorConfig, frozen=True):  # type: ignore[misc, call-arg]  # V1 native config is unavailable in RC6; runtime refuses before this definition.
     """Configuration schema for :class:`SymbologyShimActor`.
 
     Inherits from Nautilus :class:`ActorConfig` so the kernel's

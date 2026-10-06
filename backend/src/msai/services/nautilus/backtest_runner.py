@@ -22,19 +22,28 @@ avoids pipe deadlocks.
 
 from __future__ import annotations
 
+import importlib
+import inspect
 import math
 import multiprocessing as mp
 import pickle
 import re
 import tempfile
 import traceback
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from decimal import Decimal
+from functools import wraps
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pandas as pd
 
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
 from msai.services.analytics_math import compute_series_metrics, normalize_daily_returns
+from msai.services.nautilus.schema_hooks import validate_strategy_config
 from msai.services.nautilus.strategy_loader import resolve_importable_strategy_paths
 
 # NautilusTrader is heavy (pulls in Rust extensions).  We import eagerly
@@ -42,15 +51,23 @@ from msai.services.nautilus.strategy_loader import resolve_importable_strategy_p
 # always needs Nautilus.  Any import error is captured so the subprocess
 # can report it cleanly instead of crashing opaquely.
 try:
-    from nautilus_trader.backtest.config import (
+    from nautilus_trader.backtest import BacktestNode
+    from nautilus_trader.config import (
         BacktestDataConfig,
         BacktestEngineConfig,
         BacktestRunConfig,
         BacktestVenueConfig,
+        ImportableStrategyConfig,
     )
-    from nautilus_trader.backtest.node import BacktestNode
-    from nautilus_trader.model.identifiers import Venue
-    from nautilus_trader.trading.config import ImportableStrategyConfig
+    from nautilus_trader.execution import DefaultFillModel, FixedFeeModel
+    from nautilus_trader.model import (
+        BarType,
+        Currency,
+        InstrumentId,
+        Money,
+        NautilusDataType,
+        Venue,
+    )
 
     _NAUTILUS_IMPORT_ERROR: Exception | None = None
 except Exception as exc:  # pragma: no cover - environment-specific
@@ -63,7 +80,6 @@ except Exception as exc:  # pragma: no cover - environment-specific
 # its venue suffix). A backtest spanning multiple venues gets one
 # ``BacktestVenueConfig`` per unique venue, which matches how
 # Nautilus's ``BacktestNode`` wires the engine.
-_DEFAULT_STARTING_BALANCE = "1000000 USD"
 _CALENDAR_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _DAY_NANOSECONDS = 86_400_000_000_000
 
@@ -153,6 +169,8 @@ class _RunPayload:
     end_date: str
     catalog_path: str
     result_path: str = ""
+    initial_capital: float = 1_000_000.0
+    commission_per_fill: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +196,8 @@ class BacktestRunner:
         catalog_path: Path,
         *,
         timeout_seconds: int = 30 * 60,
+        initial_capital: float = 1_000_000.0,
+        commission_per_fill: float = 0.0,
     ) -> BacktestResult:
         """Execute a backtest and return a :class:`BacktestResult`.
 
@@ -212,6 +232,8 @@ class BacktestRunner:
             start_date=start_date,
             end_date=end_date,
             catalog_path=str(catalog_path),
+            initial_capital=initial_capital,
+            commission_per_fill=commission_per_fill,
         )
 
         # Create a tempfile for the subprocess to write its result into.
@@ -265,13 +287,21 @@ class BacktestRunner:
             if not bool(raw.get("ok")):
                 raise RuntimeError(str(raw.get("error", "Unknown backtest failure")))
 
+            if (
+                not isinstance(raw.get("metrics"), dict)
+                or not isinstance(raw.get("accounting"), dict)
+                or not raw.get("account")
+                or any(key not in raw for key in ("orders", "fills", "positions"))
+            ):
+                raise RuntimeError("Incomplete native backtest result or reports")
+
             return BacktestResult(
                 orders_df=pd.DataFrame(raw.get("orders", [])),
                 fills_df=pd.DataFrame(raw.get("fills", [])),
                 accounting=raw.get("accounting"),
                 positions_df=pd.DataFrame(raw.get("positions", [])),
                 account_df=pd.DataFrame(raw.get("account", [])),
-                metrics=cast("dict[str, float | int]", raw.get("metrics", _zero_metrics())),
+                metrics=cast("dict[str, float | int]", raw["metrics"]),
             )
         finally:
             if result_path.exists():
@@ -305,83 +335,82 @@ def _run_in_subprocess(payload: _RunPayload) -> None:
         return
 
     try:
-        run_config = _build_backtest_run_config(payload)
-        node = BacktestNode([run_config])
-        try:
-            results = node.run()
+        with _capture_strategy_callback_failures(payload.strategy_file) as callback_errors:
+            run_config = _build_backtest_run_config(payload)
+            node = BacktestNode([run_config])
+            try:
+                node.build()
+                node.add_strategy_from_config(run_config.id, _build_strategy_config(payload))
+                results = node.run()
+                if callback_errors:
+                    raise RuntimeError(callback_errors[0])
 
-            # No results at all -- Nautilus treated the window as empty.
-            if not results:
-                _write_subprocess_result(
-                    payload.result_path,
-                    {
-                        "ok": True,
-                        "orders": [],
-                        "positions": [],
-                        "account": [],
-                        "metrics": _zero_metrics(),
-                    },
+                # No results at all -- Nautilus treated the window as empty.
+                if len(results) != 1:
+                    raise RuntimeError("Native backtest did not produce exactly one result")
+
+                primary = results[0]
+                run_config_id = run_config.id
+                if int(primary.iterations) == 0:
+                    raise RuntimeError("Native backtest processed no bars for the requested window")
+
+                # The venue kwarg is REQUIRED on ``generate_account_report()``
+                # (gotcha #2). Phase 2 task 2.9: derive per-venue account
+                # reports and concatenate them for multi-venue backtests.
+                orders_df = _normalize_native_report(node.generate_orders_report(run_config_id))
+                fills_df = _normalize_native_report(node.generate_fills_report(run_config_id))
+                if not fills_df.empty:
+                    fills_df = fills_df.sort_values("ts_event", kind="stable")
+                positions_df = _normalize_native_report(
+                    node.generate_positions_report(run_config_id)
                 )
-                return
-
-            primary = results[0]
-            run_config_id = getattr(primary, "run_config_id", None)
-            engine = node.get_engine(run_config_id) if run_config_id else None
-
-            if engine is None:
-                # Backtest completed but we can't fish out the engine --
-                # return the stats we have without trade-level detail.
-                _write_subprocess_result(
-                    payload.result_path,
-                    {
-                        "ok": True,
-                        "orders": [],
-                        "positions": [],
-                        "account": [],
-                        "metrics": _extract_metrics(primary, pd.DataFrame(), pd.DataFrame()),
-                    },
+                venue_names = _extract_venues_from_instrument_ids(payload.instrument_ids)
+                account_frames = []
+                opening_balances: dict[str, float] = {}
+                for venue_name, venue_config in zip(venue_names, run_config.venues, strict=True):
+                    frame = node.generate_account_report(run_config_id, venue=Venue(venue_name))
+                    if not isinstance(frame, pd.DataFrame):
+                        raise RuntimeError(f"Missing native account report for {venue_name}")
+                    if frame.empty or "account_id" not in frame:
+                        raise ValueError(f"Missing opening account report for {venue_name}")
+                    account_ids = frame["account_id"].dropna().astype(str).unique()
+                    if len(account_ids) != 1 or account_ids[0] in opening_balances:
+                        raise ValueError("Ambiguous account identity in backtest report")
+                    balances = venue_config.starting_balances
+                    if len(balances) != 1:
+                        raise ValueError("Backtest accounting supports one USD balance per account")
+                    amount, currency = str(balances[0]).split()
+                    if currency != "USD":
+                        raise ValueError("Backtest accounting supports USD only")
+                    opening_balances[account_ids[0]] = float(amount)
+                    account_frames.append(frame)
+                account_df = pd.concat(account_frames) if account_frames else pd.DataFrame()
+                account_payload = _compact_account_report(
+                    account_df, opening_balances=opening_balances
                 )
-                return
+                accounting = {
+                    "version": 1,
+                    "basis": "realized_account_balance",
+                    "initial_capital": sum(opening_balances.values()),
+                    "currency": "USD",
+                    "costs": "engine_recorded",
+                    "engine_version": __import__("nautilus_trader").__version__,
+                    "leverage": 1.0,
+                    "fee_model": "FixedFeeModel",
+                    "commission_per_fill": float(
+                        Money(payload.commission_per_fill, Currency.from_str("USD")).as_decimal()
+                    ),
+                    "fill_model": "DefaultFillModel",
+                    "fill_seed": 42,
+                    "slippage_probability": 0.0,
+                    "execution_assumptions": (
+                        "L1 bar execution; LAST/MID bars synthesize equal bid/ask trade prices "
+                        "with OHLC quarter-volume legs; exhausted displayed L1 size can fill "
+                        "residual one tick worse independently of random slippage"
+                    ),
+                }
 
-            # The venue kwarg is REQUIRED on ``generate_account_report()``
-            # (gotcha #2). Phase 2 task 2.9: derive per-venue account
-            # reports and concatenate them for multi-venue backtests.
-            orders_df = engine.trader.generate_orders_report()
-            fills_df = engine.trader.generate_fills_report()
-            if not fills_df.empty:
-                fills_df = fills_df.reset_index().sort_values("ts_event", kind="stable")
-            positions_df = engine.trader.generate_positions_report()
-            venue_names = _extract_venues_from_instrument_ids(payload.instrument_ids)
-            account_frames = []
-            opening_balances: dict[str, float] = {}
-            for venue_name, venue_config in zip(venue_names, run_config.venues, strict=True):
-                frame = engine.trader.generate_account_report(venue=Venue(venue_name))
-                if frame.empty or "account_id" not in frame:
-                    raise ValueError(f"Missing opening account report for {venue_name}")
-                account_ids = frame["account_id"].dropna().astype(str).unique()
-                if len(account_ids) != 1 or account_ids[0] in opening_balances:
-                    raise ValueError("Ambiguous account identity in backtest report")
-                balances = venue_config.starting_balances
-                if len(balances) != 1:
-                    raise ValueError("Backtest accounting supports one USD balance per account")
-                amount, currency = str(balances[0]).split()
-                if currency != "USD":
-                    raise ValueError("Backtest accounting supports USD only")
-                opening_balances[account_ids[0]] = float(amount)
-                account_frames.append(frame)
-            account_df = pd.concat(account_frames) if account_frames else pd.DataFrame()
-            account_payload = _compact_account_report(account_df, opening_balances=opening_balances)
-            accounting = {
-                "version": 1,
-                "basis": "realized_account_balance",
-                "initial_capital": sum(opening_balances.values()),
-                "currency": "USD",
-                "costs": "engine_recorded",
-            }
-
-            _write_subprocess_result(
-                payload.result_path,
-                {
+                success_payload = {
                     "ok": True,
                     "orders": orders_df.to_dict(orient="records"),
                     "fills": fills_df.to_dict(orient="records"),
@@ -389,12 +418,14 @@ def _run_in_subprocess(payload: _RunPayload) -> None:
                     "positions": positions_df.to_dict(orient="records"),
                     "account": account_payload.to_dict(orient="records"),
                     "metrics": _extract_metrics(primary, fills_df, account_payload, positions_df),
-                },
-            )
-        finally:
-            # ``dispose`` is not in Nautilus's public type stubs so we
-            # cast to ``Any`` to keep mypy happy.
-            cast("Any", node).dispose()
+                }
+            finally:
+                # ``dispose`` is not in Nautilus's public type stubs so we
+                # cast to ``Any`` to keep mypy happy.
+                cast("Any", node).dispose()
+            if callback_errors:
+                raise RuntimeError(callback_errors[0])
+            _write_subprocess_result(payload.result_path, success_payload)
     except Exception:
         _write_subprocess_result(
             payload.result_path,
@@ -402,10 +433,63 @@ def _run_in_subprocess(payload: _RunPayload) -> None:
         )
 
 
+@contextmanager
+def _capture_strategy_callback_failures(strategy_file: str) -> Iterator[list[str]]:
+    """Attribute Python callback failures which RC6's native actor only logs.
+
+    Runs only inside the fresh execution child. Native execution and its original
+    exception logging remain intact; failed runs never publish result reports.
+    """
+    paths = resolve_importable_strategy_paths(strategy_file)
+    module_name, class_name = paths.strategy_path.split(":", 1)
+    strategy_cls = getattr(importlib.import_module(module_name), class_name)
+    failures: list[str] = []
+    callbacks = {
+        name: callback
+        for name, callback in inspect.getmembers(strategy_cls, inspect.isfunction)
+        if name.startswith("on_")
+    }
+    own_names = set(strategy_cls.__dict__)
+
+    def wrap(callback: Callable[..., Any]) -> Callable[..., Any]:
+        @wraps(callback)
+        def guarded(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return callback(*args, **kwargs)
+            except Exception:
+                if not failures:
+                    failures.append(
+                        f"Strategy callback {callback.__name__} failed:\n{traceback.format_exc()}"
+                    )
+                raise
+
+        return guarded
+
+    try:
+        for name, callback in callbacks.items():
+            setattr(strategy_cls, name, wrap(callback))
+        yield failures
+    finally:
+        for name, callback in callbacks.items():
+            if name in own_names:
+                setattr(strategy_cls, name, callback)
+            else:
+                delattr(strategy_cls, name)
+
+
 def _write_subprocess_result(result_path: str, payload: dict[str, Any]) -> None:
     """Write the subprocess result to a pickle file at ``result_path``."""
     with Path(result_path).open("wb") as handle:
         pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _normalize_native_report(frame: object) -> pd.DataFrame:
+    """Keep native report identities that may be carried by the pandas index."""
+    if not isinstance(frame, pd.DataFrame):
+        raise RuntimeError("Missing native backtest report")
+    if frame.index.name is not None and frame.index.name not in frame.columns:
+        return frame.reset_index()
+    return frame
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +535,42 @@ def _normalize_backtest_window(start: str, end: str) -> tuple[int, int]:
     return bounds[0], bounds[1]
 
 
+def _run_bar_type(instrument_id: str) -> BarType:
+    """The complete native bar type emitted by this bounded minute-data run."""
+    return BarType.from_str(f"{InstrumentId.from_str(instrument_id)}-1-MINUTE-LAST-EXTERNAL")
+
+
+def _build_strategy_config(payload: _RunPayload) -> ImportableStrategyConfig:
+    paths = resolve_importable_strategy_paths(payload.strategy_file)
+    module_name, class_name = paths.config_path.split(":", 1)
+    config_cls = getattr(importlib.import_module(module_name), class_name)
+    if not payload.instrument_ids:
+        raise ValueError("Backtest requires at least one instrument")
+    instrument_id = InstrumentId.from_str(payload.instrument_ids[0])
+    run_bar_type = _run_bar_type(payload.instrument_ids[0])
+    prepared = dict(payload.strategy_config)
+    # Research trials contain operator parameters only. Supply the identities
+    # of this minute-bar run, preserving explicit values for validation/refusal.
+    prepared.setdefault("instrument_id", str(instrument_id))
+    prepared.setdefault("bar_type", str(run_bar_type))
+    native_config = validate_strategy_config(config_cls, prepared)
+    if str(native_config.instrument_id) != str(instrument_id):
+        raise ValueError("Strategy instrument_id must match the backtest instrument")
+    if BarType.from_str(str(native_config.bar_type)) != run_bar_type:
+        raise ValueError(f"Strategy bar_type must match the backtest data: {run_bar_type}")
+    normalized = {}
+    for key in prepared:
+        value = getattr(native_config, key)
+        normalized[key] = (
+            str(value) if isinstance(value, (Decimal, InstrumentId, BarType)) else value
+        )
+    return ImportableStrategyConfig(
+        strategy_path=paths.strategy_path,
+        config_path=paths.config_path,
+        config=normalized,
+    )
+
+
 def _build_backtest_run_config(payload: _RunPayload) -> BacktestRunConfig:
     """Translate a :class:`_RunPayload` into a Nautilus ``BacktestRunConfig``.
 
@@ -459,14 +579,13 @@ def _build_backtest_run_config(payload: _RunPayload) -> BacktestRunConfig:
     needing to spin up a subprocess.
     """
     start_ns, end_ns = _normalize_backtest_window(payload.start_date, payload.end_date)
-    paths = resolve_importable_strategy_paths(payload.strategy_file)
-
-    strategy_config = ImportableStrategyConfig(
-        strategy_path=paths.strategy_path,
-        config_path=paths.config_path,
-        config=payload.strategy_config,
-    )
-    engine_config = BacktestEngineConfig(strategies=[strategy_config])
+    _build_strategy_config(payload)
+    engine_config = BacktestEngineConfig()
+    if not math.isfinite(payload.initial_capital) or payload.initial_capital <= 0:
+        raise ValueError("Initial capital must be positive and finite")
+    if not math.isfinite(payload.commission_per_fill) or payload.commission_per_fill < 0:
+        raise ValueError("Commission per fill must be nonnegative and finite")
+    usd = Currency.from_str("USD")
 
     # Phase 2 task 2.9: one BacktestVenueConfig per unique venue
     # in the instruments list. A single-venue equity backtest
@@ -481,16 +600,22 @@ def _build_backtest_run_config(payload: _RunPayload) -> BacktestRunConfig:
             name=venue_name,
             oms_type="NETTING",
             account_type="MARGIN",
-            starting_balances=[_DEFAULT_STARTING_BALANCE],
-            base_currency="USD",
+            starting_balances=[f"{payload.initial_capital} USD"],
+            base_currency=usd,
+            default_leverage=Decimal(1),
+            fee_model=FixedFeeModel(
+                Money(payload.commission_per_fill, usd), charge_commission_once=False
+            ),
+            fill_model=DefaultFillModel(prob_fill_on_limit=1.0, prob_slippage=0.0, random_seed=42),
         )
         for venue_name in venue_names
     ]
 
     data_config = BacktestDataConfig(
         catalog_path=payload.catalog_path,
-        data_cls="nautilus_trader.model.data:Bar",
-        instrument_ids=payload.instrument_ids,
+        data_type=NautilusDataType.Bar,
+        instrument_ids=[InstrumentId.from_str(value) for value in payload.instrument_ids],
+        bar_types=[str(_run_bar_type(value)) for value in payload.instrument_ids],
         start_time=start_ns,
         end_time=end_ns,
     )
@@ -744,20 +869,3 @@ def _nan_safe(value: float) -> float:
     if not math.isfinite(value):
         return 0.0
     return value
-
-
-def _zero_metrics() -> dict[str, float | int]:
-    """Return a fresh zero-valued metrics dict.
-
-    Used when a backtest completes successfully but produced zero bars
-    or zero trades -- callers should still see every expected metric key.
-    """
-    return {
-        "sharpe_ratio": 0.0,
-        "sortino_ratio": 0.0,
-        "max_drawdown": 0.0,
-        "total_return": 0.0,
-        "win_rate": 0.0,
-        "num_trades": 0,
-        "num_fills": 0,
-    }

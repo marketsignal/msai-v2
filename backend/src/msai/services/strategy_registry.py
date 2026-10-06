@@ -8,7 +8,7 @@ What changed vs. the Phase-1 registry
 -------------------------------------
 The earlier registry assumed plain-Python strategies that could be
 constructed with ``cls()`` (no arguments).  Nautilus strategies require a
-matching :class:`~nautilus_trader.trading.config.StrategyConfig` subclass
+matching :class:`~nautilus_trader.trading.StrategyConfig` subclass
 passed to the constructor, so we now:
 
 1. **Import** each candidate module (instead of AST-scanning it) so we can
@@ -84,10 +84,10 @@ class DiscoveredStrategy:
         config_schema: JSON Schema describing the user-defined fields of
             the strategy's ``*Config`` class. ``None`` iff
             ``config_schema_status != "ready"``. Trimmed to
-            ``__annotations__`` keys — inherited ``StrategyConfig`` base
+            explicit constructor fields — inherited ``StrategyConfig`` base
             plumbing is NOT included. Populated by
             :func:`build_user_schema`.
-        default_config: Map of field name → default value (msgspec-encoded
+        default_config: Map of field name → default value (JSON-encoded
             form) for fields that declare one. Fields without defaults
             are omitted. ``None`` iff ``config_schema_status != "ready"``.
         config_schema_status: One of ``"ready" | "unsupported" |
@@ -394,7 +394,7 @@ def _find_strategy_class(module: ModuleType) -> type | None:
     """
     nautilus_base: type | None
     try:
-        from nautilus_trader.trading.strategy import Strategy as _NautilusBase
+        from nautilus_trader.trading import Strategy as _NautilusBase
 
         nautilus_base = _NautilusBase
     except Exception:
@@ -429,22 +429,14 @@ def _find_config_class(module: ModuleType) -> type | None:
     Returns:
         The matching config class, or ``None`` if none was found.
     """
-    # Mirror `_find_strategy_class`: prefer a ``*Config`` class DEFINED
-    # in the target module. Without this filter, an alphabetically-late
-    # user-defined config (e.g. ``ZetaConfig``) loses to any imported
-    # base class (``StrategyConfig``, ``LiveExecEngineConfig``) whose
-    # name happens to end with "config". Nautilus ``StrategyConfig``'s
-    # base class IS hit by the old logic on strategies that
-    # ``from nautilus_trader.trading.config import StrategyConfig``
-    # + define a late-alphabetical subclass.
-    #
-    # Fallback to imported classes (the original behavior) ONLY if no
-    # same-module match exists — covers the "strategies.example.config"
-    # split-module case this helper's docstring flags.
+    # Prefer a native config defined in the target module. Imported sibling
+    # configs are valid fallbacks, but the native base itself is never a match.
+    from nautilus_trader.trading import StrategyConfig as NautilusBase
+
     same_module: type | None = None
     imported_fallback: type | None = None
     for _, cls in inspect.getmembers(module, inspect.isclass):
-        if not (cls.__name__.lower().endswith("config") and hasattr(cls, "parse")):
+        if cls is NautilusBase or not issubclass(cls, NautilusBase):
             continue
         if cls.__module__ == module.__name__:
             if same_module is None:
@@ -453,19 +445,7 @@ def _find_config_class(module: ModuleType) -> type | None:
             imported_fallback = cls
     if same_module is not None:
         return same_module
-    # The imported-fallback branch permits the ``strategies.example``
-    # layout where the config class lives in a sibling ``config.py``
-    # and is re-imported into the strategy module. Filter out the
-    # Nautilus base ``StrategyConfig`` explicitly — it's imported by
-    # ~every strategy file and has ``.parse``, so the naive fallback
-    # would pick it up and emit an empty config schema.
-    try:
-        from nautilus_trader.trading.config import StrategyConfig as NautilusBase  # noqa: N806
-    except Exception:  # pragma: no cover — Nautilus not importable
-        NautilusBase = None  # type: ignore[misc,assignment]  # class-or-None sentinel: "Cannot assign to a type" [misc] + None→type[X] [assignment]  # noqa: N806
-    if imported_fallback is not None and (
-        NautilusBase is None or imported_fallback is not NautilusBase
-    ):
+    if imported_fallback is not None:
         return imported_fallback
     return None
 
@@ -639,7 +619,7 @@ async def sync_strategies_to_db(
             # PATCH-saved description with the docstring on disk, making
             # the edit a silent no-op.
             # Memoize: only recompute schema when the combined hash
-            # actually changed. Avoids re-running msgspec.json.schema
+            # actually changed. Avoids re-extracting constructor schema
             # on every /api/v1/strategies/ GET.
             if row.code_hash != combined_hash:
                 row.config_class = info.config_class_name

@@ -18,12 +18,15 @@ These tests cover:
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
+from nautilus_trader.persistence import ParquetDataCatalog
 
 from msai.services.nautilus.catalog_builder import (
     build_catalog_for_symbol,
@@ -106,6 +109,160 @@ def test_verify_catalog_coverage_empty_catalog_returns_full_gap(tmp_path: Path) 
     )
     assert gap_start_ns == expected_start_ns
     assert gap_end_ns == expected_end_ns
+
+
+def test_native_catalog_exact_values_times_and_single_date(tmp_path: Path) -> None:
+    raw_root = tmp_path / "raw"
+    path = raw_root / "stocks/AAPL/2025/01.parquet"
+    path.parent.mkdir(parents=True)
+    times = pd.to_datetime([
+        "2025-01-02T23:59:00.000000123Z", "2025-01-02T00:00:00.000000123Z",
+    ])
+    frame = pd.DataFrame({
+        "timestamp": times, "open": [Decimal("100.01"), Decimal("99.98")],
+        "high": [Decimal("100.05"), Decimal("100.00")],
+        "low": [Decimal("99.99"), Decimal("99.95")],
+        "close": [Decimal("100.02"), Decimal("99.99")], "volume": [22, 11],
+    })
+    pq.write_table(pa.Table.from_pandas(frame), path)
+    catalog_root = tmp_path / "nautilus-v2"
+    iid = build_catalog_for_symbol("AAPL.NASDAQ", raw_root, catalog_root)
+    catalog = ParquetDataCatalog(str(catalog_root))
+    bars = catalog.query_bars(identifiers=[f"{iid}-1-MINUTE-LAST-EXTERNAL"])
+    assert len(bars) == 2
+    assert [bar.ts_event for bar in bars] == sorted(int(t.value) for t in times)
+    assert [bar.ts_init for bar in bars] == [bar.ts_event for bar in bars]
+    assert [str(bar.open) for bar in bars] == ["99.98", "100.01"]
+    assert [str(bar.high) for bar in bars] == ["100.00", "100.05"]
+    assert [str(bar.low) for bar in bars] == ["99.95", "99.99"]
+    assert [str(bar.close) for bar in bars] == ["99.99", "100.02"]
+    assert [str(bar.volume) for bar in bars] == ["11", "22"]
+    equity = catalog.instruments()[0]
+    assert str(equity.quote_currency) == "USD"
+    assert str(equity.price_increment) == "0.01"
+    assert equity.price_precision == 2
+    assert equity.size_precision == 0
+    assert catalog_has_bars_in_window(
+        catalog_root=catalog_root, instrument_id=iid,
+        start=date(2025, 1, 2), end=date(2025, 1, 2),
+    )
+    assert not catalog_has_bars_in_window(
+        catalog_root=catalog_root, instrument_id=iid,
+        start=date(2025, 1, 3), end=date(2025, 1, 3),
+    )
+
+
+def test_native_arrow_schema_matches_rc6_nonnullable_contract():
+    from msai.services.nautilus.catalog_builder import _native_bar_batch
+
+    batch = pa.RecordBatch.from_pydict({
+        "timestamp": [datetime(2025, 1, 2, tzinfo=UTC)],
+        "open": [100.01], "high": [100.03], "low": [99.99], "close": [100.02], "volume": [3],
+    })
+    native = _native_bar_batch(batch, price_precision=2)
+    assert native.schema.names == ["open", "high", "low", "close", "volume", "ts_event", "ts_init"]
+    assert all(not field.nullable for field in native.schema)
+    assert all(native.schema.field(name).type == pa.decimal128(38, 16) for name in [
+        "open", "high", "low", "close", "volume",
+    ])
+    assert native.schema.field("ts_event").type == pa.timestamp("ns", tz="UTC")
+    assert native.column("close")[0].as_py() == Decimal("100.02")
+
+
+@pytest.mark.parametrize("asset,symbol", [("futures", "ES.CME"), ("options", "AAPL.OPRA")])
+def test_unsupported_asset_refused_before_catalog_mutation(tmp_path, asset, symbol):
+    catalog_root = tmp_path / "catalog"
+    with pytest.raises(ValueError, match="minute equities"):
+        build_catalog_for_symbol(symbol, tmp_path / "raw", catalog_root, asset_class=asset)
+    assert not catalog_root.exists()
+
+
+def test_unsupported_interval_and_reversed_window_refused(tmp_path):
+    with pytest.raises(ValueError, match="1-MINUTE"):
+        catalog_has_bars_in_window(
+            catalog_root=tmp_path / "catalog", instrument_id="AAPL.NASDAQ",
+            start=date(2025, 1, 1), end=date(2025, 1, 1), bar_spec="5-MINUTE-LAST-EXTERNAL",
+        )
+    with pytest.raises(ValueError, match="start"):
+        verify_catalog_coverage(
+            catalog_root=tmp_path / "catalog", instrument_ids=["AAPL.NASDAQ"],
+            start=date(2025, 1, 2), end=date(2025, 1, 1),
+        )
+
+
+@pytest.mark.parametrize("broken", [
+    "null", "nan", "negative_volume", "fractional_volume", "inverted_ohlc",
+    "corrupt", "missing_column",
+])
+def test_corrupt_inputs_refuse_without_success_marker(tmp_path, broken):
+    root = tmp_path / "raw"
+    path = root / "stocks/AAPL/2025/01.parquet"
+    path.parent.mkdir(parents=True)
+    frame = pd.DataFrame({
+        "timestamp": pd.to_datetime(["2025-01-02T09:30:00Z"]),
+        "open": [100.0], "high": [101.0], "low": [99.0], "close": [100.0], "volume": [1],
+    })
+    if broken == "corrupt":
+        path.write_bytes(b"not parquet")
+    else:
+        if broken == "null":
+            frame.loc[0, "open"] = None
+        elif broken == "nan":
+            frame.loc[0, "volume"] = float("nan")
+        elif broken == "negative_volume":
+            frame.loc[0, "volume"] = -1
+        elif broken == "fractional_volume":
+            frame["volume"] = [1.5]
+        elif broken == "inverted_ohlc":
+            frame["high"] = [99.0]
+        elif broken == "missing_column":
+            frame = frame.drop(columns="high")
+        pq.write_table(pa.Table.from_pandas(frame), path)
+    catalog = tmp_path / "nautilus-v2"
+    with pytest.raises(ValueError, match="OHLCV|Parquet"):
+        build_catalog_for_symbol("AAPL", root, catalog)
+    assert not (catalog / ".msai_source_hashes/AAPL.NASDAQ.hash").exists()
+
+
+def test_default_catalog_namespace_and_unsupported_native_instrument():
+    from msai.core.config import Settings
+    from msai.services.nautilus.instruments import resolve_instrument
+
+    config = Settings(_env_file=None, data_root="/tmp/research")
+    assert config.nautilus_catalog_root.name == "nautilus-v2"
+    with pytest.raises(ValueError, match="minute equities"):
+        resolve_instrument("ESM6.CME")
+    assert str(resolve_instrument("BRK.B.NYSE").id) == "BRK.B.NYSE"
+
+
+def test_reserved_v1_catalog_root_refused_before_mutation(tmp_path):
+    baseline = tmp_path / "nautilus"
+    baseline.mkdir()
+    saved = baseline / "preserved.parquet"
+    saved.write_bytes(b"V1 baseline")
+    with pytest.raises(ValueError, match="preserved V1"):
+        build_catalog_for_symbol("AAPL", tmp_path / "raw", baseline, force=True)
+    assert saved.read_bytes() == b"V1 baseline"
+    assert list(baseline.iterdir()) == [saved]
+
+
+def test_changed_source_purge_failure_invalidates_previous_marker(tmp_path, monkeypatch):
+    from msai.services.nautilus import catalog_builder
+
+    raw, catalog = tmp_path / "raw", tmp_path / "nautilus-v2"
+    _write_synthetic_parquet(raw, rows=3, start_ts=datetime(2025, 1, 2, tzinfo=UTC), symbol="AAPL")
+    iid = build_catalog_for_symbol("AAPL", raw, catalog)
+    marker = catalog / ".msai_source_hashes" / f"{iid}.hash"
+    assert marker.exists()
+    _write_synthetic_parquet(raw, rows=4, start_ts=datetime(2025, 1, 2, tzinfo=UTC), symbol="AAPL")
+
+    def failed_purge(*args, **kwargs):
+        raise OSError("interrupted native purge")
+
+    monkeypatch.setattr(catalog_builder, "_purge_catalog_for_instrument", failed_purge)
+    with pytest.raises(OSError, match="interrupted"):
+        build_catalog_for_symbol("AAPL", raw, catalog)
+    assert not marker.exists()
 
 
 def test_verify_catalog_coverage_end_date_ns_precision_no_off_by_one(tmp_path: Path) -> None:

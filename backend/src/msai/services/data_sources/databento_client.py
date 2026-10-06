@@ -15,7 +15,6 @@ import re
 from typing import TYPE_CHECKING
 
 import pandas as pd
-from nautilus_trader.adapters.databento.loaders import DatabentoDataLoader
 from tenacity import (
     AsyncRetrying,
     retry_if_exception,
@@ -26,6 +25,7 @@ from tenacity import (
 from msai.core.config import settings
 from msai.core.logging import get_logger
 from msai.services.data_sources.databento_errors import DatabentoError
+from msai.services.nautilus.runtime_capabilities import require_live_runtime
 from msai.services.observability.trading_metrics import DATABENTO_API_CALLS_TOTAL
 
 if TYPE_CHECKING:
@@ -183,6 +183,7 @@ class DatabentoClient:
             RuntimeError: If ``DATABENTO_API_KEY`` is not configured or the
                 Databento request fails.
         """
+        require_live_runtime("Databento native definition decoding")
         if not self.api_key:
             raise RuntimeError("DATABENTO_API_KEY is not configured")
 
@@ -274,6 +275,8 @@ class DatabentoClient:
         # constructor kwarg of `DatabentoDataLoader`.
         # Setting it ensures CME futures emit venue='CME' not 'GLBX' — keeps
         # registry canonical alias in exchange-name form.
+        from nautilus_trader.adapters.databento.loaders import DatabentoDataLoader
+
         loader = DatabentoDataLoader()
         instruments = list(
             loader.from_dbn_file(

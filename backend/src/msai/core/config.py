@@ -450,14 +450,14 @@ class Settings(BaseSettings):
     @property
     def nautilus_catalog_root(self) -> Path:
         """Root directory for the NautilusTrader ``ParquetDataCatalog``
-        (``{data_root}/nautilus``).
+        (``{data_root}/nautilus-v2``), separate from the preserved V1 catalog.
 
         The catalog is lazily built from raw Parquet files on the first
         backtest request for a given symbol (see
         :mod:`msai.services.nautilus.catalog_builder`) and is read directly
         by ``BacktestNode`` during backtest execution.
         """
-        return self.data_root / "nautilus"
+        return self.data_root / "nautilus-v2"
 
     @property
     def databento_definition_root(self) -> Path:

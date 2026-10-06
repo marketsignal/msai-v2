@@ -36,14 +36,15 @@ from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
-from nautilus_trader.adapters.interactive_brokers.common import IBContract
-from nautilus_trader.adapters.interactive_brokers.config import (
-    InteractiveBrokersInstrumentProviderConfig,
-    SymbologyMethod,
-)
+from msai.services.nautilus.runtime_capabilities import require_live_runtime
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+
+    from nautilus_trader.adapters.interactive_brokers.common import IBContract
+    from nautilus_trader.adapters.interactive_brokers.config import (
+        InteractiveBrokersInstrumentProviderConfig,
+    )
 
     from msai.services.nautilus.security_master.live_resolver import (
         ResolvedInstrument,
@@ -128,42 +129,46 @@ _FUT_MONTH_CODES: dict[int, str] = {3: "H", 6: "M", 9: "U", 12: "Z"}
 
 
 # Stable Phase 1 universe — stocks, ETF, and FX contracts don't depend
-# on wall-clock time, so we precompute them at import. The futures entry
+# on wall-clock time, so construct them inside the owning live helper. The futures entry
 # rolls quarterly and is appended fresh by :func:`phase_1_paper_symbols`.
 #
 # Stocks route via IB's SMART order router; ``primaryExchange`` is the
 # disambiguator IB needs when SMART returns multiple matches. EUR/USD
 # routes via IDEALPRO (IB's FX venue) and trades 24h — useful for
 # after-hours smoke testing.
-_STATIC_SYMBOLS: dict[str, IBContract] = {
-    "AAPL": IBContract(
-        secType="STK",
-        symbol="AAPL",
-        exchange="SMART",
-        primaryExchange="NASDAQ",
-        currency="USD",
-    ),
-    "MSFT": IBContract(
-        secType="STK",
-        symbol="MSFT",
-        exchange="SMART",
-        primaryExchange="NASDAQ",
-        currency="USD",
-    ),
-    "EUR/USD": IBContract(
-        secType="CASH",
-        symbol="EUR",
-        exchange="IDEALPRO",
-        currency="USD",
-    ),
-    "SPY": IBContract(
-        secType="STK",
-        symbol="SPY",
-        exchange="SMART",
-        primaryExchange="ARCA",
-        currency="USD",
-    ),
-}
+def _static_symbols() -> dict[str, IBContract]:
+    require_live_runtime("IB instrument contracts")
+    from nautilus_trader.adapters.interactive_brokers.common import IBContract
+
+    return {
+        "AAPL": IBContract(
+            secType="STK",
+            symbol="AAPL",
+            exchange="SMART",
+            primaryExchange="NASDAQ",
+            currency="USD",
+        ),
+        "MSFT": IBContract(
+            secType="STK",
+            symbol="MSFT",
+            exchange="SMART",
+            primaryExchange="NASDAQ",
+            currency="USD",
+        ),
+        "EUR/USD": IBContract(
+            secType="CASH",
+            symbol="EUR",
+            exchange="IDEALPRO",
+            currency="USD",
+        ),
+        "SPY": IBContract(
+            secType="STK",
+            symbol="SPY",
+            exchange="SMART",
+            primaryExchange="ARCA",
+            currency="USD",
+        ),
+    }
 
 
 def phase_1_paper_symbols(*, today: date | None = None) -> dict[str, IBContract]:
@@ -171,7 +176,7 @@ def phase_1_paper_symbols(*, today: date | None = None) -> dict[str, IBContract]
 
     ES front-month is computed fresh on every call so quarterly rolls
     don't require a worker restart. Stocks/ETF/FX come from
-    :data:`_STATIC_SYMBOLS` unchanged.
+    the static contract definitions unchanged.
 
     The returned dict is safe to mutate — each call builds a new dict so
     callers can't corrupt the module-level state.
@@ -182,9 +187,12 @@ def phase_1_paper_symbols(*, today: date | None = None) -> dict[str, IBContract]
             :func:`exchange_local_today`) and thread the same value
             through any subsequent symbol-resolution calls.
     """
+    require_live_runtime("IB instrument contracts")
+    from nautilus_trader.adapters.interactive_brokers.common import IBContract
+
     resolved_today = today if today is not None else exchange_local_today()
     return {
-        **_STATIC_SYMBOLS,
+        **_static_symbols(),
         # E-mini S&P 500 futures (CME Globex, ~23h/day Sun-Fri).
         # ``exchange="CME"`` is IB's canonical name (not ``GLOBEX``).
         # ``lastTradeDateOrContractMonth`` MUST be set — IB rejects
@@ -201,7 +209,11 @@ def phase_1_paper_symbols(*, today: date | None = None) -> dict[str, IBContract]
 
 # Back-compat module-level dict for test introspection. Production code
 # paths call ``phase_1_paper_symbols()`` to get a fresh snapshot.
-PHASE_1_PAPER_SYMBOLS: dict[str, IBContract] = phase_1_paper_symbols()
+def __getattr__(name: str) -> object:
+    """Retain the legacy inspection name without import-time broker objects."""
+    if name == "PHASE_1_PAPER_SYMBOLS":
+        return phase_1_paper_symbols()
+    raise AttributeError(name)
 
 
 def build_ib_instrument_provider_config(
@@ -235,6 +247,12 @@ def build_ib_instrument_provider_config(
             The message lists the supported symbols so an operator can
             fix the typo without grepping the source.
     """
+    require_live_runtime("IB instrument provider")
+    from nautilus_trader.adapters.interactive_brokers.config import (
+        InteractiveBrokersInstrumentProviderConfig,
+        SymbologyMethod,
+    )
+
     requested = list(symbols)
     symbols_map = phase_1_paper_symbols(today=today)
     unknown = [s for s in requested if s not in symbols_map]
@@ -279,8 +297,11 @@ def _ibcontract_from_spec(spec: dict[str, object]) -> IBContract:
     equity/FX/futures preload path. The IB adapter would otherwise raise
     ``TypeError: unexpected keyword argument`` on any unknown kwarg.
     """
+    require_live_runtime("IB instrument contracts")
+    from nautilus_trader.adapters.interactive_brokers.common import IBContract
+
     filtered = {k: v for k, v in spec.items() if k in _IB_CONTRACT_KWARGS}
-    return IBContract(**filtered)  # type: ignore[arg-type]
+    return IBContract(**filtered)
 
 
 def build_ib_instrument_provider_config_from_resolved(
@@ -311,6 +332,12 @@ def build_ib_instrument_provider_config_from_resolved(
         hand to ``InteractiveBrokersDataClientConfig`` /
         ``InteractiveBrokersExecClientConfig``.
     """
+    require_live_runtime("IB instrument provider")
+    from nautilus_trader.adapters.interactive_brokers.config import (
+        InteractiveBrokersInstrumentProviderConfig,
+        SymbologyMethod,
+    )
+
     contracts = frozenset(_ibcontract_from_spec(r.contract_spec) for r in resolved)
     return InteractiveBrokersInstrumentProviderConfig(
         symbology_method=SymbologyMethod.IB_SIMPLIFIED,

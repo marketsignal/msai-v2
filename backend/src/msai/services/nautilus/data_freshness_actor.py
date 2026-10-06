@@ -53,6 +53,12 @@ runs inside the TradingNode.
 from __future__ import annotations
 
 import threading
+from typing import TYPE_CHECKING
+
+from msai.services.nautilus.runtime_capabilities import require_live_runtime
+
+if not TYPE_CHECKING:
+    require_live_runtime("Legacy feed-freshness actor")
 
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.common.config import ActorConfig
@@ -61,7 +67,7 @@ from nautilus_trader.model.data import Bar, BarType
 from msai.services.live.data_freshness import FeedKey, FreshnessRegistry
 
 
-class DataFreshnessActorConfig(ActorConfig, frozen=True):
+class DataFreshnessActorConfig(ActorConfig, frozen=True):  # type: ignore[misc, call-arg]  # V1 native config is unavailable in RC6; runtime refuses before this definition.
     """Configuration schema for :class:`DataFreshnessActor`.
 
     Inherits from Nautilus :class:`ActorConfig` so the kernel's

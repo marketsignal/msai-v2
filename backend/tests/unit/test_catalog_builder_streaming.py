@@ -30,6 +30,8 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from nautilus_trader.model import Bar, BarType
+from nautilus_trader.persistence import ParquetDataCatalog
 
 from msai.services.nautilus.catalog_builder import build_catalog_for_symbol
 
@@ -91,10 +93,10 @@ def test_streaming_builder_processes_all_rows(tmp_path: Path) -> None:
 
     # Verify the catalog actually contains 150 k bars by reading
     # them back via Nautilus's ParquetDataCatalog.
-    from nautilus_trader.persistence.catalog import ParquetDataCatalog
+    from nautilus_trader.persistence import ParquetDataCatalog
 
     catalog = ParquetDataCatalog(str(catalog_root))
-    bars = catalog.bars(instrument_ids=[instrument_id])
+    bars = catalog.query_bars(identifiers=[f"{instrument_id}-1-MINUTE-LAST-EXTERNAL"])
     assert len(bars) == 150_000
 
 
@@ -163,10 +165,10 @@ def test_streaming_builder_idempotent(tmp_path: Path) -> None:
     )
     assert first_id == second_id
 
-    from nautilus_trader.persistence.catalog import ParquetDataCatalog
+    from nautilus_trader.persistence import ParquetDataCatalog
 
     catalog = ParquetDataCatalog(str(catalog_root))
-    bars = catalog.bars(instrument_ids=[first_id])
+    bars = catalog.query_bars(identifiers=[f"{first_id}-1-MINUTE-LAST-EXTERNAL"])
     # Idempotent: still exactly 5 000 bars (not 10 000).
     assert len(bars) == 5_000
 
@@ -197,10 +199,10 @@ def test_streaming_builder_multi_partition(tmp_path: Path) -> None:
         catalog_root=catalog_root,
     )
 
-    from nautilus_trader.persistence.catalog import ParquetDataCatalog
+    from nautilus_trader.persistence import ParquetDataCatalog
 
     catalog = ParquetDataCatalog(str(catalog_root))
-    bars = catalog.bars(instrument_ids=[instrument_id])
+    bars = catalog.query_bars(identifiers=[f"{instrument_id}-1-MINUTE-LAST-EXTERNAL"])
     assert len(bars) == 5_000
 
 
@@ -230,11 +232,11 @@ def test_idempotency_skip_when_raw_unchanged(tmp_path: Path) -> None:
     )
     assert first_id == second_id
 
-    from nautilus_trader.persistence.catalog import ParquetDataCatalog
+    from nautilus_trader.persistence import ParquetDataCatalog
 
     catalog = ParquetDataCatalog(str(catalog_root))
     # Still 1 000 bars — second call did NOT double-write.
-    assert len(catalog.bars(instrument_ids=[first_id])) == 1_000
+    assert len(catalog.query_bars(identifiers=[f"{first_id}-1-MINUTE-LAST-EXTERNAL"])) == 1_000
 
 
 def test_rebuild_when_raw_data_extends(tmp_path: Path) -> None:
@@ -282,10 +284,10 @@ def test_rebuild_when_raw_data_extends(tmp_path: Path) -> None:
         catalog_root=catalog_root,
     )
 
-    from nautilus_trader.persistence.catalog import ParquetDataCatalog
+    from nautilus_trader.persistence import ParquetDataCatalog
 
     catalog = ParquetDataCatalog(str(catalog_root))
-    assert len(catalog.bars(instrument_ids=[instrument_id])) == 3_000
+    assert len(catalog.query_bars(identifiers=[f"{instrument_id}-1-MINUTE-LAST-EXTERNAL"])) == 3_000
 
 
 def test_legacy_catalog_without_marker_is_rebuilt(tmp_path: Path) -> None:
@@ -327,10 +329,10 @@ def test_legacy_catalog_without_marker_is_rebuilt(tmp_path: Path) -> None:
         catalog_root=catalog_root,
     )
 
-    from nautilus_trader.persistence.catalog import ParquetDataCatalog
+    from nautilus_trader.persistence import ParquetDataCatalog
 
     catalog = ParquetDataCatalog(str(catalog_root))
-    assert len(catalog.bars(instrument_ids=[instrument_id])) == 1_200
+    assert len(catalog.query_bars(identifiers=[f"{instrument_id}-1-MINUTE-LAST-EXTERNAL"])) == 1_200
 
 
 def test_source_hash_distinguishes_same_basename_in_different_partitions(
@@ -376,13 +378,24 @@ def test_purge_preserves_sibling_bar_specs(tmp_path: Path) -> None:
     be removed."""
     from msai.services.nautilus.catalog_builder import _purge_catalog_for_instrument
 
-    catalog_root = tmp_path / "catalog"
-    bar_dir = catalog_root / "data" / "bar" / "TSLA.NASDAQ-1-MINUTE-LAST-EXTERNAL"
-    sibling_bar_dir = catalog_root / "data" / "bar" / "TSLA.NASDAQ-5-MINUTE-LAST-EXTERNAL"
-    equity_dir = catalog_root / "data" / "equity" / "TSLA.NASDAQ"
-    for d in (bar_dir, sibling_bar_dir, equity_dir):
-        d.mkdir(parents=True)
-        (d / "placeholder.parquet").write_bytes(b"x")
+    raw_root, catalog_root = tmp_path / "raw", tmp_path / "nautilus-v2"
+    for symbol in ("TSLA", "AAPL"):
+        _write_synthetic_parquet(
+            raw_root, rows=5, start_ts=datetime(2025, 1, 2, tzinfo=UTC), symbol=symbol,
+        )
+        build_catalog_for_symbol(symbol, raw_root, catalog_root)
+    catalog = ParquetDataCatalog(str(catalog_root))
+    minute_type = "TSLA.NASDAQ-1-MINUTE-LAST-EXTERNAL"
+    sibling_type = "TSLA.NASDAQ-5-MINUTE-LAST-EXTERNAL"
+    source = catalog.query_bars(identifiers=[minute_type])[0]
+    catalog.write_bars([Bar(
+        bar_type=BarType.from_str(sibling_type), open=source.open, high=source.high,
+        low=source.low, close=source.close, volume=source.volume,
+        ts_event=source.ts_event, ts_init=source.ts_init,
+    )])
+    baseline = tmp_path / "nautilus" / "baseline.parquet"
+    baseline.parent.mkdir()
+    baseline.write_bytes(b"preserved V1 catalog")
 
     _purge_catalog_for_instrument(
         catalog_root,
@@ -390,9 +403,13 @@ def test_purge_preserves_sibling_bar_specs(tmp_path: Path) -> None:
         bar_spec="1-MINUTE-LAST-EXTERNAL",
     )
 
-    assert not bar_dir.exists(), "target bar dir must be removed"
-    assert sibling_bar_dir.exists(), "sibling bar spec must survive purge"
-    assert equity_dir.exists(), "shared instrument definition must survive purge"
+    assert catalog.query_bars(identifiers=[minute_type]) == []
+    assert len(catalog.query_bars(identifiers=[sibling_type])) == 1
+    assert len(catalog.query_bars(identifiers=["AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL"])) == 5
+    assert {str(instrument.id) for instrument in catalog.instruments()} == {
+        "TSLA.NASDAQ", "AAPL.NASDAQ",
+    }
+    assert baseline.read_bytes() == b"preserved V1 catalog"
 
 
 def test_streaming_builder_raises_when_no_raw_data(tmp_path: Path) -> None:
@@ -418,73 +435,16 @@ def test_streaming_builder_raises_when_no_raw_data(tmp_path: Path) -> None:
 # ----------------------------------------------------------------------
 
 
-def test_build_catalog_uses_raw_symbol_override_for_futures_canonical(
-    tmp_path: Path,
-) -> None:
-    """When the caller passes a canonical ID whose local-part doesn't match
-    the ingest-tree directory (e.g. ``ESM6.CME`` ingests under ``futures/ES/``),
-    :func:`build_catalog_for_symbol` must honour ``raw_symbol_override`` for
-    the path lookup.
-
-    Without the override this call would raise ``FileNotFoundError`` because
-    the resolver would derive ``raw_symbol='ESM6'`` from ``Instrument.raw_symbol``
-    and look under ``futures/ESM6/``, which doesn't exist.  With the
-    override (``raw_symbol_override='ES'``) the path lookup hits
-    ``futures/ES/`` where the ingest pipeline actually wrote the data.
-    """
-    raw_root = tmp_path / "raw"
-    catalog_root = tmp_path / "catalog"
-
-    # Ingest pipeline writes under ``futures/ES/`` — NOT ``futures/ESM6/``.
-    # We reuse the stocks-layout helper but point it at the ``futures``
-    # asset-class subdirectory by writing the file manually.
-    rng = np.random.default_rng(7)
-    rows = 500
-    timestamps = pd.date_range(
-        start=datetime(2026, 3, 1, tzinfo=UTC),
-        periods=rows,
-        freq="1min",
-        tz="UTC",
-    )
-    closes = 5000.0 + rng.standard_normal(rows).cumsum() * 0.5
-    opens = closes + rng.standard_normal(rows) * 0.1
-    highs = np.maximum(opens, closes) + np.abs(rng.standard_normal(rows)) * 0.2
-    lows = np.minimum(opens, closes) - np.abs(rng.standard_normal(rows)) * 0.2
-    volumes = rng.integers(1, 100, rows).astype(np.int64)
-    df = pd.DataFrame(
-        {
-            "timestamp": timestamps,
-            "open": opens,
-            "high": highs,
-            "low": lows,
-            "close": closes,
-            "volume": volumes,
-        }
-    )
-    out_dir = raw_root / "futures" / "ES" / "2026"
-    out_dir.mkdir(parents=True)
-    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), out_dir / "03.parquet")
-
-    # WITHOUT the override: FileNotFoundError (looks under futures/ESM6/).
+def test_futures_override_cannot_substitute_equity(tmp_path: Path) -> None:
+    """The research slice refuses the previous unsupported Equity substitution."""
     import pytest
 
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(ValueError, match="minute equities"):
         build_catalog_for_symbol(
-            symbol="ESM6.CME",
-            raw_parquet_root=raw_root,
-            catalog_root=catalog_root,
-            asset_class="futures",
+            symbol="ESM6.CME", raw_parquet_root=tmp_path / "raw",
+            catalog_root=tmp_path / "catalog", asset_class="futures", raw_symbol_override="ES",
         )
-
-    # WITH the override: resolves successfully.
-    instrument_id = build_catalog_for_symbol(
-        symbol="ESM6.CME",
-        raw_parquet_root=raw_root,
-        catalog_root=catalog_root,
-        asset_class="futures",
-        raw_symbol_override="ES",
-    )
-    assert instrument_id.endswith(".CME")
+    assert not (tmp_path / "catalog").exists()
 
 
 def test_ensure_catalog_data_raw_symbols_length_mismatch_raises() -> None:

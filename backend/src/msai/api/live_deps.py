@@ -37,11 +37,13 @@ from typing import TYPE_CHECKING
 from msai.core.config import settings
 from msai.services.live.idempotency import IdempotencyStore
 from msai.services.live_command_bus import LiveCommandBus
-from msai.services.nautilus.projection.position_reader import PositionReader
 from msai.services.nautilus.projection.projection_state import ProjectionState
+from msai.services.nautilus.runtime_capabilities import require_live_runtime
 
 if TYPE_CHECKING:
     from redis.asyncio import Redis as AsyncRedis
+
+    from msai.services.nautilus.projection.position_reader import PositionReader
 
 
 _binary_redis: AsyncRedis | None = None
@@ -108,6 +110,9 @@ def get_position_reader() -> PositionReader:
     shared :class:`ProjectionState` (fast path) plus a cold-path
     Cache reader bound to the project's Redis URL via the
     shared ``build_redis_database_config`` helper."""
+    require_live_runtime("Live cold-cache read")
+    from msai.services.nautilus.projection.position_reader import PositionReader
+
     global _position_reader  # noqa: PLW0603 — lazy singleton
     if _position_reader is None:
         _position_reader = PositionReader(projection_state=get_projection_state())
