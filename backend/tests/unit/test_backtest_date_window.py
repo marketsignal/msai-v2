@@ -74,26 +74,24 @@ def test_adjacent_train_test_and_purge_windows_do_not_overlap() -> None:
 
 
 def _run_probe(start: str, end: str) -> None:
-    import msgspec
-    from nautilus_trader.backtest.node import BacktestNode
-    from nautilus_trader.config import LoggingConfig
-    from nautilus_trader.model.data import Bar, BarType
-    from nautilus_trader.model.objects import Price, Quantity
-    from nautilus_trader.persistence.catalog import ParquetDataCatalog
-    from nautilus_trader.test_kit.providers import TestInstrumentProvider
+    from nautilus_trader.backtest import BacktestNode
+    from nautilus_trader.model import Bar, BarType, Price, Quantity
+    from nautilus_trader.persistence import ParquetDataCatalog
 
     from msai.services.nautilus.backtest_runner import (
         _build_backtest_run_config,
+        _build_strategy_config,
         _extract_metrics,
         _RunPayload,
     )
+    from msai.services.nautilus.instruments import resolve_instrument
 
     bar_type = BarType.from_str("AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL")
     with tempfile.TemporaryDirectory(prefix="msai-date-window-test-") as temporary:
         catalog = ParquetDataCatalog(temporary)
-        catalog.write_data([TestInstrumentProvider.equity(symbol="AAPL", venue="NASDAQ")])
+        catalog.write_instruments([resolve_instrument("AAPL", venue="NASDAQ")])
         price = Price.from_str("100.00")
-        catalog.write_data(
+        catalog.write_bars(
             [
                 Bar(
                     bar_type,
@@ -125,17 +123,13 @@ def _run_probe(start: str, end: str) -> None:
             catalog_path=temporary,
         )
         config = _build_backtest_run_config(payload)
-        config = msgspec.structs.replace(
-            config,
-            engine=msgspec.structs.replace(
-                config.engine, logging=LoggingConfig(bypass_logging=True)
-            ),
-        )
         node = BacktestNode(configs=[config])
         try:
+            node.build()
+            node.add_strategy_from_config(config.id, _build_strategy_config(payload))
             results = node.run()
-            engine = node.get_engine(config.id)
-            consumed = sorted(int(bar.ts_init) for bar in engine.cache.bars(bar_type))
+            cache = node.get_engine_cache(config.id)
+            consumed = sorted(int(bar.ts_init) for bar in (cache.bars(bar_type) or []))
             data = config.data[0]
             print(
                 json.dumps(
@@ -143,7 +137,7 @@ def _run_probe(start: str, end: str) -> None:
                         "consumed_ns": consumed,
                         "iterations": int(results[0].iterations),
                         "metrics": _extract_metrics(results[0], pd.DataFrame()),
-                        "data_bounds": [data.start_time_nanos, data.end_time_nanos],
+                        "data_bounds": [data.start_time, data.end_time],
                         "run_bounds": [
                             pd.Timestamp(config.start).value,
                             pd.Timestamp(config.end).value,

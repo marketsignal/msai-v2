@@ -25,21 +25,18 @@ Design notes
 
 from __future__ import annotations
 
-# Nautilus msgspec configs resolve field annotations at runtime via inspect, so
-# the model types must be importable at module load, not only under
-# TYPE_CHECKING (same rationale as smoke_market_order.py).
+# The user schema helper resolves constructor annotations at runtime.
 from nautilus_trader.indicators import ExponentialMovingAverage
-from nautilus_trader.model.data import Bar, BarType  # noqa: TC002
-from nautilus_trader.model.enums import OrderSide
-from nautilus_trader.model.identifiers import InstrumentId  # noqa: TC002
-from nautilus_trader.model.objects import Quantity
-from nautilus_trader.trading.strategy import Strategy
+from nautilus_trader.model import Bar, BarType, InstrumentId, OrderSide, Quantity  # noqa: TC002
+from nautilus_trader.trading import Strategy
 
 from msai.services.nautilus.risk import RiskAwareStrategy
 from strategies.example.config import EMACrossConfig  # noqa: TC001
 
 
-class EMACrossStrategy(RiskAwareStrategy, Strategy):
+# RC6 modify_order uses ClientOrderId; the retained V1 live mixin uses order.
+# This mixin is unarmed in research; RC6 live is refused and we do not modify orders.
+class EMACrossStrategy(RiskAwareStrategy, Strategy):  # type: ignore[misc]
     """Buy-on-golden-cross / sell-on-death-cross EMA strategy.
 
     The strategy subscribes to a single bar type and keeps two EMAs
@@ -67,7 +64,7 @@ class EMACrossStrategy(RiskAwareStrategy, Strategy):
         """Initialise EMAs and remember the instrument / bar spec.
 
         Args:
-            config: Frozen :class:`EMACrossConfig` containing the
+            config: Native :class:`EMACrossConfig` containing the
                 instrument ID, bar type, EMA periods and trade size.
         """
         super().__init__(config=config)
@@ -75,6 +72,8 @@ class EMACrossStrategy(RiskAwareStrategy, Strategy):
         self.bar_type: BarType = config.bar_type
         self.trade_size: Quantity = Quantity.from_str(str(config.trade_size))
 
+        # V2 seeds its native EMA with the mean during warm-up; retain the
+        # native indicator rather than forcing the historical V1 signal path.
         self.fast_ema = ExponentialMovingAverage(config.fast_ema_period)
         self.slow_ema = ExponentialMovingAverage(config.slow_ema_period)
 
@@ -143,7 +142,7 @@ class EMACrossStrategy(RiskAwareStrategy, Strategy):
 
         # Golden cross: fast above slow -> be long.
         if self.fast_ema.value > self.slow_ema.value:
-            if self.portfolio.is_flat(self.instrument_id):
+            if self.portfolio.is_net_flat(self.instrument_id):
                 self._submit_market_order(OrderSide.BUY)
                 decision_made = True
             elif self.portfolio.is_net_short(self.instrument_id):

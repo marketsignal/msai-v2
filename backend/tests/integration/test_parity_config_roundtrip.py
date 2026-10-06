@@ -1,209 +1,126 @@
-"""Config round-trip test (Phase 2 task 2.11, Test B).
+"""Research config parity at the native RC6 constructor and JSON boundary.
 
-Catches schema drift between the live ``ImportableStrategyConfig``
-and the backtest ``ImportableStrategyConfig`` BEFORE deployment.
-The plan describes this as: load the live config via
-``ImportableStrategyConfig`` with the live config schema, build
-a ``BacktestNode`` around it, and assert ``node.build()``
-succeeds.
-
-Why this is the right shape:
-
-- ``ImportableStrategyConfig.parse(config_path, config_dict)`` is
-  the bridge Nautilus uses in BOTH backtest and live to
-  instantiate a strategy. If the live config has an extra field
-  the backtest config schema rejects (or vice versa),
-  ``parse()`` raises ``msgspec.ValidationError`` at this layer
-  and the live deployment would fail at startup.
-- The test resolves the config_path the same way Nautilus does
-  internally (via ``resolve_config_path``) so any change to the
-  bound class breaks the test before it breaks production.
-- The test is FAST: no catalog, no engine, no subprocess. Just
-  an import + a parse + a structural assertion.
+RC6 has no V1 StrategyConfig.parse or msgspec encoding-hook API. The common
+declared-field validator constructs real native configs from persisted user JSON;
+API and worker preparation must agree on engine-owned identities. These offline
+checks do not certify unsupported RC6 live deployment or require external services.
 """
 
 from __future__ import annotations
 
+import json
 import sys
+from decimal import Decimal
 from pathlib import Path
 
-import msgspec
 import pytest
+from nautilus_trader.model import BarType, InstrumentId
+from nautilus_trader.trading import StrategyConfig
 
-# Put the project's strategies/ on sys.path so we can import the
-# real EMACrossConfig that the live deployment would load.
+from msai.services.nautilus.schema_hooks import validate_strategy_config
+
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-
-def _resolve_config_path_or_skip(path: str):  # type: ignore[no-untyped-def]
-    """Wrapper around Nautilus's ``resolve_config_path`` so the
-    test skips on environments where the import path is broken
-    instead of failing the whole suite."""
-    try:
-        from nautilus_trader.common.config import resolve_config_path
-    except ImportError as exc:  # pragma: no cover - environment-specific
-        pytest.skip(f"Nautilus config resolver unavailable: {exc}")
-    return resolve_config_path(path)
+_EMA_JSON = {
+    "instrument_id": "AAPL.NASDAQ",
+    "bar_type": "AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL",
+    "fast_ema_period": 10,
+    "slow_ema_period": 30,
+    "trade_size": "1",
+}
 
 
-def test_live_config_parses_via_importable_strategy_config() -> None:
-    """The EMA-cross config the live deployment uses must parse
-    cleanly via Nautilus's own ``StrategyConfig.parse()`` flow.
+def test_research_config_constructs_real_native_strategy() -> None:
+    from strategies.example.config import EMACrossConfig
+    from strategies.example.ema_cross import EMACrossStrategy
 
-    This is the same path Nautilus's ``StrategyFactory.create()``
-    walks at strategy instantiation time in BOTH backtest and
-    live (``nautilus_trader/common/config.py:241`` —
-    ``parse()`` wires its own ``msgspec_decoding_hook`` to
-    convert strings into ``InstrumentId``/``BarType``/etc.). A
-    successful round-trip here means a live deployment with the
-    same config will not crash at startup.
-    """
-    config_cls = _resolve_config_path_or_skip("strategies.example.config:EMACrossConfig")
-
-    # Build a live-shaped config dict — exactly what
-    # build_live_trading_node_config (Task 1.5) injects into the
-    # ImportableStrategyConfig at deploy time.
-    live_config = {
-        "instrument_id": "AAPL.NASDAQ",
-        "bar_type": "AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL",
-        "fast_ema_period": 10,
-        "slow_ema_period": 30,
-        "trade_size": "1",
-    }
-
-    # Use the bound class's own ``parse()`` classmethod so the
-    # msgspec dec_hook converts strings → Nautilus value objects
-    # the same way Nautilus does at startup time.
-    decoded = config_cls.parse(msgspec.json.encode(live_config))
+    decoded = validate_strategy_config(EMACrossConfig, json.loads(json.dumps(_EMA_JSON)))
+    assert isinstance(decoded, StrategyConfig)
+    assert isinstance(decoded.instrument_id, InstrumentId)
+    assert isinstance(decoded.bar_type, BarType)
+    assert decoded.trade_size == Decimal("1")
     assert decoded.fast_ema_period == 10
     assert decoded.slow_ema_period == 30
     assert str(decoded.instrument_id) == "AAPL.NASDAQ"
+    assert EMACrossStrategy(decoded)._halt_gate_armed is False
 
 
-def test_live_config_with_injected_manage_stop_field_parses() -> None:
-    """Task 1.10 injects ``manage_stop=True`` into the strategy
-    config at live-deploy time. The backtest config schema MUST
-    accept this field too — otherwise the same strategy that
-    deploys live can't be backtested.
+def test_ema_rejects_undeclared_live_manage_stop_field() -> None:
+    from strategies.example.config import EMACrossConfig
 
-    The EMA cross config doesn't currently declare ``manage_stop``
-    explicitly, so this test verifies that ``msgspec.json.decode``
-    rejects unknown fields with a clear error path. The behavior
-    we want long-term: every strategy config that's used in
-    LIVE must explicitly declare ``manage_stop`` (and
-    ``order_id_tag``) so the round-trip is clean. Until that
-    happens, this test documents the current state and ensures
-    we'll catch the drift the moment a strategy declares the
-    fields explicitly.
-    """
-    config_cls = _resolve_config_path_or_skip("strategies.example.config:EMACrossConfig")
-
-    live_config_with_injected = {
-        "instrument_id": "AAPL.NASDAQ",
-        "bar_type": "AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL",
-        "fast_ema_period": 10,
-        "slow_ema_period": 30,
-        "trade_size": "1",
-        "manage_stop": True,
-        "order_id_tag": "0-abcd1234abcd1234",
-    }
-
-    encoded = msgspec.json.encode(live_config_with_injected)
-    try:
-        config_cls.parse(encoded)
-    except msgspec.ValidationError as exc:
-        # Document the drift so the comment above is the actionable
-        # next step rather than a silent test failure.
-        pytest.xfail(
-            f"EMACrossConfig does not yet accept manage_stop / order_id_tag — "
-            f"strategies that need to deploy live must declare these fields. "
-            f"Drift error: {exc}"
-        )
+    # RC6 native constructors accept extra kwargs; the declared-field boundary
+    # must refuse an unsupported user field rather than skip/xfail this contract.
+    with pytest.raises(ValueError, match="manage_stop"):
+        validate_strategy_config(EMACrossConfig, _EMA_JSON | {"manage_stop": True})
 
 
-def test_smoke_config_accepts_full_live_injection() -> None:
-    """The smoke strategy DOES declare ``manage_stop`` +
-    ``order_id_tag`` (Task 1.15), so its config round-trip must
-    succeed with both fields populated. This is the contract
-    every strategy that ships in MSAI must satisfy."""
-    config_cls = _resolve_config_path_or_skip(
-        "strategies.example.smoke_market_order:SmokeMarketOrderConfig"
-    )
+def test_smoke_native_constructor_preserves_stop_and_tag_fields() -> None:
+    from strategies.example.smoke_market_order import SmokeMarketOrderConfig
 
-    live_config = {
+    payload = {
         "instrument_id": "AAPL.NASDAQ",
         "bar_type": "AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL",
         "manage_stop": True,
-        "order_id_tag": "0-abcd1234abcd1234",
+        "order_id_tag": "abcd1234abcd1234",
     }
-    decoded = config_cls.parse(msgspec.json.encode(live_config))
-    assert decoded.manage_stop is True
-    # PR #29 (portfolio-per-account-live) prepends an order-index so the
-    # tag matches ``derive_strategy_id_full``'s ``{class}-{order_index}-
-    # {slug}`` convention. The config round-trip MUST preserve the
-    # ``0-`` prefix verbatim — stripping it would desync the StrategyId
-    # minted by Nautilus from the strategy_id_full the supervisor records.
-    assert decoded.order_id_tag == "0-abcd1234abcd1234"
+    decoded = validate_strategy_config(SmokeMarketOrderConfig, payload)
+    direct = SmokeMarketOrderConfig(**payload)
+    for config in (decoded, direct):
+        assert isinstance(config, StrategyConfig)
+        assert isinstance(config.instrument_id, InstrumentId)
+        assert isinstance(config.bar_type, BarType)
+        assert config.manage_stop is True
+        assert config.order_id_tag == "abcd1234abcd1234"
 
 
-def test_round_trip_through_json_preserves_types() -> None:
-    """End-to-end JSON round-trip: encode → decode → encode
-    again must produce structurally identical output. Catches
-    subtle type drift (e.g. a Decimal silently becoming a float,
-    an InstrumentId becoming a string).
+def test_smoke_rejects_native_strategy_separator_in_order_tag() -> None:
+    from strategies.example.smoke_market_order import SmokeMarketOrderConfig
 
-    We use Nautilus's own ``parse()`` for the decode side
-    (which wires ``msgspec_decoding_hook``) and Nautilus's own
-    encoder for the re-encode side so the round-trip exercises
-    the same code path the engine uses internally.
-    """
-    from nautilus_trader.common.config import msgspec_encoding_hook
-
-    config_cls = _resolve_config_path_or_skip("strategies.example.config:EMACrossConfig")
-    config = {
+    payload = {
         "instrument_id": "AAPL.NASDAQ",
         "bar_type": "AAPL.NASDAQ-1-MINUTE-LAST-EXTERNAL",
-        "fast_ema_period": 10,
-        "slow_ema_period": 30,
-        "trade_size": "1",
+        "order_id_tag": "0-abcd1234abcd1234",
     }
+    # This old V1 tag is invalid in the actual RC6 native constructor.
+    with pytest.raises(ValueError, match="strategy ID separator"):
+        validate_strategy_config(SmokeMarketOrderConfig, payload)
+    with pytest.raises(ValueError, match="strategy ID separator"):
+        SmokeMarketOrderConfig(**payload)
 
-    once = config_cls.parse(msgspec.json.encode(config))
-    encoded_again = msgspec.json.encode(once, enc_hook=msgspec_encoding_hook)
-    twice = config_cls.parse(encoded_again)
 
+def test_json_round_trip_preserves_native_user_field_types() -> None:
+    from strategies.example.config import EMACrossConfig
+
+    once = validate_strategy_config(EMACrossConfig, json.loads(json.dumps(_EMA_JSON)))
+    encoded_fields = {
+        "instrument_id": str(once.instrument_id),
+        "bar_type": str(once.bar_type),
+        "fast_ema_period": once.fast_ema_period,
+        "slow_ema_period": once.slow_ema_period,
+        "trade_size": str(once.trade_size),
+    }
+    assert encoded_fields == _EMA_JSON
+    twice = validate_strategy_config(EMACrossConfig, json.loads(json.dumps(encoded_fields)))
+    assert isinstance(twice.instrument_id, InstrumentId)
+    assert isinstance(twice.bar_type, BarType)
+    assert isinstance(twice.trade_size, Decimal)
+    assert once.instrument_id == twice.instrument_id
+    assert once.bar_type == twice.bar_type
+    assert once.trade_size == twice.trade_size
     assert once.fast_ema_period == twice.fast_ema_period
     assert once.slow_ema_period == twice.slow_ema_period
-    assert str(once.instrument_id) == str(twice.instrument_id)
 
 
 def test_api_and_worker_inject_identical_configs_for_omitted_defaults() -> None:
-    """Council Blocking Objection (Contrarian #2, 2026-04-20):
-    The backtest API's ``_prepare_and_validate_backtest_config`` helper
-    and the worker's ``_prepare_strategy_config`` helper MUST produce
-    byte-identical dicts when given the same user-submitted config +
-    resolved instruments. Otherwise the persisted ``Backtest.config``
-    diverges from what the worker actually runs — breaking graduation
-    parity with the portfolio service.
-
-    This is the Contrarian's hard merge gate: "omitted defaults +
-    backend-injected fields normalize identically across backtest /
-    portfolio / paper / live". Proven for the API ↔ worker pair here;
-    portfolio service parity is covered by existing tests in
-    ``test_portfolio_full_lifecycle.py``.
-    """
+    """Persisted research config and the worker's engine identities must agree."""
     from msai.api.backtests import _prepare_and_validate_backtest_config
     from msai.workers.backtest_job import _prepare_strategy_config
 
     strategy_file = _REPO_ROOT / "strategies" / "example" / "ema_cross.py"
     canonical = ["AAPL.NASDAQ"]
-
-    # Case 1: user omits instrument_id + bar_type (most common — the
-    # form hides them because they're derived from ``instruments``)
     user_config = {"fast_ema_period": 5, "slow_ema_period": 20}
-
     api_result = _prepare_and_validate_backtest_config(
         dict(user_config),
         strategy_file_path=str(strategy_file),
@@ -211,23 +128,8 @@ def test_api_and_worker_inject_identical_configs_for_omitted_defaults() -> None:
         canonical_instruments=canonical,
     )
     worker_result = _prepare_strategy_config(dict(user_config), canonical)
+    assert api_result == worker_result
 
-    assert api_result == worker_result, (
-        "API and worker config-prep helpers diverged — "
-        "persisted Backtest.config will not match the worker's runtime config."
-    )
-
-    # Case 2: user supplies their own instrument_id — BOTH helpers now
-    # unconditionally overwrite it with the canonical from the resolver.
-    # Behavior change 2026-05-12 (fresh-VM-data-path-closure): the
-    # read-boundary resolver accepts both Databento MIC (``AAPL.XNAS``)
-    # and exchange-name (``AAPL.NASDAQ``) input and canonicalizes either
-    # to the registry's canonical form. Leaving user input in the worker
-    # config would make the Nautilus subprocess read the catalog at the
-    # wrong venue suffix path — see ``_prepare_strategy_config``'s
-    # docstring for the full rationale. The parity invariant from the
-    # Contrarian's blocking objection #2 still holds: API and worker
-    # produce byte-identical dicts.
     user_config_with_override = {
         "instrument_id": "MSFT.NASDAQ",
         "bar_type": "MSFT.NASDAQ-5-MINUTE-LAST-EXTERNAL",
@@ -241,9 +143,7 @@ def test_api_and_worker_inject_identical_configs_for_omitted_defaults() -> None:
     )
     worker_override = _prepare_strategy_config(dict(user_config_with_override), canonical)
     assert api_override == worker_override
-    # Both helpers REPLACE the user-supplied MSFT instrument prefix with
-    # the canonical AAPL — but preserve the caller's step/aggregation
-    # (Codex P1 catch, PR #61 round 4): a user-supplied bar_type with
-    # a non-default step (e.g. ``5-MINUTE``) MUST survive the rewrite.
+    # Preparation preserves caller aggregation while canonicalizing the prefix;
+    # this does not certify unsupported five-minute execution in this candidate.
     assert api_override["instrument_id"] == "AAPL.NASDAQ"
     assert api_override["bar_type"] == "AAPL.NASDAQ-5-MINUTE-LAST-EXTERNAL"

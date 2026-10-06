@@ -103,39 +103,123 @@ def test_daily_account_series_owns_headline_metrics_even_when_native_stats_are_n
 
 
 def _native_reports():
-    from nautilus_trader.analysis.reporter import ReportProvider
-    from nautilus_trader.model.currencies import USD
-    from nautilus_trader.model.identifiers import ClientOrderId, TradeId
-    from nautilus_trader.model.objects import Money, Price, Quantity
-    from nautilus_trader.test_kit.providers import TestInstrumentProvider
-    from nautilus_trader.test_kit.stubs.events import TestEventStubs
-    from nautilus_trader.test_kit.stubs.execution import TestExecStubs
+    from nautilus_trader.analysis import ReportProvider
+    from nautilus_trader.core import UUID4
+    from nautilus_trader.model import (
+        AccountId,
+        ClientOrderId,
+        Currency,
+        InstrumentId,
+        LimitOrder,
+        LiquiditySide,
+        Money,
+        OrderAccepted,
+        OrderCanceled,
+        OrderFilled,
+        OrderSide,
+        OrderType,
+        Price,
+        Quantity,
+        StrategyId,
+        TimeInForce,
+        TradeId,
+        TraderId,
+        VenueOrderId,
+    )
 
-    instrument = TestInstrumentProvider.equity()
-    order = TestExecStubs.limit_order(instrument=instrument, quantity=Quantity.from_int(10))
-    order.apply(TestEventStubs.order_accepted(order))
-    for identity, qty, px, fee, timestamp in [
+    common = dict(
+        trader_id=TraderId("TRADER-001"),
+        strategy_id=StrategyId("Fixture-001"),
+        instrument_id=InstrumentId.from_str("AAPL.NASDAQ"),
+    )
+    account = AccountId("NASDAQ-001")
+    venue_order = VenueOrderId("O-1")
+    identity = ClientOrderId("PARTIAL")
+    order = LimitOrder(
+        **common,
+        client_order_id=identity,
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_int(10),
+        price=Price.from_str("101.00"),
+        time_in_force=TimeInForce.GTC,
+        post_only=False,
+        reduce_only=False,
+        quote_quantity=False,
+        init_id=UUID4(),
+        ts_init=0,
+    )
+    order.apply(
+        OrderAccepted(
+            **common,
+            client_order_id=identity,
+            venue_order_id=venue_order,
+            account_id=account,
+            event_id=UUID4(),
+            ts_event=0,
+            ts_init=0,
+            reconciliation=False,
+        )
+    )
+    for fill_id, qty, px, fee, timestamp in [
         ("F1", 2, "100.00", 1.2, 1),
         ("F2", 3, "101.00", 0.0, 2),
     ]:
         order.apply(
-            TestEventStubs.order_filled(
-                order,
-                instrument,
-                trade_id=TradeId(identity),
+            OrderFilled(
+                **common,
+                client_order_id=identity,
+                venue_order_id=venue_order,
+                account_id=account,
+                trade_id=TradeId(fill_id),
+                order_side=OrderSide.BUY,
+                order_type=OrderType.LIMIT,
                 last_qty=Quantity.from_int(qty),
                 last_px=Price.from_str(px),
-                commission=Money(fee, USD),
+                currency=Currency.from_str("USD"),
+                liquidity_side=LiquiditySide.TAKER,
+                event_id=UUID4(),
                 ts_event=timestamp * 1_000_000_000,
+                ts_init=timestamp * 1_000_000_000,
+                reconciliation=False,
+                commission=Money(fee, Currency.from_str("USD")),
             )
         )
-    canceled = TestExecStubs.limit_order(
-        instrument=instrument,
-        client_order_id=ClientOrderId("CANCELED"),
+    identity = ClientOrderId("CANCELED")
+    canceled = LimitOrder(
+        **common,
+        client_order_id=identity,
+        order_side=OrderSide.BUY,
         quantity=Quantity.from_int(10),
+        price=Price.from_str("101.00"),
+        time_in_force=TimeInForce.GTC,
+        post_only=False,
+        reduce_only=False,
+        quote_quantity=False,
+        init_id=UUID4(),
+        ts_init=0,
     )
-    canceled.apply(TestEventStubs.order_accepted(canceled))
-    canceled.apply(TestEventStubs.order_canceled(canceled))
+    canceled.apply(
+        OrderAccepted(
+            **common,
+            client_order_id=identity,
+            venue_order_id=VenueOrderId("O-2"),
+            account_id=account,
+            event_id=UUID4(),
+            ts_event=0,
+            ts_init=0,
+            reconciliation=False,
+        )
+    )
+    canceled.apply(
+        OrderCanceled(
+            **common,
+            client_order_id=identity,
+            event_id=UUID4(),
+            ts_event=0,
+            ts_init=0,
+            reconciliation=False,
+        )
+    )
     return (
         ReportProvider.generate_orders_report([order, canceled]),
         ReportProvider.generate_fills_report([order, canceled]).reset_index(),

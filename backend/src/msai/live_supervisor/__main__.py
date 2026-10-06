@@ -62,9 +62,6 @@ from msai.services.alerting import AlertService
 from msai.services.live.deployment_identity import derive_strategy_id_full
 from msai.services.live.gateway_router import GatewayRouter
 from msai.services.live_command_bus import LiveCommandBus
-from msai.services.nautilus.databento_live_config import (
-    resolve_databento_targets,
-)
 from msai.services.nautilus.ibg_client_id import (
     ROLE_EXEC,
     derive_ibg_client_id,
@@ -72,21 +69,21 @@ from msai.services.nautilus.ibg_client_id import (
 from msai.services.nautilus.live_instrument_bootstrap import (
     exchange_local_today,
 )
+from msai.services.nautilus.runtime_capabilities import (
+    UnsupportedRuntimeError,
+    require_live_runtime,
+)
 from msai.services.nautilus.security_master.live_resolver import (
     LiveResolverError,
     lookup_for_live,
 )
 from msai.services.nautilus.strategy_loader import resolve_importable_strategy_paths
-from msai.services.nautilus.trading_node_subprocess import (
-    StrategyMemberPayload,
-    TradingNodePayload,
-    _trading_node_subprocess,
-)
 from msai.services.strategy_paths import resolve_strategy_file
 from msai.services.strategy_registry import compute_file_hash
 
 if TYPE_CHECKING:
     from msai.services.fleet_alerts import FleetHealthSnapshot
+    from msai.services.nautilus.trading_node_subprocess import TradingNodePayload
 
 # Canonical strategy-side venue (per ``nautilus.md`` architectural rule #3
 # — "Pin venue names per environment"). The per-account broker fleet
@@ -151,6 +148,13 @@ def _build_production_payload_factory(
     Raises are propagated so :meth:`FleetRouter.spawn` can mark
     the row as ``SPAWN_FAILED_PERMANENT``.
     """
+
+    require_live_runtime("Live supervisor payload construction")
+    from msai.services.nautilus.databento_live_config import resolve_databento_targets
+    from msai.services.nautilus.trading_node_subprocess import (
+        StrategyMemberPayload,
+        TradingNodePayload,
+    )
 
     async def _factory(
         row_id: UUID,
@@ -863,6 +867,14 @@ def _install_signal_handlers(loop: asyncio.AbstractEventLoop, stop_event: asynci
 
 
 async def _async_main() -> int:
+    try:
+        require_live_runtime("Live supervisor")
+    except UnsupportedRuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    from msai.services.nautilus.trading_node_subprocess import _trading_node_subprocess
+
     # ``setup_logging`` configures structlog. The supervisor modules
     # (__main__.py, main.py, fleet_router.py, heartbeat_monitor.py)
     # and ``live_command_bus`` all use stdlib ``logging.getLogger`` —

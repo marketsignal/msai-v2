@@ -66,6 +66,7 @@ from msai.services.live_command_bus import (
     LiveCommand,
     LiveCommandType,
 )
+from msai.services.nautilus.runtime_capabilities import require_live_runtime
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable, Sequence
@@ -706,6 +707,7 @@ async def run_forever(
     for the boot-time edge cases. (Full operator-driven dynamic add-account
     at runtime is hardened in PR 3.)
     """
+    require_live_runtime("Live supervisor loop")
     # Live registry of running consumers, shared with the refresh loop and
     # the consumed-account publisher. ``ensure_consumer`` is the single
     # idempotent entry point that starts a consumer for an account exactly

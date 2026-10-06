@@ -10,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from msai.schemas.backtest import (
+    BacktestAccounting,
     BacktestResultsResponse,
     ErrorEnvelope,
     Remediation,
@@ -18,6 +19,36 @@ from msai.schemas.backtest import (
     SeriesPayload,
     SeriesStatus,
 )
+
+
+def test_native_provenance_roundtrip_keeps_legacy_unknown():
+    base = dict(
+        version=1,
+        basis="realized_account_balance",
+        initial_capital=10_000,
+        currency="USD",
+        costs="engine_recorded",
+    )
+    legacy = BacktestAccounting(**base)
+    assert legacy.engine_version is None
+    assert legacy.slippage_probability is None
+    assert legacy.data_origin is None
+    assert legacy.model_dump() == base
+    provenance = dict(
+        engine_version="2.0.0rc6",
+        leverage=1,
+        fee_model="FixedFeeModel",
+        commission_per_fill=0,
+        fill_model="DefaultFillModel",
+        fill_seed=42,
+        slippage_probability=0,
+        execution_assumptions="L1 residual tick",
+        data_origin="synthetic",
+        fixture_id="fixture",
+        fixture_manifest_sha256="a" * 64,
+    )
+    native = BacktestAccounting(**base, **provenance)
+    assert native.model_dump(include=set(provenance)) == provenance
 
 
 class TestRemediation:

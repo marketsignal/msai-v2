@@ -1,44 +1,51 @@
-"""Resolve ticker symbols to NautilusTrader ``Instrument`` objects.
-
-Synchronous wrapper around ``TestInstrumentProvider`` for catalog-builder
-+ backtest-worker call sites that don't need the full async
-:class:`SecurityMaster` path.
-"""
+"""Explicit native USD Equity metadata for the supported research catalog."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-from nautilus_trader.test_kit.providers import TestInstrumentProvider
-
-if TYPE_CHECKING:
-    from nautilus_trader.model.instruments import Instrument
-
+from nautilus_trader.model import Currency, Equity, InstrumentId, Price, Quantity, Symbol
 
 DEFAULT_EQUITY_VENUE = "NASDAQ"
 """Default venue for a bare ticker. Callers resolving instruments on
 other venues pass ``venue=...`` explicitly."""
+
+_EQUITY_VENUES = frozenset({"NASDAQ", "NYSE", "ARCA", "AMEX", "BATS", "IEX", "SMART", "SIM"})
 
 
 def resolve_instrument(
     symbol_or_id: str,
     *,
     venue: str = DEFAULT_EQUITY_VENUE,
-) -> Instrument:
+) -> Equity:
     """Turn a raw ticker symbol (or canonical Nautilus ID) into an
-    ``Instrument`` pinned to a real IB venue.
+    ``Instrument`` for minute-equity research. This does not qualify it for IB.
 
     Accepts either a bare symbol like ``"AAPL"`` or a fully-qualified
     Nautilus identifier like ``"AAPL.NASDAQ"``. A dotted identifier's
     suffix wins over ``venue``.
     """
     if "." in symbol_or_id:
-        raw_symbol, parsed_venue = symbol_or_id.split(".", 1)
+        raw_symbol, parsed_venue = symbol_or_id.rsplit(".", 1)
         resolved_venue = parsed_venue
     else:
         raw_symbol = symbol_or_id
         resolved_venue = venue
-    return TestInstrumentProvider.equity(symbol=raw_symbol, venue=resolved_venue)
+    if resolved_venue not in _EQUITY_VENUES:
+        raise ValueError(
+            "V2 research supports minute equities on supported USD equity venues; "
+            f"{resolved_venue!r} is unsupported",
+        )
+    if not raw_symbol or "/" in raw_symbol or "\\" in raw_symbol or raw_symbol in {".", ".."}:
+        raise ValueError("V2 research requires a valid equity ticker")
+    return Equity(
+        instrument_id=InstrumentId.from_str(f"{raw_symbol}.{resolved_venue}"),
+        raw_symbol=Symbol(raw_symbol),
+        currency=Currency.from_str("USD"),
+        price_precision=2,
+        price_increment=Price.from_str("0.01"),
+        lot_size=Quantity.from_str("1"),
+        ts_event=0,
+        ts_init=0,
+    )
 
 
 def default_bar_type(

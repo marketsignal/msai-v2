@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from nautilus_trader.model.identifiers import (
+from nautilus_trader.model import (
     InstrumentId,
 )
 

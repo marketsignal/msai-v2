@@ -95,7 +95,9 @@ class ReportGenerator:
 
             html = Path(tmp_path).read_text(encoding="utf-8")
             Path(tmp_path).unlink(missing_ok=True)
-            return html
+            # Pinned QuantStats emits this handler without defining save().
+            # Correct newly generated reports; retained historical bytes stay unchanged.
+            return html.replace(' onload="save()"', "")
         except Exception as exc:
             log.warning(
                 "quantstats_report_failed",

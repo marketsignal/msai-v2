@@ -14,45 +14,27 @@ of broker round-trips and clutters the audit log.
 
 from __future__ import annotations
 
-# Nautilus msgspec configs resolve field annotations at runtime via
-# inspect, so ``InstrumentId``/``BarType`` must be importable at
-# module load, not only under ``TYPE_CHECKING``.
-from nautilus_trader.model.identifiers import InstrumentId
-from nautilus_trader.trading.config import StrategyConfig
-from nautilus_trader.trading.strategy import Strategy
+# Native imports are shared by discovery and the execution subprocess.
+from nautilus_trader.model import InstrumentId
+from nautilus_trader.trading import Strategy, StrategyConfig
 
 
-class IntentionallyFailingStrategyConfig(StrategyConfig, frozen=True, kw_only=True):
-    """Config for :class:`IntentionallyFailingStrategy`.
+class IntentionallyFailingStrategyConfig(StrategyConfig):
+    """Keep concrete string defaults used by the candidate compose bridge.
 
-    Carries ``instrument_id`` + ``bar_type`` as ``str`` (not Nautilus
-    ``InstrumentId`` / ``BarType``) with concrete msgspec defaults — the
-    portfolio compose bridge's singular→plural derivation
-    (``services/portfolio/lifecycle.py:_get_or_create_default_candidate``)
-    needs a non-empty ``default_config['instrument_id']`` to build a
-    runnable candidate, and msgspec only emits a JSON-Schema ``default``
-    for fields with a concrete default value (Nautilus identifier types
-    don't have a sensible default and so are required-without-default in
-    every production strategy).
-
-    Why ``str`` and not the proper Nautilus types: the
-    ``strategy_registry`` walker introspects msgspec-emitted JSON Schema
-    to populate ``default_config``; Nautilus identifier types resolve to
-    ``{"type": "string", ...}`` via ``nautilus_schema_hook`` but the
-    schema hook does NOT preserve a Python-level default (the hook only
-    sets ``title`` / ``examples``). Using ``str`` with a literal default
-    is the v1 compromise so the walker captures defaults the bridge can
-    consume. The proper fix is making the walker introspect Nautilus
-    type defaults; that's out of scope for the E2E iter-2 fix.
-
-    The strategy raises in ``on_start`` (see below) before any
-    ``InstrumentId.from_str`` parsing fires, so these defaults never
-    actually drive backtest behaviour — they exist purely to satisfy the
-    bridge's compose-time precondition.
+    These defaults arrange the intentionally failing fixture; on_start always
+    raises and this strategy is never a supported live deployment.
     """
 
-    instrument_id: str = "AAPL.NASDAQ"
-    bar_type: str = "AAPL.NASDAQ-1-DAY-LAST-EXTERNAL"
+    def __init__(
+        self,
+        instrument_id: str = "AAPL.NASDAQ",
+        bar_type: str = "AAPL.NASDAQ-1-DAY-LAST-EXTERNAL",
+        order_id_tag: str | None = None,
+    ) -> None:
+        super().__init__()
+        self.instrument_id = instrument_id
+        self.bar_type = bar_type
 
 
 class IntentionallyFailingStrategy(Strategy):

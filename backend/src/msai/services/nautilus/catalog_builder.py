@@ -25,16 +25,16 @@ Design goals
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
-from nautilus_trader.model.data import Bar, BarType
-from nautilus_trader.persistence.catalog import ParquetDataCatalog
-from nautilus_trader.persistence.wranglers import BarDataWrangler
+from nautilus_trader.model import BarType, NautilusDataType
+from nautilus_trader.persistence import BarDataWrangler, ParquetDataCatalog
 
 from msai.core.logging import get_logger
 from msai.services.nautilus.instruments import resolve_instrument
@@ -61,6 +61,61 @@ _OHLCV_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close", "volume")
 _BATCH_SIZE = 100_000
 
 
+def _native_bar_batch(record_batch: pa.RecordBatch, *, price_precision: int) -> pa.RecordBatch:
+    """Bridge MSAI raw OHLCV to the exact RC6 native Arrow bar schema."""
+    frame = record_batch.to_pandas()
+    if frame.isna().any().any():
+        raise ValueError("OHLCV contains null/NaN values")
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+    if frame["timestamp"].isna().any() or (frame["timestamp"].astype("int64") < 0).any():
+        raise ValueError("OHLCV timestamps must be valid UTC nanoseconds after 1970")
+    frame = frame.sort_values("timestamp")
+    if frame["timestamp"].duplicated().any():
+        raise ValueError("OHLCV contains duplicate timestamps")
+    arrays = []
+    decimal_type = pa.decimal128(38, 16)
+    for name in _OHLCV_COLUMNS:
+        values = pd.to_numeric(frame[name], errors="raise")
+        if values.isna().any() or values.isin([float("inf"), float("-inf")]).any():
+            raise ValueError(f"OHLCV {name} must contain finite numbers")
+        if name == "volume":
+            if (values < 0).any() or (values % 1 != 0).any():
+                raise ValueError("OHLCV equity volume must be nonnegative whole units")
+        else:
+            if (values <= 0).any():
+                raise ValueError(f"OHLCV {name} must be positive")
+            values = values.round(price_precision)
+        frame[name] = values
+        # Casting floats directly to decimal preserves binary residue, which
+        # native fixed-point decoding can truncate by one cent. Encode the
+        # precision-rounded decimal spelling instead.
+        arrays.append(pa.array([Decimal(str(value)) for value in values], type=decimal_type))
+    if (
+        (frame["high"] < frame[["open", "close"]].max(axis=1)).any()
+        or (frame["low"] > frame[["open", "close"]].min(axis=1)).any()
+        or (frame["high"] < frame["low"]).any()
+    ):
+        raise ValueError("OHLCV high/low bounds do not contain open and close")
+    times = pa.array(frame["timestamp"], type=pa.timestamp("ns", tz="UTC"))
+    arrays.extend([times, times])
+    schema = pa.schema([
+        *(pa.field(name, decimal_type, nullable=False) for name in _OHLCV_COLUMNS),
+        pa.field("ts_event", pa.timestamp("ns", tz="UTC"), nullable=False),
+        pa.field("ts_init", pa.timestamp("ns", tz="UTC"), nullable=False),
+    ])
+    return pa.RecordBatch.from_arrays(arrays, schema=schema)
+
+
+def _window_ns(start: date, end: date, bar_spec: str) -> tuple[int, int]:
+    if bar_spec != _BAR_SPEC:
+        raise ValueError("V2 research supports only 1-MINUTE-LAST-EXTERNAL equity bars")
+    if start > end:
+        raise ValueError("start date must not be after end date")
+    return pd.Timestamp(start, tz="UTC").value, (
+        pd.Timestamp(end, tz="UTC").value + 86_400 * 1_000_000_000 - 1
+    )
+
+
 def build_catalog_for_symbol(
     symbol: str,
     raw_parquet_root: Path,
@@ -72,23 +127,20 @@ def build_catalog_for_symbol(
 ) -> str:
     """Convert raw OHLCV files for a single symbol into Nautilus catalog format.
 
-    Reads every Parquet file under
-    ``{raw_parquet_root}/{asset_class}/{symbol}/**/*.parquet``, concatenates
-    them into a single DataFrame, normalises the index to a UTC
-    ``DatetimeIndex``, runs :class:`BarDataWrangler` to produce ``Bar``
-    objects, and writes both the instrument definition and the bars to the
-    ``ParquetDataCatalog`` rooted at ``catalog_root``.
+    Streams bounded batches from
+    ``{raw_parquet_root}/stocks/{symbol}/**/*.parquet`` into native typed Arrow
+    IPC, retaining raw timestamps as UTC nanoseconds for both event/init time.
+    Native ``BarDataWrangler`` and typed catalog writers own bar decoding and
+    persistence. The preserved V1 ``nautilus`` directory is never a valid target.
 
     Args:
-        symbol: Ticker symbol (``"AAPL"``) or a Nautilus ID (``"AAPL.SIM"``).
-            The venue suffix -- if present -- is stripped and re-bound to
-            ``SIM`` by :func:`resolve_instrument`.
+        symbol: USD equity ticker (``"AAPL"``) or canonical equity ID
+            (``"AAPL.NASDAQ"``). A supported venue suffix is preserved.
         raw_parquet_root: Root of the raw OHLCV Parquet tree (typically
             ``settings.parquet_root``).
         catalog_root: Root of the Nautilus catalog (typically
             ``settings.nautilus_catalog_root``).  Created on demand.
-        asset_class: Asset-class sub-directory name under
-            ``raw_parquet_root``.  Defaults to ``"stocks"``.
+        asset_class: Only ``"stocks"`` is supported by this research slice.
         force: When ``True``, rebuild the catalog entries for this symbol
             even if bars already exist.  Used to refresh stale data.
         raw_symbol_override: Optional raw-symbol for the ingest-tree path
@@ -114,13 +166,17 @@ def build_catalog_for_symbol(
 
     Returns:
         The canonical Nautilus instrument ID string
-        (e.g. ``"AAPL.SIM"``) that callers should pass to
+        (e.g. ``"AAPL.NASDAQ"``) that callers should pass to
         ``BacktestDataConfig.instrument_ids``.
 
     Raises:
         FileNotFoundError: No raw Parquet files exist for the requested
             symbol under ``{raw_parquet_root}/{asset_class}/{raw_symbol}``.
     """
+    if asset_class != "stocks":
+        raise ValueError("V2 research supports minute equities in stocks; other assets unsupported")
+    if catalog_root.name == "nautilus":
+        raise ValueError("The nautilus directory is preserved V1 state; use a separate V2 catalog")
     instrument = resolve_instrument(symbol)
     instrument_id_str = str(instrument.id)
     # F9: prefer the caller-supplied raw symbol for the ingest-tree
@@ -156,6 +212,7 @@ def build_catalog_for_symbol(
     # present" and never noticed the delta.
     source_hash = _compute_raw_source_hash(raw_files, raw_root=raw_parquet_root)
     marker_path = _source_marker_path(catalog_root, instrument_id_str)
+    bar_identifier = f"{instrument_id_str}-{_BAR_SPEC}"
     if force:
         # Force rebuild: unlink the marker FIRST, then purge the bar dir, so a
         # clean rebuild always follows. The marker is re-written only AFTER all
@@ -170,12 +227,11 @@ def build_catalog_for_symbol(
         if marker_path.exists():
             stored_hash = marker_path.read_text().strip()
             if stored_hash == source_hash:
-                existing_bars = catalog.bars(instrument_ids=[instrument_id_str])
-                if existing_bars:
+                intervals = catalog.get_intervals(NautilusDataType.Bar, identifier=bar_identifier)
+                if intervals:
                     log.info(
                         "nautilus_catalog_already_populated",
                         instrument_id=instrument_id_str,
-                        bar_count=len(existing_bars),
                         source_hash=source_hash,
                     )
                     return instrument_id_str
@@ -194,6 +250,7 @@ def build_catalog_for_symbol(
                 # untouched, and the shared instrument definition
                 # under data/equity/ is left in place (Codex review
                 # P2: deleting it strands sibling bar specs).
+                marker_path.unlink(missing_ok=True)
                 _purge_catalog_for_instrument(catalog_root, instrument_id_str, bar_spec=_BAR_SPEC)
         else:
             # Markerless legacy catalog (Codex review P1). Pre-patch
@@ -205,12 +262,11 @@ def build_catalog_for_symbol(
             # overlapping intervals, leaving a wrong catalog with a
             # fresh marker that locks in the staleness on the next
             # call.
-            existing_bars = catalog.bars(instrument_ids=[instrument_id_str])
-            if existing_bars:
+            intervals = catalog.get_intervals(NautilusDataType.Bar, identifier=bar_identifier)
+            if intervals:
                 log.info(
                     "nautilus_catalog_legacy_unmarked_rebuilding",
                     instrument_id=instrument_id_str,
-                    legacy_bar_count=len(existing_bars),
                     note=(
                         "no source-hash marker present; treating existing "
                         "bars as stale and purging before rebuild"
@@ -227,33 +283,46 @@ def build_catalog_for_symbol(
     # before the next batch is read — peak RSS is bounded by
     # ``_BATCH_SIZE × row_width × column_count`` plus pyarrow's own
     # buffers.
-    bar_type = BarType.from_str(f"{instrument_id_str}-{_BAR_SPEC}")
-    wrangler = BarDataWrangler(bar_type=bar_type, instrument=instrument)
+    marker_path.unlink(missing_ok=True)
+    wrangler = BarDataWrangler(
+        bar_type=bar_identifier, price_precision=instrument.price_precision,
+        size_precision=instrument.size_precision,
+    )
 
     # Order matters: the instrument must be written BEFORE any bars
     # so the catalog indexes resolve correctly when BacktestNode
     # starts up.
-    catalog.write_data([instrument])
+    catalog.write_instruments([instrument])
 
     total_bars = 0
     columns_to_read = ["timestamp", *_OHLCV_COLUMNS]
+    last_timestamp: int | None = None
     for raw_file in raw_files:
-        parquet_file = pq.ParquetFile(raw_file)
-        for record_batch in parquet_file.iter_batches(
-            batch_size=_BATCH_SIZE,
-            columns=columns_to_read,
-        ):
-            batch_df = record_batch.to_pandas()
-            if batch_df.empty:
-                continue
-            indexed_df = (
-                batch_df.assign(timestamp=pd.to_datetime(batch_df["timestamp"], utc=True))
-                .set_index("timestamp")[list(_OHLCV_COLUMNS)]
-                .sort_index()
-            )
-            bars = wrangler.process(indexed_df)
-            catalog.write_data(bars)
-            total_bars += len(bars)
+        try:
+            parquet_file = pq.ParquetFile(raw_file)
+            if not set(columns_to_read).issubset(parquet_file.schema_arrow.names):
+                raise ValueError("OHLCV Parquet is missing required timestamp/price/volume columns")
+            for record_batch in parquet_file.iter_batches(
+                batch_size=_BATCH_SIZE, columns=columns_to_read,
+            ):
+                if record_batch.num_rows == 0:
+                    continue
+                native_batch = _native_bar_batch(
+                    record_batch, price_precision=instrument.price_precision,
+                )
+                sink = pa.BufferOutputStream()
+                with pa.ipc.new_stream(sink, native_batch.schema) as writer:
+                    writer.write_batch(native_batch)
+                bars = wrangler.process_record_batch_bytes(sink.getvalue().to_pybytes())
+                if last_timestamp is not None and bars[0].ts_event <= last_timestamp:
+                    raise ValueError("OHLCV partitions/batches overlap or are out of time order")
+                catalog.write_bars(bars)
+                last_timestamp = bars[-1].ts_event
+                total_bars += len(bars)
+        except (pa.ArrowException, ValueError, TypeError) as exc:
+            raise ValueError(f"Invalid OHLCV Parquet {raw_file.name}: {exc}") from exc
+    if total_bars == 0:
+        raise ValueError("OHLCV Parquet contains no minute equity bars")
 
     # Persist the source hash AFTER the bars are written so a crash
     # mid-write leaves the marker absent and the next call rebuilds.
@@ -339,15 +408,14 @@ def _purge_catalog_for_instrument(
     instrument (1-MINUTE-LAST, 5-MINUTE-LAST, ...) and they all
     point at the same instrument entry. Removing it would orphan
     the sibling specs and a crash before the rebuild's
-    ``catalog.write_data([instrument])`` call would strand them
-    permanently. ``write_data([instrument])`` later in the rebuild
+    ``catalog.write_instruments([instrument])`` call would strand them
+    permanently. ``write_instruments([instrument])`` later in the rebuild
     is idempotent — re-writing the same instrument is safe.
     """
-    bar_dir = catalog_root / "data" / "bar" / f"{instrument_id_str}-{bar_spec}"
-    if bar_dir.exists():
-        for child in bar_dir.iterdir():
-            child.unlink()
-        bar_dir.rmdir()
+    catalog = ParquetDataCatalog(str(catalog_root))
+    catalog.delete_data_range(
+        NautilusDataType.Bar, identifier=f"{instrument_id_str}-{bar_spec}",
+    )
 
 
 def ensure_catalog_data(
@@ -447,12 +515,12 @@ def catalog_has_bars_in_window(
     does not apply here.
     """
     bar_type = BarType.from_str(f"{instrument_id}-{bar_spec}")
-    start_ns = pd.Timestamp(start, tz="UTC").value
-    # Inclusive end-of-day: last ns of ``end``.
-    end_ns = pd.Timestamp(end, tz="UTC").value + 86_400 * 1_000_000_000 - 1
+    start_ns, end_ns = _window_ns(start, end, bar_spec)
+    if not catalog_root.is_dir():
+        return False
     catalog = ParquetDataCatalog(str(catalog_root))
     try:
-        intervals = catalog.get_intervals(Bar, identifier=str(bar_type))
+        intervals = catalog.get_intervals(NautilusDataType.Bar, identifier=str(bar_type))
     except (FileNotFoundError, ValueError):
         # Missing instrument/bar directory or empty catalog → no bars.
         return False
@@ -572,15 +640,10 @@ def verify_catalog_coverage(
         as ``instrument_ids``. ``gaps`` is a list of
         ``(start_ns, end_ns)`` tuples; empty list means full coverage.
     """
+    start_ns, end_ns = _window_ns(start, end, bar_spec)
+    if not catalog_root.is_dir():
+        return [(instrument_id, [(start_ns, end_ns)]) for instrument_id in instrument_ids]
     catalog = ParquetDataCatalog(str(catalog_root))
-    start_ns = int(datetime(start.year, start.month, start.day, tzinfo=UTC).timestamp() * 1e9)
-    end_ns = (
-        int(
-            (datetime(end.year, end.month, end.day, tzinfo=UTC) + timedelta(days=1)).timestamp()
-            * 1e9
-        )
-        - 1
-    )
 
     results: list[tuple[str, list[tuple[int, int]]]] = []
     for instrument_id in instrument_ids:
@@ -588,7 +651,7 @@ def verify_catalog_coverage(
         gaps = catalog.get_missing_intervals_for_request(
             start=start_ns,
             end=end_ns,
-            data_cls=Bar,
+            data_type=NautilusDataType.Bar,
             identifier=str(bar_type),
         )
         results.append((instrument_id, list(gaps)))

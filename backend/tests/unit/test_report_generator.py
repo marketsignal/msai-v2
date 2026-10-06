@@ -40,6 +40,24 @@ def _empty_returns() -> pd.Series:  # type: ignore[type-arg]
 class TestGenerateTearsheet:
     """Tests for ReportGenerator.generate_tearsheet."""
 
+    def test_generated_quantstats_report_removes_undefined_save_load_handler(
+        self, monkeypatch
+    ) -> None:
+        import msai.services.report_generator as reports
+
+        original = '<html><body onload="save()"><script>function working(){}</script></body></html>'
+
+        def generate(*args, **kwargs):
+            from pathlib import Path
+
+            Path(kwargs["output"]).write_text(original)
+
+        monkeypatch.setattr(reports, "_HAS_QUANTSTATS", True)
+        monkeypatch.setattr(reports.qs.reports, "html", generate)
+        html = ReportGenerator().generate_tearsheet(_sample_returns())
+        assert 'onload="save()"' not in html
+        assert "function working(){}" in html
+
     def test_generate_tearsheet_returns_html(self) -> None:
         """Generate tearsheet from sample returns and verify it is HTML."""
         # Arrange
@@ -94,9 +112,9 @@ class TestSaveReport:
         path = generator.save_report(html, backtest_id, str(tmp_path))
 
         # Assert
-        from pathlib import Path as P
+        from pathlib import Path
 
-        report_file = P(path)
+        report_file = Path(path)
         assert report_file.exists()
         assert report_file.name == f"{backtest_id}.html"
         assert report_file.read_text() == html
@@ -112,9 +130,9 @@ class TestSaveReport:
         path = generator.save_report(html, "bt-001", data_root)
 
         # Assert
-        from pathlib import Path as P
+        from pathlib import Path
 
-        assert P(path).exists()
+        assert Path(path).exists()
         assert "reports" in path
 
     def test_save_report_returns_absolute_path(self, tmp_path: Path) -> None:
@@ -127,9 +145,9 @@ class TestSaveReport:
         path = generator.save_report(html, "bt-abs", str(tmp_path))
 
         # Assert
-        from pathlib import Path as P
+        from pathlib import Path
 
-        assert P(path).is_absolute()
+        assert Path(path).is_absolute()
 
 
 class TestGetReportPath:

@@ -167,10 +167,8 @@ def _find_strategy_class_name(module: ModuleType) -> str:
 def _find_config_class_name(module: ModuleType) -> str:
     """Locate a Nautilus-style ``*Config`` class in ``module``.
 
-    Nautilus strategy configs inherit from ``StrategyConfig`` which is a
-    msgspec-backed dataclass exposing a ``parse`` classmethod.  We use that
-    attribute as a signature so we don't accidentally pick up unrelated
-    pydantic/dataclass configs that happen to share the naming convention.
+    Recognize native StrategyConfig subclasses, preferring definitions in the
+    strategy module over imported helper configs. V2 has no V1 parse method.
 
     Args:
         module: The imported strategy module.
@@ -181,7 +179,14 @@ def _find_config_class_name(module: ModuleType) -> str:
     Raises:
         ValueError: No suitable ``*Config`` class was found.
     """
-    for _, cls in inspect.getmembers(module, inspect.isclass):
-        if cls.__name__.lower().endswith("config") and hasattr(cls, "parse"):
-            return cls.__name__
+    from nautilus_trader.trading import StrategyConfig
+
+    candidates = [
+        cls
+        for _, cls in inspect.getmembers(module, inspect.isclass)
+        if cls is not StrategyConfig and issubclass(cls, StrategyConfig)
+    ]
+    candidates.sort(key=lambda cls: cls.__module__ != module.__name__)
+    if candidates:
+        return candidates[0].__name__
     raise ValueError(f"No Nautilus StrategyConfig class found in module {module.__name__}")

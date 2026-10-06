@@ -315,6 +315,7 @@ export default function BacktestDetailPage({
         >
           {results.accounting ? (
             <>
+              <h2 className="font-medium text-foreground">Research simulation</h2>
               <p>
                 Opening capital: {results.accounting.initial_capital.toLocaleString("en-US")}{" "}
                 {results.accounting.currency}. Returns measure realized account
@@ -325,6 +326,50 @@ export default function BacktestDetailPage({
                 and slippage have not been validated. Fills count executions,
                 not completed trades.
               </p>
+              <dl
+                data-testid="backtest-simulation-assumptions"
+                className="mt-3 grid grid-cols-2 gap-x-4 gap-y-3 lg:grid-cols-4"
+              >
+                {[
+                  ["Engine", results.accounting.engine_version ?? "Not recorded"],
+                  ["Leverage", results.accounting.leverage == null
+                    ? "Not recorded" : `${results.accounting.leverage}×`],
+                  ["Fee model", results.accounting.fee_model ?? "Not recorded"],
+                  ["Commission per fill", results.accounting.commission_per_fill == null
+                    ? "Not recorded"
+                    : `${results.accounting.commission_per_fill.toLocaleString("en-US", {
+                        minimumFractionDigits: 2, maximumFractionDigits: 6,
+                      })} ${results.accounting.currency}`],
+                  ["Fill model", results.accounting.fill_model ?? "Not recorded"],
+                  ["Fill seed", results.accounting.fill_seed == null
+                    ? "Not recorded" : String(results.accounting.fill_seed)],
+                  ["Random slippage setting", results.accounting.slippage_probability == null
+                    ? "Not recorded"
+                    : `${(results.accounting.slippage_probability * 100).toLocaleString("en-US")} % probability`],
+                  ["Input origin", results.accounting.data_origin === "synthetic"
+                    ? "Synthetic fixture" : "Not recorded"],
+                ].map(([label, value]) => (
+                  <div key={label} className="min-w-0">
+                    <dt className="text-xs">{label}</dt>
+                    <dd className="break-words font-medium text-foreground">{value}</dd>
+                  </div>
+                ))}
+              </dl>
+              <p className="mt-3">
+                Bar execution assumptions: {results.accounting.execution_assumptions ?? "Not recorded"}
+              </p>
+              {results.accounting.data_origin === "synthetic" && (
+                <div data-testid="backtest-synthetic-scope" className="mt-2 space-y-1">
+                  <p>
+                    Generated minute data uses UTC weekdays, including holidays.
+                    It does not establish complete market sessions, realistic
+                    execution costs or strategy alpha.
+                  </p>
+                  <p className="break-words text-xs">
+                    Fixture: {results.accounting.fixture_id ?? "Not recorded"}
+                  </p>
+                </div>
+              )}
             </>
           ) : (
             <p>

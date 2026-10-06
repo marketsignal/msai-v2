@@ -62,6 +62,11 @@ from msai.core.auth import _API_KEY_CLAIMS, init_validator
 from msai.core.config import settings
 from msai.core.database import get_db
 from msai.core.logging import get_logger, logging_middleware, setup_logging
+from msai.services.nautilus.runtime_capabilities import (
+    UnsupportedRuntimeError,
+    is_v2_research_runtime,
+    require_live_runtime,
+)
 
 setup_logging(settings.environment)
 log = get_logger(__name__)
@@ -146,6 +151,7 @@ async def _start_projection_tasks() -> None:
 
     Both run until ``_projection_stop`` is set.
     """
+    require_live_runtime("Live event projection")
     from redis.asyncio import Redis as AsyncRedis
 
     from msai.api.live_deps import get_projection_state
@@ -255,19 +261,32 @@ async def _has_active_live_deployments() -> bool:
     return count > 0
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Startup/shutdown lifecycle."""
+async def _has_incompatible_live_state() -> bool:
+    """Unknown/nonterminal deployments or processes cannot enter RC6 research."""
+    from sqlalchemy import or_
+
+    from msai.core.database import async_session_factory
+    from msai.models import LiveDeployment, LiveNodeProcess
+
+    async with async_session_factory() as session:
+        for model in (LiveDeployment, LiveNodeProcess):
+            count = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(model)
+                    .where(or_(model.status.is_(None), model.status.not_in(("stopped", "failed"))))
+                )
+            ).scalar_one()
+            if count:
+                return True
+    return False
+
+
+def _configure_broker_services(app: FastAPI) -> None:
+    """Wire persisted account metadata dependencies without probing/connecting."""
     import os
 
-    from msai.api.account import start_ib_probe_task, stop_ib_probe_task
-    from msai.core.soft_delete import register_soft_delete_listeners
-    from msai.services.ib_account_snapshot import get_snapshot
     from msai.services.live.gateway_router import GatewayRouter
-
-    # Soft-delete listener — default-filters ``deleted_at IS NULL`` from
-    # select(Strategy); opt-out via ``execution_options(include_deleted=True)``.
-    register_soft_delete_listeners()
 
     # PR 1 T5 + council 2026-05-29 obj #13: fail-closed on misconfigured
     # GATEWAY_CONFIG (duplicate ib_login_key). GatewayRouter.__init__
@@ -289,6 +308,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # Dedicated MI client id — NEVER the JWT AZURE_CLIENT_ID (Codex iter-3 P1).
         mi_client_id=settings.azure_kv_mi_client_id,
     )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Startup/shutdown lifecycle."""
+    from msai.core.soft_delete import register_soft_delete_listeners
+
+    register_soft_delete_listeners()
+    if is_v2_research_runtime():
+        if await _has_incompatible_live_state():
+            raise UnsupportedRuntimeError("Research-only startup refused: active live state")
+        _configure_broker_services(app)
+        await _ensure_api_key_user()
+        log.warning("research_only_runtime_live_projection_and_broker_tasks_unsupported")
+        yield
+        return
+
+    from msai.api.account import start_ib_probe_task, stop_ib_probe_task
+    from msai.services.ib_account_snapshot import get_snapshot
+
+    _configure_broker_services(app)
     # Boot KV reachability probe (council blocking #6): fail-closed if KV is
     # unreachable AND any live deployment is in an active lifecycle state. The
     # active set mirrors the projection bootstrap query above (NOT just

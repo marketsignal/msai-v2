@@ -12,9 +12,9 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
-from nautilus_trader.model.data import BarType
-from nautilus_trader.model.identifiers import (
+from nautilus_trader.model import (
     AccountId,
+    BarType,
     ClientId,
     ComponentId,
     InstrumentId,
@@ -25,7 +25,7 @@ from nautilus_trader.model.identifiers import (
     TraderId,
     Venue,
 )
-from nautilus_trader.trading.config import StrategyConfig
+from nautilus_trader.trading import StrategyConfig
 
 from msai.services.nautilus.schema_hooks import (
     ConfigSchemaStatus,
@@ -36,16 +36,26 @@ from msai.services.nautilus.schema_hooks import (
 
 # Module-scope declaration so `from __future__ import annotations` forward
 # refs resolve against real class objects when msgspec introspects.
-class _TestEMACrossConfig(StrategyConfig, frozen=True):
-    instrument_id: InstrumentId
-    bar_type: BarType
-    fast_ema_period: int = 10
-    slow_ema_period: int = 30
-    trade_size: Decimal = Decimal("1")
+class _TestEMACrossConfig(StrategyConfig):
+    def __init__(
+        self,
+        instrument_id: InstrumentId,
+        bar_type: BarType,
+        fast_ema_period: int = 10,
+        slow_ema_period: int = 30,
+        trade_size: Decimal = Decimal("1"),
+    ) -> None:
+        super().__init__()
+        self.instrument_id = instrument_id
+        self.bar_type = bar_type
+        self.fast_ema_period = fast_ema_period
+        self.slow_ema_period = slow_ema_period
+        self.trade_size = trade_size
 
 
-class _TestEmptyConfig(StrategyConfig, frozen=True):
-    """Config with no user-defined fields, to exercise the trim path."""
+class _TestEmptyConfig(StrategyConfig):
+    def __init__(self) -> None:
+        super().__init__()
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +141,8 @@ class TestBuildUserSchema:
         }
 
         # Primitive types encoded correctly
-        assert props["fast_ema_period"] == {"type": "integer", "default": 10}
+        assert props["fast_ema_period"]["type"] == "integer"
+        assert props["fast_ema_period"]["default"] == 10
         assert props["trade_size"]["type"] == "string"
         assert props["trade_size"]["format"] == "decimal"
 
@@ -173,15 +184,11 @@ class TestBuildUserSchema:
         class UnknownType:
             pass
 
-        class ExoticConfig(StrategyConfig, frozen=True):
-            # msgspec will try to schema-encode UnknownType → hook raises
-            # NotImplementedError → build_user_schema returns UNSUPPORTED.
-            exotic: Any = None
+        class ExoticConfig(StrategyConfig):
+            def __init__(self, exotic: Any = None) -> None:
+                super().__init__()
 
-        # Force msgspec to see UnknownType by constructing a config that
-        # msgspec cannot encode. The simplest robust way: hand the function
-        # a class whose ``__annotations__`` advertises the UnknownType.
-        ExoticConfig.__annotations__ = {"exotic": UnknownType}
+        ExoticConfig.__init__.__annotations__ = {"exotic": UnknownType}
 
         schema, defaults, status = build_user_schema(ExoticConfig)
         # Extraction either fails with UNSUPPORTED (via NotImplementedError

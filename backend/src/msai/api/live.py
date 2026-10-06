@@ -98,6 +98,7 @@ from msai.services.live_command_bus import (
     LiveCommandBus,  # noqa: TC001 — FastAPI Depends resolves at runtime
 )
 from msai.services.nautilus.ibg_client_id import derive_ibg_client_id
+from msai.services.nautilus.runtime_capabilities import require_live_user
 from msai.services.nautilus.trading_node import TradingNodeManager
 from msai.services.observability.broker_account_metrics import (
     DEPLOY_TARGET_DIVERGENCE,
@@ -1154,7 +1155,7 @@ async def live_start_portfolio(  # noqa: PLR0912, PLR0915 — multi-branch dispa
     request: PortfolioStartRequest,
     http_request: Request,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-    claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
+    claims: dict[str, Any] = Depends(require_live_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
     bus: LiveCommandBus = Depends(get_command_bus),  # noqa: B008
     idem: IdempotencyStore = Depends(get_idempotency_store),  # noqa: B008
@@ -3361,7 +3362,7 @@ def _resume_blocked_reconciliation(deployment_id: str) -> NoReturn:
 
 @router.post("/resume")
 async def live_resume(
-    claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
+    claims: dict[str, Any] = Depends(require_live_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
     bus: LiveCommandBus = Depends(get_command_bus),  # noqa: B008
 ) -> LiveResumeResponse:
@@ -3602,7 +3603,7 @@ async def live_resume(
 @router.post("/resume/{account_id}", response_model=None)
 async def live_resume_account(
     account_id: str,
-    claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
+    claims: dict[str, Any] = Depends(require_live_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
     bus: LiveCommandBus = Depends(get_command_bus),  # noqa: B008
 ) -> dict[str, Any]:
@@ -3676,7 +3677,7 @@ async def live_data_health(
 
 @router.get("/release-readiness", response_model=LiveReleaseReadinessResponse)
 async def release_readiness(
-    claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008, ARG001
+    claims: dict[str, Any] = Depends(require_live_user),  # noqa: B008, ARG001
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> LiveReleaseReadinessResponse:
     """Read the entire fleet's release precondition, without list limits.
@@ -3968,7 +3969,7 @@ async def get_live_deployment_status(
 
 @router.get("/positions")
 async def live_positions(
-    claims: dict[str, Any] = Depends(get_current_user),  # noqa: B008
+    claims: dict[str, Any] = Depends(require_live_user),  # noqa: B008
     db: AsyncSession = Depends(get_db),  # noqa: B008
 ) -> LivePositionsResponse:
     """Open positions across all active deployments, read from ProjectionState.

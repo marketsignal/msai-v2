@@ -121,3 +121,70 @@ def test_materialize_series_payload_propagates_shutdown_signals(
             returns_series=pd.Series([0.01], name="returns"),
             backtest_id="bt-shutdown",
         )
+
+
+def test_fixture_provenance_is_content_bound_and_absence_unknown(tmp_path):
+    import hashlib
+    import json
+
+    from msai.workers.backtest_job import _fixture_provenance
+
+    assert _fixture_provenance(tmp_path, {"files": []}) == {}
+    raw = tmp_path / "parquet/stocks/AAPL/2025/01.parquet"
+    raw.parent.mkdir(parents=True)
+    raw.write_bytes(b"fixture")
+    manifest = {
+        "origin": "synthetic",
+        "fixture_id": "test-fixture",
+        "calendar": "UTC weekdays, not exchange sessions",
+        "files": [
+            {
+                "path": "parquet/stocks/AAPL/2025/01.parquet",
+                "sha256": hashlib.sha256(b"fixture").hexdigest(),
+            }
+        ],
+    }
+    encoded = json.dumps(manifest).encode()
+    (tmp_path / "research-fixture-manifest.json").write_bytes(encoded)
+    snapshot = {"files": [{"path": "stocks/AAPL/2025/01.parquet"}]}
+    assert _fixture_provenance(tmp_path, snapshot) == {
+        "data_origin": "synthetic",
+        "fixture_id": "test-fixture",
+        "fixture_manifest_sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+    raw.write_bytes(b"modified")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        _fixture_provenance(tmp_path, snapshot)
+
+
+def test_native_cost_assumptions_are_visible_in_new_report():
+    from msai.workers.backtest_job import _add_accounting_notice
+
+    metadata = dict(
+        initial_capital=10_000,
+        currency="USD",
+        engine_version="2.0.0rc6",
+        leverage=1,
+        fee_model="FixedFeeModel",
+        commission_per_fill=0,
+        fill_model="DefaultFillModel",
+        fill_seed=42,
+        slippage_probability=0,
+        execution_assumptions="L1 residual one tick worse <test>",
+        data_origin="synthetic",
+        fixture_id="fixture",
+        fixture_manifest_sha256="a" * 64,
+    )
+    html = _add_accounting_notice("<html><body>result</body></html>", metadata)
+    for value in (
+        "DefaultFillModel",
+        "FixedFeeModel",
+        "2.0.0rc6",
+        "synthetic",
+        "fixture",
+        "a" * 64,
+    ):
+        assert value in html
+    assert "UTC weekdays" in html
+    assert "one tick worse &lt;test&gt;" in html
+    assert "<test>" not in html

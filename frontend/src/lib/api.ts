@@ -284,6 +284,19 @@ export interface BacktestAccounting {
   initial_capital: number;
   currency: "USD";
   costs: "engine_recorded";
+  /** Recorded simulation assumptions; absence on saved results means unknown. */
+  engine_version?: string | null;
+  leverage?: number | null;
+  fee_model?: string | null;
+  /** USD commission per native fill. Known zero must stay distinct from unknown. */
+  commission_per_fill?: number | null;
+  fill_model?: string | null;
+  fill_seed?: number | null;
+  slippage_probability?: number | null;
+  execution_assumptions?: string | null;
+  data_origin?: "synthetic" | null;
+  fixture_id?: string | null;
+  fixture_manifest_sha256?: string | null;
 }
 
 export interface BacktestResultsResponse {

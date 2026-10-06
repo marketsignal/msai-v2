@@ -10,7 +10,14 @@ from datetime import date as _date
 from typing import Any, Literal
 from uuid import UUID  # noqa: TC003 — same reason
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 
 class BacktestRunRequest(BaseModel):
@@ -249,6 +256,22 @@ class BacktestAccounting(BaseModel):
     initial_capital: float = Field(..., gt=0, allow_inf_nan=False)
     currency: Literal["USD"]
     costs: Literal["engine_recorded"]
+    engine_version: str | None = None
+    leverage: float | None = Field(None, gt=0, allow_inf_nan=False)
+    fee_model: str | None = None
+    commission_per_fill: float | None = Field(None, ge=0, allow_inf_nan=False)
+    fill_model: str | None = None
+    fill_seed: int | None = Field(None, ge=0)
+    slippage_probability: float | None = Field(None, ge=0, le=1, allow_inf_nan=False)
+    execution_assumptions: str | None = None
+    data_origin: Literal["synthetic"] | None = None
+    fixture_id: str | None = None
+    fixture_manifest_sha256: str | None = Field(None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_serializer(mode="wrap")
+    def omit_unrecorded_provenance(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Preserve historical accounting JSON; new absent assumptions remain unknown."""
+        return {key: value for key, value in handler(self).items() if value is not None}
 
 
 class SeriesPayload(BaseModel):
