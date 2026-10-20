@@ -4,6 +4,9 @@ This is the **top-level orientation doc** — what infrastructure runs where, ho
 
 **October 3 release-safety candidate:** read the [current release contract](operations/release-safety.md) before executing this orientation's commands. Exact-target CI/auth evidence, complete fleet readiness and owned-rule cleanup replace the earlier list-only and age-only decisions. The candidate is not yet installed in Azure; an old readiness contract refuses automated release and needs a supervised first upgrade. All commands below require their applicable operational authorization.
 
+
+Image-retention prerequisite for revisions containing the new guard: install and review the stable VM helper/config and durable current/last-good metadata before dispatch. New configs use zero arbitrary newest-version reserve, retaining current/one proven rollback through those authorities plus all container references, seven-day creation grace and infrastructure safeguards; historical VM releases have no built-in extra pins. Current/last-good may coincide after rollback. The guard refuses before the first pull or Phase 4 metadata writes if authority/helper/config/headroom is missing. It keeps a default 5 GiB floor and pins the prospective target; no VM retention timer is added. Follow [the image-retention runbook](operations/docker-image-retention.md) for report/apply approval, explicit local recovery pins, bootstrap, historical rollback limits and Mac maintenance. Source changes alone do not activate this on an existing host.
+
 ---
 
 ## TL;DR

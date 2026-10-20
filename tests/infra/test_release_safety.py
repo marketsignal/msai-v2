@@ -320,7 +320,7 @@ elif name == "az":
                     return {**workflow.get("env", {}), **job.get("env", {}), **step.get("env", {})}
         raise AssertionError("step does not belong to a parsed workflow")
 
-    def execute(self, step):
+    def execute(self, step, cwd=None):
         self.fixture.write_text(json.dumps(self.data))
         audit_before = len(self.startup_audit.read_text().splitlines()) if self.startup_audit.exists() else 0
         log_before = len(self.log.read_text().splitlines()) if self.log.exists() else 0
@@ -332,7 +332,7 @@ elif name == "az":
             self.assertEqual(env.get("AZ_INSTALLER"), "DEB")
             env["MSAI_AZURE_CLI_PYTHON"] = str(self.cli_python)
         script = self.expand(step["run"]).replace("control/scripts/", str(ROOT / "scripts") + "/")
-        result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=ROOT, env=env,
+        result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=ROOT if cwd is None else cwd, env=env,
                                 capture_output=True, text=True, timeout=10)
         self.data = json.loads(self.fixture.read_text())
         if "nsg_rule_lifecycle.py" in step["run"]:
@@ -454,7 +454,9 @@ elif name == "az":
                 if step["name"] == "Stage compose file + Caddyfile + scripts on VM":
                     self.assertEqual(step["working-directory"], "payload")
         calls = [json.loads(line) for line in self.log.read_text().splitlines()]
-        self.assertEqual(len(calls), 8)
+        self.assertEqual(len(calls), 9)
+        self.assertEqual([name for name, _ in calls],
+                         ["ssh", "ssh", "ssh", "scp", "scp", "ssh", "scp", "scp", "ssh"])
         for name, args in calls:
             self.assertIn(name, ("ssh", "scp"))
             options = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "-o"]
@@ -464,8 +466,30 @@ elif name == "az":
         copies = [args for name, args in calls if name == "scp"]
         self.assertEqual(copies[0][-3:], ["docker-compose.prod.yml", "Caddyfile", "operator@192.0.2.1:/opt/msai/"])
         self.assertEqual(copies[1][-1], "operator@192.0.2.1:/opt/msai/scripts/")
-        self.assertEqual(copies[2][-2:], ["scripts/deploy-on-vm.sh", "operator@192.0.2.1:/tmp/deploy-on-vm-10.sh"])
+        self.assertEqual(copies[2][-2:], ["scripts/docker-image-retention.py", "operator@192.0.2.1:/opt/msai/scripts/"])
+        self.assertEqual(copies[3][-2:], ["scripts/deploy-on-vm.sh", "operator@192.0.2.1:/tmp/deploy-on-vm-10.sh"])
         self.assertEqual(calls[-1][1][-1], f"sudo bash /tmp/deploy-on-vm-10.sh {SHA[:7]} /tmp/deploy-env-10.env")
+
+    def test_old_payload_without_retention_helper_still_stages_deploy_script(self) -> None:
+        step = next(step for step in self.transport_steps()
+                    if step["name"] == "Stage compose file + Caddyfile + scripts on VM")
+        payload = self.folder / "old-payload"
+        payload.mkdir()
+        (payload / "scripts").mkdir()
+        # Transport executables are fixtures; only the real shell existence check
+        # needs payload files. Never remove/rename source in the shared checkout.
+        for source in ("docker-compose.prod.yml", "Caddyfile", "scripts/deploy-on-vm.sh"):
+            (payload / source).write_text("old application payload\n")
+        self.assertFalse((payload / "scripts/docker-image-retention.py").exists())
+        result = self.execute(step, cwd=payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertEqual([name for name, _ in calls], ["ssh", "scp", "scp", "ssh", "scp"])
+        copies = [args for name, args in calls if name == "scp"]
+        self.assertEqual(copies[0][-3:], ["docker-compose.prod.yml", "Caddyfile", "operator@192.0.2.1:/opt/msai/"])
+        self.assertEqual(copies[1][-1], "operator@192.0.2.1:/opt/msai/scripts/")
+        self.assertEqual(copies[2][-2:], ["scripts/deploy-on-vm.sh", "operator@192.0.2.1:/tmp/deploy-on-vm-10.sh"])
+        self.assertFalse(any("scripts/docker-image-retention.py" in args for _, args in calls))
 
     def test_transport_failure_stops_actual_staging_block_before_followup_calls(self) -> None:
         steps = self.transport_steps()

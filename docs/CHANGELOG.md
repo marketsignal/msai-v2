@@ -4,6 +4,12 @@ All notable changes to msai-v2 will be documented in this file.
 
 ## [Unreleased]
 
+### 2026-10-20 — Conservative Docker image retention source repair
+
+- Add a stdlib report-only CLI with exact repository groups and the selected current-plus-one-proven-rollback policy: new installer configs use zero arbitrary newest-version reserve and no built-in historical VM pins, retaining current/last-good authorities, explicit local recovery/V2 qualification/operator pins, required infrastructure, seven-day creation grace and every running/stopped container reference. Configurable nonzero reserves remain supported. Apply refreshes protections and removes only approved full IDs without force or parent pruning; it reports host bytes and Docker usage.
+- Add a preview-first stable Mac LaunchAgent installer that preserves operator pins and verifies native registration. Add a VM pre-pull/pre-metadata guard with a configurable 5 GiB floor, durable current/last-good metadata and rollback mirror refresh; helper staging tolerates pre-fix target payloads. No VM timer is introduced.
+- Add focused external-Docker and deployment shell fixtures plus an explicit infra CI command. [Operations runbook](operations/docker-image-retention.md) records installation prerequisites, stable build names and approval/recovery boundaries. Source checks do not establish live installation, cleanup or future pipeline adoption.
+
 ### 2026-10-05 — Forge 6.4.5 integration and final assessment reconciliation
 
 - PR110 merged the exact 19-file Forge 6.4.5 harness update as main `54dc40792f88fa49805d35b756c228bb5b85515c`. Paired reviews were CLEAN/P3; focused owning checks, exact-head CI/auth and exact-main CI 37356445768/auth 37356445686/image build 37356445696 passed. Application E2E was N/A for the harness-only scope. No application or Nautilus dependency changed.
