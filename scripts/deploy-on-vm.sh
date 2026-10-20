@@ -20,6 +20,7 @@
 #   FAIL_ACR_LOGIN          az acr login failed (RBAC propagating? AcrPull missing?)
 #   FAIL_RENDER_ENV         msai-render-env.service failed (KV unreachable, RBAC, secret missing)
 #   FAIL_CADDY_VALIDATE     Caddyfile syntax error — deploy aborts before pull
+#   FAIL_IMAGE_RETENTION    Missing helper/config, unsafe inventory or insufficient pull headroom
 #   FAIL_PULL               docker compose pull failed (network, registry, image not found)
 #   FAIL_MIGRATE            One-shot migrate service exited non-zero
 #   FAIL_PROBE_HEALTH       backend /health did not return 200 within budget
@@ -47,6 +48,7 @@ readonly RENDERED_ENV="/run/msai.env"
 # the gateway, so it falls back to this persistent copy after a reboot (the
 # render service only regenerates /run/msai.env, not the images env).
 readonly IMAGES_ENV_PERSIST="/opt/msai/msai-images.env"
+readonly IMAGES_LAST_GOOD_PERSIST="/opt/msai/msai-images.last-good.env"
 readonly DEFAULT_PROFILE_SERVICES=(
     postgres redis migrate
     backend backtest-worker research-worker portfolio-worker ingest-worker
@@ -106,6 +108,27 @@ DEPLOY_START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 export DEPLOY_START_TS
 
 echo "=== deploy-on-vm.sh — sha=$GIT_SHA hostname=$MSAI_HOSTNAME rg=$RESOURCE_GROUP started=$DEPLOY_START_TS ==="
+
+# ─── Phase 2.4: Retain owned images + require pull headroom ────────────────────
+# Stable helper/config are an explicit installation prerequisite, independent of
+# the selected application SHA. Refuse BEFORE any pull or Phase 4 metadata write.
+# Existing deploy workflow serializes deployments and checks complete quiet fleet.
+readonly RETENTION_HELPER="/usr/local/lib/msai/docker-image-retention.py"
+readonly RETENTION_CONFIG="/etc/msai/image-retention.json"
+if [[ ! -r "$RETENTION_HELPER" || ! -r "$RETENTION_CONFIG" ]]; then
+    echo "Install reviewed image-retention helper/config first (see operations runbook)." >&2
+    echo "FAIL_IMAGE_RETENTION" >&2
+    exit 1
+fi
+if ! /usr/bin/python3 "$RETENTION_HELPER" --config "$RETENTION_CONFIG" \
+        --apply --approve-policy --quiet-deployment \
+        --pin "${MSAI_REGISTRY}/${MSAI_BACKEND_IMAGE}:${GIT_SHA}" \
+        --pin "${MSAI_REGISTRY}/${MSAI_FRONTEND_IMAGE}:${GIT_SHA}" \
+        --min-free-bytes "${MSAI_IMAGE_MIN_FREE_BYTES:-5368709120}"; then
+    echo "Image retention/headroom refused; current image metadata is unchanged." >&2
+    echo "FAIL_IMAGE_RETENTION" >&2
+    exit 1
+fi
 
 # ─── Phase 2.5: Ensure az CLI is installed (idempotent) ────────────────────────
 # Slice 3 originally baked az-cli install into cloud-init, but
@@ -177,6 +200,10 @@ fi
 
 # ─── Phase 4: Record last-good + write new images env ──────────────────────────
 
+# Recover current authority after reboot before selecting the rollback pair.
+if [[ ! -f "$IMAGES_ENV" && -f "$IMAGES_ENV_PERSIST" ]]; then
+    cp -p "$IMAGES_ENV_PERSIST" "$IMAGES_ENV"
+fi
 if [[ -f "$IMAGES_ENV" ]]; then
     cp -p "$IMAGES_ENV" "$IMAGES_LAST_GOOD"
 else
@@ -189,6 +216,8 @@ EOF
 fi
 
 umask 077
+cp -p "$IMAGES_LAST_GOOD" "${IMAGES_LAST_GOOD_PERSIST}.tmp"
+mv "${IMAGES_LAST_GOOD_PERSIST}.tmp" "$IMAGES_LAST_GOOD_PERSIST"
 cat >"${IMAGES_ENV}.tmp" <<EOF
 MSAI_GIT_SHA=$GIT_SHA
 MSAI_REGISTRY=$MSAI_REGISTRY
@@ -321,6 +350,8 @@ rollback() {
 
     echo "→ Rolling back to last-good SHA"
     cp -p "$IMAGES_LAST_GOOD" "$IMAGES_ENV"
+    cp -p "$IMAGES_ENV" "${IMAGES_ENV_PERSIST}.tmp"
+    mv "${IMAGES_ENV_PERSIST}.tmp" "$IMAGES_ENV_PERSIST"
 
     if docker compose "${COMPOSE_FLAGS[@]}" pull "${DEFAULT_PROFILE_SERVICES[@]}" --quiet >/dev/null 2>&1 \
         && docker compose "${COMPOSE_FLAGS[@]}" up -d --wait --wait-timeout 300 "${DEFAULT_PROFILE_SERVICES[@]}"; then
